@@ -1,0 +1,43 @@
+# Backups & audit artifacts
+_audit_reports/
+
+# Virtual environments
+.venv/
+venv/
+.claude/
+
+# Python caches / test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Packaging / build outputs
+build/
+dist/
+dist*/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+.idea/
+.vscode/
+*.swp
+
+# Logs and Dev Documentation
+*.log
+knownbugs.md
+TODO.md
+AGENTS.md
+ARCH_RULES.md
+AUDIT.md
+DSL_REFERENCE.md

@@ -1,0 +1,16 @@
+# Small Benchmark Mechanism
+# 5 species, 4 reactions
+# Simple consecutive reaction chain: A -> B -> C -> D -> E
+
+# Reactions
+reaction: A -> B; k=1.0
+reaction: B -> C; k=0.8
+reaction: C -> D; k=0.6
+reaction: D -> E; k=0.4
+
+# Initial conditions
+[A] = 1.0
+[B] = 0.0
+[C] = 0.0
+[D] = 0.0
+[E] = 0.0

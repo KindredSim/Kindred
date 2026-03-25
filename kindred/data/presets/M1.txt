@@ -1,0 +1,10 @@
+# Preset M1 — Simple first-order isomerization
+# Mechanism
+A -> B ; kf = 1.0
+
+# Initials
+[A] = 1.0
+[B] = 0.0
+
+# Algebra
+let total = [A] + [B]

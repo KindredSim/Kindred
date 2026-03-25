@@ -1,0 +1,25 @@
+# Audit C allowlist: dead-code candidates
+#
+# Format:
+# - One repo-relative POSIX path per line (e.g., `kindred/gui/main_window.py`)
+# - Blank lines are ignored
+# - Comments start with `#` (inline `# ...` comments are allowed)
+#
+# Entries in this file suppress matching Audit C "unreferenced module" candidates
+# from `C_deadcode_filtered.txt`. The raw report `C_deadcode.txt` is unfiltered.
+
+# Current allowlist policy:
+# - Allowlist repo-root support modules and narrowly justified non-`kindred/**`
+#   support surfaces only.
+# - Do not allowlist `kindred/**` production modules here.
+# - Do not allowlist `tools/audit/**`; fix or justify those separately.
+
+# Environment compatibility shim (auto-imported by Python when present on sys.path).
+sitecustomize.py
+
+# GUI-path compatibility shims retained after moving headless batch models into
+# kindred.core. In-repo consumers now import the core homes directly, so these
+# modules intentionally have little/no production evidence while preserving old
+# import paths.
+kindred/gui/batch_initial_conditions.py
+kindred/gui/controllers/batch_simulation_cache.py

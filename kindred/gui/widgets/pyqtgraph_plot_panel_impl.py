@@ -1,0 +1,2152 @@
+# kindred/gui/widgets/pyqtgraph_plot_panel_impl.py
+"""High-performance plot panel using PyQtGraph (GPU-accelerated)."""
+
+from __future__ import annotations
+
+from functools import partial
+import logging
+from typing import Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
+
+import numpy as np
+from PySide6 import QtCore, QtWidgets
+from PySide6.QtCore import Qt
+
+from kindred.gui.color_manager import ColorManager
+
+# Direct imports required to avoid circular dependency with widgets/__init__.py
+from kindred.gui.widgets.axis_toolbar import AxisToolbar
+from kindred.gui.widgets.dataset_overlay_panel import DatasetOverlayPanel
+from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
+from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
+from ..ui_helpers import make_pyqtgraph_fallback_widget
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["PyQtGraphPlotPanel", "PYQTGRAPH_AVAILABLE"]
+
+
+def _try_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not np.isfinite(out):
+        return None
+    return float(out)
+
+
+def _try_1d_float_array(value: object) -> np.ndarray:
+    try:
+        return np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return np.asarray([], dtype=float)
+
+
+# Try to import pyqtgraph
+try:
+    import pyqtgraph as pg
+    PYQTGRAPH_AVAILABLE = True
+except ImportError:
+    PYQTGRAPH_AVAILABLE = False
+    pg = None
+
+
+if PYQTGRAPH_AVAILABLE:
+    class _OverlaySeries(NamedTuple):
+        dataset: str
+        species: str
+        x: np.ndarray
+        y: np.ndarray
+
+    class _DetailInspectorDock(QtWidgets.QFrame):
+        """Compact secondary inspector wrapper with a small default height hint."""
+
+        def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+            super().__init__(parent)
+            self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Minimum,
+            )
+
+        def sizeHint(self) -> QtCore.QSize:
+            hint = super().sizeHint()
+            return QtCore.QSize(max(hint.width(), 320), 136)
+
+        def minimumSizeHint(self) -> QtCore.QSize:
+            hint = super().minimumSizeHint()
+            return QtCore.QSize(max(hint.width(), 260), 120)
+
+    class _NearestHit(NamedTuple):
+        x: float
+        y: float
+        label: str
+        dataset: Optional[str]
+        color: Tuple[int, int, int]
+
+    def _resolve_dataset_species(
+        species_name: str,
+        species_dict: Dict[str, np.ndarray]
+    ) -> Tuple[Optional[str], Optional[np.ndarray]]:
+        """
+        Resolve a mechanism species name to a dataset column name and values.
+
+        This function implements flexible matching to handle common naming patterns
+        in experimental datasets (e.g., "A" matching "A_conc").
+
+        Matching rules (applied in order, first match wins):
+        1. Exact match: species_name is directly in species_dict
+        2. Case-insensitive exact match
+        3. Suffix-based match: species_name + common suffixes ("_conc", "_concentration")
+
+        Parameters
+        ----------
+        species_name : str
+            Mechanism species name (e.g., "A", "PBMP")
+        species_dict : dict
+            Dataset species columns mapping names to concentration arrays
+
+        Returns
+        -------
+        tuple
+            (resolved_key, values) if match found, (None, None) otherwise
+        """
+        if not species_name or not species_dict:
+            return None, None
+
+        # Rule 1: Exact match
+        if species_name in species_dict:
+            return species_name, species_dict[species_name]
+
+        # Build lookup for case-insensitive matching
+        lower_to_key = {key.lower(): key for key in species_dict.keys()}
+        species_lower = species_name.lower()
+
+        # Rule 2: Case-insensitive exact match
+        if species_lower in lower_to_key:
+            matched_key = lower_to_key[species_lower]
+            return matched_key, species_dict[matched_key]
+
+        # Rule 3: Suffix-based matching (common concentration column patterns)
+        suffixes = ["_conc", "_concentration"]
+        for suffix in suffixes:
+            candidate_lower = species_lower + suffix
+            if candidate_lower in lower_to_key:
+                matched_key = lower_to_key[candidate_lower]
+                return matched_key, species_dict[matched_key]
+
+        # No match found
+        return None, None
+
+    class PyQtGraphPlotPanel(QtWidgets.QWidget):
+        """
+        High-performance plot panel using PyQtGraph.
+
+        Features:
+        - GPU-accelerated rendering (OpenGL)
+        - Handles millions of points smoothly
+        - Real-time updates (60+ FPS)
+        - Interactive zoom, pan, mouse tracking
+        - AxisToolbar integration (X-axis selection, Y-axis selection, parametric mode)
+        - Custom X-axis selection (plot any species vs any species)
+        - Parametric mode support
+        - Legend with show/hide toggle
+        - Dark theme support
+        - Mouse tracking with exact value tooltips
+
+        Performance:
+        - Handles 1M+ points smoothly with GPU acceleration
+        """
+
+        # Signal emitted when series visibility changes
+        seriesVisibilityChanged = QtCore.Signal(str, bool)
+
+        def __init__(
+            self,
+            parent: Optional[QtWidgets.QWidget] = None,
+            *,
+            embed_analysis_tabs: bool = True,
+            workspace_splitter_object_name: Optional[str] = None,
+        ):
+            """
+            Initialize PyQtGraph plot panel.
+
+            Parameters
+            ----------
+            parent : QWidget, optional
+                Parent widget
+            """
+            super().__init__(parent)
+
+            # Data storage
+            self._t: Optional[np.ndarray] = None
+            self._series: Dict[str, np.ndarray] = {}
+            self._visible: Dict[str, bool] = {}
+            self._colors: Dict[str, tuple] = {}
+            self._owned_species_keys: Set[str] = set()
+            self._plot_items: Dict[str, pg.PlotDataItem] = {}
+            self._dataset_scatter_items: Dict[str, pg.ScatterPlotItem] = {}
+            self._dataset_model_items: Dict[str, pg.PlotDataItem] = {}
+            self._overlay_items: Dict[Tuple[str, str], pg.ScatterPlotItem] = {}
+            self._overlay_datasets: Dict[str, Dict[str, np.ndarray]] = {}
+            self._overlay_symbols: Dict[str, str] = {}
+            self._active_overlay_series: List[_OverlaySeries] = []
+            self._dark_mode = False
+            self._scalar_values: Dict[str, float] = {}
+
+            # Batch simulation overlays (multiple initial-condition sets overlaid as lines)
+            self._simulation_set_label: Optional[str] = None
+            self._simulation_overlays: List[Dict[str, object]] = []
+
+            # Axis control (for parametric mode and custom X-axis)
+            self._x_axis_name: str = "t"  # Current X-axis variable
+            self._parametric_mode: bool = False  # Parametric plotting mode
+
+            # Plot enhancements (v0.2.0)
+            self._secondary_y_axis: Optional[pg.ViewBox] = None
+            self._secondary_y_items: Dict[str, pg.PlotDataItem] = {}
+            self._log_x: bool = False
+            self._log_y: bool = False
+            self._annotations: List[pg.TextItem] = []
+            self._sampling_mode: str = "dense"
+            self._sampling_target: int = 1000
+            self._export_scope_preference: str = "axis"
+            self._guide_items: List[pg.InfiniteLine] = []
+            self._analysis_tabs_detached = False
+
+            # Setup UI
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+            # Create PyQtGraph PlotWidget
+            self._plot_widget = pg.PlotWidget()
+            self._plot_item = self._plot_widget.getPlotItem()
+
+            # Set white background (user requested light background)
+            self._plot_widget.setBackground('w')
+
+            # Configure plot appearance
+            self._plot_item.setLabel('bottom', 'Time', units='s')
+            self._plot_item.setLabel('left', 'Concentration', units='M')
+            self._plot_item.showGrid(x=True, y=True, alpha=0.3)
+            self._legend = self._plot_item.addLegend()
+            self._legend_visible = True
+
+            # Enable antialiasing for smoother lines
+            self._plot_widget.setAntialiasing(True)
+
+            # Setup context menu
+            self._plot_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._plot_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+            # Disable PyQtGraph's native context menus (prevents double-popups in some builds)
+            self._plot_item.setMenuEnabled(False)
+            vb = self._plot_item.getViewBox()
+            vb.setMenuEnabled(False)
+
+            # Enable mouse tracking for crosshair and tooltip
+            self._plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
+            self._crosshair_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('g', width=1, style=Qt.DashLine))
+            self._crosshair_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('g', width=1, style=Qt.DashLine))
+            self._plot_item.addItem(self._crosshair_v, ignoreBounds=True)
+            self._plot_item.addItem(self._crosshair_h, ignoreBounds=True)
+            self._crosshair_v.setVisible(False)
+            self._crosshair_h.setVisible(False)
+
+            # Tooltip label for exact values
+            self._tooltip_text = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 220, 230), border=pg.mkPen(100, 100, 100))
+            self._plot_item.addItem(self._tooltip_text)
+            self._tooltip_text.setVisible(False)
+
+            self._toolbar = AxisToolbar(self, orientation="horizontal")
+            self._toolbar.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+
+            self._legend_toggle_btn = QtWidgets.QCheckBox("Legend", self._toolbar)
+            self._legend_toggle_btn.setChecked(True)
+            self._legend_toggle_btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            self._legend_toggle_btn.toggled.connect(self._toggle_legend)
+            toolbar_layout = self._toolbar.layout()
+            toolbar_layout.insertWidget(toolbar_layout.count() - 1, self._legend_toggle_btn, 0, Qt.AlignVCenter)
+
+            self._control_strip = QtWidgets.QWidget(self)
+            control_layout = QtWidgets.QHBoxLayout(self._control_strip)
+            control_layout.setContentsMargins(8, 6, 8, 2)
+            control_layout.setSpacing(6)
+            control_layout.addWidget(self._toolbar, stretch=1)
+            layout.addWidget(self._control_strip, stretch=0)
+
+            self._plot_surface = QtWidgets.QFrame(self)
+            self._plot_surface.setObjectName("mainPlotSurface")
+            self._plot_surface.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            plot_surface_layout = QtWidgets.QVBoxLayout(self._plot_surface)
+            plot_surface_layout.setContentsMargins(8, 0, 8, 0)
+            plot_surface_layout.setSpacing(0)
+            self._plot_widget.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
+            plot_surface_layout.addWidget(self._plot_widget, stretch=1)
+
+            # Vertical splitter: plot area (top) | compact detail dock (bottom)
+            self._main_splitter = QtWidgets.QSplitter(Qt.Vertical, self)
+            if workspace_splitter_object_name:
+                self._main_splitter.setObjectName(str(workspace_splitter_object_name))
+            self._main_splitter.setChildrenCollapsible(False)
+            self._main_splitter.setHandleWidth(8)
+            self._main_splitter.addWidget(self._plot_surface)
+            self._main_splitter.setCollapsible(0, False)
+
+            self._details_dock = _DetailInspectorDock(self._main_splitter)
+            details_dock_layout = QtWidgets.QVBoxLayout(self._details_dock)
+            details_dock_layout.setContentsMargins(0, 0, 0, 0)
+            details_dock_layout.setSpacing(0)
+
+            self._details_tabs = QtWidgets.QTabWidget(self._details_dock)
+            self._details_tabs.setObjectName("mainPlotDetailTabs")
+            self._details_tabs.setDocumentMode(True)
+            self._details_tabs.setTabPosition(QtWidgets.QTabWidget.TabPosition.North)
+            details_dock_layout.addWidget(self._details_tabs, stretch=1)
+
+            stats_container = QtWidgets.QWidget(self._details_tabs)
+            stats_layout = QtWidgets.QVBoxLayout(stats_container)
+            stats_layout.setContentsMargins(8, 8, 8, 8)
+            stats_layout.setSpacing(4)
+
+            stats_selector_row = QtWidgets.QHBoxLayout()
+            stats_selector_row.setContentsMargins(0, 0, 0, 0)
+            stats_selector_row.setSpacing(6)
+
+            stats_selector_label = QtWidgets.QLabel("Select Result Set:", stats_container)
+            stats_selector_row.addWidget(stats_selector_label, stretch=0)
+
+            self._stats_result_selector = QtWidgets.QComboBox(stats_container)
+            self._stats_result_selector.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+            stats_selector_row.addWidget(self._stats_result_selector, stretch=1)
+            stats_selector_row.addStretch(1)
+
+            stats_layout.addLayout(stats_selector_row, stretch=0)
+
+            self._stats_table = SpeciesStatisticsTable(stats_container)
+            stats_layout.addWidget(self._stats_table, stretch=1)
+
+            self._stats_results_map: Dict[str, Dict[str, object]] = {}
+            self._stats_result_selector.currentTextChanged.connect(self._on_stats_result_selector_changed)
+
+            self._param_table = ParameterStatisticsTable(self._details_tabs)
+            self._param_table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+            self._overlay_panel = DatasetOverlayPanel(self._details_tabs)
+            self._overlay_panel.selectionChanged.connect(self._on_overlay_selection_changed)
+            self._overlay_panel.styleChanged.connect(self._on_overlay_style_changed)
+
+            self._details_tabs.addTab(stats_container, "Statistics")
+            self._details_tabs.addTab(self._param_table, "Parameters")
+            self._details_tabs.addTab(self._overlay_panel, "Overlays")
+            self._details_tabs.setCurrentWidget(stats_container)
+
+            self._main_splitter.addWidget(self._details_dock)
+            self._main_splitter.setCollapsible(1, True)
+            self._main_splitter.setStretchFactor(0, 5)
+            self._main_splitter.setStretchFactor(1, 1)
+            layout.addWidget(self._main_splitter, stretch=1)
+            QtCore.QTimer.singleShot(0, self._apply_default_workspace_splitter_sizes)
+
+            if not bool(embed_analysis_tabs):
+                self.detach_analysis_tabs_for_dock()
+
+            # Connect toolbar signals
+            self._toolbar.xChanged.connect(self._on_x_axis_changed)
+            self._toolbar.ySelectionChanged.connect(self._on_y_selection_changed)
+            self._toolbar.parametricToggled.connect(self._on_parametric_toggled)
+            self._toolbar.axisRangeChanged.connect(self._on_axis_range_changed)
+            self._toolbar.optionsRequested.connect(self._on_toolbar_option_requested)
+            self._toolbar.addGuideRequested.connect(self._on_add_guide_requested)
+            logger.debug("Connected axis range changed signal")
+
+            logger.debug("PyQtGraphPlotPanel initialized")
+
+        def _apply_default_workspace_splitter_sizes(self) -> None:
+            splitter = getattr(self, "_main_splitter", None)
+            if splitter is None:
+                return
+            total = sum(int(size) for size in splitter.sizes())
+            if total <= 0:
+                total = max(int(self.height()), 720)
+            if bool(getattr(self, "_analysis_tabs_detached", False)):
+                splitter.setSizes([max(1, total), 0])
+                return
+            detail = max(120, int(round(total * 0.16)))
+            detail = min(detail, max(140, int(total * 0.18)))
+            plot = max(1, total - detail)
+            splitter.setSizes([plot, detail])
+
+        def analysis_tabs_widget(self) -> Optional[QtWidgets.QWidget]:
+            return getattr(self, "_details_tabs", None)
+
+        def workspace_splitter(self) -> Optional[QtWidgets.QSplitter]:
+            return getattr(self, "_main_splitter", None)
+
+        def detach_analysis_tabs_for_dock(self) -> Optional[QtWidgets.QWidget]:
+            tabs = getattr(self, "_details_tabs", None)
+            if tabs is None:
+                return None
+            if bool(getattr(self, "_analysis_tabs_detached", False)):
+                return tabs
+
+            details_dock = getattr(self, "_details_dock", None)
+            if details_dock is not None:
+                layout = details_dock.layout()
+                if layout is not None:
+                    layout.removeWidget(tabs)
+                tabs.setParent(None)
+                details_dock.hide()
+                details_dock.setMinimumHeight(0)
+                details_dock.setMaximumHeight(0)
+
+            splitter = getattr(self, "_main_splitter", None)
+            if splitter is not None:
+                splitter.setSizes([max(1, sum(int(size) for size in splitter.sizes())), 0])
+
+            self._analysis_tabs_detached = True
+            return tabs
+
+        def set_data(
+            self,
+            t: np.ndarray,
+            series: Dict[str, np.ndarray],
+            *,
+            label: Optional[str] = None,
+            overlays: Optional[Sequence[Dict[str, object]]] = None,
+            owned_species: Optional[Sequence[str]] = None,
+        ) -> None:
+            """
+            Set time and concentration data.
+
+            Parameters
+            ----------
+            t : np.ndarray
+                Time points
+            series : dict
+                Dictionary of {species_name: concentrations}
+
+            Notes
+            -----
+            No downsampling needed! PyQtGraph handles large datasets efficiently.
+            """
+            self._t = np.asarray(t, dtype=float).reshape(-1)
+            self._series = {str(k): np.asarray(v, dtype=float).reshape(-1)
+                           for k, v in series.items()}
+            self._visible = {k: True for k in self._series.keys()}
+            color_manager = ColorManager.instance()
+            provided_owned = {str(name).strip() for name in (owned_species or []) if str(name).strip()}
+            series_keys = {str(name).strip() for name in self._series.keys() if str(name).strip()}
+            if provided_owned:
+                self._owned_species_keys = set(provided_owned)
+                color_manager.set_species_roster(sorted(self._owned_species_keys))
+            elif self._owned_species_keys and self._owned_species_keys.issubset(series_keys):
+                self._owned_species_keys = {name for name in self._owned_species_keys if name in series_keys}
+            else:
+                self._owned_species_keys = set(series_keys)
+                if self._owned_species_keys:
+                    color_manager.seed_species(sorted(self._owned_species_keys))
+
+            self._simulation_set_label = str(label) if label else None
+            self._workspace_preview_display_provenance_by_set_id = {}
+            normalized_overlays: List[Dict[str, object]] = []
+            for entry in (overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                entry_label = str(entry.get("label") or "")
+                entry_t = entry.get("t")
+                entry_series = entry.get("series") or entry.get("species") or {}
+                if not entry_label or entry_t is None or not isinstance(entry_series, dict):
+                    continue
+                t_arr = _try_1d_float_array(entry_t)
+                if t_arr.size == 0:
+                    continue
+                series_map: Dict[str, np.ndarray] = {}
+                for k, v in entry_series.items():
+                    arr = _try_1d_float_array(v)
+                    if arr.size == 0:
+                        continue
+                    series_map[str(k)] = arr
+                normalized_entry: Dict[str, object] = {"label": entry_label, "t": t_arr, "series": series_map}
+                set_id = str(entry.get("set_id") or "").strip()
+                if set_id:
+                    normalized_entry["set_id"] = set_id
+                curve_role = str(entry.get("curve_role") or "").strip()
+                if curve_role:
+                    normalized_entry["curve_role"] = curve_role
+                normalized_overlays.append(normalized_entry)
+            self._simulation_overlays = normalized_overlays
+
+            # Assign colors
+            self._assign_colors()
+            self._overlay_panel.refresh_color_swatches()
+
+            # Update AxisToolbar with available data
+            self._update_toolbar()
+
+            # Update plot
+            self._update_plot()
+
+            logger.debug(f"Data set: {len(self._t)} points, {len(self._series)} series")
+
+        def render_dataset_layers(
+            self,
+            *,
+            data_t: np.ndarray,
+            dataset_series: Dict[str, np.ndarray],
+            model_t: Optional[np.ndarray] = None,
+            model_series: Optional[Dict[str, np.ndarray]] = None,
+            visible_species: Sequence[str],
+            xlabel: str,
+            ylabel: str,
+        ) -> None:
+            """Render dataset-tab scatter/model layers without clearing unrelated backend state."""
+            t_arr = _try_1d_float_array(data_t)
+            series_map = {
+                str(name): _try_1d_float_array(values)
+                for name, values in (dataset_series or {}).items()
+                if str(name)
+            }
+            active_dataset = {name: values for name, values in series_map.items() if values.size}
+            visible = {str(name) for name in (visible_species or []) if str(name)}
+
+            model_t_arr = _try_1d_float_array(model_t) if model_t is not None else np.asarray([], dtype=float)
+            model_map = {
+                str(name): _try_1d_float_array(values)
+                for name, values in (model_series or {}).items()
+                if str(name)
+            }
+
+            self._set_dataset_axis_labels(xlabel=xlabel, ylabel=ylabel)
+
+            if t_arr.size == 0 or not active_dataset:
+                self._prune_dataset_scatter_items(set())
+                self._prune_dataset_model_items(set())
+                return
+
+            color_manager = ColorManager.instance()
+            color_manager.seed_species(active_dataset.keys())
+
+            active_scatter_keys: Set[str] = set()
+            active_model_keys: Set[str] = set()
+            for species_name, y_data in active_dataset.items():
+                if y_data.shape[0] != t_arr.shape[0]:
+                    logger.warning(
+                        "Dataset layer length mismatch for %s: %s vs %s",
+                        species_name,
+                        int(y_data.shape[0]),
+                        int(t_arr.shape[0]),
+                    )
+                    continue
+
+                scatter_color = color_manager.get_species_rgb(species_name, known_species=tuple(active_dataset.keys()))
+                brush = pg.mkBrush(*scatter_color, 150)
+                active_scatter_keys.add(species_name)
+                self._upsert_dataset_scatter_item(
+                    key=species_name,
+                    x_data=t_arr,
+                    y_data=y_data,
+                    brush=brush,
+                    size=8,
+                    name=f"{species_name} (data)",
+                )
+                self._dataset_scatter_items[species_name].setVisible(species_name in visible)
+
+                model_values = model_map.get(species_name)
+                if model_t_arr.size == 0 or model_values is None:
+                    continue
+                if model_values.shape[0] != model_t_arr.shape[0]:
+                    logger.warning(
+                        "Dataset model length mismatch for %s: %s vs %s",
+                        species_name,
+                        int(model_values.shape[0]),
+                        int(model_t_arr.shape[0]),
+                    )
+                    continue
+
+                pen = pg.mkPen(color=scatter_color, width=2)
+                active_model_keys.add(species_name)
+                self._upsert_dataset_model_item(
+                    key=species_name,
+                    x_data=model_t_arr,
+                    y_data=model_values,
+                    pen=pen,
+                    name=f"{species_name} (model)",
+                )
+                self._dataset_model_items[species_name].setVisible(species_name in visible)
+
+            self._prune_dataset_scatter_items(active_scatter_keys)
+            self._prune_dataset_model_items(active_model_keys)
+
+        def stats_table(self) -> SpeciesStatisticsTable:
+            """Return the species statistics table widget."""
+            return self._stats_table
+
+        def parameter_table(self) -> ParameterStatisticsTable:
+            """Return the solver-parameter table widget."""
+            return self._param_table
+
+        def set_scalar_values(self, scalars: Dict[str, float]) -> None:
+            """Store algebra scalar outputs for guide selection."""
+            cleaned: Dict[str, float] = {}
+            for name, value in (scalars or {}).items():
+                val = _try_float(value)
+                if val is None:
+                    continue
+                cleaned[str(name)] = float(val)
+            self._scalar_values = cleaned
+            if self._t is not None and self._series:
+                self._update_toolbar()
+
+        def selected_series(self) -> List[str]:
+            """Return the currently selected Y-series names."""
+            return list(self._toolbar.selected_y())
+
+        def get_export_scope_preference(self) -> str:
+            """Return the preferred export scope for CSV dialogs."""
+            return self._export_scope_preference
+
+        def export_payload(self) -> Optional[Dict[str, object]]:
+            """
+            Return a standardized export payload for CSV export code.
+
+            Returns
+            -------
+            dict or None
+                {'t': np.ndarray, 'series': Dict[str, np.ndarray]}
+            """
+            if self._t is None or not self._series:
+                return None
+            return {
+                "t": np.asarray(self._t, dtype=float).reshape(-1),
+                "series": dict(self._series),
+            }
+
+        def set_selected_series(self, names: Sequence[str]) -> None:
+            """Apply a specific selection of Y-series."""
+            valid = [n for n in names if n in self._series]
+            self._toolbar.select_y(valid)
+            self._on_y_selection_changed(valid)
+
+        def update_statistics(
+            self,
+            t: np.ndarray,
+            series: Dict[str, np.ndarray],
+            chi_squared: Optional[float] = None,
+        ) -> None:
+            """Update the species statistics table with latest results."""
+            label = str(getattr(self, "_simulation_set_label", "") or "").strip() or "Results"
+            self.set_statistics_results(
+                {label: {"t": t, "series": series, "chi_squared": chi_squared}},
+                prefer=label,
+            )
+
+        def set_statistics_results(
+            self,
+            results_map: Dict[str, Dict[str, object]],
+            *,
+            prefer: Optional[str] = None,
+        ) -> None:
+            """
+            Provide the full set of results available for the statistics table.
+
+            Parameters
+            ----------
+            results_map : dict
+                Mapping of result-set label -> {'t': array, 'series': {species: array}, 'chi_squared': optional}
+            prefer : str, optional
+                Preferred selection label (used after refresh).
+            """
+            cleaned: Dict[str, Dict[str, object]] = {}
+            for raw_label, payload in (results_map or {}).items():
+                label = str(raw_label or "").strip()
+                if not label:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                t_payload = payload.get("t")
+                series_payload = payload.get("series")
+                if t_payload is None or not isinstance(series_payload, dict) or not series_payload:
+                    continue
+                cleaned[label] = dict(payload)
+
+            self._stats_results_map = cleaned
+
+            previous = str(self._stats_result_selector.currentText() or "").strip()
+            preferred = str(prefer or "").strip()
+            next_selection = (
+                preferred
+                if preferred and preferred in cleaned
+                else (previous if previous and previous in cleaned else next(iter(cleaned.keys()), ""))
+            )
+
+            self._stats_result_selector.blockSignals(True)
+            try:
+                self._stats_result_selector.clear()
+                for label in cleaned.keys():
+                    self._stats_result_selector.addItem(label)
+                if next_selection:
+                    self._stats_result_selector.setCurrentText(next_selection)
+            finally:
+                self._stats_result_selector.blockSignals(False)
+
+            self._stats_result_selector.setEnabled(self._stats_result_selector.count() > 1)
+            if next_selection:
+                self._render_statistics_for_label(next_selection)
+            else:
+                self._stats_table.setRowCount(0)
+
+        def _on_stats_result_selector_changed(self, label: str) -> None:
+            label = str(label or "").strip()
+            if not label:
+                self._stats_table.setRowCount(0)
+                return
+            self._render_statistics_for_label(label)
+
+        def _render_statistics_for_label(self, label: str) -> None:
+            payload = self._stats_results_map.get(str(label))
+            if not isinstance(payload, dict):
+                self._stats_table.setRowCount(0)
+                return
+            t_payload = payload.get("t")
+            series_payload = payload.get("series")
+            if t_payload is None or not isinstance(series_payload, dict):
+                self._stats_table.setRowCount(0)
+                return
+            chi_squared_value: Optional[float] = None
+            raw_chi_squared = payload.get("chi_squared")
+            if raw_chi_squared is not None:
+                try:
+                    chi_squared_value = float(raw_chi_squared)
+                except Exception:
+                    chi_squared_value = None
+
+            t_arr = _try_1d_float_array(t_payload)
+            if t_arr.size == 0:
+                self._stats_table.setRowCount(0)
+                return
+
+            normalized_series: Dict[str, np.ndarray] = {}
+            for name, values in series_payload.items():
+                arr = _try_1d_float_array(values)
+                if arr.size == 0:
+                    continue
+                normalized_series[str(name)] = arr
+
+            if not normalized_series:
+                self._stats_table.setRowCount(0)
+                return
+
+            self._stats_table.update_results(t_arr, normalized_series, chi_squared=chi_squared_value)
+
+        def update_parameters(self, parameters: Dict[str, Tuple[float, str]]) -> None:
+            """Update the solver parameter table."""
+            try:
+                self._param_table.update_parameters(parameters)
+            except Exception as exc:
+                logger.debug("Failed to update parameter table: %s", exc)
+
+        def set_overlay_catalog(self, datasets: Dict[str, Dict[str, np.ndarray]]) -> None:
+            """
+            Provide the currently loaded experimental datasets for overlays.
+
+            Parameters
+            ----------
+            datasets : dict
+                Mapping of dataset name -> {'t': array, 'species': {name: array}}
+            """
+            normalized: Dict[str, Dict[str, np.ndarray]] = {}
+            for name, payload in (datasets or {}).items():
+                try:
+                    t_raw = np.asarray(payload.get("t", []), dtype=float).reshape(-1)
+                    species_raw = payload.get("species") or {}
+                    if t_raw.size == 0 or not species_raw:
+                        continue
+                    species_norm: Dict[str, np.ndarray] = {}
+                    for sp_name, values in species_raw.items():
+                        arr = np.asarray(values, dtype=float).reshape(-1)
+                        if arr.size:
+                            species_norm[str(sp_name)] = arr
+                    if species_norm:
+                        normalized[name] = {"t": t_raw, "species": species_norm}
+                except Exception as exc:
+                    logger.warning("Failed to normalize dataset '%s' for overlay: %s", name, exc)
+
+            self._overlay_datasets = normalized
+            self._assign_overlay_styles()
+            self._overlay_panel.set_datasets(normalized)
+            self._update_plot()
+
+        def active_overlays(self) -> List[str]:
+            """Return dataset names currently active as overlays."""
+            return self._overlay_panel.selected_datasets()
+
+        def overlay_snapshot(self) -> Dict[str, object]:
+            """Return metadata about overlay state for provenance."""
+            return {
+                "selected": list(self._overlay_panel.selected_datasets()),
+                "available": sorted(self._overlay_datasets.keys()),
+                "x_axis": self._x_axis_name,
+                "parametric": self._parametric_mode,
+            }
+
+        def _assign_colors(self):
+            """Assign globally owned colors to species and neutral colors to derived series."""
+            color_manager = ColorManager.instance()
+            self._colors.clear()
+            owned_keys = set(self._owned_species_keys or set())
+            if owned_keys:
+                color_manager.seed_species(sorted(owned_keys))
+            for name in self._series.keys():
+                canonical = color_manager.resolve_species_key(name, known_species=tuple(owned_keys) if owned_keys else None)
+                if not owned_keys or canonical in owned_keys:
+                    self._colors[name] = color_manager.get_species_rgb(name, known_species=tuple(owned_keys) if owned_keys else None)
+                else:
+                    non_species = color_manager.get_non_species_color(name)
+                    self._colors[name] = (non_species.red(), non_species.green(), non_species.blue())
+
+        def _assign_overlay_styles(self):
+            """Assign deterministic marker styles to overlay datasets."""
+            color_manager = ColorManager.instance()
+            self._overlay_symbols.clear()
+            for idx, name in enumerate(sorted(self._overlay_datasets.keys())):
+                self._overlay_symbols[name] = color_manager.get_dataset_symbol(idx)
+
+        def _overlay_display_color(self, dataset_name: str, species_key: str) -> tuple[int, int, int]:
+            """Return the current display color for an overlay dataset column."""
+            color_manager = ColorManager.instance()
+            payload = self._overlay_datasets.get(str(dataset_name)) or {}
+            species_dict = (payload or {}).get("species") or {}
+            resolved_key, _ = _resolve_dataset_species(str(species_key), species_dict)
+            color_key = str(resolved_key or species_key)
+            current_species_color = color_manager.get_current_species_color(color_key)
+            color = (
+                current_species_color
+                if current_species_color is not None
+                else color_manager.get_non_species_color(color_key)
+            )
+            return (int(color.red()), int(color.green()), int(color.blue()))
+
+        def refresh_overlay_presentation_for_current_roster(self) -> None:
+            """Keep visible overlay markers aligned with current-roster swatch semantics."""
+            self._overlay_panel.refresh_color_swatches()
+            if self._active_overlay_series:
+                self._draw_overlay_series(list(self._active_overlay_series))
+
+        def _get_sampling_indices(self, length: int):
+            """Return slice or index array for downsampling plots."""
+            if self._sampling_mode == "dense" or length <= self._sampling_target:
+                return slice(None)
+            if length <= 0:
+                return np.array([], dtype=int)
+            target = max(2, min(int(self._sampling_target), int(length)))
+            return np.unique(np.linspace(0, length - 1, num=target, dtype=int))
+
+        def _sample_xy(self, x_data: np.ndarray, y_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            """Apply sampling to X/Y arrays for plotting."""
+            indices = self._get_sampling_indices(x_data.shape[0])
+            if isinstance(indices, slice):
+                return x_data, y_data
+            return x_data[indices], y_data[indices]
+
+        _SUBSCRIPT_CHAR_MAP = {
+            "0": "₀",
+            "1": "₁",
+            "2": "₂",
+            "3": "₃",
+            "4": "₄",
+            "5": "₅",
+            "6": "₆",
+            "7": "₇",
+            "8": "₈",
+            "9": "₉",
+            "+": "₊",
+            "-": "₋",
+            "(": "₍",
+            ")": "₎",
+            "a": "ₐ",
+            "e": "ₑ",
+            "h": "ₕ",
+            "i": "ᵢ",
+            "j": "ⱼ",
+            "k": "ₖ",
+            "l": "ₗ",
+            "m": "ₘ",
+            "n": "ₙ",
+            "o": "ₒ",
+            "p": "ₚ",
+            "r": "ᵣ",
+            "s": "ₛ",
+            "t": "ₜ",
+            "u": "ᵤ",
+            "v": "ᵥ",
+            "x": "ₓ",
+        }
+
+        def _format_species_set_label(self, species: str, set_label: Optional[str]) -> str:
+            """Format legend labels like A(set1), preferring a subscript set label when feasible."""
+            species = str(species)
+            set_label = str(set_label or "").strip()
+            if not set_label:
+                return species
+            sub_chars: List[str] = []
+            for ch in set_label:
+                mapped = self._SUBSCRIPT_CHAR_MAP.get(ch)
+                if mapped is None:
+                    mapped = self._SUBSCRIPT_CHAR_MAP.get(ch.lower())
+                if mapped is None:
+                    return f"{species}({set_label})"
+                sub_chars.append(mapped)
+            return f"{species}₍{''.join(sub_chars)}₎"
+
+        def _upsert_curve_item(
+            self,
+            *,
+            key: str,
+            x_data: np.ndarray,
+            y_data: np.ndarray,
+            pen: object,
+            name: Optional[str] = None,
+        ) -> None:
+            item = self._plot_items.get(key)
+            if item is None:
+                item = self._plot_item.plot(x_data, y_data, name=str(name or key), pen=pen)
+                self._plot_items[key] = item
+                return
+            item.setData(x_data, y_data)
+            item.setPen(pen)
+
+        def _prune_curve_items(self, active_keys: Set[str]) -> None:
+            for key in list(self._plot_items.keys()):
+                if key in active_keys:
+                    continue
+                item = self._plot_items.pop(key, None)
+                if item is None:
+                    continue
+                self._plot_item.removeItem(item)
+
+        def _upsert_dataset_scatter_item(
+            self,
+            *,
+            key: str,
+            x_data: np.ndarray,
+            y_data: np.ndarray,
+            brush: object,
+            size: float,
+            name: str,
+        ) -> None:
+            item = self._dataset_scatter_items.get(key)
+            if item is None:
+                item = pg.ScatterPlotItem(
+                    x=x_data,
+                    y=y_data,
+                    pen=None,
+                    brush=brush,
+                    size=size,
+                    name=name,
+                )
+                self._plot_item.addItem(item)
+                self._dataset_scatter_items[key] = item
+                return
+            item.setData(x=x_data, y=y_data, pen=None, brush=brush, size=size)
+
+        def _prune_dataset_scatter_items(self, active_keys: Set[str]) -> None:
+            for key in list(self._dataset_scatter_items.keys()):
+                if key in active_keys:
+                    continue
+                item = self._dataset_scatter_items.pop(key, None)
+                if item is None:
+                    continue
+                self._plot_item.removeItem(item)
+
+        def _upsert_dataset_model_item(
+            self,
+            *,
+            key: str,
+            x_data: np.ndarray,
+            y_data: np.ndarray,
+            pen: object,
+            name: str,
+        ) -> None:
+            item = self._dataset_model_items.get(key)
+            if item is None:
+                item = self._plot_item.plot(x_data, y_data, name=name, pen=pen)
+                self._dataset_model_items[key] = item
+                return
+            item.setData(x_data, y_data)
+            item.setPen(pen)
+
+        def _prune_dataset_model_items(self, active_keys: Set[str]) -> None:
+            for key in list(self._dataset_model_items.keys()):
+                if key in active_keys:
+                    continue
+                item = self._dataset_model_items.pop(key, None)
+                if item is None:
+                    continue
+                self._plot_item.removeItem(item)
+
+        def _upsert_dataset_overlay_item(
+            self,
+            *,
+            key: Tuple[str, str],
+            x_data: np.ndarray,
+            y_data: np.ndarray,
+            pen: object,
+            brush: object,
+            size: float,
+            symbol: str,
+            name: str,
+        ) -> None:
+            scatter = self._overlay_items.get(key)
+            if scatter is None:
+                scatter = pg.ScatterPlotItem(
+                    x_data,
+                    y_data,
+                    pen=pen,
+                    brush=brush,
+                    size=size,
+                    symbol=symbol,
+                    name=name,
+                )
+                scatter.setZValue(5)
+                self._plot_item.addItem(scatter)
+                self._overlay_items[key] = scatter
+                return
+            scatter.setData(x=x_data, y=y_data, pen=pen, brush=brush, size=size, symbol=symbol)
+            scatter.setZValue(5)
+
+        def _prune_dataset_overlay_items(self, active_keys: Set[Tuple[str, str]]) -> None:
+            for key in list(self._overlay_items.keys()):
+                if key in active_keys:
+                    continue
+                item = self._overlay_items.pop(key, None)
+                if item is None:
+                    continue
+                self._plot_item.removeItem(item)
+
+        def _update_plot(self):
+            """Update plot with current data, visibility settings, and axis configuration."""
+            if self._t is None:
+                return
+
+            # Get X-axis data and label
+            x_data, x_label = self._get_x_data()
+            if x_data is None:
+                return
+            x_array = np.asarray(x_data, dtype=float).reshape(-1)
+            if x_array.size == 0:
+                return
+
+            sample_idx = self._get_sampling_indices(x_array.shape[0])
+            x_plot = x_array if isinstance(sample_idx, slice) else x_array[sample_idx]
+
+            # Update axis labels dynamically
+            self._plot_item.setLabel('bottom', x_label)
+            if not self._parametric_mode:
+                self._plot_item.setLabel('left', 'Concentration', units='M')
+            else:
+                # In parametric mode, Y label depends on selected series
+                selected = self._toolbar.selected_y()
+                if selected:
+                    self._plot_item.setLabel('left', f'{selected[0]}', units='M')
+
+            # Add visible series (only those selected in toolbar)
+            selected_series = list(self._toolbar.selected_y())
+            active_curve_keys: Set[str] = set()
+            for name in selected_series:
+                if name not in self._series:
+                    continue
+                if not self._visible.get(name, True):
+                    continue
+
+                y_data = np.asarray(self._series[name], dtype=float).reshape(-1)
+                if y_data.shape[0] != x_array.shape[0]:
+                    logger.debug("Skipping series '%s': length mismatch with X axis", name)
+                    continue
+                color = self._colors.get(name, (100, 100, 100))
+                pen = pg.mkPen(color=color, width=2)
+
+                y_plot = y_data if isinstance(sample_idx, slice) else y_data[sample_idx]
+                label = self._format_species_set_label(name, self._simulation_set_label)
+                active_curve_keys.add(label)
+                self._upsert_curve_item(
+                    key=label,
+                    x_data=x_plot,
+                    y_data=y_plot,
+                    pen=pen,
+                )
+
+            # Batch simulation overlays (additional initial-condition sets as lines)
+            sim_overlays = list(self._simulation_overlays or [])
+            if sim_overlays:
+                color_manager = ColorManager.instance()
+                x_name = self._x_axis_name or "t"
+                for idx, entry in enumerate(sim_overlays):
+                    if not isinstance(entry, dict):
+                        continue
+                    set_label = str(entry.get("label") or "")
+                    curve_role = str(entry.get("curve_role") or "")
+                    if not set_label:
+                        continue
+                    t_overlay = entry.get("t")
+                    series_overlay = entry.get("series") or {}
+                    if t_overlay is None or not isinstance(series_overlay, dict):
+                        continue
+                    t_arr = _try_1d_float_array(t_overlay)
+                    if t_arr.size == 0:
+                        continue
+                    if t_arr.size == 0:
+                        continue
+                    if x_name == "t":
+                        x_overlay = t_arr
+                    else:
+                        x_source = series_overlay.get(x_name)
+                        if x_source is None:
+                            continue
+                        x_overlay = np.asarray(x_source, dtype=float).reshape(-1)
+                        if x_overlay.size == 0:
+                            continue
+
+                    idx_overlay = self._get_sampling_indices(x_overlay.shape[0])
+                    x_plot_overlay = x_overlay if isinstance(idx_overlay, slice) else x_overlay[idx_overlay]
+                    style = color_manager.get_dataset_line_style(idx)
+
+                    for species in selected_series:
+                        y_source = series_overlay.get(species)
+                        if y_source is None:
+                            continue
+                        y_arr = np.asarray(y_source, dtype=float).reshape(-1)
+                        if y_arr.shape[0] != x_overlay.shape[0]:
+                            continue
+                        y_plot_overlay = y_arr if isinstance(idx_overlay, slice) else y_arr[idx_overlay]
+
+                        base_color = self._colors.get(species, (100, 100, 100))
+                        try:
+                            r, g, b = base_color
+                        except Exception:
+                            r, g, b = (100, 100, 100)
+
+                        overlay_label = self._format_species_set_label(species, set_label)
+                        overlay_key = overlay_label
+                        overlay_name = overlay_label
+                        if curve_role == "canonical_ghost":
+                            overlay_key = f"{overlay_label} [canonical]"
+                            overlay_name = f"{overlay_label} [ref]"
+                            pen = pg.mkPen(color=(r, g, b, 90), width=1.2, style=Qt.PenStyle.DashLine)
+                        else:
+                            pen = pg.mkPen(color=(r, g, b, 180), width=1.6, style=style)
+                        active_curve_keys.add(overlay_key)
+                        self._upsert_curve_item(
+                            key=overlay_key,
+                            x_data=x_plot_overlay,
+                            y_data=y_plot_overlay,
+                            pen=pen,
+                            name=overlay_name,
+                        )
+
+            self._prune_curve_items(active_curve_keys)
+
+            overlays, warnings = self._build_overlay_series(selected_series)
+            self._active_overlay_series = overlays
+            self._overlay_panel.set_status_messages(warnings)
+            self._draw_overlay_series(overlays)
+            self._refresh_view_after_plot_update()
+
+        def _refresh_view_after_plot_update(self) -> None:
+            """Keep auto-range truthful across live result updates without overriding manual ranges."""
+            toolbar = getattr(self, "_toolbar", None)
+            if toolbar is None or not bool(toolbar.is_auto_range()):
+                return
+            try:
+                self._plot_item.enableAutoRange(x=True, y=True)
+                self._plot_item.autoRange()
+            except Exception as exc:
+                logger.debug("Failed to auto-range plot after data update: %s", exc, exc_info=True)
+
+        def _build_overlay_series(self, selected_series: List[str]) -> Tuple[List[_OverlaySeries], List[str]]:
+            """Compute overlay series respecting current axis selection and per-dataset column filters."""
+            overlays: List[_OverlaySeries] = []
+            warnings: List[str] = []
+            x_name = self._x_axis_name or "t"
+            active = self._overlay_panel.selected_datasets()
+
+            # Get per-dataset enabled species/columns from overlay panel
+            enabled_by_dataset = self._overlay_panel.selected_dataset_species()
+
+            for dataset_name in active:
+                payload = self._overlay_datasets.get(dataset_name)
+                if not payload:
+                    continue
+                if x_name == "t":
+                    x_source = payload["t"]
+                else:
+                    x_source = payload["species"].get(x_name)
+                if x_source is None:
+                    warnings.append(f"{dataset_name}: missing '{x_name}' values")
+                    continue
+
+                x_array = np.asarray(x_source, dtype=float).reshape(-1)
+                if x_array.size == 0:
+                    warnings.append(f"{dataset_name}: '{x_name}' has no data")
+                    continue
+
+                for species in selected_series:
+                    # Use flexible species name resolution to handle naming variations
+                    resolved_key, y_source = _resolve_dataset_species(species, payload["species"])
+                    if y_source is None:
+                        # Generate clear warning about missing species match
+                        available = sorted(payload["species"].keys())
+                        warnings.append(
+                            f"{dataset_name}: no column matching species '{species}'. "
+                            f"Available: {', '.join(available[:5])}" +
+                            (f" (and {len(available) - 5} more)" if len(available) > 5 else "")
+                        )
+                        continue
+
+                    # Check if this dataset column is enabled in the overlay panel
+                    enabled_for_dataset = enabled_by_dataset.get(dataset_name)
+                    if enabled_for_dataset is not None and resolved_key not in enabled_for_dataset:
+                        # User disabled this dataset column in the overlay panel; skip silently
+                        continue
+
+                    y_array = np.asarray(y_source, dtype=float).reshape(-1)
+                    if y_array.size == 0:
+                        warnings.append(f"{dataset_name}: '{resolved_key}' has no data")
+                        continue
+                    if y_array.shape[0] != x_array.shape[0]:
+                        warnings.append(
+                            f"{dataset_name}: '{resolved_key}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
+                        )
+                        continue
+                    overlays.append(_OverlaySeries(dataset_name, species, x_array, y_array))
+
+            return overlays, warnings
+
+        def _draw_overlay_series(self, overlays: List[_OverlaySeries]) -> None:
+            """Render overlay scatter markers using species-owned colors and dataset markers."""
+            # Get current dataset styling from overlay panel (size and opacity)
+            style = self._overlay_panel.dataset_style()
+            active_keys: Set[Tuple[str, str]] = set()
+
+            for entry in overlays:
+                # Determine the dataset column key that was resolved for this overlay
+                # We need to look it up again to get the actual dataset column name
+                payload = self._overlay_datasets.get(entry.dataset)
+                if not payload:
+                    continue
+
+                # Resolve the species again to get the dataset column key
+                resolved_key, _ = _resolve_dataset_species(entry.species, payload["species"])
+                if resolved_key is None:
+                    continue
+
+                color = self._overlay_display_color(entry.dataset, str(resolved_key))
+                symbol = self._overlay_symbols.get(entry.dataset, 'o')
+
+                # Apply user-configured opacity to alpha channel
+                alpha = style.opacity
+                brush = pg.mkBrush(color[0], color[1], color[2], alpha)
+                pen = pg.mkPen(color=color, width=1.4)
+
+                name = f"{entry.dataset}: {entry.species}"
+                x_plot, y_plot = self._sample_xy(
+                    np.asarray(entry.x, dtype=float).reshape(-1),
+                    np.asarray(entry.y, dtype=float).reshape(-1),
+                )
+                overlay_key = (entry.dataset, entry.species)
+                active_keys.add(overlay_key)
+                self._upsert_dataset_overlay_item(
+                    key=overlay_key,
+                    x_data=x_plot,
+                    y_data=y_plot,
+                    pen=pen,
+                    brush=brush,
+                    size=style.size,
+                    symbol=symbol,
+                    name=name,
+                )
+            self._prune_dataset_overlay_items(active_keys)
+
+        def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
+            """
+            Build header + rows for CSV export including overlays.
+
+            Parameters
+            ----------
+            scope : str
+                "axis" to use current toolbar selections, "all" for all series.
+            """
+            toolbar = self._toolbar
+            if toolbar is None:
+                raise ValueError("Axis toolbar unavailable for export.")
+
+            series = self._series
+            if not series:
+                raise ValueError("No simulation data available to export.")
+
+            if scope == "axis":
+                y_names = toolbar.selected_y()
+                if not y_names:
+                    raise ValueError("Select at least one Y-series before exporting.")
+            else:
+                y_names = list(series.keys())
+
+            y_names = [name for name in y_names if name in series]
+            if not y_names:
+                raise ValueError("No valid Y-series found to export.")
+
+            x_name = toolbar.current_x() or "t"
+            x_data, derived_label = self._get_x_data()
+            if x_data is None:
+                raise ValueError(f"The selected X-axis '{x_name}' has no data to export.")
+
+            x_array = np.asarray(x_data, dtype=float).reshape(-1)
+            if x_array.size == 0:
+                raise ValueError("X-axis has no points to export.")
+
+            columns: List[Tuple[str, np.ndarray]] = []
+            x_header = derived_label or x_name
+            columns.append((x_header, x_array))
+
+            for name in y_names:
+                arr = np.asarray(series[name], dtype=float).reshape(-1)
+                if arr.shape[0] != x_array.shape[0]:
+                    raise ValueError(
+                        f"Series '{name}' length ({arr.shape[0]}) does not match X-axis length ({x_array.shape[0]})."
+                    )
+                columns.append((name, arr))
+
+            overlay_series, warnings = self._build_overlay_series(list(self._toolbar.selected_y()))
+            active_overlays = self._overlay_panel.selected_datasets()
+            if warnings and active_overlays:
+                warning_msg = "\n".join(f" - {msg}" for msg in warnings)
+                raise ValueError(
+                    "Cannot export overlay datasets until issues are resolved:\n" + warning_msg
+                )
+
+            for entry in overlay_series:
+                x_header_ds = f"{entry.dataset}::{x_header}"
+                y_header_ds = f"{entry.dataset}::{entry.species}"
+                columns.append((x_header_ds, entry.x))
+                columns.append((y_header_ds, entry.y))
+
+            max_len = max(col[1].shape[0] for col in columns)
+            header = [col[0] for col in columns]
+            rows: List[List[object]] = []
+            for idx in range(max_len):
+                row: List[object] = []
+                for _, values in columns:
+                    if idx < values.shape[0]:
+                        row.append(values[idx])
+                    else:
+                        row.append("")
+                rows.append(row)
+
+            return header, rows
+
+        def _set_dataset_axis_labels(self, *, xlabel: str, ylabel: str) -> None:
+            x_text = str(xlabel or "Time")
+            y_text = str(ylabel or "Concentration")
+            x_units = "s" if x_text == "Time" else None
+            y_units = "M" if y_text == "Concentration" else None
+            self._plot_item.setLabel("bottom", x_text, units=x_units)
+            self._plot_item.setLabel("left", y_text, units=y_units)
+
+        def _update_toolbar(self):
+            """Update AxisToolbar with available variables."""
+            if self._t is None:
+                return
+
+            # X-axis candidates: time + all species
+            x_candidates = ["t"] + list(self._series.keys())
+            self._toolbar.set_x_candidates(x_candidates)
+
+            # Y-axis candidates: all species (checked by default if visible)
+            y_candidates = [(name, self._visible.get(name, True)) for name in self._series.keys()]
+            scalar_names = [
+                name for name in sorted(self._scalar_values.keys())
+                if name not in self._series
+            ]
+            for name in scalar_names:
+                y_candidates.append((name, False))
+            self._toolbar.set_y_candidates(y_candidates, disabled=scalar_names)
+
+        def visible_series(self):
+            """Get list of visible series names."""
+            return [name for name, vis in self._visible.items() if vis]
+
+        def set_series_visible(self, name: str, visible: bool) -> None:
+            """
+            Set visibility of a series.
+
+            Parameters
+            ----------
+            name : str
+                Series name
+            visible : bool
+                Whether the series should be visible
+            """
+            if name not in self._series:
+                return
+            prev = self._visible.get(name, True)
+            self._visible[name] = bool(visible)
+            if prev != self._visible[name]:
+                self.seriesVisibilityChanged.emit(name, self._visible[name])
+                self._update_plot()
+
+        def visible(self, name: str) -> bool:
+            """
+            Check if a series is visible.
+
+            Parameters
+            ----------
+            name : str
+                Series name
+
+            Returns
+            -------
+            bool
+                True if visible, False otherwise
+            """
+            return self._visible.get(name, False)
+
+        def _get_x_data(self) -> Tuple[Optional[np.ndarray], str]:
+            """
+            Get X-axis data and label based on current selection.
+
+            Returns
+            -------
+            tuple
+                (x_data array, x_label string)
+            """
+            if self._x_axis_name == "t":
+                return self._t, "Time (s)"
+            elif self._x_axis_name in self._series:
+                # X-axis is one of the species
+                return self._series[self._x_axis_name], f"[{self._x_axis_name}] (M)"
+            else:
+                # Unknown X-axis, fall back to time
+                return self._t, "Time (s)"
+
+        def _on_x_axis_changed(self, name: str) -> None:
+            """Handle X-axis selection change from toolbar."""
+            self._x_axis_name = name
+            self._update_plot()
+
+        def _on_y_selection_changed(self, selected: List[str]) -> None:
+            """Handle Y-axis selection change from toolbar."""
+            # Update visibility based on toolbar selection
+            for series_name in self._series.keys():
+                self._visible[series_name] = series_name in selected
+            self._update_plot()
+
+        def _on_parametric_toggled(self, enabled: bool) -> None:
+            """Handle parametric mode toggle from toolbar."""
+            self._parametric_mode = enabled
+            self._update_plot()
+
+        def _on_toolbar_option_requested(self, action: str, data: object) -> None:
+            """Handle option menu selections from the axis toolbar."""
+            action_key = str(action).strip().lower()
+            if action_key == "sampling":
+                mode = str(data).strip().lower()
+                if mode in {"dense", "coarse"}:
+                    self._sampling_mode = mode
+                    self._update_plot()
+                return
+            if action_key == "export_scope":
+                scope = str(data).strip().lower()
+                if scope in {"axis", "visible"}:
+                    self._export_scope_preference = "axis"
+                elif scope == "all":
+                    self._export_scope_preference = "all"
+                return
+            logger.debug("Unhandled toolbar option: %s (%s)", action, data)
+
+        def _add_guide_line(self, value: float) -> None:
+            guide = pg.InfiniteLine(
+                angle=0,
+                pos=value,
+                movable=True,
+                pen=pg.mkPen(color=(150, 0, 150), width=1, style=Qt.DashLine),
+            )
+            guide.setZValue(10)
+            self._plot_item.addItem(guide, ignoreBounds=True)
+            self._guide_items.append(guide)
+
+        def _on_add_guide_requested(self, from_scalar: object) -> None:
+            """Add a horizontal guide line at a user-provided value."""
+            scalars = self._scalar_values or {}
+            scalar_name: Optional[str] = None
+
+            if isinstance(from_scalar, str) and from_scalar:
+                scalar_name = from_scalar
+            elif scalars:
+                options = []
+                option_map: Dict[str, str] = {}
+                for name, value in sorted(scalars.items(), key=lambda item: item[0]):
+                    label = f"{name} = {value:.6g}"
+                    options.append(label)
+                    option_map[label] = name
+                selection, ok = QtWidgets.QInputDialog.getItem(
+                    self,
+                    "Add Guide",
+                    "Select scalar for guide:",
+                    options,
+                    0,
+                    False,
+                )
+                if not ok or not selection:
+                    return
+                scalar_name = option_map.get(selection)
+
+            if scalar_name and scalar_name in scalars:
+                self._add_guide_line(float(scalars[scalar_name]))
+                return
+
+            label = "Guide value"
+            if isinstance(from_scalar, str) and from_scalar:
+                label = f"Value for {from_scalar}"
+
+            value, ok = QtWidgets.QInputDialog.getDouble(
+                self,
+                "Add Guide",
+                label,
+                0.0,
+                -1e12,
+                1e12,
+                6,
+            )
+            if not ok:
+                return
+            self._add_guide_line(value)
+
+        def _toggle_legend(self, visible: bool) -> None:
+            """Toggle legend visibility."""
+            self._legend_visible = visible
+            if self._legend is not None:
+                self._legend.setVisible(visible)
+            logger.debug(f"Legend visibility: {visible}")
+
+        def _on_overlay_selection_changed(self, _names: List[str]) -> None:
+            """Redraw when overlay checklist changes."""
+            self._update_plot()
+
+        def _on_overlay_style_changed(self) -> None:
+            """Redraw when dataset point styling changes."""
+            self._update_plot()
+
+        def _on_axis_range_changed(self) -> None:
+            """Handle axis range change from toolbar (auto/manual toggle or manual values changed)."""
+            logger.debug(f"Axis range changed: auto={self._toolbar.is_auto_range()}, ranges={self._toolbar.get_manual_ranges()}")
+            self._apply_axis_ranges()
+
+        def _apply_axis_ranges(self) -> None:
+            """Apply manual axis ranges from toolbar, or use auto range."""
+            if self._toolbar.is_auto_range():
+                # Auto range mode: let PyQtGraph auto-scale
+                self._plot_item.enableAutoRange()
+                logger.debug("Applied auto range")
+            else:
+                # Manual range mode: use values from toolbar
+                x_min, x_max, y_min, y_max = self._toolbar.get_manual_ranges()
+
+                # Apply X range if both values are provided
+                if x_min is not None and x_max is not None:
+                    self._plot_item.setXRange(x_min, x_max, padding=0)
+                    logger.debug(f"Applied manual X range: [{x_min}, {x_max}]")
+
+                # Apply Y range if both values are provided
+                if y_min is not None and y_max is not None:
+                    self._plot_item.setYRange(y_min, y_max, padding=0)
+                    logger.debug(f"Applied manual Y range: [{y_min}, {y_max}]")
+
+        def _on_mouse_moved(self, pos) -> None:
+            """
+            Handle mouse movement for crosshair and tooltip.
+
+            Parameters
+            ----------
+            pos : QPointF
+                Mouse position in scene coordinates
+            """
+            if self._t is None or not self._series:
+                return
+
+            # Map scene position to plot coordinates
+            mouse_point = self._plot_item.vb.mapSceneToView(pos)
+            x_mouse = mouse_point.x()
+            y_mouse = mouse_point.y()
+
+            # Get X data
+            x_data, x_label = self._get_x_data()
+            if x_data is None or len(x_data) == 0:
+                self._crosshair_v.setVisible(False)
+                self._crosshair_h.setVisible(False)
+                self._tooltip_text.setVisible(False)
+                return
+
+            # Check if mouse is within plot bounds
+            view_box = self._plot_item.vb.viewRange()
+            x_range = view_box[0]
+            y_range = view_box[1]
+
+            if not (x_range[0] <= x_mouse <= x_range[1] and y_range[0] <= y_mouse <= y_range[1]):
+                self._crosshair_v.setVisible(False)
+                self._crosshair_h.setVisible(False)
+                self._tooltip_text.setVisible(False)
+                return
+
+            # Find nearest data point
+            nearest = self._find_nearest_data_point(x_mouse, y_mouse, x_data)
+
+            if nearest is not None:
+                color = nearest.color or (0, 180, 0)
+                pen = pg.mkPen(color=color, width=1.2, style=Qt.DashLine)
+                self._crosshair_v.setPen(pen)
+                self._crosshair_h.setPen(pen)
+                # Show crosshair at exact data point
+                self._crosshair_v.setPos(nearest.x)
+                self._crosshair_h.setPos(nearest.y)
+                self._crosshair_v.setVisible(True)
+                self._crosshair_h.setVisible(True)
+
+                # Show tooltip with exact values
+                kind = "Sim" if nearest.dataset is None else f"Dataset {nearest.dataset}"
+                tooltip_text = (
+                    f"{kind}: {nearest.label}\n"
+                    f"{self._x_axis_name} = {self._format_number(nearest.x)}\n"
+                    f"{nearest.label} = {self._format_number(nearest.y)}"
+                )
+                self._tooltip_text.setText(tooltip_text)
+                self._tooltip_text.setPos(x_mouse, y_mouse)
+                self._tooltip_text.setVisible(True)
+            else:
+                self._crosshair_v.setVisible(False)
+                self._crosshair_h.setVisible(False)
+                self._tooltip_text.setVisible(False)
+
+        def _find_nearest_data_point(self, x_mouse: float, y_mouse: float, x_data: np.ndarray) -> Optional[_NearestHit]:
+            """
+            Find the nearest data point to the mouse cursor.
+
+            Parameters
+            ----------
+            x_mouse, y_mouse : float
+                Mouse coordinates in plot space
+            x_data : np.ndarray
+                X-axis data
+
+            Returns
+            -------
+            tuple or None
+                (x_value, y_value, series_name) if found within threshold, None otherwise
+            """
+            best_match: Optional[_NearestHit] = None
+            best_distance = float('inf')
+            threshold = 0.05  # Relative threshold (5% of plot range)
+
+            # Get current view range for normalizing distance
+            view_box = self._plot_item.vb.viewRange()
+            x_range = view_box[0][1] - view_box[0][0]
+            y_range = view_box[1][1] - view_box[1][0]
+
+            # Check each visible series
+            for name in self._toolbar.selected_y():
+                if name not in self._series:
+                    continue
+                if not self._visible.get(name, True):
+                    continue
+
+                y_data = self._series[name]
+
+                # Find nearest point in this series
+                # Normalize distances to account for different axis scales
+                distances = np.sqrt(((x_data - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
+                min_idx = np.argmin(distances)
+                min_distance = distances[min_idx]
+
+                if min_distance < best_distance:
+                    color = self._colors.get(name, (0, 160, 0))
+                    best_match = _NearestHit(
+                        x_data[min_idx],
+                        y_data[min_idx],
+                        name,
+                        None,
+                        color,
+                    )
+                    best_distance = min_distance
+
+            # Check dataset overlays
+            for overlay in self._active_overlay_series:
+                y_data = overlay.y
+                x_overlay = overlay.x
+                distances = np.sqrt(((x_overlay - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
+                min_idx = np.argmin(distances)
+                min_distance = distances[min_idx]
+
+                if min_distance < best_distance:
+                    color = self._overlay_display_color(overlay.dataset, overlay.species)
+                    best_match = _NearestHit(
+                        x_overlay[min_idx],
+                        y_data[min_idx],
+                        overlay.species,
+                        overlay.dataset,
+                        color,
+                    )
+                    best_distance = min_distance
+
+            # Return match only if within threshold
+            if best_match and best_distance <= threshold:
+                return best_match
+            return None
+
+        def _format_number(self, value: float) -> str:
+            """Format number for display with appropriate precision."""
+            import math
+            if not math.isfinite(value):
+                return str(value)
+
+            abs_val = abs(value)
+            if abs_val == 0:
+                return "0"
+            elif abs_val >= 1000:
+                return f"{value:.2e}"
+            elif abs_val >= 10:
+                return f"{value:.1f}"
+            elif abs_val >= 0.01:
+                return f"{value:.3f}"
+            else:
+                return f"{value:.2e}"
+
+        def clear(self):
+            """Clear all plot data."""
+            self._plot_item.clear()
+            self._t = None
+            self._series = {}
+            self._visible = {}
+            self._colors = {}
+            self._plot_items = {}
+            self._dataset_scatter_items = {}
+            self._dataset_model_items = {}
+            self._overlay_items = {}
+            self._active_overlay_series = []
+            self._annotations = []
+            self._guide_items = []
+            self._scalar_values = {}
+
+        # ==================== Plot Enhancements (v0.2.0) ====================
+
+        def _show_context_menu(self, position):
+            """Show context menu for plot enhancements."""
+            menu = QtWidgets.QMenu(self)
+
+            # Secondary Y-axis actions
+            secondary_menu = menu.addMenu("Secondary Y-Axis")
+            if self._secondary_y_axis is None:
+                add_secondary_action = secondary_menu.addAction("Add Secondary Y-Axis")
+                add_secondary_action.triggered.connect(self._add_secondary_y_axis)
+            else:
+                remove_secondary_action = secondary_menu.addAction("Remove Secondary Y-Axis")
+                remove_secondary_action.triggered.connect(self._remove_secondary_y_axis)
+
+            menu.addSeparator()
+
+            # Log scale actions
+            log_menu = menu.addMenu("Log Scale")
+
+            log_x_action = log_menu.addAction("Log X-Axis")
+            log_x_action.setCheckable(True)
+            log_x_action.setChecked(self._log_x)
+            log_x_action.triggered.connect(self._toggle_log_x)
+
+            log_y_action = log_menu.addAction("Log Y-Axis")
+            log_y_action.setCheckable(True)
+            log_y_action.setChecked(self._log_y)
+            log_y_action.triggered.connect(self._toggle_log_y)
+
+            menu.addSeparator()
+
+            # Axis range actions
+            axis_range_action = menu.addAction("Custom Axis Ranges...")
+            axis_range_action.triggered.connect(self._show_axis_range_dialog)
+
+            menu.addSeparator()
+
+            # Annotation actions
+            annotation_menu = menu.addMenu("Annotations")
+            add_annotation_action = annotation_menu.addAction("Add Text Annotation...")
+            add_annotation_action.triggered.connect(self._add_annotation)
+
+            if self._annotations:
+                clear_annotations_action = annotation_menu.addAction("Clear All Annotations")
+                clear_annotations_action.triggered.connect(self._clear_annotations)
+
+            menu.addSeparator()
+
+            export_action = menu.addAction("Export Plot...")
+            export_action.triggered.connect(self._export_plot)
+
+            mouse_menu = menu.addMenu("Mouse Mode")
+            vb = self._plot_item.getViewBox()
+
+            pan_action = mouse_menu.addAction("Pan (3-Button)")
+            pan_action.triggered.connect(
+                partial(vb.setMouseMode, pg.ViewBox.PanMode)
+            )
+
+            rect_action = mouse_menu.addAction("Rect Zoom (1-Button)")
+            rect_action.triggered.connect(
+                partial(vb.setMouseMode, pg.ViewBox.RectMode)
+            )
+
+            menu.addSeparator()
+
+            # Reset view action
+            reset_action = menu.addAction("Reset View")
+            reset_action.triggered.connect(self._reset_view)
+
+            # Show menu at cursor position
+            menu.exec_(self._plot_widget.mapToGlobal(position))
+
+        def _add_secondary_y_axis(self):
+            """Add secondary Y-axis for selected series."""
+            if self._secondary_y_axis is not None:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Secondary Axis",
+                    "Secondary Y-axis already exists. Remove it first to add a new one."
+                )
+                return
+
+            # Ask user which series to plot on secondary axis
+            available_series = list(self._series.keys())
+            if not available_series:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "No Data",
+                    "No series available to plot on secondary axis."
+                )
+                return
+
+            # Show selection dialog
+            item, ok = QtWidgets.QInputDialog.getItem(
+                self,
+                "Select Series",
+                "Choose series for secondary Y-axis:",
+                available_series,
+                0,
+                False
+            )
+
+            if not ok or not item:
+                return
+
+            # Create secondary ViewBox
+            self._secondary_y_axis = pg.ViewBox()
+            self._plot_item.showAxis('right')
+            self._plot_item.scene().addItem(self._secondary_y_axis)
+            self._plot_item.getAxis('right').linkToView(self._secondary_y_axis)
+            self._secondary_y_axis.setXLink(self._plot_item)
+
+            # Update views when resizing
+            def update_views():
+                self._secondary_y_axis.setGeometry(self._plot_item.vb.sceneBoundingRect())
+                self._secondary_y_axis.linkedViewChanged(self._plot_item.vb, self._secondary_y_axis.XAxis)
+
+            self._plot_item.vb.sigResized.connect(update_views)
+
+            # Plot selected series on secondary axis
+            x_data, _ = self._get_x_data()
+            if x_data is not None and item in self._series:
+                y_data = self._series[item]
+                color = self._colors.get(item, (100, 100, 100))
+                pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
+
+                plot_item = pg.PlotDataItem(x_data, y_data, pen=pen, name=f"{item} (secondary)")
+                self._secondary_y_axis.addItem(plot_item)
+                self._secondary_y_items[item] = plot_item
+
+                # Set label
+                self._plot_item.setLabel('right', item, units='M')
+                self._plot_item.getAxis('right').setPen('k' if not self._dark_mode else '#e0e0e0')
+                self._plot_item.getAxis('right').setTextPen('k' if not self._dark_mode else '#e0e0e0')
+
+                update_views()
+
+                logger.info(f"Added secondary Y-axis for series: {item}")
+
+        def _remove_secondary_y_axis(self):
+            """Remove secondary Y-axis."""
+            if self._secondary_y_axis is None:
+                return
+
+            # Remove plot items
+            for item in self._secondary_y_items.values():
+                self._secondary_y_axis.removeItem(item)
+            self._secondary_y_items.clear()
+
+            # Remove ViewBox
+            self._plot_item.scene().removeItem(self._secondary_y_axis)
+            self._secondary_y_axis = None
+
+            # Hide right axis
+            self._plot_item.hideAxis('right')
+
+            logger.info("Removed secondary Y-axis")
+
+        def _toggle_log_x(self):
+            """Toggle X-axis log scale."""
+            self._log_x = not self._log_x
+            self._plot_item.setLogMode(x=self._log_x, y=self._log_y)
+            logger.info(f"X-axis log scale: {self._log_x}")
+
+        def _toggle_log_y(self):
+            """Toggle Y-axis log scale."""
+            self._log_y = not self._log_y
+            self._plot_item.setLogMode(x=self._log_x, y=self._log_y)
+            logger.info(f"Y-axis log scale: {self._log_y}")
+
+        def _show_axis_range_dialog(self):
+            """Show dialog for custom axis ranges."""
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Custom Axis Ranges")
+            dialog.setModal(True)
+
+            layout = QtWidgets.QFormLayout(dialog)
+
+            # Get current ranges
+            x_range = self._plot_item.viewRange()[0]
+            y_range = self._plot_item.viewRange()[1]
+
+            # X-axis range
+            x_min_spin = QtWidgets.QDoubleSpinBox()
+            x_min_spin.setDecimals(6)
+            x_min_spin.setRange(-1e10, 1e10)
+            x_min_spin.setValue(x_range[0])
+
+            x_max_spin = QtWidgets.QDoubleSpinBox()
+            x_max_spin.setDecimals(6)
+            x_max_spin.setRange(-1e10, 1e10)
+            x_max_spin.setValue(x_range[1])
+
+            # Y-axis range
+            y_min_spin = QtWidgets.QDoubleSpinBox()
+            y_min_spin.setDecimals(6)
+            y_min_spin.setRange(-1e10, 1e10)
+            y_min_spin.setValue(y_range[0])
+
+            y_max_spin = QtWidgets.QDoubleSpinBox()
+            y_max_spin.setDecimals(6)
+            y_max_spin.setRange(-1e10, 1e10)
+            y_max_spin.setValue(y_range[1])
+
+            layout.addRow("X Min:", x_min_spin)
+            layout.addRow("X Max:", x_max_spin)
+            layout.addRow("Y Min:", y_min_spin)
+            layout.addRow("Y Max:", y_max_spin)
+
+            # Buttons
+            button_box = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            layout.addRow(button_box)
+
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                # Apply ranges
+                self._plot_item.setRange(
+                    xRange=(x_min_spin.value(), x_max_spin.value()),
+                    yRange=(y_min_spin.value(), y_max_spin.value())
+                )
+                logger.info(
+                    f"Custom axis ranges applied: X=[{x_min_spin.value()}, {x_max_spin.value()}], "
+                    f"Y=[{y_min_spin.value()}, {y_max_spin.value()}]"
+                )
+
+        def _add_annotation(self):
+            """Add text annotation to plot."""
+            # Get annotation text
+            text, ok = QtWidgets.QInputDialog.getText(
+                self,
+                "Add Annotation",
+                "Enter annotation text:"
+            )
+
+            if not ok or not text:
+                return
+
+            # Get position (center of current view)
+            view_range = self._plot_item.viewRange()
+            x_pos = (view_range[0][0] + view_range[0][1]) / 2
+            y_pos = (view_range[1][0] + view_range[1][1]) / 2
+
+            # Create text item
+            annotation = pg.TextItem(
+                text=text,
+                color='k' if not self._dark_mode else 'w',
+                anchor=(0.5, 0.5),
+                border=pg.mkPen('k' if not self._dark_mode else 'w'),
+                fill=pg.mkBrush(255, 255, 255, 200) if not self._dark_mode else pg.mkBrush(30, 30, 30, 200)
+            )
+            annotation.setPos(x_pos, y_pos)
+
+            # Make it draggable (by setting movable flag)
+            # Note: TextItem doesn't have built-in drag support, but we can add it
+            self._plot_item.addItem(annotation)
+            self._annotations.append(annotation)
+
+            logger.info(f"Added annotation: {text} at ({x_pos}, {y_pos})")
+
+        def _clear_annotations(self):
+            """Clear all annotations from plot."""
+            for annotation in self._annotations:
+                self._plot_item.removeItem(annotation)
+            self._annotations.clear()
+            logger.info("Cleared all annotations")
+
+        def _export_plot(self):
+            """Open pyqtgraph's export dialog for the plot scene."""
+            scene = self._plot_item.scene()
+            scene.contextMenuItem = self._plot_item
+            scene.showExportDialog()
+
+        def _reset_view(self):
+            """Reset plot view to auto range."""
+            self._plot_item.autoRange()
+            logger.info("Reset plot view to auto range")
+
+        def set_theme(self, dark_mode: bool = False):
+            """
+            Apply color theme to plot.
+
+            Parameters
+            ----------
+            dark_mode : bool
+                If True, use dark theme colors
+            """
+            self._dark_mode = bool(dark_mode)
+
+            if dark_mode:
+                # Dark theme
+                self._plot_widget.setBackground('#1e1e1e')
+                self._plot_item.getAxis('bottom').setPen('#e0e0e0')
+                self._plot_item.getAxis('left').setPen('#e0e0e0')
+                self._plot_item.getAxis('bottom').setTextPen('#e0e0e0')
+                self._plot_item.getAxis('left').setTextPen('#e0e0e0')
+
+                # Grid color
+                self._plot_item.showGrid(x=True, y=True, alpha=0.2)
+            else:
+                # Light theme
+                self._plot_widget.setBackground('w')
+                self._plot_item.getAxis('bottom').setPen('k')
+                self._plot_item.getAxis('left').setPen('k')
+                self._plot_item.getAxis('bottom').setTextPen('k')
+                self._plot_item.getAxis('left').setTextPen('k')
+
+                # Grid color
+                self._plot_item.showGrid(x=True, y=True, alpha=0.3)
+
+            # Refresh plot
+            self._update_plot()
+
+else:
+    # PyQtGraph not available - provide a stub that warns users
+    class PyQtGraphPlotPanel(QtWidgets.QWidget):
+        """Stub class when PyQtGraph is not available."""
+
+        # Signal emitted when series visibility changes
+        seriesVisibilityChanged = QtCore.Signal(str, bool)
+
+        def __init__(
+            self,
+            parent: Optional[QtWidgets.QWidget] = None,
+            *,
+            embed_analysis_tabs: bool = True,
+            workspace_splitter_object_name: Optional[str] = None,
+        ):
+            super().__init__(parent)
+            _ = workspace_splitter_object_name
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.addWidget(make_pyqtgraph_fallback_widget(self))
+            self._main_splitter = None
+            self._details_tabs = None
+            self._analysis_tabs_detached = not bool(embed_analysis_tabs)
+
+        def set_data(self, t, series):
+            """Stub method."""
+            pass
+
+        def render_dataset_layers(
+            self,
+            *,
+            data_t,
+            dataset_series,
+            model_t=None,
+            model_series=None,
+            visible_species=(),
+            xlabel="Time",
+            ylabel="Concentration",
+        ):
+            """Stub method."""
+            pass
+
+        def clear(self):
+            """Stub method."""
+            pass
+
+        def set_theme(self, dark_mode=False):
+            """Stub method."""
+            pass
+
+        def visible_series(self):
+            """Stub method."""
+            return []
+
+        def set_series_visible(self, name: str, visible: bool) -> None:
+            """Stub method."""
+            pass
+
+        def visible(self, name: str) -> bool:
+            """Stub method."""
+            return False
+
+        def set_overlay_catalog(self, datasets):
+            """Stub method."""
+            pass
+
+        def active_overlays(self):
+            """Stub method."""
+            return []
+
+        def overlay_snapshot(self):
+            """Stub method."""
+            return {}
+
+        def build_visible_export(self, scope: str):
+            """Stub method."""
+            raise RuntimeError("PyQtGraph is required for overlay exports.")
+
+        def analysis_tabs_widget(self):
+            """Stub method."""
+            return None
+
+        def workspace_splitter(self):
+            """Stub method."""
+            return None
+
+        def detach_analysis_tabs_for_dock(self):
+            """Stub method."""
+            return None

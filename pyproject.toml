@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools==75.1.0", "wheel==0.44.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kindred"
+description = "Chemical kinetics simulation and fitting GUI"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Pedro Oliveira" }]
+keywords = ["chemical kinetics", "kinetics", "fitting", "simulation", "gui", "chemistry"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering",
+]
+urls = { Homepage = "https://github.com/kindredsim/kindred", Repository = "https://github.com/kindredsim/kindred" }
+requires-python = ">=3.10,<3.13"
+dynamic = ["version"]
+dependencies = [
+    "numpy==2.0.0",
+    "scipy==1.13.1",
+    "bottleneck==1.6.0",
+    "PySide6==6.7.2",
+    "shiboken6==6.7.2",
+    "pyqtdarktheme-fork==2.3.4",
+    "pyqtgraph==0.13.7",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-qt",
+    "tomli; python_version < '3.11'",
+]
+
+[project.gui-scripts]
+kindred = "kindred.gui_entrypoint:main"
+kindred-gui = "kindred.gui_entrypoint:main"
+
+[tool.setuptools]
+packages = { find = {} }
+
+[tool.setuptools.dynamic]
+version = { attr = "kindred._version.__version__" }
+
+[tool.setuptools.package-data]
+kindred = ["data/**/*"]

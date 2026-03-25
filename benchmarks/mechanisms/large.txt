@@ -1,0 +1,183 @@
+# Large Benchmark Mechanism
+# 120 species, ~200 reactions
+# Complex network simulating large-scale chemical system
+
+# Primary chain (S1-S20)
+reaction: S1 -> S2; k=1.0
+reaction: S2 -> S3; k=0.95
+reaction: S3 -> S4; k=0.90
+reaction: S4 -> S5; k=0.85
+reaction: S5 -> S6; k=0.80
+reaction: S6 -> S7; k=0.75
+reaction: S7 -> S8; k=0.70
+reaction: S8 -> S9; k=0.65
+reaction: S9 -> S10; k=0.60
+reaction: S10 -> S11; k=0.55
+reaction: S11 -> S12; k=0.50
+reaction: S12 -> S13; k=0.45
+reaction: S13 -> S14; k=0.40
+reaction: S14 -> S15; k=0.35
+reaction: S15 -> S16; k=0.30
+reaction: S16 -> S17; k=0.25
+reaction: S17 -> S18; k=0.20
+reaction: S18 -> S19; k=0.15
+reaction: S19 -> S20; k=0.10
+
+# Branch network 1 (S21-S40)
+reaction: S5 -> S21 + S22; k=0.5
+reaction: S21 -> S23; k=0.4
+reaction: S22 -> S24; k=0.4
+reaction: S23 + S24 -> S25; k=1.0
+reaction: S25 -> S26 + S27; k=0.3
+reaction: S26 -> S28; k=0.3
+reaction: S27 -> S29; k=0.3
+reaction: S28 + S29 -> S30; k=0.8
+reaction: S30 -> S31 + S32; k=0.2
+reaction: S31 -> S33; k=0.2
+reaction: S32 -> S34; k=0.2
+reaction: S33 + S34 -> S35; k=0.6
+reaction: S35 -> S36 + S37; k=0.15
+reaction: S36 -> S38; k=0.15
+reaction: S37 -> S39; k=0.15
+reaction: S38 + S39 -> S40; k=0.4
+
+# Branch network 2 (S41-S60)
+reaction: S10 -> S41 + S42; k=0.4
+reaction: S41 -> S43; k=0.3
+reaction: S42 -> S44; k=0.3
+reaction: S43 + S44 -> S45; k=0.7
+reaction: S45 -> S46 + S47; k=0.25
+reaction: S46 -> S48; k=0.25
+reaction: S47 -> S49; k=0.25
+reaction: S48 + S49 -> S50; k=0.6
+reaction: S50 -> S51 + S52; k=0.2
+reaction: S51 -> S53; k=0.2
+reaction: S52 -> S54; k=0.2
+reaction: S53 + S54 -> S55; k=0.5
+reaction: S55 -> S56 + S57; k=0.15
+reaction: S56 -> S58; k=0.15
+reaction: S57 -> S59; k=0.15
+reaction: S58 + S59 -> S60; k=0.35
+
+# Branch network 3 (S61-S80)
+reaction: S15 -> S61 + S62; k=0.3
+reaction: S61 -> S63; k=0.25
+reaction: S62 -> S64; k=0.25
+reaction: S63 + S64 -> S65; k=0.5
+reaction: S65 -> S66 + S67; k=0.2
+reaction: S66 -> S68; k=0.2
+reaction: S67 -> S69; k=0.2
+reaction: S68 + S69 -> S70; k=0.4
+reaction: S70 -> S71 + S72; k=0.15
+reaction: S71 -> S73; k=0.15
+reaction: S72 -> S74; k=0.15
+reaction: S73 + S74 -> S75; k=0.3
+reaction: S75 -> S76 + S77; k=0.1
+reaction: S76 -> S78; k=0.1
+reaction: S77 -> S79; k=0.1
+reaction: S78 + S79 -> S80; k=0.2
+
+# Final convergence network (S81-S100)
+reaction: S40 -> S81; k=0.2
+reaction: S60 -> S82; k=0.2
+reaction: S80 -> S83; k=0.2
+reaction: S81 + S82 -> S84; k=0.5
+reaction: S82 + S83 -> S85; k=0.5
+reaction: S81 + S83 -> S86; k=0.5
+reaction: S84 -> S87; k=0.3
+reaction: S85 -> S88; k=0.3
+reaction: S86 -> S89; k=0.3
+reaction: S87 + S88 -> S90; k=0.4
+reaction: S88 + S89 -> S91; k=0.4
+reaction: S87 + S89 -> S92; k=0.4
+reaction: S90 -> S93; k=0.25
+reaction: S91 -> S94; k=0.25
+reaction: S92 -> S95; k=0.25
+reaction: S93 + S94 -> S96; k=0.3
+reaction: S94 + S95 -> S97; k=0.3
+reaction: S93 + S95 -> S98; k=0.3
+reaction: S96 -> S99; k=0.2
+reaction: S97 -> S100; k=0.2
+reaction: S98 -> S100; k=0.2
+
+# Terminal species (S101-S120)
+reaction: S20 -> S101; k=0.15
+reaction: S40 -> S102; k=0.15
+reaction: S60 -> S103; k=0.15
+reaction: S80 -> S104; k=0.15
+reaction: S99 -> S105; k=0.15
+reaction: S100 -> S106; k=0.15
+reaction: S101 + S102 -> S107; k=0.25
+reaction: S103 + S104 -> S108; k=0.25
+reaction: S105 + S106 -> S109; k=0.25
+reaction: S107 -> S110; k=0.2
+reaction: S108 -> S111; k=0.2
+reaction: S109 -> S112; k=0.2
+reaction: S110 + S111 -> S113; k=0.2
+reaction: S111 + S112 -> S114; k=0.2
+reaction: S110 + S112 -> S115; k=0.2
+reaction: S113 -> S116; k=0.15
+reaction: S114 -> S117; k=0.15
+reaction: S115 -> S118; k=0.15
+reaction: S116 + S117 -> S119; k=0.15
+reaction: S117 + S118 -> S120; k=0.15
+
+# Cross-network reactions (coupling)
+reaction: S10 + S30 -> S50; k=0.1
+reaction: S20 + S40 -> S60; k=0.1
+reaction: S30 + S60 -> S90; k=0.1
+reaction: S50 + S70 -> S100; k=0.1
+reaction: S25 + S45 -> S65; k=0.08
+reaction: S35 + S55 -> S75; k=0.08
+reaction: S45 + S65 -> S85; k=0.08
+reaction: S55 + S75 -> S95; k=0.08
+
+# Equilibria
+equilibrium: S5 <-> S25; kf=1.0; K=2.0
+equilibrium: S10 <-> S50; kf=1.0; K=1.5
+equilibrium: S15 <-> S75; kf=1.0; K=1.2
+equilibrium: S20 <-> S100; kf=1.0; K=1.0
+equilibrium: S30 <-> S60; kf=1.0; K=1.8
+equilibrium: S40 <-> S80; kf=1.0; K=1.6
+equilibrium: S50 <-> S90; kf=1.0; K=1.4
+equilibrium: S60 <-> S100; kf=1.0; K=1.3
+
+# Trimolecular reactions (rare but possible)
+reaction: S21 + S41 + S61 -> S81; k=0.05
+reaction: S30 + S50 + S70 -> S90; k=0.05
+reaction: S40 + S60 + S80 -> S100; k=0.05
+
+# Catalytic cycles
+reaction: S10 + S50 -> S10 + S51; k=0.2
+reaction: S20 + S70 -> S20 + S71; k=0.2
+reaction: S30 + S90 -> S30 + S91; k=0.2
+
+# Decay/termination reactions
+reaction: S100 -> S120; k=0.05
+reaction: S110 -> S120; k=0.04
+reaction: S115 -> S120; k=0.03
+reaction: S119 -> S120; k=0.02
+reaction: S120 -> ; k=0.01
+
+# Complex bimolecular network
+reaction: S25 + S26 -> S27; k=0.12
+reaction: S35 + S36 -> S37; k=0.11
+reaction: S45 + S46 -> S47; k=0.10
+reaction: S55 + S56 -> S57; k=0.09
+reaction: S65 + S66 -> S67; k=0.08
+reaction: S75 + S76 -> S77; k=0.07
+reaction: S85 + S86 -> S87; k=0.06
+reaction: S95 + S96 -> S97; k=0.05
+
+# Autocatalytic reactions
+reaction: 2*S50 -> 3*S50 + S51; k=0.01
+reaction: 2*S90 -> 3*S90 + S91; k=0.01
+reaction: 2*S100 -> 3*S100 + S101; k=0.01
+
+# Feedback loops
+reaction: S100 -> S10; k=0.02
+reaction: S90 -> S5; k=0.02
+reaction: S80 -> S3; k=0.02
+
+# Initial conditions (only S1 has initial concentration)
+[S1] = 1.0

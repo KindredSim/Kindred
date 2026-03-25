@@ -1,0 +1,19 @@
+# Audit F allowlist: conservative entrypoint commands that must exit quickly.
+# - One command per line.
+# - Lines are parsed with Python `shlex.split` (POSIX mode); quote accordingly.
+# - Use `{PY}` as a placeholder for the Python interpreter (replaced with sys.executable).
+#
+# Notes:
+# - Avoid commands that start the full GUI event loop (`python -m kindred`) because they
+#   will not exit on their own. Prefer short bootstrap snippets.
+# - Keep this list stable and intentionally curated.
+
+{PY} -c "import kindred; print('OK: import kindred')"
+{PY} -c "from kindred.io.resources import get_resource_path; p=get_resource_path('assets/kindred.ico'); print(f'OK: resource {p}')"
+{PY} -c "import sys; import kindred.__main__ as m; sys.argv=['kindred','--audit-arg']; rc=m.main(); print(f'OK: kindred.__main__.main argv-block rc={rc}'); raise SystemExit(0 if rc==64 else 1)"
+{PY} -c "from PySide6 import QtWidgets; from kindred.gui.main_window import MainWindow; app=QtWidgets.QApplication([]); w=MainWindow(); w.show(); app.processEvents(); w.close(); app.quit(); print('OK: gui bootstrap')"
+{PY} tools/audit/deps_audit.py --help
+{PY} tools/audit/deadcode_audit.py --help
+{PY} tools/audit/import_audit.py --help
+{PY} tools/audit/import_sweep_audit.py --help
+

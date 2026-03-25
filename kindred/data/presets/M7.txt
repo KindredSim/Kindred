@@ -1,0 +1,10 @@
+# Preset M7 — Dimerization 2A ⇌ A2
+# Mechanism
+equilibrium: 2*A <-> A2 ; kf = 0.05 ; kr = 0.02
+
+# Initials
+[A]  = 1.0
+[A2] = 0.0
+
+# Algebra
+let total = [A] + 2*[A2]

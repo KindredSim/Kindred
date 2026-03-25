@@ -1,0 +1,12 @@
+# Preset M6 — Parallel and competition
+# Mechanism
+A -> B ; kf = 0.8
+A -> C ; kf = 0.2
+
+# Initials
+[A] = 1.0
+[B] = 0.0
+[C] = 0.0
+
+# Algebra
+let Sel_B = [B] / max([B] + [C], 1e-30)

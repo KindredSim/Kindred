@@ -1,0 +1,19 @@
+{
+  "name": "Fast",
+  "description": "Optimized for speed with reduced accuracy for quick exploration",
+  "solver": {
+    "method": "BDF",
+    "rtol": 1e-4,
+    "atol": 1e-9
+  },
+  "grid": {
+    "N": 200
+  },
+  "ui": {
+    "theme": "default"
+  },
+  "export": {
+    "default_format": "csv"
+  },
+  "version": "1.0"
+}

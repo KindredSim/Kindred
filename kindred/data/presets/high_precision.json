@@ -1,0 +1,19 @@
+{
+  "name": "High Precision",
+  "description": "High accuracy for stiff systems and publication-quality results",
+  "solver": {
+    "method": "Radau",
+    "rtol": 1e-9,
+    "atol": 1e-15
+  },
+  "grid": {
+    "N": 5000
+  },
+  "ui": {
+    "theme": "default"
+  },
+  "export": {
+    "default_format": "csv"
+  },
+  "version": "1.0"
+}

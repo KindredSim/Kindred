@@ -1,0 +1,91 @@
+# Medium Benchmark Mechanism
+# 25 species, 40 reactions
+# Branched reaction network with cycles
+
+# Linear chain
+reaction: S1 -> S2; k=1.0
+reaction: S2 -> S3; k=0.9
+reaction: S3 -> S4; k=0.8
+reaction: S4 -> S5; k=0.7
+
+# Branch 1
+reaction: S5 -> S6 + S7; k=0.6
+reaction: S6 -> S8; k=0.5
+reaction: S7 -> S9; k=0.5
+reaction: S8 + S9 -> S10; k=2.0
+
+# Branch 2
+reaction: S5 -> S11 + S12; k=0.4
+reaction: S11 -> S13; k=0.3
+reaction: S12 -> S14; k=0.3
+reaction: S13 + S14 -> S15; k=1.5
+
+# Cycle 1
+reaction: S10 -> S16; k=0.4
+reaction: S16 -> S17; k=0.4
+reaction: S17 -> S18; k=0.4
+reaction: S18 -> S10; k=0.3
+
+# Cycle 2
+reaction: S15 -> S19; k=0.3
+reaction: S19 -> S20; k=0.3
+reaction: S20 -> S21; k=0.3
+reaction: S21 -> S15; k=0.2
+
+# Convergence
+reaction: S18 -> S22; k=0.2
+reaction: S21 -> S22; k=0.2
+reaction: S22 -> S23; k=0.5
+
+# Final steps
+reaction: S23 -> S24; k=0.4
+reaction: S24 -> S25; k=0.3
+
+# Cross reactions
+reaction: S10 + S15 -> S23; k=0.1
+reaction: S16 + S19 -> S24; k=0.1
+
+# Reversible reactions
+equilibrium: S2 <-> S6; kf=1.0; K=1.5
+equilibrium: S3 <-> S11; kf=1.0; K=2.0
+equilibrium: S17 <-> S20; kf=1.0; K=1.2
+
+# Bimolecular reactions
+reaction: S6 + S11 -> S16; k=0.5
+reaction: S8 + S13 -> S19; k=0.4
+reaction: S9 + S14 -> S20; k=0.3
+
+# Termination reactions
+reaction: S22 -> S25; k=0.2
+reaction: S23 + S24 -> 2*S25; k=0.1
+reaction: S18 + S21 -> S25; k=0.1
+
+# Decay reactions
+reaction: S25 -> ; k=0.05
+
+# Initial conditions
+[S1] = 1.0
+[S2] = 0.0
+[S3] = 0.0
+[S4] = 0.0
+[S5] = 0.0
+[S6] = 0.0
+[S7] = 0.0
+[S8] = 0.0
+[S9] = 0.0
+[S10] = 0.0
+[S11] = 0.0
+[S12] = 0.0
+[S13] = 0.0
+[S14] = 0.0
+[S15] = 0.0
+[S16] = 0.0
+[S17] = 0.0
+[S18] = 0.0
+[S19] = 0.0
+[S20] = 0.0
+[S21] = 0.0
+[S22] = 0.0
+[S23] = 0.0
+[S24] = 0.0
+[S25] = 0.0

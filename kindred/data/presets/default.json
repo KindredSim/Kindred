@@ -1,0 +1,19 @@
+{
+  "name": "Default",
+  "description": "Default simulation settings with balanced performance",
+  "solver": {
+    "method": "LSODA",
+    "rtol": 1e-6,
+    "atol": 1e-12
+  },
+  "grid": {
+    "N": 1000
+  },
+  "ui": {
+    "theme": "default"
+  },
+  "export": {
+    "default_format": "csv"
+  },
+  "version": "1.0"
+}

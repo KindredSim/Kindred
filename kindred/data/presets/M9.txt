@@ -1,0 +1,21 @@
+# Preset M9 — PBMPBPIN cascade with reversible pre-equilibrium
+# Mirrors the complex global-fitting datasets under tests/data/synthetic/complex_mechanism_global.
+
+# Mechanism
+A + B <-> Int + Water ; kf = 1.0 ; kr = 0.01
+Int + C -> PBMPBPIN ; kf = 0.01
+PBMPBPIN + Water -> PBMP + pinBOH ; kf = 100.0
+
+# Initial concentrations (mol/L)
+[A] = 0.2
+[B] = 0.2
+[C] = 0.2
+[Int] = 0.0
+[Water] = 0.05
+[PBMPBPIN] = 0.0
+[PBMP] = 0.0
+[pinBOH] = 0.0
+
+# Algebraic observables
+let total_PBMP = [PBMPBPIN] + [PBMP]
+let selectivity = [PBMP] / max([PBMP] + [pinBOH], 1e-18)

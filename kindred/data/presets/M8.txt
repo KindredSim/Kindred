@@ -1,0 +1,15 @@
+# Preset M8 — Michaelis–Menten elementary mechanism
+# Mechanism
+E + S <-> ES ; kf = 10.0 ; kr = 2.0
+ES -> E + P  ; kf = 1.0
+
+# Initials
+[E]  = 1.0
+[S]  = 10.0
+[ES] = 0.0
+[P]  = 0.0
+
+# Algebra
+let kcat = 1.0
+let v    = kcat * [ES]
+let Et   = [E]_0 + [ES]

@@ -1,0 +1,13 @@
+# Preset M4 — Reversible A <-> B with a spectator C (baseline variety)
+
+# Mechanism
+equilibrium: A <-> B; kf=1.5; kr=0.25
+reaction: B -> C; k=0.1
+
+# Initial concentrations
+[A] = 1.0
+[B] = 0.0
+[C] = 0.0
+
+# Algebra
+let yield_C = [C] / max([A]_0, 1e-30)
