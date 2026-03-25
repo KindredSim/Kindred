@@ -52,15 +52,16 @@ def _show_only_batch_set(main_window, *, row: int, qt_app) -> tuple[str, str]:
 
 
 def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
 
-    combo = panel.findChild(QtWidgets.QComboBox, "global_fit_fit_targets_dataset_combo")
-    assert combo is not None
-    for i in range(combo.count()):
-        if str(combo.itemData(i)) == str(dataset_id):
-            combo.setCurrentIndex(i)
+    dataset_list = panel.window().findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+    assert dataset_list is not None
+    for i in range(dataset_list.count()):
+        item = dataset_list.item(i)
+        if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
+            dataset_list.setCurrentRow(i)
             return
-    raise AssertionError(f"Dataset id not in combo: {dataset_id!r}")
+    raise AssertionError(f"Dataset id not in list: {dataset_id!r}")
 
 
 def _set_fit_targets_pending(panel, *, dataset_id: str, enabled_species: set[str], qt_app) -> None:
@@ -244,6 +245,9 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
 
         # Default: all datasets included (Use checked), but Run Fit is blocked until Apply.
         assert window._run_button.isEnabled() is False
+        targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
+        window._tabs.setCurrentIndex(targets_idx)
+        QtWidgets.QApplication.processEvents()
         blocked = window.findChild(QtWidgets.QLabel, "global_fit_fit_targets_run_blocked")
         assert blocked is not None
         assert blocked.isVisible()

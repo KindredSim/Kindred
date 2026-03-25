@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from PySide6 import QtCore, QtWidgets
+
 from kindred.gui.fitting.window import FittingWindow
 
 
@@ -31,19 +33,138 @@ def _make_window() -> FittingWindow:
     )
 
 
-def test_global_fit_right_panel_tabs_include_setup_parameters_statistics(qt_app):
+def _make_two_dataset_window() -> FittingWindow:
+    t = np.linspace(0.0, 1.0, 5)
+    y_a = np.linspace(1.0, 0.5, t.size)
+    y_b = np.linspace(0.2, 0.9, t.size)
+    return FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 1.23, "min": 0.01, "max": 10.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "ds1",
+                "t": t.copy(),
+                "species_data": {"A": y_a.copy()},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+            {
+                "id": "ds2",
+                "label": "ds2",
+                "t": t.copy(),
+                "species_data": {"B": y_b.copy()},
+                "selected_species": ["B"],
+                "weight": 0.5,
+                "include": True,
+            },
+        ],
+        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": y_a.copy(), "B": y_b.copy()}},
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
+            {"id": "ds2", "t": t.copy(), "y": np.vstack([y_b.copy()]), "species": ["B"]},
+        ],
+        dataset_weights={"ds1": 1.0, "ds2": 0.5},
+    )
+
+
+def _targets_dataset_ids(dataset_list: QtWidgets.QListWidget) -> list[str]:
+    ids: list[str] = []
+    for row in range(dataset_list.count()):
+        item = dataset_list.item(row)
+        assert item is not None
+        ids.append(str(item.data(QtCore.Qt.UserRole) or ""))
+    return ids
+
+
+def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app):
     window = _make_window()
     try:
         titles = [window._tabs.tabText(i) for i in range(window._tabs.count())]
-        assert "Setup" in titles
-        assert "Parameters" in titles
-        assert "Statistics" in titles
+        assert titles == ["Data", "Targets & Weights", "Parameters & ICs", "Run & Results"]
 
-        setup_widget = window._tabs.widget(titles.index("Setup"))
-        params_widget = window._tabs.widget(titles.index("Parameters"))
+        data_widget = window._tabs.widget(titles.index("Data"))
+        targets_widget = window._tabs.widget(titles.index("Targets & Weights"))
+        params_widget = window._tabs.widget(titles.index("Parameters & ICs"))
+        run_widget = window._tabs.widget(titles.index("Run & Results"))
 
-        assert not setup_widget.isAncestorOf(window._param_table)
+        sampling_panel = window.findChild(QtWidgets.QWidget, "global_fit_sampling_panel")
+        targets_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
+        weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
+        ic_table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
+        run_stamp = window.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
+
+        assert sampling_panel is not None
+        assert targets_list is not None
+        assert weight_mode is not None
+        assert weight_edit is not None
+        assert ic_table is not None
+        assert run_stamp is not None
+
+        assert window._dataset_table.columnCount() == 3
+        assert [window._dataset_table.horizontalHeaderItem(i).text() for i in range(window._dataset_table.columnCount())] == [
+            "Use",
+            "Dataset",
+            "Species",
+        ]
+
+        assert data_widget.isAncestorOf(window._dataset_table)
+        assert data_widget.isAncestorOf(sampling_panel)
+        assert not data_widget.isAncestorOf(weight_mode)
+        assert not data_widget.isAncestorOf(weight_edit)
+
+        assert targets_widget.isAncestorOf(targets_list)
+        assert targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel"))
+        assert targets_widget.isAncestorOf(weight_mode)
+        assert targets_widget.isAncestorOf(weight_edit)
+        assert _targets_dataset_ids(targets_list) == ["ds1"]
+
         assert params_widget.isAncestorOf(window._param_table)
         assert params_widget.isAncestorOf(window._method_combo)
+        assert params_widget.isAncestorOf(ic_table)
+
+        assert run_widget.isAncestorOf(run_stamp)
+        assert run_widget.isAncestorOf(window._copy_stamp_button)
+        assert run_widget.isAncestorOf(window._copy_stamp_json_button)
+    finally:
+        window.close()
+
+
+def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(qt_app):
+    window = _make_two_dataset_window()
+    try:
+        table = window._dataset_table
+        table.selectRow(1)
+        qt_app.processEvents()
+
+        targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
+        window._tabs.setCurrentIndex(targets_idx)
+        qt_app.processEvents()
+
+        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        assert dataset_list is not None
+        current = dataset_list.currentItem()
+        assert current is not None
+        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds2"
+
+        dataset_list.setCurrentRow(0)
+        qt_app.processEvents()
+        current = dataset_list.currentItem()
+        assert current is not None
+        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
+
+        data_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Data")
+        window._tabs.setCurrentIndex(data_idx)
+        qt_app.processEvents()
+        table.selectRow(1)
+        qt_app.processEvents()
+
+        window._tabs.setCurrentIndex(targets_idx)
+        qt_app.processEvents()
+        current = dataset_list.currentItem()
+        assert current is not None
+        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
     finally:
         window.close()

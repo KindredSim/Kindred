@@ -94,14 +94,15 @@ def _make_two_dataset_window(*, ds1_selected: list[str], ds2_selected: list[str]
 
 
 def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
-    from PySide6 import QtWidgets
-    combo = panel.findChild(QtWidgets.QComboBox, "global_fit_fit_targets_dataset_combo")
-    assert combo is not None
-    for i in range(combo.count()):
-        if str(combo.itemData(i)) == str(dataset_id):
-            combo.setCurrentIndex(i)
+    from PySide6 import QtCore, QtWidgets
+    dataset_list = panel.window().findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+    assert dataset_list is not None
+    for i in range(dataset_list.count()):
+        item = dataset_list.item(i)
+        if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
+            dataset_list.setCurrentRow(i)
             return
-    raise AssertionError(f"Dataset id not in combo: {dataset_id!r}")
+    raise AssertionError(f"Dataset id not in list: {dataset_id!r}")
 
 
 def _dataset_table_row_for(window, dataset_id: str) -> int:
