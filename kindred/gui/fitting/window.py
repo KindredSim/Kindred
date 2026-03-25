@@ -1598,6 +1598,12 @@ class FittingWindow(QtWidgets.QDialog):
 
         layout.addWidget(dataset_group, stretch=3)
         layout.addWidget(self._create_sampling_panel(), stretch=2)
+        self._run_block_reason_label = QtWidgets.QLabel(widget)
+        self._run_block_reason_label.setObjectName("global_fit_run_block_reason_label")
+        self._run_block_reason_label.setWordWrap(True)
+        self._run_block_reason_label.setStyleSheet("font-size: 11px;")
+        self._run_block_reason_label.hide()
+        layout.addWidget(self._run_block_reason_label, stretch=0)
         return widget
 
     def _create_targets_weights_tab(self) -> QtWidgets.QWidget:
@@ -1999,7 +2005,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._fit_targets_checks_layout.setSpacing(6)
         self._fit_targets_scroll.setWidget(self._fit_targets_checks_container)
 
-        self._weight_mode_combo.currentIndexChanged.connect(self._refresh_dataset_weight_editor_state)
+        self._weight_mode_combo.currentIndexChanged.connect(self._on_weight_mode_changed)
         self._dataset_weight_edit.editingFinished.connect(self._commit_selected_dataset_weight_edit)
         self._refresh_fit_targets_checklist()
         self._refresh_dataset_weight_editor_state()
@@ -2092,8 +2098,11 @@ class FittingWindow(QtWidgets.QDialog):
     def _on_fit_targets_dataset_list_selection_changed(
         self,
         current: Optional[QtWidgets.QListWidgetItem],
-        _previous: Optional[QtWidgets.QListWidgetItem],
+        previous: Optional[QtWidgets.QListWidgetItem],
     ) -> None:
+        previous_id = str(previous.data(Qt.UserRole) or "").strip() if previous is not None else ""
+        if previous_id:
+            self._flush_dataset_weight_editor_for_dataset(previous_id)
         ds_id = str(current.data(Qt.UserRole) or "").strip() if current is not None else ""
         self._fit_targets_current_dataset_id = ds_id or None
         self._refresh_fit_targets_checklist()
@@ -2172,6 +2181,27 @@ class FittingWindow(QtWidgets.QDialog):
                     self._dataset_manager.update_fit_settings(ds_id, settings)
             except Exception:
                 pass
+
+    def _flush_dataset_weight_editor_for_dataset(self, dataset_id: Optional[str]) -> None:
+        if self._dataset_weight_is_refreshing or not hasattr(self, "_dataset_weight_edit"):
+            return
+        ds_id = str(dataset_id or "").strip()
+        if not ds_id or not self._dataset_weight_edit.isEnabled():
+            return
+        text = str(self._dataset_weight_edit.text() or "").strip()
+        try:
+            weight = float(text)
+        except Exception:
+            self._refresh_dataset_weight_editor_state()
+            return
+        if not np.isfinite(weight):
+            self._refresh_dataset_weight_editor_state()
+            return
+        self._persist_dataset_weight(ds_id, weight)
+
+    def _on_weight_mode_changed(self) -> None:
+        self._flush_dataset_weight_editor_for_dataset(self._selected_fit_targets_dataset_id())
+        self._refresh_dataset_weight_editor_state()
 
     def _commit_selected_dataset_weight_edit(self) -> None:
         if self._dataset_weight_is_refreshing:
@@ -3077,9 +3107,14 @@ class FittingWindow(QtWidgets.QDialog):
             )
             if hasattr(self, "_fit_targets_footer"):
                 self._fit_targets_footer.set_secondary_error(message)
+            if hasattr(self, "_run_block_reason_label"):
+                self._run_block_reason_label.setText(f"{message} Open Targets & Weights to apply targets.")
+                self._run_block_reason_label.show()
         else:
             if hasattr(self, "_fit_targets_footer"):
                 self._fit_targets_footer.set_secondary_error(None)
+            if hasattr(self, "_run_block_reason_label"):
+                self._run_block_reason_label.hide()
 
         self._refresh_run_button_enabled_state()
 
@@ -4552,6 +4587,7 @@ class FittingWindow(QtWidgets.QDialog):
         if self._worker and self._worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
             return
+        self._flush_dataset_weight_editor_for_dataset(self._selected_fit_targets_dataset_id())
         config = self._collect_parameter_config()
         if not config:
             return

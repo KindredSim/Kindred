@@ -245,6 +245,13 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
 
         # Default: all datasets included (Use checked), but Run Fit is blocked until Apply.
         assert window._run_button.isEnabled() is False
+        data_reason = window.findChild(QtWidgets.QLabel, "global_fit_run_block_reason_label")
+        assert data_reason is not None
+        assert data_reason.isVisible()
+        data_text = data_reason.text().lower()
+        assert "run fit disabled" in data_text
+        assert "targets & weights" in data_text
+
         targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
         window._tabs.setCurrentIndex(targets_idx)
         QtWidgets.QApplication.processEvents()

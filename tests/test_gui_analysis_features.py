@@ -232,8 +232,8 @@ def test_fitting_window_small_multiples_grid(qapp):
     window.close()
 
 
-def test_fitting_window_respects_dataset_initials(qapp, monkeypatch):
-    """Global fitting window must forward per-dataset initials to the worker."""
+def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monkeypatch):
+    """Global fitting window must flush the visible dataset weight before starting a fit."""
     from kindred.core.analysis.dataset_parameter_overrides import split_fit_dataset_parameter_overrides
     from kindred.gui.fitting.window import FittingWindow
 
@@ -337,7 +337,6 @@ def test_fitting_window_respects_dataset_initials(qapp, monkeypatch):
 
     weight_mode.setCurrentIndex(1)
     weight_edit.setText("0.75")
-    weight_edit.editingFinished.emit()
     qapp.processEvents()
 
     window._start_fit()

@@ -168,3 +168,35 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
         assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
     finally:
         window.close()
+
+
+def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
+    window = _make_two_dataset_window()
+    try:
+        targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
+        window._tabs.setCurrentIndex(targets_idx)
+        qt_app.processEvents()
+
+        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
+        weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
+        assert dataset_list is not None
+        assert weight_mode is not None
+        assert weight_edit is not None
+
+        dataset_list.setCurrentRow(0)
+        qt_app.processEvents()
+        weight_mode.setCurrentIndex(1)
+        weight_edit.setText("0.75")
+        qt_app.processEvents()
+
+        dataset_list.setCurrentRow(1)
+        qt_app.processEvents()
+
+        assert window._dataset_entries[0]["weight"] == pytest.approx(0.75)
+
+        dataset_list.setCurrentRow(0)
+        qt_app.processEvents()
+        assert weight_edit.text() == "0.75"
+    finally:
+        window.close()
