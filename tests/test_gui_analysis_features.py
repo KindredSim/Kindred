@@ -315,7 +315,10 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
         dataset_weights={"ds1": 1.0, "ds2": 0.5},
         apply_callback=lambda params: None,
     )
-    targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
+    top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
+    assert top_tabs is not None
+    assert window._tabs is top_tabs
+    targets_idx = [top_tabs.tabText(i) for i in range(top_tabs.count())].index("Targets & Weights")
     window._tabs.setCurrentIndex(targets_idx)
     qapp.processEvents()
 

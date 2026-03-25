@@ -78,16 +78,39 @@ def _targets_dataset_ids(dataset_list: QtWidgets.QListWidget) -> list[str]:
     return ids
 
 
+def _tab_index(tab_bar: QtWidgets.QTabBar, title: str) -> int:
+    titles = [tab_bar.tabText(i) for i in range(tab_bar.count())]
+    return titles.index(title)
+
+
 def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app):
     window = _make_window()
     try:
-        titles = [window._tabs.tabText(i) for i in range(window._tabs.count())]
+        window.show()
+        qt_app.processEvents()
+
+        top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
+        shell_splitter = window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter")
+        content_stack = window.findChild(QtWidgets.QStackedWidget, "global_fit_current_tab_stack")
+        footer = window.findChild(QtWidgets.QWidget, "global_fit_footer")
+
+        assert top_tabs is not None
+        assert shell_splitter is not None
+        assert content_stack is not None
+        assert footer is not None
+        assert window.findChild(QtWidgets.QTabWidget, "global_fit_right_tabs") is None
+        assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
+        assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
+
+        assert window._tabs is top_tabs
+
+        titles = [top_tabs.tabText(i) for i in range(top_tabs.count())]
         assert titles == ["Data", "Targets & Weights", "Parameters & ICs", "Run & Results"]
 
-        data_widget = window._tabs.widget(titles.index("Data"))
-        targets_widget = window._tabs.widget(titles.index("Targets & Weights"))
-        params_widget = window._tabs.widget(titles.index("Parameters & ICs"))
-        run_widget = window._tabs.widget(titles.index("Run & Results"))
+        data_widget = content_stack.widget(_tab_index(top_tabs, "Data"))
+        targets_widget = content_stack.widget(_tab_index(top_tabs, "Targets & Weights"))
+        params_widget = content_stack.widget(_tab_index(top_tabs, "Parameters & ICs"))
+        run_widget = content_stack.widget(_tab_index(top_tabs, "Run & Results"))
 
         sampling_panel = window.findChild(QtWidgets.QWidget, "global_fit_sampling_panel")
         targets_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
@@ -95,6 +118,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
         ic_table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
         run_stamp = window.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
+        run_block = window.findChild(QtWidgets.QLabel, "global_fit_run_block_reason_label")
 
         assert sampling_panel is not None
         assert targets_list is not None
@@ -102,6 +126,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert weight_edit is not None
         assert ic_table is not None
         assert run_stamp is not None
+        assert run_block is not None
 
         assert window._dataset_table.columnCount() == 3
         assert [window._dataset_table.horizontalHeaderItem(i).text() for i in range(window._dataset_table.columnCount())] == [
@@ -128,6 +153,11 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert run_widget.isAncestorOf(run_stamp)
         assert run_widget.isAncestorOf(window._copy_stamp_button)
         assert run_widget.isAncestorOf(window._copy_stamp_json_button)
+        assert footer.isAncestorOf(run_block)
+
+        shell_sizes = shell_splitter.sizes()
+        assert len(shell_sizes) == 2
+        assert shell_sizes[0] > shell_sizes[1]
     finally:
         window.close()
 
@@ -139,7 +169,7 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
         table.selectRow(1)
         qt_app.processEvents()
 
-        targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
+        targets_idx = _tab_index(window._tabs, "Targets & Weights")
         window._tabs.setCurrentIndex(targets_idx)
         qt_app.processEvents()
 
@@ -155,7 +185,7 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
         assert current is not None
         assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
 
-        data_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Data")
+        data_idx = _tab_index(window._tabs, "Data")
         window._tabs.setCurrentIndex(data_idx)
         qt_app.processEvents()
         table.selectRow(1)
@@ -173,7 +203,7 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
 def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
     window = _make_two_dataset_window()
     try:
-        targets_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Targets & Weights")
+        targets_idx = _tab_index(window._tabs, "Targets & Weights")
         window._tabs.setCurrentIndex(targets_idx)
         qt_app.processEvents()
 
@@ -198,5 +228,32 @@ def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
         dataset_list.setCurrentRow(0)
         qt_app.processEvents()
         assert weight_edit.text() == "0.75"
+    finally:
+        window.close()
+
+
+def test_shell_uses_single_top_navigation_host_and_survives_narrow_resize(qt_app):
+    window = _make_window()
+    try:
+        window.show()
+        window.resize(980, 700)
+        qt_app.processEvents()
+
+        top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
+        shell_splitter = window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter")
+        content_stack = window.findChild(QtWidgets.QStackedWidget, "global_fit_current_tab_stack")
+
+        assert top_tabs is not None
+        assert shell_splitter is not None
+        assert content_stack is not None
+        assert window.findChild(QtWidgets.QTabWidget, "global_fit_right_tabs") is None
+        assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
+        assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
+
+        assert top_tabs.count() == 4
+        assert window._subset_widget.width() >= 300
+        assert content_stack.width() >= 260
+        assert window._subset_widget.parentWidget() is shell_splitter
+        assert content_stack.parentWidget() is shell_splitter
     finally:
         window.close()

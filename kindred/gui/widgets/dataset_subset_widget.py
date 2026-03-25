@@ -35,15 +35,22 @@ class DatasetSubsetWidget(QtWidgets.QWidget):
         self._last_union_species_for_grid_selection: Optional[Set[str]] = None
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(splitter, stretch=1)
 
         self._selector = DatasetOverlayPanel()
+        self._selector.setMinimumWidth(240)
+        self._selector.setMaximumWidth(360)
         splitter.addWidget(self._selector)
         self._grid = GridPlotView()
         splitter.addWidget(self._grid)
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([280, 940])
 
         self._selector.set_datasets(self._build_dataset_payloads())
         self._sync_overlay_selection(previous_selected_datasets=[], previous_enabled_species={}, allow_default_include=True)
