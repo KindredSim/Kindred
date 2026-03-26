@@ -5,9 +5,11 @@ import pytest
 
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.global_fitting import (
+    _build_parameter_layout,
     _GlobalFitObjective,
     _normalize_weights,
 )
+from kindred.core.objective import ObjectiveContext
 from kindred.core.exceptions import FitSimulationError
 
 
@@ -147,3 +149,182 @@ def test_global_chi_squared_uses_full_objective_residuals_for_parametric_x_penal
     assert residuals.size == 2 * t_obs.size
     assert result.global_chi_squared == pytest.approx(expected_chi_squared)
     assert result.global_r_squared == pytest.approx(expected_r_squared)
+
+
+def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_weight_scale() -> None:
+    t_obs = np.linspace(0.0, 1.0, 4, dtype=float)
+    payload = FitDatasetSpec(
+        dataset_id="ds1",
+        t_exp=t_obs,
+        species_list=["A", "B"],
+        y_matrix=np.zeros((2, t_obs.size), dtype=float),
+        point_count=int(2 * t_obs.size),
+        x_name="t",
+        x_obs=None,
+        x_mode="auto",
+        target_weights={"A": 1.0, "B": 3.0},
+    )
+    layout = _build_parameter_layout(
+        payloads=[payload],
+        shared_params={"k": 0.5},
+        dataset_variable_params={},
+        bounds=None,
+        log10_params=None,
+    )
+    objective = _GlobalFitObjective(
+        simulation_func=lambda _params: {"t": t_obs.copy(), "species": {}},
+        payloads=[payload],
+        shared_params={"k": 0.5},
+        dataset_params={},
+        weights={"ds1": 2.0},
+        layout=layout,
+        penalty_value=10.0,
+        ctx=ObjectiveContext(),
+        progress_callback=None,
+        cancellation_check=None,
+    )
+
+    residuals = objective(layout.x0.copy())
+
+    expected_scales = np.sqrt(np.asarray([2.0 * 1.0 / 4.0, 2.0 * 3.0 / 4.0], dtype=float))
+    np.testing.assert_allclose(
+        residuals[: t_obs.size],
+        np.full_like(t_obs, 2.0 * expected_scales[0] * 10.0),
+    )
+    np.testing.assert_allclose(
+        residuals[t_obs.size :],
+        np.full_like(t_obs, 2.0 * expected_scales[1] * 10.0),
+    )
+
+
+def test_global_fit_objective_rebalances_targets_without_raw_cross_dataset_inflation_under_equal_baseline_residuals() -> None:
+    t_obs = np.linspace(0.0, 1.0, 4, dtype=float)
+    ds1_y = np.linspace(1.0, 2.0, t_obs.size, dtype=float)
+    ds2_y = np.linspace(0.5, 1.5, t_obs.size, dtype=float)
+
+    def _make_ds1_payload(target_weights: dict[str, float]) -> FitDatasetSpec:
+        return FitDatasetSpec(
+            dataset_id="ds1",
+            t_exp=t_obs,
+            species_list=["A", "B"],
+            y_matrix=np.vstack([ds1_y, ds1_y]),
+            point_count=int(2 * t_obs.size),
+            x_name="t",
+            x_obs=None,
+            x_mode="auto",
+            target_weights=dict(target_weights),
+        )
+
+    ds2_payload = FitDatasetSpec(
+        dataset_id="ds2",
+        t_exp=t_obs,
+        species_list=["C"],
+        y_matrix=ds2_y.reshape(1, -1),
+        point_count=int(t_obs.size),
+        x_name="t",
+        x_obs=None,
+        x_mode="auto",
+        target_weights={"C": 1.0},
+    )
+
+    def simulation_func(_params):
+        return {
+            "t": t_obs.copy(),
+            "species": {
+                "A": np.zeros_like(t_obs),
+                "B": np.zeros_like(t_obs),
+                "C": np.zeros_like(t_obs),
+            },
+        }
+
+    residual_vectors = []
+    for target_weights in ({"A": 1.0, "B": 1.0}, {"A": 5.0, "B": 1.0}):
+        payloads = [_make_ds1_payload(target_weights), ds2_payload]
+        layout = _build_parameter_layout(
+            payloads=payloads,
+            shared_params={"k": 0.5},
+            dataset_variable_params={},
+            bounds=None,
+            log10_params=None,
+        )
+        objective = _GlobalFitObjective(
+            simulation_func=simulation_func,
+            payloads=payloads,
+            shared_params={"k": 0.5},
+            dataset_params={},
+            weights={"ds1": 2.0, "ds2": 3.0},
+            layout=layout,
+            penalty_value=10.0,
+            ctx=ObjectiveContext(),
+            progress_callback=None,
+            cancellation_check=None,
+        )
+        residual_vectors.append(objective(layout.x0.copy()))
+
+    residuals_equal, residuals_reweighted = residual_vectors
+    n_obs = t_obs.size
+    ds1_a_equal = residuals_equal[:n_obs]
+    ds1_b_equal = residuals_equal[n_obs : 2 * n_obs]
+    ds2_equal = residuals_equal[2 * n_obs :]
+    ds1_a_reweighted = residuals_reweighted[:n_obs]
+    ds1_b_reweighted = residuals_reweighted[n_obs : 2 * n_obs]
+    ds2_reweighted = residuals_reweighted[2 * n_obs :]
+
+    assert float(np.sum(ds1_a_reweighted**2)) > float(np.sum(ds1_a_equal**2))
+    assert float(np.sum(ds1_b_reweighted**2)) < float(np.sum(ds1_b_equal**2))
+    assert float(np.sum(residuals_reweighted[: 2 * n_obs] ** 2)) == pytest.approx(
+        float(np.sum(residuals_equal[: 2 * n_obs] ** 2))
+    )
+    assert float(np.sum(ds2_reweighted**2)) == pytest.approx(float(np.sum(ds2_equal**2)))
+
+
+def test_global_fit_objective_keeps_dx_penalty_dataset_weighted_only_when_target_weight_changes() -> None:
+    t_obs = np.linspace(0.0, 1.0, 6, dtype=float)
+    x_obs = np.full_like(t_obs, 10.0, dtype=float)
+    y_obs = np.linspace(0.0, 2.0, t_obs.size, dtype=float)
+
+    def _make_payload(target_weight: float) -> FitDatasetSpec:
+        return FitDatasetSpec(
+            dataset_id="ds1",
+            t_exp=t_obs,
+            species_list=["Y"],
+            y_matrix=y_obs.reshape(1, -1),
+            point_count=int(t_obs.size),
+            x_name="X",
+            x_obs=x_obs.copy(),
+            x_mode="time_guided",
+            target_weights={"Y": target_weight},
+        )
+
+    def simulation_func(_params):
+        t_sim = np.linspace(0.0, 1.0, 101, dtype=float)
+        return {"t": t_sim.copy(), "species": {"X": t_sim.copy(), "Y": np.zeros_like(t_sim)}}
+
+    payload_1 = _make_payload(1.0)
+    payload_5 = _make_payload(5.0)
+    residuals = []
+    for payload in (payload_1, payload_5):
+        layout = _build_parameter_layout(
+            payloads=[payload],
+            shared_params={"k": 0.5},
+            dataset_variable_params={},
+            bounds=None,
+            log10_params=None,
+        )
+        objective = _GlobalFitObjective(
+            simulation_func=simulation_func,
+            payloads=[payload],
+            shared_params={"k": 0.5},
+            dataset_params={},
+            weights={"ds1": 2.0},
+            layout=layout,
+            penalty_value=10.0,
+            ctx=ObjectiveContext(),
+            progress_callback=None,
+            cancellation_check=None,
+        )
+        residuals.append(objective(layout.x0.copy()))
+
+    residuals_1, residuals_5 = residuals
+    np.testing.assert_allclose(residuals_5[: t_obs.size], residuals_1[: t_obs.size])
+    np.testing.assert_allclose(residuals_5[t_obs.size :], residuals_1[t_obs.size :])

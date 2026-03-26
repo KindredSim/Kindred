@@ -187,6 +187,7 @@ def build_selected_fit_dataset_payload(
     t: np.ndarray,
     species_data: Dict[str, np.ndarray],
     selected_species: Sequence[str],
+    target_weights: Optional[Dict[str, float]] = None,
     x_name: str = "t",
     x_obs: Optional[np.ndarray] = None,
     x_mapping_mode: str = "auto",
@@ -198,6 +199,7 @@ def build_selected_fit_dataset_payload(
         t=t,
         species_data=species_data,
         selected_species=selected_species,
+        target_weights=target_weights,
         x_name=x_name,
         x_obs=x_obs,
         x_mapping_mode=x_mapping_mode,
@@ -978,6 +980,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._fit_targets_available_by_dataset: Dict[str, List[str]] = {}
         self._fit_targets_selection_applied: Dict[str, List[str]] = {}
         self._fit_targets_selection_pending: Dict[str, set[str]] = {}
+        self._fit_target_weights_applied: Dict[str, Dict[str, float]] = {}
+        self._fit_target_weights_pending: Dict[str, Dict[str, float]] = {}
+        self._fit_target_weights_pending_invalid: Dict[str, Dict[str, str]] = {}
         self._fit_targets_dirty = False
         self._fit_targets_current_dataset_id: Optional[str] = None
         self._fit_targets_is_refreshing = False
@@ -1137,6 +1142,7 @@ class FittingWindow(QtWidgets.QDialog):
         full_t: Dict[str, np.ndarray] = {}
         available_by_dataset: Dict[str, List[str]] = {}
         applied: Dict[str, List[str]] = {}
+        applied_target_weights: Dict[str, Dict[str, float]] = {}
 
         for entry in self._dataset_entries:
             ds_id = str(entry.get("id") or "").strip()
@@ -1181,12 +1187,20 @@ class FittingWindow(QtWidgets.QDialog):
                 if str(x).strip() and str(x) in series_map
             ]
             applied[ds_id] = list(initial_selection)
+            applied_target_weights[ds_id] = self._normalize_fit_target_weights_for_selection(
+                ds_id,
+                initial_selection,
+                entry.get("target_weights"),
+            )
 
         self._fit_targets_full_series_by_dataset = full_series
         self._fit_targets_full_t_by_dataset = full_t
         self._fit_targets_available_by_dataset = available_by_dataset
         self._fit_targets_selection_applied = applied
         self._fit_targets_selection_pending = {ds: set(names) for ds, names in applied.items()}
+        self._fit_target_weights_applied = {ds: dict(weights) for ds, weights in applied_target_weights.items()}
+        self._fit_target_weights_pending = {ds: dict(weights) for ds, weights in applied_target_weights.items()}
+        self._fit_target_weights_pending_invalid = {}
         self._fit_targets_dirty = False
 
         for entry in self._dataset_entries:
@@ -1195,10 +1209,116 @@ class FittingWindow(QtWidgets.QDialog):
                 continue
             selection = list(self._fit_targets_selection_applied.get(ds_id, []))
             entry["selected_species"] = list(selection)
+            entry["target_weights"] = self._applied_selected_target_weights_for_dataset(ds_id)
             series_map = self._fit_targets_full_series_by_dataset.get(ds_id, {})
             entry["species_data"] = {name: series_map[name] for name in selection if name in series_map}
 
         self._rebuild_selected_payload_lookup()
+
+    @staticmethod
+    def _is_valid_fit_target_weight(value: object) -> bool:
+        try:
+            numeric = float(value)
+        except Exception:
+            return False
+        return bool(np.isfinite(numeric) and numeric > 0.0)
+
+    def _normalize_fit_target_weights_for_selection(
+        self,
+        dataset_id: str,
+        selection: Sequence[str],
+        raw_weights: object,
+    ) -> Dict[str, float]:
+        weights_map = dict(raw_weights) if isinstance(raw_weights, dict) else {}
+        normalized: Dict[str, float] = {}
+        for name in [str(x) for x in (selection or []) if str(x).strip()]:
+            value = weights_map.get(name, 1.0)
+            normalized[name] = float(value) if self._is_valid_fit_target_weight(value) else 1.0
+        return normalized
+
+    def _applied_selected_target_weights_for_dataset(self, dataset_id: str) -> Dict[str, float]:
+        ds_id = str(dataset_id or "").strip()
+        selection = [str(x) for x in (self._fit_targets_selection_applied.get(ds_id, []) or []) if str(x).strip()]
+        weights = self._fit_target_weights_applied.get(ds_id, {}) if isinstance(self._fit_target_weights_applied, dict) else {}
+        return {
+            name: float(weights.get(name, 1.0)) if self._is_valid_fit_target_weight(weights.get(name, 1.0)) else 1.0
+            for name in selection
+        }
+
+    def _pending_fit_target_weights_for_dataset(self, dataset_id: str) -> Dict[str, float]:
+        ds_id = str(dataset_id or "").strip()
+        if not ds_id:
+            return {}
+        weights = self._fit_target_weights_pending.setdefault(ds_id, {})
+        if not isinstance(weights, dict):
+            weights = {}
+            self._fit_target_weights_pending[ds_id] = weights
+        return weights
+
+    def _pending_fit_target_weight_invalid_text(self, dataset_id: str, target_name: str) -> Optional[str]:
+        invalid_map = self._fit_target_weights_pending_invalid.get(str(dataset_id or "").strip(), {})
+        if not isinstance(invalid_map, dict):
+            return None
+        text = invalid_map.get(str(target_name or "").strip())
+        return str(text) if text is not None else None
+
+    def _pending_fit_target_weight_value(self, dataset_id: str, target_name: str) -> float:
+        ds_id = str(dataset_id or "").strip()
+        name = str(target_name or "").strip()
+        if not ds_id or not name:
+            return 1.0
+        weights = self._pending_fit_target_weights_for_dataset(ds_id)
+        value = weights.get(name, 1.0)
+        if not self._is_valid_fit_target_weight(value):
+            value = 1.0
+        weights[name] = float(value)
+        return float(value)
+
+    def _pending_fit_target_weight_text(self, dataset_id: str, target_name: str) -> str:
+        invalid_text = self._pending_fit_target_weight_invalid_text(dataset_id, target_name)
+        if invalid_text is not None:
+            return invalid_text
+        return f"{self._pending_fit_target_weight_value(dataset_id, target_name):.6g}"
+
+    def _set_pending_fit_target_weight_text(self, dataset_id: str, target_name: str, text: str) -> None:
+        ds_id = str(dataset_id or "").strip()
+        name = str(target_name or "").strip()
+        if not ds_id or not name:
+            return
+        weights = self._pending_fit_target_weights_for_dataset(ds_id)
+        invalid_map = self._fit_target_weights_pending_invalid.setdefault(ds_id, {})
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            invalid_map[name] = raw_text
+        else:
+            try:
+                value = float(raw_text)
+            except Exception:
+                invalid_map[name] = raw_text
+            else:
+                if self._is_valid_fit_target_weight(value):
+                    weights[name] = float(value)
+                    invalid_map.pop(name, None)
+                else:
+                    invalid_map[name] = raw_text
+        if not invalid_map:
+            self._fit_target_weights_pending_invalid.pop(ds_id, None)
+
+    def _fit_target_weight_is_pending_invalid(self, dataset_id: str, target_name: str) -> bool:
+        invalid_map = self._fit_target_weights_pending_invalid.get(str(dataset_id or "").strip(), {})
+        return bool(isinstance(invalid_map, dict) and str(target_name or "").strip() in invalid_map)
+
+    def _set_fit_target_weight_editor_visual_state(
+        self,
+        editor: QtWidgets.QLineEdit,
+        *,
+        dataset_id: str,
+        target_name: str,
+    ) -> None:
+        if self._fit_target_weight_is_pending_invalid(dataset_id, target_name):
+            editor.setStyleSheet("border: 1px solid rgb(204, 68, 68);")
+        else:
+            editor.setStyleSheet("")
 
     def _modeled_series_names_for_x_axis(self) -> set[str]:
         modeled = {str(x) for x in (self._mechanism_species or []) if str(x).strip()}
@@ -1275,6 +1395,7 @@ class FittingWindow(QtWidgets.QDialog):
                 continue
             selection = list(self._fit_targets_selection_applied.get(ds_id, []))
             entry["selected_species"] = list(selection)
+            entry["target_weights"] = self._applied_selected_target_weights_for_dataset(ds_id)
 
             full_t = self._fit_targets_full_t_by_dataset.get(ds_id, np.asarray(entry.get("t", []), dtype=float).reshape(-1))
             cfg = self._sampling_applied_config_for_dataset(ds_id)
@@ -1347,6 +1468,7 @@ class FittingWindow(QtWidgets.QDialog):
                 t=t_values,
                 species_data=series_map,
                 selected_species=selection,
+                target_weights=self._applied_selected_target_weights_for_dataset(ds_id),
                 x_name=x_name,
                 x_obs=x_obs,  # already sampled against the same indices as t/y
                 x_mapping_mode=x_mapping_mode,
@@ -2128,6 +2250,7 @@ class FittingWindow(QtWidgets.QDialog):
         current: Optional[QtWidgets.QListWidgetItem],
         previous: Optional[QtWidgets.QListWidgetItem],
     ) -> None:
+        self._flush_visible_fit_target_weight_edits()
         previous_id = str(previous.data(Qt.UserRole) or "").strip() if previous is not None else ""
         if previous_id:
             self._flush_dataset_weight_editor_for_dataset(previous_id)
@@ -2963,11 +3086,40 @@ class FittingWindow(QtWidgets.QDialog):
                 return
 
             pending = self._fit_targets_selection_pending.get(ds_id, set())
+            invalid_weights = self._fit_target_weights_pending_invalid.get(ds_id, {})
             for name in available:
-                cb = QtWidgets.QCheckBox(str(name))
+                row = QtWidgets.QWidget(self._fit_targets_checks_container)
+                row_layout = QtWidgets.QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+
+                cb = QtWidgets.QCheckBox(str(name), row)
                 cb.setChecked(str(name) in pending)
                 cb.toggled.connect(lambda checked, n=str(name): self._on_fit_target_toggled(n, checked))
-                self._fit_targets_checks_layout.addWidget(cb)
+                row_layout.addWidget(cb, stretch=1)
+
+                weight_edit = QtWidgets.QLineEdit(row)
+                weight_edit.setObjectName("global_fit_target_weight_edit")
+                weight_edit.setProperty("fitTargetName", str(name))
+                weight_edit.setProperty("fitTargetDatasetId", ds_id)
+                weight_edit.setMaximumWidth(110)
+                setup_scientific_validator(weight_edit)
+                weight_edit.setText(self._pending_fit_target_weight_text(ds_id, str(name)))
+                weight_edit.textChanged.connect(
+                    lambda text, n=str(name): self._on_fit_target_weight_text_edited(n, text)
+                )
+                weight_edit.editingFinished.connect(
+                    lambda n=str(name), editor=weight_edit: self._on_fit_target_weight_editing_finished(n, editor)
+                )
+                if str(name) in invalid_weights:
+                    weight_edit.setText(str(invalid_weights[str(name)]))
+                self._set_fit_target_weight_editor_visual_state(
+                    weight_edit,
+                    dataset_id=ds_id,
+                    target_name=str(name),
+                )
+                row_layout.addWidget(weight_edit)
+                self._fit_targets_checks_layout.addWidget(row)
             self._fit_targets_checks_layout.addStretch(1)
         finally:
             self._fit_targets_is_refreshing = False
@@ -2988,14 +3140,86 @@ class FittingWindow(QtWidgets.QDialog):
             pending.discard(name)
         self._update_fit_targets_dirty_state()
 
+    def _on_fit_target_weight_text_edited(self, series_name: str, text: str) -> None:
+        if self._fit_targets_is_refreshing:
+            return
+        ds_id = self._fit_targets_current_dataset_id
+        if not ds_id:
+            return
+        name = str(series_name).strip()
+        if not name:
+            return
+        self._set_pending_fit_target_weight_text(ds_id, name, text)
+        editor = self.sender()
+        if isinstance(editor, QtWidgets.QLineEdit):
+            self._set_fit_target_weight_editor_visual_state(editor, dataset_id=ds_id, target_name=name)
+        self._update_fit_targets_dirty_state()
+
+    def _on_fit_target_weight_editing_finished(
+        self,
+        series_name: str,
+        editor: QtWidgets.QLineEdit,
+    ) -> None:
+        if self._fit_targets_is_refreshing:
+            return
+        ds_id = self._fit_targets_current_dataset_id
+        if not ds_id:
+            return
+        name = str(series_name).strip()
+        if not name:
+            return
+        self._set_pending_fit_target_weight_text(ds_id, name, editor.text())
+        if not self._fit_target_weight_is_pending_invalid(ds_id, name):
+            editor.setText(f"{self._pending_fit_target_weight_value(ds_id, name):.6g}")
+        self._set_fit_target_weight_editor_visual_state(editor, dataset_id=ds_id, target_name=name)
+        self._update_fit_targets_dirty_state()
+
+    def _flush_visible_fit_target_weight_edits(self) -> None:
+        if not hasattr(self, "_fit_targets_checks_container"):
+            return
+        for editor in self._fit_targets_checks_container.findChildren(QtWidgets.QLineEdit, "global_fit_target_weight_edit"):
+            ds_id = str(editor.property("fitTargetDatasetId") or "").strip()
+            name = str(editor.property("fitTargetName") or "").strip()
+            if not ds_id or not name:
+                continue
+            self._set_pending_fit_target_weight_text(ds_id, name, editor.text())
+            if not self._fit_target_weight_is_pending_invalid(ds_id, name):
+                editor.setText(f"{self._pending_fit_target_weight_value(ds_id, name):.6g}")
+            self._set_fit_target_weight_editor_visual_state(editor, dataset_id=ds_id, target_name=name)
+
     def _update_fit_targets_dirty_state(self) -> None:
-        all_ids = set(self._fit_targets_selection_applied.keys()) | set(self._fit_targets_selection_pending.keys())
+        all_ids = (
+            set(self._fit_targets_selection_applied.keys())
+            | set(self._fit_targets_selection_pending.keys())
+            | set(self._fit_target_weights_applied.keys())
+            | set(self._fit_target_weights_pending.keys())
+            | set(self._fit_target_weights_pending_invalid.keys())
+        )
         dirty = False
         for ds_id in all_ids:
             if set(self._fit_targets_selection_applied.get(ds_id, []) or []) != set(
                 self._fit_targets_selection_pending.get(ds_id, set()) or set()
             ):
                 dirty = True
+                break
+            names = (
+                set(self._fit_targets_available_by_dataset.get(ds_id, []) or [])
+                | set((self._fit_target_weights_applied.get(ds_id, {}) or {}).keys())
+                | set((self._fit_target_weights_pending.get(ds_id, {}) or {}).keys())
+                | set((self._fit_target_weights_pending_invalid.get(ds_id, {}) or {}).keys())
+            )
+            for name in names:
+                applied_weight = float((self._fit_target_weights_applied.get(ds_id, {}) or {}).get(name, 1.0))
+                pending_weight = float((self._fit_target_weights_pending.get(ds_id, {}) or {}).get(name, 1.0))
+                if self._fit_target_weight_is_pending_invalid(ds_id, name) or not math.isclose(
+                    applied_weight,
+                    pending_weight,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                ):
+                    dirty = True
+                    break
+            if dirty:
                 break
         self._fit_targets_dirty = bool(dirty)
         if hasattr(self, "_fit_targets_footer"):
@@ -3073,6 +3297,19 @@ class FittingWindow(QtWidgets.QDialog):
                 invalid.append(ds_id)
         return invalid
 
+    def _invalid_pending_target_weight_dataset_ids(self) -> List[str]:
+        invalid: List[str] = []
+        used = set(self._included_dataset_ids_from_table())
+        all_ids = set(self._fit_targets_selection_pending.keys()) | set(self._fit_target_weights_pending_invalid.keys())
+        for ds_id in sorted(all_ids & used):
+            pending_selection = set(self._fit_targets_selection_pending.get(ds_id, set()) or set())
+            invalid_map = self._fit_target_weights_pending_invalid.get(ds_id, {})
+            if not isinstance(invalid_map, dict):
+                continue
+            if any(str(name).strip() in pending_selection for name in invalid_map.keys()):
+                invalid.append(ds_id)
+        return invalid
+
     def _invalid_applied_used_dataset_ids(self) -> List[str]:
         used = set(self._included_dataset_ids_from_table())
         invalid = []
@@ -3101,6 +3338,7 @@ class FittingWindow(QtWidgets.QDialog):
         if not hasattr(self, "_run_button"):
             return
         invalid_pending = set(self._invalid_pending_used_dataset_ids())
+        invalid_pending_weights = set(self._invalid_pending_target_weight_dataset_ids())
         invalid_applied = set(self._invalid_applied_used_dataset_ids())
 
         # Row highlighting: applied-invalid is stronger than pending-invalid.
@@ -3110,7 +3348,7 @@ class FittingWindow(QtWidgets.QDialog):
                 continue
             if ds_id in invalid_applied:
                 self._set_dataset_row_validation_state(ds_id, "invalid_applied")
-            elif ds_id in invalid_pending:
+            elif ds_id in invalid_pending or ds_id in invalid_pending_weights:
                 self._set_dataset_row_validation_state(ds_id, "invalid_pending")
             else:
                 self._set_dataset_row_validation_state(ds_id, "")
@@ -3120,6 +3358,11 @@ class FittingWindow(QtWidgets.QDialog):
         if current and current in invalid_pending:
             label = self._dataset_label_for_id(current)
             message = f"Dataset {label} has no fit targets. Select at least one series or uncheck Use."
+            if hasattr(self, "_fit_targets_footer"):
+                self._fit_targets_footer.set_error(message)
+        elif current and current in invalid_pending_weights:
+            label = self._dataset_label_for_id(current)
+            message = f"Dataset {label} has invalid target weights. Use finite values > 0."
             if hasattr(self, "_fit_targets_footer"):
                 self._fit_targets_footer.set_error(message)
         else:
@@ -3307,6 +3550,7 @@ class FittingWindow(QtWidgets.QDialog):
                     "t": t_values,
                     "species_data": {},  # applied selection starts empty
                     "selected_species": [],
+                    "target_weights": {},
                     "weight": self._dataset_weight_for_id(ds_id),
                     "include": True,
                 }
@@ -3317,6 +3561,9 @@ class FittingWindow(QtWidgets.QDialog):
             self._fit_targets_available_by_dataset[ds_id] = sorted(series_map.keys())
             self._fit_targets_selection_applied[ds_id] = []
             self._fit_targets_selection_pending[ds_id] = set()
+            self._fit_target_weights_applied[ds_id] = {}
+            self._fit_target_weights_pending[ds_id] = {}
+            self._fit_target_weights_pending_invalid.pop(ds_id, None)
             self._sampling_applied[ds_id] = self._sampling_default_config_for_time_axis(t_values)
 
             # Seed per-dataset initial parameter maps from persisted fit settings (best-effort).
@@ -3343,6 +3590,9 @@ class FittingWindow(QtWidgets.QDialog):
         for ds_id in list(remove_set):
             self._fit_targets_selection_applied.pop(ds_id, None)
             self._fit_targets_selection_pending.pop(ds_id, None)
+            self._fit_target_weights_applied.pop(ds_id, None)
+            self._fit_target_weights_pending.pop(ds_id, None)
+            self._fit_target_weights_pending_invalid.pop(ds_id, None)
             self._fit_targets_available_by_dataset.pop(ds_id, None)
             self._fit_targets_full_series_by_dataset.pop(ds_id, None)
             self._fit_targets_full_t_by_dataset.pop(ds_id, None)
@@ -3423,11 +3673,15 @@ class FittingWindow(QtWidgets.QDialog):
             return
 
     def _apply_fit_targets_changes(self) -> None:
+        self._flush_visible_fit_target_weight_edits()
         if not self._fit_targets_dirty:
             return
         used_ids = set(self._included_dataset_ids_from_table())
         new_applied = dict(self._fit_targets_selection_applied or {})
+        new_applied_target_weights = dict(self._fit_target_weights_applied or {})
         invalid_pending_used: set[str] = set()
+        invalid_pending_weights: set[str] = set()
+        deferred_excluded_pending_weights: set[str] = set()
 
         for ds_id in sorted(set(self._fit_targets_selection_pending.keys()) | set(new_applied.keys())):
             available = list(self._fit_targets_available_by_dataset.get(ds_id, []))
@@ -3436,14 +3690,34 @@ class FittingWindow(QtWidgets.QDialog):
             if ds_id in used_ids and not pending_list:
                 invalid_pending_used.add(ds_id)
                 continue
+            invalid_map = self._fit_target_weights_pending_invalid.get(ds_id, {})
+            has_invalid_pending_weights = isinstance(invalid_map, dict) and any(name in invalid_map for name in pending_list)
+            if ds_id in used_ids and has_invalid_pending_weights:
+                invalid_pending_weights.add(ds_id)
+                continue
+            if ds_id not in used_ids and has_invalid_pending_weights:
+                deferred_excluded_pending_weights.add(ds_id)
+                continue
             new_applied[str(ds_id)] = list(pending_list)
+            pending_weights = self._fit_target_weights_pending.get(ds_id, {}) if isinstance(self._fit_target_weights_pending, dict) else {}
+            new_applied_target_weights[str(ds_id)] = {
+                str(name): float(pending_weights.get(name, 1.0))
+                for name in pending_list
+            }
 
         # Commit: valid datasets update applied; invalid-used datasets keep applied unchanged and keep pending empty.
         self._fit_targets_selection_applied = {ds: list(v) for ds, v in new_applied.items()}
+        self._fit_target_weights_applied = {ds: dict(v) for ds, v in new_applied_target_weights.items()}
         for ds_id in list(self._fit_targets_selection_pending.keys()):
-            if ds_id in invalid_pending_used:
+            if (
+                ds_id in invalid_pending_used
+                or ds_id in invalid_pending_weights
+                or ds_id in deferred_excluded_pending_weights
+            ):
                 continue
             self._fit_targets_selection_pending[ds_id] = set(self._fit_targets_selection_applied.get(ds_id, []) or [])
+            self._fit_target_weights_pending[ds_id] = dict(self._fit_target_weights_applied.get(ds_id, {}) or {})
+            self._fit_target_weights_pending_invalid.pop(ds_id, None)
 
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._rebuild_selected_payload_lookup()
@@ -3456,7 +3730,8 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._update_fit_targets_dirty_state()
         self._refresh_fit_targets_checklist()
-        msg = "Fit targets applied" if not invalid_pending_used else "Fit targets: some changes not applied"
+        invalid_pending_any = bool(invalid_pending_used or invalid_pending_weights)
+        msg = "Fit targets applied" if not invalid_pending_any else "Fit targets: some changes not applied"
         if not subset_updated:
             msg = f"{msg} (subset view stale)"
         self._status_label.setText(msg)
@@ -3467,6 +3742,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._fit_targets_selection_pending = {
             ds: set(v) for ds, v in (self._fit_targets_selection_applied or {}).items()
         }
+        self._fit_target_weights_pending = {
+            ds: dict(v) for ds, v in (self._fit_target_weights_applied or {}).items()
+        }
+        self._fit_target_weights_pending_invalid = {}
         self._update_fit_targets_dirty_state()
         self._refresh_fit_targets_checklist()
 
@@ -4615,6 +4894,7 @@ class FittingWindow(QtWidgets.QDialog):
         if self._worker and self._worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
             return
+        self._flush_visible_fit_target_weight_edits()
         self._flush_dataset_weight_editor_for_dataset(self._selected_fit_targets_dataset_id())
         config = self._collect_parameter_config()
         if not config:
@@ -4661,6 +4941,7 @@ class FittingWindow(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Global Fit", "Simulation callback is unavailable.")
             self._set_running_state(False)
             return
+        self._flush_visible_fit_target_weight_edits()
 
         selected_ids = list(dataset_selection.get("ids") or [])
         mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
@@ -5272,10 +5553,15 @@ class FittingWindow(QtWidgets.QDialog):
             if isinstance(getattr(self, "_fit_targets_selection_applied", None), dict)
             else {}
         )
+        applied_target_weights = {
+            str(ds_id): self._applied_selected_target_weights_for_dataset(str(ds_id))
+            for ds_id in applied_targets.keys()
+        }
         stamp = build_global_fit_run_stamp(
             dataset_rows=list(dataset_selection.get("rows") or []),
             included_ids=list(included_ids),
             applied_fit_targets=applied_targets,
+            applied_target_weights=applied_target_weights,
             weights_used=(dict(weights) if isinstance(weights, dict) else None),
             weight_mode=weight_mode,
             fit_config=dict(config or {}),

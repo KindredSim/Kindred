@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -18,6 +18,7 @@ class FitDatasetSpec(Mapping[str, Any]):
     x_name: str
     x_obs: Optional[np.ndarray]
     x_mode: str
+    target_weights: Dict[str, float] = field(default_factory=dict)
 
     def to_payload_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -25,6 +26,7 @@ class FitDatasetSpec(Mapping[str, Any]):
             "t": np.asarray(self.t_exp, dtype=float).reshape(-1),
             "y": np.asarray(self.y_matrix, dtype=float),
             "species": list(self.species_list),
+            "target_weights": dict(self.target_weights),
         }
         if str(self.x_name or "t").strip() != "t":
             payload["x_name"] = str(self.x_name or "t").strip() or "t"
@@ -129,6 +131,11 @@ def _copy_fit_dataset_spec(spec: FitDatasetSpec) -> FitDatasetSpec:
     x_name = str(spec.x_name or "t").strip() or "t"
     x_obs = None if spec.x_obs is None else np.asarray(spec.x_obs, dtype=float).reshape(-1)
     x_mode = normalize_x_mapping_mode(spec.x_mode)
+    target_weights = normalize_dataset_target_weights(
+        dataset_id=str(spec.dataset_id),
+        selected_targets=species_list,
+        target_weights=getattr(spec, "target_weights", None),
+    )
     return FitDatasetSpec(
         dataset_id=str(spec.dataset_id),
         t_exp=t_values,
@@ -138,6 +145,7 @@ def _copy_fit_dataset_spec(spec: FitDatasetSpec) -> FitDatasetSpec:
         x_name=x_name,
         x_obs=x_obs,
         x_mode=x_mode,
+        target_weights=target_weights,
     )
 
 
@@ -161,6 +169,11 @@ def _coerce_fit_dataset_spec_from_mapping(
     x_name = str(ds_norm.get("x_name") or "t").strip() or "t"
     x_obs: Optional[np.ndarray] = None
     x_mode = "auto"
+    target_weights = normalize_dataset_target_weights(
+        dataset_id=ds_id,
+        selected_targets=species_list,
+        target_weights=ds_norm.get("target_weights"),
+    )
     if x_name != "t":
         x_obs = np.asarray(ds_norm.get("x_obs", []), dtype=float).reshape(-1)
         if x_obs.size != t_values.size:
@@ -186,6 +199,7 @@ def _coerce_fit_dataset_spec_from_mapping(
         x_name=x_name,
         x_obs=x_obs,
         x_mode=x_mode,
+        target_weights=target_weights,
     )
 
 
@@ -264,12 +278,35 @@ def normalize_dataset_species_and_y(
     raise ValueError(f"Dataset '{ds_id}' has unsupported 'species' type: {type(species)!r}")
 
 
+def normalize_dataset_target_weights(
+    *,
+    dataset_id: str,
+    selected_targets: Sequence[str],
+    target_weights: Optional[Mapping[str, object]],
+) -> Dict[str, float]:
+    ds_id = str(dataset_id or "").strip() or "<dataset>"
+    selection = [str(name) for name in (selected_targets or []) if str(name).strip()]
+    raw_weights = dict(target_weights or {}) if isinstance(target_weights, Mapping) else {}
+    normalized: Dict[str, float] = {}
+    for name in selection:
+        raw_value = raw_weights.get(name, 1.0)
+        try:
+            value = float(raw_value)
+        except Exception as exc:
+            raise ValueError(f"Dataset '{ds_id}' target weight for '{name}' is invalid: {raw_value!r}.") from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"Dataset '{ds_id}' target weight for '{name}' must be finite and positive.")
+        normalized[name] = float(value)
+    return normalized
+
+
 def read_fit_dataset_payload(
     *,
     dataset_id: str,
     t: np.ndarray,
     species_data: Mapping[str, np.ndarray],
     selected_species: Sequence[str],
+    target_weights: Optional[Mapping[str, object]] = None,
     x_name: str = "t",
     x_obs: Optional[np.ndarray] = None,
     x_mapping_mode: str = "auto",
@@ -308,12 +345,22 @@ def read_fit_dataset_payload(
     if not rows:
         return FitDatasetPayloadResult.invalid(f"Dataset '{ds_id}' requires at least one valid selected series.")
 
+    try:
+        target_weights_norm = normalize_dataset_target_weights(
+            dataset_id=ds_id,
+            selected_targets=selection,
+            target_weights=target_weights,
+        )
+    except ValueError as exc:
+        return FitDatasetPayloadResult.invalid(str(exc))
+
     x_name_norm = str(x_name or "t").strip() or "t"
     dataset_payload: Dict[str, Any] = {
         "id": ds_id,
         "t": t_values,
         "y": np.vstack(rows),
         "species": list(selection),
+        "target_weights": dict(target_weights_norm),
     }
 
     if x_name_norm != "t":
@@ -354,6 +401,7 @@ def build_fit_dataset_payload(
     t: np.ndarray,
     species_data: Mapping[str, np.ndarray],
     selected_species: Sequence[str],
+    target_weights: Optional[Mapping[str, object]] = None,
     x_name: str = "t",
     x_obs: Optional[np.ndarray] = None,
     x_mapping_mode: str = "auto",
@@ -363,6 +411,7 @@ def build_fit_dataset_payload(
         t=t,
         species_data=species_data,
         selected_species=selected_species,
+        target_weights=target_weights,
         x_name=x_name,
         x_obs=x_obs,
         x_mapping_mode=x_mapping_mode,

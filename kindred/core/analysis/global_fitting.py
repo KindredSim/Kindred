@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -143,6 +143,38 @@ def _normalize_weights(payloads: List[FitDatasetSpec], weights: Optional[Dict[st
         raise ValueError("Sum of dataset weights must be positive.")
     n = max(1, len(payloads))
     return {ds_id: float(weight) * float(n) / total_weight for ds_id, weight in normalized.items()}
+
+
+def _normalized_target_weight_multipliers(
+    *,
+    species_list: Sequence[str],
+    target_weights: Optional[Dict[str, float]],
+) -> Dict[str, float]:
+    names = [str(name) for name in (species_list or []) if str(name).strip()]
+    if not names:
+        return {}
+
+    raw_weights = dict(target_weights or {}) if isinstance(target_weights, dict) else {}
+    cleaned: List[Tuple[str, float]] = []
+    total_weight = 0.0
+    for name in names:
+        try:
+            value = float(raw_weights.get(name, 1.0))
+        except Exception:
+            value = 1.0
+        if not np.isfinite(value) or value <= 0.0:
+            value = 1.0
+        cleaned.append((name, float(value)))
+        total_weight += float(value)
+
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        return {name: 1.0 for name, _value in cleaned}
+
+    count = float(len(cleaned))
+    return {
+        name: float(np.sqrt(count * float(value) / total_weight))
+        for name, value in cleaned
+    }
 
 
 def _robust_span(values: np.ndarray) -> float:
@@ -519,6 +551,11 @@ class _GlobalFitObjective:
             x_obs = payload.x_obs if x_name != "t" else None
             x_mode = payload.x_mode
             weight = self._weights.get(ds_id, 1.0)
+            target_weights = dict(getattr(payload, "target_weights", {}) or {})
+            target_multipliers = _normalized_target_weight_multipliers(
+                species_list=species_list,
+                target_weights=target_weights,
+            )
 
             full_params = dict(param_dict)
             full_params.update(self._dataset_params.get(ds_id, {}))
@@ -542,8 +579,12 @@ class _GlobalFitObjective:
                     self._warned_objective_keys.add(key)
                     logger.warning("Simulation failed for %s: %s", ds_id, exc)
                 for idx in range(int(y_matrix.shape[0])):
+                    species_name = str(species_list[idx])
+                    target_weight = float(target_multipliers.get(species_name, 1.0))
                     y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float))
+                    all_residuals.extend(
+                        (float(weight) * float(target_weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float)
+                    )
                 if x_name != "t" and x_mode in ("auto", "time_guided"):
                     all_residuals.extend(
                         (float(weight) * self._penalty_value)
@@ -563,8 +604,12 @@ class _GlobalFitObjective:
                     self._warned_objective_keys.add(key)
                     logger.warning("Simulation failed for %s: %s", ds_id, err)
                 for idx in range(int(y_matrix.shape[0])):
+                    species_name = str(species_list[idx])
+                    target_weight = float(target_multipliers.get(species_name, 1.0))
                     y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float))
+                    all_residuals.extend(
+                        (float(weight) * float(target_weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float)
+                    )
                 if x_name != "t" and x_mode in ("auto", "time_guided"):
                     all_residuals.extend(
                         (float(weight) * self._penalty_value)
@@ -587,6 +632,8 @@ class _GlobalFitObjective:
             for idx, species_name in enumerate(species_list):
                 _raise_if_fitting_cancelled(self._cancellation_check)
                 y_exp = y_matrix[idx]
+                target_weight = float(target_multipliers.get(str(species_name), 1.0))
+                effective_weight = float(weight) * float(target_weight)
                 model_series = sim_species.get(species_name)
                 if model_series is None:
                     err = FitSimulationError(
@@ -599,7 +646,7 @@ class _GlobalFitObjective:
                         self._warned_objective_keys.add(key)
                         logger.warning("%s", err)
                     y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
+                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
                     continue
 
                 try:
@@ -642,7 +689,7 @@ class _GlobalFitObjective:
                         self._warned_objective_keys.add(key)
                         logger.warning("Alignment failed for %s:%s: %s", ds_id, species_name, exc)
                     y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
+                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
                     continue
                 except Exception as exc:
                     if isinstance(exc, (FittingCancelled, SimulationCancelled)):
@@ -657,7 +704,7 @@ class _GlobalFitObjective:
                         self._warned_objective_keys.add(key)
                         logger.warning("%s", err)
                     y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
+                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
                     continue
 
                 if not np.all(np.isfinite(y_sim)):
@@ -671,10 +718,10 @@ class _GlobalFitObjective:
                         self._warned_objective_keys.add(key)
                         logger.warning("%s", err)
                     y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
+                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
                     continue
 
-                residual_vector = float(weight) * (
+                residual_vector = effective_weight * (
                     np.asarray(y_sim, dtype=float).reshape(-1) - np.asarray(y_exp, dtype=float).reshape(-1)
                 )
                 if not np.all(np.isfinite(residual_vector)):
@@ -688,7 +735,7 @@ class _GlobalFitObjective:
                         self._warned_objective_keys.add(key)
                         logger.warning("%s", err)
                     y_exp_arr = np.asarray(y_exp, dtype=float).reshape(-1)
-                    all_residuals.extend((float(weight) * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
+                    all_residuals.extend((effective_weight * self._penalty_value) * np.ones_like(y_exp_arr, dtype=float))
                     continue
                 all_residuals.extend(np.asarray(residual_vector, dtype=float).reshape(-1))
 

@@ -88,6 +88,15 @@ def _toggle_fit_targets_pending(panel) -> None:
     checkbox_b.setChecked(True)
 
 
+def _target_weight_edit(panel, *, target_name: str):
+    from PySide6 import QtWidgets
+
+    for edit in reversed(panel.findChildren(QtWidgets.QLineEdit)):
+        if str(edit.property("fitTargetName") or "") == str(target_name):
+            return edit
+    raise AssertionError(f"Target weight edit not found: {target_name!r}")
+
+
 def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
     from PySide6 import QtCore, QtWidgets
     from kindred import __version__ as kindred_version
@@ -146,6 +155,49 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         assert stamp_label is not None
         assert stamp_label.isHidden() is False
         assert "stamp" in stamp_label.text().lower()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
+    from PySide6 import QtCore, QtWidgets
+
+    class _FakeWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        finished = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def start(self):
+            return
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+
+    window = _make_window(selected_species=["A"])
+    try:
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        assert panel is not None
+
+        edit_a = _target_weight_edit(panel, target_name="A")
+        edit_b = _target_weight_edit(panel, target_name="B")
+        edit_a.setText("2.5")
+        edit_b.setText("9.0")
+        qt_app.processEvents()
+
+        config = window._collect_parameter_config()
+        assert config is not None
+        selection = window._collect_dataset_selection()
+        window._start_global_fit(config, selection)
+
+        assert window._last_run_stamp["version"] == 3
+        assert window._last_run_stamp["target_weights_applied"]["ds1"] == {"A": "1"}
+        assert window._last_run_stamp["datasets"][0]["target_weights_applied"] == {"A": "1"}
     finally:
         window.close()
         qt_app.processEvents()
