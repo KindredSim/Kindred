@@ -167,6 +167,7 @@ if PYQTGRAPH_AVAILABLE:
             *,
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
+            enable_axis_inversion_actions: bool = False,
             enable_canonical_ghost_toggle_action: bool = False,
         ):
             """
@@ -208,6 +209,9 @@ if PYQTGRAPH_AVAILABLE:
             self._secondary_y_items: Dict[str, pg.PlotDataItem] = {}
             self._log_x: bool = False
             self._log_y: bool = False
+            self._invert_x_axis: bool = False
+            self._invert_y_axis: bool = False
+            self._enable_axis_inversion_actions = bool(enable_axis_inversion_actions)
             self._show_canonical_ghost_lines: bool = True
             self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
             self._annotations: List[pg.TextItem] = []
@@ -247,6 +251,7 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_item.setMenuEnabled(False)
             vb = self._plot_item.getViewBox()
             vb.setMenuEnabled(False)
+            self._apply_axis_inversion_state()
 
             # Enable mouse tracking for crosshair and tooltip
             self._plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
@@ -1780,6 +1785,19 @@ if PYQTGRAPH_AVAILABLE:
             log_y_action.setChecked(self._log_y)
             log_y_action.triggered.connect(self._toggle_log_y)
 
+            if self._enable_axis_inversion_actions:
+                direction_menu = menu.addMenu("Axis Direction")
+
+                invert_x_action = direction_menu.addAction("Invert X-Axis")
+                invert_x_action.setCheckable(True)
+                invert_x_action.setChecked(self._invert_x_axis)
+                invert_x_action.triggered.connect(self._toggle_invert_x)
+
+                invert_y_action = direction_menu.addAction("Invert Y-Axis")
+                invert_y_action.setCheckable(True)
+                invert_y_action.setChecked(self._invert_y_axis)
+                invert_y_action.triggered.connect(self._toggle_invert_y)
+
             menu.addSeparator()
 
             if self._enable_canonical_ghost_toggle_action:
@@ -1933,6 +1951,23 @@ if PYQTGRAPH_AVAILABLE:
             self._show_canonical_ghost_lines = show
             self._update_plot()
 
+        def _apply_axis_inversion_state(self) -> None:
+            viewbox = self._plot_item.getViewBox()
+            viewbox.invertX(self._invert_x_axis)
+            viewbox.invertY(self._invert_y_axis)
+
+        def _toggle_invert_x(self):
+            """Toggle X-axis inversion."""
+            self._invert_x_axis = not self._invert_x_axis
+            self._apply_axis_inversion_state()
+            logger.info(f"X-axis inverted: {self._invert_x_axis}")
+
+        def _toggle_invert_y(self):
+            """Toggle Y-axis inversion."""
+            self._invert_y_axis = not self._invert_y_axis
+            self._apply_axis_inversion_state()
+            logger.info(f"Y-axis inverted: {self._invert_y_axis}")
+
         def _toggle_log_x(self):
             """Toggle X-axis log scale."""
             self._log_x = not self._log_x
@@ -2053,6 +2088,7 @@ if PYQTGRAPH_AVAILABLE:
         def _reset_view(self):
             """Reset plot view to auto range."""
             self._plot_item.autoRange()
+            self._apply_axis_inversion_state()
             logger.info("Reset plot view to auto range")
 
         def set_theme(self, dark_mode: bool = False):
@@ -2104,9 +2140,11 @@ else:
             *,
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
+            enable_axis_inversion_actions: bool = False,
         ):
             super().__init__(parent)
             _ = workspace_splitter_object_name
+            _ = enable_axis_inversion_actions
             layout = QtWidgets.QVBoxLayout(self)
             layout.addWidget(make_pyqtgraph_fallback_widget(self))
             self._main_splitter = None

@@ -71,6 +71,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
         self._main_plot = PlotPanelClass(
             embed_analysis_tabs=bool(main_plot_embed_analysis_tabs),
             workspace_splitter_object_name="mainPlotWorkspaceSplitter",
+            enable_axis_inversion_actions=True,
             enable_canonical_ghost_toggle_action=True,
         )
         self._main_plot.setObjectName("plotPanel")

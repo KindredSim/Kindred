@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.widgets.plot_tabs import PlotTabsWidget
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import (
     PYQTGRAPH_AVAILABLE,
     PyQtGraphPlotPanel,
@@ -9,6 +10,24 @@ from kindred.gui.widgets.pyqtgraph_plot_panel_impl import (
 
 
 pytestmark = pytest.mark.gui
+
+
+def _capture_context_menu(monkeypatch):
+    captured_menus = []
+
+    def _fake_exec(self, *_args, **_kwargs):
+        captured_menus.append(self)
+        return None
+
+    monkeypatch.setattr(QtWidgets.QMenu, "exec_", _fake_exec)
+    return captured_menus
+
+
+def _find_action(actions, text: str):
+    for action in actions:
+        if action.text() == text:
+            return action
+    raise AssertionError(f"Missing action {text!r}")
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
@@ -29,13 +48,7 @@ def test_pyqtgraph_native_menus_disabled_and_custom_actions_present(qtbot, monke
 
     monkeypatch.setattr(type(scene), "showExportDialog", _fake_show_export_dialog)
 
-    captured_menus = []
-
-    def _fake_exec(self, *_args, **_kwargs):
-        captured_menus.append(self)
-        return None
-
-    monkeypatch.setattr(QtWidgets.QMenu, "exec_", _fake_exec)
+    captured_menus = _capture_context_menu(monkeypatch)
 
     panel._show_context_menu(QtCore.QPoint(0, 0))
 
@@ -82,13 +95,7 @@ def test_main_plot_context_menu_toggle_hides_and_restores_canonical_reference_li
     panel.show()
     QtWidgets.QApplication.processEvents()
 
-    captured_menus = []
-
-    def _fake_exec(self, *_args, **_kwargs):
-        captured_menus.append(self)
-        return None
-
-    monkeypatch.setattr(QtWidgets.QMenu, "exec_", _fake_exec)
+    captured_menus = _capture_context_menu(monkeypatch)
 
     panel._show_context_menu(QtCore.QPoint(0, 0))
     menu = captured_menus.pop()
@@ -156,3 +163,93 @@ def test_main_plot_context_menu_toggle_hides_and_restores_canonical_reference_li
     assert any(str(entry.get("curve_role") or "") == "canonical_ghost" for entry in overlays)
     assert non_ghost_key in panel._plot_items
     assert ghost_key in panel._plot_items
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_main_plot_axis_inversion_actions_are_scoped_to_simulation_plot(qtbot, monkeypatch):
+    widget = PlotTabsWidget()
+    qtbot.addWidget(widget)
+    widget.show()
+    QtWidgets.QApplication.processEvents()
+
+    dataset_panel = widget.add_dataset_tab("dataset-1")
+    QtWidgets.QApplication.processEvents()
+
+    captured_menus = _capture_context_menu(monkeypatch)
+
+    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
+    main_menu = captured_menus.pop()
+    axis_direction_action = _find_action(main_menu.actions(), "Axis Direction")
+    axis_direction_menu = axis_direction_action.menu()
+    assert axis_direction_menu is not None
+    invert_x_action = _find_action(axis_direction_menu.actions(), "Invert X-Axis")
+    invert_y_action = _find_action(axis_direction_menu.actions(), "Invert Y-Axis")
+    assert invert_x_action.isCheckable()
+    assert invert_y_action.isCheckable()
+
+    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
+    dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Axis Direction" for action in dataset_menu.actions())
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
+    panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
+    try:
+        panel.show()
+        panel.resize(400, 300)
+        panel.set_data(
+            np.array([2.0, 6.0, 10.0], dtype=float),
+            {"A": np.array([1.0, 5.0, 9.0], dtype=float)},
+        )
+        panel._toolbar.set_auto_range(False)
+        panel._plot_item.setRange(xRange=(2.0, 10.0), yRange=(1.0, 9.0), padding=0.0)
+        qt_app.processEvents()
+
+        def _scene_positions():
+            viewbox = panel._plot_item.getViewBox()
+            x_low = viewbox.mapViewToScene(QtCore.QPointF(2.0, 5.0)).x()
+            x_high = viewbox.mapViewToScene(QtCore.QPointF(10.0, 5.0)).x()
+            y_low = viewbox.mapViewToScene(QtCore.QPointF(6.0, 1.0)).y()
+            y_high = viewbox.mapViewToScene(QtCore.QPointF(6.0, 9.0)).y()
+            return x_low, x_high, y_low, y_high
+
+        viewbox = panel._plot_item.getViewBox()
+        initial_x_low, initial_x_high, initial_y_low, initial_y_high = _scene_positions()
+        assert viewbox.state.get("xInverted") is False
+        assert viewbox.state.get("yInverted") is False
+        assert initial_x_low < initial_x_high
+        assert initial_y_low > initial_y_high
+        x_data, y_data = panel._plot_items["A"].getData()
+        np.testing.assert_allclose(np.asarray(x_data, dtype=float), np.array([2.0, 6.0, 10.0], dtype=float))
+        np.testing.assert_allclose(np.asarray(y_data, dtype=float), np.array([1.0, 5.0, 9.0], dtype=float))
+
+        panel._toggle_invert_x()
+        qt_app.processEvents()
+        assert viewbox.state.get("xInverted") is True
+        x_low, x_high, y_low, y_high = _scene_positions()
+        assert x_low > x_high
+        assert y_low > y_high
+        x_data, y_data = panel._plot_items["A"].getData()
+        np.testing.assert_allclose(np.asarray(x_data, dtype=float), np.array([2.0, 6.0, 10.0], dtype=float))
+        np.testing.assert_allclose(np.asarray(y_data, dtype=float), np.array([1.0, 5.0, 9.0], dtype=float))
+
+        panel._toggle_invert_y()
+        qt_app.processEvents()
+        assert viewbox.state.get("xInverted") is True
+        assert viewbox.state.get("yInverted") is True
+        x_low, x_high, y_low, y_high = _scene_positions()
+        assert x_low > x_high
+        assert y_low < y_high
+
+        panel._toggle_invert_x()
+        panel._toggle_invert_y()
+        qt_app.processEvents()
+        assert viewbox.state.get("xInverted") is False
+        assert viewbox.state.get("yInverted") is False
+        restored_x_low, restored_x_high, restored_y_low, restored_y_high = _scene_positions()
+        assert restored_x_low < restored_x_high
+        assert restored_y_low > restored_y_high
+    finally:
+        panel.deleteLater()
+        qt_app.processEvents()
