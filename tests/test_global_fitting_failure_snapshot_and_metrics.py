@@ -199,6 +199,111 @@ def test_global_fit_result_dataset_diagnostics_remain_raw_under_target_weighting
     assert result.global_chi_squared == pytest.approx(1.5)
 
 
+def test_global_fit_result_missing_species_failure_diagnostics_remain_raw_under_target_weighting() -> None:
+    t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
+    penalty_value = 1e6
+    weight_a = np.sqrt(2.0 * 5.0 / 6.0)
+    weight_b = np.sqrt(2.0 * 1.0 / 6.0)
+
+    def simulation_func(_params):
+        return {
+            "t": t_obs.copy(),
+            "species": {
+                "A": np.zeros_like(t_obs),
+            },
+        }
+
+    result = fit_global(
+        simulation_func,
+        datasets=[
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": np.vstack([np.ones_like(t_obs), 2.0 * np.ones_like(t_obs)]),
+                "species": ["A", "B"],
+                "target_weights": {"A": 5.0, "B": 1.0},
+            }
+        ],
+        shared_params={"k": 0.2},
+        weights={"ds1": 1.0},
+        max_nfev=1,
+    )
+
+    info = result.dataset_info[0]
+    expected_raw_penalty = np.full_like(t_obs, penalty_value)
+
+    np.testing.assert_allclose(result.residual_series["ds1"]["A"], -np.ones_like(t_obs))
+    np.testing.assert_allclose(result.residual_series["ds1"]["B"], expected_raw_penalty)
+    np.testing.assert_allclose(info.residuals[: t_obs.size], -np.ones_like(t_obs))
+    np.testing.assert_allclose(info.residuals[t_obs.size :], expected_raw_penalty)
+    assert info.chi_squared == pytest.approx((5.0 + 5.0 * penalty_value**2) / 10.0)
+    assert info.rmse == pytest.approx(np.sqrt((5.0 + 5.0 * penalty_value**2) / 10.0))
+    assert info.mae == pytest.approx((5.0 + 5.0 * penalty_value) / 10.0)
+
+    assert result.objective_residuals is not None
+    np.testing.assert_allclose(result.objective_residuals[: t_obs.size], -weight_a * np.ones_like(t_obs))
+    np.testing.assert_allclose(
+        result.objective_residuals[t_obs.size :],
+        np.full_like(t_obs, weight_b * penalty_value),
+    )
+    assert result.global_chi_squared == pytest.approx(
+        float(np.mean(np.asarray(result.objective_residuals, dtype=float) ** 2))
+    )
+
+
+def test_global_fit_result_nonfinite_series_failure_diagnostics_remain_raw_under_target_weighting() -> None:
+    t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
+    penalty_value = 1e6
+    weight_a = np.sqrt(2.0 * 5.0 / 6.0)
+    weight_b = np.sqrt(2.0 * 1.0 / 6.0)
+
+    def simulation_func(_params):
+        return {
+            "t": t_obs.copy(),
+            "species": {
+                "A": np.zeros_like(t_obs),
+                "B": np.full_like(t_obs, np.nan),
+            },
+        }
+
+    result = fit_global(
+        simulation_func,
+        datasets=[
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": np.vstack([np.ones_like(t_obs), 2.0 * np.ones_like(t_obs)]),
+                "species": ["A", "B"],
+                "target_weights": {"A": 5.0, "B": 1.0},
+            }
+        ],
+        shared_params={"k": 0.2},
+        weights={"ds1": 1.0},
+        max_nfev=1,
+    )
+
+    info = result.dataset_info[0]
+    expected_raw_penalty = np.full_like(t_obs, penalty_value)
+
+    np.testing.assert_allclose(result.residual_series["ds1"]["A"], -np.ones_like(t_obs))
+    np.testing.assert_allclose(result.residual_series["ds1"]["B"], expected_raw_penalty)
+    np.testing.assert_allclose(info.residuals[: t_obs.size], -np.ones_like(t_obs))
+    np.testing.assert_allclose(info.residuals[t_obs.size :], expected_raw_penalty)
+    assert info.chi_squared == pytest.approx((5.0 + 5.0 * penalty_value**2) / 10.0)
+    assert info.rmse == pytest.approx(np.sqrt((5.0 + 5.0 * penalty_value**2) / 10.0))
+    assert info.mae == pytest.approx((5.0 + 5.0 * penalty_value) / 10.0)
+
+    assert result.objective_residuals is not None
+    np.testing.assert_allclose(result.objective_residuals[: t_obs.size], -weight_a * np.ones_like(t_obs))
+    np.testing.assert_allclose(
+        result.objective_residuals[t_obs.size :],
+        np.full_like(t_obs, weight_b * penalty_value),
+    )
+    assert result.global_chi_squared == pytest.approx(
+        float(np.mean(np.asarray(result.objective_residuals, dtype=float) ** 2))
+    )
+
+
 def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_weight_scale() -> None:
     t_obs = np.linspace(0.0, 1.0, 4, dtype=float)
     payload = FitDatasetSpec(
