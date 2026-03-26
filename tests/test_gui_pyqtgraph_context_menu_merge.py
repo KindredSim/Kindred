@@ -43,6 +43,20 @@ def _split_tsv(text: str) -> list[list[str]]:
     return [line.split("\t") for line in lines]
 
 
+def _find_header_index(header: list[str], *, prefix: str, contains: list[str]) -> int:
+    for idx, cell in enumerate(header):
+        if not cell.startswith(prefix):
+            continue
+        if all(token in cell for token in contains):
+            return idx
+    raise AssertionError(f"Missing header with prefix={prefix!r} contains={contains!r}")
+
+
+def _numeric_column(rows: list[list[str]], idx: int) -> np.ndarray:
+    values = [row[idx] for row in rows if idx < len(row) and row[idx] != ""]
+    return np.asarray([float(value) for value in values], dtype=float)
+
+
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_pyqtgraph_native_menus_disabled_and_custom_actions_present(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel()
@@ -391,6 +405,108 @@ def test_copy_visible_data_includes_secondary_axis_only_primary_trace_without_wa
     assert any("Time" in cell for cell in primary_headers)
     assert any("C" in cell and "[right axis]" in cell for cell in primary_headers)
     assert all("A" not in cell for cell in primary_headers)
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_uses_synchronized_secondary_axis_trace_after_x_axis_change(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "B": np.array([10.0, 20.0, 30.0], dtype=float),
+            "C": np.array([5.0, 6.0, 7.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    panel._add_secondary_y_axis()
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    secondary_item = panel._secondary_y_items["C"]
+    plotted_x, plotted_y = secondary_item.getData()
+    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), np.array([10.0, 20.0, 30.0], dtype=float))
+    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), np.array([5.0, 6.0, 7.0], dtype=float))
+
+    panel._series["C"] = np.array([105.0, 106.0, 107.0], dtype=float)
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    body = rows[1:]
+    x_idx = _find_header_index(header, prefix="set1::", contains=["[B]"])
+    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
+
+    np.testing.assert_allclose(_numeric_column(body, x_idx), np.asarray(plotted_x, dtype=float))
+    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
+    assert "105.0" not in clipboard.last_text
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_uses_synchronized_secondary_axis_trace_after_set_data_refresh(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "B": np.array([10.0, 20.0, 30.0], dtype=float),
+            "C": np.array([5.0, 6.0, 7.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    panel._add_secondary_y_axis()
+
+    panel.set_data(
+        np.array([4.0, 5.0, 6.0], dtype=float),
+        {
+            "A": np.array([11.0, 12.0, 13.0], dtype=float),
+            "B": np.array([40.0, 50.0, 60.0], dtype=float),
+            "C": np.array([15.0, 16.0, 17.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    QtWidgets.QApplication.processEvents()
+
+    secondary_item = panel._secondary_y_items["C"]
+    plotted_x, plotted_y = secondary_item.getData()
+    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), np.array([4.0, 5.0, 6.0], dtype=float))
+    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), np.array([15.0, 16.0, 17.0], dtype=float))
+
+    panel._series["C"] = np.array([215.0, 216.0, 217.0], dtype=float)
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    body = rows[1:]
+    time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
+    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
+
+    np.testing.assert_allclose(_numeric_column(body, time_idx), np.asarray(plotted_x, dtype=float))
+    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
+    assert "215.0" not in clipboard.last_text
+
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):

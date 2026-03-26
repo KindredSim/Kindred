@@ -672,6 +672,13 @@ if PYQTGRAPH_AVAILABLE:
                     names.append(series_name)
             return names
 
+        def _primary_copy_series_array(self, series_name: str) -> np.ndarray:
+            secondary_item = self._secondary_y_items.get(str(series_name))
+            if secondary_item is not None:
+                _, y_data = secondary_item.getData()
+                return _try_1d_float_array(y_data)
+            return _try_1d_float_array(self._series.get(series_name))
+
         @staticmethod
         def _qualified_copy_header(block_label: Optional[str], column_label: str) -> str:
             label = str(block_label or "").strip()
@@ -731,7 +738,7 @@ if PYQTGRAPH_AVAILABLE:
 
             primary_y_added = 0
             for name in primary_visible_y_names:
-                y_array = _try_1d_float_array(self._series.get(name))
+                y_array = self._primary_copy_series_array(name)
                 if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
                     continue
                 self._append_copy_column(
@@ -1382,6 +1389,7 @@ if PYQTGRAPH_AVAILABLE:
             self._active_overlay_series = overlays
             self._overlay_panel.set_status_messages(warnings)
             self._draw_overlay_series(overlays)
+            self._sync_secondary_y_items()
             self._refresh_view_after_plot_update()
 
         def _refresh_view_after_plot_update(self) -> None:
@@ -2116,25 +2124,59 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_item.vb.sigResized.connect(update_views)
 
             # Plot selected series on secondary axis
-            x_data, _ = self._get_x_data()
-            if x_data is not None and item in self._series:
-                y_data = self._series[item]
+            if item in self._series:
                 color = self._colors.get(item, (100, 100, 100))
                 pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
-
-                plot_item = pg.PlotDataItem(x_data, y_data, pen=pen, name=f"{item} (secondary)")
+                plot_item = pg.PlotDataItem([], [], pen=pen, name=f"{item} (secondary)")
                 self._secondary_y_axis.addItem(plot_item)
                 self._secondary_y_items[item] = plot_item
-
-                # Set label
-                self._plot_item.setLabel('right', item, units='M')
-                self._plot_item.getAxis('right').setPen('k' if not self._dark_mode else '#e0e0e0')
-                self._plot_item.getAxis('right').setTextPen('k' if not self._dark_mode else '#e0e0e0')
-
-                update_views()
-                self._apply_axis_inversion_state()
-
+                self._sync_secondary_y_items()
                 logger.info(f"Added secondary Y-axis for series: {item}")
+
+        def _remove_secondary_y_item(self, series_name: str) -> None:
+            plot_item = self._secondary_y_items.pop(series_name, None)
+            if plot_item is None or self._secondary_y_axis is None:
+                return
+            try:
+                self._secondary_y_axis.removeItem(plot_item)
+            except Exception:
+                logger.debug("Failed to remove secondary axis item '%s'", series_name, exc_info=True)
+
+        def _sync_secondary_y_items(self) -> None:
+            if self._secondary_y_axis is None:
+                self._secondary_y_items.clear()
+                return
+            if not self._secondary_y_items:
+                self._remove_secondary_y_axis()
+                return
+
+            x_data, _ = self._get_x_data()
+            x_array = _try_1d_float_array(x_data)
+            stale_names: List[str] = []
+
+            for series_name, plot_item in list(self._secondary_y_items.items()):
+                y_array = _try_1d_float_array(self._series.get(series_name))
+                if x_array.size == 0 or y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                    stale_names.append(str(series_name))
+                    continue
+                plot_item.setData(x=x_array, y=y_array)
+
+            for series_name in stale_names:
+                self._remove_secondary_y_item(series_name)
+
+            if not self._secondary_y_items:
+                self._remove_secondary_y_axis()
+                return
+
+            label_name = next(iter(self._secondary_y_items.keys()))
+            self._plot_item.setLabel('right', label_name, units='M')
+            self._plot_item.getAxis('right').setPen('k' if not self._dark_mode else '#e0e0e0')
+            self._plot_item.getAxis('right').setTextPen('k' if not self._dark_mode else '#e0e0e0')
+
+            resize_handler = self._secondary_y_resize_handler
+            if resize_handler is not None:
+                resize_handler()
+            self._apply_axis_inversion_state()
 
         def _remove_secondary_y_axis(self):
             """Remove secondary Y-axis."""
