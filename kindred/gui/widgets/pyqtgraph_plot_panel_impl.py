@@ -657,12 +657,20 @@ if PYQTGRAPH_AVAILABLE:
             self._toolbar.select_y(valid)
             self._on_y_selection_changed(valid)
 
-        def _visible_copy_series_names(self) -> List[str]:
+        def _visible_overlay_copy_series_names(self) -> List[str]:
             toolbar = getattr(self, "_toolbar", None)
             if toolbar is None:
                 return []
             selected = list(toolbar.selected_y())
             return [name for name in selected if name in self._series and self._visible.get(name, True)]
+
+        def _visible_primary_copy_series_names(self) -> List[str]:
+            names = list(self._visible_overlay_copy_series_names())
+            for name in self._secondary_y_items.keys():
+                series_name = str(name)
+                if series_name in self._series and series_name not in names:
+                    names.append(series_name)
+            return names
 
         @staticmethod
         def _qualified_copy_header(block_label: Optional[str], column_label: str) -> str:
@@ -690,13 +698,14 @@ if PYQTGRAPH_AVAILABLE:
                 return
             columns.append((str(header), array))
 
-        def _build_visible_copy_columns(self) -> List[Tuple[str, np.ndarray]]:
+        def _build_visible_copy_blocks(self) -> List[List[Tuple[str, np.ndarray]]]:
             if self._t is None or not self._series:
                 raise ValueError("No simulation data is available to copy.")
 
-            visible_y_names = self._visible_copy_series_names()
-            if not visible_y_names:
+            primary_visible_y_names = self._visible_primary_copy_series_names()
+            if not primary_visible_y_names:
                 raise ValueError("No visible Y-series are available to copy.")
+            overlay_visible_y_names = self._visible_overlay_copy_series_names()
 
             x_data, x_label = self._get_x_data()
             x_array = _try_1d_float_array(x_data)
@@ -704,34 +713,36 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("The current X-axis has no visible data to copy.")
 
             x_name = str(self._x_axis_name or "t")
-            columns: List[Tuple[str, np.ndarray]] = []
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
             primary_label = str(self._simulation_set_label or "").strip()
+            primary_columns: List[Tuple[str, np.ndarray]] = []
 
             self._append_copy_column(
-                columns,
+                primary_columns,
                 header=self._qualified_copy_header(primary_label, "Time (s)"),
                 values=self._t,
             )
             if x_name != "t":
                 self._append_copy_column(
-                    columns,
+                    primary_columns,
                     header=self._qualified_copy_header(primary_label, x_label),
                     values=x_array,
                 )
 
             primary_y_added = 0
-            for name in visible_y_names:
+            for name in primary_visible_y_names:
                 y_array = _try_1d_float_array(self._series.get(name))
                 if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
                     continue
                 self._append_copy_column(
-                    columns,
+                    primary_columns,
                     header=self._copy_series_header(primary_label, name),
                     values=y_array,
                 )
                 primary_y_added += 1
             if primary_y_added == 0:
                 raise ValueError("No visible primary simulation series are eligible for copy.")
+            blocks.append(primary_columns)
 
             for entry in list(self._simulation_overlays or []):
                 if not isinstance(entry, dict):
@@ -758,7 +769,7 @@ if PYQTGRAPH_AVAILABLE:
                 )
 
                 overlay_y_added = 0
-                for name in visible_y_names:
+                for name in overlay_visible_y_names:
                     y_array = _try_1d_float_array(overlay_series.get(name))
                     if y_array.size == 0 or y_array.shape[0] != x_overlay_array.shape[0]:
                         continue
@@ -769,7 +780,7 @@ if PYQTGRAPH_AVAILABLE:
                     )
                     overlay_y_added += 1
                 if overlay_y_added:
-                    columns.extend(overlay_columns)
+                    blocks.append(overlay_columns)
 
             for overlay in list(self._active_overlay_series or []):
                 x_overlay_array = _try_1d_float_array(overlay.x)
@@ -777,17 +788,30 @@ if PYQTGRAPH_AVAILABLE:
                 if x_overlay_array.size == 0 or y_overlay_array.size == 0:
                     continue
                 block_label = str(overlay.dataset or "").strip()
+                dataset_columns: List[Tuple[str, np.ndarray]] = []
                 self._append_copy_column(
-                    columns,
+                    dataset_columns,
                     header=self._qualified_copy_header(block_label, x_label),
                     values=x_overlay_array,
                 )
                 self._append_copy_column(
-                    columns,
+                    dataset_columns,
                     header=self._copy_series_header(block_label, str(overlay.species)),
                     values=y_overlay_array,
                 )
+                if dataset_columns:
+                    blocks.append(dataset_columns)
 
+            return blocks
+
+        @staticmethod
+        def _flatten_copy_blocks(blocks: Sequence[Sequence[Tuple[str, np.ndarray]]]) -> List[Tuple[str, np.ndarray]]:
+            columns: List[Tuple[str, np.ndarray]] = []
+            non_empty_blocks = [list(block) for block in blocks if list(block)]
+            for idx, block in enumerate(non_empty_blocks):
+                if idx > 0:
+                    columns.append(("", np.asarray([], dtype=float)))
+                columns.extend(block)
             return columns
 
         @staticmethod
@@ -818,7 +842,7 @@ if PYQTGRAPH_AVAILABLE:
 
         def _copy_visible_data(self) -> None:
             try:
-                columns = self._build_visible_copy_columns()
+                columns = self._flatten_copy_blocks(self._build_visible_copy_blocks())
                 header, rows = self._copy_columns_to_rows(columns)
                 clipboard = self._get_clipboard()
                 if clipboard is None:

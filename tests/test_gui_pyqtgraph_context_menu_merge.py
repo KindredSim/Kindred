@@ -279,6 +279,7 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     panel.set_selected_series(["A", "C"])
     panel._on_x_axis_changed("B")
     panel._add_secondary_y_axis()
+    panel.set_selected_series(["A"])
 
     panel.set_overlay_catalog(
         {
@@ -311,12 +312,22 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     assert primary_cols
     assert overlay_cols
     assert dataset_cols
-    assert max(primary_cols) < min(overlay_cols) < min(dataset_cols)
+    assert header[0] != ""
+    assert header[-1] != ""
+    assert max(primary_cols) + 2 == min(overlay_cols)
+    assert header[max(primary_cols) + 1] == ""
+    assert max(overlay_cols) + 2 == min(dataset_cols)
+    assert header[max(overlay_cols) + 1] == ""
 
     primary_headers = [header[idx] for idx in primary_cols]
     assert any("Time" in cell for cell in primary_headers)
     assert any("[B]" in cell for cell in primary_headers)
     assert any("C" in cell and "[right axis]" in cell for cell in primary_headers)
+    assert any("A" in cell for cell in primary_headers)
+
+    overlay_headers = [header[idx] for idx in overlay_cols]
+    assert any("A" in cell for cell in overlay_headers)
+    assert all("C" not in cell for cell in overlay_headers)
 
     dataset_headers = [header[idx] for idx in dataset_cols]
     assert any("A" in cell for cell in dataset_headers)
@@ -336,6 +347,50 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     assert body[3][overlay_y_idx] == ""
     assert body[2][dataset_x_idx] == ""
     assert body[2][dataset_y_idx] == ""
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_includes_secondary_axis_only_primary_trace_without_warning(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    warning_calls = []
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(
+        QtWidgets.QInputDialog,
+        "getItem",
+        lambda *args, **kwargs: ("C", True),
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warning_calls.append((args, kwargs)),
+    )
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([5.0, 6.0, 7.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel._add_secondary_y_axis()
+    panel.set_selected_series([])
+    QtWidgets.QApplication.processEvents()
+
+    panel._copy_visible_data()
+
+    assert warning_calls == []
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    primary_headers = [cell for cell in rows[0] if cell.startswith("set1::")]
+    assert any("Time" in cell for cell in primary_headers)
+    assert any("C" in cell and "[right axis]" in cell for cell in primary_headers)
+    assert all("A" not in cell for cell in primary_headers)
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
