@@ -3875,11 +3875,13 @@ def test_slider_preview_multiselect_shows_clean_canonical_and_dirty_canonical_gh
         slider_triggered=True,
     )
 
+    main_window._status_label.setText("Preview pending for current selection.")
     assert controller._flush_slider_plot_updates() is True
     qt_app.processEvents()
 
     plot = main_window._plot_tabs._main_plot
     assert main_window.active_batch_selection()[0] == dirty_primary_id
+    assert main_window._status_label.text() == f"Loaded 1 species, {preview_t.size} timepoints"
     assert np.allclose(
         np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
         dirty_preview,
@@ -3903,6 +3905,201 @@ def test_slider_preview_multiselect_shows_clean_canonical_and_dirty_canonical_gh
     assert np.allclose(
         np.asarray((dirty_primary_ghost.get("series") or {})["A"], dtype=float),
         primary_canonical,
+    )
+
+
+def test_workspace_aware_preview_display_clears_stale_pending_status_after_success(
+    main_window,
+    qt_app,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(selected_ids) == 2
+    dirty_primary_id = selected_ids[0]
+    clean_secondary_id = selected_ids[1]
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "workspace-aware-preview-status-success-explicit-key"
+    primary_canonical = np.asarray([7.0, 14.0], dtype=float)
+    secondary_canonical = np.asarray([3.0, 6.0], dtype=float)
+    for set_id, series in (
+        (dirty_primary_id, primary_canonical),
+        (clean_secondary_id, secondary_canonical),
+    ):
+        cache.result_cache[f"{explicit_key}::{set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": series},
+            "algebra_scalars": {},
+        }
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = tuple(selected_ids)
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[dirty_primary_id])
+
+    preview_t = _current_preview_time_axis(main_window)
+    dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
+    preview_key = "workspace-aware-preview-status-success-preview-key"
+    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
+    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        set_id=dirty_primary_id,
+        mechanism_text=mechanism_text,
+    )
+    cache.preview_cache[f"{preview_key}::{dirty_primary_id}"] = {
+        "t": preview_t,
+        "series": {"A": dirty_preview},
+        "algebra_scalars": {},
+        "mechanism_text": mechanism_text,
+        "solver_config": dict(solver_config),
+        "preview_batch_cache_token": str(preview_token or ""),
+    }
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = tuple(selected_ids)
+
+    main_window._status_label.setText("Preview pending for current selection.")
+    assert (
+        main_window.display_cached_batch_selection(
+            cache_key=preview_key,
+            selected_sets=selected_ids,
+            prefer_set=dirty_primary_id,
+            cache_store=cache.preview_cache,
+            allow_fallback=False,
+        )
+        is True
+    )
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    assert main_window._status_label.text() == f"Loaded 1 species, {preview_t.size} timepoints"
+    assert main_window.active_batch_selection()[0] == dirty_primary_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        dirty_preview,
+    )
+    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
+    assert any(
+        str(entry.get("set_id") or "") == clean_secondary_id
+        and str(entry.get("curve_role") or "") != "canonical_ghost"
+        for entry in overlays
+    )
+    assert any(
+        str(entry.get("set_id") or "") == dirty_primary_id
+        and str(entry.get("curve_role") or "") == "canonical_ghost"
+        for entry in overlays
+    )
+
+
+@pytest.mark.parametrize(
+    ("initial_status", "stage_missing_preview", "seed_missing_explicit", "expected_status"),
+    [
+        (
+            "Result not cached (evicted). Press Run to compute.",
+            True,
+            False,
+            "Preview pending for current selection.",
+        ),
+        (
+            "Preview pending for current selection.",
+            False,
+            True,
+            "Result not cached (evicted). Press Run to compute.",
+        ),
+    ],
+)
+def test_workspace_aware_preview_partial_success_uses_current_selection_warning(
+    main_window,
+    qt_app,
+    initial_status,
+    stage_missing_preview,
+    seed_missing_explicit,
+    expected_status,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(selected_ids) == 2
+    dirty_primary_id = selected_ids[0]
+    secondary_id = selected_ids[1]
+
+    cache = main_window.simulation_controller.batch_cache
+    if seed_missing_explicit:
+        explicit_key = "workspace-aware-preview-partial-status-explicit-key"
+        cache.result_cache[f"{explicit_key}::{dirty_primary_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
+            "algebra_scalars": {},
+        }
+        cache.active_cache_key = explicit_key
+        cache.active_cache_valid_set_ids = (dirty_primary_id,)
+    else:
+        cache.active_cache_key = None
+        cache.active_cache_valid_set_ids = None
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[dirty_primary_id])
+    if stage_missing_preview:
+        main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[secondary_id])
+
+    preview_t = _current_preview_time_axis(main_window)
+    dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
+    preview_key = "workspace-aware-preview-partial-status-preview-key"
+    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
+    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        set_id=dirty_primary_id,
+        mechanism_text=mechanism_text,
+    )
+    cache.preview_cache[f"{preview_key}::{dirty_primary_id}"] = {
+        "t": preview_t,
+        "series": {"A": dirty_preview},
+        "algebra_scalars": {},
+        "mechanism_text": mechanism_text,
+        "solver_config": dict(solver_config),
+        "preview_batch_cache_token": str(preview_token or ""),
+    }
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = tuple(selected_ids)
+
+    assert initial_status != expected_status
+    main_window._status_label.setText(initial_status)
+    assert (
+        main_window.display_cached_batch_selection(
+            cache_key=preview_key,
+            selected_sets=selected_ids,
+            prefer_set=dirty_primary_id,
+            cache_store=cache.preview_cache,
+            allow_fallback=False,
+        )
+        is True
+    )
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    assert main_window._status_label.text() == expected_status
+    assert main_window.active_batch_selection()[0] == dirty_primary_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        dirty_preview,
     )
 
 

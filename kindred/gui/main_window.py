@@ -3475,10 +3475,6 @@ class MainWindow(
         """Public API used by controllers (avoid reaching into `_` widget fields)."""
         self._status_label.setText(str(text))
 
-    def current_status_text(self) -> str:
-        """Public API used by controllers to preserve higher-priority status messages."""
-        return str(self._status_label.text() or "")
-
     def main_plot_has_data(self) -> bool:
         plot = self.main_plot()
         return bool(getattr(plot, "_series", {})) and getattr(plot, "_t", None) is not None
@@ -3956,6 +3952,10 @@ class MainWindow(
                 self._record_current_main_plot_workspace_preview_provenance(
                     selected_set_ids=normalized_selected_sets
                 )
+                if outcome_reason == "preview_pending":
+                    self.set_status_text("Preview pending for current selection.")
+                else:
+                    self.set_status_text("Result not cached (evicted). Press Run to compute.")
             return bool(outcome.displayed)
         return False
 
