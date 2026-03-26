@@ -625,6 +625,124 @@ def test_copy_visible_data_respects_coarse_sampling_for_secondary_axis_after_set
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_respects_coarse_sampling_for_overlay_blocks(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+
+    t_primary = np.linspace(0.0, 10.0, 2000)
+    t_overlay = np.linspace(0.0, 5.0, 1500)
+    t_dataset = np.linspace(0.0, 3.0, 1600)
+    panel.set_data(
+        t_primary,
+        {
+            "A": np.sin(t_primary),
+            "B": np.cos(t_primary),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "t": t_overlay,
+                "series": {
+                    "A": np.linspace(10.0, 20.0, 1500),
+                    "B": np.linspace(30.0, 40.0, 1500),
+                },
+            }
+        ],
+    )
+    panel.set_selected_series(["A"])
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": t_dataset,
+                "species": {
+                    "A": np.linspace(100.0, 200.0, 1600),
+                    "B": np.linspace(300.0, 400.0, 1600),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A"}
+    panel._on_toolbar_option_requested("sampling", "coarse")
+    panel._update_plot()
+    QtWidgets.QApplication.processEvents()
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    body = rows[1:]
+    overlay_x_idx = _find_header_index(header, prefix="set2::", contains=["Time"])
+    overlay_y_idx = _find_header_index(header, prefix="set2::", contains=["A"])
+    dataset_x_idx = _find_header_index(header, prefix="ds1::", contains=["Time"])
+    dataset_y_idx = _find_header_index(header, prefix="ds1::", contains=["A"])
+
+    overlay_expected_idx = np.unique(np.linspace(0, t_overlay.shape[0] - 1, num=panel._sampling_target, dtype=int))
+    dataset_expected_idx = np.unique(np.linspace(0, t_dataset.shape[0] - 1, num=panel._sampling_target, dtype=int))
+
+    assert len(body) == panel._sampling_target
+    np.testing.assert_allclose(_numeric_column(body, overlay_x_idx), t_overlay[overlay_expected_idx])
+    np.testing.assert_allclose(
+        _numeric_column(body, overlay_y_idx),
+        np.linspace(10.0, 20.0, 1500)[overlay_expected_idx],
+    )
+    np.testing.assert_allclose(_numeric_column(body, dataset_x_idx), t_dataset[dataset_expected_idx])
+    np.testing.assert_allclose(
+        _numeric_column(body, dataset_y_idx),
+        np.linspace(100.0, 200.0, 1600)[dataset_expected_idx],
+    )
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_keeps_species_x_plot_usable_when_time_mismatches(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    warning_calls = []
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warning_calls.append((args, kwargs)),
+    )
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "B": np.array([1.0, 2.0, 3.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    primary_key = panel._format_species_set_label("A", "set1")
+    assert primary_key in panel._plot_items
+
+    panel._copy_visible_data()
+
+    assert warning_calls == []
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    primary_headers = [cell for cell in rows[0] if cell.startswith("set1::")]
+    assert all("Time" not in cell for cell in primary_headers)
+    assert any("[B]" in cell for cell in primary_headers)
+    assert any(cell.endswith("::A") or cell == "set1::A" for cell in primary_headers)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
     try:

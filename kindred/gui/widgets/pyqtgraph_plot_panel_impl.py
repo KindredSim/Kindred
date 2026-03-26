@@ -690,7 +690,7 @@ if PYQTGRAPH_AVAILABLE:
 
         def _current_primary_plot_basis(
             self,
-        ) -> Optional[Tuple[str, str, np.ndarray, np.ndarray, np.ndarray, object]]:
+        ) -> Optional[Tuple[str, str, np.ndarray, np.ndarray, Optional[np.ndarray], object]]:
             x_name = str(self._x_axis_name or "t")
             x_data, x_label = self._get_x_data()
             x_array = _try_1d_float_array(x_data)
@@ -699,9 +699,9 @@ if PYQTGRAPH_AVAILABLE:
             sample_idx = self._get_sampling_indices(x_array.shape[0])
             x_plot = self._apply_sample_indices(x_array, sample_idx)
             t_array = _try_1d_float_array(self._t)
-            if t_array.size == 0 or t_array.shape[0] != x_array.shape[0]:
-                return None
-            t_plot = self._apply_sample_indices(t_array, sample_idx)
+            t_plot: Optional[np.ndarray] = None
+            if t_array.size != 0 and t_array.shape[0] == x_array.shape[0]:
+                t_plot = self._apply_sample_indices(t_array, sample_idx)
             return x_name, x_label, x_array, x_plot, t_plot, sample_idx
 
         @staticmethod
@@ -748,11 +748,12 @@ if PYQTGRAPH_AVAILABLE:
             primary_label = str(self._simulation_set_label or "").strip()
             primary_columns: List[Tuple[str, np.ndarray]] = []
 
-            self._append_copy_column(
-                primary_columns,
-                header=self._qualified_copy_header(primary_label, "Time (s)"),
-                values=t_plot,
-            )
+            if t_plot is not None:
+                self._append_copy_column(
+                    primary_columns,
+                    header=self._qualified_copy_header(primary_label, "Time (s)"),
+                    values=t_plot,
+                )
             if x_name != "t":
                 self._append_copy_column(
                     primary_columns,
@@ -795,12 +796,14 @@ if PYQTGRAPH_AVAILABLE:
                 x_overlay_array = _try_1d_float_array(x_overlay)
                 if x_overlay_array.size == 0:
                     continue
+                overlay_sample_idx = self._get_sampling_indices(x_overlay_array.shape[0])
+                x_overlay_plot = self._apply_sample_indices(x_overlay_array, overlay_sample_idx)
 
                 overlay_columns: List[Tuple[str, np.ndarray]] = []
                 self._append_copy_column(
                     overlay_columns,
                     header=self._qualified_copy_header(block_label, x_label),
-                    values=x_overlay_array,
+                    values=x_overlay_plot,
                 )
 
                 overlay_y_added = 0
@@ -808,10 +811,11 @@ if PYQTGRAPH_AVAILABLE:
                     y_array = _try_1d_float_array(overlay_series.get(name))
                     if y_array.size == 0 or y_array.shape[0] != x_overlay_array.shape[0]:
                         continue
+                    y_plot = self._apply_sample_indices(y_array, overlay_sample_idx)
                     self._append_copy_column(
                         overlay_columns,
                         header=self._copy_series_header(block_label, name),
-                        values=y_array,
+                        values=y_plot,
                     )
                     overlay_y_added += 1
                 if overlay_y_added:
@@ -822,17 +826,18 @@ if PYQTGRAPH_AVAILABLE:
                 y_overlay_array = _try_1d_float_array(overlay.y)
                 if x_overlay_array.size == 0 or y_overlay_array.size == 0:
                     continue
+                x_overlay_plot, y_overlay_plot = self._sample_xy(x_overlay_array, y_overlay_array)
                 block_label = str(overlay.dataset or "").strip()
                 dataset_columns: List[Tuple[str, np.ndarray]] = []
                 self._append_copy_column(
                     dataset_columns,
                     header=self._qualified_copy_header(block_label, x_label),
-                    values=x_overlay_array,
+                    values=x_overlay_plot,
                 )
                 self._append_copy_column(
                     dataset_columns,
                     header=self._copy_series_header(block_label, str(overlay.species)),
-                    values=y_overlay_array,
+                    values=y_overlay_plot,
                 )
                 if dataset_columns:
                     blocks.append(dataset_columns)
