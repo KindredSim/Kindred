@@ -49,6 +49,7 @@ class ResultsControllerPort:
     show_simulation_tab: Callable[[], None]
     refresh_simulation_plot_views: Callable[[], None]
     schedule_main_plot_refresh: Callable[[Sequence[int]], None]
+    current_status_text: Callable[[], str]
     set_status_text: Callable[[str], None]
 
 
@@ -97,6 +98,17 @@ class ResultsController(QtCore.QObject):
     def __init__(self, ui: ResultsControllerPort):
         super().__init__(ui.parent)
         self._ui = ui
+
+    def _preserve_existing_status_text(self) -> bool:
+        try:
+            current = str(self._ui.current_status_text() or "")
+        except Exception:
+            return False
+        return current in {
+            "Preview pending for current selection.",
+            "Result not cached (evicted). Press Run to compute.",
+            "Cached result invalid. Press Run to compute.",
+        }
 
     def _main_plot(self) -> object | None:
         try:
@@ -664,7 +676,8 @@ class ResultsController(QtCore.QObject):
             self._ui.show_simulation_tab()
             self._ui.refresh_simulation_plot_views()
             self._ui.schedule_main_plot_refresh((50, 100))
-            self._ui.set_status_text(f"Loaded {len(series)} species, {len(t)} timepoints")
+            if not self._preserve_existing_status_text():
+                self._ui.set_status_text(f"Loaded {len(series)} species, {len(t)} timepoints")
             logger.info("Data set: %s species, %s points", int(len(series)), int(len(t)))
         except Exception as exc:
             logger.warning("Failed to set data: %s", exc, exc_info=True)

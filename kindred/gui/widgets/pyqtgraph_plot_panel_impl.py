@@ -167,6 +167,7 @@ if PYQTGRAPH_AVAILABLE:
             *,
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
+            enable_canonical_ghost_toggle_action: bool = False,
         ):
             """
             Initialize PyQtGraph plot panel.
@@ -207,6 +208,8 @@ if PYQTGRAPH_AVAILABLE:
             self._secondary_y_items: Dict[str, pg.PlotDataItem] = {}
             self._log_x: bool = False
             self._log_y: bool = False
+            self._show_canonical_ghost_lines: bool = True
+            self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
             self._annotations: List[pg.TextItem] = []
             self._sampling_mode: str = "dense"
             self._sampling_target: int = 1000
@@ -1096,6 +1099,8 @@ if PYQTGRAPH_AVAILABLE:
                         continue
                     set_label = str(entry.get("label") or "")
                     curve_role = str(entry.get("curve_role") or "")
+                    if curve_role == "canonical_ghost" and not self._show_canonical_ghost_lines:
+                        continue
                     if not set_label:
                         continue
                     t_overlay = entry.get("t")
@@ -1777,6 +1782,14 @@ if PYQTGRAPH_AVAILABLE:
 
             menu.addSeparator()
 
+            if self._enable_canonical_ghost_toggle_action:
+                ghost_action = menu.addAction("Show Canonical Reference Lines")
+                ghost_action.setCheckable(True)
+                ghost_action.setChecked(self._show_canonical_ghost_lines)
+                ghost_action.setEnabled(self._has_canonical_ghost_overlays())
+                ghost_action.toggled.connect(self._set_canonical_ghost_lines_visible)
+                menu.addSeparator()
+
             # Axis range actions
             axis_range_action = menu.addAction("Custom Axis Ranges...")
             axis_range_action.triggered.connect(self._show_axis_range_dialog)
@@ -1904,6 +1917,21 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_item.hideAxis('right')
 
             logger.info("Removed secondary Y-axis")
+
+        def _has_canonical_ghost_overlays(self) -> bool:
+            for entry in (self._simulation_overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
+                    return True
+            return False
+
+        def _set_canonical_ghost_lines_visible(self, visible: bool) -> None:
+            show = bool(visible)
+            if self._show_canonical_ghost_lines == show:
+                return
+            self._show_canonical_ghost_lines = show
+            self._update_plot()
 
         def _toggle_log_x(self):
             """Toggle X-axis log scale."""

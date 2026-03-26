@@ -3475,6 +3475,10 @@ class MainWindow(
         """Public API used by controllers (avoid reaching into `_` widget fields)."""
         self._status_label.setText(str(text))
 
+    def current_status_text(self) -> str:
+        """Public API used by controllers to preserve higher-priority status messages."""
+        return str(self._status_label.text() or "")
+
     def main_plot_has_data(self) -> bool:
         plot = self.main_plot()
         return bool(getattr(plot, "_series", {})) and getattr(plot, "_t", None) is not None

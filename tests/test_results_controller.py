@@ -44,6 +44,7 @@ def _make_results_ui(plot: object) -> SimpleNamespace:
         show_simulation_tab=lambda: None,
         refresh_simulation_plot_views=lambda: None,
         schedule_main_plot_refresh=lambda _delays: None,
+        current_status_text=lambda: "Ready",
         set_status_text=lambda _text: None,
     )
 
@@ -392,3 +393,37 @@ def test_fallback_path_must_not_return_invalidated_cached_result_as_available() 
     assert outcome.displayed is False, (
         "Fallback path returned an invalidated cache entry as available"
     )
+
+
+def test_set_data_does_not_clobber_preview_pending_status_text() -> None:
+    plot = MagicMock()
+    ui = _make_results_ui(plot)
+    ui.set_status_text = MagicMock()
+    ui.current_status_text = lambda: "Preview pending for current selection."
+    controller = ResultsController(ui)
+
+    controller.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 0.5], dtype=float)},
+        label="set1",
+        overlays=[],
+    )
+
+    ui.set_status_text.assert_not_called()
+
+
+def test_set_data_still_updates_ready_status_text() -> None:
+    plot = MagicMock()
+    ui = _make_results_ui(plot)
+    ui.set_status_text = MagicMock()
+    ui.current_status_text = lambda: "Ready"
+    controller = ResultsController(ui)
+
+    controller.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 0.5], dtype=float)},
+        label="set1",
+        overlays=[],
+    )
+
+    ui.set_status_text.assert_called_once_with("Loaded 1 species, 2 timepoints")

@@ -357,6 +357,7 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
         show_simulation_tab=main_window.show_simulation_tab,
         refresh_simulation_plot_views=main_window.refresh_simulation_plot_views,
         schedule_main_plot_refresh=main_window.schedule_main_plot_refresh,
+        current_status_text=main_window.current_status_text,
         set_status_text=main_window.set_status_text,
     )
     results_controller = ResultsController(results_port)
