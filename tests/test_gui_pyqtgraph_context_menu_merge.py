@@ -743,6 +743,66 @@ def test_copy_visible_data_keeps_species_x_plot_usable_when_time_mismatches(qtbo
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_species_x_partial_render_state_filters_incompatible_y_series_across_render_export_hover_and_copy(
+    qtbot, monkeypatch
+):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    warning_calls = []
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warning_calls.append((args, kwargs)),
+    )
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "B": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([7.0, 8.0, 9.0, 10.0, 11.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    rendered_keys = set(panel._plot_items.keys())
+    assert panel._format_species_set_label("A", "set1") in rendered_keys
+    assert panel._format_species_set_label("C", "set1") not in rendered_keys
+
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert any(header == "A" for header in axis_header)
+    assert "C" not in axis_header
+
+    all_header, all_rows = panel.build_visible_export("all")
+    assert all_rows
+    assert any(header == "A" for header in all_header)
+    assert "C" not in all_header
+
+    x_data = np.asarray(panel._get_x_data()[0], dtype=float)
+    hit = panel._find_nearest_data_point(2.0, 20.0, x_data)
+    assert hit is not None
+    assert hit.label == "A"
+
+    panel._copy_visible_data()
+
+    assert warning_calls == []
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    primary_headers = [cell for cell in rows[0] if cell.startswith("set1::")]
+    assert any(cell.endswith("::A") or cell == "set1::A" for cell in primary_headers)
+    assert all(not cell.endswith("::C") and "C [right axis]" not in cell for cell in primary_headers)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
     try:

@@ -657,12 +657,41 @@ if PYQTGRAPH_AVAILABLE:
             self._toolbar.select_y(valid)
             self._on_y_selection_changed(valid)
 
+        def _current_axis_renderable_series_names(
+            self,
+            names: Sequence[str],
+            *,
+            require_visible: bool,
+        ) -> List[str]:
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
+                return []
+            x_array = primary_basis[2]
+            renderable: List[str] = []
+            seen: Set[str] = set()
+            for raw_name in names:
+                name = str(raw_name)
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name not in self._series:
+                    continue
+                if require_visible and not self._visible.get(name, True):
+                    continue
+                y_array = _try_1d_float_array(self._series.get(name))
+                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                    continue
+                renderable.append(name)
+            return renderable
+
         def _visible_overlay_copy_series_names(self) -> List[str]:
             toolbar = getattr(self, "_toolbar", None)
             if toolbar is None:
                 return []
-            selected = list(toolbar.selected_y())
-            return [name for name in selected if name in self._series and self._visible.get(name, True)]
+            return self._current_axis_renderable_series_names(
+                list(toolbar.selected_y()),
+                require_visible=True,
+            )
 
         def _visible_primary_copy_series_names(self) -> List[str]:
             names = list(self._visible_overlay_copy_series_names())
@@ -1310,23 +1339,21 @@ if PYQTGRAPH_AVAILABLE:
                 self._plot_item.setLabel('left', 'Concentration', units='M')
             else:
                 # In parametric mode, Y label depends on selected series
-                selected = self._toolbar.selected_y()
+                selected = self._current_axis_renderable_series_names(
+                    list(self._toolbar.selected_y()),
+                    require_visible=True,
+                )
                 if selected:
                     self._plot_item.setLabel('left', f'{selected[0]}', units='M')
 
             # Add visible series (only those selected in toolbar)
-            selected_series = list(self._toolbar.selected_y())
+            selected_series = self._current_axis_renderable_series_names(
+                list(self._toolbar.selected_y()),
+                require_visible=True,
+            )
             active_curve_keys: Set[str] = set()
             for name in selected_series:
-                if name not in self._series:
-                    continue
-                if not self._visible.get(name, True):
-                    continue
-
                 y_data = np.asarray(self._series[name], dtype=float).reshape(-1)
-                if y_data.shape[0] != x_array.shape[0]:
-                    logger.debug("Skipping series '%s': length mismatch with X axis", name)
-                    continue
                 color = self._colors.get(name, (100, 100, 100))
                 pen = pg.mkPen(color=color, width=2)
 
@@ -1552,13 +1579,17 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("No simulation data available to export.")
 
             if scope == "axis":
-                y_names = toolbar.selected_y()
+                y_names = self._current_axis_renderable_series_names(
+                    list(toolbar.selected_y()),
+                    require_visible=True,
+                )
                 if not y_names:
                     raise ValueError("Select at least one Y-series before exporting.")
             else:
-                y_names = list(series.keys())
-
-            y_names = [name for name in y_names if name in series]
+                y_names = self._current_axis_renderable_series_names(
+                    list(series.keys()),
+                    require_visible=False,
+                )
             if not y_names:
                 raise ValueError("No valid Y-series found to export.")
 
@@ -1578,12 +1609,10 @@ if PYQTGRAPH_AVAILABLE:
             for name in y_names:
                 arr = np.asarray(series[name], dtype=float).reshape(-1)
                 if arr.shape[0] != x_array.shape[0]:
-                    raise ValueError(
-                        f"Series '{name}' length ({arr.shape[0]}) does not match X-axis length ({x_array.shape[0]})."
-                    )
+                    continue
                 columns.append((name, arr))
 
-            overlay_series, warnings = self._build_overlay_series(list(self._toolbar.selected_y()))
+            overlay_series, warnings = self._build_overlay_series(list(y_names))
             active_overlays = self._overlay_panel.selected_datasets()
             if warnings and active_overlays:
                 warning_msg = "\n".join(f" - {msg}" for msg in warnings)
@@ -1919,13 +1948,14 @@ if PYQTGRAPH_AVAILABLE:
             y_range = view_box[1][1] - view_box[1][0]
 
             # Check each visible series
-            for name in self._toolbar.selected_y():
-                if name not in self._series:
+            visible_names = self._current_axis_renderable_series_names(
+                list(self._toolbar.selected_y()),
+                require_visible=True,
+            )
+            for name in visible_names:
+                y_data = _try_1d_float_array(self._series.get(name))
+                if y_data.shape[0] != x_data.shape[0]:
                     continue
-                if not self._visible.get(name, True):
-                    continue
-
-                y_data = self._series[name]
 
                 # Find nearest point in this series
                 # Normalize distances to account for different axis scales
