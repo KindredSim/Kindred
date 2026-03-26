@@ -6,7 +6,13 @@ pytestmark = [pytest.mark.gui]
 
 _DATASET_INVALID_MARK_ROLE = 0x10FF  # Qt.UserRole + offset, internal-only for tests
 
-def _make_window(*, selected_species: list[str]):
+
+def _make_window(
+    *,
+    selected_species: list[str],
+    entry_target_weights: dict[str, float] | None = None,
+    payload_target_weights: dict[str, float] | None = None,
+):
     from kindred.gui.fitting.window import FittingWindow
 
     t = np.linspace(0.0, 1.0, 5)
@@ -24,6 +30,8 @@ def _make_window(*, selected_species: list[str]):
             "include": True,
         }
     ]
+    if entry_target_weights is not None:
+        dataset_entries[0]["target_weights"] = dict(entry_target_weights)
     selected_rows = [np.asarray(dataset_entries[0]["species_data"][name]) for name in selected_species]
     dataset_payloads = [
         {
@@ -33,6 +41,8 @@ def _make_window(*, selected_species: list[str]):
             "species": list(selected_species),
         }
     ]
+    if payload_target_weights is not None:
+        dataset_payloads[0]["target_weights"] = dict(payload_target_weights)
     return FittingWindow(
         mode="global",
         parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
@@ -252,6 +262,37 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
         window._start_global_fit(config, selection)
         assert captured["starts"] == 2
         assert captured["datasets"][-1][0]["target_weights"] == {"A": 2.5}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_preloaded_target_weights_seed_applied_state_from_dataset_entry_before_payload(qt_app):
+    window = _make_window(
+        selected_species=["A"],
+        entry_target_weights={"A": 2.5},
+        payload_target_weights={"A": 9.0},
+    )
+    try:
+        assert window._fit_target_weights_applied["ds1"] == {"A": 2.5}
+        assert window._fit_target_weights_pending["ds1"]["A"] == 2.5
+        assert window._dataset_entries[0]["target_weights"] == {"A": 2.5}
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 2.5}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_preloaded_target_weights_fall_back_to_seeded_payload_when_entry_omits_them(qt_app):
+    window = _make_window(
+        selected_species=["A"],
+        payload_target_weights={"A": 3.5},
+    )
+    try:
+        assert window._fit_target_weights_applied["ds1"] == {"A": 3.5}
+        assert window._fit_target_weights_pending["ds1"]["A"] == 3.5
+        assert window._dataset_entries[0]["target_weights"] == {"A": 3.5}
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 3.5}
     finally:
         window.close()
         qt_app.processEvents()

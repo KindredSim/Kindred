@@ -376,6 +376,9 @@ class GlobalFitWorker(QtCore.QThread):
         dict[str, np.ndarray],
         dict[str, dict[str, float]],
     ]:
+        from kindred.core.analysis.global_fitting import _normalize_weights
+
+        normalized_weights = _normalize_weights(self._dataset_specs, self._weights)
         model_series: dict[str, dict[str, np.ndarray]] = {}
         residual_series: dict[str, dict[str, np.ndarray]] = {}
         plot_model_series: dict[str, dict[str, np.ndarray]] = {}
@@ -396,6 +399,7 @@ class GlobalFitWorker(QtCore.QThread):
                     spec,
                     shared_params=shared_params,
                     dataset_params=dataset_params,
+                    normalized_weights=normalized_weights,
                 )
                 if dataset_payload is None:
                     continue
@@ -432,6 +436,7 @@ class GlobalFitWorker(QtCore.QThread):
         *,
         shared_params: dict[str, float],
         dataset_params: dict[str, dict[str, float]],
+        normalized_weights: dict[str, float],
     ) -> Optional[
         tuple[
             dict[str, np.ndarray],
@@ -477,6 +482,8 @@ class GlobalFitWorker(QtCore.QThread):
             species_list=species_list,
             y_matrix=y_matrix,
             t_exp=t_exp,
+            target_weights=dict(getattr(spec, "target_weights", {}) or {}),
+            normalized_weights=normalized_weights,
             x_name=x_name,
             x_obs=x_obs,
             x_mode=x_mode,
@@ -549,6 +556,8 @@ class GlobalFitWorker(QtCore.QThread):
         species_list: list[str],
         y_matrix: np.ndarray,
         t_exp: np.ndarray,
+        target_weights: dict[str, float],
+        normalized_weights: dict[str, float],
         x_name: str,
         x_obs: Optional[np.ndarray],
         x_mode: str,
@@ -560,12 +569,20 @@ class GlobalFitWorker(QtCore.QThread):
         residual_for_ds: dict[str, np.ndarray] = {}
         plot_for_ds: dict[str, np.ndarray] = {}
 
+        from kindred.core.analysis.global_fitting import _normalized_target_weight_multipliers
+
+        dataset_weight = float(normalized_weights.get(ds_id, 1.0))
+        target_multipliers = _normalized_target_weight_multipliers(
+            species_list=species_list,
+            target_weights=target_weights,
+        )
         residual_blocks: list[np.ndarray] = []
         exp_blocks: list[np.ndarray] = []
         for idx, species_name in enumerate(species_list):
             if species_name not in sim_species:
                 continue
             y_exp = y_matrix[idx].reshape(-1)
+            effective_weight = dataset_weight * float(target_multipliers.get(str(species_name), 1.0))
             y_sim_raw = sim_species[species_name]
             if y_sim_raw.size == t_exp.size:
                 y_sim_time = y_sim_raw
@@ -607,9 +624,9 @@ class GlobalFitWorker(QtCore.QThread):
                     plot_vals = np.asarray(y_sim_raw, dtype=float).reshape(-1)
                     plot_for_ds[species_name] = np.asarray(plot_vals[plot_mask], dtype=float).reshape(-1)
 
-            residual = y_sim_resid - y_exp
+            residual = effective_weight * (np.asarray(y_sim_resid, dtype=float).reshape(-1) - y_exp)
             residual_for_ds[species_name] = residual
-            residual_blocks.append(y_exp - y_sim_resid)
+            residual_blocks.append(-residual)
             exp_blocks.append(y_exp)
 
         stats_for_ds: Optional[dict[str, float]] = None

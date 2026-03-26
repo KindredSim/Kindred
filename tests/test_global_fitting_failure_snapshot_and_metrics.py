@@ -8,6 +8,7 @@ from kindred.core.analysis.global_fitting import (
     _build_parameter_layout,
     _GlobalFitObjective,
     _normalize_weights,
+    fit_global,
 )
 from kindred.core.objective import ObjectiveContext
 from kindred.core.exceptions import FitSimulationError
@@ -149,6 +150,51 @@ def test_global_chi_squared_uses_full_objective_residuals_for_parametric_x_penal
     assert residuals.size == 2 * t_obs.size
     assert result.global_chi_squared == pytest.approx(expected_chi_squared)
     assert result.global_r_squared == pytest.approx(expected_r_squared)
+
+
+def test_global_fit_result_dataset_diagnostics_follow_target_weighted_residuals() -> None:
+    t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
+
+    def simulation_func(_params):
+        return {
+            "t": t_obs.copy(),
+            "species": {
+                "A": np.zeros_like(t_obs),
+                "B": np.zeros_like(t_obs),
+            },
+        }
+
+    result = fit_global(
+        simulation_func,
+        datasets=[
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": np.vstack([np.ones_like(t_obs), 2.0 * np.ones_like(t_obs)]),
+                "species": ["A", "B"],
+                "target_weights": {"A": 5.0, "B": 1.0},
+            }
+        ],
+        shared_params={"k": 0.2},
+        max_nfev=1,
+    )
+
+    info = result.dataset_info[0]
+    expected_a_scale = float(np.sqrt(2.0 * 5.0 / 6.0))
+    expected_b_scale = float(np.sqrt(2.0 * 1.0 / 6.0))
+
+    np.testing.assert_allclose(
+        result.residual_series["ds1"]["A"],
+        np.full_like(t_obs, -expected_a_scale),
+    )
+    np.testing.assert_allclose(
+        result.residual_series["ds1"]["B"],
+        np.full_like(t_obs, -2.0 * expected_b_scale),
+    )
+    assert float(np.sum(info.residuals**2)) == pytest.approx(15.0)
+    assert info.chi_squared == pytest.approx(1.5)
+    assert info.rmse == pytest.approx(np.sqrt(1.5))
+    assert info.mae == pytest.approx((expected_a_scale + 2.0 * expected_b_scale) / 2.0)
 
 
 def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_weight_scale() -> None:

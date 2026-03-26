@@ -1582,6 +1582,13 @@ class FittingWindow(QtWidgets.QDialog):
                     )
                     continue
             selected_species = entry.get("selected_species") or []
+            entry_target_weights = dict(entry.get("target_weights")) if isinstance(entry.get("target_weights"), dict) else None
+            seeded_payload = self._global_payload_lookup.get(dataset_id, {}) if isinstance(self._global_payload_lookup, dict) else {}
+            payload_target_weights = (
+                dict(seeded_payload.get("target_weights"))
+                if isinstance(seeded_payload, dict) and isinstance(seeded_payload.get("target_weights"), dict)
+                else {}
+            )
             normalized.append(
                 {
                     "id": dataset_id,
@@ -1589,6 +1596,7 @@ class FittingWindow(QtWidgets.QDialog):
                     "t": t_values,
                     "species_data": species_data,
                     "selected_species": list(selected_species),
+                    "target_weights": dict(entry_target_weights) if entry_target_weights is not None else dict(payload_target_weights),
                     "weight": float(entry.get("weight", 1.0)),
                     "include": bool(entry.get("include", True)),
                 }

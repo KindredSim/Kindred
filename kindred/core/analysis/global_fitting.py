@@ -823,6 +823,11 @@ def _assemble_global_fit_result(
         x_name = payload.x_name
         x_obs = payload.x_obs if x_name != "t" else None
         x_mode = payload.x_mode
+        dataset_weight = float(weights.get(ds_id, 1.0))
+        target_multipliers = _normalized_target_weight_multipliers(
+            species_list=species_list,
+            target_weights=dict(getattr(payload, "target_weights", {}) or {}),
+        )
 
         _raise_if_fitting_cancelled(cancellation_check)
 
@@ -872,7 +877,9 @@ def _assemble_global_fit_result(
         for idx, species_name in enumerate(species_list):
             y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
             exp_blocks.append(y_exp)
-            penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
+            target_weight = float(target_multipliers.get(str(species_name), 1.0))
+            effective_weight = dataset_weight * target_weight
+            penalty_block = np.full_like(y_exp, effective_weight * penalty_value, dtype=float)
 
             if not (isinstance(sim_species, dict) and species_name in sim_species):
                 if ds_id not in final_dataset_errors:
@@ -936,8 +943,9 @@ def _assemble_global_fit_result(
                 residual_blocks.append(penalty_block)
                 residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
             else:
-                residual_blocks.append(y_exp - y_sim_resid)
-                residual_series_map.setdefault(ds_id, {})[species_name] = y_sim_resid - y_exp
+                weighted_residual = effective_weight * (np.asarray(y_sim_resid, dtype=float) - y_exp)
+                residual_blocks.append(-weighted_residual)
+                residual_series_map.setdefault(ds_id, {})[species_name] = weighted_residual
 
             if x_name == "t":
                 plot_model_series_map.setdefault(ds_id, {})[species_name] = y_sim_time
