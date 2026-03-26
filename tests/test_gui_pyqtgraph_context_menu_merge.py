@@ -253,3 +253,113 @@ def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     finally:
         panel.deleteLater()
         qt_app.processEvents()
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_inherits_inversion_across_remove_readd_lifecycle(qt_app, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
+    try:
+        panel.show()
+        panel.resize(400, 300)
+        panel.set_data(
+            np.array([2.0, 6.0, 10.0], dtype=float),
+            {
+                "A": np.array([1.0, 5.0, 9.0], dtype=float),
+                "B": np.array([10.0, 50.0, 90.0], dtype=float),
+            },
+        )
+        panel._toolbar.set_auto_range(False)
+        panel._plot_item.setRange(xRange=(2.0, 10.0), yRange=(1.0, 9.0), padding=0.0)
+        qt_app.processEvents()
+
+        def _scene_positions(viewbox, *, y_low: float, y_high: float):
+            x_low = viewbox.mapViewToScene(QtCore.QPointF(2.0, 5.0)).x()
+            x_high = viewbox.mapViewToScene(QtCore.QPointF(10.0, 5.0)).x()
+            y_scene_low = viewbox.mapViewToScene(QtCore.QPointF(6.0, y_low)).y()
+            y_scene_high = viewbox.mapViewToScene(QtCore.QPointF(6.0, y_high)).y()
+            return x_low, x_high, y_scene_low, y_scene_high
+
+        monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("B", True))
+
+        panel._toggle_invert_x()
+        panel._toggle_invert_y()
+        qt_app.processEvents()
+
+        panel._add_secondary_y_axis()
+        qt_app.processEvents()
+
+        primary_viewbox = panel._plot_item.getViewBox()
+        secondary_viewbox = panel._secondary_y_axis
+        assert secondary_viewbox is not None
+        secondary_viewbox.setRange(xRange=(2.0, 10.0), yRange=(10.0, 90.0), padding=0.0)
+        qt_app.processEvents()
+
+        assert primary_viewbox.state.get("xInverted") is True
+        assert primary_viewbox.state.get("yInverted") is True
+        assert secondary_viewbox.state.get("xInverted") is True
+        assert secondary_viewbox.state.get("yInverted") is True
+        primary_x_low, primary_x_high, primary_y_low, primary_y_high = _scene_positions(
+            primary_viewbox,
+            y_low=1.0,
+            y_high=9.0,
+        )
+        secondary_x_low, secondary_x_high, secondary_y_low, secondary_y_high = _scene_positions(
+            secondary_viewbox,
+            y_low=10.0,
+            y_high=90.0,
+        )
+        assert primary_x_low > primary_x_high
+        assert primary_y_low < primary_y_high
+        assert secondary_x_low > secondary_x_high
+        assert secondary_y_low < secondary_y_high
+
+        panel._remove_secondary_y_axis()
+        qt_app.processEvents()
+        assert panel._secondary_y_axis is None
+        assert panel._secondary_y_items == {}
+
+        panel.resize(420, 300)
+        qt_app.processEvents()
+
+        panel._add_secondary_y_axis()
+        qt_app.processEvents()
+        secondary_viewbox = panel._secondary_y_axis
+        assert secondary_viewbox is not None
+        secondary_viewbox.setRange(xRange=(2.0, 10.0), yRange=(10.0, 90.0), padding=0.0)
+        qt_app.processEvents()
+
+        assert secondary_viewbox.state.get("xInverted") is True
+        assert secondary_viewbox.state.get("yInverted") is True
+        secondary_x_low, secondary_x_high, secondary_y_low, secondary_y_high = _scene_positions(
+            secondary_viewbox,
+            y_low=10.0,
+            y_high=90.0,
+        )
+        assert secondary_x_low > secondary_x_high
+        assert secondary_y_low < secondary_y_high
+
+        panel._toggle_invert_x()
+        panel._toggle_invert_y()
+        qt_app.processEvents()
+
+        assert primary_viewbox.state.get("xInverted") is False
+        assert primary_viewbox.state.get("yInverted") is False
+        assert secondary_viewbox.state.get("xInverted") is False
+        assert secondary_viewbox.state.get("yInverted") is False
+        primary_x_low, primary_x_high, primary_y_low, primary_y_high = _scene_positions(
+            primary_viewbox,
+            y_low=1.0,
+            y_high=9.0,
+        )
+        secondary_x_low, secondary_x_high, secondary_y_low, secondary_y_high = _scene_positions(
+            secondary_viewbox,
+            y_low=10.0,
+            y_high=90.0,
+        )
+        assert primary_x_low < primary_x_high
+        assert primary_y_low > primary_y_high
+        assert secondary_x_low < secondary_x_high
+        assert secondary_y_low > secondary_y_high
+    finally:
+        panel.deleteLater()
+        qt_app.processEvents()

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from functools import partial
 import logging
-from typing import Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -207,6 +207,7 @@ if PYQTGRAPH_AVAILABLE:
             # Plot enhancements (v0.2.0)
             self._secondary_y_axis: Optional[pg.ViewBox] = None
             self._secondary_y_items: Dict[str, pg.PlotDataItem] = {}
+            self._secondary_y_resize_handler: Optional[Callable[[], None]] = None
             self._log_x: bool = False
             self._log_y: bool = False
             self._invert_x_axis: bool = False
@@ -1892,9 +1893,12 @@ if PYQTGRAPH_AVAILABLE:
 
             # Update views when resizing
             def update_views():
+                if self._secondary_y_axis is None:
+                    return
                 self._secondary_y_axis.setGeometry(self._plot_item.vb.sceneBoundingRect())
                 self._secondary_y_axis.linkedViewChanged(self._plot_item.vb, self._secondary_y_axis.XAxis)
 
+            self._secondary_y_resize_handler = update_views
             self._plot_item.vb.sigResized.connect(update_views)
 
             # Plot selected series on secondary axis
@@ -1914,6 +1918,7 @@ if PYQTGRAPH_AVAILABLE:
                 self._plot_item.getAxis('right').setTextPen('k' if not self._dark_mode else '#e0e0e0')
 
                 update_views()
+                self._apply_axis_inversion_state()
 
                 logger.info(f"Added secondary Y-axis for series: {item}")
 
@@ -1926,6 +1931,14 @@ if PYQTGRAPH_AVAILABLE:
             for item in self._secondary_y_items.values():
                 self._secondary_y_axis.removeItem(item)
             self._secondary_y_items.clear()
+
+            resize_handler = self._secondary_y_resize_handler
+            if resize_handler is not None:
+                try:
+                    self._plot_item.vb.sigResized.disconnect(resize_handler)
+                except (RuntimeError, TypeError):
+                    logger.debug("Failed to disconnect secondary axis resize handler", exc_info=True)
+                self._secondary_y_resize_handler = None
 
             # Remove ViewBox
             self._plot_item.scene().removeItem(self._secondary_y_axis)
@@ -1955,6 +1968,10 @@ if PYQTGRAPH_AVAILABLE:
             viewbox = self._plot_item.getViewBox()
             viewbox.invertX(self._invert_x_axis)
             viewbox.invertY(self._invert_y_axis)
+            secondary_viewbox = self._secondary_y_axis
+            if secondary_viewbox is not None:
+                secondary_viewbox.invertX(self._invert_x_axis)
+                secondary_viewbox.invertY(self._invert_y_axis)
 
         def _toggle_invert_x(self):
             """Toggle X-axis inversion."""
