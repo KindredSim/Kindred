@@ -73,6 +73,7 @@ class PlotTabsWidget(QtWidgets.QWidget):
             workspace_splitter_object_name="mainPlotWorkspaceSplitter",
             enable_axis_inversion_actions=True,
             enable_canonical_ghost_toggle_action=True,
+            enable_copy_visible_data_action=True,
         )
         self._main_plot.setObjectName("plotPanel")
         self._main_plot_analysis_widget = None

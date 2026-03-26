@@ -12,6 +12,14 @@ from kindred.gui.widgets.pyqtgraph_plot_panel_impl import (
 pytestmark = pytest.mark.gui
 
 
+class _DummyClipboard:
+    def __init__(self) -> None:
+        self.last_text = ""
+
+    def setText(self, text: str, *_args, **_kwargs) -> None:  # noqa: N802 - Qt-style
+        self.last_text = str(text)
+
+
 def _capture_context_menu(monkeypatch):
     captured_menus = []
 
@@ -28,6 +36,11 @@ def _find_action(actions, text: str):
         if action.text() == text:
             return action
     raise AssertionError(f"Missing action {text!r}")
+
+
+def _split_tsv(text: str) -> list[list[str]]:
+    lines = [line for line in str(text).splitlines() if line]
+    return [line.split("\t") for line in lines]
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
@@ -191,6 +204,138 @@ def test_main_plot_axis_inversion_actions_are_scoped_to_simulation_plot(qtbot, m
     dataset_menu = captured_menus.pop()
     assert all(action.text() != "Axis Direction" for action in dataset_menu.actions())
 
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_main_plot_context_menu_includes_copy_visible_data_and_dataset_plot_does_not(qtbot, monkeypatch):
+    widget = PlotTabsWidget()
+    qtbot.addWidget(widget)
+    widget.show()
+    QtWidgets.QApplication.processEvents()
+
+    dataset_panel = widget.add_dataset_tab("dataset-1")
+    QtWidgets.QApplication.processEvents()
+
+    captured_menus = _capture_context_menu(monkeypatch)
+
+    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
+    main_menu = captured_menus.pop()
+    _find_action(main_menu.actions(), "Copy Visible Data")
+
+    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
+    dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Copy Visible Data" for action in dataset_menu.actions())
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_and_dataset_markers(
+    qtbot, monkeypatch
+):
+    panel = PyQtGraphPlotPanel(
+        enable_copy_visible_data_action=True,
+        enable_canonical_ghost_toggle_action=True,
+    )
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t_primary = np.array([0.0, 1.0, 2.0, 3.0], dtype=float)
+    panel.set_data(
+        t_primary,
+        {
+            "A": np.array([10.0, 20.0, 30.0, 40.0], dtype=float),
+            "B": np.array([0.10, 0.20, 0.30, 0.40], dtype=float),
+            "C": np.array([5.0, 6.0, 7.0, 8.0], dtype=float),
+            "D": np.array([1.0, 1.5, 2.0, 2.5], dtype=float),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "series": {
+                    "A": np.array([101.0, 102.0, 103.0], dtype=float),
+                    "B": np.array([0.15, 0.25, 0.35], dtype=float),
+                    "C": np.array([201.0, 202.0, 203.0], dtype=float),
+                },
+            },
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "curve_role": "canonical_ghost",
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "series": {
+                    "A": np.array([901.0, 902.0, 903.0], dtype=float),
+                    "B": np.array([0.16, 0.26, 0.36], dtype=float),
+                    "C": np.array([951.0, 952.0, 953.0], dtype=float),
+                },
+            },
+        ],
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._on_x_axis_changed("B")
+    panel._add_secondary_y_axis()
+
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0], dtype=float),
+                "species": {
+                    "A": np.array([1001.0, 1002.0], dtype=float),
+                    "B": np.array([0.12, 0.22], dtype=float),
+                    "C": np.array([1101.0, 1102.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A"}
+    panel._update_plot()
+    QtWidgets.QApplication.processEvents()
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows, "Expected clipboard TSV output"
+    header = rows[0]
+    body = rows[1:]
+    assert len(body) == 4
+
+    primary_cols = [idx for idx, cell in enumerate(header) if cell.startswith("set1::")]
+    overlay_cols = [idx for idx, cell in enumerate(header) if cell.startswith("set2::")]
+    dataset_cols = [idx for idx, cell in enumerate(header) if cell.startswith("ds1::")]
+    assert primary_cols
+    assert overlay_cols
+    assert dataset_cols
+    assert max(primary_cols) < min(overlay_cols) < min(dataset_cols)
+
+    primary_headers = [header[idx] for idx in primary_cols]
+    assert any("Time" in cell for cell in primary_headers)
+    assert any("[B]" in cell for cell in primary_headers)
+    assert any("C" in cell and "[right axis]" in cell for cell in primary_headers)
+
+    dataset_headers = [header[idx] for idx in dataset_cols]
+    assert any("A" in cell for cell in dataset_headers)
+    assert all("C" not in cell for cell in dataset_headers)
+
+    assert "901.0" not in clipboard.last_text
+    assert "902.0" not in clipboard.last_text
+    assert all("canonical" not in cell.lower() for cell in header)
+    assert all("[ref]" not in cell for cell in header)
+
+    overlay_x_idx = next(idx for idx in overlay_cols if "[B]" in header[idx])
+    overlay_y_idx = next(idx for idx in overlay_cols if "A" in header[idx] and "[B]" not in header[idx])
+    dataset_x_idx = next(idx for idx in dataset_cols if "[B]" in header[idx])
+    dataset_y_idx = next(idx for idx in dataset_cols if "A" in header[idx] and "[B]" not in header[idx])
+
+    assert body[3][overlay_x_idx] == ""
+    assert body[3][overlay_y_idx] == ""
+    assert body[2][dataset_x_idx] == ""
+    assert body[2][dataset_y_idx] == ""
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
