@@ -1501,10 +1501,20 @@ if PYQTGRAPH_AVAILABLE:
                 payload = self._overlay_datasets.get(dataset_name)
                 if not payload:
                     continue
+                species_payload = payload["species"]
+                enabled_for_dataset = enabled_by_dataset.get(dataset_name)
+                if enabled_for_dataset is not None:
+                    dataset_species = {
+                        key: species_payload[key]
+                        for key in enabled_for_dataset
+                        if key in species_payload
+                    }
+                else:
+                    dataset_species = species_payload
                 if x_name == "t":
                     x_source = payload["t"]
                 else:
-                    x_source = payload["species"].get(x_name)
+                    x_source = species_payload.get(x_name)
                 if x_source is None:
                     warnings.append(f"{dataset_name}: missing '{x_name}' values")
                     continue
@@ -1515,22 +1525,18 @@ if PYQTGRAPH_AVAILABLE:
                     continue
 
                 for species in selected_series:
-                    # Use flexible species name resolution to handle naming variations
-                    resolved_key, y_source = _resolve_dataset_species(species, payload["species"])
+                    # Resolve within the enabled dataset subset first so simulation-only
+                    # species do not become false dataset obligations on species-X axes.
+                    resolved_key, y_source = _resolve_dataset_species(species, dataset_species)
                     if y_source is None:
-                        # Generate clear warning about missing species match
-                        available = sorted(payload["species"].keys())
+                        if enabled_for_dataset is not None:
+                            continue
+                        available = sorted(species_payload.keys())
                         warnings.append(
                             f"{dataset_name}: no column matching species '{species}'. "
                             f"Available: {', '.join(available[:5])}" +
                             (f" (and {len(available) - 5} more)" if len(available) > 5 else "")
                         )
-                        continue
-
-                    # Check if this dataset column is enabled in the overlay panel
-                    enabled_for_dataset = enabled_by_dataset.get(dataset_name)
-                    if enabled_for_dataset is not None and resolved_key not in enabled_for_dataset:
-                        # User disabled this dataset column in the overlay panel; skip silently
                         continue
 
                     y_array = np.asarray(y_source, dtype=float).reshape(-1)
