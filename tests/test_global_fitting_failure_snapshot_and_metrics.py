@@ -152,7 +152,7 @@ def test_global_chi_squared_uses_full_objective_residuals_for_parametric_x_penal
     assert result.global_r_squared == pytest.approx(expected_r_squared)
 
 
-def test_global_fit_result_dataset_diagnostics_follow_target_weighted_residuals() -> None:
+def test_global_fit_result_dataset_diagnostics_remain_raw_under_target_weighting() -> None:
     t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
 
     def simulation_func(_params):
@@ -180,21 +180,23 @@ def test_global_fit_result_dataset_diagnostics_follow_target_weighted_residuals(
     )
 
     info = result.dataset_info[0]
-    expected_a_scale = float(np.sqrt(2.0 * 5.0 / 6.0))
-    expected_b_scale = float(np.sqrt(2.0 * 1.0 / 6.0))
-
     np.testing.assert_allclose(
         result.residual_series["ds1"]["A"],
-        np.full_like(t_obs, -expected_a_scale),
+        -np.ones_like(t_obs),
     )
     np.testing.assert_allclose(
         result.residual_series["ds1"]["B"],
-        np.full_like(t_obs, -2.0 * expected_b_scale),
+        np.full_like(t_obs, -2.0),
     )
-    assert float(np.sum(info.residuals**2)) == pytest.approx(15.0)
-    assert info.chi_squared == pytest.approx(1.5)
-    assert info.rmse == pytest.approx(np.sqrt(1.5))
-    assert info.mae == pytest.approx((expected_a_scale + 2.0 * expected_b_scale) / 2.0)
+    np.testing.assert_allclose(info.residuals[: t_obs.size], -np.ones_like(t_obs))
+    np.testing.assert_allclose(info.residuals[t_obs.size :], np.full_like(t_obs, -2.0))
+    assert float(np.sum(info.residuals**2)) == pytest.approx(25.0)
+    assert info.chi_squared == pytest.approx(2.5)
+    assert info.rmse == pytest.approx(np.sqrt(2.5))
+    assert info.mae == pytest.approx(1.5)
+    assert result.objective_residuals is not None
+    assert float(np.sum(result.objective_residuals**2)) == pytest.approx(15.0)
+    assert result.global_chi_squared == pytest.approx(1.5)
 
 
 def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_weight_scale() -> None:

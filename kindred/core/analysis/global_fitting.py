@@ -943,9 +943,9 @@ def _assemble_global_fit_result(
                 residual_blocks.append(penalty_block)
                 residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
             else:
-                weighted_residual = effective_weight * (np.asarray(y_sim_resid, dtype=float) - y_exp)
-                residual_blocks.append(-weighted_residual)
-                residual_series_map.setdefault(ds_id, {})[species_name] = weighted_residual
+                raw_residual = np.asarray(y_sim_resid, dtype=float) - y_exp
+                residual_blocks.append(raw_residual)
+                residual_series_map.setdefault(ds_id, {})[species_name] = raw_residual
 
             if x_name == "t":
                 plot_model_series_map.setdefault(ds_id, {})[species_name] = y_sim_time

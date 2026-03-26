@@ -62,7 +62,7 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
     assert [p["cost"] for p in emitted] == [10.0, 9.0, 8.0]
 
 
-def test_global_fit_worker_best_payload_stats_follow_target_weighted_residuals(qt_app):
+def test_global_fit_worker_best_payload_stats_remain_raw_under_target_weighting(qt_app):
     t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
 
     def simulation(_params):
@@ -94,18 +94,15 @@ def test_global_fit_worker_best_payload_stats_follow_target_weighted_residuals(q
         dataset_params={},
     )
 
-    expected_a_scale = float(np.sqrt(2.0 * 5.0 / 6.0))
-    expected_b_scale = float(np.sqrt(2.0 * 1.0 / 6.0))
-
     np.testing.assert_allclose(model_series["ds1"]["A"], np.zeros_like(t_obs))
     np.testing.assert_allclose(plot_model_series["ds1"]["A"], np.zeros_like(t_obs))
     np.testing.assert_allclose(plot_model_x["ds1"], t_obs)
     np.testing.assert_allclose(
         residual_series["ds1"]["A"],
-        np.full_like(t_obs, -expected_a_scale),
+        -np.ones_like(t_obs),
     )
     np.testing.assert_allclose(
         residual_series["ds1"]["B"],
-        np.full_like(t_obs, -2.0 * expected_b_scale),
+        np.full_like(t_obs, -2.0),
     )
-    assert dataset_stats["ds1"]["chi_squared"] == pytest.approx(1.5)
+    assert dataset_stats["ds1"]["chi_squared"] == pytest.approx(2.5)
