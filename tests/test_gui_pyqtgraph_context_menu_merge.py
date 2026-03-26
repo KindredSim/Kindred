@@ -509,6 +509,122 @@ def test_copy_visible_data_uses_synchronized_secondary_axis_trace_after_set_data
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_respects_coarse_sampling_for_secondary_axis_after_x_axis_change(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t = np.linspace(0.0, 10.0, 2000)
+    x_species = np.linspace(100.0, 300.0, 2000)
+    secondary_series = np.linspace(5.0, 15.0, 2000)
+    panel.set_data(
+        t,
+        {
+            "A": np.sin(t),
+            "B": x_species,
+            "C": secondary_series,
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    panel._on_toolbar_option_requested("sampling", "coarse")
+    panel._add_secondary_y_axis()
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    expected_idx = np.unique(np.linspace(0, t.shape[0] - 1, num=panel._sampling_target, dtype=int))
+    secondary_item = panel._secondary_y_items["C"]
+    plotted_x, plotted_y = secondary_item.getData()
+    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), x_species[expected_idx])
+    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), secondary_series[expected_idx])
+    assert len(plotted_x) <= panel._sampling_target
+
+    panel._series["C"] = secondary_series + 1000.0
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    body = rows[1:]
+    time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
+    x_idx = _find_header_index(header, prefix="set1::", contains=["[B]"])
+    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
+
+    assert len(body) == len(expected_idx)
+    np.testing.assert_allclose(_numeric_column(body, time_idx), t[expected_idx])
+    np.testing.assert_allclose(_numeric_column(body, x_idx), np.asarray(plotted_x, dtype=float))
+    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
+    assert "1005.0" not in clipboard.last_text
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_visible_data_respects_coarse_sampling_for_secondary_axis_after_set_data_refresh(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t_initial = np.linspace(0.0, 10.0, 2000)
+    panel.set_data(
+        t_initial,
+        {
+            "A": np.sin(t_initial),
+            "C": np.linspace(5.0, 15.0, 2000),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    panel._on_toolbar_option_requested("sampling", "coarse")
+    panel._add_secondary_y_axis()
+
+    t_refresh = np.linspace(20.0, 30.0, 2000)
+    refreshed_secondary = np.linspace(25.0, 35.0, 2000)
+    panel.set_data(
+        t_refresh,
+        {
+            "A": np.cos(t_refresh),
+            "C": refreshed_secondary,
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A"])
+    QtWidgets.QApplication.processEvents()
+
+    expected_idx = np.unique(np.linspace(0, t_refresh.shape[0] - 1, num=panel._sampling_target, dtype=int))
+    secondary_item = panel._secondary_y_items["C"]
+    plotted_x, plotted_y = secondary_item.getData()
+    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), t_refresh[expected_idx])
+    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), refreshed_secondary[expected_idx])
+    assert len(plotted_x) <= panel._sampling_target
+
+    panel._series["C"] = refreshed_secondary + 2000.0
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    body = rows[1:]
+    time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
+    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
+
+    assert len(body) == len(expected_idx)
+    np.testing.assert_allclose(_numeric_column(body, time_idx), np.asarray(plotted_x, dtype=float))
+    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
+    assert "2025.0" not in clipboard.last_text
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
     try:

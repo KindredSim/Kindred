@@ -680,6 +680,31 @@ if PYQTGRAPH_AVAILABLE:
             return _try_1d_float_array(self._series.get(series_name))
 
         @staticmethod
+        def _apply_sample_indices(array: np.ndarray, sample_idx: object) -> np.ndarray:
+            values = _try_1d_float_array(array)
+            if values.size == 0:
+                return values
+            if isinstance(sample_idx, slice):
+                return values
+            return values[sample_idx]
+
+        def _current_primary_plot_basis(
+            self,
+        ) -> Optional[Tuple[str, str, np.ndarray, np.ndarray, np.ndarray, object]]:
+            x_name = str(self._x_axis_name or "t")
+            x_data, x_label = self._get_x_data()
+            x_array = _try_1d_float_array(x_data)
+            if x_array.size == 0:
+                return None
+            sample_idx = self._get_sampling_indices(x_array.shape[0])
+            x_plot = self._apply_sample_indices(x_array, sample_idx)
+            t_array = _try_1d_float_array(self._t)
+            if t_array.size == 0 or t_array.shape[0] != x_array.shape[0]:
+                return None
+            t_plot = self._apply_sample_indices(t_array, sample_idx)
+            return x_name, x_label, x_array, x_plot, t_plot, sample_idx
+
+        @staticmethod
         def _qualified_copy_header(block_label: Optional[str], column_label: str) -> str:
             label = str(block_label or "").strip()
             column = str(column_label or "").strip()
@@ -714,12 +739,11 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("No visible Y-series are available to copy.")
             overlay_visible_y_names = self._visible_overlay_copy_series_names()
 
-            x_data, x_label = self._get_x_data()
-            x_array = _try_1d_float_array(x_data)
-            if x_array.size == 0:
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
                 raise ValueError("The current X-axis has no visible data to copy.")
+            x_name, x_label, x_array, x_plot, t_plot, sample_idx = primary_basis
 
-            x_name = str(self._x_axis_name or "t")
             blocks: List[List[Tuple[str, np.ndarray]]] = []
             primary_label = str(self._simulation_set_label or "").strip()
             primary_columns: List[Tuple[str, np.ndarray]] = []
@@ -727,19 +751,23 @@ if PYQTGRAPH_AVAILABLE:
             self._append_copy_column(
                 primary_columns,
                 header=self._qualified_copy_header(primary_label, "Time (s)"),
-                values=self._t,
+                values=t_plot,
             )
             if x_name != "t":
                 self._append_copy_column(
                     primary_columns,
                     header=self._qualified_copy_header(primary_label, x_label),
-                    values=x_array,
+                    values=x_plot,
                 )
 
             primary_y_added = 0
             for name in primary_visible_y_names:
                 y_array = self._primary_copy_series_array(name)
-                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                if str(name) not in self._secondary_y_items:
+                    if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                        continue
+                    y_array = self._apply_sample_indices(y_array, sample_idx)
+                if y_array.size == 0 or y_array.shape[0] != x_plot.shape[0]:
                     continue
                 self._append_copy_column(
                     primary_columns,
@@ -1266,16 +1294,10 @@ if PYQTGRAPH_AVAILABLE:
             if self._t is None:
                 return
 
-            # Get X-axis data and label
-            x_data, x_label = self._get_x_data()
-            if x_data is None:
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
                 return
-            x_array = np.asarray(x_data, dtype=float).reshape(-1)
-            if x_array.size == 0:
-                return
-
-            sample_idx = self._get_sampling_indices(x_array.shape[0])
-            x_plot = x_array if isinstance(sample_idx, slice) else x_array[sample_idx]
+            _x_name, x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
 
             # Update axis labels dynamically
             self._plot_item.setLabel('bottom', x_label)
@@ -1303,7 +1325,7 @@ if PYQTGRAPH_AVAILABLE:
                 color = self._colors.get(name, (100, 100, 100))
                 pen = pg.mkPen(color=color, width=2)
 
-                y_plot = y_data if isinstance(sample_idx, slice) else y_data[sample_idx]
+                y_plot = self._apply_sample_indices(y_data, sample_idx)
                 label = self._format_species_set_label(name, self._simulation_set_label)
                 active_curve_keys.add(label)
                 self._upsert_curve_item(
@@ -2150,8 +2172,11 @@ if PYQTGRAPH_AVAILABLE:
                 self._remove_secondary_y_axis()
                 return
 
-            x_data, _ = self._get_x_data()
-            x_array = _try_1d_float_array(x_data)
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
+                self._remove_secondary_y_axis()
+                return
+            _x_name, _x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
             stale_names: List[str] = []
 
             for series_name, plot_item in list(self._secondary_y_items.items()):
@@ -2159,7 +2184,11 @@ if PYQTGRAPH_AVAILABLE:
                 if x_array.size == 0 or y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
                     stale_names.append(str(series_name))
                     continue
-                plot_item.setData(x=x_array, y=y_array)
+                y_plot = self._apply_sample_indices(y_array, sample_idx)
+                if y_plot.size == 0 or y_plot.shape[0] != x_plot.shape[0]:
+                    stale_names.append(str(series_name))
+                    continue
+                plot_item.setData(x=x_plot, y=y_plot)
 
             for series_name in stale_names:
                 self._remove_secondary_y_item(series_name)
