@@ -803,6 +803,162 @@ def test_species_x_partial_render_state_filters_incompatible_y_series_across_ren
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_species_x_mixed_primary_and_overlay_lengths_keep_overlay_local_c_series_visible_and_exported(
+    qtbot, monkeypatch
+):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    warning_calls = []
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warning_calls.append((args, kwargs)),
+    )
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "B": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([7.0, 8.0, 9.0, 10.0, 11.0], dtype=float),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "t": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+                "series": {
+                    "A": np.array([101.0, 102.0, 103.0, 104.0, 105.0], dtype=float),
+                    "B": np.array([11.0, 12.0, 13.0, 14.0, 15.0], dtype=float),
+                    "C": np.array([70.0, 80.0, 90.0, 100.0, 110.0], dtype=float),
+                },
+            }
+        ],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+                "species": {
+                    "A": np.array([201.0, 202.0, 203.0, 204.0, 205.0], dtype=float),
+                    "B": np.array([21.0, 22.0, 23.0, 24.0, 25.0], dtype=float),
+                    "C": np.array([170.0, 180.0, 190.0, 200.0, 210.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A", "C"}
+    panel.set_selected_series(["A", "C"])
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    assert panel._format_species_set_label("A", "set1") in panel._plot_items
+    assert panel._format_species_set_label("C", "set1") not in panel._plot_items
+    assert panel._format_species_set_label("C", "set2") in panel._plot_items
+    assert any(entry.dataset == "ds1" and entry.species == "C" for entry in panel._active_overlay_series)
+
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert any(header == "A" for header in axis_header)
+    assert any(header.startswith("set2::") and header.endswith("::C") for header in axis_header)
+    assert any(header.startswith("ds1::") and header.endswith("::C") for header in axis_header)
+
+    all_header, all_rows = panel.build_visible_export("all")
+    assert all_rows
+    assert any(header.startswith("set2::") and header.endswith("::C") for header in all_header)
+    assert any(header.startswith("ds1::") and header.endswith("::C") for header in all_header)
+
+    panel._copy_visible_data()
+
+    assert warning_calls == []
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    primary_headers = [cell for cell in rows[0] if cell.startswith("set1::")]
+    assert any(cell.endswith("::A") or cell == "set1::A" for cell in primary_headers)
+    assert all(not cell.endswith("::C") and "C [right axis]" not in cell for cell in primary_headers)
+    assert any(cell.startswith("set2::") and cell.endswith("::C") for cell in rows[0])
+    assert any(cell.startswith("ds1::") and cell.endswith("::C") for cell in rows[0])
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_species_x_overlay_only_visible_state_exports_and_copies_overlay_blocks(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    warning_calls = []
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warning_calls.append((args, kwargs)),
+    )
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "B": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([7.0, 8.0, 9.0, 10.0, 11.0], dtype=float),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "t": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+                "series": {
+                    "B": np.array([11.0, 12.0, 13.0, 14.0, 15.0], dtype=float),
+                    "C": np.array([70.0, 80.0, 90.0, 100.0, 110.0], dtype=float),
+                },
+            }
+        ],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+                "species": {
+                    "B": np.array([21.0, 22.0, 23.0, 24.0, 25.0], dtype=float),
+                    "C": np.array([170.0, 180.0, 190.0, 200.0, 210.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"C"}
+    panel.set_selected_series(["C"])
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    assert panel._format_species_set_label("C", "set1") not in panel._plot_items
+    assert panel._format_species_set_label("C", "set2") in panel._plot_items
+    assert any(entry.dataset == "ds1" and entry.species == "C" for entry in panel._active_overlay_series)
+
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert all(header != "C" for header in axis_header)
+    assert any(header.startswith("set2::") and header.endswith("::C") for header in axis_header)
+    assert any(header.startswith("ds1::") and header.endswith("::C") for header in axis_header)
+
+    panel._copy_visible_data()
+
+    assert warning_calls == []
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    assert all(not cell.startswith("set1::") for cell in rows[0])
+    assert any(cell.startswith("set2::") and cell.endswith("::C") for cell in rows[0])
+    assert any(cell.startswith("ds1::") and cell.endswith("::C") for cell in rows[0])
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
     try:

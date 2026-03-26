@@ -657,7 +657,50 @@ if PYQTGRAPH_AVAILABLE:
             self._toolbar.select_y(valid)
             self._on_y_selection_changed(valid)
 
-        def _current_axis_renderable_series_names(
+        def _series_names_compatible_with_x(
+            self,
+            names: Sequence[str],
+            series_map: Dict[str, object],
+            x_array: np.ndarray,
+            *,
+            require_visible: bool,
+        ) -> List[str]:
+            compatible: List[str] = []
+            seen: Set[str] = set()
+            for raw_name in names:
+                name = str(raw_name)
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name not in series_map:
+                    continue
+                if require_visible and not self._visible.get(name, True):
+                    continue
+                y_array = _try_1d_float_array(series_map.get(name))
+                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                    continue
+                compatible.append(name)
+            return compatible
+
+        def _visible_selected_series_names(self) -> List[str]:
+            toolbar = getattr(self, "_toolbar", None)
+            if toolbar is None:
+                return []
+            names: List[str] = []
+            seen: Set[str] = set()
+            for raw_name in toolbar.selected_y():
+                name = str(raw_name)
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name not in self._series:
+                    continue
+                if not self._visible.get(name, True):
+                    continue
+                names.append(name)
+            return names
+
+        def _current_primary_renderable_series_names(
             self,
             names: Sequence[str],
             *,
@@ -666,35 +709,23 @@ if PYQTGRAPH_AVAILABLE:
             primary_basis = self._current_primary_plot_basis()
             if primary_basis is None:
                 return []
-            x_array = primary_basis[2]
-            renderable: List[str] = []
-            seen: Set[str] = set()
-            for raw_name in names:
-                name = str(raw_name)
-                if name in seen:
-                    continue
-                seen.add(name)
-                if name not in self._series:
-                    continue
-                if require_visible and not self._visible.get(name, True):
-                    continue
-                y_array = _try_1d_float_array(self._series.get(name))
-                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
-                    continue
-                renderable.append(name)
-            return renderable
-
-        def _visible_overlay_copy_series_names(self) -> List[str]:
-            toolbar = getattr(self, "_toolbar", None)
-            if toolbar is None:
-                return []
-            return self._current_axis_renderable_series_names(
-                list(toolbar.selected_y()),
-                require_visible=True,
+            return self._series_names_compatible_with_x(
+                names,
+                self._series,
+                primary_basis[2],
+                require_visible=require_visible,
             )
 
+        def _visible_overlay_copy_series_names(self) -> List[str]:
+            return self._visible_selected_series_names()
+
         def _visible_primary_copy_series_names(self) -> List[str]:
-            names = list(self._visible_overlay_copy_series_names())
+            names = list(
+                self._current_primary_renderable_series_names(
+                    self._visible_selected_series_names(),
+                    require_visible=False,
+                )
+            )
             for name in self._secondary_y_items.keys():
                 series_name = str(name)
                 if series_name in self._series and series_name not in names:
@@ -764,8 +795,6 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("No simulation data is available to copy.")
 
             primary_visible_y_names = self._visible_primary_copy_series_names()
-            if not primary_visible_y_names:
-                raise ValueError("No visible Y-series are available to copy.")
             overlay_visible_y_names = self._visible_overlay_copy_series_names()
 
             primary_basis = self._current_primary_plot_basis()
@@ -805,9 +834,8 @@ if PYQTGRAPH_AVAILABLE:
                     values=y_array,
                 )
                 primary_y_added += 1
-            if primary_y_added == 0:
-                raise ValueError("No visible primary simulation series are eligible for copy.")
-            blocks.append(primary_columns)
+            if primary_y_added:
+                blocks.append(primary_columns)
 
             for entry in list(self._simulation_overlays or []):
                 if not isinstance(entry, dict):
@@ -1332,6 +1360,11 @@ if PYQTGRAPH_AVAILABLE:
             if primary_basis is None:
                 return
             _x_name, x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
+            selected_visible_series = self._visible_selected_series_names()
+            selected_primary_series = self._current_primary_renderable_series_names(
+                selected_visible_series,
+                require_visible=False,
+            )
 
             # Update axis labels dynamically
             self._plot_item.setLabel('bottom', x_label)
@@ -1339,20 +1372,12 @@ if PYQTGRAPH_AVAILABLE:
                 self._plot_item.setLabel('left', 'Concentration', units='M')
             else:
                 # In parametric mode, Y label depends on selected series
-                selected = self._current_axis_renderable_series_names(
-                    list(self._toolbar.selected_y()),
-                    require_visible=True,
-                )
-                if selected:
-                    self._plot_item.setLabel('left', f'{selected[0]}', units='M')
+                if selected_primary_series:
+                    self._plot_item.setLabel('left', f'{selected_primary_series[0]}', units='M')
 
             # Add visible series (only those selected in toolbar)
-            selected_series = self._current_axis_renderable_series_names(
-                list(self._toolbar.selected_y()),
-                require_visible=True,
-            )
             active_curve_keys: Set[str] = set()
-            for name in selected_series:
+            for name in selected_primary_series:
                 y_data = np.asarray(self._series[name], dtype=float).reshape(-1)
                 color = self._colors.get(name, (100, 100, 100))
                 pen = pg.mkPen(color=color, width=2)
@@ -1403,8 +1428,13 @@ if PYQTGRAPH_AVAILABLE:
                     idx_overlay = self._get_sampling_indices(x_overlay.shape[0])
                     x_plot_overlay = x_overlay if isinstance(idx_overlay, slice) else x_overlay[idx_overlay]
                     style = color_manager.get_dataset_line_style(idx)
-
-                    for species in selected_series:
+                    overlay_species = self._series_names_compatible_with_x(
+                        selected_visible_series,
+                        series_overlay,
+                        x_overlay,
+                        require_visible=False,
+                    )
+                    for species in overlay_species:
                         y_source = series_overlay.get(species)
                         if y_source is None:
                             continue
@@ -1439,7 +1469,7 @@ if PYQTGRAPH_AVAILABLE:
 
             self._prune_curve_items(active_curve_keys)
 
-            overlays, warnings = self._build_overlay_series(selected_series)
+            overlays, warnings = self._build_overlay_series(selected_visible_series)
             self._active_overlay_series = overlays
             self._overlay_panel.set_status_messages(warnings)
             self._draw_overlay_series(overlays)
@@ -1579,19 +1609,11 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("No simulation data available to export.")
 
             if scope == "axis":
-                y_names = self._current_axis_renderable_series_names(
-                    list(toolbar.selected_y()),
-                    require_visible=True,
-                )
-                if not y_names:
+                candidate_names = self._visible_selected_series_names()
+                if not candidate_names:
                     raise ValueError("Select at least one Y-series before exporting.")
             else:
-                y_names = self._current_axis_renderable_series_names(
-                    list(series.keys()),
-                    require_visible=False,
-                )
-            if not y_names:
-                raise ValueError("No valid Y-series found to export.")
+                candidate_names = list(series.keys())
 
             x_name = toolbar.current_x() or "t"
             x_data, derived_label = self._get_x_data()
@@ -1602,17 +1624,60 @@ if PYQTGRAPH_AVAILABLE:
             if x_array.size == 0:
                 raise ValueError("X-axis has no points to export.")
 
-            columns: List[Tuple[str, np.ndarray]] = []
             x_header = derived_label or x_name
-            columns.append((x_header, x_array))
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            primary_y_names = self._series_names_compatible_with_x(
+                candidate_names,
+                series,
+                x_array,
+                require_visible=False,
+            )
+            if primary_y_names:
+                primary_columns: List[Tuple[str, np.ndarray]] = [(x_header, x_array)]
+                for name in primary_y_names:
+                    arr = np.asarray(series[name], dtype=float).reshape(-1)
+                    if arr.shape[0] != x_array.shape[0]:
+                        continue
+                    primary_columns.append((name, arr))
+                if len(primary_columns) > 1:
+                    blocks.append(primary_columns)
 
-            for name in y_names:
-                arr = np.asarray(series[name], dtype=float).reshape(-1)
-                if arr.shape[0] != x_array.shape[0]:
+            for entry in list(self._simulation_overlays or []):
+                if not isinstance(entry, dict):
                     continue
-                columns.append((name, arr))
+                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                    continue
+                block_label = str(entry.get("label") or "").strip()
+                overlay_series_map = entry.get("series") or {}
+                if not isinstance(overlay_series_map, dict):
+                    continue
+                if x_name == "t":
+                    x_overlay = entry.get("t")
+                else:
+                    x_overlay = overlay_series_map.get(x_name)
+                x_overlay_array = _try_1d_float_array(x_overlay)
+                if x_overlay_array.size == 0:
+                    continue
+                overlay_y_names = self._series_names_compatible_with_x(
+                    candidate_names,
+                    overlay_series_map,
+                    x_overlay_array,
+                    require_visible=False,
+                )
+                if not overlay_y_names:
+                    continue
+                overlay_columns: List[Tuple[str, np.ndarray]] = [
+                    (f"{block_label}::{x_header}", x_overlay_array)
+                ]
+                for name in overlay_y_names:
+                    arr = np.asarray(overlay_series_map[name], dtype=float).reshape(-1)
+                    if arr.shape[0] != x_overlay_array.shape[0]:
+                        continue
+                    overlay_columns.append((f"{block_label}::{name}", arr))
+                if len(overlay_columns) > 1:
+                    blocks.append(overlay_columns)
 
-            overlay_series, warnings = self._build_overlay_series(list(y_names))
+            overlay_series, warnings = self._build_overlay_series(list(candidate_names))
             active_overlays = self._overlay_panel.selected_datasets()
             if warnings and active_overlays:
                 warning_msg = "\n".join(f" - {msg}" for msg in warnings)
@@ -1623,8 +1688,11 @@ if PYQTGRAPH_AVAILABLE:
             for entry in overlay_series:
                 x_header_ds = f"{entry.dataset}::{x_header}"
                 y_header_ds = f"{entry.dataset}::{entry.species}"
-                columns.append((x_header_ds, entry.x))
-                columns.append((y_header_ds, entry.y))
+                blocks.append([(x_header_ds, entry.x), (y_header_ds, entry.y)])
+
+            columns: List[Tuple[str, np.ndarray]] = [col for block in blocks for col in block]
+            if not columns:
+                raise ValueError("No valid Y-series found to export.")
 
             max_len = max(col[1].shape[0] for col in columns)
             header = [col[0] for col in columns]
@@ -1948,9 +2016,9 @@ if PYQTGRAPH_AVAILABLE:
             y_range = view_box[1][1] - view_box[1][0]
 
             # Check each visible series
-            visible_names = self._current_axis_renderable_series_names(
-                list(self._toolbar.selected_y()),
-                require_visible=True,
+            visible_names = self._current_primary_renderable_series_names(
+                self._visible_selected_series_names(),
+                require_visible=False,
             )
             for name in visible_names:
                 y_data = _try_1d_float_array(self._series.get(name))
