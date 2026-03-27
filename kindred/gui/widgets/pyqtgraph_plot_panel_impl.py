@@ -57,6 +57,9 @@ if PYQTGRAPH_AVAILABLE:
         species: str
         x: np.ndarray
         y: np.ndarray
+        logical_x_axis_name: str
+        resolved_x_column: Optional[str]
+        resolved_y_column: str
 
     class _DetailInspectorDock(QtWidgets.QFrame):
         """Compact secondary inspector wrapper with a small default height hint."""
@@ -194,6 +197,10 @@ if PYQTGRAPH_AVAILABLE:
             self._overlay_datasets: Dict[str, Dict[str, np.ndarray]] = {}
             self._overlay_symbols: Dict[str, str] = {}
             self._active_overlay_series: List[_OverlaySeries] = []
+            self._export_all_overlay_series: List[_OverlaySeries] = []
+            self._active_overlay_warnings: List[str] = []
+            self._export_all_overlay_warnings: List[str] = []
+            self._export_all_overlay_cache_dirty: bool = True
             self._dark_mode = False
             self._scalar_values: Dict[str, float] = {}
 
@@ -1139,13 +1146,10 @@ if PYQTGRAPH_AVAILABLE:
             for idx, name in enumerate(sorted(self._overlay_datasets.keys())):
                 self._overlay_symbols[name] = color_manager.get_dataset_symbol(idx)
 
-        def _overlay_display_color(self, dataset_name: str, species_key: str) -> tuple[int, int, int]:
-            """Return the current display color for an overlay dataset column."""
+        def _overlay_display_color(self, species_key: str) -> tuple[int, int, int]:
+            """Return the current display color for a resolved overlay dataset column."""
             color_manager = ColorManager.instance()
-            payload = self._overlay_datasets.get(str(dataset_name)) or {}
-            species_dict = (payload or {}).get("species") or {}
-            resolved_key, _ = _resolve_dataset_species(str(species_key), species_dict)
-            color_key = str(resolved_key or species_key)
+            color_key = str(species_key or "").strip()
             current_species_color = color_manager.get_current_species_color(color_key)
             color = (
                 current_species_color
@@ -1159,6 +1163,48 @@ if PYQTGRAPH_AVAILABLE:
             self._overlay_panel.refresh_color_swatches()
             if self._active_overlay_series:
                 self._draw_overlay_series(list(self._active_overlay_series))
+
+        def _clear_overlay_series_caches(self) -> None:
+            self._active_overlay_series = []
+            self._export_all_overlay_series = []
+            self._active_overlay_warnings = []
+            self._export_all_overlay_warnings = []
+            self._export_all_overlay_cache_dirty = True
+
+        def _resolve_overlay_x_source(
+            self,
+            x_name: str,
+            payload: Dict[str, Dict[str, np.ndarray]],
+        ) -> Tuple[Optional[str], Optional[np.ndarray]]:
+            """Resolve overlay X values once while preserving current exact-match semantics."""
+            if x_name == "t":
+                return None, _try_1d_float_array(payload.get("t"))
+            species_payload = payload.get("species") or {}
+            if not isinstance(species_payload, dict):
+                return None, None
+            x_source = species_payload.get(x_name)
+            if x_source is None:
+                return None, None
+            return x_name, _try_1d_float_array(x_source)
+
+        def _rebuild_overlay_series_caches(self, selected_visible_series: Sequence[str]) -> None:
+            """
+            Rebuild all overlay-record caches before any downstream consumer uses them.
+
+            Built overlay records are fully resolved snapshots. Draw, hover,
+            refresh, copy, and export paths must use only these records and must
+            not call _resolve_dataset_species() again.
+            """
+            axis_candidate_names = list(selected_visible_series or [])
+            self._active_overlay_series, self._active_overlay_warnings = self._build_overlay_series(axis_candidate_names)
+
+        def _ensure_export_all_overlay_cache(self) -> None:
+            if not self._export_all_overlay_cache_dirty:
+                return
+            self._export_all_overlay_series, self._export_all_overlay_warnings = self._build_overlay_series(
+                list(self._series.keys())
+            )
+            self._export_all_overlay_cache_dirty = False
 
         def _get_sampling_indices(self, length: int):
             """Return slice or index array for downsampling plots."""
@@ -1353,6 +1399,8 @@ if PYQTGRAPH_AVAILABLE:
 
         def _update_plot(self):
             """Update plot with current data, visibility settings, and axis configuration."""
+            self._clear_overlay_series_caches()
+            self._overlay_panel.set_status_messages([])
             if self._t is None:
                 return
 
@@ -1469,10 +1517,9 @@ if PYQTGRAPH_AVAILABLE:
 
             self._prune_curve_items(active_curve_keys)
 
-            overlays, warnings = self._build_overlay_series(selected_visible_series)
-            self._active_overlay_series = overlays
-            self._overlay_panel.set_status_messages(warnings)
-            self._draw_overlay_series(overlays)
+            self._rebuild_overlay_series_caches(selected_visible_series)
+            self._overlay_panel.set_status_messages(self._active_overlay_warnings)
+            self._draw_overlay_series(list(self._active_overlay_series))
             self._sync_secondary_y_items()
             self._refresh_view_after_plot_update()
 
@@ -1488,7 +1535,7 @@ if PYQTGRAPH_AVAILABLE:
                 logger.debug("Failed to auto-range plot after data update: %s", exc, exc_info=True)
 
         def _build_overlay_series(self, selected_series: List[str]) -> Tuple[List[_OverlaySeries], List[str]]:
-            """Compute overlay series respecting current axis selection and per-dataset column filters."""
+            """Compute fully resolved overlay records for the current axis and dataset subset."""
             overlays: List[_OverlaySeries] = []
             warnings: List[str] = []
             x_name = self._x_axis_name or "t"
@@ -1503,40 +1550,48 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 species_payload = payload["species"]
                 enabled_for_dataset = enabled_by_dataset.get(dataset_name)
+                enabled_species = None
                 if enabled_for_dataset is not None:
-                    dataset_species = {
+                    enabled_species = {
                         key: species_payload[key]
                         for key in enabled_for_dataset
                         if key in species_payload
                     }
-                else:
-                    dataset_species = species_payload
-                if x_name == "t":
-                    x_source = payload["t"]
-                else:
-                    x_source = species_payload.get(x_name)
-                if x_source is None:
+                resolved_x_column, x_array = self._resolve_overlay_x_source(x_name, payload)
+                if x_array is None:
                     warnings.append(f"{dataset_name}: missing '{x_name}' values")
                     continue
-
-                x_array = np.asarray(x_source, dtype=float).reshape(-1)
                 if x_array.size == 0:
-                    warnings.append(f"{dataset_name}: '{x_name}' has no data")
+                    warnings.append(f"{dataset_name}: '{resolved_x_column or x_name}' has no data")
                     continue
 
                 for species in selected_series:
-                    # Resolve within the enabled dataset subset first so simulation-only
-                    # species do not become false dataset obligations on species-X axes.
-                    resolved_key, y_source = _resolve_dataset_species(species, dataset_species)
+                    # Enabled dataset columns are authoritative for what can render/export.
+                    # Species-X views skip silently when the enabled subset does not expose
+                    # a given simulation species. Time-axis views still warn on true dataset
+                    # mismatches, so probe the full payload only to classify misses.
+                    resolved_key = None
+                    y_source = None
+                    if enabled_species is not None:
+                        resolved_key, y_source = _resolve_dataset_species(species, enabled_species)
+                    else:
+                        resolved_key, y_source = _resolve_dataset_species(species, species_payload)
                     if y_source is None:
-                        if enabled_for_dataset is not None:
-                            continue
+                        if enabled_species is not None:
+                            if x_name != "t":
+                                continue
+                            full_resolved_key, _ = _resolve_dataset_species(species, species_payload)
+                            if full_resolved_key is not None:
+                                continue
                         available = sorted(species_payload.keys())
                         warnings.append(
                             f"{dataset_name}: no column matching species '{species}'. "
                             f"Available: {', '.join(available[:5])}" +
                             (f" (and {len(available) - 5} more)" if len(available) > 5 else "")
                         )
+                        continue
+                    if enabled_species is not None and resolved_key not in enabled_species:
+                        # Guard against future resolver changes selecting a disabled column.
                         continue
 
                     y_array = np.asarray(y_source, dtype=float).reshape(-1)
@@ -1548,7 +1603,17 @@ if PYQTGRAPH_AVAILABLE:
                             f"{dataset_name}: '{resolved_key}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
                         )
                         continue
-                    overlays.append(_OverlaySeries(dataset_name, species, x_array, y_array))
+                    overlays.append(
+                        _OverlaySeries(
+                            dataset_name,
+                            species,
+                            x_array,
+                            y_array,
+                            x_name,
+                            resolved_x_column,
+                            str(resolved_key),
+                        )
+                    )
 
             return overlays, warnings
 
@@ -1559,18 +1624,7 @@ if PYQTGRAPH_AVAILABLE:
             active_keys: Set[Tuple[str, str]] = set()
 
             for entry in overlays:
-                # Determine the dataset column key that was resolved for this overlay
-                # We need to look it up again to get the actual dataset column name
-                payload = self._overlay_datasets.get(entry.dataset)
-                if not payload:
-                    continue
-
-                # Resolve the species again to get the dataset column key
-                resolved_key, _ = _resolve_dataset_species(entry.species, payload["species"])
-                if resolved_key is None:
-                    continue
-
-                color = self._overlay_display_color(entry.dataset, str(resolved_key))
+                color = self._overlay_display_color(entry.resolved_y_column)
                 symbol = self._overlay_symbols.get(entry.dataset, 'o')
 
                 # Apply user-configured opacity to alpha channel
@@ -1618,8 +1672,13 @@ if PYQTGRAPH_AVAILABLE:
                 candidate_names = self._visible_selected_series_names()
                 if not candidate_names:
                     raise ValueError("Select at least one Y-series before exporting.")
+                overlay_series = list(self._active_overlay_series)
+                warnings = list(self._active_overlay_warnings)
             else:
+                self._ensure_export_all_overlay_cache()
                 candidate_names = list(series.keys())
+                overlay_series = list(self._export_all_overlay_series)
+                warnings = list(self._export_all_overlay_warnings)
 
             x_name = toolbar.current_x() or "t"
             x_data, derived_label = self._get_x_data()
@@ -1683,7 +1742,6 @@ if PYQTGRAPH_AVAILABLE:
                 if len(overlay_columns) > 1:
                     blocks.append(overlay_columns)
 
-            overlay_series, warnings = self._build_overlay_series(list(candidate_names))
             active_overlays = self._overlay_panel.selected_datasets()
             if warnings and active_overlays:
                 warning_msg = "\n".join(f" - {msg}" for msg in warnings)
@@ -2057,7 +2115,7 @@ if PYQTGRAPH_AVAILABLE:
                 min_distance = distances[min_idx]
 
                 if min_distance < best_distance:
-                    color = self._overlay_display_color(overlay.dataset, overlay.species)
+                    color = self._overlay_display_color(overlay.resolved_y_column)
                     best_match = _NearestHit(
                         x_overlay[min_idx],
                         y_data[min_idx],
@@ -2102,6 +2160,10 @@ if PYQTGRAPH_AVAILABLE:
             self._dataset_model_items = {}
             self._overlay_items = {}
             self._active_overlay_series = []
+            self._export_all_overlay_series = []
+            self._active_overlay_warnings = []
+            self._export_all_overlay_warnings = []
+            self._export_all_overlay_cache_dirty = True
             self._annotations = []
             self._guide_items = []
             self._scalar_values = {}
