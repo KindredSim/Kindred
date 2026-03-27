@@ -4622,6 +4622,7 @@ class MainWindow(
         self,
         *,
         set_id: str,
+        label: str,
         cache_key: str,
         valid_set_ids: Optional[Sequence[str]],
         invalidated_set_ids: Optional[Sequence[str]],
@@ -4645,10 +4646,48 @@ class MainWindow(
         )
         if entry_result.entry is None:
             return None, "invalid_cache_entry" if entry_result.state == "invalid" else "no_cached_results"
-        label = str(self.batch_set_name_for_id(set_id) or set_id)
         return self._copy_all_shown_block_from_entry(set_id=str(set_id), label=label, entry=entry_result.entry), None
 
-    def _copy_all_dirty_shown_block(self, *, set_id: str):
+    def _copy_all_live_plot_shown_block(
+        self,
+        *,
+        set_id: str,
+        label: str,
+        invalidated_set_ids: Optional[Sequence[str]],
+    ):
+        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
+        if batch_cache is None:
+            return None
+        sid = str(set_id or "").strip()
+        if not sid:
+            return None
+        active_set_id = str(batch_cache.active_batch_set_id or "").strip()
+        if active_set_id != sid:
+            return None
+        invalidated = {str(raw_id) for raw_id in (invalidated_set_ids or ()) if str(raw_id)}
+        if sid not in invalidated:
+            return None
+        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+        if plot is None:
+            return None
+        plot_t = np.asarray(getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [], dtype=float).reshape(-1)
+        plot_series_raw = getattr(plot, "_series", {}) or {}
+        if plot_t.size <= 0 or not isinstance(plot_series_raw, Mapping):
+            return None
+        plot_series = {
+            str(name): np.asarray(values, dtype=float).reshape(-1)
+            for name, values in dict(plot_series_raw).items()
+            if np.asarray(values, dtype=float).reshape(-1).size > 0
+        }
+        if not plot_series:
+            return None
+        return self._copy_all_shown_block_from_entry(
+            set_id=sid,
+            label=label,
+            entry={"t": plot_t, "series": plot_series},
+        )
+
+    def _copy_all_dirty_shown_block(self, *, set_id: str, label: str):
         resolved_entries, reason, _, _, _, _, _ = self._resolve_workspace_aware_batch_selection(
             selected_sets=[str(set_id)]
         )
@@ -4657,7 +4696,7 @@ class MainWindow(
             return None, str(reason or "preview_pending")
         return self._copy_all_shown_block_from_entry(
             set_id=str(resolved.set_id),
-            label=str(resolved.label),
+            label=str(label),
             entry=resolved.entry,
         ), None
 
@@ -4677,15 +4716,23 @@ class MainWindow(
         missing_items = []
         for set_id in shown_set_ids:
             label = str(self.batch_set_name_for_id(set_id) or set_id)
+            export_label = str(popup_labels.get(str(set_id), label))
             if self._preview_session.has_dirty_state_for_set(str(set_id)):
-                block, reason = self._copy_all_dirty_shown_block(set_id=str(set_id))
+                block, reason = self._copy_all_dirty_shown_block(set_id=str(set_id), label=export_label)
             else:
                 block, reason = self._copy_all_clean_shown_block(
                     set_id=str(set_id),
+                    label=export_label,
                     cache_key=cache_key,
                     valid_set_ids=valid_set_ids or None,
                     invalidated_set_ids=invalidated_set_ids or None,
                 )
+                if block is None:
+                    block = self._copy_all_live_plot_shown_block(
+                        set_id=str(set_id),
+                        label=export_label,
+                        invalidated_set_ids=invalidated_set_ids or None,
+                    )
             if block is not None:
                 shown_blocks.append(block)
                 continue

@@ -1374,6 +1374,93 @@ def test_single_shown_dirty_preview_preserves_canonical_ref_through_main_window_
 
 
 @pytest.mark.gui
+def test_copy_all_export_plan_uses_preserved_live_preview_after_commit_when_explicit_cache_invalidated(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("copy-all export triggered recompute")),
+        raising=True,
+    )
+
+    _set_shown_rows(main_window, [1])
+    qt_app.processEvents()
+
+    shown_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert shown_id
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "copy-all-preserved-preview-explicit-key"
+    preview_key = "copy-all-preserved-preview-preview-key"
+    cache.result_cache[f"{explicit_key}::{shown_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([4.0, 8.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[shown_id])
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = np.linspace(9.0, 18.0, preview_t.size, dtype=float)
+    cache.preview_cache[f"{preview_key}::{shown_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=shown_id,
+        series={"A": preview_series},
+    )
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (shown_id,)
+    cache.active_cache_key = explicit_key
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    np.testing.assert_allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        preview_series,
+    )
+    preserved = main_window._active_workspace_preview_display_snapshot()
+    assert preserved is not None
+
+    main_window._preview_session.commit_current_mechanism_workspace()
+    assert main_window._preview_session.has_dirty_state_for_set(shown_id) is False
+    main_window._invalidate_active_results_after_authoritative_mechanism_change(
+        preserve_current_display=preserved
+    )
+    qt_app.processEvents()
+
+    assert tuple(str(set_id) for set_id in (cache.active_cache_invalidated_set_ids or ())) == (shown_id,)
+    np.testing.assert_allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        preview_series,
+    )
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
+        (shown_id, str(main_window.batch_set_name_for_id(shown_id) or shown_id))
+    ]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, preview_t)
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], preview_series)
+
+
+@pytest.mark.gui
 def test_selection_change_clean_focused_partial_workspace_preview_keeps_resolved_results_visible_with_pending_status(
     main_window, monkeypatch, qt_app
 ):
@@ -2387,7 +2474,7 @@ def test_copy_all_export_plan_is_side_effect_free_and_disambiguates_duplicate_mi
 
     plan = main_window._build_main_plot_copy_all_export_plan()
 
-    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(first_id, "dup")]
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(first_id, "dup (row 1)")]
     assert len(plan.missing_items) == 1
     assert plan.missing_items[0].set_id == second_id
     assert plan.missing_items[0].label == "dup"
