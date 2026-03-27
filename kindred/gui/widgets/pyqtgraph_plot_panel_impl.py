@@ -243,7 +243,10 @@ if PYQTGRAPH_AVAILABLE:
 
             # Plot enhancements (v0.2.0)
             self._secondary_y_axis: Optional[pg.ViewBox] = None
+            self._secondary_y_species: List[str] = []
             self._secondary_y_items: Dict[str, pg.PlotDataItem] = {}
+            self._secondary_y_overlay_items: Dict[str, pg.PlotDataItem] = {}
+            self._secondary_y_dataset_overlay_items: Dict[Tuple[str, str], pg.ScatterPlotItem] = {}
             self._secondary_y_resize_handler: Optional[Callable[[], None]] = None
             self._log_x: bool = False
             self._log_y: bool = False
@@ -534,6 +537,7 @@ if PYQTGRAPH_AVAILABLE:
                     normalized_entry["curve_role"] = curve_role
                 normalized_overlays.append(normalized_entry)
             self._simulation_overlays = normalized_overlays
+            self._secondary_y_species = [name for name in self._secondary_y_species if name in self._series]
 
             # Assign colors
             self._assign_colors()
@@ -753,19 +757,38 @@ if PYQTGRAPH_AVAILABLE:
                 require_visible=require_visible,
             )
 
+        def _uses_secondary_y_species(self, species_name: str) -> bool:
+            return str(species_name) in self._secondary_y_species
+
+        def _axis_scope_series_names(self) -> List[str]:
+            names = list(self._visible_selected_series_names())
+            for series_name in self._secondary_y_species:
+                if series_name in self._series and series_name not in names:
+                    names.append(series_name)
+            return names
+
+        def _secondary_y_label_text(self) -> str:
+            return ", ".join(str(name) for name in self._secondary_y_species if str(name))
+
+        def _series_header_text(self, series_name: str) -> str:
+            header = str(series_name)
+            if self._uses_secondary_y_species(series_name):
+                header = f"{header} [right axis]"
+            return header
+
         def _visible_overlay_copy_series_names(self) -> List[str]:
-            return self._visible_selected_series_names()
+            return self._axis_scope_series_names()
 
         def _visible_primary_copy_series_names(self) -> List[str]:
             names = list(
                 self._current_primary_renderable_series_names(
-                    self._visible_selected_series_names(),
+                    self._axis_scope_series_names(),
                     require_visible=False,
                 )
             )
-            for name in self._secondary_y_items.keys():
+            for name in self._secondary_y_species:
                 series_name = str(name)
-                if series_name in self._series and series_name not in names:
+                if series_name in self._secondary_y_items and series_name not in names:
                     names.append(series_name)
             return names
 
@@ -810,10 +833,7 @@ if PYQTGRAPH_AVAILABLE:
             return f"{label}::{column}"
 
         def _copy_series_header(self, block_label: Optional[str], series_name: str) -> str:
-            header = str(series_name)
-            if str(series_name) in self._secondary_y_items:
-                header = f"{header} [right axis]"
-            return self._qualified_copy_header(block_label, header)
+            return self._qualified_copy_header(block_label, self._series_header_text(series_name))
 
         def _append_copy_column(
             self,
@@ -1402,8 +1422,7 @@ if PYQTGRAPH_AVAILABLE:
         def refresh_overlay_presentation_for_current_roster(self) -> None:
             """Keep visible overlay markers aligned with current-roster swatch semantics."""
             self._overlay_panel.refresh_color_swatches()
-            if self._active_overlay_series:
-                self._draw_overlay_series(list(self._active_overlay_series))
+            self._draw_overlay_series(list(self._active_overlay_series))
 
         def _clear_overlay_series_caches(self) -> None:
             self._active_overlay_series = []
@@ -1428,7 +1447,7 @@ if PYQTGRAPH_AVAILABLE:
                 return None, None
             return x_name, _try_1d_float_array(x_source)
 
-        def _rebuild_overlay_series_caches(self, selected_visible_series: Sequence[str]) -> None:
+        def _rebuild_overlay_series_caches(self, axis_scope_series: Sequence[str]) -> None:
             """
             Rebuild all overlay-record caches before any downstream consumer uses them.
 
@@ -1436,7 +1455,7 @@ if PYQTGRAPH_AVAILABLE:
             refresh, copy, and export paths must use only these records and must
             not call _resolve_dataset_species() again.
             """
-            axis_candidate_names = list(selected_visible_series or [])
+            axis_candidate_names = list(axis_scope_series or [])
             self._active_overlay_series, self._active_overlay_warnings = self._build_overlay_series(axis_candidate_names)
 
         def _ensure_export_all_overlay_cache(self) -> None:
@@ -1539,6 +1558,43 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 self._plot_item.removeItem(item)
 
+        def _upsert_secondary_curve_item(
+            self,
+            registry: Dict[str, pg.PlotDataItem],
+            *,
+            key: str,
+            x_data: np.ndarray,
+            y_data: np.ndarray,
+            pen: object,
+            name: Optional[str] = None,
+        ) -> None:
+            self._ensure_secondary_y_axis()
+            item = registry.get(key)
+            if item is None:
+                item = pg.PlotDataItem(x=x_data, y=y_data, pen=pen, name=str(name or key))
+                self._secondary_y_axis.addItem(item)
+                registry[key] = item
+                return
+            item.setData(x=x_data, y=y_data)
+            item.setPen(pen)
+
+        def _prune_secondary_curve_registry(
+            self,
+            registry: Dict[str, pg.PlotDataItem],
+            active_keys: Set[str],
+        ) -> None:
+            secondary_viewbox = self._secondary_y_axis
+            for key in list(registry.keys()):
+                if key in active_keys:
+                    continue
+                item = registry.pop(key, None)
+                if item is None or secondary_viewbox is None:
+                    continue
+                try:
+                    secondary_viewbox.removeItem(item)
+                except Exception:
+                    logger.debug("Failed to remove secondary curve item '%s'", key, exc_info=True)
+
         def _upsert_dataset_scatter_item(
             self,
             *,
@@ -1638,6 +1694,53 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 self._plot_item.removeItem(item)
 
+        def _upsert_secondary_dataset_overlay_item(
+            self,
+            *,
+            key: Tuple[str, str],
+            x_data: np.ndarray,
+            y_data: np.ndarray,
+            pen: object,
+            brush: object,
+            size: float,
+            symbol: str,
+            name: str,
+        ) -> None:
+            self._ensure_secondary_y_axis()
+            scatter = self._secondary_y_dataset_overlay_items.get(key)
+            if scatter is None:
+                scatter = pg.ScatterPlotItem(
+                    x_data,
+                    y_data,
+                    pen=pen,
+                    brush=brush,
+                    size=size,
+                    symbol=symbol,
+                    name=name,
+                )
+                scatter.setZValue(5)
+                self._secondary_y_axis.addItem(scatter)
+                self._secondary_y_dataset_overlay_items[key] = scatter
+                return
+            scatter.setData(x=x_data, y=y_data, pen=pen, brush=brush, size=size, symbol=symbol)
+            scatter.setZValue(5)
+
+        def _prune_secondary_dataset_overlay_items(
+            self,
+            active_keys: Set[Tuple[str, str]],
+        ) -> None:
+            secondary_viewbox = self._secondary_y_axis
+            for key in list(self._secondary_y_dataset_overlay_items.keys()):
+                if key in active_keys:
+                    continue
+                item = self._secondary_y_dataset_overlay_items.pop(key, None)
+                if item is None or secondary_viewbox is None:
+                    continue
+                try:
+                    secondary_viewbox.removeItem(item)
+                except Exception:
+                    logger.debug("Failed to remove secondary overlay item '%s'", key, exc_info=True)
+
         def _update_plot(self):
             """Update plot with current data, visibility settings, and axis configuration."""
             self._clear_overlay_series_caches()
@@ -1650,6 +1753,7 @@ if PYQTGRAPH_AVAILABLE:
                 return
             _x_name, x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
             selected_visible_series = self._visible_selected_series_names()
+            axis_scope_series = self._axis_scope_series_names()
             selected_primary_series = self._current_primary_renderable_series_names(
                 selected_visible_series,
                 require_visible=False,
@@ -1667,6 +1771,8 @@ if PYQTGRAPH_AVAILABLE:
             # Add visible series (only those selected in toolbar)
             active_curve_keys: Set[str] = set()
             for name in selected_primary_series:
+                if self._uses_secondary_y_species(name):
+                    continue
                 y_data = np.asarray(self._series[name], dtype=float).reshape(-1)
                 color = self._colors.get(name, (100, 100, 100))
                 pen = pg.mkPen(color=color, width=2)
@@ -1683,6 +1789,7 @@ if PYQTGRAPH_AVAILABLE:
 
             # Batch simulation overlays (additional initial-condition sets as lines)
             sim_overlays = list(self._simulation_overlays or [])
+            active_secondary_overlay_keys: Set[str] = set()
             if sim_overlays:
                 color_manager = ColorManager.instance()
                 x_name = self._x_axis_name or "t"
@@ -1702,8 +1809,6 @@ if PYQTGRAPH_AVAILABLE:
                     t_arr = _try_1d_float_array(t_overlay)
                     if t_arr.size == 0:
                         continue
-                    if t_arr.size == 0:
-                        continue
                     if x_name == "t":
                         x_overlay = t_arr
                     else:
@@ -1718,7 +1823,7 @@ if PYQTGRAPH_AVAILABLE:
                     x_plot_overlay = x_overlay if isinstance(idx_overlay, slice) else x_overlay[idx_overlay]
                     style = color_manager.get_dataset_line_style(idx)
                     overlay_species = self._series_names_compatible_with_x(
-                        selected_visible_series,
+                        axis_scope_series,
                         series_overlay,
                         x_overlay,
                         require_visible=False,
@@ -1747,18 +1852,30 @@ if PYQTGRAPH_AVAILABLE:
                             pen = pg.mkPen(color=(r, g, b, 90), width=1.2, style=Qt.PenStyle.DashLine)
                         else:
                             pen = pg.mkPen(color=(r, g, b, 180), width=1.6, style=style)
-                        active_curve_keys.add(overlay_key)
-                        self._upsert_curve_item(
-                            key=overlay_key,
-                            x_data=x_plot_overlay,
-                            y_data=y_plot_overlay,
-                            pen=pen,
-                            name=overlay_name,
-                        )
+                        if self._uses_secondary_y_species(species):
+                            active_secondary_overlay_keys.add(overlay_key)
+                            self._upsert_secondary_curve_item(
+                                self._secondary_y_overlay_items,
+                                key=overlay_key,
+                                x_data=x_plot_overlay,
+                                y_data=y_plot_overlay,
+                                pen=pen,
+                                name=overlay_name,
+                            )
+                        else:
+                            active_curve_keys.add(overlay_key)
+                            self._upsert_curve_item(
+                                key=overlay_key,
+                                x_data=x_plot_overlay,
+                                y_data=y_plot_overlay,
+                                pen=pen,
+                                name=overlay_name,
+                            )
+            self._prune_secondary_curve_registry(self._secondary_y_overlay_items, active_secondary_overlay_keys)
 
             self._prune_curve_items(active_curve_keys)
 
-            self._rebuild_overlay_series_caches(selected_visible_series)
+            self._rebuild_overlay_series_caches(axis_scope_series)
             self._overlay_panel.set_status_messages(self._active_overlay_warnings)
             self._draw_overlay_series(list(self._active_overlay_series))
             self._sync_secondary_y_items()
@@ -1862,7 +1979,8 @@ if PYQTGRAPH_AVAILABLE:
             """Render overlay scatter markers using species-owned colors and dataset markers."""
             # Get current dataset styling from overlay panel (size and opacity)
             style = self._overlay_panel.dataset_style()
-            active_keys: Set[Tuple[str, str]] = set()
+            active_primary_keys: Set[Tuple[str, str]] = set()
+            active_secondary_keys: Set[Tuple[str, str]] = set()
 
             for entry in overlays:
                 color = self._overlay_display_color(entry.resolved_y_column)
@@ -1879,18 +1997,32 @@ if PYQTGRAPH_AVAILABLE:
                     np.asarray(entry.y, dtype=float).reshape(-1),
                 )
                 overlay_key = (entry.dataset, entry.species)
-                active_keys.add(overlay_key)
-                self._upsert_dataset_overlay_item(
-                    key=overlay_key,
-                    x_data=x_plot,
-                    y_data=y_plot,
-                    pen=pen,
-                    brush=brush,
-                    size=style.size,
-                    symbol=symbol,
-                    name=name,
-                )
-            self._prune_dataset_overlay_items(active_keys)
+                if self._uses_secondary_y_species(entry.species):
+                    active_secondary_keys.add(overlay_key)
+                    self._upsert_secondary_dataset_overlay_item(
+                        key=overlay_key,
+                        x_data=x_plot,
+                        y_data=y_plot,
+                        pen=pen,
+                        brush=brush,
+                        size=style.size,
+                        symbol=symbol,
+                        name=name,
+                    )
+                else:
+                    active_primary_keys.add(overlay_key)
+                    self._upsert_dataset_overlay_item(
+                        key=overlay_key,
+                        x_data=x_plot,
+                        y_data=y_plot,
+                        pen=pen,
+                        brush=brush,
+                        size=style.size,
+                        symbol=symbol,
+                        name=name,
+                    )
+            self._prune_dataset_overlay_items(active_primary_keys)
+            self._prune_secondary_dataset_overlay_items(active_secondary_keys)
 
         def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
             """
@@ -1910,7 +2042,7 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("No simulation data available to export.")
 
             if scope == "axis":
-                candidate_names = self._visible_selected_series_names()
+                candidate_names = self._axis_scope_series_names()
                 if not candidate_names:
                     raise ValueError("Select at least one Y-series before exporting.")
                 overlay_series = list(self._active_overlay_series)
@@ -1944,7 +2076,7 @@ if PYQTGRAPH_AVAILABLE:
                     arr = np.asarray(series[name], dtype=float).reshape(-1)
                     if arr.shape[0] != x_array.shape[0]:
                         continue
-                    primary_columns.append((name, arr))
+                    primary_columns.append((self._series_header_text(name), arr))
                 if len(primary_columns) > 1:
                     blocks.append(primary_columns)
 
@@ -1979,7 +2111,7 @@ if PYQTGRAPH_AVAILABLE:
                     arr = np.asarray(overlay_series_map[name], dtype=float).reshape(-1)
                     if arr.shape[0] != x_overlay_array.shape[0]:
                         continue
-                    overlay_columns.append((f"{block_label}::{name}", arr))
+                    overlay_columns.append((f"{block_label}::{self._series_header_text(name)}", arr))
                 if len(overlay_columns) > 1:
                     blocks.append(overlay_columns)
 
@@ -1992,7 +2124,7 @@ if PYQTGRAPH_AVAILABLE:
 
             for entry in overlay_series:
                 x_header_ds = f"{entry.dataset}::{x_header}"
-                y_header_ds = f"{entry.dataset}::{entry.species}"
+                y_header_ds = f"{entry.dataset}::{self._series_header_text(entry.species)}"
                 blocks.append([(x_header_ds, entry.x), (y_header_ds, entry.y)])
 
             columns: List[Tuple[str, np.ndarray]] = [col for block in blocks for col in block]
@@ -2322,7 +2454,7 @@ if PYQTGRAPH_AVAILABLE:
 
             # Check each visible series
             visible_names = self._current_primary_renderable_series_names(
-                self._visible_selected_series_names(),
+                self._axis_scope_series_names(),
                 require_visible=False,
             )
             for name in visible_names:
@@ -2391,6 +2523,7 @@ if PYQTGRAPH_AVAILABLE:
 
         def clear(self):
             """Clear all plot data."""
+            self._teardown_secondary_y_axis()
             self._plot_item.clear()
             self._t = None
             self._series = {}
@@ -2400,6 +2533,10 @@ if PYQTGRAPH_AVAILABLE:
             self._dataset_scatter_items = {}
             self._dataset_model_items = {}
             self._overlay_items = {}
+            self._secondary_y_species = []
+            self._secondary_y_items = {}
+            self._secondary_y_overlay_items = {}
+            self._secondary_y_dataset_overlay_items = {}
             self._active_overlay_series = []
             self._export_all_overlay_series = []
             self._active_overlay_warnings = []
@@ -2417,10 +2554,9 @@ if PYQTGRAPH_AVAILABLE:
 
             # Secondary Y-axis actions
             secondary_menu = menu.addMenu("Secondary Y-Axis")
-            if self._secondary_y_axis is None:
-                add_secondary_action = secondary_menu.addAction("Add Secondary Y-Axis")
-                add_secondary_action.triggered.connect(self._add_secondary_y_axis)
-            else:
+            add_secondary_action = secondary_menu.addAction("Add Secondary Y-Axis")
+            add_secondary_action.triggered.connect(self._add_secondary_y_axis)
+            if self._secondary_y_species:
                 remove_secondary_action = secondary_menu.addAction("Remove Secondary Y-Axis")
                 remove_secondary_action.triggered.connect(self._remove_secondary_y_axis)
 
@@ -2512,46 +2648,48 @@ if PYQTGRAPH_AVAILABLE:
             menu.exec_(self._plot_widget.mapToGlobal(position))
 
         def _add_secondary_y_axis(self):
-            """Add secondary Y-axis for selected series."""
-            if self._secondary_y_axis is not None:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Secondary Axis",
-                    "Secondary Y-axis already exists. Remove it first to add a new one."
-                )
-                return
-
-            # Ask user which series to plot on secondary axis
-            available_series = list(self._series.keys())
+            """Add one species to the shared secondary Y-axis."""
+            available_series = [
+                str(name)
+                for name in self._series.keys()
+                if str(name) and str(name) not in self._secondary_y_species
+            ]
             if not available_series:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "No Data",
-                    "No series available to plot on secondary axis."
+                    "No additional series are available to plot on the secondary axis.",
                 )
                 return
 
-            # Show selection dialog
             item, ok = QtWidgets.QInputDialog.getItem(
                 self,
                 "Select Series",
                 "Choose series for secondary Y-axis:",
                 available_series,
                 0,
-                False
+                False,
             )
-
             if not ok or not item:
                 return
 
-            # Create secondary ViewBox
+            species_name = str(item)
+            if species_name not in self._series or self._uses_secondary_y_species(species_name):
+                return
+            self._secondary_y_species.append(species_name)
+            self._ensure_secondary_y_axis()
+            self._update_plot()
+            logger.info("Added secondary Y-axis membership for series: %s", species_name)
+
+        def _ensure_secondary_y_axis(self) -> None:
+            if self._secondary_y_axis is not None:
+                return
             self._secondary_y_axis = pg.ViewBox()
             self._plot_item.showAxis('right')
             self._plot_item.scene().addItem(self._secondary_y_axis)
             self._plot_item.getAxis('right').linkToView(self._secondary_y_axis)
             self._secondary_y_axis.setXLink(self._plot_item)
 
-            # Update views when resizing
             def update_views():
                 if self._secondary_y_axis is None:
                     return
@@ -2560,61 +2698,58 @@ if PYQTGRAPH_AVAILABLE:
 
             self._secondary_y_resize_handler = update_views
             self._plot_item.vb.sigResized.connect(update_views)
+            update_views()
+            self._apply_axis_inversion_state()
 
-            # Plot selected series on secondary axis
-            if item in self._series:
-                color = self._colors.get(item, (100, 100, 100))
-                pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
-                plot_item = pg.PlotDataItem([], [], pen=pen, name=f"{item} (secondary)")
-                self._secondary_y_axis.addItem(plot_item)
-                self._secondary_y_items[item] = plot_item
-                self._sync_secondary_y_items()
-                logger.info(f"Added secondary Y-axis for series: {item}")
-
-        def _remove_secondary_y_item(self, series_name: str) -> None:
-            plot_item = self._secondary_y_items.pop(series_name, None)
-            if plot_item is None or self._secondary_y_axis is None:
+        def _remove_secondary_y_species(self, species_name: str) -> None:
+            species_key = str(species_name or "").strip()
+            if not species_key:
                 return
-            try:
-                self._secondary_y_axis.removeItem(plot_item)
-            except Exception:
-                logger.debug("Failed to remove secondary axis item '%s'", series_name, exc_info=True)
+            self._secondary_y_species = [name for name in self._secondary_y_species if str(name) != species_key]
+            if self._secondary_y_species:
+                self._update_plot()
+                return
+            self._teardown_secondary_y_axis()
+            self._update_plot()
 
         def _sync_secondary_y_items(self) -> None:
-            if self._secondary_y_axis is None:
-                self._secondary_y_items.clear()
-                return
-            if not self._secondary_y_items:
-                self._remove_secondary_y_axis()
+            if not self._secondary_y_species:
+                self._prune_secondary_curve_registry(self._secondary_y_items, set())
+                self._prune_secondary_curve_registry(self._secondary_y_overlay_items, set())
+                self._prune_secondary_dataset_overlay_items(set())
+                self._teardown_secondary_y_axis()
                 return
 
             primary_basis = self._current_primary_plot_basis()
             if primary_basis is None:
-                self._remove_secondary_y_axis()
+                self._prune_secondary_curve_registry(self._secondary_y_items, set())
                 return
-            _x_name, _x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
-            stale_names: List[str] = []
 
-            for series_name, plot_item in list(self._secondary_y_items.items()):
+            self._ensure_secondary_y_axis()
+            _x_name, _x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
+            active_species: Set[str] = set()
+
+            for series_name in self._secondary_y_species:
                 y_array = _try_1d_float_array(self._series.get(series_name))
                 if x_array.size == 0 or y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
-                    stale_names.append(str(series_name))
                     continue
                 y_plot = self._apply_sample_indices(y_array, sample_idx)
                 if y_plot.size == 0 or y_plot.shape[0] != x_plot.shape[0]:
-                    stale_names.append(str(series_name))
                     continue
-                plot_item.setData(x=x_plot, y=y_plot)
+                color = self._colors.get(series_name, (100, 100, 100))
+                pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
+                self._upsert_secondary_curve_item(
+                    self._secondary_y_items,
+                    key=series_name,
+                    x_data=x_plot,
+                    y_data=y_plot,
+                    pen=pen,
+                    name=f"{series_name} (secondary)",
+                )
+                active_species.add(series_name)
 
-            for series_name in stale_names:
-                self._remove_secondary_y_item(series_name)
-
-            if not self._secondary_y_items:
-                self._remove_secondary_y_axis()
-                return
-
-            label_name = next(iter(self._secondary_y_items.keys()))
-            self._plot_item.setLabel('right', label_name, units='M')
+            self._prune_secondary_curve_registry(self._secondary_y_items, active_species)
+            self._plot_item.setLabel('right', self._secondary_y_label_text(), units='M')
             self._plot_item.getAxis('right').setPen('k' if not self._dark_mode else '#e0e0e0')
             self._plot_item.getAxis('right').setTextPen('k' if not self._dark_mode else '#e0e0e0')
 
@@ -2624,14 +2759,48 @@ if PYQTGRAPH_AVAILABLE:
             self._apply_axis_inversion_state()
 
         def _remove_secondary_y_axis(self):
-            """Remove secondary Y-axis."""
-            if self._secondary_y_axis is None:
+            """Remove one species from the secondary Y-axis, or tear it down when empty."""
+            if not self._secondary_y_species:
+                self._teardown_secondary_y_axis()
+                return
+            if len(self._secondary_y_species) == 1:
+                self._remove_secondary_y_species(self._secondary_y_species[0])
                 return
 
-            # Remove plot items
-            for item in self._secondary_y_items.values():
-                self._secondary_y_axis.removeItem(item)
+            item, ok = QtWidgets.QInputDialog.getItem(
+                self,
+                "Remove Series",
+                "Remove which series from the secondary Y-axis?",
+                list(self._secondary_y_species),
+                0,
+                False,
+            )
+            if not ok or not item:
+                return
+            self._remove_secondary_y_species(str(item))
+
+        def _teardown_secondary_y_axis(self) -> None:
+            secondary_viewbox = self._secondary_y_axis
+            if secondary_viewbox is not None:
+                for item in list(self._secondary_y_items.values()):
+                    try:
+                        secondary_viewbox.removeItem(item)
+                    except Exception:
+                        logger.debug("Failed to remove secondary primary item", exc_info=True)
+                for item in list(self._secondary_y_overlay_items.values()):
+                    try:
+                        secondary_viewbox.removeItem(item)
+                    except Exception:
+                        logger.debug("Failed to remove secondary overlay line", exc_info=True)
+                for item in list(self._secondary_y_dataset_overlay_items.values()):
+                    try:
+                        secondary_viewbox.removeItem(item)
+                    except Exception:
+                        logger.debug("Failed to remove secondary overlay marker", exc_info=True)
+
             self._secondary_y_items.clear()
+            self._secondary_y_overlay_items.clear()
+            self._secondary_y_dataset_overlay_items.clear()
 
             resize_handler = self._secondary_y_resize_handler
             if resize_handler is not None:
@@ -2641,13 +2810,11 @@ if PYQTGRAPH_AVAILABLE:
                     logger.debug("Failed to disconnect secondary axis resize handler", exc_info=True)
                 self._secondary_y_resize_handler = None
 
-            # Remove ViewBox
-            self._plot_item.scene().removeItem(self._secondary_y_axis)
+            if secondary_viewbox is not None:
+                self._plot_item.scene().removeItem(secondary_viewbox)
             self._secondary_y_axis = None
-
-            # Hide right axis
             self._plot_item.hideAxis('right')
-
+            self._plot_item.setLabel('right', '')
             logger.info("Removed secondary Y-axis")
 
         def _has_canonical_ghost_overlays(self) -> bool:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PySide6 import QtGui
+from PySide6 import QtGui, QtWidgets
 
 from kindred.gui.plot_config import get_plot_panel_class, is_pyqtgraph_available
 from kindred.gui.widgets.dataset_plot_panel import DatasetPlotPanel
@@ -542,6 +542,77 @@ def test_main_plot_overlay_enabled_alias_preserves_resolved_dataset_column_color
         assert overlay.resolved_y_column == "A_conc"
         np.testing.assert_allclose(overlay.x, x_axis_species)
         np.testing.assert_allclose(overlay.y, observed_alias)
+        assert _brush_rgb(item.opts["brush"]) == expected
+
+        hit = panel._find_nearest_data_point(1.0, observed_alias[0], np.asarray(panel._get_x_data()[0], dtype=float))
+        assert hit is not None
+        assert hit.dataset == "ds1"
+        assert hit.label == "A"
+        assert tuple(hit.color) == expected
+    finally:
+        panel.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
+def test_secondary_axis_dataset_overlay_alias_uses_logical_species_membership_and_keeps_resolved_color_hover(
+    qt_app,
+    monkeypatch,
+) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+
+    panel_cls = get_plot_panel_class()
+    panel = panel_cls()
+    try:
+        t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+        x_axis_species = np.asarray([1.0, 2.0, 3.0], dtype=float)
+        simulated = np.asarray([3.0, 3.0, 3.0], dtype=float)
+        observed_alias = np.asarray([1.2, 0.8, 0.4], dtype=float)
+
+        monkeypatch.setattr(
+            QtWidgets.QInputDialog,
+            "getItem",
+            lambda *args, **kwargs: ("A", True),
+        )
+
+        panel.set_data(
+            t,
+            {"A": simulated, "B": x_axis_species},
+            label="set1",
+            owned_species=["A", "A_conc", "B"],
+        )
+        manager.set_species_roster(["A", "A_conc", "B"])
+        panel.set_overlay_catalog(
+            {
+                "ds1": {
+                    "t": t,
+                    "species": {
+                        "A": np.asarray([1.0, 0.6, 0.2], dtype=float),
+                        "A_conc": observed_alias,
+                        "B": x_axis_species,
+                    },
+                },
+            }
+        )
+        panel._overlay_panel._selected["ds1"] = True
+        panel._overlay_panel._enabled_species["ds1"] = {"A_conc"}
+        panel.set_selected_series(["A"])
+        panel._on_x_axis_changed("B")
+        panel._add_secondary_y_axis()
+        qt_app.processEvents()
+
+        overlay = panel._active_overlay_series[0]
+        expected = _rgb(manager.get_species_color("A_conc"))
+        item = panel._secondary_y_dataset_overlay_items[("ds1", "A")]
+
+        assert overlay.species == "A"
+        assert overlay.resolved_x_column == "B"
+        assert overlay.resolved_y_column == "A_conc"
+        assert ("ds1", "A") not in panel._overlay_items
+        assert ("ds1", "A") in panel._secondary_y_dataset_overlay_items
         assert _brush_rgb(item.opts["brush"]) == expected
 
         hit = panel._find_nearest_data_point(1.0, observed_alias[0], np.asarray(panel._get_x_data()[0], dtype=float))
