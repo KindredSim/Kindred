@@ -1116,6 +1116,64 @@ def test_hover_hit_testing_includes_simulation_overlays_reference_lines_and_data
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_hover_distance_ties_prefer_rendered_overlay_and_reference_lines_over_primary(qtbot):
+    panel = PyQtGraphPlotPanel(
+        enable_hover_crosshair_toggle_action=True,
+        enable_canonical_ghost_toggle_action=True,
+    )
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+
+    t = np.array([0.0, 1.0, 2.0], dtype=float)
+    ordinary_values = np.array([10.0, 20.0, 30.0], dtype=float)
+    reference_values = np.array([100.0, 120.0, 140.0], dtype=float)
+    panel.set_data(
+        t,
+        {
+            "A": ordinary_values,
+            "B": reference_values,
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "t": t,
+                "series": {"A": ordinary_values},
+            },
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "curve_role": "canonical_ghost",
+                "t": t,
+                "series": {"B": reference_values},
+            },
+        ],
+    )
+    panel.set_selected_series(["A", "B"])
+    panel._set_hover_crosshair_enabled(True)
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(0.0, 150.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    ordinary_overlay_label = panel._format_species_set_label("A", "set2")
+    reference_overlay_label = panel._format_species_set_label("B", "set2")
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 20.0))
+    assert panel._tooltip_text.isVisible() is True
+    assert panel._tooltip_text.toPlainText().splitlines()[0] == f"Sim: {ordinary_overlay_label}"
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(20.0)
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 120.0))
+    assert panel._tooltip_text.isVisible() is True
+    assert panel._tooltip_text.toPlainText().splitlines()[0] == f"Sim: {reference_overlay_label} [ref]"
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(120.0)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_hover_off_suppresses_lookup_mapping_and_existing_visuals(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_hover_crosshair_toggle_action=True)
     qtbot.addWidget(panel)

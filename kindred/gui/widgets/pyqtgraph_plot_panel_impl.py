@@ -2298,9 +2298,9 @@ if PYQTGRAPH_AVAILABLE:
             scene_pos: QtCore.QPointF,
             viewbox,
             candidates: Sequence[_HoverCandidate],
-        ) -> Optional[_NearestHit]:
+        ) -> Tuple[Optional[_NearestHit], float]:
             if not candidates:
-                return None
+                return None, float("inf")
             mouse_point = viewbox.mapSceneToView(scene_pos)
             x_mouse = float(mouse_point.x())
             y_mouse = float(mouse_point.y())
@@ -2326,8 +2326,8 @@ if PYQTGRAPH_AVAILABLE:
                     )
                     best_distance = min_distance
             if best_match is None or best_distance > threshold:
-                return None
-            return best_match
+                return None, float("inf")
+            return best_match, best_distance
 
         def _find_nearest_hover_hit(
             self,
@@ -2338,12 +2338,12 @@ if PYQTGRAPH_AVAILABLE:
                 self._axis_scope_series_names(),
                 require_visible=False,
             )
-            candidates: List[_HoverCandidate] = []
+            primary_candidates: List[_HoverCandidate] = []
             for name in visible_names:
                 y_data = _try_1d_float_array(self._series.get(name))
                 if y_data.shape[0] != x_data.shape[0]:
                     continue
-                candidates.append(
+                primary_candidates.append(
                     _HoverCandidate(
                         x_data,
                         y_data,
@@ -2352,6 +2352,7 @@ if PYQTGRAPH_AVAILABLE:
                         self._colors.get(name, (0, 160, 0)),
                     )
                 )
+            overlay_candidates: List[_HoverCandidate] = []
             primary_plot_item_keys = self._current_primary_plot_item_keys()
             for key, item in self._plot_items.items():
                 if key in primary_plot_item_keys:
@@ -2365,7 +2366,7 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 label = self._rendered_plot_item_label(item, key)
                 color = self._rendered_plot_item_color(item, (0, 160, 0))
-                candidates.append(
+                overlay_candidates.append(
                     _HoverCandidate(
                         x_rendered,
                         y_rendered,
@@ -2374,8 +2375,9 @@ if PYQTGRAPH_AVAILABLE:
                         color,
                     )
                 )
+            dataset_candidates: List[_HoverCandidate] = []
             for overlay in self._active_overlay_series:
-                candidates.append(
+                dataset_candidates.append(
                     _HoverCandidate(
                         np.asarray(overlay.x, dtype=float).reshape(-1),
                         np.asarray(overlay.y, dtype=float).reshape(-1),
@@ -2384,11 +2386,27 @@ if PYQTGRAPH_AVAILABLE:
                         self._overlay_display_color(overlay.resolved_y_column),
                     )
                 )
-            return self._find_nearest_hit_from_candidates(
+            best_hit, best_distance = self._find_nearest_hit_from_candidates(
                 scene_pos=scene_pos,
                 viewbox=self._plot_item.vb,
-                candidates=candidates,
+                candidates=primary_candidates,
             )
+            overlay_hit, overlay_distance = self._find_nearest_hit_from_candidates(
+                scene_pos=scene_pos,
+                viewbox=self._plot_item.vb,
+                candidates=overlay_candidates,
+            )
+            if overlay_hit is not None and overlay_distance <= best_distance:
+                best_hit = overlay_hit
+                best_distance = overlay_distance
+            dataset_hit, dataset_distance = self._find_nearest_hit_from_candidates(
+                scene_pos=scene_pos,
+                viewbox=self._plot_item.vb,
+                candidates=dataset_candidates,
+            )
+            if dataset_hit is not None and dataset_distance < best_distance:
+                best_hit = dataset_hit
+            return best_hit
 
         def _on_mouse_moved(self, pos) -> None:
             """
