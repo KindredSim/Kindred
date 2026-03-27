@@ -298,7 +298,6 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     panel._on_x_axis_changed("B")
     panel._add_secondary_y_axis()
     panel.set_selected_series(["A"])
-    panel._on_toolbar_option_requested("sampling", "coarse")
 
     panel.set_overlay_catalog(
         {
