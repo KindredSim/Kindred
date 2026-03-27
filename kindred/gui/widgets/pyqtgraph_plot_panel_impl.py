@@ -109,20 +109,6 @@ if PYQTGRAPH_AVAILABLE:
             hint = super().minimumSizeHint()
             return QtCore.QSize(max(hint.width(), 260), 120)
 
-    class _NearestHit(NamedTuple):
-        x: float
-        y: float
-        label: str
-        dataset: Optional[str]
-        color: Tuple[int, int, int]
-
-    class _HoverCandidate(NamedTuple):
-        x_data: np.ndarray
-        y_data: np.ndarray
-        label: str
-        dataset: Optional[str]
-        color: Tuple[int, int, int]
-
     def _resolve_dataset_species(
         species_name: str,
         species_dict: Dict[str, np.ndarray]
@@ -191,7 +177,6 @@ if PYQTGRAPH_AVAILABLE:
         - Parametric mode support
         - Legend with show/hide toggle
         - Dark theme support
-        - Mouse tracking with exact value tooltips
 
         Performance:
         - Handles 1M+ points smoothly with GPU acceleration
@@ -209,7 +194,6 @@ if PYQTGRAPH_AVAILABLE:
             enable_axis_inversion_actions: bool = False,
             enable_canonical_ghost_toggle_action: bool = False,
             enable_copy_visible_data_action: bool = False,
-            enable_hover_crosshair_toggle_action: bool = False,
         ):
             """
             Initialize PyQtGraph plot panel.
@@ -258,8 +242,6 @@ if PYQTGRAPH_AVAILABLE:
             self._show_canonical_ghost_lines: bool = True
             self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
             self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
-            self._enable_hover_crosshair_toggle_action = bool(enable_hover_crosshair_toggle_action)
-            self._hover_crosshair_enabled: bool = not self._enable_hover_crosshair_toggle_action
             self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
             self._annotations: List[pg.TextItem] = []
             self._sampling_mode: str = "dense"
@@ -299,16 +281,6 @@ if PYQTGRAPH_AVAILABLE:
             vb = self._plot_item.getViewBox()
             vb.setMenuEnabled(False)
             self._apply_axis_inversion_state()
-
-            # Enable mouse tracking for crosshair and tooltip
-            self._plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
-            self._crosshair_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('g', width=1, style=Qt.DashLine))
-            self._crosshair_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('g', width=1, style=Qt.DashLine))
-
-            # Tooltip label for exact values
-            self._tooltip_text = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 220, 230), border=pg.mkPen(100, 100, 100))
-            self._ensure_hover_visual_items()
-            self._clear_hover_state()
 
             self._toolbar = AxisToolbar(self, orientation="horizontal")
             self._toolbar.setSizePolicy(
@@ -1428,8 +1400,8 @@ if PYQTGRAPH_AVAILABLE:
             """
             Rebuild all overlay-record caches before any downstream consumer uses them.
 
-            Built overlay records are fully resolved snapshots. Draw, hover,
-            refresh, copy, and export paths must use only these records and must
+            Built overlay records are fully resolved snapshots. Draw, refresh,
+            copy, and export paths must use only these records and must
             not call _resolve_dataset_species() again.
             """
             axis_candidate_names = list(axis_scope_series or [])
@@ -2224,343 +2196,9 @@ if PYQTGRAPH_AVAILABLE:
                     self._plot_item.setYRange(y_min, y_max, padding=0)
                     logger.debug(f"Applied manual Y range: [{y_min}, {y_max}]")
 
-        def _clear_hover_state(self) -> None:
-            self._crosshair_v.setVisible(False)
-            self._crosshair_h.setVisible(False)
-            self._tooltip_text.setVisible(False)
-
-        def _current_primary_plot_item_keys(self) -> Set[str]:
-            selected_visible_series = self._visible_selected_series_names()
-            selected_primary_series = self._current_primary_renderable_series_names(
-                selected_visible_series,
-                require_visible=False,
-            )
-            return {
-                self._format_species_set_label(name, self._simulation_set_label)
-                for name in selected_primary_series
-            }
-
-        @staticmethod
-        def _hover_xy_arrays(x_data: object, y_data: object) -> Tuple[np.ndarray, np.ndarray]:
-            x_array = _try_1d_float_array(x_data)
-            y_array = _try_1d_float_array(y_data)
-            if x_array.size == 0 or y_array.size == 0 or x_array.shape[0] != y_array.shape[0]:
-                return np.asarray([], dtype=float), np.asarray([], dtype=float)
-            finite_mask = np.isfinite(x_array) & np.isfinite(y_array)
-            if not np.any(finite_mask):
-                return np.asarray([], dtype=float), np.asarray([], dtype=float)
-            if not np.all(finite_mask):
-                x_array = x_array[finite_mask]
-                y_array = y_array[finite_mask]
-            return x_array, y_array
-
-        @staticmethod
-        def _rendered_plot_item_label(item: object, fallback: str) -> str:
-            name_getter = getattr(item, "name", None)
-            if callable(name_getter):
-                try:
-                    label = str(name_getter() or "").strip()
-                except Exception:
-                    label = ""
-                if label:
-                    return label
-            return str(fallback)
-
-        @staticmethod
-        def _rendered_plot_item_color(item: object, fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
-            opts = getattr(item, "opts", None)
-            pen = opts.get("pen") if isinstance(opts, dict) else None
-            if pen is None:
-                return fallback
-            try:
-                qcolor = pg.mkPen(pen).color()
-            except Exception:
-                return fallback
-            return (int(qcolor.red()), int(qcolor.green()), int(qcolor.blue()))
-
-        def _ensure_hover_visual_items(self) -> None:
-            scene = self._plot_widget.scene()
-            if self._crosshair_v.scene() is not scene:
-                self._plot_item.addItem(self._crosshair_v, ignoreBounds=True)
-            if self._crosshair_h.scene() is not scene:
-                self._plot_item.addItem(self._crosshair_h, ignoreBounds=True)
-            if self._tooltip_text.scene() is not scene:
-                self._plot_item.addItem(self._tooltip_text)
-
-        def _set_hover_crosshair_enabled(self, enabled: bool) -> None:
-            self._hover_crosshair_enabled = bool(enabled)
-            if not self._hover_crosshair_enabled:
-                self._clear_hover_state()
-
-        def _find_nearest_hit_from_candidates(
-            self,
-            *,
-            scene_pos: QtCore.QPointF,
-            viewbox,
-            candidates: Sequence[_HoverCandidate],
-        ) -> Tuple[Optional[_NearestHit], float]:
-            if not candidates:
-                return None, float("inf")
-            mouse_point = viewbox.mapSceneToView(scene_pos)
-            x_mouse = float(mouse_point.x())
-            y_mouse = float(mouse_point.y())
-            view_range = viewbox.viewRange()
-            x_range = float(view_range[0][1] - view_range[0][0]) or 1.0
-            y_range = float(view_range[1][1] - view_range[1][0]) or 1.0
-            best_match: Optional[_NearestHit] = None
-            best_distance = float("inf")
-            threshold = 0.05
-            for x_data, y_data, label, dataset, color in candidates:
-                if x_data.shape[0] == 0 or y_data.shape[0] == 0 or x_data.shape[0] != y_data.shape[0]:
-                    continue
-                distances = np.sqrt(((x_data - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
-                min_idx = int(np.argmin(distances))
-                min_distance = float(distances[min_idx])
-                if min_distance < best_distance:
-                    best_match = _NearestHit(
-                        float(x_data[min_idx]),
-                        float(y_data[min_idx]),
-                        str(label),
-                        dataset,
-                        color,
-                    )
-                    best_distance = min_distance
-            if best_match is None or best_distance > threshold:
-                return None, float("inf")
-            return best_match, best_distance
-
-        def _find_nearest_hover_hit(
-            self,
-            scene_pos: QtCore.QPointF,
-            x_data: np.ndarray,
-        ) -> Optional[_NearestHit]:
-            visible_names = self._current_primary_renderable_series_names(
-                self._axis_scope_series_names(),
-                require_visible=False,
-            )
-            primary_candidates: List[_HoverCandidate] = []
-            for name in visible_names:
-                y_data = _try_1d_float_array(self._series.get(name))
-                if y_data.shape[0] != x_data.shape[0]:
-                    continue
-                primary_candidates.append(
-                    _HoverCandidate(
-                        x_data,
-                        y_data,
-                        str(name),
-                        None,
-                        self._colors.get(name, (0, 160, 0)),
-                    )
-                )
-            overlay_candidates: List[_HoverCandidate] = []
-            primary_plot_item_keys = self._current_primary_plot_item_keys()
-            for key, item in self._plot_items.items():
-                if key in primary_plot_item_keys:
-                    continue
-                try:
-                    rendered_x, rendered_y = item.getData()
-                except Exception:
-                    continue
-                x_rendered, y_rendered = self._hover_xy_arrays(rendered_x, rendered_y)
-                if x_rendered.size == 0:
-                    continue
-                label = self._rendered_plot_item_label(item, key)
-                color = self._rendered_plot_item_color(item, (0, 160, 0))
-                overlay_candidates.append(
-                    _HoverCandidate(
-                        x_rendered,
-                        y_rendered,
-                        label,
-                        None,
-                        color,
-                    )
-                )
-            dataset_candidates: List[_HoverCandidate] = []
-            for overlay in self._active_overlay_series:
-                dataset_candidates.append(
-                    _HoverCandidate(
-                        np.asarray(overlay.x, dtype=float).reshape(-1),
-                        np.asarray(overlay.y, dtype=float).reshape(-1),
-                        str(overlay.species),
-                        overlay.dataset,
-                        self._overlay_display_color(overlay.resolved_y_column),
-                    )
-                )
-            best_hit, best_distance = self._find_nearest_hit_from_candidates(
-                scene_pos=scene_pos,
-                viewbox=self._plot_item.vb,
-                candidates=primary_candidates,
-            )
-            overlay_hit, overlay_distance = self._find_nearest_hit_from_candidates(
-                scene_pos=scene_pos,
-                viewbox=self._plot_item.vb,
-                candidates=overlay_candidates,
-            )
-            if overlay_hit is not None and overlay_distance <= best_distance:
-                best_hit = overlay_hit
-                best_distance = overlay_distance
-            dataset_hit, dataset_distance = self._find_nearest_hit_from_candidates(
-                scene_pos=scene_pos,
-                viewbox=self._plot_item.vb,
-                candidates=dataset_candidates,
-            )
-            if dataset_hit is not None and dataset_distance < best_distance:
-                best_hit = dataset_hit
-            return best_hit
-
-        def _on_mouse_moved(self, pos) -> None:
-            """
-            Handle mouse movement for crosshair and tooltip.
-
-            Parameters
-            ----------
-            pos : QPointF
-                Mouse position in scene coordinates
-            """
-            if not self._hover_crosshair_enabled:
-                self._clear_hover_state()
-                return
-            if self._t is None or not self._series:
-                self._clear_hover_state()
-                return
-
-            # Get X data
-            x_data, _x_label = self._get_x_data()
-            if x_data is None or len(x_data) == 0:
-                self._clear_hover_state()
-                return
-
-            primary_viewbox = self._plot_item.vb
-            if not primary_viewbox.sceneBoundingRect().contains(pos):
-                self._clear_hover_state()
-                return
-
-            nearest = self._find_nearest_hover_hit(
-                pos,
-                np.asarray(x_data, dtype=float).reshape(-1),
-            )
-            if nearest is None:
-                self._clear_hover_state()
-                return
-
-            color = nearest.color or (0, 180, 0)
-            pen = pg.mkPen(color=color, width=1.2, style=Qt.DashLine)
-            kind = "Sim" if nearest.dataset is None else f"Dataset {nearest.dataset}"
-            tooltip_text = (
-                f"{kind}: {nearest.label}\n"
-                f"{self._x_axis_name} = {self._format_number(nearest.x)}\n"
-                f"{nearest.label} = {self._format_number(nearest.y)}"
-            )
-            primary_mouse_point = primary_viewbox.mapSceneToView(pos)
-            self._crosshair_v.setPen(pen)
-            self._crosshair_v.setPos(nearest.x)
-            self._crosshair_v.setVisible(True)
-            self._tooltip_text.setText(tooltip_text)
-            self._tooltip_text.setPos(primary_mouse_point.x(), primary_mouse_point.y())
-            self._tooltip_text.setVisible(True)
-            self._crosshair_h.setPen(pen)
-            self._crosshair_h.setPos(nearest.y)
-            self._crosshair_h.setVisible(True)
-
-        def _find_nearest_data_point(self, x_mouse: float, y_mouse: float, x_data: np.ndarray) -> Optional[_NearestHit]:
-            """
-            Find the nearest data point to the mouse cursor.
-
-            Parameters
-            ----------
-            x_mouse, y_mouse : float
-                Mouse coordinates in plot space
-            x_data : np.ndarray
-                X-axis data
-
-            Returns
-            -------
-            tuple or None
-                (x_value, y_value, series_name) if found within threshold, None otherwise
-            """
-            best_match: Optional[_NearestHit] = None
-            best_distance = float('inf')
-            threshold = 0.05  # Relative threshold (5% of plot range)
-
-            # Get current view range for normalizing distance
-            view_box = self._plot_item.vb.viewRange()
-            x_range = view_box[0][1] - view_box[0][0]
-            y_range = view_box[1][1] - view_box[1][0]
-
-            # Check each visible series
-            visible_names = self._current_primary_renderable_series_names(
-                self._axis_scope_series_names(),
-                require_visible=False,
-            )
-            for name in visible_names:
-                y_data = _try_1d_float_array(self._series.get(name))
-                if y_data.shape[0] != x_data.shape[0]:
-                    continue
-
-                # Find nearest point in this series
-                # Normalize distances to account for different axis scales
-                distances = np.sqrt(((x_data - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
-                min_idx = np.argmin(distances)
-                min_distance = distances[min_idx]
-
-                if min_distance < best_distance:
-                    color = self._colors.get(name, (0, 160, 0))
-                    best_match = _NearestHit(
-                        x_data[min_idx],
-                        y_data[min_idx],
-                        name,
-                        None,
-                        color,
-                    )
-                    best_distance = min_distance
-
-            # Check dataset overlays
-            for overlay in self._active_overlay_series:
-                y_data = overlay.y
-                x_overlay = overlay.x
-                distances = np.sqrt(((x_overlay - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
-                min_idx = np.argmin(distances)
-                min_distance = distances[min_idx]
-
-                if min_distance < best_distance:
-                    color = self._overlay_display_color(overlay.resolved_y_column)
-                    best_match = _NearestHit(
-                        x_overlay[min_idx],
-                        y_data[min_idx],
-                        overlay.species,
-                        overlay.dataset,
-                        color,
-                    )
-                    best_distance = min_distance
-
-            # Return match only if within threshold
-            if best_match and best_distance <= threshold:
-                return best_match
-            return None
-
-        def _format_number(self, value: float) -> str:
-            """Format number for display with appropriate precision."""
-            import math
-            if not math.isfinite(value):
-                return str(value)
-
-            abs_val = abs(value)
-            if abs_val == 0:
-                return "0"
-            elif abs_val >= 1000:
-                return f"{value:.2e}"
-            elif abs_val >= 10:
-                return f"{value:.1f}"
-            elif abs_val >= 0.01:
-                return f"{value:.3f}"
-            else:
-                return f"{value:.2e}"
-
         def clear(self):
             """Clear all plot data."""
             self._plot_item.clear()
-            self._ensure_hover_visual_items()
-            self._clear_hover_state()
             self._t = None
             self._series = {}
             self._visible = {}
@@ -2647,11 +2285,6 @@ if PYQTGRAPH_AVAILABLE:
 
             export_action = menu.addAction("Export Plot...")
             export_action.triggered.connect(self._export_plot)
-            if self._enable_hover_crosshair_toggle_action:
-                hover_action = menu.addAction("Enable Hover/Crosshair")
-                hover_action.setCheckable(True)
-                hover_action.setChecked(self._hover_crosshair_enabled)
-                hover_action.toggled.connect(self._set_hover_crosshair_enabled)
             mouse_menu = menu.addMenu("Mouse Mode")
             vb = self._plot_item.getViewBox()
 
@@ -2881,14 +2514,12 @@ else:
             enable_axis_inversion_actions: bool = False,
             enable_canonical_ghost_toggle_action: bool = False,
             enable_copy_visible_data_action: bool = False,
-            enable_hover_crosshair_toggle_action: bool = False,
         ):
             super().__init__(parent)
             _ = workspace_splitter_object_name
             _ = enable_axis_inversion_actions
             _ = enable_canonical_ghost_toggle_action
             _ = enable_copy_visible_data_action
-            _ = enable_hover_crosshair_toggle_action
             layout = QtWidgets.QVBoxLayout(self)
             layout.addWidget(make_pyqtgraph_fallback_widget(self))
             self._main_splitter = None

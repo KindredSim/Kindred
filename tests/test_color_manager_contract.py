@@ -482,11 +482,6 @@ def test_main_plot_overlay_aliases_keep_species_color_and_vary_marker_by_dataset
         assert _brush_rgb(item_one.opts["brush"]) == expected
         assert _brush_rgb(item_two.opts["brush"]) == expected
         assert item_one.opts["symbol"] != item_two.opts["symbol"]
-
-        hit = panel._find_nearest_data_point(0.0, 1.0, t)
-        assert hit is not None
-        assert hit.dataset == "ds1"
-        assert tuple(hit.color) == expected
     finally:
         panel.close()
         qt_app.processEvents()
@@ -543,12 +538,6 @@ def test_main_plot_overlay_enabled_alias_preserves_resolved_dataset_column_color
         np.testing.assert_allclose(overlay.x, x_axis_species)
         np.testing.assert_allclose(overlay.y, observed_alias)
         assert _brush_rgb(item.opts["brush"]) == expected
-
-        hit = panel._find_nearest_data_point(1.0, observed_alias[0], np.asarray(panel._get_x_data()[0], dtype=float))
-        assert hit is not None
-        assert hit.dataset == "ds1"
-        assert hit.label == "A"
-        assert tuple(hit.color) == expected
     finally:
         panel.close()
         qt_app.processEvents()
