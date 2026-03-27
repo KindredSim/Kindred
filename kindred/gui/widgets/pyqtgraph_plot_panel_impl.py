@@ -2229,6 +2229,55 @@ if PYQTGRAPH_AVAILABLE:
             self._crosshair_h.setVisible(False)
             self._tooltip_text.setVisible(False)
 
+        def _current_primary_plot_item_keys(self) -> Set[str]:
+            selected_visible_series = self._visible_selected_series_names()
+            selected_primary_series = self._current_primary_renderable_series_names(
+                selected_visible_series,
+                require_visible=False,
+            )
+            return {
+                self._format_species_set_label(name, self._simulation_set_label)
+                for name in selected_primary_series
+            }
+
+        @staticmethod
+        def _hover_xy_arrays(x_data: object, y_data: object) -> Tuple[np.ndarray, np.ndarray]:
+            x_array = _try_1d_float_array(x_data)
+            y_array = _try_1d_float_array(y_data)
+            if x_array.size == 0 or y_array.size == 0 or x_array.shape[0] != y_array.shape[0]:
+                return np.asarray([], dtype=float), np.asarray([], dtype=float)
+            finite_mask = np.isfinite(x_array) & np.isfinite(y_array)
+            if not np.any(finite_mask):
+                return np.asarray([], dtype=float), np.asarray([], dtype=float)
+            if not np.all(finite_mask):
+                x_array = x_array[finite_mask]
+                y_array = y_array[finite_mask]
+            return x_array, y_array
+
+        @staticmethod
+        def _rendered_plot_item_label(item: object, fallback: str) -> str:
+            name_getter = getattr(item, "name", None)
+            if callable(name_getter):
+                try:
+                    label = str(name_getter() or "").strip()
+                except Exception:
+                    label = ""
+                if label:
+                    return label
+            return str(fallback)
+
+        @staticmethod
+        def _rendered_plot_item_color(item: object, fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
+            opts = getattr(item, "opts", None)
+            pen = opts.get("pen") if isinstance(opts, dict) else None
+            if pen is None:
+                return fallback
+            try:
+                qcolor = pg.mkPen(pen).color()
+            except Exception:
+                return fallback
+            return (int(qcolor.red()), int(qcolor.green()), int(qcolor.blue()))
+
         def _ensure_hover_visual_items(self) -> None:
             scene = self._plot_widget.scene()
             if self._crosshair_v.scene() is not scene:
@@ -2301,6 +2350,28 @@ if PYQTGRAPH_AVAILABLE:
                         str(name),
                         None,
                         self._colors.get(name, (0, 160, 0)),
+                    )
+                )
+            primary_plot_item_keys = self._current_primary_plot_item_keys()
+            for key, item in self._plot_items.items():
+                if key in primary_plot_item_keys:
+                    continue
+                try:
+                    rendered_x, rendered_y = item.getData()
+                except Exception:
+                    continue
+                x_rendered, y_rendered = self._hover_xy_arrays(rendered_x, rendered_y)
+                if x_rendered.size == 0:
+                    continue
+                label = self._rendered_plot_item_label(item, key)
+                color = self._rendered_plot_item_color(item, (0, 160, 0))
+                candidates.append(
+                    _HoverCandidate(
+                        x_rendered,
+                        y_rendered,
+                        label,
+                        None,
+                        color,
                     )
                 )
             for overlay in self._active_overlay_series:

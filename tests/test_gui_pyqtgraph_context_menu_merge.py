@@ -1040,6 +1040,82 @@ def test_default_hover_recovers_after_clear_and_repopulate(qtbot):
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_hover_hit_testing_includes_simulation_overlays_reference_lines_and_dataset_overlays(qtbot):
+    panel = PyQtGraphPlotPanel(
+        enable_hover_crosshair_toggle_action=True,
+        enable_canonical_ghost_toggle_action=True,
+    )
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+
+    t = np.array([0.0, 1.0, 2.0], dtype=float)
+    panel.set_data(
+        t,
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "t": t,
+                "series": {"A": np.array([40.0, 60.0, 80.0], dtype=float)},
+            },
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "curve_role": "canonical_ghost",
+                "t": t,
+                "series": {"A": np.array([100.0, 120.0, 140.0], dtype=float)},
+            },
+        ],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": t,
+                "species": {"A": np.array([150.0, 160.0, 170.0], dtype=float)},
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A"}
+    panel.set_selected_series(["A"])
+    panel._set_hover_crosshair_enabled(True)
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(0.0, 180.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    overlay_label = panel._format_species_set_label("A", "set2")
+    assert overlay_label in panel._plot_items
+    assert f"{overlay_label} [canonical]" in panel._plot_items
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 60.0))
+    assert panel._tooltip_text.isVisible() is True
+    assert f"Sim: {overlay_label}" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(60.0)
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 120.0))
+    assert panel._tooltip_text.isVisible() is True
+    assert f"Sim: {overlay_label} [ref]" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(120.0)
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 160.0))
+    assert panel._tooltip_text.isVisible() is True
+    assert "Dataset ds1: A" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(160.0)
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 2.0))
+    assert panel._tooltip_text.isVisible() is True
+    assert "Sim: A" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(2.0)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_hover_off_suppresses_lookup_mapping_and_existing_visuals(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_hover_crosshair_toggle_action=True)
     qtbot.addWidget(panel)
