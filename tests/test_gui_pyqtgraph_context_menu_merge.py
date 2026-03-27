@@ -2274,6 +2274,123 @@ def test_scene_mapped_hover_on_secondary_axis_uses_secondary_viewbox_when_enable
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_hover_tooltip_uses_rendered_curve_labels_for_distinct_secondary_items(
+    qtbot,
+    monkeypatch,
+):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t = np.array([0.0, 1.0, 2.0], dtype=float)
+    panel.set_data(
+        t,
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([100.0, 200.0, 300.0], dtype=float),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "t": t,
+                "series": {"C": np.array([110.0, 210.0, 310.0], dtype=float)},
+            },
+            {
+                "label": "set2",
+                "curve_role": "canonical_ghost",
+                "t": t,
+                "series": {"C": np.array([120.0, 220.0, 320.0], dtype=float)},
+            },
+        ],
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    assert panel._secondary_y_axis is not None
+    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(95.0, 325.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    overlay_label = panel._format_species_set_label("C", "set2")
+
+    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 210.0))
+    overlay_tooltip = panel._tooltip_text.toPlainText()
+
+    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 220.0))
+    reference_tooltip = panel._tooltip_text.toPlainText()
+
+    assert panel._tooltip_text.isVisible() is True
+    assert f"Sim: {overlay_label}\n" in overlay_tooltip
+    assert "[ref]" not in overlay_tooltip
+    assert f"Sim: {overlay_label} [ref]" in reference_tooltip
+    assert overlay_tooltip.splitlines()[0] != reference_tooltip.splitlines()[0]
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_refresh_clears_hover_state_when_hovered_secondary_item_is_removed(
+    qtbot,
+    monkeypatch,
+):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t = np.array([0.0, 1.0, 2.0], dtype=float)
+    panel.set_data(
+        t,
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([100.0, 200.0, 300.0], dtype=float),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "t": t,
+                "series": {"C": np.array([110.0, 210.0, 310.0], dtype=float)},
+            },
+            {
+                "label": "set2",
+                "curve_role": "canonical_ghost",
+                "t": t,
+                "series": {"C": np.array([120.0, 220.0, 320.0], dtype=float)},
+            },
+        ],
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    assert panel._secondary_y_axis is not None
+    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(95.0, 325.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 220.0))
+
+    assert panel._tooltip_text.isVisible() is True
+    assert panel._secondary_crosshair_h is not None
+    assert panel._secondary_crosshair_h.isVisible() is True
+    assert panel._crosshair_h.isVisible() is False
+    assert panel._secondary_y_axis is not None
+
+    panel._set_canonical_ghost_lines_visible(False)
+    QtWidgets.QApplication.processEvents()
+
+    assert panel._secondary_y_axis is not None
+    assert panel._tooltip_text.isVisible() is False
+    assert panel._secondary_crosshair_h is not None
+    assert panel._secondary_crosshair_h.isVisible() is False
+    assert panel._crosshair_h.isVisible() is False
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_secondary_axis_primary_line_legend_tracks_right_axis_refresh(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel()
     qtbot.addWidget(panel)

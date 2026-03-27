@@ -116,6 +116,14 @@ if PYQTGRAPH_AVAILABLE:
         dataset: Optional[str]
         color: Tuple[int, int, int]
 
+    class _HoverCandidate(NamedTuple):
+        x_data: np.ndarray
+        y_data: np.ndarray
+        label: str
+        dataset: Optional[str]
+        color: Tuple[int, int, int]
+        source_item: Optional[object]
+
     class _SecondaryRenderable(NamedTuple):
         item: object
         species: str
@@ -258,6 +266,7 @@ if PYQTGRAPH_AVAILABLE:
             self._secondary_legend_items: Dict[object, str] = {}
             self._secondary_y_resize_handler: Optional[Callable[[], None]] = None
             self._secondary_crosshair_h: Optional[pg.InfiniteLine] = None
+            self._hovered_secondary_item: Optional[object] = None
             self._log_x: bool = False
             self._log_y: bool = False
             self._invert_x_axis: bool = False
@@ -1844,6 +1853,15 @@ if PYQTGRAPH_AVAILABLE:
             renderables, active_species = self._derive_active_secondary_renderables()
             self._active_secondary_renderables = list(renderables)
             self._active_secondary_species = list(active_species)
+            active_items = {entry.item for entry in renderables}
+            if (
+                not self._hover_crosshair_enabled
+                or (
+                    self._hovered_secondary_item is not None
+                    and self._hovered_secondary_item not in active_items
+                )
+            ):
+                self._clear_hover_state()
             self._sync_secondary_legend_entries(renderables)
             if not renderables:
                 self._teardown_secondary_y_axis()
@@ -2502,6 +2520,7 @@ if PYQTGRAPH_AVAILABLE:
                     logger.debug(f"Applied manual Y range: [{y_min}, {y_max}]")
 
         def _clear_hover_state(self) -> None:
+            self._hovered_secondary_item = None
             self._crosshair_v.setVisible(False)
             self._crosshair_h.setVisible(False)
             self._tooltip_text.setVisible(False)
@@ -2526,10 +2545,10 @@ if PYQTGRAPH_AVAILABLE:
             *,
             scene_pos: QtCore.QPointF,
             viewbox,
-            candidates: Sequence[Tuple[np.ndarray, np.ndarray, str, Optional[str], Tuple[int, int, int]]],
-        ) -> Tuple[Optional[_NearestHit], float]:
+            candidates: Sequence[_HoverCandidate],
+        ) -> Tuple[Optional[_NearestHit], float, Optional[object]]:
             if not candidates:
-                return None, float("inf")
+                return None, float("inf"), None
             mouse_point = viewbox.mapSceneToView(scene_pos)
             x_mouse = float(mouse_point.x())
             y_mouse = float(mouse_point.y())
@@ -2539,8 +2558,9 @@ if PYQTGRAPH_AVAILABLE:
             best_match: Optional[_NearestHit] = None
             best_distance = float("inf")
             best_scene_distance = float("inf")
+            best_source_item: Optional[object] = None
             threshold = 0.05
-            for x_data, y_data, label, dataset, color in candidates:
+            for x_data, y_data, label, dataset, color, source_item in candidates:
                 if x_data.shape[0] == 0 or y_data.shape[0] == 0 or x_data.shape[0] != y_data.shape[0]:
                     continue
                 distances = np.sqrt(((x_data - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
@@ -2561,14 +2581,15 @@ if PYQTGRAPH_AVAILABLE:
                         x_data[min_idx],
                         y_data[min_idx],
                     )
+                    best_source_item = source_item
             if best_match is None or best_distance > threshold:
-                return None, float("inf")
-            return best_match, best_scene_distance
+                return None, float("inf"), None
+            return best_match, best_scene_distance, best_source_item
 
         def _secondary_hover_candidates(
             self,
-        ) -> List[Tuple[np.ndarray, np.ndarray, str, Optional[str], Tuple[int, int, int]]]:
-            candidates: List[Tuple[np.ndarray, np.ndarray, str, Optional[str], Tuple[int, int, int]]] = []
+        ) -> List[_HoverCandidate]:
+            candidates: List[_HoverCandidate] = []
             for registry in (
                 self._secondary_y_items,
                 self._secondary_y_overlay_items,
@@ -2587,19 +2608,31 @@ if PYQTGRAPH_AVAILABLE:
                     color = getattr(item, "_kindred_secondary_color", None)
                     if not color:
                         color = self._colors.get(species, (0, 160, 0))
-                    candidates.append((x_array, y_array, species, dataset, tuple(color)))
+                    label = str(item.name() or "").strip() if hasattr(item, "name") else ""
+                    if not label:
+                        label = species
+                    candidates.append(
+                        _HoverCandidate(
+                            x_array,
+                            y_array,
+                            label,
+                            dataset,
+                            tuple(color),
+                            item,
+                        )
+                    )
             return candidates
 
         def _find_nearest_hover_hit(
             self,
             scene_pos: QtCore.QPointF,
             x_data: np.ndarray,
-        ) -> Tuple[Optional[str], Optional[_NearestHit]]:
+        ) -> Tuple[Optional[str], Optional[_NearestHit], Optional[object]]:
             visible_names = self._current_primary_renderable_series_names(
                 self._axis_scope_series_names(),
                 require_visible=False,
             )
-            primary_candidates: List[Tuple[np.ndarray, np.ndarray, str, Optional[str], Tuple[int, int, int]]] = []
+            primary_candidates: List[_HoverCandidate] = []
             for name in visible_names:
                 if self._uses_secondary_y_species(name):
                     continue
@@ -2607,46 +2640,49 @@ if PYQTGRAPH_AVAILABLE:
                 if y_data.shape[0] != x_data.shape[0]:
                     continue
                 primary_candidates.append(
-                    (
+                    _HoverCandidate(
                         x_data,
                         y_data,
                         str(name),
                         None,
                         self._colors.get(name, (0, 160, 0)),
+                        None,
                     )
                 )
             for overlay in self._active_overlay_series:
                 if self._uses_secondary_y_species(overlay.species):
                     continue
                 primary_candidates.append(
-                    (
+                    _HoverCandidate(
                         np.asarray(overlay.x, dtype=float).reshape(-1),
                         np.asarray(overlay.y, dtype=float).reshape(-1),
                         str(overlay.species),
                         overlay.dataset,
                         self._overlay_display_color(overlay.resolved_y_column),
+                        None,
                     )
                 )
-            primary_hit, primary_scene_distance = self._find_nearest_hit_from_candidates(
+            primary_hit, primary_scene_distance, _primary_source_item = self._find_nearest_hit_from_candidates(
                 scene_pos=scene_pos,
                 viewbox=self._plot_item.vb,
                 candidates=primary_candidates,
             )
             secondary_hit: Optional[_NearestHit] = None
             secondary_scene_distance = float("inf")
+            secondary_source_item: Optional[object] = None
             secondary_viewbox = self._secondary_y_axis
             secondary_candidates = self._secondary_hover_candidates()
             if secondary_viewbox is not None and secondary_candidates:
-                secondary_hit, secondary_scene_distance = self._find_nearest_hit_from_candidates(
+                secondary_hit, secondary_scene_distance, secondary_source_item = self._find_nearest_hit_from_candidates(
                     scene_pos=scene_pos,
                     viewbox=secondary_viewbox,
                     candidates=secondary_candidates,
                 )
             if primary_hit is None and secondary_hit is None:
-                return None, None
+                return None, None, None
             if secondary_hit is None or primary_scene_distance <= secondary_scene_distance:
-                return "primary", primary_hit
-            return "secondary", secondary_hit
+                return "primary", primary_hit, None
+            return "secondary", secondary_hit, secondary_source_item
 
         def _on_mouse_moved(self, pos) -> None:
             """
@@ -2675,10 +2711,17 @@ if PYQTGRAPH_AVAILABLE:
                 self._clear_hover_state()
                 return
 
-            owner, nearest = self._find_nearest_hover_hit(pos, np.asarray(x_data, dtype=float).reshape(-1))
+            owner, nearest, hovered_secondary_item = self._find_nearest_hover_hit(
+                pos,
+                np.asarray(x_data, dtype=float).reshape(-1),
+            )
             if nearest is None or owner is None:
                 self._clear_hover_state()
                 return
+            if owner == "secondary":
+                self._hovered_secondary_item = hovered_secondary_item
+            else:
+                self._hovered_secondary_item = None
 
             color = nearest.color or (0, 180, 0)
             pen = pg.mkPen(color=color, width=1.2, style=Qt.DashLine)
