@@ -63,6 +63,17 @@ def _axis_label_text(panel: PyQtGraphPlotPanel, axis_name: str) -> str:
     return str(getattr(axis, "labelText", "") or "")
 
 
+def _legend_texts(panel: PyQtGraphPlotPanel) -> list[str]:
+    legend = getattr(panel, "_legend", None)
+    if legend is None:
+        return []
+    return [str(label.text) for _sample, label in list(legend.items)]
+
+
+def _scene_point(viewbox, x: float, y: float) -> QtCore.QPointF:
+    return viewbox.mapViewToScene(QtCore.QPointF(float(x), float(y)))
+
+
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_pyqtgraph_native_menus_disabled_and_custom_actions_present(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel()
@@ -247,6 +258,29 @@ def test_main_plot_context_menu_includes_copy_actions_and_dataset_plot_does_not(
     dataset_menu = captured_menus.pop()
     assert all(action.text() != "Copy All" for action in dataset_menu.actions())
     assert all(action.text() != "Copy Visible Data" for action in dataset_menu.actions())
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_main_plot_context_menu_includes_hover_toggle_and_dataset_plot_does_not(qtbot, monkeypatch):
+    widget = PlotTabsWidget()
+    qtbot.addWidget(widget)
+    widget.show()
+    QtWidgets.QApplication.processEvents()
+
+    dataset_panel = widget.add_dataset_tab("dataset-1")
+    QtWidgets.QApplication.processEvents()
+
+    captured_menus = _capture_context_menu(monkeypatch)
+
+    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
+    main_menu = captured_menus.pop()
+    hover_action = _find_action(main_menu.actions(), "Enable Hover/Crosshair")
+    assert hover_action.isCheckable()
+    assert hover_action.isChecked() is False
+
+    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
+    dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Enable Hover/Crosshair" for action in dataset_menu.actions())
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
@@ -1461,6 +1495,63 @@ def test_species_x_partial_render_state_filters_incompatible_y_series_across_ren
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_hover_off_suppresses_lookup_mapping_and_existing_visuals(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_hover_crosshair_toggle_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+    )
+    QtWidgets.QApplication.processEvents()
+
+    panel._crosshair_v.setVisible(True)
+    panel._crosshair_h.setVisible(True)
+    panel._tooltip_text.setText("stale")
+    panel._tooltip_text.setVisible(True)
+
+    monkeypatch.setattr(
+        panel._plot_item.vb,
+        "mapSceneToView",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scene mapping should be skipped")),
+    )
+
+    panel._on_mouse_moved(QtCore.QPointF(10.0, 10.0))
+
+    assert panel._crosshair_v.isVisible() is False
+    assert panel._crosshair_h.isVisible() is False
+    assert panel._tooltip_text.isVisible() is False
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_default_plot_panel_hover_lookup_remains_enabled_without_toggle_action(qtbot):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+    )
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    scene_pos = _scene_point(panel._plot_item.vb, 1.0, 2.0)
+    panel._on_mouse_moved(scene_pos)
+
+    assert panel._tooltip_text.isVisible() is True
+    assert "Sim: A" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.isVisible() is True
+    assert panel._crosshair_h.isVisible() is True
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(2.0)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_species_x_mixed_primary_and_overlay_lengths_keep_overlay_local_c_series_visible_and_exported(
     qtbot, monkeypatch
 ):
@@ -2145,3 +2236,146 @@ def test_secondary_axis_inherits_inversion_across_remove_readd_lifecycle(qt_app,
     finally:
         panel.deleteLater()
         qt_app.processEvents()
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_scene_mapped_hover_on_secondary_axis_uses_secondary_viewbox_when_enabled(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel(enable_hover_crosshair_toggle_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([100.0, 200.0, 300.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    panel._set_hover_crosshair_enabled(True)
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    assert panel._secondary_y_axis is not None
+    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(100.0, 300.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    scene_pos = _scene_point(panel._secondary_y_axis, 1.0, 200.0)
+    panel._on_mouse_moved(scene_pos)
+
+    assert panel._tooltip_text.isVisible() is True
+    assert "Sim: C" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(200.0)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_primary_line_legend_tracks_right_axis_refresh(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([4.0, 5.0, 6.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    QtWidgets.QApplication.processEvents()
+
+    expected_label = panel._format_species_set_label("C", "set1")
+    assert expected_label in _legend_texts(panel)
+
+    panel._remove_secondary_y_axis()
+    QtWidgets.QApplication.processEvents()
+
+    assert expected_label in _legend_texts(panel)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_overlay_and_reference_legend_tracks_right_axis_refresh(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t = np.array([0.0, 1.0, 2.0], dtype=float)
+    panel.set_data(
+        t,
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([4.0, 5.0, 6.0], dtype=float),
+        },
+        label="set1",
+        overlays=[
+            {
+                "label": "set2",
+                "t": t,
+                "series": {"C": np.array([4.5, 5.5, 6.5], dtype=float)},
+            },
+            {
+                "label": "set2",
+                "curve_role": "canonical_ghost",
+                "t": t,
+                "series": {"C": np.array([4.2, 5.2, 6.2], dtype=float)},
+            },
+        ],
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    QtWidgets.QApplication.processEvents()
+
+    overlay_label = panel._format_species_set_label("C", "set2")
+    assert overlay_label in _legend_texts(panel)
+    assert f"{overlay_label} [ref]" in _legend_texts(panel)
+
+    panel._remove_secondary_y_axis()
+    QtWidgets.QApplication.processEvents()
+
+    assert overlay_label in _legend_texts(panel)
+    assert f"{overlay_label} [ref]" in _legend_texts(panel)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_tears_down_when_membership_remains_but_current_basis_has_no_renderables(
+    qtbot,
+    monkeypatch,
+):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "B": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([7.0, 8.0, 9.0, 10.0, 11.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    assert panel._secondary_y_species == ["C"]
+    assert panel._secondary_y_axis is None
+    assert panel._secondary_y_items == {}
+    assert panel._secondary_y_overlay_items == {}
+    assert panel._secondary_y_dataset_overlay_items == {}
+    assert _axis_label_text(panel, "right") == ""
+    assert panel._format_species_set_label("C", "set1") not in _legend_texts(panel)
