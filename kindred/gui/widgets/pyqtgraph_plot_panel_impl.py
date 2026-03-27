@@ -2608,9 +2608,12 @@ if PYQTGRAPH_AVAILABLE:
                     color = getattr(item, "_kindred_secondary_color", None)
                     if not color:
                         color = self._colors.get(species, (0, 160, 0))
-                    label = str(item.name() or "").strip() if hasattr(item, "name") else ""
-                    if not label:
+                    if dataset is not None:
                         label = species
+                    else:
+                        label = str(item.name() or "").strip() if hasattr(item, "name") else ""
+                        if not label:
+                            label = species
                     candidates.append(
                         _HoverCandidate(
                             x_array,

@@ -2331,6 +2331,54 @@ def test_secondary_axis_hover_tooltip_uses_rendered_curve_labels_for_distinct_se
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_secondary_axis_dataset_overlay_hover_tooltip_keeps_dataset_prefix_clean(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    t = np.array([0.0, 1.0, 2.0], dtype=float)
+    panel.set_data(
+        t,
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([100.0, 200.0, 300.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": t,
+                "species": {
+                    "C": np.array([150.0, 250.0, 350.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"C"}
+    panel.set_selected_series(["A", "C"])
+    panel._add_secondary_y_axis()
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    assert panel._secondary_y_axis is not None
+    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(95.0, 355.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 250.0))
+    tooltip = panel._tooltip_text.toPlainText()
+
+    assert panel._tooltip_text.isVisible() is True
+    assert "Dataset ds1: C" in tooltip
+    assert "Dataset ds1: ds1: C" not in tooltip
+    assert "ds1: C =" not in tooltip
+    assert "C = 250.0" in tooltip
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_secondary_axis_refresh_clears_hover_state_when_hovered_secondary_item_is_removed(
     qtbot,
     monkeypatch,
