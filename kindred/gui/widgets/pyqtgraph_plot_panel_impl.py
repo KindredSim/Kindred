@@ -1037,7 +1037,12 @@ if PYQTGRAPH_AVAILABLE:
 
             blocks: List[List[Tuple[str, np.ndarray]]] = []
             missing_items: List[CopyAllMissingItem] = list(plan.missing_items or [])
-            shown_set_ids: Set[str] = set()
+            # Provider-owned shown-set IDs are the only truthful source for shown simulations.
+            shown_set_ids: Set[str] = {
+                str(item.set_id or "").strip()
+                for item in list(plan.missing_items or [])
+                if str(item.set_id or "").strip()
+            }
 
             for shown_block in list(plan.shown_blocks or []):
                 set_id = str(shown_block.set_id or "").strip()

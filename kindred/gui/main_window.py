@@ -4655,14 +4655,8 @@ class MainWindow(
         label: str,
         invalidated_set_ids: Optional[Sequence[str]],
     ):
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        if batch_cache is None:
-            return None
         sid = str(set_id or "").strip()
         if not sid:
-            return None
-        active_set_id = str(batch_cache.active_batch_set_id or "").strip()
-        if active_set_id != sid:
             return None
         invalidated = {str(raw_id) for raw_id in (invalidated_set_ids or ()) if str(raw_id)}
         if sid not in invalidated:
@@ -4670,22 +4664,52 @@ class MainWindow(
         plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
         if plot is None:
             return None
-        plot_t = np.asarray(getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [], dtype=float).reshape(-1)
-        plot_series_raw = getattr(plot, "_series", {}) or {}
-        if plot_t.size <= 0 or not isinstance(plot_series_raw, Mapping):
-            return None
-        plot_series = {
-            str(name): np.asarray(values, dtype=float).reshape(-1)
-            for name, values in dict(plot_series_raw).items()
-            if np.asarray(values, dtype=float).reshape(-1).size > 0
-        }
-        if not plot_series:
-            return None
-        return self._copy_all_shown_block_from_entry(
-            set_id=sid,
-            label=label,
-            entry={"t": plot_t, "series": plot_series},
-        )
+        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
+        active_set_id = str(batch_cache.active_batch_set_id or "").strip() if batch_cache is not None else ""
+
+        if active_set_id == sid:
+            plot_t = np.asarray(
+                getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [],
+                dtype=float,
+            ).reshape(-1)
+            plot_series_raw = getattr(plot, "_series", {}) or {}
+            if plot_t.size > 0 and isinstance(plot_series_raw, Mapping):
+                plot_series = {
+                    str(name): np.asarray(values, dtype=float).reshape(-1)
+                    for name, values in dict(plot_series_raw).items()
+                    if np.asarray(values, dtype=float).reshape(-1).size > 0
+                }
+                if plot_series:
+                    return self._copy_all_shown_block_from_entry(
+                        set_id=sid,
+                        label=label,
+                        entry={"t": plot_t, "series": plot_series},
+                    )
+
+        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
+                continue
+            if str(entry.get("set_id") or "").strip() != sid:
+                continue
+            overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
+            overlay_series_raw = entry.get("series") or {}
+            if overlay_t.size <= 0 or not isinstance(overlay_series_raw, Mapping):
+                continue
+            overlay_series = {
+                str(name): np.asarray(values, dtype=float).reshape(-1)
+                for name, values in dict(overlay_series_raw).items()
+                if np.asarray(values, dtype=float).reshape(-1).size > 0
+            }
+            if not overlay_series:
+                continue
+            return self._copy_all_shown_block_from_entry(
+                set_id=sid,
+                label=label,
+                entry={"t": overlay_t, "series": overlay_series},
+            )
+        return None
 
     def _copy_all_dirty_shown_block(self, *, set_id: str, label: str):
         resolved_entries, reason, _, _, _, _, _ = self._resolve_workspace_aware_batch_selection(

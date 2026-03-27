@@ -623,6 +623,80 @@ def test_copy_all_soft_fail_yes_copies_available_blocks_only(qtbot, monkeypatch)
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_all_does_not_recover_missing_shown_set_from_local_overlay_fallback(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "B": np.array([0.1, 0.2, 0.3], dtype=float),
+        },
+        label="dup (row 1)",
+        overlays=[
+            {
+                "label": "dup",
+                "set_id": "set2",
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "series": {
+                    "A": np.array([10.0, 11.0, 12.0], dtype=float),
+                    "B": np.array([0.4, 0.5, 0.6], dtype=float),
+                },
+            }
+        ],
+    )
+    panel.set_selected_series(["A"])
+
+    captured_missing = []
+
+    def _confirm(missing_items):
+        captured_missing.extend(missing_items)
+        return True
+
+    monkeypatch.setattr(panel, "_confirm_copy_all_missing_items", _confirm, raising=False)
+    plot_contract = plot_panel_impl
+    panel.set_copy_all_export_plan_provider(
+        lambda: plot_contract.CopyAllExportPlan(
+            shown_blocks=[
+                plot_contract.CopyAllShownBlock(
+                    set_id="set1",
+                    label="dup (row 1)",
+                    t=np.array([0.0, 1.0, 2.0], dtype=float),
+                    series={
+                        "A": np.array([1.0, 2.0, 3.0], dtype=float),
+                        "B": np.array([0.1, 0.2, 0.3], dtype=float),
+                    },
+                )
+            ],
+            missing_items=[
+                plot_contract.CopyAllMissingItem(
+                    set_id="set2",
+                    label="dup",
+                    popup_label="dup (row 2)",
+                    reason="no_cached_results",
+                )
+            ],
+        )
+    )
+
+    panel._copy_all()
+
+    assert [item.popup_label for item in captured_missing] == ["dup (row 2)"]
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    assert any(cell.startswith("dup (row 1)::") for cell in header)
+    assert all(not cell.startswith("dup::") for cell in header)
+    assert all(not cell.startswith("dup (row 2)::") for cell in header)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_all_soft_fail_no_leaves_clipboard_unchanged(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel()
     qtbot.addWidget(panel)

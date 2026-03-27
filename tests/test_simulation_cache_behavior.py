@@ -1461,6 +1461,73 @@ def test_copy_all_export_plan_uses_preserved_live_preview_after_commit_when_expl
 
 
 @pytest.mark.gui
+def test_copy_all_export_plan_includes_non_primary_live_overlay_shown_block_with_disambiguated_label(
+    main_window,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _set_shown_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "dup")
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = "copy-all-live-overlay-replay-key"
+    cache.active_cache_invalidated_set_ids = (first_id, second_id)
+    cache.active_batch_set_id = first_id
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(first_id) or "")
+    cache.last_display_selection = [first_id, second_id]
+
+    primary_t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+    primary_series = np.asarray([11.0, 12.0, 13.0], dtype=float)
+    overlay_t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+    overlay_series = np.asarray([21.0, 22.0, 23.0], dtype=float)
+    main_window.set_data(
+        primary_t,
+        {"A": primary_series},
+        label="dup",
+        overlays=[
+            {
+                "label": "dup",
+                "set_id": second_id,
+                "t": overlay_t,
+                "series": {"A": overlay_series},
+            }
+        ],
+    )
+    qt_app.processEvents()
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
+        (first_id, "dup (row 1)"),
+        (second_id, "dup (row 2)"),
+    ]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, primary_t)
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], primary_series)
+    np.testing.assert_allclose(plan.shown_blocks[1].t, overlay_t)
+    np.testing.assert_allclose(plan.shown_blocks[1].series["A"], overlay_series)
+
+
+@pytest.mark.gui
 def test_selection_change_clean_focused_partial_workspace_preview_keeps_resolved_results_visible_with_pending_status(
     main_window, monkeypatch, qt_app
 ):
