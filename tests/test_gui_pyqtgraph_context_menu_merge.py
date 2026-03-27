@@ -284,6 +284,43 @@ def test_main_plot_context_menu_includes_hover_toggle_and_dataset_plot_does_not(
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_main_and_dataset_plot_context_menus_do_not_expose_secondary_axis(qtbot, monkeypatch):
+    widget = PlotTabsWidget()
+    qtbot.addWidget(widget)
+    widget.show()
+    QtWidgets.QApplication.processEvents()
+
+    dataset_panel = widget.add_dataset_tab("dataset-1")
+    QtWidgets.QApplication.processEvents()
+
+    captured_menus = _capture_context_menu(monkeypatch)
+
+    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
+    main_menu = captured_menus.pop()
+    assert all(action.text() != "Secondary Y-Axis" for action in main_menu.actions())
+
+    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
+    dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Secondary Y-Axis" for action in dataset_menu.actions())
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_plot_panel_backend_does_not_carry_secondary_axis_helpers_or_state(qtbot):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    assert not hasattr(panel, "_add_secondary_y_axis")
+    assert not hasattr(panel, "_remove_secondary_y_axis")
+    assert not hasattr(panel, "_secondary_y_axis")
+    assert not hasattr(panel, "_secondary_y_species")
+    assert not hasattr(panel, "_secondary_y_items")
+    assert not hasattr(panel, "_secondary_y_overlay_items")
+    assert not hasattr(panel, "_secondary_y_dataset_overlay_items")
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_and_dataset_markers(
     qtbot, monkeypatch
 ):
@@ -297,7 +334,6 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
 
     clipboard = _DummyClipboard()
     monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
 
     t_primary = np.array([0.0, 1.0, 2.0, 3.0], dtype=float)
     panel.set_data(
@@ -335,7 +371,6 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     )
     panel.set_selected_series(["A", "C"])
     panel._on_x_axis_changed("B")
-    panel._add_secondary_y_axis()
     panel.set_selected_series(["A"])
 
     panel.set_overlay_catalog(
@@ -379,12 +414,12 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     primary_headers = [header[idx] for idx in primary_cols]
     assert any("Time" in cell for cell in primary_headers)
     assert any("[B]" in cell for cell in primary_headers)
-    assert any("C" in cell and "[right axis]" in cell for cell in primary_headers)
     assert any("A" in cell for cell in primary_headers)
+    assert all("C" not in cell for cell in primary_headers)
 
     overlay_headers = [header[idx] for idx in overlay_cols]
     assert any("A" in cell for cell in overlay_headers)
-    assert any("C" in cell and "[right axis]" in cell for cell in overlay_headers)
+    assert all("C" not in cell for cell in overlay_headers)
 
     dataset_headers = [header[idx] for idx in dataset_cols]
     assert any("A" in cell for cell in dataset_headers)
@@ -417,7 +452,6 @@ def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_da
 
     clipboard = _DummyClipboard()
     monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
 
     panel._sampling_target = 3
 
@@ -465,7 +499,6 @@ def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_da
     )
     panel.set_selected_series(["A", "C"])
     panel._on_x_axis_changed("B")
-    panel._add_secondary_y_axis()
     panel.set_selected_series(["A"])
     panel._on_toolbar_option_requested("sampling", "coarse")
 
@@ -541,7 +574,6 @@ def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_da
     set1_time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
     set1_x_idx = _find_header_index(header, prefix="set1::", contains=["B", "[B]"])
     set1_a_idx = _find_header_index(header, prefix="set1::", contains=["A"])
-    set1_c_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
     set3_x_idx = _find_header_index(header, prefix="set3::", contains=["B", "[B]"])
     set3_a_idx = _find_header_index(header, prefix="set3::", contains=["A"])
     dataset_x_idx = _find_header_index(header, prefix="ds1::", contains=["B", "[B]"])
@@ -550,7 +582,10 @@ def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_da
     np.testing.assert_allclose(_numeric_column(body, set1_time_idx), np.linspace(0.0, 5.0, 6))
     np.testing.assert_allclose(_numeric_column(body, set1_x_idx), np.linspace(0.11, 0.66, 6))
     np.testing.assert_allclose(_numeric_column(body, set1_a_idx), np.linspace(11.0, 16.0, 6))
-    np.testing.assert_allclose(_numeric_column(body, set1_c_idx), np.linspace(21.0, 26.0, 6))
+    assert all("C" not in cell for cell in header if cell.startswith("set1::"))
+    assert all("C" not in cell for cell in header if cell.startswith("set2::"))
+    assert all("C" not in cell for cell in header if cell.startswith("set3::"))
+    assert all("C" not in cell for cell in header if cell.startswith("ds1::"))
 
     assert _numeric_column(body, set3_x_idx).shape[0] == 3
     assert _numeric_column(body, set3_a_idx).shape[0] == 3
@@ -750,267 +785,6 @@ def test_copy_all_soft_fail_no_leaves_clipboard_unchanged(qtbot, monkeypatch):
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_copy_visible_data_includes_secondary_axis_only_primary_trace_without_warning(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    clipboard = _DummyClipboard()
-    warning_calls = []
-    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(
-        QtWidgets.QInputDialog,
-        "getItem",
-        lambda *args, **kwargs: ("C", True),
-    )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "warning",
-        lambda *args, **kwargs: warning_calls.append((args, kwargs)),
-    )
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([5.0, 6.0, 7.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel._add_secondary_y_axis()
-    panel.set_selected_series([])
-    QtWidgets.QApplication.processEvents()
-
-    panel._copy_visible_data()
-
-    assert warning_calls == []
-    rows = _split_tsv(clipboard.last_text)
-    assert rows
-    primary_headers = [cell for cell in rows[0] if cell.startswith("set1::")]
-    assert any("Time" in cell for cell in primary_headers)
-    assert any("C" in cell and "[right axis]" in cell for cell in primary_headers)
-    assert all("A" not in cell for cell in primary_headers)
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_copy_visible_data_uses_synchronized_secondary_axis_trace_after_x_axis_change(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    clipboard = _DummyClipboard()
-    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "B": np.array([10.0, 20.0, 30.0], dtype=float),
-            "C": np.array([5.0, 6.0, 7.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A"])
-    panel._add_secondary_y_axis()
-    panel._on_x_axis_changed("B")
-    QtWidgets.QApplication.processEvents()
-
-    secondary_item = panel._secondary_y_items["C"]
-    plotted_x, plotted_y = secondary_item.getData()
-    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), np.array([10.0, 20.0, 30.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), np.array([5.0, 6.0, 7.0], dtype=float))
-
-    panel._series["C"] = np.array([105.0, 106.0, 107.0], dtype=float)
-
-    panel._copy_visible_data()
-
-    rows = _split_tsv(clipboard.last_text)
-    assert rows
-    header = rows[0]
-    body = rows[1:]
-    x_idx = _find_header_index(header, prefix="set1::", contains=["[B]"])
-    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
-
-    np.testing.assert_allclose(_numeric_column(body, x_idx), np.asarray(plotted_x, dtype=float))
-    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
-    assert "105.0" not in clipboard.last_text
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_copy_visible_data_uses_synchronized_secondary_axis_trace_after_set_data_refresh(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    clipboard = _DummyClipboard()
-    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "B": np.array([10.0, 20.0, 30.0], dtype=float),
-            "C": np.array([5.0, 6.0, 7.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A"])
-    panel._add_secondary_y_axis()
-
-    panel.set_data(
-        np.array([4.0, 5.0, 6.0], dtype=float),
-        {
-            "A": np.array([11.0, 12.0, 13.0], dtype=float),
-            "B": np.array([40.0, 50.0, 60.0], dtype=float),
-            "C": np.array([15.0, 16.0, 17.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A"])
-    QtWidgets.QApplication.processEvents()
-
-    secondary_item = panel._secondary_y_items["C"]
-    plotted_x, plotted_y = secondary_item.getData()
-    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), np.array([4.0, 5.0, 6.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), np.array([15.0, 16.0, 17.0], dtype=float))
-
-    panel._series["C"] = np.array([215.0, 216.0, 217.0], dtype=float)
-
-    panel._copy_visible_data()
-
-    rows = _split_tsv(clipboard.last_text)
-    assert rows
-    header = rows[0]
-    body = rows[1:]
-    time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
-    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
-
-    np.testing.assert_allclose(_numeric_column(body, time_idx), np.asarray(plotted_x, dtype=float))
-    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
-    assert "215.0" not in clipboard.last_text
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_copy_visible_data_respects_coarse_sampling_for_secondary_axis_after_x_axis_change(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    clipboard = _DummyClipboard()
-    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    t = np.linspace(0.0, 10.0, 2000)
-    x_species = np.linspace(100.0, 300.0, 2000)
-    secondary_series = np.linspace(5.0, 15.0, 2000)
-    panel.set_data(
-        t,
-        {
-            "A": np.sin(t),
-            "B": x_species,
-            "C": secondary_series,
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A"])
-    panel._on_toolbar_option_requested("sampling", "coarse")
-    panel._add_secondary_y_axis()
-    panel._on_x_axis_changed("B")
-    QtWidgets.QApplication.processEvents()
-
-    expected_idx = np.unique(np.linspace(0, t.shape[0] - 1, num=panel._sampling_target, dtype=int))
-    secondary_item = panel._secondary_y_items["C"]
-    plotted_x, plotted_y = secondary_item.getData()
-    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), x_species[expected_idx])
-    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), secondary_series[expected_idx])
-    assert len(plotted_x) <= panel._sampling_target
-
-    panel._series["C"] = secondary_series + 1000.0
-
-    panel._copy_visible_data()
-
-    rows = _split_tsv(clipboard.last_text)
-    assert rows
-    header = rows[0]
-    body = rows[1:]
-    time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
-    x_idx = _find_header_index(header, prefix="set1::", contains=["[B]"])
-    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
-
-    assert len(body) == len(expected_idx)
-    np.testing.assert_allclose(_numeric_column(body, time_idx), t[expected_idx])
-    np.testing.assert_allclose(_numeric_column(body, x_idx), np.asarray(plotted_x, dtype=float))
-    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
-    assert "1005.0" not in clipboard.last_text
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_copy_visible_data_respects_coarse_sampling_for_secondary_axis_after_set_data_refresh(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    clipboard = _DummyClipboard()
-    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    t_initial = np.linspace(0.0, 10.0, 2000)
-    panel.set_data(
-        t_initial,
-        {
-            "A": np.sin(t_initial),
-            "C": np.linspace(5.0, 15.0, 2000),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A"])
-    panel._on_toolbar_option_requested("sampling", "coarse")
-    panel._add_secondary_y_axis()
-
-    t_refresh = np.linspace(20.0, 30.0, 2000)
-    refreshed_secondary = np.linspace(25.0, 35.0, 2000)
-    panel.set_data(
-        t_refresh,
-        {
-            "A": np.cos(t_refresh),
-            "C": refreshed_secondary,
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A"])
-    QtWidgets.QApplication.processEvents()
-
-    expected_idx = np.unique(np.linspace(0, t_refresh.shape[0] - 1, num=panel._sampling_target, dtype=int))
-    secondary_item = panel._secondary_y_items["C"]
-    plotted_x, plotted_y = secondary_item.getData()
-    np.testing.assert_allclose(np.asarray(plotted_x, dtype=float), t_refresh[expected_idx])
-    np.testing.assert_allclose(np.asarray(plotted_y, dtype=float), refreshed_secondary[expected_idx])
-    assert len(plotted_x) <= panel._sampling_target
-
-    panel._series["C"] = refreshed_secondary + 2000.0
-
-    panel._copy_visible_data()
-
-    rows = _split_tsv(clipboard.last_text)
-    assert rows
-    header = rows[0]
-    body = rows[1:]
-    time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
-    y_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
-
-    assert len(body) == len(expected_idx)
-    np.testing.assert_allclose(_numeric_column(body, time_idx), np.asarray(plotted_x, dtype=float))
-    np.testing.assert_allclose(_numeric_column(body, y_idx), np.asarray(plotted_y, dtype=float))
-    assert "2025.0" not in clipboard.last_text
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_visible_data_respects_coarse_sampling_for_overlay_blocks(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
     qtbot.addWidget(panel)
@@ -1084,386 +858,6 @@ def test_copy_visible_data_respects_coarse_sampling_for_overlay_blocks(qtbot, mo
         _numeric_column(body, dataset_y_idx),
         np.linspace(100.0, 200.0, 1600)[dataset_expected_idx],
     )
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_species_membership_routes_matching_trace_classes_and_prunes_back_to_primary(
-    qtbot,
-    monkeypatch,
-):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    item_choices = iter([("C", True), ("D", True), ("D", True), ("C", True)])
-    info_calls = []
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: next(item_choices))
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *args, **kwargs: info_calls.append((args, kwargs)),
-    )
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "B": np.array([10.0, 20.0, 30.0], dtype=float),
-            "C": np.array([5.0, 6.0, 7.0], dtype=float),
-            "D": np.array([15.0, 16.0, 17.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "set_id": "set2",
-                "t": np.array([0.0, 1.0, 2.0], dtype=float),
-                "series": {
-                    "A": np.array([101.0, 102.0, 103.0], dtype=float),
-                    "B": np.array([110.0, 120.0, 130.0], dtype=float),
-                    "C": np.array([105.0, 106.0, 107.0], dtype=float),
-                    "D": np.array([115.0, 116.0, 117.0], dtype=float),
-                },
-            }
-        ],
-    )
-    panel.set_overlay_catalog(
-        {
-            "ds1": {
-                "t": np.array([0.0, 1.0, 2.0], dtype=float),
-                "species": {
-                    "B": np.array([210.0, 220.0, 230.0], dtype=float),
-                    "C": np.array([205.0, 206.0, 207.0], dtype=float),
-                    "D": np.array([215.0, 216.0, 217.0], dtype=float),
-                },
-            }
-        }
-    )
-    panel._overlay_panel._selected["ds1"] = True
-    panel._overlay_panel._enabled_species["ds1"] = {"C", "D"}
-    panel.set_selected_series(["A", "C", "D"])
-    panel._on_x_axis_changed("B")
-
-    panel._add_secondary_y_axis()
-    panel._add_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    assert info_calls == []
-    assert list(panel._secondary_y_species) == ["C", "D"]
-    assert set(panel._secondary_y_items) == {"C", "D"}
-    assert _axis_label_text(panel, "right") == "C, D"
-
-    assert panel._format_species_set_label("A", "set1") in panel._plot_items
-    assert panel._format_species_set_label("C", "set1") not in panel._plot_items
-    assert panel._format_species_set_label("D", "set1") not in panel._plot_items
-
-    overlay_c_key = panel._format_species_set_label("C", "set2")
-    overlay_d_key = panel._format_species_set_label("D", "set2")
-    assert overlay_c_key not in panel._plot_items
-    assert overlay_d_key not in panel._plot_items
-    assert overlay_c_key in panel._secondary_y_overlay_items
-    assert overlay_d_key in panel._secondary_y_overlay_items
-    assert ("ds1", "C") not in panel._overlay_items
-    assert ("ds1", "D") not in panel._overlay_items
-    assert ("ds1", "C") in panel._secondary_y_dataset_overlay_items
-    assert ("ds1", "D") in panel._secondary_y_dataset_overlay_items
-
-    panel._remove_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    assert list(panel._secondary_y_species) == ["C"]
-    assert panel._secondary_y_axis is not None
-    assert set(panel._secondary_y_items) == {"C"}
-    assert _axis_label_text(panel, "right") == "C"
-    assert overlay_c_key in panel._secondary_y_overlay_items
-    assert overlay_d_key not in panel._secondary_y_overlay_items
-    assert ("ds1", "C") in panel._secondary_y_dataset_overlay_items
-    assert ("ds1", "D") not in panel._secondary_y_dataset_overlay_items
-    assert panel._format_species_set_label("D", "set1") in panel._plot_items
-    assert overlay_d_key in panel._plot_items
-    assert ("ds1", "D") in panel._overlay_items
-
-    panel._remove_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    assert panel._secondary_y_axis is None
-    assert panel._secondary_y_species == []
-    assert panel._secondary_y_items == {}
-    assert panel._secondary_y_overlay_items == {}
-    assert panel._secondary_y_dataset_overlay_items == {}
-    assert _axis_label_text(panel, "right") == ""
-    assert panel._format_species_set_label("C", "set1") in panel._plot_items
-    assert overlay_c_key in panel._plot_items
-    assert ("ds1", "C") in panel._overlay_items
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_multiple_species_resyncs_all_matching_trace_classes_after_x_axis_change_and_set_data_refresh(
-    qtbot,
-    monkeypatch,
-):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    item_choices = iter([("C", True), ("D", True)])
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: next(item_choices))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "B": np.array([10.0, 20.0, 30.0], dtype=float),
-            "C": np.array([5.0, 6.0, 7.0], dtype=float),
-            "D": np.array([15.0, 16.0, 17.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "set_id": "set2",
-                "t": np.array([0.0, 1.0, 2.0], dtype=float),
-                "series": {
-                    "B": np.array([110.0, 120.0, 130.0], dtype=float),
-                    "C": np.array([105.0, 106.0, 107.0], dtype=float),
-                    "D": np.array([115.0, 116.0, 117.0], dtype=float),
-                },
-            }
-        ],
-    )
-    panel.set_overlay_catalog(
-        {
-            "ds1": {
-                "t": np.array([0.0, 1.0, 2.0], dtype=float),
-                "species": {
-                    "B": np.array([210.0, 220.0, 230.0], dtype=float),
-                    "C": np.array([205.0, 206.0, 207.0], dtype=float),
-                    "D": np.array([215.0, 216.0, 217.0], dtype=float),
-                },
-            }
-        }
-    )
-    panel._overlay_panel._selected["ds1"] = True
-    panel._overlay_panel._enabled_species["ds1"] = {"C", "D"}
-    panel.set_selected_series(["A", "C", "D"])
-
-    panel._add_secondary_y_axis()
-    panel._add_secondary_y_axis()
-    panel._on_x_axis_changed("B")
-    QtWidgets.QApplication.processEvents()
-
-    primary_c = panel._secondary_y_items["C"]
-    primary_d = panel._secondary_y_items["D"]
-    overlay_c = panel._secondary_y_overlay_items[panel._format_species_set_label("C", "set2")]
-    overlay_d = panel._secondary_y_overlay_items[panel._format_species_set_label("D", "set2")]
-    dataset_c = panel._secondary_y_dataset_overlay_items[("ds1", "C")]
-    dataset_d = panel._secondary_y_dataset_overlay_items[("ds1", "D")]
-
-    primary_c_x, primary_c_y = primary_c.getData()
-    primary_d_x, primary_d_y = primary_d.getData()
-    overlay_c_x, overlay_c_y = overlay_c.getData()
-    overlay_d_x, overlay_d_y = overlay_d.getData()
-    dataset_c_x, dataset_c_y = dataset_c.getData()
-    dataset_d_x, dataset_d_y = dataset_d.getData()
-
-    np.testing.assert_allclose(np.asarray(primary_c_x, dtype=float), np.array([10.0, 20.0, 30.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(primary_c_y, dtype=float), np.array([5.0, 6.0, 7.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(primary_d_x, dtype=float), np.array([10.0, 20.0, 30.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(primary_d_y, dtype=float), np.array([15.0, 16.0, 17.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_c_x, dtype=float), np.array([110.0, 120.0, 130.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_c_y, dtype=float), np.array([105.0, 106.0, 107.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_d_x, dtype=float), np.array([110.0, 120.0, 130.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_d_y, dtype=float), np.array([115.0, 116.0, 117.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_c_x, dtype=float), np.array([210.0, 220.0, 230.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_c_y, dtype=float), np.array([205.0, 206.0, 207.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_d_x, dtype=float), np.array([210.0, 220.0, 230.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_d_y, dtype=float), np.array([215.0, 216.0, 217.0], dtype=float))
-
-    panel.set_data(
-        np.array([4.0, 5.0, 6.0], dtype=float),
-        {
-            "A": np.array([11.0, 12.0, 13.0], dtype=float),
-            "B": np.array([40.0, 50.0, 60.0], dtype=float),
-            "C": np.array([15.0, 16.0, 17.0], dtype=float),
-            "D": np.array([25.0, 26.0, 27.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "set_id": "set2",
-                "t": np.array([4.0, 5.0, 6.0], dtype=float),
-                "series": {
-                    "B": np.array([140.0, 150.0, 160.0], dtype=float),
-                    "C": np.array([125.0, 126.0, 127.0], dtype=float),
-                    "D": np.array([135.0, 136.0, 137.0], dtype=float),
-                },
-            }
-        ],
-        owned_species=["A", "B", "C", "D"],
-    )
-    panel.set_overlay_catalog(
-        {
-            "ds1": {
-                "t": np.array([4.0, 5.0, 6.0], dtype=float),
-                "species": {
-                    "B": np.array([240.0, 250.0, 260.0], dtype=float),
-                    "C": np.array([225.0, 226.0, 227.0], dtype=float),
-                    "D": np.array([235.0, 236.0, 237.0], dtype=float),
-                },
-            }
-        }
-    )
-    panel._overlay_panel._selected["ds1"] = True
-    panel._overlay_panel._enabled_species["ds1"] = {"C", "D"}
-    panel.set_selected_series(["A", "C", "D"])
-    panel._on_x_axis_changed("B")
-    QtWidgets.QApplication.processEvents()
-
-    primary_c = panel._secondary_y_items["C"]
-    primary_d = panel._secondary_y_items["D"]
-    overlay_c = panel._secondary_y_overlay_items[panel._format_species_set_label("C", "set2")]
-    overlay_d = panel._secondary_y_overlay_items[panel._format_species_set_label("D", "set2")]
-    dataset_c = panel._secondary_y_dataset_overlay_items[("ds1", "C")]
-    dataset_d = panel._secondary_y_dataset_overlay_items[("ds1", "D")]
-
-    primary_c_x, primary_c_y = primary_c.getData()
-    primary_d_x, primary_d_y = primary_d.getData()
-    overlay_c_x, overlay_c_y = overlay_c.getData()
-    overlay_d_x, overlay_d_y = overlay_d.getData()
-    dataset_c_x, dataset_c_y = dataset_c.getData()
-    dataset_d_x, dataset_d_y = dataset_d.getData()
-
-    np.testing.assert_allclose(np.asarray(primary_c_x, dtype=float), np.array([40.0, 50.0, 60.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(primary_c_y, dtype=float), np.array([15.0, 16.0, 17.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(primary_d_x, dtype=float), np.array([40.0, 50.0, 60.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(primary_d_y, dtype=float), np.array([25.0, 26.0, 27.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_c_x, dtype=float), np.array([140.0, 150.0, 160.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_c_y, dtype=float), np.array([125.0, 126.0, 127.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_d_x, dtype=float), np.array([140.0, 150.0, 160.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(overlay_d_y, dtype=float), np.array([135.0, 136.0, 137.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_c_x, dtype=float), np.array([240.0, 250.0, 260.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_c_y, dtype=float), np.array([225.0, 226.0, 227.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_d_x, dtype=float), np.array([240.0, 250.0, 260.0], dtype=float))
-    np.testing.assert_allclose(np.asarray(dataset_d_y, dtype=float), np.array([235.0, 236.0, 237.0], dtype=float))
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_species_membership_keeps_copy_and_export_headers_truthful_for_matching_trace_classes(
-    qtbot,
-    monkeypatch,
-):
-    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    clipboard = _DummyClipboard()
-    item_choices = iter([("C", True), ("D", True)])
-    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: next(item_choices))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "B": np.array([10.0, 20.0, 30.0], dtype=float),
-            "C": np.array([5.0, 6.0, 7.0], dtype=float),
-            "D": np.array([15.0, 16.0, 17.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "set_id": "set2",
-                "t": np.array([0.0, 1.0, 2.0], dtype=float),
-                "series": {
-                    "B": np.array([110.0, 120.0, 130.0], dtype=float),
-                    "C": np.array([105.0, 106.0, 107.0], dtype=float),
-                    "D": np.array([115.0, 116.0, 117.0], dtype=float),
-                },
-            }
-        ],
-    )
-    panel.set_overlay_catalog(
-        {
-            "ds1": {
-                "t": np.array([0.0, 1.0, 2.0], dtype=float),
-                "species": {
-                    "B": np.array([210.0, 220.0, 230.0], dtype=float),
-                    "C": np.array([205.0, 206.0, 207.0], dtype=float),
-                    "D": np.array([215.0, 216.0, 217.0], dtype=float),
-                },
-            }
-        }
-    )
-    panel._overlay_panel._selected["ds1"] = True
-    panel._overlay_panel._enabled_species["ds1"] = {"C", "D"}
-    panel.set_selected_series(["A", "C", "D"])
-    panel._on_x_axis_changed("B")
-    panel._add_secondary_y_axis()
-    panel._add_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    axis_header, axis_rows = panel.build_visible_export("axis")
-    assert axis_rows
-    assert "C [right axis]" in axis_header
-    assert "D [right axis]" in axis_header
-    assert "set2::C [right axis]" in axis_header
-    assert "set2::D [right axis]" in axis_header
-    assert "ds1::C [right axis]" in axis_header
-    assert "ds1::D [right axis]" in axis_header
-
-    all_header, all_rows = panel.build_visible_export("all")
-    assert all_rows
-    assert "C [right axis]" in all_header
-    assert "D [right axis]" in all_header
-    assert "set2::C [right axis]" in all_header
-    assert "set2::D [right axis]" in all_header
-    assert "ds1::C [right axis]" in all_header
-    assert "ds1::D [right axis]" in all_header
-
-    panel._copy_visible_data()
-    visible_rows = _split_tsv(clipboard.last_text)
-    assert visible_rows
-    visible_header = visible_rows[0]
-    assert "set1::C [right axis]" in visible_header
-    assert "set1::D [right axis]" in visible_header
-    assert "set2::C [right axis]" in visible_header
-    assert "set2::D [right axis]" in visible_header
-    assert "ds1::C [right axis]" in visible_header
-    assert "ds1::D [right axis]" in visible_header
-
-    panel.set_copy_all_export_plan_provider(
-        lambda: plot_panel_impl.CopyAllExportPlan(
-            shown_blocks=[
-                plot_panel_impl.CopyAllShownBlock(
-                    set_id="set1",
-                    label="set1",
-                    t=np.array([0.0, 1.0, 2.0], dtype=float),
-                    series={
-                        "A": np.array([11.0, 12.0, 13.0], dtype=float),
-                        "B": np.array([10.0, 20.0, 30.0], dtype=float),
-                        "C": np.array([21.0, 22.0, 23.0], dtype=float),
-                        "D": np.array([31.0, 32.0, 33.0], dtype=float),
-                    },
-                )
-            ],
-            missing_items=[],
-        )
-    )
-    panel._copy_all()
-    copy_all_rows = _split_tsv(clipboard.last_text)
-    assert copy_all_rows
-    copy_all_header = copy_all_rows[0]
-    assert "set1::C [right axis]" in copy_all_header
-    assert "set1::D [right axis]" in copy_all_header
-    assert "set2::C [right axis]" in copy_all_header
-    assert "set2::D [right axis]" in copy_all_header
-    assert "ds1::C [right axis]" in copy_all_header
-    assert "ds1::D [right axis]" in copy_all_header
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
@@ -1566,6 +960,83 @@ def test_species_x_partial_render_state_filters_incompatible_y_series_across_ren
     primary_headers = [cell for cell in rows[0] if cell.startswith("set1::")]
     assert any(cell.endswith("::A") or cell == "set1::A" for cell in primary_headers)
     assert all(not cell.endswith("::C") and "C [right axis]" not in cell for cell in primary_headers)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_toggle_enabled_hover_recovers_after_clear_and_repopulate(qtbot):
+    panel = PyQtGraphPlotPanel(enable_hover_crosshair_toggle_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+    )
+    QtWidgets.QApplication.processEvents()
+
+    panel.clear()
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+    )
+    panel._set_hover_crosshair_enabled(True)
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    scene = panel._plot_widget.scene()
+    assert panel._crosshair_v.scene() is scene
+    assert panel._crosshair_h.scene() is scene
+    assert panel._tooltip_text.scene() is scene
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 2.0))
+
+    assert panel._tooltip_text.isVisible() is True
+    assert "Sim: A" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.isVisible() is True
+    assert panel._crosshair_h.isVisible() is True
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(2.0)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_default_hover_recovers_after_clear_and_repopulate(qtbot):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    panel.resize(400, 300)
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+    )
+    QtWidgets.QApplication.processEvents()
+
+    panel.clear()
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="set1",
+    )
+    panel._toolbar.set_auto_range(False)
+    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
+    QtWidgets.QApplication.processEvents()
+
+    scene = panel._plot_widget.scene()
+    assert panel._crosshair_v.scene() is scene
+    assert panel._crosshair_h.scene() is scene
+    assert panel._tooltip_text.scene() is scene
+
+    panel._on_mouse_moved(_scene_point(panel._plot_item.vb, 1.0, 2.0))
+
+    assert panel._tooltip_text.isVisible() is True
+    assert "Sim: A" in panel._tooltip_text.toPlainText()
+    assert panel._crosshair_v.isVisible() is True
+    assert panel._crosshair_h.isVisible() is True
+    assert panel._crosshair_v.value() == pytest.approx(1.0)
+    assert panel._crosshair_h.value() == pytest.approx(2.0)
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
@@ -2200,421 +1671,3 @@ def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     finally:
         panel.deleteLater()
         qt_app.processEvents()
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_inherits_inversion_across_remove_readd_lifecycle(qt_app, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_axis_inversion_actions=True)
-    try:
-        panel.show()
-        panel.resize(400, 300)
-        panel.set_data(
-            np.array([2.0, 6.0, 10.0], dtype=float),
-            {
-                "A": np.array([1.0, 5.0, 9.0], dtype=float),
-                "B": np.array([10.0, 50.0, 90.0], dtype=float),
-            },
-        )
-        panel._toolbar.set_auto_range(False)
-        panel._plot_item.setRange(xRange=(2.0, 10.0), yRange=(1.0, 9.0), padding=0.0)
-        qt_app.processEvents()
-
-        def _scene_positions(viewbox, *, y_low: float, y_high: float):
-            x_low = viewbox.mapViewToScene(QtCore.QPointF(2.0, 5.0)).x()
-            x_high = viewbox.mapViewToScene(QtCore.QPointF(10.0, 5.0)).x()
-            y_scene_low = viewbox.mapViewToScene(QtCore.QPointF(6.0, y_low)).y()
-            y_scene_high = viewbox.mapViewToScene(QtCore.QPointF(6.0, y_high)).y()
-            return x_low, x_high, y_scene_low, y_scene_high
-
-        monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("B", True))
-
-        panel._toggle_invert_x()
-        panel._toggle_invert_y()
-        qt_app.processEvents()
-
-        panel._add_secondary_y_axis()
-        qt_app.processEvents()
-
-        primary_viewbox = panel._plot_item.getViewBox()
-        secondary_viewbox = panel._secondary_y_axis
-        assert secondary_viewbox is not None
-        secondary_viewbox.setRange(xRange=(2.0, 10.0), yRange=(10.0, 90.0), padding=0.0)
-        qt_app.processEvents()
-
-        assert primary_viewbox.state.get("xInverted") is True
-        assert primary_viewbox.state.get("yInverted") is True
-        assert secondary_viewbox.state.get("xInverted") is True
-        assert secondary_viewbox.state.get("yInverted") is True
-        primary_x_low, primary_x_high, primary_y_low, primary_y_high = _scene_positions(
-            primary_viewbox,
-            y_low=1.0,
-            y_high=9.0,
-        )
-        secondary_x_low, secondary_x_high, secondary_y_low, secondary_y_high = _scene_positions(
-            secondary_viewbox,
-            y_low=10.0,
-            y_high=90.0,
-        )
-        assert primary_x_low > primary_x_high
-        assert primary_y_low < primary_y_high
-        assert secondary_x_low > secondary_x_high
-        assert secondary_y_low < secondary_y_high
-
-        panel._remove_secondary_y_axis()
-        qt_app.processEvents()
-        assert panel._secondary_y_axis is None
-        assert panel._secondary_y_items == {}
-
-        panel.resize(420, 300)
-        qt_app.processEvents()
-
-        panel._add_secondary_y_axis()
-        qt_app.processEvents()
-        secondary_viewbox = panel._secondary_y_axis
-        assert secondary_viewbox is not None
-        secondary_viewbox.setRange(xRange=(2.0, 10.0), yRange=(10.0, 90.0), padding=0.0)
-        qt_app.processEvents()
-
-        assert secondary_viewbox.state.get("xInverted") is True
-        assert secondary_viewbox.state.get("yInverted") is True
-        secondary_x_low, secondary_x_high, secondary_y_low, secondary_y_high = _scene_positions(
-            secondary_viewbox,
-            y_low=10.0,
-            y_high=90.0,
-        )
-        assert secondary_x_low > secondary_x_high
-        assert secondary_y_low < secondary_y_high
-
-        panel._toggle_invert_x()
-        panel._toggle_invert_y()
-        qt_app.processEvents()
-
-        assert primary_viewbox.state.get("xInverted") is False
-        assert primary_viewbox.state.get("yInverted") is False
-        assert secondary_viewbox.state.get("xInverted") is False
-        assert secondary_viewbox.state.get("yInverted") is False
-        primary_x_low, primary_x_high, primary_y_low, primary_y_high = _scene_positions(
-            primary_viewbox,
-            y_low=1.0,
-            y_high=9.0,
-        )
-        secondary_x_low, secondary_x_high, secondary_y_low, secondary_y_high = _scene_positions(
-            secondary_viewbox,
-            y_low=10.0,
-            y_high=90.0,
-        )
-        assert primary_x_low < primary_x_high
-        assert primary_y_low > primary_y_high
-        assert secondary_x_low < secondary_x_high
-        assert secondary_y_low > secondary_y_high
-    finally:
-        panel.deleteLater()
-        qt_app.processEvents()
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_scene_mapped_hover_on_secondary_axis_uses_secondary_viewbox_when_enabled(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel(enable_hover_crosshair_toggle_action=True)
-    qtbot.addWidget(panel)
-    panel.show()
-    panel.resize(400, 300)
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([100.0, 200.0, 300.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    panel._set_hover_crosshair_enabled(True)
-    panel._toolbar.set_auto_range(False)
-    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
-    assert panel._secondary_y_axis is not None
-    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(100.0, 300.0), padding=0.0)
-    QtWidgets.QApplication.processEvents()
-
-    scene_pos = _scene_point(panel._secondary_y_axis, 1.0, 200.0)
-    panel._on_mouse_moved(scene_pos)
-
-    assert panel._tooltip_text.isVisible() is True
-    assert "Sim: C" in panel._tooltip_text.toPlainText()
-    assert panel._crosshair_v.value() == pytest.approx(1.0)
-    assert panel._crosshair_h.value() == pytest.approx(200.0)
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_hover_tooltip_uses_rendered_curve_labels_for_distinct_secondary_items(
-    qtbot,
-    monkeypatch,
-):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-    panel.resize(400, 300)
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    t = np.array([0.0, 1.0, 2.0], dtype=float)
-    panel.set_data(
-        t,
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([100.0, 200.0, 300.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "t": t,
-                "series": {"C": np.array([110.0, 210.0, 310.0], dtype=float)},
-            },
-            {
-                "label": "set2",
-                "curve_role": "canonical_ghost",
-                "t": t,
-                "series": {"C": np.array([120.0, 220.0, 320.0], dtype=float)},
-            },
-        ],
-    )
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    panel._toolbar.set_auto_range(False)
-    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
-    assert panel._secondary_y_axis is not None
-    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(95.0, 325.0), padding=0.0)
-    QtWidgets.QApplication.processEvents()
-
-    overlay_label = panel._format_species_set_label("C", "set2")
-
-    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 210.0))
-    overlay_tooltip = panel._tooltip_text.toPlainText()
-
-    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 220.0))
-    reference_tooltip = panel._tooltip_text.toPlainText()
-
-    assert panel._tooltip_text.isVisible() is True
-    assert f"Sim: {overlay_label}\n" in overlay_tooltip
-    assert "[ref]" not in overlay_tooltip
-    assert f"Sim: {overlay_label} [ref]" in reference_tooltip
-    assert overlay_tooltip.splitlines()[0] != reference_tooltip.splitlines()[0]
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_dataset_overlay_hover_tooltip_keeps_dataset_prefix_clean(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-    panel.resize(400, 300)
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    t = np.array([0.0, 1.0, 2.0], dtype=float)
-    panel.set_data(
-        t,
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([100.0, 200.0, 300.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_overlay_catalog(
-        {
-            "ds1": {
-                "t": t,
-                "species": {
-                    "C": np.array([150.0, 250.0, 350.0], dtype=float),
-                },
-            }
-        }
-    )
-    panel._overlay_panel._selected["ds1"] = True
-    panel._overlay_panel._enabled_species["ds1"] = {"C"}
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    panel._toolbar.set_auto_range(False)
-    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
-    assert panel._secondary_y_axis is not None
-    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(95.0, 355.0), padding=0.0)
-    QtWidgets.QApplication.processEvents()
-
-    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 250.0))
-    tooltip = panel._tooltip_text.toPlainText()
-
-    assert panel._tooltip_text.isVisible() is True
-    assert "Dataset ds1: C" in tooltip
-    assert "Dataset ds1: ds1: C" not in tooltip
-    assert "ds1: C =" not in tooltip
-    assert "C = 250.0" in tooltip
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_refresh_clears_hover_state_when_hovered_secondary_item_is_removed(
-    qtbot,
-    monkeypatch,
-):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-    panel.resize(400, 300)
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    t = np.array([0.0, 1.0, 2.0], dtype=float)
-    panel.set_data(
-        t,
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([100.0, 200.0, 300.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "t": t,
-                "series": {"C": np.array([110.0, 210.0, 310.0], dtype=float)},
-            },
-            {
-                "label": "set2",
-                "curve_role": "canonical_ghost",
-                "t": t,
-                "series": {"C": np.array([120.0, 220.0, 320.0], dtype=float)},
-            },
-        ],
-    )
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    panel._toolbar.set_auto_range(False)
-    panel._plot_item.setRange(xRange=(0.0, 2.0), yRange=(1.0, 3.0), padding=0.0)
-    assert panel._secondary_y_axis is not None
-    panel._secondary_y_axis.setRange(xRange=(0.0, 2.0), yRange=(95.0, 325.0), padding=0.0)
-    QtWidgets.QApplication.processEvents()
-
-    panel._on_mouse_moved(_scene_point(panel._secondary_y_axis, 1.0, 220.0))
-
-    assert panel._tooltip_text.isVisible() is True
-    assert panel._secondary_crosshair_h is not None
-    assert panel._secondary_crosshair_h.isVisible() is True
-    assert panel._crosshair_h.isVisible() is False
-    assert panel._secondary_y_axis is not None
-
-    panel._set_canonical_ghost_lines_visible(False)
-    QtWidgets.QApplication.processEvents()
-
-    assert panel._secondary_y_axis is not None
-    assert panel._tooltip_text.isVisible() is False
-    assert panel._secondary_crosshair_h is not None
-    assert panel._secondary_crosshair_h.isVisible() is False
-    assert panel._crosshair_h.isVisible() is False
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_primary_line_legend_tracks_right_axis_refresh(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0], dtype=float),
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([4.0, 5.0, 6.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    expected_label = panel._format_species_set_label("C", "set1")
-    assert expected_label in _legend_texts(panel)
-
-    panel._remove_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    assert expected_label in _legend_texts(panel)
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_overlay_and_reference_legend_tracks_right_axis_refresh(qtbot, monkeypatch):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    t = np.array([0.0, 1.0, 2.0], dtype=float)
-    panel.set_data(
-        t,
-        {
-            "A": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([4.0, 5.0, 6.0], dtype=float),
-        },
-        label="set1",
-        overlays=[
-            {
-                "label": "set2",
-                "t": t,
-                "series": {"C": np.array([4.5, 5.5, 6.5], dtype=float)},
-            },
-            {
-                "label": "set2",
-                "curve_role": "canonical_ghost",
-                "t": t,
-                "series": {"C": np.array([4.2, 5.2, 6.2], dtype=float)},
-            },
-        ],
-    )
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    overlay_label = panel._format_species_set_label("C", "set2")
-    assert overlay_label in _legend_texts(panel)
-    assert f"{overlay_label} [ref]" in _legend_texts(panel)
-
-    panel._remove_secondary_y_axis()
-    QtWidgets.QApplication.processEvents()
-
-    assert overlay_label in _legend_texts(panel)
-    assert f"{overlay_label} [ref]" in _legend_texts(panel)
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_secondary_axis_tears_down_when_membership_remains_but_current_basis_has_no_renderables(
-    qtbot,
-    monkeypatch,
-):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
-
-    panel.set_data(
-        np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=float),
-        {
-            "A": np.array([10.0, 20.0, 30.0], dtype=float),
-            "B": np.array([1.0, 2.0, 3.0], dtype=float),
-            "C": np.array([7.0, 8.0, 9.0, 10.0, 11.0], dtype=float),
-        },
-        label="set1",
-    )
-    panel.set_selected_series(["A", "C"])
-    panel._add_secondary_y_axis()
-    panel._on_x_axis_changed("B")
-    QtWidgets.QApplication.processEvents()
-
-    assert panel._secondary_y_species == ["C"]
-    assert panel._secondary_y_axis is None
-    assert panel._secondary_y_items == {}
-    assert panel._secondary_y_overlay_items == {}
-    assert panel._secondary_y_dataset_overlay_items == {}
-    assert _axis_label_text(panel, "right") == ""
-    assert panel._format_species_set_label("C", "set1") not in _legend_texts(panel)
