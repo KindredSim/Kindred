@@ -259,6 +259,11 @@ class MainWindow(
         self.setCentralWidget(self._plot_tabs)
         self._theme_manager = shell.theme_manager
         self.results_controller = shell.results_controller
+        plot = getattr(self, "_plot_tabs", None)
+        main_plot = getattr(plot, "_main_plot", None)
+        set_copy_all_provider = getattr(main_plot, "set_copy_all_export_plan_provider", None)
+        if callable(set_copy_all_provider):
+            set_copy_all_provider(self._build_main_plot_copy_all_export_plan)
 
     def _init_mechanism_dock_and_panel(self) -> None:
         mechanism_dock_components = build_mechanism_dock(self)
@@ -4572,6 +4577,127 @@ class MainWindow(
             return self._batch_store.row_for_set_id(str(set_id or ""))
         except Exception:
             return None
+
+    def _copy_all_popup_labels_by_set_id(self, set_ids: Sequence[str]) -> Dict[str, str]:
+        labels_by_id: Dict[str, str] = {}
+        label_counts: Dict[str, int] = {}
+        for raw_set_id in set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id:
+                continue
+            label = str(self.batch_set_name_for_id(set_id) or set_id)
+            labels_by_id[set_id] = label
+            label_counts[label] = int(label_counts.get(label, 0)) + 1
+
+        popup_labels: Dict[str, str] = {}
+        for set_id, label in labels_by_id.items():
+            popup_label = str(label)
+            if int(label_counts.get(label, 0)) > 1:
+                row = self._batch_row_for_set_id(set_id)
+                if row is not None:
+                    popup_label = f"{label} (row {int(row) + 1})"
+            popup_labels[set_id] = popup_label
+        return popup_labels
+
+    def _copy_all_shown_block_from_entry(
+        self,
+        *,
+        set_id: str,
+        label: str,
+        entry: Mapping[str, Any],
+    ):
+        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllShownBlock
+
+        return CopyAllShownBlock(
+            set_id=str(set_id),
+            label=str(label),
+            t=np.asarray(entry.get("t"), dtype=float).reshape(-1),
+            series={
+                str(name): np.asarray(values, dtype=float).reshape(-1)
+                for name, values in dict(entry.get("series") or {}).items()
+            },
+        )
+
+    def _copy_all_clean_shown_block(
+        self,
+        *,
+        set_id: str,
+        cache_key: str,
+        valid_set_ids: Optional[Sequence[str]],
+        invalidated_set_ids: Optional[Sequence[str]],
+    ):
+        if not cache_key:
+            return None, "no_cached_results"
+        coverage = self.results_controller.cached_batch_selection_coverage(
+            cache_key=str(cache_key),
+            selected_sets=[str(set_id)],
+            cache_store=self._sim_controller.batch_cache.result_cache,
+            valid_set_ids=valid_set_ids,
+            invalidated_set_ids=invalidated_set_ids,
+            allow_fallback=False,
+        )
+        if not coverage.available_ids:
+            return None, str(coverage.reason or "no_cached_results")
+        entry_result = self._cache_entry_for_set_id_from_store(
+            store=self._sim_controller.batch_cache.result_cache,
+            cache_key=str(cache_key),
+            set_id=str(set_id),
+        )
+        if entry_result.entry is None:
+            return None, "invalid_cache_entry" if entry_result.state == "invalid" else "no_cached_results"
+        label = str(self.batch_set_name_for_id(set_id) or set_id)
+        return self._copy_all_shown_block_from_entry(set_id=str(set_id), label=label, entry=entry_result.entry), None
+
+    def _copy_all_dirty_shown_block(self, *, set_id: str):
+        resolved_entries, reason, _, _, _, _, _ = self._resolve_workspace_aware_batch_selection(
+            selected_sets=[str(set_id)]
+        )
+        resolved = next((entry for entry in resolved_entries if str(entry.set_id) == str(set_id)), None)
+        if resolved is None or resolved.entry is None:
+            return None, str(reason or "preview_pending")
+        return self._copy_all_shown_block_from_entry(
+            set_id=str(resolved.set_id),
+            label=str(resolved.label),
+            entry=resolved.entry,
+        ), None
+
+    def _build_main_plot_copy_all_export_plan(self):
+        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllExportPlan, CopyAllMissingItem
+
+        shown_set_ids = [str(set_id) for set_id in (self.shown_batch_set_ids() or []) if str(set_id)]
+        popup_labels = self._copy_all_popup_labels_by_set_id(shown_set_ids)
+        batch_cache = self._sim_controller.batch_cache
+        cache_key = str(batch_cache.active_cache_key or "")
+        valid_set_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id))
+        invalidated_set_ids = tuple(
+            str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
+        )
+
+        shown_blocks = []
+        missing_items = []
+        for set_id in shown_set_ids:
+            label = str(self.batch_set_name_for_id(set_id) or set_id)
+            if self._preview_session.has_dirty_state_for_set(str(set_id)):
+                block, reason = self._copy_all_dirty_shown_block(set_id=str(set_id))
+            else:
+                block, reason = self._copy_all_clean_shown_block(
+                    set_id=str(set_id),
+                    cache_key=cache_key,
+                    valid_set_ids=valid_set_ids or None,
+                    invalidated_set_ids=invalidated_set_ids or None,
+                )
+            if block is not None:
+                shown_blocks.append(block)
+                continue
+            missing_items.append(
+                CopyAllMissingItem(
+                    set_id=str(set_id),
+                    label=label,
+                    popup_label=str(popup_labels.get(str(set_id), label)),
+                    reason=str(reason or "no_cached_results"),
+                )
+            )
+        return CopyAllExportPlan(shown_blocks=shown_blocks, missing_items=missing_items)
 
     def _set_cached_focused_batch_set_id(self, set_id: str) -> str:
         focused_set_id = str(set_id or "").strip()

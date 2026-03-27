@@ -221,7 +221,7 @@ def test_main_plot_axis_inversion_actions_are_scoped_to_simulation_plot(qtbot, m
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_main_plot_context_menu_includes_copy_visible_data_and_dataset_plot_does_not(qtbot, monkeypatch):
+def test_main_plot_context_menu_includes_copy_actions_and_dataset_plot_does_not(qtbot, monkeypatch):
     widget = PlotTabsWidget()
     qtbot.addWidget(widget)
     widget.show()
@@ -229,15 +229,18 @@ def test_main_plot_context_menu_includes_copy_visible_data_and_dataset_plot_does
 
     dataset_panel = widget.add_dataset_tab("dataset-1")
     QtWidgets.QApplication.processEvents()
+    widget._main_plot.set_copy_all_export_plan_provider(lambda: None)
 
     captured_menus = _capture_context_menu(monkeypatch)
 
     widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
     main_menu = captured_menus.pop()
+    _find_action(main_menu.actions(), "Copy All")
     _find_action(main_menu.actions(), "Copy Visible Data")
 
     dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
     dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Copy All" for action in dataset_menu.actions())
     assert all(action.text() != "Copy Visible Data" for action in dataset_menu.actions())
 
 
@@ -295,6 +298,7 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     panel._on_x_axis_changed("B")
     panel._add_secondary_y_axis()
     panel.set_selected_series(["A"])
+    panel._on_toolbar_option_requested("sampling", "coarse")
 
     panel.set_overlay_catalog(
         {
@@ -362,6 +366,275 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     assert body[3][overlay_y_idx] == ""
     assert body[2][dataset_x_idx] == ""
     assert body[2][dataset_y_idx] == ""
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_dataset_markers(
+    qtbot, monkeypatch
+):
+    panel = PyQtGraphPlotPanel(enable_canonical_ghost_toggle_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", lambda *args, **kwargs: ("C", True))
+
+    panel._sampling_target = 3
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "B": np.array([0.1, 0.2, 0.3], dtype=float),
+            "C": np.array([5.0, 6.0, 7.0], dtype=float),
+        },
+        label="focused",
+        overlays=[
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "t": np.linspace(0.0, 9.0, 10),
+                "series": {
+                    "A": np.linspace(50.0, 59.0, 10),
+                    "B": np.linspace(0.5, 1.4, 10),
+                    "C": np.linspace(150.0, 159.0, 10),
+                },
+            },
+            {
+                "label": "set3",
+                "set_id": "set3",
+                "t": np.linspace(0.0, 9.0, 10),
+                "series": {
+                    "A": np.linspace(250.0, 259.0, 10),
+                    "B": np.linspace(2.5, 3.4, 10),
+                    "C": np.linspace(350.0, 359.0, 10),
+                },
+            },
+            {
+                "label": "set2",
+                "set_id": "set2",
+                "curve_role": "canonical_ghost",
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "series": {
+                    "A": np.array([901.0, 902.0, 903.0], dtype=float),
+                    "B": np.array([9.1, 9.2, 9.3], dtype=float),
+                    "C": np.array([951.0, 952.0, 953.0], dtype=float),
+                },
+            },
+        ],
+    )
+    panel.set_selected_series(["A", "C"])
+    panel._on_x_axis_changed("B")
+    panel._add_secondary_y_axis()
+    panel.set_selected_series(["A"])
+    panel._on_toolbar_option_requested("sampling", "coarse")
+
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.linspace(0.0, 5.0, 6),
+                "species": {
+                    "A": np.linspace(1001.0, 1006.0, 6),
+                    "B": np.linspace(10.1, 10.6, 6),
+                    "C": np.linspace(1101.0, 1106.0, 6),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A"}
+    panel._update_plot()
+    QtWidgets.QApplication.processEvents()
+
+    plot_contract = plot_panel_impl
+    panel.set_copy_all_export_plan_provider(
+        lambda: plot_contract.CopyAllExportPlan(
+            shown_blocks=[
+                plot_contract.CopyAllShownBlock(
+                    set_id="set1",
+                    label="set1",
+                    t=np.linspace(0.0, 5.0, 6),
+                    series={
+                        "A": np.linspace(11.0, 16.0, 6),
+                        "B": np.linspace(0.11, 0.66, 6),
+                        "C": np.linspace(21.0, 26.0, 6),
+                    },
+                ),
+                plot_contract.CopyAllShownBlock(
+                    set_id="set2",
+                    label="set2",
+                    t=np.linspace(10.0, 15.0, 6),
+                    series={
+                        "A": np.linspace(31.0, 36.0, 6),
+                        "B": np.linspace(1.11, 1.66, 6),
+                        "C": np.linspace(41.0, 46.0, 6),
+                    },
+                ),
+            ],
+            missing_items=[],
+        )
+    )
+
+    panel._copy_all()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows, "Expected clipboard TSV output"
+    header = rows[0]
+    body = rows[1:]
+    assert len(body) == 6
+
+    set1_cols = [idx for idx, cell in enumerate(header) if cell.startswith("set1::")]
+    set2_cols = [idx for idx, cell in enumerate(header) if cell.startswith("set2::")]
+    set3_cols = [idx for idx, cell in enumerate(header) if cell.startswith("set3::")]
+    dataset_cols = [idx for idx, cell in enumerate(header) if cell.startswith("ds1::")]
+    assert set1_cols
+    assert set2_cols
+    assert set3_cols
+    assert dataset_cols
+
+    assert sum(1 for cell in header if cell == "set2::Time (s)") == 1
+    assert sum(1 for cell in header if cell.startswith("set2::") and "[B]" in cell) == 1
+    assert "set3::Time (s)" not in header
+    assert "901.0" not in clipboard.last_text
+    assert "902.0" not in clipboard.last_text
+
+    set1_time_idx = _find_header_index(header, prefix="set1::", contains=["Time"])
+    set1_x_idx = _find_header_index(header, prefix="set1::", contains=["B", "[B]"])
+    set1_a_idx = _find_header_index(header, prefix="set1::", contains=["A"])
+    set1_c_idx = _find_header_index(header, prefix="set1::", contains=["C", "[right axis]"])
+    set3_x_idx = _find_header_index(header, prefix="set3::", contains=["B", "[B]"])
+    set3_a_idx = _find_header_index(header, prefix="set3::", contains=["A"])
+    dataset_x_idx = _find_header_index(header, prefix="ds1::", contains=["B", "[B]"])
+    dataset_y_idx = _find_header_index(header, prefix="ds1::", contains=["A"])
+
+    np.testing.assert_allclose(_numeric_column(body, set1_time_idx), np.linspace(0.0, 5.0, 6))
+    np.testing.assert_allclose(_numeric_column(body, set1_x_idx), np.linspace(0.11, 0.66, 6))
+    np.testing.assert_allclose(_numeric_column(body, set1_a_idx), np.linspace(11.0, 16.0, 6))
+    np.testing.assert_allclose(_numeric_column(body, set1_c_idx), np.linspace(21.0, 26.0, 6))
+
+    assert _numeric_column(body, set3_x_idx).shape[0] == 3
+    assert _numeric_column(body, set3_a_idx).shape[0] == 3
+    assert _numeric_column(body, dataset_x_idx).shape[0] == 3
+    assert _numeric_column(body, dataset_y_idx).shape[0] == 3
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_all_soft_fail_yes_copies_available_blocks_only(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    clipboard.last_text = "unchanged"
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "B": np.array([0.1, 0.2, 0.3], dtype=float),
+        },
+        label="focused",
+    )
+    panel.set_selected_series(["A"])
+    panel._on_x_axis_changed("B")
+
+    captured_missing = []
+
+    def _confirm(missing_items):
+        captured_missing.extend(missing_items)
+        return True
+
+    monkeypatch.setattr(panel, "_confirm_copy_all_missing_items", _confirm, raising=False)
+    plot_contract = plot_panel_impl
+    panel.set_copy_all_export_plan_provider(
+        lambda: plot_contract.CopyAllExportPlan(
+            shown_blocks=[
+                plot_contract.CopyAllShownBlock(
+                    set_id="set1",
+                    label="set1",
+                    t=np.array([0.0, 1.0, 2.0], dtype=float),
+                    series={
+                        "A": np.array([10.0, 11.0, 12.0], dtype=float),
+                        "B": np.array([0.4, 0.5, 0.6], dtype=float),
+                    },
+                )
+            ],
+            missing_items=[
+                plot_contract.CopyAllMissingItem(
+                    set_id="set2",
+                    label="dup",
+                    popup_label="dup (row 2)",
+                    reason="no_cached_results",
+                )
+            ],
+        )
+    )
+
+    panel._copy_all()
+
+    assert [item.popup_label for item in captured_missing] == ["dup (row 2)"]
+    assert [item.reason for item in captured_missing] == ["no_cached_results"]
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    assert any(cell.startswith("set1::") for cell in rows[0])
+    assert all(not cell.startswith("set2::") for cell in rows[0])
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_copy_all_soft_fail_no_leaves_clipboard_unchanged(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    clipboard.last_text = "unchanged"
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([1.0, 2.0, 3.0], dtype=float),
+            "B": np.array([0.1, 0.2, 0.3], dtype=float),
+        },
+        label="focused",
+    )
+    panel.set_selected_series(["A"])
+    panel._on_x_axis_changed("B")
+
+    monkeypatch.setattr(panel, "_confirm_copy_all_missing_items", lambda _missing_items: False, raising=False)
+    plot_contract = plot_panel_impl
+    panel.set_copy_all_export_plan_provider(
+        lambda: plot_contract.CopyAllExportPlan(
+            shown_blocks=[
+                plot_contract.CopyAllShownBlock(
+                    set_id="set1",
+                    label="set1",
+                    t=np.array([0.0, 1.0, 2.0], dtype=float),
+                    series={
+                        "A": np.array([10.0, 11.0, 12.0], dtype=float),
+                        "B": np.array([0.4, 0.5, 0.6], dtype=float),
+                    },
+                )
+            ],
+            missing_items=[
+                plot_contract.CopyAllMissingItem(
+                    set_id="set2",
+                    label="set2",
+                    popup_label="set2",
+                    reason="preview_pending",
+                )
+            ],
+        )
+    )
+
+    panel._copy_all()
+
+    assert clipboard.last_text == "unchanged"
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")

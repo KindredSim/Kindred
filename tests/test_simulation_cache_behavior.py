@@ -2328,3 +2328,84 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
         np.asarray([2.0, 4.0], dtype=float),
     )
     assert main_window.active_batch_selection()[0] == newer_id
+
+
+@pytest.mark.gui
+def test_copy_all_export_plan_is_side_effect_free_and_disambiguates_duplicate_missing_labels(
+    main_window, qt_app
+):
+    from PySide6 import QtWidgets
+
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {
+        "A": np.asarray([1.0, 2.0], dtype=float),
+        "B": np.asarray([0.1, 0.2], dtype=float),
+    }
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window._status_label.setText("unchanged")
+    main_window._set_main_plot_workspace_preview_provenance({"sentinel": {"marker": 1}})
+
+    main_window._batch_model.set_species(["A", "B"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _set_shown_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "dup")
+
+    cache_key = "copy-all-cache-key"
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = cache_key
+    cache.active_cache_valid_set_ids = [first_id, second_id]
+    cache.active_cache_invalidated_set_ids = []
+    cache.result_cache[f"{cache_key}::{first_id}"] = {
+        "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+        "series": {
+            "A": np.asarray([10.0, 11.0, 12.0], dtype=float),
+            "B": np.asarray([0.3, 0.4, 0.5], dtype=float),
+        },
+        "algebra_scalars": {},
+    }
+
+    before_status = main_window._status_label.text()
+    before_selection = main_window.active_batch_selection()
+    before_plot_label = getattr(main_window.main_plot(), "_simulation_set_label", None)
+    before_plot_t = np.asarray(getattr(main_window.main_plot(), "_t", []), dtype=float).copy()
+    before_plot_series = {
+        str(name): np.asarray(values, dtype=float).copy()
+        for name, values in dict(getattr(main_window.main_plot(), "_series", {}) or {}).items()
+    }
+    before_provenance = dict(main_window._main_plot_workspace_preview_provenance())
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(first_id, "dup")]
+    assert len(plan.missing_items) == 1
+    assert plan.missing_items[0].set_id == second_id
+    assert plan.missing_items[0].label == "dup"
+    assert plan.missing_items[0].popup_label == "dup (row 2)"
+    assert plan.missing_items[0].reason == "no_cached_results"
+    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0, 2.0], dtype=float))
+    np.testing.assert_allclose(
+        plan.shown_blocks[0].series["A"],
+        np.asarray([10.0, 11.0, 12.0], dtype=float),
+    )
+
+    assert main_window._status_label.text() == before_status
+    assert main_window.active_batch_selection() == before_selection
+    assert getattr(main_window.main_plot(), "_simulation_set_label", None) == before_plot_label
+    np.testing.assert_allclose(np.asarray(getattr(main_window.main_plot(), "_t", []), dtype=float), before_plot_t)
+    assert main_window._main_plot_workspace_preview_provenance() == before_provenance
+    for name, values in before_plot_series.items():
+        np.testing.assert_allclose(
+            np.asarray(getattr(main_window.main_plot(), "_series", {})[name], dtype=float),
+            values,
+        )

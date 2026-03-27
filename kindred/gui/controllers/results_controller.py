@@ -255,7 +255,7 @@ class ResultsController(QtCore.QObject):
             if other is None:
                 continue
             overlay_label = self._ui.batch_name_for_id(sid) or str(sid)
-            overlays.append(dict(build_overlay_entry(label=overlay_label, entry=other)))
+            overlays.append(dict(build_overlay_entry(label=overlay_label, entry=other, set_id=sid)))
         return overlays
 
     def _apply_cached_batch_plot_metadata(

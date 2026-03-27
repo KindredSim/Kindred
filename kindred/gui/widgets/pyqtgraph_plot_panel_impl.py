@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
 import logging
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
@@ -22,7 +23,35 @@ from ..ui_helpers import make_pyqtgraph_fallback_widget
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PyQtGraphPlotPanel", "PYQTGRAPH_AVAILABLE"]
+__all__ = [
+    "CopyAllExportPlan",
+    "CopyAllMissingItem",
+    "CopyAllShownBlock",
+    "PyQtGraphPlotPanel",
+    "PYQTGRAPH_AVAILABLE",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllShownBlock:
+    set_id: str
+    label: str
+    t: np.ndarray
+    series: Dict[str, np.ndarray]
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllMissingItem:
+    set_id: str
+    label: str
+    popup_label: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllExportPlan:
+    shown_blocks: List[CopyAllShownBlock]
+    missing_items: List[CopyAllMissingItem]
 
 
 def _try_float(value: object) -> Optional[float]:
@@ -224,6 +253,7 @@ if PYQTGRAPH_AVAILABLE:
             self._show_canonical_ghost_lines: bool = True
             self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
             self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
+            self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
             self._annotations: List[pg.TextItem] = []
             self._sampling_mode: str = "dense"
             self._sampling_target: int = 1000
@@ -797,6 +827,243 @@ if PYQTGRAPH_AVAILABLE:
                 return
             columns.append((str(header), array))
 
+        def set_copy_all_export_plan_provider(
+            self,
+            provider: Optional[Callable[[], Optional[CopyAllExportPlan]]],
+        ) -> None:
+            self._copy_all_export_plan_provider = provider if callable(provider) else None
+
+        def _current_copy_axis_spec(self) -> Tuple[str, str]:
+            x_name = str(self._x_axis_name or "t")
+            _, x_label = self._get_x_data()
+            if x_name != "t" and x_name not in self._series:
+                return "t", "Time (s)"
+            return x_name, str(x_label or "Time (s)")
+
+        def _build_visible_overlay_copy_blocks(
+            self,
+            *,
+            x_name: str,
+            x_label: str,
+            visible_y_names: Sequence[str],
+            excluded_set_ids: Optional[Set[str]] = None,
+        ) -> List[List[Tuple[str, np.ndarray]]]:
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            excluded = {str(set_id) for set_id in (excluded_set_ids or set()) if str(set_id)}
+            for entry in list(self._simulation_overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                    continue
+                entry_set_id = str(entry.get("set_id") or "").strip()
+                if entry_set_id and entry_set_id in excluded:
+                    continue
+                block_label = str(entry.get("label") or "").strip()
+                overlay_series = entry.get("series") or {}
+                if not isinstance(overlay_series, dict):
+                    continue
+                if x_name == "t":
+                    x_overlay = entry.get("t")
+                else:
+                    x_overlay = overlay_series.get(x_name)
+                x_overlay_array = _try_1d_float_array(x_overlay)
+                if x_overlay_array.size == 0:
+                    continue
+                overlay_sample_idx = self._get_sampling_indices(x_overlay_array.shape[0])
+                x_overlay_plot = self._apply_sample_indices(x_overlay_array, overlay_sample_idx)
+
+                overlay_columns: List[Tuple[str, np.ndarray]] = []
+                self._append_copy_column(
+                    overlay_columns,
+                    header=self._qualified_copy_header(block_label, x_label),
+                    values=x_overlay_plot,
+                )
+
+                overlay_y_added = 0
+                for name in visible_y_names:
+                    y_array = _try_1d_float_array(overlay_series.get(name))
+                    if y_array.size == 0 or y_array.shape[0] != x_overlay_array.shape[0]:
+                        continue
+                    y_plot = self._apply_sample_indices(y_array, overlay_sample_idx)
+                    self._append_copy_column(
+                        overlay_columns,
+                        header=self._copy_series_header(block_label, name),
+                        values=y_plot,
+                    )
+                    overlay_y_added += 1
+                if overlay_y_added:
+                    blocks.append(overlay_columns)
+            return blocks
+
+        def _build_dataset_overlay_copy_blocks(
+            self,
+            *,
+            x_label: str,
+        ) -> List[List[Tuple[str, np.ndarray]]]:
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            for overlay in list(self._active_overlay_series or []):
+                x_overlay_array = _try_1d_float_array(overlay.x)
+                y_overlay_array = _try_1d_float_array(overlay.y)
+                if x_overlay_array.size == 0 or y_overlay_array.size == 0:
+                    continue
+                x_overlay_plot, y_overlay_plot = self._sample_xy(x_overlay_array, y_overlay_array)
+                block_label = str(overlay.dataset or "").strip()
+                dataset_columns: List[Tuple[str, np.ndarray]] = []
+                self._append_copy_column(
+                    dataset_columns,
+                    header=self._qualified_copy_header(block_label, x_label),
+                    values=x_overlay_plot,
+                )
+                self._append_copy_column(
+                    dataset_columns,
+                    header=self._copy_series_header(block_label, str(overlay.species)),
+                    values=y_overlay_plot,
+                )
+                if dataset_columns:
+                    blocks.append(dataset_columns)
+            return blocks
+
+        def _shown_block_current_x_values(
+            self,
+            *,
+            t_values: np.ndarray,
+            series_values: Dict[str, np.ndarray],
+            x_name: str,
+        ) -> np.ndarray:
+            if x_name == "t":
+                return t_values
+            x_values = _try_1d_float_array(series_values.get(x_name))
+            if x_values.size == 0 or x_values.shape[0] != t_values.shape[0]:
+                return np.asarray([], dtype=float)
+            return x_values
+
+        def _build_shown_simulation_copy_block(
+            self,
+            shown_block: CopyAllShownBlock,
+            *,
+            x_name: str,
+            x_label: str,
+            visible_y_names: Sequence[str],
+        ) -> Tuple[Optional[List[Tuple[str, np.ndarray]]], Optional[str]]:
+            t_values = _try_1d_float_array(shown_block.t)
+            if t_values.size == 0:
+                return None, "no_simulation_data"
+            x_values = self._shown_block_current_x_values(t_values=t_values, series_values=shown_block.series, x_name=x_name)
+            if x_values.size == 0:
+                return None, "current_x_unavailable"
+
+            block_label = str(shown_block.label or "").strip()
+            shown_columns: List[Tuple[str, np.ndarray]] = []
+            self._append_copy_column(
+                shown_columns,
+                header=self._qualified_copy_header(block_label, "Time (s)"),
+                values=t_values,
+            )
+            if x_name != "t":
+                self._append_copy_column(
+                    shown_columns,
+                    header=self._qualified_copy_header(block_label, x_label),
+                    values=x_values,
+                )
+
+            y_added = 0
+            for name in visible_y_names:
+                y_values = _try_1d_float_array(shown_block.series.get(name))
+                if y_values.size == 0 or y_values.shape[0] != x_values.shape[0]:
+                    continue
+                self._append_copy_column(
+                    shown_columns,
+                    header=self._copy_series_header(block_label, name),
+                    values=y_values,
+                )
+                y_added += 1
+            if y_added <= 0:
+                return None, "no_visible_series"
+            return shown_columns, None
+
+        def _build_copy_all_blocks(
+            self,
+            plan: CopyAllExportPlan,
+        ) -> Tuple[List[List[Tuple[str, np.ndarray]]], List[CopyAllMissingItem]]:
+            if self._t is None or not self._series:
+                raise ValueError("No simulation data is available to copy.")
+
+            visible_primary_y_names = self._visible_primary_copy_series_names()
+            if not visible_primary_y_names:
+                raise ValueError("No visible simulation series are available to copy.")
+            visible_overlay_y_names = self._visible_overlay_copy_series_names()
+            x_name, x_label = self._current_copy_axis_spec()
+
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            missing_items: List[CopyAllMissingItem] = list(plan.missing_items or [])
+            shown_set_ids: Set[str] = set()
+
+            for shown_block in list(plan.shown_blocks or []):
+                set_id = str(shown_block.set_id or "").strip()
+                if set_id:
+                    shown_set_ids.add(set_id)
+                block_columns, missing_reason = self._build_shown_simulation_copy_block(
+                    shown_block,
+                    x_name=x_name,
+                    x_label=x_label,
+                    visible_y_names=visible_primary_y_names,
+                )
+                if block_columns is not None:
+                    blocks.append(block_columns)
+                    continue
+                missing_items.append(
+                    CopyAllMissingItem(
+                        set_id=set_id,
+                        label=str(shown_block.label or ""),
+                        popup_label=str(shown_block.label or set_id or "Shown simulation"),
+                        reason=str(missing_reason or "no_simulation_data"),
+                    )
+                )
+
+            blocks.extend(
+                self._build_visible_overlay_copy_blocks(
+                    x_name=x_name,
+                    x_label=x_label,
+                    visible_y_names=visible_overlay_y_names,
+                    excluded_set_ids=shown_set_ids,
+                )
+            )
+            blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
+            return blocks, missing_items
+
+        @staticmethod
+        def _copy_all_reason_text(reason: str) -> str:
+            reason_key = str(reason or "").strip()
+            return {
+                "preview_pending": "Preview pending",
+                "no_cached_results": "Result not cached (evicted)",
+                "invalid_cache_entry": "Invalid cached result",
+                "current_x_unavailable": "Current X-axis data unavailable",
+                "no_visible_series": "No visible series available",
+                "no_simulation_data": "No simulation data available",
+            }.get(reason_key, "Unavailable")
+
+        def _confirm_copy_all_missing_items(self, missing_items: Sequence[CopyAllMissingItem]) -> bool:
+            entries = [item for item in missing_items if isinstance(item, CopyAllMissingItem)]
+            if not entries:
+                return True
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            box.setWindowTitle("Copy All")
+            box.setText("Some shown simulations are unavailable for truthful export.")
+            lines = [
+                f"{str(item.popup_label or item.label or item.set_id or 'Shown simulation')}: "
+                f"{self._copy_all_reason_text(item.reason)}"
+                for item in entries
+            ]
+            box.setInformativeText("\n".join(lines) + "\n\nCopy available data anyway?")
+            yes_button = box.addButton("Yes", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            no_button = box.addButton("No", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(no_button)
+            box.setEscapeButton(no_button)
+            box.exec()
+            return box.clickedButton() is yes_button
+
         def _build_visible_copy_blocks(self) -> List[List[Tuple[str, np.ndarray]]]:
             if self._t is None or not self._series:
                 raise ValueError("No simulation data is available to copy.")
@@ -844,67 +1111,14 @@ if PYQTGRAPH_AVAILABLE:
             if primary_y_added:
                 blocks.append(primary_columns)
 
-            for entry in list(self._simulation_overlays or []):
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("curve_role") or "") == "canonical_ghost":
-                    continue
-                block_label = str(entry.get("label") or "").strip()
-                overlay_series = entry.get("series") or {}
-                if not isinstance(overlay_series, dict):
-                    continue
-                if x_name == "t":
-                    x_overlay = entry.get("t")
-                else:
-                    x_overlay = overlay_series.get(x_name)
-                x_overlay_array = _try_1d_float_array(x_overlay)
-                if x_overlay_array.size == 0:
-                    continue
-                overlay_sample_idx = self._get_sampling_indices(x_overlay_array.shape[0])
-                x_overlay_plot = self._apply_sample_indices(x_overlay_array, overlay_sample_idx)
-
-                overlay_columns: List[Tuple[str, np.ndarray]] = []
-                self._append_copy_column(
-                    overlay_columns,
-                    header=self._qualified_copy_header(block_label, x_label),
-                    values=x_overlay_plot,
+            blocks.extend(
+                self._build_visible_overlay_copy_blocks(
+                    x_name=x_name,
+                    x_label=x_label,
+                    visible_y_names=overlay_visible_y_names,
                 )
-
-                overlay_y_added = 0
-                for name in overlay_visible_y_names:
-                    y_array = _try_1d_float_array(overlay_series.get(name))
-                    if y_array.size == 0 or y_array.shape[0] != x_overlay_array.shape[0]:
-                        continue
-                    y_plot = self._apply_sample_indices(y_array, overlay_sample_idx)
-                    self._append_copy_column(
-                        overlay_columns,
-                        header=self._copy_series_header(block_label, name),
-                        values=y_plot,
-                    )
-                    overlay_y_added += 1
-                if overlay_y_added:
-                    blocks.append(overlay_columns)
-
-            for overlay in list(self._active_overlay_series or []):
-                x_overlay_array = _try_1d_float_array(overlay.x)
-                y_overlay_array = _try_1d_float_array(overlay.y)
-                if x_overlay_array.size == 0 or y_overlay_array.size == 0:
-                    continue
-                x_overlay_plot, y_overlay_plot = self._sample_xy(x_overlay_array, y_overlay_array)
-                block_label = str(overlay.dataset or "").strip()
-                dataset_columns: List[Tuple[str, np.ndarray]] = []
-                self._append_copy_column(
-                    dataset_columns,
-                    header=self._qualified_copy_header(block_label, x_label),
-                    values=x_overlay_plot,
-                )
-                self._append_copy_column(
-                    dataset_columns,
-                    header=self._copy_series_header(block_label, str(overlay.species)),
-                    values=y_overlay_plot,
-                )
-                if dataset_columns:
-                    blocks.append(dataset_columns)
+            )
+            blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
 
             return blocks
 
@@ -960,6 +1174,33 @@ if PYQTGRAPH_AVAILABLE:
                     self,
                     "Copy Visible Data",
                     f"Failed to copy visible plot data: {exc}",
+                )
+
+        def _copy_all(self) -> None:
+            try:
+                provider = self._copy_all_export_plan_provider
+                if provider is None:
+                    raise ValueError("Copy All is unavailable.")
+                plan = provider()
+                if plan is None:
+                    raise ValueError("Copy All is unavailable.")
+                blocks, missing_items = self._build_copy_all_blocks(plan)
+                if missing_items and not self._confirm_copy_all_missing_items(missing_items):
+                    return
+                columns = self._flatten_copy_blocks(blocks)
+                header, rows = self._copy_columns_to_rows(columns)
+                clipboard = self._get_clipboard()
+                if clipboard is None:
+                    raise ValueError("Clipboard is unavailable.")
+                clipboard.setText(self._rows_to_tsv(header, rows))
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Copy All", str(exc))
+            except Exception as exc:
+                logger.exception("Failed to copy all plot data: %s", exc)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Copy All",
+                    f"Failed to copy all plot data: {exc}",
                 )
 
         def update_statistics(
@@ -2237,6 +2478,10 @@ if PYQTGRAPH_AVAILABLE:
                 clear_annotations_action.triggered.connect(self._clear_annotations)
 
             menu.addSeparator()
+
+            if self._copy_all_export_plan_provider is not None:
+                copy_all_action = menu.addAction("Copy All")
+                copy_all_action.triggered.connect(self._copy_all)
 
             if self._enable_copy_visible_data_action:
                 copy_visible_action = menu.addAction("Copy Visible Data")
