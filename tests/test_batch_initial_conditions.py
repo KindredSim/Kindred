@@ -1075,6 +1075,111 @@ def test_move_relabels_overlays_when_primary_is_empty_but_display_selection_surv
 
 
 @pytest.mark.gui
+def test_build_copy_all_export_plan_uses_live_overlay_for_clean_evicted_visible_set(main_window, qt_app):
+    from PySide6 import QtWidgets
+
+    from kindred.core.batch_simulation_cache import BatchSimulationCache
+
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    first_name = str(main_window.batch_set_name_for_id(first_id) or "")
+    second_name = str(main_window.batch_set_name_for_id(second_id) or "")
+    assert first_id and second_id
+
+    cache = main_window.simulation_controller.batch_cache
+    cache_key = "copy-all-live-overlay-fallback"
+    cache.active_cache_key = cache_key
+    cache.active_cache_valid_set_ids = (first_id, second_id)
+    cache.active_cache_invalidated_set_ids = None
+    cache.active_batch_set_id = first_id
+    cache.active_batch_set = first_name
+    cache.last_display_selection = [first_id, second_id]
+    cache.result_cache[BatchSimulationCache.entry_key(cache_key, first_id)] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([1.0, 2.0], dtype=float)},
+    }
+
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 2.0], dtype=float)},
+        label=first_name,
+        overlays=[
+            {
+                "label": second_name,
+                "set_id": second_id,
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "series": {"A": np.asarray([3.0, 4.0], dtype=float)},
+            }
+        ],
+    )
+    main_window.sync_main_plot_copy_labels(first_id, [first_id, second_id])
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [block.set_id for block in plan.shown_blocks] == [first_id, second_id]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[1].series["A"], np.asarray([3.0, 4.0], dtype=float))
+
+
+@pytest.mark.gui
+def test_batch_set_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_app):
+    from PySide6 import QtCore, QtWidgets
+
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 0), "dup", QtCore.Qt.EditRole)
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 0), "set2", QtCore.Qt.EditRole)
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_batch_set_id = first_id
+    cache.active_batch_set = "dup"
+    cache.last_display_selection = [first_id, second_id]
+
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 2.0], dtype=float)},
+        label="dup",
+        overlays=[
+            {
+                "label": "set2",
+                "set_id": second_id,
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "series": {"A": np.asarray([3.0, 4.0], dtype=float)},
+            }
+        ],
+    )
+    main_window.sync_main_plot_copy_labels(first_id, [first_id, second_id])
+
+    plot = main_window._plot_tabs._main_plot
+    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
+    assert getattr(plot, "_simulation_set_popup_label", None) == "dup"
+    assert overlays[0].get("popup_label") == "set2"
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 0), "dup", QtCore.Qt.EditRole)
+    qt_app.processEvents()
+
+    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
+    assert getattr(plot, "_simulation_set_popup_label", None) == "dup (row 1)"
+    assert overlays[0]["popup_label"] == "dup (row 2)"
+
+
+@pytest.mark.gui
 def test_global_fit_creates_and_seeds_new_batch_set_from_dataset_t0(main_window, monkeypatch):
     """
     Regression: starting a global fit should prompt for an unmapped dataset and,

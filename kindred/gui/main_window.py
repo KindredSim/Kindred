@@ -611,6 +611,7 @@ class MainWindow(
             for signal_name, slot in (
                 ("showMembershipChanged", self._on_batch_show_membership_changed),
                 ("sliderEditTargetsChanged", self._on_slider_edit_targets_changed),
+                ("dataChanged", self._on_batch_model_data_changed),
             ):
                 signal = getattr(model, signal_name, None)
                 if signal is None:
@@ -665,6 +666,7 @@ class MainWindow(
             try:
                 current_model.showMembershipChanged.connect(self._on_batch_show_membership_changed)
                 current_model.sliderEditTargetsChanged.connect(self._on_slider_edit_targets_changed)
+                current_model.dataChanged.connect(self._on_batch_model_data_changed)
             except RuntimeError as exc:
                 logger.debug("Failed to connect batch model semantics signals: %s", exc, exc_info=True)
         if current_selection_model is not None:
@@ -3497,7 +3499,9 @@ class MainWindow(
         self._run_btn.setEnabled(bool(enabled))
         editor = getattr(self, "_mechanism_editor", None)
         if editor is not None:
-            if enabled:
+            if hasattr(editor, "set_run_gated"):
+                editor.set_run_gated(not bool(enabled))
+            elif enabled:
                 editor.run_btn.setEnabled(editor.is_mechanism_valid())
             else:
                 editor.run_btn.setEnabled(False)
@@ -3570,6 +3574,15 @@ class MainWindow(
                 entry["popup_label"] = popup_label
             else:
                 entry.pop("popup_label", None)
+
+    def _sync_main_plot_copy_labels_for_cached_batch_selection(self) -> None:
+        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
+        if batch_cache is None:
+            return
+        active_set_id = str(self.active_batch_selection()[0] or "").strip()
+        selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
+        if active_set_id or selected_ids:
+            self.sync_main_plot_copy_labels(active_set_id, selected_ids)
 
     def show_simulation_tab(self) -> None:
         self._plot_tabs._tabs.setCurrentIndex(0)
@@ -4727,12 +4740,13 @@ class MainWindow(
         set_id: str,
         label: str,
         invalidated_set_ids: Optional[Sequence[str]],
+        allow_clean_missing_cache: bool = False,
     ):
         sid = str(set_id or "").strip()
         if not sid:
             return None
         invalidated = {str(raw_id) for raw_id in (invalidated_set_ids or ()) if str(raw_id)}
-        if sid not in invalidated:
+        if sid not in invalidated and not bool(allow_clean_missing_cache):
             return None
         plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
         if plot is None:
@@ -4823,10 +4837,14 @@ class MainWindow(
                     invalidated_set_ids=invalidated_set_ids or None,
                 )
                 if block is None:
+                    allow_clean_missing_cache = (
+                        str(reason or "") == "no_cached_results" and str(set_id) not in invalidated_set_ids
+                    )
                     block = self._copy_all_live_plot_shown_block(
                         set_id=str(set_id),
                         label=export_label,
                         invalidated_set_ids=invalidated_set_ids or None,
+                        allow_clean_missing_cache=allow_clean_missing_cache,
                     )
                 if block is None and str(set_id) == live_primary_fallback_set_id:
                     block = self._copy_all_live_primary_block(
@@ -5011,12 +5029,7 @@ class MainWindow(
                     signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        if batch_cache is not None:
-            active_set_id = str(self.active_batch_selection()[0] or "").strip()
-            selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
-            if active_set_id or selected_ids:
-                self.sync_main_plot_copy_labels(active_set_id, selected_ids)
+        self._sync_main_plot_copy_labels_for_cached_batch_selection()
 
     def _batch_delete_target_rows(self) -> List[int]:
         rows = self._batch_selected_rows()
@@ -5538,6 +5551,22 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
+
+    def _on_batch_model_data_changed(
+        self,
+        top_left: QtCore.QModelIndex,
+        bottom_right: QtCore.QModelIndex,
+        roles: Sequence[int] | None = None,
+    ) -> None:
+        if not top_left.isValid() or not bottom_right.isValid():
+            return
+        if int(top_left.column()) != 0 or int(bottom_right.column()) != 0:
+            return
+        display_role = int(getattr(QtCore.Qt.DisplayRole, "value", QtCore.Qt.DisplayRole))
+        normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}
+        if normalized_roles and display_role not in normalized_roles:
+            return
+        self._sync_main_plot_copy_labels_for_cached_batch_selection()
 
     def _on_batch_current_changed(self, *_args) -> None:
         focused_set_id = self._update_focused_batch_set_id()

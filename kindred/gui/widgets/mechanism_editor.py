@@ -60,6 +60,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().__init__(parent)
 
         self._current_validation_state = "idle"
+        self._run_gated = False
         self._reactions_edit_action: Optional[QtGui.QAction] = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -484,7 +485,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             Status message to display
         """
         self._current_validation_state = state
-        self._run_btn.setEnabled(state == "valid")
+        self._run_btn.setEnabled(state == "valid" and not self._run_gated)
         self._run_btn.setToolTip(
             "Run simulation for all selected batch sets (same as Run Selected in Batch Initial Conditions)"
             if state == "valid"
@@ -533,6 +534,13 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     @property
     def run_btn(self) -> QtWidgets.QPushButton:
         return self._run_btn
+
+    def set_run_gated(self, gated: bool) -> None:
+        self._run_gated = bool(gated)
+        if self._run_gated:
+            self._run_btn.setEnabled(False)
+        elif self._current_validation_state == "valid":
+            self._run_btn.setEnabled(True)
 
     def is_mechanism_valid(self) -> bool:
         return self._current_validation_state == "valid"
