@@ -324,11 +324,17 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         )
         self.horizontalHeader().setStretchLastSection(False)
         self.setAlternatingRowColors(True)
+        self._auto_fit_timer = QtCore.QTimer(self)
+        self._auto_fit_timer.setSingleShot(True)
+        self._auto_fit_timer.setInterval(50)
+        self._auto_fit_timer.timeout.connect(self._auto_fit_columns)
 
     def setModel(self, model: Optional[QtCore.QAbstractItemModel]) -> None:  # noqa: N802
         super().setModel(model)
         if isinstance(model, BatchInitialConditionsTableModel):
             model.modelReset.connect(self._apply_column_presentation)
+            model.rowsInserted.connect(self._schedule_auto_fit)
+            model.dataChanged.connect(self._on_data_changed)
         self._apply_column_presentation()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
@@ -383,14 +389,27 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
                 header.moveSection(current_visual, visual_index)
         header.setSectionsMovable(bool(movable_before))
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
-        self.setColumnWidth(0, 150)
         for column in range(1, model.edit_target_column()):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            self.setColumnWidth(column, 120)
         self._auto_fit_columns()
         for column in (model.edit_target_column(), model.show_column()):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.setColumnWidth(column, 72 if column == model.edit_target_column() else 56)
+
+    def _on_data_changed(
+        self,
+        top_left: QtCore.QModelIndex,
+        bottom_right: QtCore.QModelIndex,
+        roles: list[int] | None = None,
+    ) -> None:
+        model = self.model()
+        if not isinstance(model, BatchInitialConditionsTableModel):
+            return
+        if top_left.column() < model.edit_target_column():
+            self._schedule_auto_fit()
+
+    def _schedule_auto_fit(self) -> None:
+        self._auto_fit_timer.start()
 
     def _auto_fit_columns(self) -> None:
         model = self.model()
@@ -399,7 +418,10 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         if model.rowCount() == 0:
             return
         for column in range(0, model.edit_target_column()):
+            min_width = 150 if column == 0 else 120
             self.resizeColumnToContents(column)
+            if self.columnWidth(column) < min_width:
+                self.setColumnWidth(column, min_width)
 
     def _control_index_at_event(self, event: QtGui.QMouseEvent) -> QtCore.QModelIndex | None:
         if event.button() != QtCore.Qt.LeftButton:
