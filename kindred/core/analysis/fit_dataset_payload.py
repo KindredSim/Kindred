@@ -286,7 +286,12 @@ def normalize_dataset_target_weights(
 ) -> Dict[str, float]:
     ds_id = str(dataset_id or "").strip() or "<dataset>"
     selection = [str(name) for name in (selected_targets or []) if str(name).strip()]
-    raw_weights = dict(target_weights or {}) if isinstance(target_weights, Mapping) else {}
+    if target_weights is not None and not isinstance(target_weights, Mapping):
+        raise ValueError(
+            f"Dataset '{ds_id}' target_weights must be a mapping or None, "
+            f"got {type(target_weights)!r}."
+        )
+    raw_weights = dict(target_weights or {})
     normalized: Dict[str, float] = {}
     for name in selection:
         raw_value = raw_weights.get(name, 1.0)

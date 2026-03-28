@@ -366,7 +366,7 @@ class MainWindow(
         if bool(locked):
             return (
                 "State network is read-only while Reactions editing is locked. "
-                "Use Unlock Reactions Editing to make deliberate changes."
+                "Use Allow Editing to make deliberate changes."
             )
         return "Edit the state network with full validation. Changes apply directly to the current mechanism."
 
@@ -471,13 +471,13 @@ class MainWindow(
 
     def _report_locked_reactions_undo_redo_block(self, *, redo: bool) -> None:
         action_text = "redo" if redo else "undo"
-        self._status_label.setText(f"Unlock Reactions Editing to {action_text} mechanism changes")
+        self._status_label.setText(f"Allow Editing to {action_text} mechanism changes")
         logger.debug("Blocked %s while reactions editing is locked", action_text)
 
     def _prompt_mechanism_edit_unlock_warning(self) -> bool:
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("Unlock Reactions Editing")
+        box.setWindowTitle("Allow Editing")
         box.setText("Edits in the Reactions editor change the canonical mechanism text.")
         box.setInformativeText(
             "Use unlocking only for deliberate edits. Save/load and migration rewrites can still update the editor while it remains locked."
@@ -1087,7 +1087,7 @@ class MainWindow(
             [
                 ("&Undo", self._undo, QtGui.QKeySequence.Undo, "undoAction", "Undo last edit in mechanism editor"),
                 ("&Redo", self._redo, QtGui.QKeySequence.Redo, "redoAction", "Redo previously undone edit"),
-                ("Unlock Reactions Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
+                ("Allow Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
                 None,
                 ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
                 ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),

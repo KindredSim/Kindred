@@ -3379,6 +3379,11 @@ class SimulationController(QtCore.QObject):
                     overlays=[],
                     owned_species=owned_species,
                 )
+                if hasattr(self.ui.results, "sync_main_plot_copy_labels"):
+                    self.ui.results.sync_main_plot_copy_labels(
+                        str(batch_set_id or ""),
+                        [str(batch_set_id)] if str(batch_set_id or "").strip() else [],
+                    )
                 plot = self.ui.results.main_plot()
                 if hasattr(plot, "set_scalar_values"):
                     plot.set_scalar_values(algebra_scalars)

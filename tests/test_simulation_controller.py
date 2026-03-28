@@ -251,6 +251,9 @@ class _FakeMainWindow(QtCore.QObject):
     def set_results_table(self, table: object) -> None:
         self._results_table = table
 
+    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids) -> None:
+        pass
+
     def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None:
         self._set_temperature_override_state(enabled=bool(enabled), tooltip=str(tooltip))
 

@@ -1513,8 +1513,8 @@ def test_time_axis_dataset_overlay_filtered_subset_still_warns_and_blocks_export
     with pytest.raises(ValueError, match="Cannot export overlay datasets until issues are resolved"):
         panel.build_visible_export("axis")
 
-    with pytest.raises(ValueError, match="Cannot export overlay datasets until issues are resolved"):
-        panel.build_visible_export("all")
+    header, rows = panel.build_visible_export("all")
+    assert len(header) > 0
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")

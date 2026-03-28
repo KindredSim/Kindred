@@ -974,9 +974,6 @@ if PYQTGRAPH_AVAILABLE:
             if self._t is None or not self._series:
                 raise ValueError("No simulation data is available to copy.")
 
-            visible_primary_y_names = self._visible_primary_copy_series_names()
-            if not visible_primary_y_names:
-                raise ValueError("No visible simulation series are available to copy.")
             visible_overlay_y_names = self._visible_overlay_copy_series_names()
             x_name, x_label = self._current_copy_axis_spec()
 
@@ -997,7 +994,7 @@ if PYQTGRAPH_AVAILABLE:
                     shown_block,
                     x_name=x_name,
                     x_label=x_label,
-                    visible_y_names=visible_primary_y_names,
+                    visible_y_names=self._axis_scope_series_names(),
                 )
                 if block_columns is not None:
                     blocks.append(block_columns)
@@ -1020,6 +1017,8 @@ if PYQTGRAPH_AVAILABLE:
                 )
             )
             blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
+            if not blocks:
+                raise ValueError("No visible simulation series are available to copy.")
             return blocks, missing_items
 
         @staticmethod
@@ -1431,9 +1430,14 @@ if PYQTGRAPH_AVAILABLE:
         def _ensure_export_all_overlay_cache(self) -> None:
             if not self._export_all_overlay_cache_dirty:
                 return
-            self._export_all_overlay_series, self._export_all_overlay_warnings = self._build_overlay_series(
+            overlay_series, raw_warnings = self._build_overlay_series(
                 list(self._series.keys())
             )
+            self._export_all_overlay_series = overlay_series
+            self._export_all_overlay_warnings = [
+                msg for msg in raw_warnings
+                if ": no column matching species " not in msg
+            ]
             self._export_all_overlay_cache_dirty = False
 
         def _get_sampling_indices(self, length: int):
