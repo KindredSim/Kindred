@@ -310,7 +310,6 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_surface = QtWidgets.QFrame(self)
             self._plot_surface.setObjectName("mainPlotSurface")
             self._plot_surface.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-            self._plot_surface.setMinimumHeight(200)
             plot_surface_layout = QtWidgets.QVBoxLayout(self._plot_surface)
             plot_surface_layout.setContentsMargins(8, 0, 8, 0)
             plot_surface_layout.setSpacing(0)

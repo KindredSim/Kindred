@@ -59,6 +59,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         """
         super().__init__(parent)
 
+        self._current_validation_state = "idle"
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -72,20 +74,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Text editor for DSL
         reactions_header_row = QtWidgets.QHBoxLayout()
-        reactions_header_row.addWidget(QtWidgets.QLabel("Reaction DSL:"))
-        self._dsl_directives_btn = QtWidgets.QToolButton()
-        self._dsl_directives_btn.setText("DSL directives")
-        self._dsl_directives_btn.setCheckable(True)
-        self._dsl_directives_btn.setChecked(False)
-        self._dsl_directives_btn.setToolTip(
-            "Show global DSL directives & advanced features (algebra, observables, computational mode)"
-        )
-        reactions_header_row.addWidget(self._dsl_directives_btn)
-        self._reactions_edit_btn = QtWidgets.QToolButton()
+        self._reactions_edit_btn = QtWidgets.QPushButton()
         self._reactions_edit_btn.setObjectName("reactionsEditGuardButton")
+        self._reactions_edit_btn.setCheckable(True)
+        self._reactions_edit_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
         self._reactions_edit_btn.hide()
         reactions_header_row.addWidget(self._reactions_edit_btn)
         reactions_header_row.addStretch()
+        self._run_btn = QtWidgets.QPushButton("\u25b6 Run")
+        run_font = self._run_btn.font()
+        run_font.setPointSize(run_font.pointSize() + 2)
+        self._run_btn.setFont(run_font)
+        self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
+        self._run_btn.setEnabled(False)
+        reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 
         self._reactions_edit_status_label = QtWidgets.QLabel("")
@@ -95,30 +97,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_edit_status_label.setFont(status_font)
         reactions_layout.addWidget(self._reactions_edit_status_label)
 
-        self._dsl_directives_help = QtWidgets.QLabel(
-            '<pre style="white-space: pre-wrap;">Global DSL Directives &amp; Advanced Features:\n'
-            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol, J/mol)\n"
-            "T=300          (Global isothermal temperature in K)\n"
-            "[A]=1.0        (Hardcode initial conditions directly)\n"
-            "\n"
-            "Algebra &amp; Observables (# algebra):\n"
-            "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
-            "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
-            "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
-            "*Note: Bracketed species [A] can ONLY be used in 'let', never in 'param'.*\n"
-            "\n"
-            "Computational Mode (# === Computational Mode ===):\n"
-            "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
-            "Note: The 'hartree' energy unit is only supported within Computational Mode blocks.\n"
-            "\n"
-            "Note: Kindred normalizes all energies internally to J/mol.</pre>"
-        )
-        self._dsl_directives_help.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self._dsl_directives_help.setWordWrap(True)
-        self._dsl_directives_help.setStyleSheet("padding: 4px 0;")
-        self._dsl_directives_help.setVisible(False)
-        reactions_layout.addWidget(self._dsl_directives_help)
-        self._dsl_directives_btn.toggled.connect(self._dsl_directives_help.setVisible)
         self._reactions_text = QtWidgets.QPlainTextEdit()
         self._reactions_text.setPlaceholderText(
             "Example:\n"
@@ -262,6 +240,55 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_text.textChanged.connect(self._on_text_changed)
 
         self._tabs.addTab(self._reactions_tab, "Reactions")
+
+        # Help tab — example + directive/algebra/computational-mode reference
+        self._help_tab = QtWidgets.QWidget()
+        help_layout = QtWidgets.QVBoxLayout(self._help_tab)
+        help_layout.setContentsMargins(0, 0, 0, 0)
+        help_scroll = make_scroll_area(self._help_tab)
+        help_label = QtWidgets.QLabel(
+            '<pre style="white-space: pre-wrap;"><b>Global DSL Directives &amp; Advanced Features</b>\n'
+            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol, J/mol)\n"
+            "T=300          (Global isothermal temperature in K)\n"
+            "[A]=1.0        (Hardcode initial conditions directly)\n"
+            "\n"
+            "<b>Algebra &amp; Observables (# algebra)</b>\n"
+            "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
+            "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
+            "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
+            "*Note: Bracketed species [A] can ONLY be used in 'let', never in 'param'.*\n"
+            "\n"
+            "<b>Computational Mode (# === Computational Mode ===)</b>\n"
+            "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
+            "Note: The 'hartree' energy unit is only supported within Computational Mode blocks.\n"
+            "\n"
+            "Note: Kindred normalizes all energies internally to J/mol.\n"
+            "\n"
+            "<b>Example</b>\n"
+            "reaction: 2A + B =&gt; C ; kf=1e5\n"
+            "equilibrium: C &lt;=&gt; D ; K=2.5\n"
+            "reaction: C + E -&gt; F ; kf=k_derived\n"
+            "reaction: A -&gt; A_Side ; kf=0.01\n"
+            "\n"
+            "# algebra\n"
+            "param scale = 2.0\n"
+            "param k_base = 1.5e3\n"
+            "param k_derived = k_base * scale\n"
+            "\n"
+            "let total_A = [A] + [A_Side]\n"
+            "let conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
+            "\n"
+            "# === Computational Mode ===\n"
+            "comp: species C G=-450.12</pre>"
+        )
+        help_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        help_label.setWordWrap(True)
+        help_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+        help_label.setStyleSheet("padding: 8px;")
+        help_scroll.setWidget(help_label)
+        help_scroll.setWidgetResizable(True)
+        help_layout.addWidget(help_scroll)
+        self._tabs.addTab(self._help_tab, "Help")
 
         # Notes tab - persisted free-form text (never parsed/injected into DSL)
         self._notes_tab = QtWidgets.QWidget()
@@ -448,12 +475,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         message : str
             Status message to display
         """
+        self._current_validation_state = state
+        self._run_btn.setEnabled(state == "valid")
+
         if state == "idle":
             self._validation_label.setText("")
             self._validation_label.setStyleSheet("QLabel { padding: 4px; }")
 
         elif state == "validating":
-            self._validation_label.setText("⏳ Validating...")
+            self._validation_label.setText("\u23f3 Validating...")
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
@@ -487,12 +517,38 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         idx = self._slider_solver_combo.findText(s)
         self._slider_solver_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
+    @property
+    def run_btn(self) -> QtWidgets.QPushButton:
+        return self._run_btn
+
+    def is_mechanism_valid(self) -> bool:
+        return self._current_validation_state == "valid"
+
     def set_reactions_edit_action(self, action: Optional[QtGui.QAction]) -> None:
         if action is None:
             self._reactions_edit_btn.hide()
             return
-        self._reactions_edit_btn.setDefaultAction(action)
-        self._reactions_edit_btn.show()
+        btn = self._reactions_edit_btn
+        btn.setText(action.text())
+        btn.setToolTip(action.toolTip())
+        btn.setChecked(action.isChecked())
+        try:
+            btn.toggled.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        btn.toggled.connect(action.trigger)
+
+        def _sync_from_action():
+            prev = btn.blockSignals(True)
+            try:
+                btn.setText(action.text())
+                btn.setToolTip(action.toolTip())
+                btn.setChecked(action.isChecked())
+            finally:
+                btn.blockSignals(prev)
+
+        action.changed.connect(_sync_from_action)
+        btn.show()
 
     def set_reactions_edit_status_text(self, text: str) -> None:
         text_s = str(text)

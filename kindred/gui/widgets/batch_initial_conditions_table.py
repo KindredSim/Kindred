@@ -409,11 +409,12 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             return
         if model.rowCount() == 0:
             return
+        fm = self.horizontalHeader().fontMetrics()
+        set_name_min = fm.horizontalAdvance(" Set Name ") + 20
         for column in range(0, model.edit_target_column()):
-            min_width = 150 if column == 0 else 120
             self.resizeColumnToContents(column)
-            if self.columnWidth(column) < min_width:
-                self.setColumnWidth(column, min_width)
+            if column == 0 and self.columnWidth(column) < set_name_min:
+                self.setColumnWidth(column, set_name_min)
 
     def _control_index_at_event(self, event: QtGui.QMouseEvent) -> QtCore.QModelIndex | None:
         if event.button() != QtCore.Qt.LeftButton:

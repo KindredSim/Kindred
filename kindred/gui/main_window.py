@@ -330,6 +330,7 @@ class MainWindow(
             self._disable_slider_override_mode_buttons()
 
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
+        self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
         self._refresh_slider_transaction_button_state()
 
     def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
@@ -371,14 +372,14 @@ class MainWindow(
 
     def _refresh_mechanism_edit_lock_ui(self) -> None:
         locked = self.mechanism_editing_locked()
-        button_text = "Unlock Reactions Editing" if locked else "Lock Reactions Editing"
+        button_text = "Allow Editing"
         tooltip = (
             "Temporarily enable deliberate edits in the Reactions editor."
             if locked
             else "Return the Reactions editor to read-only mode."
         )
         status_text = (
-            "Reactions editor is read-only. Use Unlock Reactions Editing before making deliberate changes."
+            "Reactions editor is read-only. Use Allow Editing to make changes."
             if locked
             else "Reactions editor is unlocked. Changes here modify the canonical mechanism text saved with the project."
         )

@@ -1944,16 +1944,18 @@ def test_batch_table_auto_fit_on_model_reset_and_minimum_widths(main_window):
     model.set_species(["A", "B"])
     QtWidgets.QApplication.processEvents()
 
-    # Columns should not shrink below 150 (col 0) / 120 (species)
-    assert table.columnWidth(0) >= 150, "Set Name column below minimum width"
-    assert table.columnWidth(1) >= 120, "Species column 1 below minimum width"
-    assert table.columnWidth(2) >= 120, "Species column 2 below minimum width"
+    # Column 0 minimum is font-metrics-based; species columns have no floor
+    fm = table.horizontalHeader().fontMetrics()
+    set_name_min = fm.horizontalAdvance(" Set Name ") + 20
+    assert table.columnWidth(0) >= set_name_min, "Set Name column below minimum width"
+    assert table.columnWidth(1) > 0, "Species column 1 should have positive width"
+    assert table.columnWidth(2) > 0, "Species column 2 should have positive width"
 
     # A second modelReset (species change) should re-apply auto-fit
     model.set_species(["A", "B", "LongerSpeciesName"])
     QtWidgets.QApplication.processEvents()
 
-    assert table.columnWidth(0) >= 150, "Set Name column below minimum after reset"
-    assert table.columnWidth(1) >= 120, "Species column 1 below minimum after reset"
-    assert table.columnWidth(2) >= 120, "Species column 2 below minimum after reset"
-    assert table.columnWidth(3) >= 120, "Species column 3 below minimum after reset"
+    assert table.columnWidth(0) >= set_name_min, "Set Name column below minimum after reset"
+    assert table.columnWidth(1) > 0, "Species column 1 should have positive width after reset"
+    assert table.columnWidth(2) > 0, "Species column 2 should have positive width after reset"
+    assert table.columnWidth(3) > 0, "Species column 3 should have positive width after reset"
