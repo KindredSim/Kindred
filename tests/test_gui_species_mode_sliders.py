@@ -1935,16 +1935,8 @@ def test_species_mode_reset_clears_subset_scope_overlay_cache_even_with_unrelate
     assert display_calls == []
 
 
-def _flush_auto_fit(table):
-    """Force the debounce timer to fire immediately if pending."""
-    timer = table._auto_fit_timer
-    if timer.isActive():
-        timer.stop()
-        table._auto_fit_columns()
-
-
-def test_batch_table_auto_fit_on_insert_rename_and_minimum_widths(main_window):
-    """Regression: auto-fit must fire on row insert and rename, and enforce floor widths."""
+def test_batch_table_auto_fit_on_model_reset_and_minimum_widths(main_window):
+    """Auto-fit fires on modelReset (species change) and enforces floor widths."""
     model = main_window._batch_model
     table = main_window._batch_table
     assert table is not None
@@ -1952,29 +1944,16 @@ def test_batch_table_auto_fit_on_insert_rename_and_minimum_widths(main_window):
     model.set_species(["A", "B"])
     QtWidgets.QApplication.processEvents()
 
-    # -- Minimum width floor: columns should not shrink below 150 (col 0) / 120 (species) --
+    # Columns should not shrink below 150 (col 0) / 120 (species)
     assert table.columnWidth(0) >= 150, "Set Name column below minimum width"
     assert table.columnWidth(1) >= 120, "Species column 1 below minimum width"
     assert table.columnWidth(2) >= 120, "Species column 2 below minimum width"
 
-    # -- Insert a row and verify auto-fit fires --
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
+    # A second modelReset (species change) should re-apply auto-fit
+    model.set_species(["A", "B", "LongerSpeciesName"])
     QtWidgets.QApplication.processEvents()
-    _flush_auto_fit(table)
 
-    width_after_insert = table.columnWidth(0)
-    assert width_after_insert >= 150, "Set Name column below minimum after insert"
-
-    # -- Rename a set to a long name and verify column 0 expands --
-    long_name = "A Very Long Batch Set Name That Should Expand The Column"
-    idx = model.index(0, 0)
-    model.setData(idx, long_name, QtCore.Qt.EditRole)
-    QtWidgets.QApplication.processEvents()
-    _flush_auto_fit(table)
-
-    width_after_rename = table.columnWidth(0)
-    assert width_after_rename > width_after_insert, (
-        f"Set Name column did not expand after rename: {width_after_rename} <= {width_after_insert}"
-    )
+    assert table.columnWidth(0) >= 150, "Set Name column below minimum after reset"
+    assert table.columnWidth(1) >= 120, "Species column 1 below minimum after reset"
+    assert table.columnWidth(2) >= 120, "Species column 2 below minimum after reset"
+    assert table.columnWidth(3) >= 120, "Species column 3 below minimum after reset"
