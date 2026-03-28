@@ -367,6 +367,7 @@ class VariableSliders(QtWidgets.QWidget):
 
         # Slider
         slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setMinimumHeight(28)
         slider.setMinimum(0)
         slider.setMaximum(1000)  # 1000 steps for smooth control
         slider.setSingleStep(5)
@@ -440,6 +441,13 @@ class VariableSliders(QtWidgets.QWidget):
             min_label.setMinimumHeight(min_label.fontMetrics().height() + 4)
             max_label.setMinimumHeight(max_label.fontMetrics().height() + 4)
         range_layout.addWidget(min_label)
+        if scale != "linear":
+            for mid_text in ["10<sup>-6</sup>", "1", "10<sup>6</sup>"]:
+                range_layout.addStretch()
+                mid_label = QtWidgets.QLabel(mid_text)
+                mid_label.setTextFormat(QtCore.Qt.RichText)
+                mid_label.setMinimumHeight(mid_label.fontMetrics().height() + 4)
+                range_layout.addWidget(mid_label)
         range_layout.addStretch()
         range_layout.addWidget(max_label)
         layout.addLayout(range_layout)
