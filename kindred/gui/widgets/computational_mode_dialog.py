@@ -119,7 +119,7 @@ class ComputationalModeDialog(QtWidgets.QDialog):
         self._pressure_value = QtWidgets.QDoubleSpinBox()
         self._pressure_value.setRange(1e-12, 1e12)
         self._pressure_value.setDecimals(3)
-        self._pressure_value.setMaximumWidth(max_input_width)
+        self._pressure_value.setMaximumWidth(210)
         self._pressure_unit = QtWidgets.QComboBox()
         self._pressure_unit.addItems(["atm", "bar", "Pa"])
         self._pressure_unit.setCurrentText("atm")
@@ -144,7 +144,7 @@ class ComputationalModeDialog(QtWidgets.QDialog):
         self._std_default_spin = QtWidgets.QDoubleSpinBox()
         self._std_default_spin.setRange(1e-12, 1e12)
         self._std_default_spin.setDecimals(3)
-        self._std_default_spin.setMaximumWidth(max_input_width)
+        self._std_default_spin.setMaximumWidth(210)
 
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Energy unit (input):"))
