@@ -192,9 +192,16 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.TextAlignmentRole and self.is_control_column(col):
             return int(QtCore.Qt.AlignCenter)
 
-        if role == QtCore.Qt.ToolTipRole and col == self.edit_target_column():
-            if self._is_temporarily_focus_target_row(row):
-                return "Focused row is temporarily included in slider edit scope."
+        if role == QtCore.Qt.ToolTipRole:
+            if col == 0:
+                names = self._store.set_names()
+                return names[row] if 0 <= row < len(names) else None
+            if 1 <= col < self.edit_target_column():
+                return self.data(index, QtCore.Qt.DisplayRole)
+            if col == self.edit_target_column():
+                if self._is_temporarily_focus_target_row(row):
+                    return "Focused row is temporarily included in slider edit scope."
+                return None
             return None
 
         if role == QtCore.Qt.ForegroundRole and col == self.edit_target_column():
@@ -326,6 +333,12 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         self.setAlternatingRowColors(True)
 
     def setModel(self, model: Optional[QtCore.QAbstractItemModel]) -> None:  # noqa: N802
+        old_model = self.model()
+        if isinstance(old_model, BatchInitialConditionsTableModel):
+            try:
+                old_model.modelReset.disconnect(self._apply_column_presentation)
+            except (TypeError, RuntimeError):
+                pass
         super().setModel(model)
         if isinstance(model, BatchInitialConditionsTableModel):
             model.modelReset.connect(self._apply_column_presentation)
