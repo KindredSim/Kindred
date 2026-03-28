@@ -77,7 +77,7 @@ _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
 _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
-_ANALYSIS_SURFACE_NAMES: tuple[str, ...] = ("Statistics", "Parameters", "Overlays")
+_ANALYSIS_SURFACE_NAMES: tuple[str, ...] = ("Statistics", "Parameters")
 _ABOUT_DIALOG_MIN_WIDTH = 420
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
 
@@ -711,6 +711,9 @@ class MainWindow(
         )
         self._right_dock = right_dock_components.dock
         self._right_panel = right_dock_components.panel
+        _overlay_accessor = getattr(self._plot_tabs._main_plot, "overlay_panel", None)
+        if callable(_overlay_accessor):
+            self._right_panel.add_tab(_overlay_accessor(), "Overlays")
         self._right_dock.setWidget(right_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._right_dock), self._right_dock)
 
@@ -898,7 +901,8 @@ class MainWindow(
         if callable(refresh_overlay_presentation):
             refresh_overlay_presentation()
             return
-        overlay_panel = getattr(plot, "_overlay_panel", None)
+        _accessor = getattr(plot, "overlay_panel", None)
+        overlay_panel = _accessor() if callable(_accessor) else None
         refresh_swatches = getattr(overlay_panel, "refresh_color_swatches", None)
         if callable(refresh_swatches):
             refresh_swatches()

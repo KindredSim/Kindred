@@ -72,7 +72,6 @@ def test_main_plot_workspace_prefers_horizontal_controls_and_tabbed_secondary_su
         assert [details_tabs.tabText(i) for i in range(details_tabs.count())] == [
             "Statistics",
             "Parameters",
-            "Overlays",
         ]
 
         splitter = plot._main_splitter

@@ -45,6 +45,10 @@ class RightPanelTabbed(QtWidgets.QWidget):
         self._data_manager.setObjectName("dataPanel")
         self._tabs.addTab(self._data_manager, "Data")
 
+    def add_tab(self, widget: QtWidgets.QWidget, label: str) -> int:
+        """Add an external widget as a new tab. Returns the tab index."""
+        return self._tabs.addTab(widget, label)
+
     def get_dataset(self, name: str):
         """Resolve a dataset through the public data-manager boundary."""
         return self._data_manager.get_dataset(str(name))

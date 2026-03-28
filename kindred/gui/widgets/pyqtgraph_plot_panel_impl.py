@@ -373,7 +373,6 @@ if PYQTGRAPH_AVAILABLE:
 
             self._details_tabs.addTab(stats_container, "Statistics")
             self._details_tabs.addTab(self._param_table, "Parameters")
-            self._details_tabs.addTab(self._overlay_panel, "Overlays")
             self._details_tabs.setCurrentWidget(stats_container)
 
             self._main_splitter.addWidget(self._details_dock)
@@ -626,6 +625,10 @@ if PYQTGRAPH_AVAILABLE:
         def parameter_table(self) -> ParameterStatisticsTable:
             """Return the solver-parameter table widget."""
             return self._param_table
+
+        def overlay_panel(self) -> DatasetOverlayPanel:
+            """Return the dataset overlay panel widget."""
+            return self._overlay_panel
 
         def set_scalar_values(self, scalars: Dict[str, float]) -> None:
             """Store algebra scalar outputs for guide selection."""
