@@ -2631,3 +2631,45 @@ def test_copy_all_export_plan_is_side_effect_free_and_disambiguates_duplicate_mi
             np.asarray(getattr(main_window.main_plot(), "_series", {})[name], dtype=float),
             values,
         )
+
+
+@pytest.mark.gui
+def test_copy_all_export_plan_includes_live_primary_when_no_rows_are_shown(main_window, monkeypatch, qt_app):
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {
+        "A": np.asarray([5.0, 6.0], dtype=float),
+        "B": np.asarray([0.5, 0.6], dtype=float),
+    }
+
+    main_window._batch_model.set_species(["A", "B"])
+    cache = main_window.simulation_controller.batch_cache
+    primary_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert primary_id
+    cache.active_batch_set_id = primary_id
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
+    cache.last_display_selection = [primary_id]
+    monkeypatch.setattr(main_window, "shown_batch_set_ids", lambda: [], raising=False)
+
+    main_window.results_controller.set_data(
+        t0,
+        series0,
+        label=str(main_window.batch_set_name_for_id(primary_id) or primary_id),
+        overlays=[],
+    )
+    qt_app.processEvents()
+
+    assert main_window.shown_batch_set_ids() == []
+    assert main_window.main_plot_has_data() is True
+    assert main_window.active_batch_selection() == (
+        primary_id,
+        str(main_window.batch_set_name_for_id(primary_id) or primary_id),
+    )
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
+        (primary_id, str(main_window.batch_set_name_for_id(primary_id) or primary_id))
+    ]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, t0)
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], series0["A"])

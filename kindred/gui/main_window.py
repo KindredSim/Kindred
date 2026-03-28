@@ -4678,6 +4678,41 @@ class MainWindow(
             return None, "invalid_cache_entry" if entry_result.state == "invalid" else "no_cached_results"
         return self._copy_all_shown_block_from_entry(set_id=str(set_id), label=label, entry=entry_result.entry), None
 
+    def _copy_all_live_primary_block(
+        self,
+        *,
+        set_id: str,
+        label: str,
+    ):
+        sid = str(set_id or "").strip()
+        if not sid or not self.main_plot_has_data():
+            return None
+        active_set_id = str(self.active_batch_selection()[0] or "").strip()
+        if active_set_id != sid:
+            return None
+        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+        if plot is None:
+            return None
+        plot_t = np.asarray(
+            getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [],
+            dtype=float,
+        ).reshape(-1)
+        plot_series_raw = getattr(plot, "_series", {}) or {}
+        if plot_t.size <= 0 or not isinstance(plot_series_raw, Mapping):
+            return None
+        plot_series = {
+            str(name): np.asarray(values, dtype=float).reshape(-1)
+            for name, values in dict(plot_series_raw).items()
+            if np.asarray(values, dtype=float).reshape(-1).size > 0
+        }
+        if not plot_series:
+            return None
+        return self._copy_all_shown_block_from_entry(
+            set_id=sid,
+            label=label,
+            entry={"t": plot_t, "series": plot_series},
+        )
+
     def _copy_all_live_plot_shown_block(
         self,
         *,
@@ -4698,23 +4733,9 @@ class MainWindow(
         active_set_id = str(batch_cache.active_batch_set_id or "").strip() if batch_cache is not None else ""
 
         if active_set_id == sid:
-            plot_t = np.asarray(
-                getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [],
-                dtype=float,
-            ).reshape(-1)
-            plot_series_raw = getattr(plot, "_series", {}) or {}
-            if plot_t.size > 0 and isinstance(plot_series_raw, Mapping):
-                plot_series = {
-                    str(name): np.asarray(values, dtype=float).reshape(-1)
-                    for name, values in dict(plot_series_raw).items()
-                    if np.asarray(values, dtype=float).reshape(-1).size > 0
-                }
-                if plot_series:
-                    return self._copy_all_shown_block_from_entry(
-                        set_id=sid,
-                        label=label,
-                        entry={"t": plot_t, "series": plot_series},
-                    )
+            block = self._copy_all_live_primary_block(set_id=sid, label=label)
+            if block is not None:
+                return block
 
         for entry in list(getattr(plot, "_simulation_overlays", []) or []):
             if not isinstance(entry, Mapping):
@@ -4758,6 +4779,12 @@ class MainWindow(
         from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllExportPlan, CopyAllMissingItem
 
         shown_set_ids = [str(set_id) for set_id in (self.shown_batch_set_ids() or []) if str(set_id)]
+        live_primary_fallback_set_id = ""
+        if not shown_set_ids:
+            active_set_id = str(self.active_batch_selection()[0] or "").strip()
+            if active_set_id and self.main_plot_has_data():
+                shown_set_ids = [active_set_id]
+                live_primary_fallback_set_id = active_set_id
         popup_labels = self._copy_all_popup_labels_by_set_id(shown_set_ids)
         batch_cache = self._sim_controller.batch_cache
         cache_key = str(batch_cache.active_cache_key or "")
@@ -4786,6 +4813,11 @@ class MainWindow(
                         set_id=str(set_id),
                         label=export_label,
                         invalidated_set_ids=invalidated_set_ids or None,
+                    )
+                if block is None and str(set_id) == live_primary_fallback_set_id:
+                    block = self._copy_all_live_primary_block(
+                        set_id=str(set_id),
+                        label=export_label,
                     )
             if block is not None:
                 shown_blocks.append(block)
@@ -4949,6 +4981,12 @@ class MainWindow(
                     signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
+        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
+        if batch_cache is not None:
+            self.sync_main_plot_copy_labels(
+                str(self.active_batch_selection()[0] or ""),
+                [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)],
+            )
 
     def _batch_delete_target_rows(self) -> List[int]:
         rows = self._batch_selected_rows()
