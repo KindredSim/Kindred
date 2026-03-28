@@ -60,6 +60,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().__init__(parent)
 
         self._current_validation_state = "idle"
+        self._reactions_edit_action: Optional[QtGui.QAction] = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -532,10 +533,16 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         btn.setText(action.text())
         btn.setToolTip(action.toolTip())
         btn.setChecked(action.isChecked())
-        try:
-            btn.toggled.disconnect()
-        except (RuntimeError, TypeError):
-            pass
+        if self._reactions_edit_action is not None:
+            try:
+                btn.toggled.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                self._reactions_edit_action.changed.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        self._reactions_edit_action = action
         btn.toggled.connect(action.trigger)
 
         def _sync_from_action():

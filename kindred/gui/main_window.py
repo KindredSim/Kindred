@@ -396,18 +396,14 @@ class MainWindow(
             if callable(set_status_text):
                 set_status_text(status_text)
             action = getattr(self, "_mechanism_edit_lock_action", None)
+            if action is not None:
+                action.setText(button_text)
+                action.setToolTip(tooltip)
             bind_action = getattr(editor, "set_reactions_edit_action", None)
             if action is not None and callable(bind_action):
                 bind_action(action)
-        action = getattr(self, "_mechanism_edit_lock_action", None)
-        if action is not None:
-            previous = action.blockSignals(True)
-            try:
-                action.setText(button_text)
-                action.setToolTip(tooltip)
+            if action is not None:
                 action.setChecked(not locked)
-            finally:
-                action.blockSignals(previous)
         dialog = getattr(self, "_state_network_dialog", None)
         if dialog is not None:
             try:
@@ -3499,6 +3495,12 @@ class MainWindow(
 
     def set_run_button_enabled(self, enabled: bool) -> None:
         self._run_btn.setEnabled(bool(enabled))
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is not None:
+            if enabled:
+                editor.run_btn.setEnabled(editor.is_mechanism_valid())
+            else:
+                editor.run_btn.setEnabled(False)
 
     def set_stop_button_enabled(self, enabled: bool) -> None:
         self._stop_btn.setEnabled(bool(enabled))
