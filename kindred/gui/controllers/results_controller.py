@@ -46,6 +46,7 @@ class ResultsControllerPort:
     main_plot_stats_table: Callable[[], object]
     set_results_table: Callable[[object], None]
     set_main_plot_data: Callable[..., None]
+    sync_main_plot_copy_labels: Callable[[str, Sequence[str]], None]
     show_simulation_tab: Callable[[], None]
     refresh_simulation_plot_views: Callable[[], None]
     schedule_main_plot_refresh: Callable[[Sequence[int]], None]
@@ -255,7 +256,7 @@ class ResultsController(QtCore.QObject):
             if other is None:
                 continue
             overlay_label = self._ui.batch_name_for_id(sid) or str(sid)
-            overlays.append(dict(build_overlay_entry(label=overlay_label, entry=other)))
+            overlays.append(dict(build_overlay_entry(label=overlay_label, entry=other, set_id=sid)))
         return overlays
 
     def _apply_cached_batch_plot_metadata(
@@ -571,6 +572,7 @@ class ResultsController(QtCore.QObject):
             primary_label=str(primary_label),
             available=availability.available_ids,
         )
+        self._ui.sync_main_plot_copy_labels(str(primary), list(availability.available_ids))
         return CachedBatchSelectionDisplayOutcome(True)
 
     def display_resolved_batch_selection_outcome(
@@ -640,6 +642,10 @@ class ResultsController(QtCore.QObject):
             primary=str(primary.set_id),
             primary_label=str(primary.label),
             available=[str(resolved.set_id) for resolved in resolved_entries],
+        )
+        self._ui.sync_main_plot_copy_labels(
+            str(primary.set_id),
+            [str(resolved.set_id) for resolved in resolved_entries],
         )
         return CachedBatchSelectionDisplayOutcome(True)
 

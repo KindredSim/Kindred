@@ -59,6 +59,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         """
         super().__init__(parent)
 
+        self._current_validation_state = "idle"
+        self._run_gated = False
+        self._reactions_edit_action: Optional[QtGui.QAction] = None
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -72,20 +76,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Text editor for DSL
         reactions_header_row = QtWidgets.QHBoxLayout()
-        reactions_header_row.addWidget(QtWidgets.QLabel("Reaction DSL:"))
-        self._dsl_directives_btn = QtWidgets.QToolButton()
-        self._dsl_directives_btn.setText("DSL directives")
-        self._dsl_directives_btn.setCheckable(True)
-        self._dsl_directives_btn.setChecked(False)
-        self._dsl_directives_btn.setToolTip(
-            "Show global DSL directives & advanced features (algebra, observables, computational mode)"
-        )
-        reactions_header_row.addWidget(self._dsl_directives_btn)
-        self._reactions_edit_btn = QtWidgets.QToolButton()
+        self._reactions_edit_btn = QtWidgets.QPushButton()
         self._reactions_edit_btn.setObjectName("reactionsEditGuardButton")
+        self._reactions_edit_btn.setCheckable(True)
+        self._reactions_edit_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
         self._reactions_edit_btn.hide()
         reactions_header_row.addWidget(self._reactions_edit_btn)
         reactions_header_row.addStretch()
+        self._run_btn = QtWidgets.QPushButton("\u25b6 Run")
+        run_font = self._run_btn.font()
+        run_font.setPointSize(run_font.pointSize() + 2)
+        self._run_btn.setFont(run_font)
+        self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
+        self._run_btn.setEnabled(False)
+        reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 
         self._reactions_edit_status_label = QtWidgets.QLabel("")
@@ -95,30 +99,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_edit_status_label.setFont(status_font)
         reactions_layout.addWidget(self._reactions_edit_status_label)
 
-        self._dsl_directives_help = QtWidgets.QLabel(
-            '<pre style="white-space: pre-wrap;">Global DSL Directives &amp; Advanced Features:\n'
-            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol, J/mol)\n"
-            "T=300          (Global isothermal temperature in K)\n"
-            "[A]=1.0        (Hardcode initial conditions directly)\n"
-            "\n"
-            "Algebra &amp; Observables (# algebra):\n"
-            "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
-            "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
-            "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
-            "*Note: Bracketed species [A] can ONLY be used in 'let', never in 'param'.*\n"
-            "\n"
-            "Computational Mode (# === Computational Mode ===):\n"
-            "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
-            "Note: The 'hartree' energy unit is only supported within Computational Mode blocks.\n"
-            "\n"
-            "Note: Kindred normalizes all energies internally to J/mol.</pre>"
-        )
-        self._dsl_directives_help.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self._dsl_directives_help.setWordWrap(True)
-        self._dsl_directives_help.setStyleSheet("padding: 4px 0;")
-        self._dsl_directives_help.setVisible(False)
-        reactions_layout.addWidget(self._dsl_directives_help)
-        self._dsl_directives_btn.toggled.connect(self._dsl_directives_help.setVisible)
         self._reactions_text = QtWidgets.QPlainTextEdit()
         self._reactions_text.setPlaceholderText(
             "Example:\n"
@@ -172,31 +152,35 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.setSpacing(8)
 
         # Fine mode toggle
-        self._fine_btn = QtWidgets.QToolButton()
-        self._fine_btn.setText("Fine")
+        self._fine_btn = QtWidgets.QPushButton("Fine")
         self._fine_btn.setCheckable(True)
+        self._fine_btn.setToolTip("Toggle fine adjustment mode for more precise slider control")
         self._fine_btn.toggled.connect(lambda v: self._variable_sliders.set_fine_mode(v))
         slider_actions_layout.addWidget(self._fine_btn)
 
         # Override mode controls (Commit/Reset)
         self._commit_slider_overrides_btn = QtWidgets.QPushButton("Commit")
         self._commit_slider_overrides_btn.setObjectName("commitSliderOverridesButton")
+        self._commit_slider_overrides_btn.setToolTip("Apply current slider values to the canonical mechanism")
         slider_actions_layout.addWidget(self._commit_slider_overrides_btn)
 
         self._reset_slider_overrides_btn = QtWidgets.QPushButton("Reset")
         self._reset_slider_overrides_btn.setObjectName("resetSliderOverridesButton")
+        self._reset_slider_overrides_btn.setToolTip("Revert sliders to canonical mechanism values")
         slider_actions_layout.addWidget(self._reset_slider_overrides_btn)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
         self._slider_visibility_picker_btn.setText("Visible sliders")
         self._slider_visibility_picker_btn.setObjectName("sliderVisibilityPickerButton")
+        self._slider_visibility_picker_btn.setToolTip("Choose which mechanism parameters to show as interactive sliders")
         self._slider_visibility_picker_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self._slider_visibility_menu = _PersistentToggleMenu(self)
         self._slider_visibility_menu.aboutToShow.connect(self._rebuild_slider_visibility_menu)
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
         self._slider_edit_targets_label = QtWidgets.QLabel("Slider edit targets: none")
+        self._slider_edit_targets_label.setToolTip("The batch set whose initial conditions are controlled by concentration sliders")
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
         self._slider_edit_targets_label.setFont(target_font)
@@ -207,19 +191,21 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_runtime_layout.setSpacing(8)
 
         # Slider simulation points
-        slider_runtime_layout.addWidget(QtWidgets.QLabel("Slider sim points:"))
+        slider_runtime_layout.addWidget(QtWidgets.QLabel("Points:"))
         self._slider_points_spin = QtWidgets.QSpinBox()
         self._slider_points_spin.setRange(50, 20000)
         self._slider_points_spin.setSingleStep(50)
         self._slider_points_spin.setValue(100)
-        self._slider_points_spin.setMinimumWidth(80)
+        self._slider_points_spin.setMinimumWidth(100)
+        self._slider_points_spin.setToolTip("Number of time points for slider preview simulations")
         slider_runtime_layout.addWidget(self._slider_points_spin)
 
         # Slider solver
-        slider_runtime_layout.addWidget(QtWidgets.QLabel("Slider solver:"))
+        slider_runtime_layout.addWidget(QtWidgets.QLabel("Solver:"))
         self._slider_solver_combo = QtWidgets.QComboBox()
         self._slider_solver_combo.addItems(["LSODA", "Radau", "BDF"])
         self._slider_solver_combo.setCurrentText("LSODA")
+        self._slider_solver_combo.setToolTip("ODE solver used for slider preview simulations")
         slider_runtime_layout.addWidget(self._slider_solver_combo)
         slider_runtime_layout.addStretch()
 
@@ -229,19 +215,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_pane_layout = QtWidgets.QVBoxLayout(self._slider_pane_container)
         slider_pane_layout.setContentsMargins(0, 0, 0, 0)
         slider_pane_layout.setSpacing(6)
-        slider_header = QtWidgets.QLabel("Interactive sliders")
-        slider_header_font = slider_header.font()
-        slider_header_font.setBold(True)
-        slider_header.setFont(slider_header_font)
-        slider_pane_layout.addWidget(slider_header)
         slider_pane_layout.addLayout(slider_actions_layout)
         slider_pane_layout.addLayout(slider_runtime_layout)
         self._slider_empty_state_label = QtWidgets.QLabel("Choose sliders from Visible sliders.")
         self._slider_empty_state_label.setWordWrap(True)
+        self._slider_empty_state_label.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
         empty_state_font = self._slider_empty_state_label.font()
         empty_state_font.setPointSize(max(1, empty_state_font.pointSize() - 1))
         self._slider_empty_state_label.setFont(empty_state_font)
-        slider_pane_layout.addWidget(self._slider_empty_state_label)
+        slider_pane_layout.addWidget(self._slider_empty_state_label, stretch=1)
         slider_pane_layout.addWidget(self._slider_surface, stretch=1)
         self._slider_workspace_state = (False, False)
         self._slider_workspace_detached = False
@@ -267,6 +249,55 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_text.textChanged.connect(self._on_text_changed)
 
         self._tabs.addTab(self._reactions_tab, "Reactions")
+
+        # Help tab — example + directive/algebra/computational-mode reference
+        self._help_tab = QtWidgets.QWidget()
+        help_layout = QtWidgets.QVBoxLayout(self._help_tab)
+        help_layout.setContentsMargins(0, 0, 0, 0)
+        help_scroll = make_scroll_area(self._help_tab)
+        help_label = QtWidgets.QLabel(
+            '<pre style="white-space: pre-wrap;"><b>Global DSL Directives &amp; Advanced Features</b>\n'
+            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol, J/mol)\n"
+            "T=300          (Global isothermal temperature in K)\n"
+            "[A]=1.0        (Hardcode initial conditions directly)\n"
+            "\n"
+            "<b>Algebra &amp; Observables (# algebra)</b>\n"
+            "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
+            "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
+            "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
+            "*Note: Bracketed species [A] can ONLY be used in 'let', never in 'param'.*\n"
+            "\n"
+            "<b>Computational Mode (# === Computational Mode ===)</b>\n"
+            "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
+            "Note: The 'hartree' energy unit is only supported within Computational Mode blocks.\n"
+            "\n"
+            "Note: Kindred normalizes all energies internally to J/mol.\n"
+            "\n"
+            "<b>Example</b>\n"
+            "reaction: 2A + B =&gt; C ; kf=1e5\n"
+            "equilibrium: C &lt;=&gt; D ; K=2.5\n"
+            "reaction: C + E -&gt; F ; kf=k_derived\n"
+            "reaction: A -&gt; A_Side ; kf=0.01\n"
+            "\n"
+            "# algebra\n"
+            "param scale = 2.0\n"
+            "param k_base = 1.5e3\n"
+            "param k_derived = k_base * scale\n"
+            "\n"
+            "let total_A = [A] + [A_Side]\n"
+            "let conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
+            "\n"
+            "# === Computational Mode ===\n"
+            "comp: species C G=-450.12</pre>"
+        )
+        help_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        help_label.setWordWrap(True)
+        help_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+        help_label.setStyleSheet("padding: 8px;")
+        help_scroll.setWidget(help_label)
+        help_scroll.setWidgetResizable(True)
+        help_layout.addWidget(help_scroll)
+        self._tabs.addTab(self._help_tab, "Help")
 
         # Notes tab - persisted free-form text (never parsed/injected into DSL)
         self._notes_tab = QtWidgets.QWidget()
@@ -453,12 +484,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         message : str
             Status message to display
         """
+        self._current_validation_state = state
+        self._run_btn.setEnabled(state == "valid" and not self._run_gated)
+        self._run_btn.setToolTip(
+            "Run simulation for all selected batch sets (same as Run Selected in Batch Initial Conditions)"
+            if state == "valid"
+            else "No valid mechanism \u2014 enter a valid reaction mechanism to enable"
+        )
+
         if state == "idle":
             self._validation_label.setText("")
             self._validation_label.setStyleSheet("QLabel { padding: 4px; }")
 
         elif state == "validating":
-            self._validation_label.setText("⏳ Validating...")
+            self._validation_label.setText("\u23f3 Validating...")
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
@@ -492,12 +531,51 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         idx = self._slider_solver_combo.findText(s)
         self._slider_solver_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
+    @property
+    def run_btn(self) -> QtWidgets.QPushButton:
+        return self._run_btn
+
+    def set_run_gated(self, gated: bool) -> None:
+        self._run_gated = bool(gated)
+        if self._run_gated:
+            self._run_btn.setEnabled(False)
+        elif self._current_validation_state == "valid":
+            self._run_btn.setEnabled(True)
+
+    def is_mechanism_valid(self) -> bool:
+        return self._current_validation_state == "valid"
+
     def set_reactions_edit_action(self, action: Optional[QtGui.QAction]) -> None:
         if action is None:
             self._reactions_edit_btn.hide()
             return
-        self._reactions_edit_btn.setDefaultAction(action)
-        self._reactions_edit_btn.show()
+        btn = self._reactions_edit_btn
+        btn.setText(action.text())
+        btn.setToolTip(action.toolTip())
+        btn.setChecked(action.isChecked())
+        if self._reactions_edit_action is not None:
+            try:
+                btn.toggled.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                self._reactions_edit_action.changed.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        self._reactions_edit_action = action
+        btn.toggled.connect(action.trigger)
+
+        def _sync_from_action():
+            prev = btn.blockSignals(True)
+            try:
+                btn.setText(action.text())
+                btn.setToolTip(action.toolTip())
+                btn.setChecked(action.isChecked())
+            finally:
+                btn.blockSignals(prev)
+
+        action.changed.connect(_sync_from_action)
+        btn.show()
 
     def set_reactions_edit_status_text(self, text: str) -> None:
         text_s = str(text)

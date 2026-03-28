@@ -3,7 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kindred.core.analysis.fit_dataset_payload import normalize_dataset_species_and_y
+from kindred.core.analysis.fit_dataset_payload import (
+    coerce_fit_dataset_specs,
+    normalize_dataset_species_and_y,
+)
 from kindred.gui.fitting.window import build_selected_fit_dataset_payload
 
 
@@ -90,3 +93,56 @@ def test_gui_payload_builder_keeps_missing_x_obs_distinct_from_invalid_x_obs() -
     assert payload is None
     assert err is not None
     assert "missing x_obs" in err
+
+
+@pytest.mark.unit
+def test_gui_payload_builder_includes_selected_target_weights_only_and_defaults_omitted() -> None:
+    payload, err = build_selected_fit_dataset_payload(
+        dataset_id="ds1",
+        t=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        species_data={
+            "A": np.asarray([1.0, 2.0, 3.0], dtype=float),
+            "B": np.asarray([0.0, 1.0, 0.0], dtype=float),
+            "C": np.asarray([4.0, 5.0, 6.0], dtype=float),
+        },
+        selected_species=["A", "B"],
+        target_weights={"A": 2.5, "C": 99.0},
+    )
+
+    assert err is None
+    assert payload is not None
+    assert payload["target_weights"] == {"A": 2.5, "B": 1.0}
+
+
+@pytest.mark.unit
+def test_coerce_fit_dataset_specs_normalizes_target_weights_for_selected_targets_only() -> None:
+    spec = coerce_fit_dataset_specs(
+        [
+            {
+                "id": "ds1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "y": np.asarray([[1.0, 2.0, 3.0], [0.0, 1.0, 0.0]], dtype=float),
+                "species": ["A", "B"],
+                "target_weights": {"A": 3.0, "C": 99.0},
+            }
+        ]
+    )[0]
+
+    assert spec.target_weights == {"A": 3.0, "B": 1.0}
+    assert spec.to_payload_dict()["target_weights"] == {"A": 3.0, "B": 1.0}
+
+
+@pytest.mark.unit
+def test_coerce_fit_dataset_specs_rejects_nonpositive_or_nonfinite_target_weights() -> None:
+    base = {
+        "id": "ds1",
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "y": np.asarray([[1.0, 0.5]], dtype=float),
+        "species": ["A"],
+    }
+
+    with pytest.raises(ValueError, match="target weight"):
+        coerce_fit_dataset_specs([dict(base, target_weights={"A": 0.0})])
+
+    with pytest.raises(ValueError, match="target weight"):
+        coerce_fit_dataset_specs([dict(base, target_weights={"A": np.inf})])

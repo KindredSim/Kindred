@@ -77,7 +77,7 @@ _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
 _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
-_ANALYSIS_SURFACE_NAMES: tuple[str, ...] = ("Statistics", "Parameters", "Overlays")
+_ANALYSIS_SURFACE_NAMES: tuple[str, ...] = ("Statistics", "Parameters")
 _ABOUT_DIALOG_MIN_WIDTH = 420
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
 
@@ -259,6 +259,11 @@ class MainWindow(
         self.setCentralWidget(self._plot_tabs)
         self._theme_manager = shell.theme_manager
         self.results_controller = shell.results_controller
+        plot = getattr(self, "_plot_tabs", None)
+        main_plot = getattr(plot, "_main_plot", None)
+        set_copy_all_provider = getattr(main_plot, "set_copy_all_export_plan_provider", None)
+        if callable(set_copy_all_provider):
+            set_copy_all_provider(self._build_main_plot_copy_all_export_plan)
 
     def _init_mechanism_dock_and_panel(self) -> None:
         mechanism_dock_components = build_mechanism_dock(self)
@@ -325,6 +330,7 @@ class MainWindow(
             self._disable_slider_override_mode_buttons()
 
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
+        self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
         self._refresh_slider_transaction_button_state()
 
     def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
@@ -360,23 +366,19 @@ class MainWindow(
         if bool(locked):
             return (
                 "State network is read-only while Reactions editing is locked. "
-                "Use Unlock Reactions Editing to make deliberate changes."
+                "Use Allow Editing to make deliberate changes."
             )
         return "Edit the state network with full validation. Changes apply directly to the current mechanism."
 
     def _refresh_mechanism_edit_lock_ui(self) -> None:
         locked = self.mechanism_editing_locked()
-        button_text = "Unlock Reactions Editing" if locked else "Lock Reactions Editing"
+        button_text = "Allow Editing"
         tooltip = (
-            "Temporarily enable deliberate edits in the Reactions editor."
+            "Toggle to enable editing of the reaction mechanism"
             if locked
-            else "Return the Reactions editor to read-only mode."
+            else "Toggle to return the reaction mechanism to read-only mode"
         )
-        status_text = (
-            "Reactions editor is read-only. Use Unlock Reactions Editing before making deliberate changes."
-            if locked
-            else "Reactions editor is unlocked. Changes here modify the canonical mechanism text saved with the project."
-        )
+        status_text = ""
         editor = getattr(self, "_mechanism_editor", None)
         if editor is not None:
             set_read_only = getattr(editor, "set_reactions_read_only", None)
@@ -390,18 +392,14 @@ class MainWindow(
             if callable(set_status_text):
                 set_status_text(status_text)
             action = getattr(self, "_mechanism_edit_lock_action", None)
+            if action is not None:
+                action.setText(button_text)
+                action.setToolTip(tooltip)
             bind_action = getattr(editor, "set_reactions_edit_action", None)
             if action is not None and callable(bind_action):
                 bind_action(action)
-        action = getattr(self, "_mechanism_edit_lock_action", None)
-        if action is not None:
-            previous = action.blockSignals(True)
-            try:
-                action.setText(button_text)
-                action.setToolTip(tooltip)
+            if action is not None:
                 action.setChecked(not locked)
-            finally:
-                action.blockSignals(previous)
         dialog = getattr(self, "_state_network_dialog", None)
         if dialog is not None:
             try:
@@ -473,13 +471,13 @@ class MainWindow(
 
     def _report_locked_reactions_undo_redo_block(self, *, redo: bool) -> None:
         action_text = "redo" if redo else "undo"
-        self._status_label.setText(f"Unlock Reactions Editing to {action_text} mechanism changes")
+        self._status_label.setText(f"Allow Editing to {action_text} mechanism changes")
         logger.debug("Blocked %s while reactions editing is locked", action_text)
 
     def _prompt_mechanism_edit_unlock_warning(self) -> bool:
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setWindowTitle("Unlock Reactions Editing")
+        box.setWindowTitle("Allow Editing")
         box.setText("Edits in the Reactions editor change the canonical mechanism text.")
         box.setInformativeText(
             "Use unlocking only for deliberate edits. Save/load and migration rewrites can still update the editor while it remains locked."
@@ -574,7 +572,6 @@ class MainWindow(
         species_panel = self._try_wire_species_panel()
 
         sim_panel = self._batch_panel
-        self._batch_section = sim_panel.section
         self._batch_table = sim_panel.batch_table
         self._add_batch_set_btn = sim_panel.add_batch_set_btn
         self._move_batch_up_btn = sim_panel.move_batch_up_btn
@@ -614,6 +611,7 @@ class MainWindow(
             for signal_name, slot in (
                 ("showMembershipChanged", self._on_batch_show_membership_changed),
                 ("sliderEditTargetsChanged", self._on_slider_edit_targets_changed),
+                ("dataChanged", self._on_batch_model_data_changed),
             ):
                 signal = getattr(model, signal_name, None)
                 if signal is None:
@@ -668,6 +666,7 @@ class MainWindow(
             try:
                 current_model.showMembershipChanged.connect(self._on_batch_show_membership_changed)
                 current_model.sliderEditTargetsChanged.connect(self._on_slider_edit_targets_changed)
+                current_model.dataChanged.connect(self._on_batch_model_data_changed)
             except RuntimeError as exc:
                 logger.debug("Failed to connect batch model semantics signals: %s", exc, exc_info=True)
         if current_selection_model is not None:
@@ -714,6 +713,9 @@ class MainWindow(
         )
         self._right_dock = right_dock_components.dock
         self._right_panel = right_dock_components.panel
+        _overlay_accessor = getattr(self._plot_tabs._main_plot, "overlay_panel", None)
+        if callable(_overlay_accessor):
+            self._right_panel.add_tab(_overlay_accessor(), "Overlays")
         self._right_dock.setWidget(right_dock_components.container)
         self.addDockWidget(self._default_dock_area(self._right_dock), self._right_dock)
 
@@ -901,7 +903,8 @@ class MainWindow(
         if callable(refresh_overlay_presentation):
             refresh_overlay_presentation()
             return
-        overlay_panel = getattr(plot, "_overlay_panel", None)
+        _accessor = getattr(plot, "overlay_panel", None)
+        overlay_panel = _accessor() if callable(_accessor) else None
         refresh_swatches = getattr(overlay_panel, "refresh_color_swatches", None)
         if callable(refresh_swatches):
             refresh_swatches()
@@ -1084,7 +1087,7 @@ class MainWindow(
             [
                 ("&Undo", self._undo, QtGui.QKeySequence.Undo, "undoAction", "Undo last edit in mechanism editor"),
                 ("&Redo", self._redo, QtGui.QKeySequence.Redo, "redoAction", "Redo previously undone edit"),
-                ("Unlock Reactions Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
+                ("Allow Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
                 None,
                 ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
                 ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
@@ -2805,7 +2808,7 @@ class MainWindow(
             if not isinstance(entry, dict):
                 continue
             overlay_label = str(entry.get("label") or "").strip()
-            overlay_set_id = overlay_label_to_set_id.get(overlay_label)
+            overlay_set_id = str(entry.get("set_id") or "").strip() or overlay_label_to_set_id.get(overlay_label, "")
             if not overlay_set_id or overlay_set_id not in selected_dirty_overlay_ids:
                 continue
             overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
@@ -3122,6 +3125,10 @@ class MainWindow(
                     label=plot_label,
                     overlays=preserved_overlays if preserve_multiselect_overlays else [],
                     owned_species=plot_owned_species,
+                )
+                self.sync_main_plot_copy_labels(
+                    preserved_set_id,
+                    preserved_selected_ids or ([preserved_set_id] if preserved_set_id else []),
                 )
                 plot_results_map: Dict[str, Dict[str, object]] = {
                     plot_label: {
@@ -3490,6 +3497,14 @@ class MainWindow(
 
     def set_run_button_enabled(self, enabled: bool) -> None:
         self._run_btn.setEnabled(bool(enabled))
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is not None:
+            if hasattr(editor, "set_run_gated"):
+                editor.set_run_gated(not bool(enabled))
+            elif enabled:
+                editor.run_btn.setEnabled(editor.is_mechanism_valid())
+            else:
+                editor.run_btn.setEnabled(False)
 
     def set_stop_button_enabled(self, enabled: bool) -> None:
         self._stop_btn.setEnabled(bool(enabled))
@@ -3533,6 +3548,41 @@ class MainWindow(
         owned_species: Optional[Sequence[str]] = None,
     ) -> None:
         self.main_plot().set_data(t, series, label=label, overlays=overlays, owned_species=owned_species)
+
+    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None:
+        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+        if plot is None:
+            return
+        primary_set_id_s = str(primary_set_id or "").strip()
+        selected_ids: list[str] = []
+        for raw_set_id in selected_set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id or set_id in selected_ids:
+                continue
+            selected_ids.append(set_id)
+        if primary_set_id_s and primary_set_id_s not in selected_ids:
+            selected_ids.append(primary_set_id_s)
+        popup_labels = self._copy_all_popup_labels_by_set_id(selected_ids)
+        primary_label = str(getattr(plot, "_simulation_set_label", "") or "").strip()
+        setattr(plot, "_simulation_set_popup_label", str(popup_labels.get(primary_set_id_s, primary_label)))
+        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
+            if not isinstance(entry, dict):
+                continue
+            entry_set_id = str(entry.get("set_id") or "").strip()
+            popup_label = str(popup_labels.get(entry_set_id, "")).strip()
+            if popup_label:
+                entry["popup_label"] = popup_label
+            else:
+                entry.pop("popup_label", None)
+
+    def _sync_main_plot_copy_labels_for_cached_batch_selection(self) -> None:
+        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
+        if batch_cache is None:
+            return
+        active_set_id = str(self.active_batch_selection()[0] or "").strip()
+        selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
+        if active_set_id or selected_ids:
+            self.sync_main_plot_copy_labels(active_set_id, selected_ids)
 
     def show_simulation_tab(self) -> None:
         self._plot_tabs._tabs.setCurrentIndex(0)
@@ -3755,6 +3805,11 @@ class MainWindow(
         batch_cache.active_batch_set = str(set_name)
         batch_cache.last_display_selection = [str(item) for item in (selected_ids or []) if str(item)]
 
+    def clear_display_selection_state(self) -> None:
+        clear_display = getattr(self._sim_controller.batch_cache, "clear_display_selection_state", None)
+        if callable(clear_display):
+            clear_display()
+
     def batch_result_cache_store(self) -> MutableMapping[str, Dict[str, Any]]:
         return self._sim_controller.batch_cache.result_cache
 
@@ -3952,6 +4007,10 @@ class MainWindow(
                 self._record_current_main_plot_workspace_preview_provenance(
                     selected_set_ids=normalized_selected_sets
                 )
+                if outcome_reason == "preview_pending":
+                    self.set_status_text("Preview pending for current selection.")
+                else:
+                    self.set_status_text("Result not cached (evicted). Press Run to compute.")
             return bool(outcome.displayed)
         return False
 
@@ -4569,6 +4628,258 @@ class MainWindow(
         except Exception:
             return None
 
+    def _copy_all_popup_labels_by_set_id(self, set_ids: Sequence[str]) -> Dict[str, str]:
+        labels_by_id: Dict[str, str] = {}
+        label_counts: Dict[str, int] = {}
+        for raw_set_id in set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id:
+                continue
+            label = str(self.batch_set_name_for_id(set_id) or set_id)
+            labels_by_id[set_id] = label
+            label_counts[label] = int(label_counts.get(label, 0)) + 1
+
+        popup_labels: Dict[str, str] = {}
+        for set_id, label in labels_by_id.items():
+            popup_label = str(label)
+            if int(label_counts.get(label, 0)) > 1:
+                row = self._batch_row_for_set_id(set_id)
+                if row is not None:
+                    popup_label = f"{label} (row {int(row) + 1})"
+            popup_labels[set_id] = popup_label
+        return popup_labels
+
+    def _copy_all_shown_block_from_entry(
+        self,
+        *,
+        set_id: str,
+        label: str,
+        entry: Mapping[str, Any],
+    ):
+        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllShownBlock
+
+        return CopyAllShownBlock(
+            set_id=str(set_id),
+            label=str(label),
+            t=np.asarray(entry.get("t"), dtype=float).reshape(-1),
+            series={
+                str(name): np.asarray(values, dtype=float).reshape(-1)
+                for name, values in dict(entry.get("series") or {}).items()
+            },
+        )
+
+    def _copy_all_clean_shown_block(
+        self,
+        *,
+        set_id: str,
+        label: str,
+        cache_key: str,
+        valid_set_ids: Optional[Sequence[str]],
+        invalidated_set_ids: Optional[Sequence[str]],
+    ):
+        if not cache_key:
+            return None, "no_cached_results"
+        coverage = self.results_controller.cached_batch_selection_coverage(
+            cache_key=str(cache_key),
+            selected_sets=[str(set_id)],
+            cache_store=self._sim_controller.batch_cache.result_cache,
+            valid_set_ids=valid_set_ids,
+            invalidated_set_ids=invalidated_set_ids,
+            allow_fallback=False,
+        )
+        if not coverage.available_ids:
+            return None, str(coverage.reason or "no_cached_results")
+        entry_result = self._cache_entry_for_set_id_from_store(
+            store=self._sim_controller.batch_cache.result_cache,
+            cache_key=str(cache_key),
+            set_id=str(set_id),
+        )
+        if entry_result.entry is None:
+            return None, "invalid_cache_entry" if entry_result.state == "invalid" else "no_cached_results"
+        return self._copy_all_shown_block_from_entry(set_id=str(set_id), label=label, entry=entry_result.entry), None
+
+    def _copy_all_live_primary_block(
+        self,
+        *,
+        set_id: str,
+        label: str,
+    ):
+        sid = str(set_id or "").strip()
+        if not self.main_plot_has_data():
+            return None
+        if sid:
+            active_set_id = str(self.active_batch_selection()[0] or "").strip()
+            if active_set_id != sid:
+                return None
+        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+        if plot is None:
+            return None
+        plot_t = np.asarray(
+            getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [],
+            dtype=float,
+        ).reshape(-1)
+        plot_series_raw = getattr(plot, "_series", {}) or {}
+        if plot_t.size <= 0 or not isinstance(plot_series_raw, Mapping):
+            return None
+        plot_series = {
+            str(name): np.asarray(values, dtype=float).reshape(-1)
+            for name, values in dict(plot_series_raw).items()
+            if np.asarray(values, dtype=float).reshape(-1).size > 0
+        }
+        if not plot_series:
+            return None
+        return self._copy_all_shown_block_from_entry(
+            set_id=sid,
+            label=label,
+            entry={"t": plot_t, "series": plot_series},
+        )
+
+    def _copy_all_live_plot_shown_block(
+        self,
+        *,
+        set_id: str,
+        label: str,
+        invalidated_set_ids: Optional[Sequence[str]],
+        allow_clean_missing_cache: bool = False,
+    ):
+        sid = str(set_id or "").strip()
+        if not sid:
+            return None
+        invalidated = {str(raw_id) for raw_id in (invalidated_set_ids or ()) if str(raw_id)}
+        if sid not in invalidated and not bool(allow_clean_missing_cache):
+            return None
+        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+        if plot is None:
+            return None
+        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
+        active_set_id = str(batch_cache.active_batch_set_id or "").strip() if batch_cache is not None else ""
+
+        if active_set_id == sid:
+            block = self._copy_all_live_primary_block(set_id=sid, label=label)
+            if block is not None:
+                return block
+
+        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
+                continue
+            if str(entry.get("set_id") or "").strip() != sid:
+                continue
+            overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
+            overlay_series_raw = entry.get("series") or {}
+            if overlay_t.size <= 0 or not isinstance(overlay_series_raw, Mapping):
+                continue
+            overlay_series = {
+                str(name): np.asarray(values, dtype=float).reshape(-1)
+                for name, values in dict(overlay_series_raw).items()
+                if np.asarray(values, dtype=float).reshape(-1).size > 0
+            }
+            if not overlay_series:
+                continue
+            return self._copy_all_shown_block_from_entry(
+                set_id=sid,
+                label=label,
+                entry={"t": overlay_t, "series": overlay_series},
+            )
+        return None
+
+    def _copy_all_dirty_shown_block(self, *, set_id: str, label: str):
+        resolved_entries, reason, _, _, _, _, _ = self._resolve_workspace_aware_batch_selection(
+            selected_sets=[str(set_id)]
+        )
+        resolved = next((entry for entry in resolved_entries if str(entry.set_id) == str(set_id)), None)
+        if resolved is None or resolved.entry is None:
+            return None, str(reason or "preview_pending")
+        return self._copy_all_shown_block_from_entry(
+            set_id=str(resolved.set_id),
+            label=str(label),
+            entry=resolved.entry,
+        ), None
+
+    def _build_main_plot_copy_all_export_plan(self):
+        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllExportPlan, CopyAllMissingItem
+
+        shown_set_ids = [str(set_id) for set_id in (self.shown_batch_set_ids() or []) if str(set_id)]
+        live_primary_fallback_set_id = ""
+        non_batch_live_primary_label = ""
+        if not shown_set_ids and self.main_plot_has_data():
+            active_set_id = str(self.active_batch_selection()[0] or "").strip()
+            if active_set_id:
+                shown_set_ids = [active_set_id]
+                live_primary_fallback_set_id = active_set_id
+            else:
+                plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+                non_batch_live_primary_label = str(
+                    getattr(plot, "_simulation_set_label", "") if plot is not None else ""
+                ).strip() or "Results"
+        popup_labels = self._copy_all_popup_labels_by_set_id(shown_set_ids)
+        batch_cache = self._sim_controller.batch_cache
+        cache_key = str(batch_cache.active_cache_key or "")
+        valid_set_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id))
+        invalidated_set_ids = tuple(
+            str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
+        )
+
+        shown_blocks = []
+        missing_items = []
+        for set_id in shown_set_ids:
+            label = str(self.batch_set_name_for_id(set_id) or set_id)
+            export_label = str(popup_labels.get(str(set_id), label))
+            if self._preview_session.has_dirty_state_for_set(str(set_id)):
+                block, reason = self._copy_all_dirty_shown_block(set_id=str(set_id), label=export_label)
+            else:
+                block, reason = self._copy_all_clean_shown_block(
+                    set_id=str(set_id),
+                    label=export_label,
+                    cache_key=cache_key,
+                    valid_set_ids=valid_set_ids or None,
+                    invalidated_set_ids=invalidated_set_ids or None,
+                )
+                if block is None:
+                    allow_clean_missing_cache = (
+                        str(reason or "") == "no_cached_results" and str(set_id) not in invalidated_set_ids
+                    )
+                    block = self._copy_all_live_plot_shown_block(
+                        set_id=str(set_id),
+                        label=export_label,
+                        invalidated_set_ids=invalidated_set_ids or None,
+                        allow_clean_missing_cache=allow_clean_missing_cache,
+                    )
+                if block is None and str(set_id) == live_primary_fallback_set_id:
+                    block = self._copy_all_live_primary_block(
+                        set_id=str(set_id),
+                        label=export_label,
+                    )
+            if block is not None:
+                shown_blocks.append(block)
+                continue
+            missing_items.append(
+                CopyAllMissingItem(
+                    set_id=str(set_id),
+                    label=label,
+                    popup_label=str(popup_labels.get(str(set_id), label)),
+                    reason=str(reason or "no_cached_results"),
+                )
+            )
+        if non_batch_live_primary_label:
+            block = self._copy_all_live_primary_block(
+                set_id="",
+                label=non_batch_live_primary_label,
+            )
+            if block is not None:
+                shown_blocks.append(block)
+            else:
+                missing_items.append(
+                    CopyAllMissingItem(
+                        set_id="",
+                        label=non_batch_live_primary_label,
+                        popup_label=non_batch_live_primary_label,
+                        reason="no_simulation_data",
+                    )
+                )
+        return CopyAllExportPlan(shown_blocks=shown_blocks, missing_items=missing_items)
+
     def _set_cached_focused_batch_set_id(self, set_id: str) -> str:
         focused_set_id = str(set_id or "").strip()
         if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
@@ -4718,6 +5029,7 @@ class MainWindow(
                     signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
+        self._sync_main_plot_copy_labels_for_cached_batch_selection()
 
     def _batch_delete_target_rows(self) -> List[int]:
         rows = self._batch_selected_rows()
@@ -5239,6 +5551,22 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
+
+    def _on_batch_model_data_changed(
+        self,
+        top_left: QtCore.QModelIndex,
+        bottom_right: QtCore.QModelIndex,
+        roles: Sequence[int] | None = None,
+    ) -> None:
+        if not top_left.isValid() or not bottom_right.isValid():
+            return
+        if not (int(top_left.column()) <= 0 <= int(bottom_right.column())):
+            return
+        display_role = int(getattr(QtCore.Qt.DisplayRole, "value", QtCore.Qt.DisplayRole))
+        normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}
+        if normalized_roles and display_role not in normalized_roles:
+            return
+        self._sync_main_plot_copy_labels_for_cached_batch_selection()
 
     def _on_batch_current_changed(self, *_args) -> None:
         focused_set_id = self._update_focused_batch_set_id()

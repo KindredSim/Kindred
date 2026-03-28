@@ -141,6 +141,41 @@ class TestGlobalFitting:
 
         assert abs(weighted.shared_params['k'] - 0.3) < abs(unweighted.shared_params['k'] - 0.3)
 
+    def test_global_fit_target_weights_bias_result_within_dataset(self):
+        """Per-target weights should bias a multi-target dataset toward the preferred target."""
+
+        def simulate(params):
+            k = params['k']
+            t = np.linspace(0, 5, 40)
+            return {
+                't': t,
+                'species': {
+                    'A': np.exp(-k * t),
+                    'B': np.exp(-2.0 * k * t),
+                },
+            }
+
+        t = np.linspace(0, 5, 40)
+        datasets_unweighted = [
+            {
+                'id': 'mixed',
+                't': t,
+                'y': np.vstack([
+                    np.exp(-0.3 * t),
+                    np.exp(-2.0 * 0.9 * t),
+                ]),
+                'species': ['A', 'B'],
+            }
+        ]
+        datasets_weighted = [
+            dict(datasets_unweighted[0], target_weights={'A': 5.0, 'B': 1.0})
+        ]
+
+        unweighted = fit_global(simulate, datasets_unweighted, {'k': 0.5})
+        weighted = fit_global(simulate, datasets_weighted, {'k': 0.5})
+
+        assert abs(weighted.shared_params['k'] - 0.3) < abs(unweighted.shared_params['k'] - 0.3)
+
     def test_global_fit_with_dataset_variable_initials(self):
         """Fit per-dataset initial concentrations with bounds."""
         def simulate(params):

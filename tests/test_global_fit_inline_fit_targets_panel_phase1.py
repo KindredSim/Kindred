@@ -6,7 +6,13 @@ pytestmark = [pytest.mark.gui]
 
 _DATASET_INVALID_MARK_ROLE = 0x10FF  # Qt.UserRole + offset, internal-only for tests
 
-def _make_window(*, selected_species: list[str]):
+
+def _make_window(
+    *,
+    selected_species: list[str],
+    entry_target_weights: dict[str, float] | None = None,
+    payload_target_weights: dict[str, float] | None = None,
+):
     from kindred.gui.fitting.window import FittingWindow
 
     t = np.linspace(0.0, 1.0, 5)
@@ -24,6 +30,8 @@ def _make_window(*, selected_species: list[str]):
             "include": True,
         }
     ]
+    if entry_target_weights is not None:
+        dataset_entries[0]["target_weights"] = dict(entry_target_weights)
     selected_rows = [np.asarray(dataset_entries[0]["species_data"][name]) for name in selected_species]
     dataset_payloads = [
         {
@@ -33,6 +41,8 @@ def _make_window(*, selected_species: list[str]):
             "species": list(selected_species),
         }
     ]
+    if payload_target_weights is not None:
+        dataset_payloads[0]["target_weights"] = dict(payload_target_weights)
     return FittingWindow(
         mode="global",
         parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
@@ -94,14 +104,15 @@ def _make_two_dataset_window(*, ds1_selected: list[str], ds2_selected: list[str]
 
 
 def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
-    from PySide6 import QtWidgets
-    combo = panel.findChild(QtWidgets.QComboBox, "global_fit_fit_targets_dataset_combo")
-    assert combo is not None
-    for i in range(combo.count()):
-        if str(combo.itemData(i)) == str(dataset_id):
-            combo.setCurrentIndex(i)
+    from PySide6 import QtCore, QtWidgets
+    dataset_list = panel.window().findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+    assert dataset_list is not None
+    for i in range(dataset_list.count()):
+        item = dataset_list.item(i)
+        if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
+            dataset_list.setCurrentRow(i)
             return
-    raise AssertionError(f"Dataset id not in combo: {dataset_id!r}")
+    raise AssertionError(f"Dataset id not in list: {dataset_id!r}")
 
 
 def _dataset_table_row_for(window, dataset_id: str) -> int:
@@ -114,6 +125,15 @@ def _dataset_table_row_for(window, dataset_id: str) -> int:
         if str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
             return row
     raise AssertionError(f"Dataset row not found: {dataset_id!r}")
+
+
+def _target_weight_edit(panel, *, target_name: str):
+    from PySide6 import QtWidgets
+
+    for edit in reversed(panel.findChildren(QtWidgets.QLineEdit)):
+        if str(edit.property("fitTargetName") or "") == str(target_name):
+            return edit
+    raise AssertionError(f"Target weight edit not found: {target_name!r}")
 
 
 def test_global_fit_window_shows_inline_fit_targets_panel(qt_app):
@@ -183,6 +203,96 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         window._start_global_fit(config, selection)
         assert captured["starts"] == 2
         assert set(captured["datasets"][-1][0]["species"]) == {"A", "B"}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch):
+    from PySide6 import QtCore, QtWidgets
+
+    captured = {"datasets": [], "starts": 0}
+
+    class _FakeWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        finished = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+
+        def __init__(self, datasets, shared_params, **_kwargs):
+            super().__init__()
+            captured["datasets"].append([dict(ds) for ds in datasets])
+
+        def start(self):
+            captured["starts"] += 1
+
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+
+    window = _make_window(selected_species=["A"])
+    try:
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        assert panel is not None
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        assert apply_btn is not None
+
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 1.0}
+
+        edit_a = _target_weight_edit(panel, target_name="A")
+        edit_b = _target_weight_edit(panel, target_name="B")
+        edit_a.setText("2.5")
+        edit_b.setText("9.0")
+        qt_app.processEvents()
+
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 1.0}
+
+        config = window._collect_parameter_config()
+        assert config is not None
+        selection = window._collect_dataset_selection()
+        window._start_global_fit(config, selection)
+        assert captured["starts"] == 1
+        assert captured["datasets"][-1][0]["target_weights"] == {"A": 1.0}
+
+        apply_btn.click()
+        qt_app.processEvents()
+        assert captured["starts"] == 1
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 2.5}
+
+        window._start_global_fit(config, selection)
+        assert captured["starts"] == 2
+        assert captured["datasets"][-1][0]["target_weights"] == {"A": 2.5}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_preloaded_target_weights_seed_applied_state_from_dataset_entry_before_payload(qt_app):
+    window = _make_window(
+        selected_species=["A"],
+        entry_target_weights={"A": 2.5},
+        payload_target_weights={"A": 9.0},
+    )
+    try:
+        assert window._fit_target_weights_applied["ds1"] == {"A": 2.5}
+        assert window._fit_target_weights_pending["ds1"]["A"] == 2.5
+        assert window._dataset_entries[0]["target_weights"] == {"A": 2.5}
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 2.5}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_preloaded_target_weights_fall_back_to_seeded_payload_when_entry_omits_them(qt_app):
+    window = _make_window(
+        selected_species=["A"],
+        payload_target_weights={"A": 3.5},
+    )
+    try:
+        assert window._fit_target_weights_applied["ds1"] == {"A": 3.5}
+        assert window._fit_target_weights_pending["ds1"]["A"] == 3.5
+        assert window._dataset_entries[0]["target_weights"] == {"A": 3.5}
+        assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 3.5}
     finally:
         window.close()
         qt_app.processEvents()
@@ -283,6 +393,66 @@ def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, mon
         assert window._fit_targets_selection_applied["ds1"] == ["A"]
         assert window._run_button.isEnabled()
         assert status.isHidden()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_reincluded(qt_app, monkeypatch):
+    from PySide6 import QtCore, QtWidgets
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+
+    window = _make_two_dataset_window(ds1_selected=["A"], ds2_selected=["C"])
+    try:
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        assert panel is not None
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        error_label = panel.findChild(QtWidgets.QLabel, "global_fit_fit_targets_error")
+        assert apply_btn is not None
+        assert error_label is not None
+
+        _set_fit_targets_dataset(panel, dataset_id="ds1")
+        edit_a = _target_weight_edit(panel, target_name="A")
+        edit_a.setText("0")
+        qt_app.processEvents()
+
+        assert "ds1" in window._invalid_pending_target_weight_dataset_ids()
+        assert "invalid target weights" in error_label.text().lower()
+
+        row = _dataset_table_row_for(window, "ds1")
+        use_item = window._dataset_table.item(row, 0)
+        mark_item = window._dataset_table.item(row, 1)
+        assert use_item is not None
+        assert mark_item is not None
+
+        use_item.setCheckState(QtCore.Qt.Unchecked)
+        qt_app.processEvents()
+
+        assert "ds1" not in window._invalid_pending_target_weight_dataset_ids()
+        assert "invalid target weights" not in error_label.text().lower()
+        assert not bool(mark_item.data(_DATASET_INVALID_MARK_ROLE))
+        assert window._run_button.isEnabled()
+
+        apply_btn.click()
+        qt_app.processEvents()
+
+        assert window._status_label.text() == "Fit targets applied"
+        assert window._fit_target_weights_pending_invalid["ds1"] == {"A": "0"}
+        assert _target_weight_edit(panel, target_name="A").text() == "0"
+
+        row = _dataset_table_row_for(window, "ds1")
+        use_item = window._dataset_table.item(row, 0)
+        mark_item = window._dataset_table.item(row, 1)
+        assert use_item is not None
+        assert mark_item is not None
+        use_item.setCheckState(QtCore.Qt.Checked)
+        qt_app.processEvents()
+
+        assert "ds1" in window._invalid_pending_target_weight_dataset_ids()
+        assert "invalid target weights" in error_label.text().lower()
+        assert bool(mark_item.data(_DATASET_INVALID_MARK_ROLE))
+        assert window._run_button.isEnabled()
     finally:
         window.close()
         qt_app.processEvents()

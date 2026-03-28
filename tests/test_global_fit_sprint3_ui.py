@@ -92,7 +92,9 @@ def test_fit_completion_shows_success_popup(qt_app, monkeypatch):
 def test_graphs_tab_removed(qt_app):
     window = _make_window()
     try:
-        titles = [window._tabs.tabText(i) for i in range(window._tabs.count())]
+        top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
+        assert top_tabs is not None
+        titles = [top_tabs.tabText(i) for i in range(top_tabs.count())]
         assert "Graphs" not in titles
     finally:
         window.close()

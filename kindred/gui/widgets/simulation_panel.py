@@ -12,8 +12,6 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
 )
-from kindred.gui.widgets.collapsible_section import CollapsibleSection
-
 __all__ = ["SimulationPanel"]
 
 
@@ -39,8 +37,6 @@ class SimulationPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        self.section = CollapsibleSection("Batch Initial Conditions")
 
         batch_widget = QtWidgets.QWidget()
         batch_layout = QtWidgets.QVBoxLayout(batch_widget)
@@ -75,14 +71,14 @@ class SimulationPanel(QtWidgets.QWidget):
         self.sim_time_spinbox = QtWidgets.QLineEdit(controls_row_widget)
         self.sim_time_spinbox.setText("10.0")
         self.sim_time_spinbox.setToolTip("Total simulation time t_end in seconds (free-form numeric text)")
-        self.sim_time_spinbox.setMaximumWidth(100)
+        self.sim_time_spinbox.setMaximumWidth(140)
         self.sim_time_spinbox.textChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.num_points_spinbox = QtWidgets.QSpinBox(controls_row_widget)
         self.num_points_spinbox.setRange(10, 100000)  # 10 to 100k points
         self.num_points_spinbox.setValue(100)
         self.num_points_spinbox.setToolTip("Number of points in the simulation output")
-        self.num_points_spinbox.setMaximumWidth(100)
+        self.num_points_spinbox.setMaximumWidth(140)
         self.num_points_spinbox.valueChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.run_btn = QtWidgets.QPushButton("Run Selected")
@@ -157,5 +153,4 @@ class SimulationPanel(QtWidgets.QWidget):
         self.temperature_spinbox.setEnabled(False)
         self.temperature_spinbox.setVisible(False)
 
-        self.section.set_content_widget(batch_widget)
-        layout.addWidget(self.section)
+        layout.addWidget(batch_widget, stretch=1)

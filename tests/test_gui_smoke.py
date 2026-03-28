@@ -203,3 +203,25 @@ def test_mechanism_editor_validation_rejects_unsupported_let_named_set_blocks(ma
     assert label.startswith("✗ Error:")
     assert "unrecognized line" in label
     assert "let baseline = {" in label
+
+
+def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window):
+    editor = main_window._mechanism_editor
+    editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    editor._validate_dsl()
+
+    assert editor.run_btn.isEnabled() is True
+
+    main_window.set_run_button_enabled(False)
+
+    assert main_window._run_btn.isEnabled() is False
+    assert editor.run_btn.isEnabled() is False
+
+    editor._set_validation_state("valid", "✓ Valid: 2 species, 1 reactions, 0 equilibria")
+
+    assert editor.run_btn.isEnabled() is False
+
+    main_window.set_run_button_enabled(True)
+
+    assert main_window._run_btn.isEnabled() is True
+    assert editor.run_btn.isEnabled() is True

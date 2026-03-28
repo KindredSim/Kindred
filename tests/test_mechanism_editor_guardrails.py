@@ -149,7 +149,7 @@ def test_locked_user_facing_undo_does_not_mutate_reactions_text(main_window, mon
 
     assert main_window.mechanism_editing_locked() is True
     assert reactions_widget.toPlainText() == changed_text
-    assert main_window._status_label.text() == "Unlock Reactions Editing to undo mechanism changes"
+    assert main_window._status_label.text() == "Allow Editing to undo mechanism changes"
 
 
 def test_locked_user_facing_redo_does_not_mutate_reactions_text(main_window, monkeypatch, qt_app):
@@ -178,7 +178,7 @@ def test_locked_user_facing_redo_does_not_mutate_reactions_text(main_window, mon
 
     assert main_window.mechanism_editing_locked() is True
     assert reactions_widget.toPlainText() == baseline
-    assert main_window._status_label.text() == "Unlock Reactions Editing to redo mechanism changes"
+    assert main_window._status_label.text() == "Allow Editing to redo mechanism changes"
     assert reactions_widget.document().isRedoAvailable() is True
     assert changed_text != baseline
 
@@ -219,7 +219,7 @@ def test_locked_user_facing_undo_redo_do_not_apply_mechanism_undo_stack(main_win
 
     main_window._undo()
     assert reactions_widget.toPlainText() == changed
-    assert main_window._status_label.text() == "Unlock Reactions Editing to undo mechanism changes"
+    assert main_window._status_label.text() == "Allow Editing to undo mechanism changes"
 
     main_window._undo_stack.undo()
     qt_app.processEvents()
@@ -227,7 +227,7 @@ def test_locked_user_facing_undo_redo_do_not_apply_mechanism_undo_stack(main_win
 
     main_window._redo()
     assert reactions_widget.toPlainText() == baseline
-    assert main_window._status_label.text() == "Unlock Reactions Editing to redo mechanism changes"
+    assert main_window._status_label.text() == "Allow Editing to redo mechanism changes"
 
 
 def test_locked_user_facing_undo_redo_do_not_apply_state_network_only_authoritative_command(
@@ -264,7 +264,7 @@ def test_locked_user_facing_undo_redo_do_not_apply_state_network_only_authoritat
 
     main_window._undo()
     assert main_window.mechanism_state_network_dsl_raw() == changed_state
-    assert main_window._status_label.text() == "Unlock Reactions Editing to undo mechanism changes"
+    assert main_window._status_label.text() == "Allow Editing to undo mechanism changes"
 
     main_window._undo_stack.undo()
     qt_app.processEvents()
@@ -272,7 +272,7 @@ def test_locked_user_facing_undo_redo_do_not_apply_state_network_only_authoritat
 
     main_window._redo()
     assert main_window.mechanism_state_network_dsl_raw() == baseline_state
-    assert main_window._status_label.text() == "Unlock Reactions Editing to redo mechanism changes"
+    assert main_window._status_label.text() == "Allow Editing to redo mechanism changes"
 
 
 def test_locked_mode_preserves_notes_undo_redo(main_window, qt_app):

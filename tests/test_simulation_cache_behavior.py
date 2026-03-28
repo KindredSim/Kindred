@@ -1374,6 +1374,228 @@ def test_single_shown_dirty_preview_preserves_canonical_ref_through_main_window_
 
 
 @pytest.mark.gui
+def test_copy_all_export_plan_uses_preserved_live_preview_after_commit_when_explicit_cache_invalidated(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("copy-all export triggered recompute")),
+        raising=True,
+    )
+
+    _set_shown_rows(main_window, [1])
+    qt_app.processEvents()
+
+    shown_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert shown_id
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "copy-all-preserved-preview-explicit-key"
+    preview_key = "copy-all-preserved-preview-preview-key"
+    cache.result_cache[f"{explicit_key}::{shown_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([4.0, 8.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[shown_id])
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = np.linspace(9.0, 18.0, preview_t.size, dtype=float)
+    cache.preview_cache[f"{preview_key}::{shown_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=shown_id,
+        series={"A": preview_series},
+    )
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (shown_id,)
+    cache.active_cache_key = explicit_key
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    np.testing.assert_allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        preview_series,
+    )
+    preserved = main_window._active_workspace_preview_display_snapshot()
+    assert preserved is not None
+
+    main_window._preview_session.commit_current_mechanism_workspace()
+    assert main_window._preview_session.has_dirty_state_for_set(shown_id) is False
+    main_window._invalidate_active_results_after_authoritative_mechanism_change(
+        preserve_current_display=preserved
+    )
+    qt_app.processEvents()
+
+    assert tuple(str(set_id) for set_id in (cache.active_cache_invalidated_set_ids or ())) == (shown_id,)
+    np.testing.assert_allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        preview_series,
+    )
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
+        (shown_id, str(main_window.batch_set_name_for_id(shown_id) or shown_id))
+    ]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, preview_t)
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], preview_series)
+
+
+@pytest.mark.gui
+def test_copy_all_export_plan_includes_non_primary_live_overlay_shown_block_with_disambiguated_label(
+    main_window,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _set_shown_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "dup")
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = "copy-all-live-overlay-replay-key"
+    cache.active_cache_invalidated_set_ids = (first_id, second_id)
+    cache.active_batch_set_id = first_id
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(first_id) or "")
+    cache.last_display_selection = [first_id, second_id]
+
+    primary_t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+    primary_series = np.asarray([11.0, 12.0, 13.0], dtype=float)
+    overlay_t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+    overlay_series = np.asarray([21.0, 22.0, 23.0], dtype=float)
+    main_window.set_data(
+        primary_t,
+        {"A": primary_series},
+        label="dup",
+        overlays=[
+            {
+                "label": "dup",
+                "set_id": second_id,
+                "t": overlay_t,
+                "series": {"A": overlay_series},
+            }
+        ],
+    )
+    qt_app.processEvents()
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
+        (first_id, "dup (row 1)"),
+        (second_id, "dup (row 2)"),
+    ]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, primary_t)
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], primary_series)
+    np.testing.assert_allclose(plan.shown_blocks[1].t, overlay_t)
+    np.testing.assert_allclose(plan.shown_blocks[1].series["A"], overlay_series)
+
+
+@pytest.mark.gui
+def test_main_plot_workspace_preview_provenance_prefers_overlay_set_id_for_duplicate_labels(
+    main_window,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _set_shown_rows(main_window, [0, 1])
+    _select_rows(main_window, [1, 0])
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "dup")
+
+    cache = main_window.simulation_controller.batch_cache
+    preview_key = "duplicate-label-provenance-preview-key"
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[first_id])
+    overlay_t = _current_preview_time_axis(main_window)
+    overlay_series = np.linspace(21.0, 42.0, overlay_t.size, dtype=float)
+    cache.preview_cache[f"{preview_key}::{first_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=first_id,
+        series={"A": overlay_series},
+    )
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (first_id,)
+
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([5.0, 6.0], dtype=float)},
+        label="dup",
+        overlays=[
+            {
+                "label": "dup",
+                "set_id": first_id,
+                "t": overlay_t,
+                "series": {"A": overlay_series},
+            }
+        ],
+    )
+    qt_app.processEvents()
+
+    main_window._record_current_main_plot_workspace_preview_provenance(
+        selected_set_ids=[first_id, second_id]
+    )
+
+    provenance = main_window._main_plot_workspace_preview_provenance()
+    assert set(provenance) == {first_id}
+    assert provenance[first_id] == main_window._current_workspace_preview_identity_payload(set_id=first_id)
+    assert second_id not in provenance
+
+
+@pytest.mark.gui
 def test_selection_change_clean_focused_partial_workspace_preview_keeps_resolved_results_visible_with_pending_status(
     main_window, monkeypatch, qt_app
 ):
@@ -2328,3 +2550,159 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
         np.asarray([2.0, 4.0], dtype=float),
     )
     assert main_window.active_batch_selection()[0] == newer_id
+
+
+@pytest.mark.gui
+def test_copy_all_export_plan_is_side_effect_free_and_disambiguates_duplicate_missing_labels(
+    main_window, qt_app
+):
+    from PySide6 import QtWidgets
+
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {
+        "A": np.asarray([1.0, 2.0], dtype=float),
+        "B": np.asarray([0.1, 0.2], dtype=float),
+    }
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window._status_label.setText("unchanged")
+    main_window._set_main_plot_workspace_preview_provenance({"sentinel": {"marker": 1}})
+
+    main_window._batch_model.set_species(["A", "B"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _set_shown_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "dup")
+
+    cache_key = "copy-all-cache-key"
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = cache_key
+    cache.active_cache_valid_set_ids = [first_id, second_id]
+    cache.active_cache_invalidated_set_ids = []
+    cache.result_cache[f"{cache_key}::{first_id}"] = {
+        "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+        "series": {
+            "A": np.asarray([10.0, 11.0, 12.0], dtype=float),
+            "B": np.asarray([0.3, 0.4, 0.5], dtype=float),
+        },
+        "algebra_scalars": {},
+    }
+
+    before_status = main_window._status_label.text()
+    before_selection = main_window.active_batch_selection()
+    before_plot_label = getattr(main_window.main_plot(), "_simulation_set_label", None)
+    before_plot_t = np.asarray(getattr(main_window.main_plot(), "_t", []), dtype=float).copy()
+    before_plot_series = {
+        str(name): np.asarray(values, dtype=float).copy()
+        for name, values in dict(getattr(main_window.main_plot(), "_series", {}) or {}).items()
+    }
+    before_provenance = dict(main_window._main_plot_workspace_preview_provenance())
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(first_id, "dup (row 1)")]
+    assert len(plan.missing_items) == 1
+    assert plan.missing_items[0].set_id == second_id
+    assert plan.missing_items[0].label == "dup"
+    assert plan.missing_items[0].popup_label == "dup (row 2)"
+    assert plan.missing_items[0].reason == "no_cached_results"
+    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0, 2.0], dtype=float))
+    np.testing.assert_allclose(
+        plan.shown_blocks[0].series["A"],
+        np.asarray([10.0, 11.0, 12.0], dtype=float),
+    )
+
+    assert main_window._status_label.text() == before_status
+    assert main_window.active_batch_selection() == before_selection
+    assert getattr(main_window.main_plot(), "_simulation_set_label", None) == before_plot_label
+    np.testing.assert_allclose(np.asarray(getattr(main_window.main_plot(), "_t", []), dtype=float), before_plot_t)
+    assert main_window._main_plot_workspace_preview_provenance() == before_provenance
+    for name, values in before_plot_series.items():
+        np.testing.assert_allclose(
+            np.asarray(getattr(main_window.main_plot(), "_series", {})[name], dtype=float),
+            values,
+        )
+
+
+@pytest.mark.gui
+def test_copy_all_export_plan_includes_live_primary_when_no_rows_are_shown(main_window, monkeypatch, qt_app):
+    main_window._batch_model.set_species(["A"])
+    cache = main_window.simulation_controller.batch_cache
+    primary_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert primary_id
+    primary_label = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
+    cache.active_batch_set_id = primary_id
+    cache.active_batch_set = primary_label
+    cache.last_display_selection = [primary_id]
+    monkeypatch.setattr(main_window, "shown_batch_set_ids", lambda: [], raising=False)
+    monkeypatch.setattr(main_window, "display_cached_batch_selection", lambda **_kwargs: False, raising=False)
+
+    main_window.simulation_controller.run_state.latest_sim_request_id = 31
+    main_window.simulation_controller.run_state.active_run_id = 31
+    main_window.simulation_controller.on_simulation_complete(
+        _fake_sim_result(marker=5.0),
+        run_id=31,
+        fast_mode=False,
+        request_id=31,
+        batch_set=primary_label,
+        batch_set_id=primary_id,
+        cache_key="copy-all-direct-hidden-rows",
+    )
+    qt_app.processEvents()
+
+    assert main_window.shown_batch_set_ids() == []
+    assert main_window.main_plot_has_data() is True
+    assert main_window.active_batch_selection() == (primary_id, primary_label)
+    assert cache.last_display_selection == [primary_id]
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(primary_id, primary_label)]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0], dtype=float))
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], np.asarray([5.0, 10.0], dtype=float))
+
+
+@pytest.mark.gui
+def test_copy_all_export_plan_keeps_batch_identity_when_hidden_rows_mask_batch_sourced_plot(
+    main_window, monkeypatch, qt_app
+):
+    main_window._batch_model.set_species(["A"])
+    cache = main_window.simulation_controller.batch_cache
+    primary_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert primary_id
+    cache_key = "copy-all-hidden-rows-batch"
+    primary_label = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
+    cache.result_cache[f"{cache_key}::{primary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([7.0, 8.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+
+    displayed = main_window.display_cached_batch_selection(
+        cache_key=cache_key,
+        selected_sets=[primary_id],
+        prefer_set=primary_id,
+        allow_fallback=False,
+    )
+    qt_app.processEvents()
+
+    assert displayed is True
+    assert main_window.active_batch_selection() == (primary_id, primary_label)
+    monkeypatch.setattr(main_window, "shown_batch_set_ids", lambda: [], raising=False)
+
+    plan = main_window._build_main_plot_copy_all_export_plan()
+
+    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(primary_id, primary_label)]
+    assert plan.missing_items == []
+    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0], dtype=float))
+    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], np.asarray([7.0, 8.0], dtype=float))

@@ -145,12 +145,12 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             return None
         if orientation == QtCore.Qt.Horizontal:
             if section == 0:
-                return "SetName"
+                return "Set Name"
             species = self._store.visible_species()
             if 0 <= section - 1 < len(species):
                 return f"{species[section - 1]} (M)"
             if section == self.edit_target_column():
-                return "Target"
+                return "Slider"
             if section == self.show_column():
                 return "Show"
             return ""
@@ -192,9 +192,18 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.TextAlignmentRole and self.is_control_column(col):
             return int(QtCore.Qt.AlignCenter)
 
-        if role == QtCore.Qt.ToolTipRole and col == self.edit_target_column():
-            if self._is_temporarily_focus_target_row(row):
-                return "Focused row is temporarily included in slider edit scope."
+        if role == QtCore.Qt.ToolTipRole:
+            if col == 0:
+                names = self._store.set_names()
+                return names[row] if 0 <= row < len(names) else None
+            if 1 <= col < self.edit_target_column():
+                return self.data(index, QtCore.Qt.DisplayRole)
+            if col == self.edit_target_column():
+                if self._is_temporarily_focus_target_row(row):
+                    return "Focused row is temporarily included in slider edit scope."
+                return "Select which batch set the interactive sliders control"
+            if col == self.show_column():
+                return "Show or hide this set's curves on the plot"
             return None
 
         if role == QtCore.Qt.ForegroundRole and col == self.edit_target_column():
@@ -326,6 +335,12 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         self.setAlternatingRowColors(True)
 
     def setModel(self, model: Optional[QtCore.QAbstractItemModel]) -> None:  # noqa: N802
+        old_model = self.model()
+        if isinstance(old_model, BatchInitialConditionsTableModel):
+            try:
+                old_model.modelReset.disconnect(self._apply_column_presentation)
+            except (TypeError, RuntimeError):
+                pass
         super().setModel(model)
         if isinstance(model, BatchInitialConditionsTableModel):
             model.modelReset.connect(self._apply_column_presentation)
@@ -382,12 +397,26 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             if current_visual != visual_index:
                 header.moveSection(current_visual, visual_index)
         header.setSectionsMovable(bool(movable_before))
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
         for column in range(1, model.edit_target_column()):
-            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self._auto_fit_columns()
         for column in (model.edit_target_column(), model.show_column()):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.setColumnWidth(column, 72 if column == model.edit_target_column() else 56)
+
+    def _auto_fit_columns(self) -> None:
+        model = self.model()
+        if not isinstance(model, BatchInitialConditionsTableModel):
+            return
+        if model.rowCount() == 0:
+            return
+        fm = self.horizontalHeader().fontMetrics()
+        set_name_min = fm.horizontalAdvance(" Set Name ") + 20
+        for column in range(0, model.edit_target_column()):
+            self.resizeColumnToContents(column)
+            if column == 0 and self.columnWidth(column) < set_name_min:
+                self.setColumnWidth(column, set_name_min)
 
     def _control_index_at_event(self, event: QtGui.QMouseEvent) -> QtCore.QModelIndex | None:
         if event.button() != QtCore.Qt.LeftButton:

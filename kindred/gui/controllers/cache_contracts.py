@@ -27,6 +27,7 @@ class PlotOverlayEntryV1(TypedDict):
     t: np.ndarray
     series: Dict[str, np.ndarray]
     set_id: NotRequired[str]
+    popup_label: NotRequired[str]
     curve_role: NotRequired[str]
 
 

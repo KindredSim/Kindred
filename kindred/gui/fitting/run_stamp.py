@@ -55,6 +55,32 @@ def _normalize_applied_fit_targets(
     return applied_norm
 
 
+def _normalize_applied_target_weights(
+    applied_target_weights: Optional[Dict[str, Dict[str, float]]],
+    *,
+    applied_fit_targets: Dict[str, List[str]],
+    included_ids: set[str],
+) -> dict[str, dict[str, str]]:
+    raw = dict(applied_target_weights or {}) if isinstance(applied_target_weights, dict) else {}
+    normalized: dict[str, dict[str, str]] = {}
+    for ds_id, targets in applied_fit_targets.items():
+        key = str(ds_id).strip()
+        if not key or key not in included_ids:
+            continue
+        weight_map = raw.get(key)
+        weight_map = dict(weight_map) if isinstance(weight_map, dict) else {}
+        normalized[key] = {}
+        for target_name in sorted({str(x).strip() for x in (targets or []) if str(x).strip()}):
+            try:
+                value = float(weight_map.get(target_name, 1.0))
+            except Exception:
+                value = 1.0
+            if not np.isfinite(value) or value <= 0.0:
+                value = 1.0
+            normalized[key][target_name] = _float_to_canonical_str(value)
+    return normalized
+
+
 def _index_dataset_rows_by_id(
     dataset_rows: Sequence[Dict[str, Any]],
     *,
@@ -74,6 +100,7 @@ def _build_global_fit_datasets_block(
     ordered_ids: Sequence[str],
     row_by_id: Dict[str, Dict[str, Any]],
     applied_targets: Dict[str, List[str]],
+    applied_target_weights: Dict[str, Dict[str, str]],
 ) -> list[dict[str, Any]]:
     datasets_block: list[dict[str, Any]] = []
     for ds_id in ordered_ids:
@@ -84,6 +111,7 @@ def _build_global_fit_datasets_block(
                 "label": str(row.get("label") or ds_id),
                 "weight_input": _float_to_canonical_str(row.get("weight", 1.0)),
                 "fit_targets_applied": list(applied_targets.get(ds_id, [])),
+                "target_weights_applied": dict(applied_target_weights.get(ds_id, {})),
             }
         )
     return datasets_block
@@ -234,6 +262,7 @@ def build_global_fit_run_stamp(
     applied_fit_targets: Dict[str, Sequence[str]],
     weights_used: Optional[Dict[str, float]],
     weight_mode: str,
+    applied_target_weights: Optional[Dict[str, Dict[str, float]]] = None,
     fit_config: Dict[str, Any],
     mechanism_text: str,
     reactions_text: str,
@@ -245,11 +274,17 @@ def build_global_fit_run_stamp(
     ordered_ids = _normalize_included_dataset_ids(included_ids)
     included = set(ordered_ids)
     applied_norm = _normalize_applied_fit_targets(applied_fit_targets, included_ids=included)
+    applied_target_weights_norm = _normalize_applied_target_weights(
+        applied_target_weights,
+        applied_fit_targets=applied_norm,
+        included_ids=included,
+    )
     row_by_id = _index_dataset_rows_by_id(dataset_rows, included_ids=included)
     datasets_block = _build_global_fit_datasets_block(
         ordered_ids=ordered_ids,
         row_by_id=row_by_id,
         applied_targets=applied_norm,
+        applied_target_weights=applied_target_weights_norm,
     )
     weights_block = _normalize_global_fit_weights_used(weights_used)
 
@@ -279,11 +314,12 @@ def build_global_fit_run_stamp(
     prepared_block = _normalize_prepared_simulation_block(prepared_simulation)
 
     return {
-        "version": 2,
+        "version": 3,
         "mode": "global",
         "kindred_version": str(KINDRED_VERSION or ""),
         "datasets": datasets_block,
         "fit_targets_applied": {k: applied_norm[k] for k in ordered_ids if k in applied_norm},
+        "target_weights_applied": {k: applied_target_weights_norm[k] for k in ordered_ids if k in applied_target_weights_norm},
         "weight_mode": str(weight_mode or ""),
         "weights_used": weights_block,
         "algorithm": {

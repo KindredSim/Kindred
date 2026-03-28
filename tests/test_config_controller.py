@@ -540,6 +540,34 @@ def test_splitter_state_round_trips_via_main_plot_workspace_splitter_even_with_d
         qt_app.processEvents()
 
 
+def test_load_settings_corrupt_splitter_state_falls_back_without_crashing(main_window, monkeypatch, caplog):
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("window/splitter_state", QtCore.QByteArray(b"corrupt-state"))
+    settings.sync()
+
+    splitter = main_window._plot_tabs._main_plot._main_splitter
+    assert splitter is not None
+    baseline_state = splitter.saveState()
+
+    original_value = settings.value
+
+    def _raising_value(key, *args, **kwargs):
+        if key == "window/splitter_state":
+            raise EOFError("Ran out of input")
+        return original_value(key, *args, **kwargs)
+
+    monkeypatch.setattr(settings, "value", _raising_value)
+
+    with caplog.at_level("WARNING"):
+        main_window.config_controller.load_settings()
+
+    assert splitter.saveState() == baseline_state
+    assert settings.contains("window/splitter_state") is False
+    assert "window/splitter_state" in caplog.text
+    assert "Ran out of input" in caplog.text
+
+
 def test_compact_on_screen_sliders_dock_floating_state_round_trips_via_window_state(main_window, qt_app, monkeypatch):
     settings = main_window._settings
     settings.clear()
