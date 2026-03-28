@@ -1066,6 +1066,9 @@ def test_move_relabels_overlays_when_primary_is_empty_but_display_selection_surv
     qt_app.processEvents()
 
     assert main_window._batch_store.set_names()[:2] == ["dup", "dup"]
+    # Without a live active set_id, the primary cannot resolve to a truthful row.
+    # Row-qualified disambiguation only applies to entries that still map to a batch row.
+    assert getattr(plot, "_simulation_set_popup_label", None) == "dup"
     overlays = list(getattr(plot, "_simulation_overlays", []) or [])
     assert overlays
     assert overlays[0]["popup_label"] == "dup (row 1)"
