@@ -227,6 +227,7 @@ if PYQTGRAPH_AVAILABLE:
 
             # Batch simulation overlays (multiple initial-condition sets overlaid as lines)
             self._simulation_set_label: Optional[str] = None
+            self._simulation_set_popup_label: Optional[str] = None
             self._simulation_overlays: List[Dict[str, object]] = []
 
             # Axis control (for parametric mode and custom X-axis)
@@ -481,6 +482,7 @@ if PYQTGRAPH_AVAILABLE:
                     color_manager.seed_species(sorted(self._owned_species_keys))
 
             self._simulation_set_label = str(label) if label else None
+            self._simulation_set_popup_label = None
             self._workspace_preview_display_provenance_by_set_id = {}
             normalized_overlays: List[Dict[str, object]] = []
             for entry in (overlays or []):
@@ -504,6 +506,9 @@ if PYQTGRAPH_AVAILABLE:
                 set_id = str(entry.get("set_id") or "").strip()
                 if set_id:
                     normalized_entry["set_id"] = set_id
+                popup_label = str(entry.get("popup_label") or "").strip()
+                if popup_label:
+                    normalized_entry["popup_label"] = popup_label
                 curve_role = str(entry.get("curve_role") or "").strip()
                 if curve_role:
                     normalized_entry["curve_role"] = curve_role
@@ -780,6 +785,15 @@ if PYQTGRAPH_AVAILABLE:
         def _copy_series_header(self, block_label: Optional[str], series_name: str) -> str:
             return self._qualified_copy_header(block_label, self._series_header_text(series_name))
 
+        def _primary_copy_block_label(self) -> str:
+            return str(self._simulation_set_popup_label or self._simulation_set_label or "").strip()
+
+        @staticmethod
+        def _overlay_copy_block_label(entry: object) -> str:
+            if not isinstance(entry, dict):
+                return ""
+            return str(entry.get("popup_label") or entry.get("label") or "").strip()
+
         def _append_copy_column(
             self,
             columns: List[Tuple[str, np.ndarray]],
@@ -823,7 +837,7 @@ if PYQTGRAPH_AVAILABLE:
                 entry_set_id = str(entry.get("set_id") or "").strip()
                 if entry_set_id and entry_set_id in excluded:
                     continue
-                block_label = str(entry.get("label") or "").strip()
+                block_label = self._overlay_copy_block_label(entry)
                 overlay_series = entry.get("series") or {}
                 if not isinstance(overlay_series, dict):
                     continue
@@ -1047,7 +1061,7 @@ if PYQTGRAPH_AVAILABLE:
             x_name, x_label, x_array, x_plot, t_plot, sample_idx = primary_basis
 
             blocks: List[List[Tuple[str, np.ndarray]]] = []
-            primary_label = str(self._simulation_set_label or "").strip()
+            primary_label = self._primary_copy_block_label()
             primary_columns: List[Tuple[str, np.ndarray]] = []
 
             if t_plot is not None:
@@ -1919,7 +1933,7 @@ if PYQTGRAPH_AVAILABLE:
                     continue
                 if str(entry.get("curve_role") or "") == "canonical_ghost":
                     continue
-                block_label = str(entry.get("label") or "").strip()
+                block_label = self._overlay_copy_block_label(entry)
                 overlay_series_map = entry.get("series") or {}
                 if not isinstance(overlay_series_map, dict):
                     continue

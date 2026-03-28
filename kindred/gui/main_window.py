@@ -2810,7 +2810,7 @@ class MainWindow(
             if not isinstance(entry, dict):
                 continue
             overlay_label = str(entry.get("label") or "").strip()
-            overlay_set_id = overlay_label_to_set_id.get(overlay_label)
+            overlay_set_id = str(entry.get("set_id") or "").strip() or overlay_label_to_set_id.get(overlay_label, "")
             if not overlay_set_id or overlay_set_id not in selected_dirty_overlay_ids:
                 continue
             overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
@@ -3127,6 +3127,10 @@ class MainWindow(
                     label=plot_label,
                     overlays=preserved_overlays if preserve_multiselect_overlays else [],
                     owned_species=plot_owned_species,
+                )
+                self.sync_main_plot_copy_labels(
+                    preserved_set_id,
+                    preserved_selected_ids or ([preserved_set_id] if preserved_set_id else []),
                 )
                 plot_results_map: Dict[str, Dict[str, object]] = {
                     plot_label: {
@@ -3538,6 +3542,32 @@ class MainWindow(
         owned_species: Optional[Sequence[str]] = None,
     ) -> None:
         self.main_plot().set_data(t, series, label=label, overlays=overlays, owned_species=owned_species)
+
+    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None:
+        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+        if plot is None:
+            return
+        primary_set_id_s = str(primary_set_id or "").strip()
+        selected_ids: list[str] = []
+        for raw_set_id in selected_set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id or set_id in selected_ids:
+                continue
+            selected_ids.append(set_id)
+        if primary_set_id_s and primary_set_id_s not in selected_ids:
+            selected_ids.append(primary_set_id_s)
+        popup_labels = self._copy_all_popup_labels_by_set_id(selected_ids)
+        primary_label = str(getattr(plot, "_simulation_set_label", "") or "").strip()
+        setattr(plot, "_simulation_set_popup_label", str(popup_labels.get(primary_set_id_s, primary_label)))
+        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
+            if not isinstance(entry, dict):
+                continue
+            entry_set_id = str(entry.get("set_id") or "").strip()
+            popup_label = str(popup_labels.get(entry_set_id, "")).strip()
+            if popup_label:
+                entry["popup_label"] = popup_label
+            else:
+                entry.pop("popup_label", None)
 
     def show_simulation_tab(self) -> None:
         self._plot_tabs._tabs.setCurrentIndex(0)

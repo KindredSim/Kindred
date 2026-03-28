@@ -354,6 +354,7 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
         main_plot_stats_table=main_window.main_plot_stats_table,
         set_results_table=main_window.set_results_table,
         set_main_plot_data=main_window.set_main_plot_data,
+        sync_main_plot_copy_labels=main_window.sync_main_plot_copy_labels,
         show_simulation_tab=main_window.show_simulation_tab,
         refresh_simulation_plot_views=main_window.refresh_simulation_plot_views,
         schedule_main_plot_refresh=main_window.schedule_main_plot_refresh,

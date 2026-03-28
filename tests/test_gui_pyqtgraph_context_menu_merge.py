@@ -447,6 +447,60 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_visible_export_and_copy_visible_data_use_popup_labels_for_duplicate_simulation_names(
+    qtbot, monkeypatch
+):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {"A": np.array([1.0, 2.0, 3.0], dtype=float)},
+        label="dup",
+        overlays=[
+            {
+                "label": "dup",
+                "popup_label": "dup (row 2)",
+                "set_id": "set2",
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "series": {"A": np.array([10.0, 11.0, 12.0], dtype=float)},
+            }
+        ],
+    )
+    panel._simulation_set_popup_label = "dup (row 1)"
+    panel.set_selected_series(["A"])
+    QtWidgets.QApplication.processEvents()
+
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert "Time (s)" in axis_header
+    assert "A" in axis_header
+    assert any(cell.startswith("dup (row 2)::") for cell in axis_header)
+    assert all(not cell.startswith("dup::") for cell in axis_header)
+
+    all_header, all_rows = panel.build_visible_export("all")
+    assert all_rows
+    assert "Time (s)" in all_header
+    assert "A" in all_header
+    assert any(cell.startswith("dup (row 2)::") for cell in all_header)
+    assert all(not cell.startswith("dup::") for cell in all_header)
+
+    panel._copy_visible_data()
+
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    header = rows[0]
+    assert any(cell.startswith("dup (row 1)::") for cell in header)
+    assert any(cell.startswith("dup (row 2)::") for cell in header)
+    assert all(not cell.startswith("dup::") for cell in header)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_dataset_markers(
     qtbot, monkeypatch
 ):

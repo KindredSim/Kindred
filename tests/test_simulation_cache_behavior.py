@@ -1528,6 +1528,74 @@ def test_copy_all_export_plan_includes_non_primary_live_overlay_shown_block_with
 
 
 @pytest.mark.gui
+def test_main_plot_workspace_preview_provenance_prefers_overlay_set_id_for_duplicate_labels(
+    main_window,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _set_shown_rows(main_window, [0, 1])
+    _select_rows(main_window, [1, 0])
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "dup")
+
+    cache = main_window.simulation_controller.batch_cache
+    preview_key = "duplicate-label-provenance-preview-key"
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[first_id])
+    overlay_t = _current_preview_time_axis(main_window)
+    overlay_series = np.linspace(21.0, 42.0, overlay_t.size, dtype=float)
+    cache.preview_cache[f"{preview_key}::{first_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=first_id,
+        series={"A": overlay_series},
+    )
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (first_id,)
+
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([5.0, 6.0], dtype=float)},
+        label="dup",
+        overlays=[
+            {
+                "label": "dup",
+                "set_id": first_id,
+                "t": overlay_t,
+                "series": {"A": overlay_series},
+            }
+        ],
+    )
+    qt_app.processEvents()
+
+    main_window._record_current_main_plot_workspace_preview_provenance(
+        selected_set_ids=[first_id, second_id]
+    )
+
+    provenance = main_window._main_plot_workspace_preview_provenance()
+    assert set(provenance) == {first_id}
+    assert provenance[first_id] == main_window._current_workspace_preview_identity_payload(set_id=first_id)
+    assert second_id not in provenance
+
+
+@pytest.mark.gui
 def test_selection_change_clean_focused_partial_workspace_preview_keeps_resolved_results_visible_with_pending_status(
     main_window, monkeypatch, qt_app
 ):

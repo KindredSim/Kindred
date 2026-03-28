@@ -41,6 +41,7 @@ def _make_results_ui(plot: object) -> SimpleNamespace:
         main_plot_stats_table=lambda: MagicMock(),
         set_results_table=lambda _table: None,
         set_main_plot_data=lambda *_args, **_kwargs: None,
+        sync_main_plot_copy_labels=lambda _primary_set_id, _selected_set_ids: None,
         show_simulation_tab=lambda: None,
         refresh_simulation_plot_views=lambda: None,
         schedule_main_plot_refresh=lambda _delays: None,
@@ -340,6 +341,39 @@ def test_display_cached_batch_selection_outcome_includes_set_id_on_clean_cached_
     assert len(overlays) == 1
     assert overlays[0]["label"] == "set1"
     assert overlays[0]["set_id"] == "set1"
+
+
+def test_display_cached_batch_selection_outcome_syncs_copy_labels_for_duplicate_names() -> None:
+    plot = MagicMock()
+    ui = _make_results_ui(plot)
+    ui.batch_name_for_id = lambda set_id: {"set1": "dup", "set2": "dup"}.get(str(set_id))
+    ui.batch_id_for_name = lambda name: None
+    ui.set_main_plot_data = MagicMock()
+    ui.sync_main_plot_copy_labels = MagicMock()
+    controller = ResultsController(ui)
+    store = {
+        "cache-key::set1": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([1.0, 0.5], dtype=float)},
+            "algebra_scalars": {},
+        },
+        "cache-key::set2": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([2.0, 1.5], dtype=float)},
+            "algebra_scalars": {},
+        },
+    }
+
+    outcome = controller.display_cached_batch_selection_outcome(
+        cache_key="cache-key",
+        selected_sets=["set1", "set2"],
+        prefer_set="set2",
+        cache_store=store,
+        allow_fallback=False,
+    )
+
+    assert outcome == CachedBatchSelectionDisplayOutcome(True, reason=None)
+    ui.sync_main_plot_copy_labels.assert_called_once_with("set2", ["set1", "set2"])
 
 
 def test_display_cached_batch_selection_forwards_valid_subset_without_fallback() -> None:
