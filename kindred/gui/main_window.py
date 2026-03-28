@@ -374,15 +374,11 @@ class MainWindow(
         locked = self.mechanism_editing_locked()
         button_text = "Allow Editing"
         tooltip = (
-            "Temporarily enable deliberate edits in the Reactions editor."
+            "Toggle to enable editing of the reaction mechanism"
             if locked
-            else "Return the Reactions editor to read-only mode."
+            else "Toggle to return the reaction mechanism to read-only mode"
         )
-        status_text = (
-            "Reactions editor is read-only. Use Allow Editing to make changes."
-            if locked
-            else "Reactions editor is unlocked. Changes here modify the canonical mechanism text saved with the project."
-        )
+        status_text = ""
         editor = getattr(self, "_mechanism_editor", None)
         if editor is not None:
             set_read_only = getattr(editor, "set_reactions_read_only", None)

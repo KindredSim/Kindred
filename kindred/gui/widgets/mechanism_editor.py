@@ -153,28 +153,33 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         # Fine mode toggle
         self._fine_btn = QtWidgets.QPushButton("Fine")
         self._fine_btn.setCheckable(True)
+        self._fine_btn.setToolTip("Toggle fine adjustment mode for more precise slider control")
         self._fine_btn.toggled.connect(lambda v: self._variable_sliders.set_fine_mode(v))
         slider_actions_layout.addWidget(self._fine_btn)
 
         # Override mode controls (Commit/Reset)
         self._commit_slider_overrides_btn = QtWidgets.QPushButton("Commit")
         self._commit_slider_overrides_btn.setObjectName("commitSliderOverridesButton")
+        self._commit_slider_overrides_btn.setToolTip("Apply current slider values to the canonical mechanism")
         slider_actions_layout.addWidget(self._commit_slider_overrides_btn)
 
         self._reset_slider_overrides_btn = QtWidgets.QPushButton("Reset")
         self._reset_slider_overrides_btn.setObjectName("resetSliderOverridesButton")
+        self._reset_slider_overrides_btn.setToolTip("Revert sliders to canonical mechanism values")
         slider_actions_layout.addWidget(self._reset_slider_overrides_btn)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
         self._slider_visibility_picker_btn.setText("Visible sliders")
         self._slider_visibility_picker_btn.setObjectName("sliderVisibilityPickerButton")
+        self._slider_visibility_picker_btn.setToolTip("Choose which mechanism parameters to show as interactive sliders")
         self._slider_visibility_picker_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self._slider_visibility_menu = _PersistentToggleMenu(self)
         self._slider_visibility_menu.aboutToShow.connect(self._rebuild_slider_visibility_menu)
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
         self._slider_edit_targets_label = QtWidgets.QLabel("Slider edit targets: none")
+        self._slider_edit_targets_label.setToolTip("The batch set whose initial conditions are controlled by concentration sliders")
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
         self._slider_edit_targets_label.setFont(target_font)
@@ -191,6 +196,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_points_spin.setSingleStep(50)
         self._slider_points_spin.setValue(100)
         self._slider_points_spin.setMinimumWidth(100)
+        self._slider_points_spin.setToolTip("Number of time points for slider preview simulations")
         slider_runtime_layout.addWidget(self._slider_points_spin)
 
         # Slider solver
@@ -198,6 +204,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_solver_combo = QtWidgets.QComboBox()
         self._slider_solver_combo.addItems(["LSODA", "Radau", "BDF"])
         self._slider_solver_combo.setCurrentText("LSODA")
+        self._slider_solver_combo.setToolTip("ODE solver used for slider preview simulations")
         slider_runtime_layout.addWidget(self._slider_solver_combo)
         slider_runtime_layout.addStretch()
 
@@ -478,6 +485,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         """
         self._current_validation_state = state
         self._run_btn.setEnabled(state == "valid")
+        self._run_btn.setToolTip(
+            "Run simulation for all selected batch sets (same as Run Selected in Batch Initial Conditions)"
+            if state == "valid"
+            else "No valid mechanism \u2014 enter a valid reaction mechanism to enable"
+        )
 
         if state == "idle":
             self._validation_label.setText("")

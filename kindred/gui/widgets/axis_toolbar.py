@@ -108,10 +108,11 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_selector_btn.setMenu(self._y_menu)
 
         self._parametric = QtWidgets.QCheckBox("Parametric", self)
-        self._parametric.setToolTip("Plot X(t) vs each selected Y(t)")
+        self._parametric.setToolTip("Plot selected Y variables against each other instead of against time")
 
         self._options_btn = QtWidgets.QToolButton(self)
         self._options_btn.setText("Options")
+        self._options_btn.setToolTip("Plot display options")
         self._options_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self._options_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._options_btn.setIcon(QtGui.QIcon.fromTheme("preferences-other"))
@@ -134,7 +135,7 @@ class AxisToolbar(QtWidgets.QWidget):
         # Axis range controls
         self._auto_range = QtWidgets.QCheckBox("Auto", self)
         self._auto_range.setChecked(True)
-        self._auto_range.setToolTip("Automatically fit axes to data")
+        self._auto_range.setToolTip("Auto-scale axes to fit all visible data")
 
         self._x_min = QtWidgets.QLineEdit(self)
         self._x_min.setPlaceholderText("X min")

@@ -201,7 +201,9 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             if col == self.edit_target_column():
                 if self._is_temporarily_focus_target_row(row):
                     return "Focused row is temporarily included in slider edit scope."
-                return None
+                return "Select which batch set the interactive sliders control"
+            if col == self.show_column():
+                return "Show or hide this set's curves on the plot"
             return None
 
         if role == QtCore.Qt.ForegroundRole and col == self.edit_target_column():
