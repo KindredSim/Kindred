@@ -5010,12 +5010,11 @@ class MainWindow(
                     signals_blocked = False
         self._update_batch_row_controls_state()
         batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_set_id = str(self.active_batch_selection()[0] or "").strip()
-        if batch_cache is not None and active_set_id:
-            self.sync_main_plot_copy_labels(
-                active_set_id,
-                [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)],
-            )
+        if batch_cache is not None:
+            active_set_id = str(self.active_batch_selection()[0] or "").strip()
+            selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
+            if active_set_id or selected_ids:
+                self.sync_main_plot_copy_labels(active_set_id, selected_ids)
 
     def _batch_delete_target_rows(self) -> List[int]:
         rows = self._batch_selected_rows()

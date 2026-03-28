@@ -2229,6 +2229,9 @@ if PYQTGRAPH_AVAILABLE:
             self._annotations = []
             self._guide_items = []
             self._scalar_values = {}
+            self._simulation_set_label = None
+            self._simulation_set_popup_label = None
+            self._simulation_overlays = []
 
         # ==================== Plot Enhancements (v0.2.0) ====================
 

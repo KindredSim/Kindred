@@ -129,6 +129,40 @@ def test_pyqtgraph_native_menus_disabled_and_custom_actions_present(qtbot, monke
 
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_clear_resets_simulation_metadata_to_init_values(qtbot):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 2.0], dtype=float)},
+        label="dup",
+        overlays=[
+            {
+                "label": "dup",
+                "popup_label": "dup (row 2)",
+                "set_id": "set2",
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "series": {"A": np.asarray([3.0, 4.0], dtype=float)},
+            }
+        ],
+    )
+    panel._simulation_set_popup_label = "dup (row 1)"
+
+    assert panel._simulation_set_label == "dup"
+    assert panel._simulation_set_popup_label == "dup (row 1)"
+    assert list(panel._simulation_overlays or [])
+
+    panel.clear()
+
+    assert panel._simulation_set_label is None
+    assert panel._simulation_set_popup_label is None
+    assert panel._simulation_overlays == []
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_context_menu_toggle_hides_and_restores_canonical_reference_lines(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_canonical_ghost_toggle_action=True)
     qtbot.addWidget(panel)
