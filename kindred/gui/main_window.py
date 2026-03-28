@@ -5560,7 +5560,7 @@ class MainWindow(
     ) -> None:
         if not top_left.isValid() or not bottom_right.isValid():
             return
-        if int(top_left.column()) != 0 or int(bottom_right.column()) != 0:
+        if not (int(top_left.column()) <= 0 <= int(bottom_right.column())):
             return
         display_role = int(getattr(QtCore.Qt.DisplayRole, "value", QtCore.Qt.DisplayRole))
         normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}

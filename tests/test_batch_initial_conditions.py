@@ -1180,6 +1180,65 @@ def test_batch_set_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_
 
 
 @pytest.mark.gui
+def test_batch_table_paste_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_app):
+    from PySide6 import QtWidgets
+
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    main_window._batch_store.set_set_name(0, "dup")
+    main_window._batch_store.set_set_name(1, "set2")
+    main_window._batch_store.set_value(1, "A", 1.0)
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_batch_set_id = first_id
+    cache.active_batch_set = "dup"
+    cache.last_display_selection = [first_id, second_id]
+
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 2.0], dtype=float)},
+        label="dup",
+        overlays=[
+            {
+                "label": "set2",
+                "set_id": second_id,
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "series": {"A": np.asarray([3.0, 4.0], dtype=float)},
+            }
+        ],
+    )
+    main_window.sync_main_plot_copy_labels(first_id, [first_id, second_id])
+
+    plot = main_window._plot_tabs._main_plot
+    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
+    assert getattr(plot, "_simulation_set_popup_label", None) == "dup"
+    assert overlays[0].get("popup_label") == "set2"
+
+    table = getattr(main_window, "_batch_table", None)
+    assert table is not None
+    table.setCurrentIndex(main_window._batch_model.index(1, 0))
+
+    clipboard = QtWidgets.QApplication.clipboard()
+    assert clipboard is not None
+    clipboard.setText("dup\t1.0")
+    table._handle_paste()
+    qt_app.processEvents()
+
+    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
+    assert getattr(plot, "_simulation_set_popup_label", None) == "dup (row 1)"
+    assert overlays[0]["popup_label"] == "dup (row 2)"
+
+
+@pytest.mark.gui
 def test_global_fit_creates_and_seeds_new_batch_set_from_dataset_t0(main_window, monkeypatch):
     """
     Regression: starting a global fit should prompt for an unmapped dataset and,
