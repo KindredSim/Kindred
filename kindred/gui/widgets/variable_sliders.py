@@ -340,7 +340,7 @@ class VariableSliders(QtWidgets.QWidget):
         # Container for this slider
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(2)
 
         # Top row: name label and value label
@@ -439,7 +439,6 @@ class VariableSliders(QtWidgets.QWidget):
             max_label.setTextFormat(QtCore.Qt.RichText)
             min_label.setMinimumHeight(min_label.fontMetrics().height() + 4)
             max_label.setMinimumHeight(max_label.fontMetrics().height() + 4)
-        range_layout.addStretch()
         range_layout.addWidget(min_label)
         range_layout.addStretch()
         range_layout.addWidget(max_label)

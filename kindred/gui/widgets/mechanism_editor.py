@@ -172,8 +172,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.setSpacing(8)
 
         # Fine mode toggle
-        self._fine_btn = QtWidgets.QToolButton()
-        self._fine_btn.setText("Fine")
+        self._fine_btn = QtWidgets.QPushButton("Fine")
         self._fine_btn.setCheckable(True)
         self._fine_btn.toggled.connect(lambda v: self._variable_sliders.set_fine_mode(v))
         slider_actions_layout.addWidget(self._fine_btn)
@@ -207,7 +206,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_runtime_layout.setSpacing(8)
 
         # Slider simulation points
-        slider_runtime_layout.addWidget(QtWidgets.QLabel("Slider sim points:"))
+        slider_runtime_layout.addWidget(QtWidgets.QLabel("Points:"))
         self._slider_points_spin = QtWidgets.QSpinBox()
         self._slider_points_spin.setRange(50, 20000)
         self._slider_points_spin.setSingleStep(50)
@@ -216,7 +215,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_runtime_layout.addWidget(self._slider_points_spin)
 
         # Slider solver
-        slider_runtime_layout.addWidget(QtWidgets.QLabel("Slider solver:"))
+        slider_runtime_layout.addWidget(QtWidgets.QLabel("Solver:"))
         self._slider_solver_combo = QtWidgets.QComboBox()
         self._slider_solver_combo.addItems(["LSODA", "Radau", "BDF"])
         self._slider_solver_combo.setCurrentText("LSODA")
