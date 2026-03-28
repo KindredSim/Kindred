@@ -71,14 +71,14 @@ class SimulationPanel(QtWidgets.QWidget):
         self.sim_time_spinbox = QtWidgets.QLineEdit(controls_row_widget)
         self.sim_time_spinbox.setText("10.0")
         self.sim_time_spinbox.setToolTip("Total simulation time t_end in seconds (free-form numeric text)")
-        self.sim_time_spinbox.setMaximumWidth(100)
+        self.sim_time_spinbox.setMaximumWidth(140)
         self.sim_time_spinbox.textChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.num_points_spinbox = QtWidgets.QSpinBox(controls_row_widget)
         self.num_points_spinbox.setRange(10, 100000)  # 10 to 100k points
         self.num_points_spinbox.setValue(100)
         self.num_points_spinbox.setToolTip("Number of points in the simulation output")
-        self.num_points_spinbox.setMaximumWidth(100)
+        self.num_points_spinbox.setMaximumWidth(140)
         self.num_points_spinbox.valueChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.run_btn = QtWidgets.QPushButton("Run Selected")

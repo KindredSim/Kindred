@@ -435,6 +435,10 @@ class VariableSliders(QtWidgets.QWidget):
         else:
             min_label = QtWidgets.QLabel(self._format_power_of_ten(_LOG_SLIDER_EXP_MIN))
             max_label = QtWidgets.QLabel(self._format_power_of_ten(_LOG_SLIDER_EXP_MAX))
+            min_label.setTextFormat(QtCore.Qt.RichText)
+            max_label.setTextFormat(QtCore.Qt.RichText)
+            min_label.setMinimumHeight(min_label.fontMetrics().height() + 4)
+            max_label.setMinimumHeight(max_label.fontMetrics().height() + 4)
         range_layout.addStretch()
         range_layout.addWidget(min_label)
         range_layout.addStretch()
@@ -951,7 +955,7 @@ class VariableSliders(QtWidgets.QWidget):
         log_value = min(max(float(log_value), _LOG_SLIDER_EXP_MIN), _LOG_SLIDER_EXP_MAX)
         exponent = int(round(log_value))
         if abs(log_value - exponent) < 1e-6:
-            return f"10^{exponent}"
+            return f"10<sup>{exponent}</sup>"
         value = 10 ** log_value
         if value >= 1000 or value < 0.001:
             return f"{value:.1e}"
