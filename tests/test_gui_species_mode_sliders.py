@@ -974,7 +974,7 @@ def test_batch_table_visual_order_places_state_controls_before_set_name(main_win
     model = main_window._batch_model
     assert table is not None
 
-    assert _visual_headers(table, model)[:5] == ["Slider", "Show", "SetName", "A (M)", "B (M)"]
+    assert _visual_headers(table, model)[:5] == ["Slider", "Show", "Set Name", "A (M)", "B (M)"]
     assert main_window._mechanism_editor._slider_edit_targets_label.text() == "Slider edit targets: set1"
 
 

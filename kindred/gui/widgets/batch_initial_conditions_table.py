@@ -145,7 +145,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             return None
         if orientation == QtCore.Qt.Horizontal:
             if section == 0:
-                return "SetName"
+                return "Set Name"
             species = self._store.visible_species()
             if 0 <= section - 1 < len(species):
                 return f"{species[section - 1]} (M)"
@@ -382,22 +382,23 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             if current_visual != visual_index:
                 header.moveSection(current_visual, visual_index)
         header.setSectionsMovable(bool(movable_before))
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        self.setColumnWidth(0, 150)
         for column in range(1, model.edit_target_column()):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Interactive)
             self.setColumnWidth(column, 120)
-        self._auto_fit_species_columns()
+        self._auto_fit_columns()
         for column in (model.edit_target_column(), model.show_column()):
             header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.setColumnWidth(column, 72 if column == model.edit_target_column() else 56)
 
-    def _auto_fit_species_columns(self) -> None:
+    def _auto_fit_columns(self) -> None:
         model = self.model()
         if not isinstance(model, BatchInitialConditionsTableModel):
             return
         if model.rowCount() == 0:
             return
-        for column in range(1, model.edit_target_column()):
+        for column in range(0, model.edit_target_column()):
             self.resizeColumnToContents(column)
 
     def _control_index_at_event(self, event: QtGui.QMouseEvent) -> QtCore.QModelIndex | None:
