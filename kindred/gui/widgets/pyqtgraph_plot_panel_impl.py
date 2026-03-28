@@ -259,6 +259,7 @@ if PYQTGRAPH_AVAILABLE:
             # Create PyQtGraph PlotWidget
             self._plot_widget = pg.PlotWidget()
             self._plot_item = self._plot_widget.getPlotItem()
+            self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
 
             # Set white background (user requested light background)
             self._plot_widget.setBackground('w')
@@ -309,6 +310,7 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_surface = QtWidgets.QFrame(self)
             self._plot_surface.setObjectName("mainPlotSurface")
             self._plot_surface.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            self._plot_surface.setMinimumHeight(200)
             plot_surface_layout = QtWidgets.QVBoxLayout(self._plot_surface)
             plot_surface_layout.setContentsMargins(8, 0, 8, 0)
             plot_surface_layout.setSpacing(0)
@@ -408,6 +410,9 @@ if PYQTGRAPH_AVAILABLE:
                 return
             detail = max(120, int(round(total * 0.16)))
             detail = min(detail, max(140, int(total * 0.18)))
+            # Ensure the plot surface keeps at least 200px
+            if total - detail < 200:
+                detail = max(0, total - 200)
             plot = max(1, total - detail)
             splitter.setSizes([plot, detail])
 

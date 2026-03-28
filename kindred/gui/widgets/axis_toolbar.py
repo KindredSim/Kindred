@@ -117,8 +117,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self._options_btn.setIcon(QtGui.QIcon.fromTheme("preferences-other"))
 
         self._menu = QtWidgets.QMenu(self)
-        self._action_sampling_dense = self._menu.addAction("Sampling: Dense")
-        self._action_sampling_coarse = self._menu.addAction("Sampling: Coarse")
+        self._action_downsampling = self._menu.addAction("Downsampling: 1k points/curve")
+        self._action_downsampling.setCheckable(True)
+        self._action_downsampling.setChecked(False)
         self._menu.addSeparator()
         self._action_add_guide = self._menu.addAction("Add Guide from Scalar…")
         self._menu.addSeparator()
@@ -170,8 +171,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self._parametric.toggled.connect(self._on_parametric_toggled)
         self._y_list.itemChanged.connect(self._on_y_item_changed)
 
-        self._action_sampling_dense.triggered.connect(lambda: self._emit_option("sampling", "dense"))
-        self._action_sampling_coarse.triggered.connect(lambda: self._emit_option("sampling", "coarse"))
+        self._action_downsampling.toggled.connect(
+            lambda on: self._emit_option("sampling", "coarse" if on else "dense")
+        )
         self._action_add_guide.triggered.connect(lambda: self.addGuideRequested.emit(None))
         self._action_export_scope_visible.triggered.connect(lambda: self._emit_option("export_scope", "visible"))
         self._action_export_scope_all.triggered.connect(lambda: self._emit_option("export_scope", "all"))
@@ -329,7 +331,7 @@ class AxisToolbar(QtWidgets.QWidget):
         x_label: QtWidgets.QLabel,
         y_label: QtWidgets.QLabel
     ) -> None:
-        _ = y_label
+        y_label.setVisible(False)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
