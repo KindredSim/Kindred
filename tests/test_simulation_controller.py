@@ -359,6 +359,12 @@ class _FakeMainWindow(QtCore.QObject):
         value = self._batch_preferred_primary_set_id(list(rows))
         return str(value) if value is not None else None
 
+    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: list[str]) -> None:
+        _ = (set_id, set_name, selected_ids)
+
+    def clear_display_selection_state(self) -> None:
+        return None
+
     def batch_cache_key(
         self,
         *,

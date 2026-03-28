@@ -3368,6 +3368,10 @@ class SimulationController(QtCore.QObject):
                         owned_species = list(mechanism.species_names())
                     except Exception:
                         owned_species = None
+                if str(batch_set_id or "").strip():
+                    self.ui.batch.set_active_batch_selection(str(batch_set_id), str(batch_set or ""), [str(batch_set_id)])
+                else:
+                    self.ui.batch.clear_display_selection_state()
                 self.ui.results.set_data(
                     t,
                     series,

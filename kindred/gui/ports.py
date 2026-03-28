@@ -120,6 +120,10 @@ class SimulationBatchPort(Protocol):
 
     def batch_preferred_primary_set_id(self, rows: Sequence[int]) -> Optional[str]: ...
 
+    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: Sequence[str]) -> None: ...
+
+    def clear_display_selection_state(self) -> None: ...
+
     def batch_cache_key(
         self,
         *,

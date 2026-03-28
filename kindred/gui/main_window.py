@@ -3790,6 +3790,11 @@ class MainWindow(
         batch_cache.active_batch_set = str(set_name)
         batch_cache.last_display_selection = [str(item) for item in (selected_ids or []) if str(item)]
 
+    def clear_display_selection_state(self) -> None:
+        clear_display = getattr(self._sim_controller.batch_cache, "clear_display_selection_state", None)
+        if callable(clear_display):
+            clear_display()
+
     def batch_result_cache_store(self) -> MutableMapping[str, Dict[str, Any]]:
         return self._sim_controller.batch_cache.result_cache
 
@@ -4685,11 +4690,12 @@ class MainWindow(
         label: str,
     ):
         sid = str(set_id or "").strip()
-        if not sid or not self.main_plot_has_data():
+        if not self.main_plot_has_data():
             return None
-        active_set_id = str(self.active_batch_selection()[0] or "").strip()
-        if active_set_id != sid:
-            return None
+        if sid:
+            active_set_id = str(self.active_batch_selection()[0] or "").strip()
+            if active_set_id != sid:
+                return None
         plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
         if plot is None:
             return None
@@ -4780,11 +4786,17 @@ class MainWindow(
 
         shown_set_ids = [str(set_id) for set_id in (self.shown_batch_set_ids() or []) if str(set_id)]
         live_primary_fallback_set_id = ""
-        if not shown_set_ids:
+        non_batch_live_primary_label = ""
+        if not shown_set_ids and self.main_plot_has_data():
             active_set_id = str(self.active_batch_selection()[0] or "").strip()
-            if active_set_id and self.main_plot_has_data():
+            if active_set_id:
                 shown_set_ids = [active_set_id]
                 live_primary_fallback_set_id = active_set_id
+            else:
+                plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
+                non_batch_live_primary_label = str(
+                    getattr(plot, "_simulation_set_label", "") if plot is not None else ""
+                ).strip() or "Results"
         popup_labels = self._copy_all_popup_labels_by_set_id(shown_set_ids)
         batch_cache = self._sim_controller.batch_cache
         cache_key = str(batch_cache.active_cache_key or "")
@@ -4830,6 +4842,22 @@ class MainWindow(
                     reason=str(reason or "no_cached_results"),
                 )
             )
+        if non_batch_live_primary_label:
+            block = self._copy_all_live_primary_block(
+                set_id="",
+                label=non_batch_live_primary_label,
+            )
+            if block is not None:
+                shown_blocks.append(block)
+            else:
+                missing_items.append(
+                    CopyAllMissingItem(
+                        set_id="",
+                        label=non_batch_live_primary_label,
+                        popup_label=non_batch_live_primary_label,
+                        reason="no_simulation_data",
+                    )
+                )
         return CopyAllExportPlan(shown_blocks=shown_blocks, missing_items=missing_items)
 
     def _set_cached_focused_batch_set_id(self, set_id: str) -> str:
@@ -4982,9 +5010,10 @@ class MainWindow(
                     signals_blocked = False
         self._update_batch_row_controls_state()
         batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        if batch_cache is not None:
+        active_set_id = str(self.active_batch_selection()[0] or "").strip()
+        if batch_cache is not None and active_set_id:
             self.sync_main_plot_copy_labels(
-                str(self.active_batch_selection()[0] or ""),
+                active_set_id,
                 [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)],
             )
 

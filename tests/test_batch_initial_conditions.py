@@ -944,6 +944,73 @@ def test_move_reorders_cached_main_plot_popup_labels_for_duplicate_names(main_wi
 
 
 @pytest.mark.gui
+def test_move_skips_main_plot_popup_resync_for_direct_path_plot(main_window, monkeypatch, qt_app):
+    from PySide6 import QtCore, QtWidgets
+
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    first_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_id and second_id
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_batch_set_id = first_id
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(first_id) or first_id)
+    cache.last_display_selection = [first_id, second_id]
+
+    monkeypatch.setattr(main_window, "display_cached_batch_selection", lambda **_kwargs: False, raising=False)
+
+    main_window.simulation_controller.run_state.latest_sim_request_id = 44
+    main_window.simulation_controller.run_state.active_run_id = 44
+    main_window.simulation_controller.on_simulation_complete(
+        {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "Y": np.asarray([[2.0, 4.0]], dtype=float),
+            "species_names": ["A"],
+            "algebra_scalars": {},
+            "mechanism": None,
+            "mechanism_text": "reaction: A -> B; k1=1.0",
+            "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15},
+            "fallback_occurred": False,
+            "fallback_message": None,
+        },
+        run_id=44,
+        fast_mode=False,
+        request_id=44,
+    )
+    qt_app.processEvents()
+
+    assert main_window.active_batch_selection() == ("", "")
+    assert cache.last_display_selection == []
+
+    sync_calls = []
+
+    def _sync(*args, **kwargs):
+        sync_calls.append((args, kwargs))
+
+    monkeypatch.setattr(main_window, "sync_main_plot_copy_labels", _sync, raising=False)
+
+    table = main_window._batch_table
+    assert table is not None
+    idx = main_window._batch_model.index(1, 0)
+    table.setCurrentIndex(idx)
+    sel = table.selectionModel()
+    assert sel is not None
+    sel.clearSelection()
+    sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+
+    main_window._move_selected_batch_sets(delta=-1)
+    qt_app.processEvents()
+
+    assert sync_calls == []
+
+
+@pytest.mark.gui
 def test_global_fit_creates_and_seeds_new_batch_set_from_dataset_t0(main_window, monkeypatch):
     """
     Regression: starting a global fit should prompt for an unmapped dataset and,
