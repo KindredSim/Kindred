@@ -12,8 +12,6 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
 )
-from kindred.gui.widgets.collapsible_section import CollapsibleSection
-
 __all__ = ["SimulationPanel"]
 
 
@@ -39,8 +37,6 @@ class SimulationPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-
-        self.section = CollapsibleSection("Batch Initial Conditions")
 
         batch_widget = QtWidgets.QWidget()
         batch_layout = QtWidgets.QVBoxLayout(batch_widget)
@@ -157,5 +153,4 @@ class SimulationPanel(QtWidgets.QWidget):
         self.temperature_spinbox.setEnabled(False)
         self.temperature_spinbox.setVisible(False)
 
-        self.section.set_content_widget(batch_widget)
-        layout.addWidget(self.section)
+        layout.addWidget(batch_widget, stretch=1)

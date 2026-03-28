@@ -802,7 +802,7 @@ def test_target_checkbox_toggle_uses_model_path_and_does_not_move_focus_or_row_s
     calls = _track_checkstate_set_data(model, monkeypatch)
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 2])
-    edit_column = _column_for_header(model, "Target")
+    edit_column = _column_for_header(model, "Slider")
     focus_before = table.currentIndex()
     selected_before = [idx.row() for idx in table.selectionModel().selectedRows(0)]
 
@@ -912,7 +912,7 @@ def test_edit_checkbox_click_on_focused_row_toggles_explicit_membership_without_
     main_window.show()
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
-    edit_column = _column_for_header(model, "Target")
+    edit_column = _column_for_header(model, "Slider")
     focus_before = table.currentIndex()
     selected_before = [idx.row() for idx in table.selectionModel().selectedRows(0)]
     set0_id = str(main_window.batch_set_id_for_row(0) or "")
@@ -974,7 +974,7 @@ def test_batch_table_visual_order_places_state_controls_before_set_name(main_win
     model = main_window._batch_model
     assert table is not None
 
-    assert _visual_headers(table, model)[:5] == ["Target", "Show", "SetName", "A (M)", "B (M)"]
+    assert _visual_headers(table, model)[:5] == ["Slider", "Show", "SetName", "A (M)", "B (M)"]
     assert main_window._mechanism_editor._slider_edit_targets_label.text() == "Slider edit targets: set1"
 
 

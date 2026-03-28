@@ -579,7 +579,6 @@ class MainWindow(
         species_panel = self._try_wire_species_panel()
 
         sim_panel = self._batch_panel
-        self._batch_section = sim_panel.section
         self._batch_table = sim_panel.batch_table
         self._add_batch_set_btn = sim_panel.add_batch_set_btn
         self._move_batch_up_btn = sim_panel.move_batch_up_btn
