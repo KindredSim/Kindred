@@ -114,7 +114,7 @@ class TemperatureScheduleDialog(QtWidgets.QDialog):
         self._tau_spin.setRange(0.001, 1_000_000_000.0)
         self._tau_spin.setDecimals(3)
         self._tau_spin.setValue(10.0)
-        self._tau_spin.setMaximumWidth(120)
+        self._tau_spin.setMaximumWidth(180)
         self._tau_spin.valueChanged.connect(lambda _value: self._refresh_outputs())
         table_controls.addWidget(self._tau_spin)
 

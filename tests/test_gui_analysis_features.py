@@ -232,8 +232,8 @@ def test_fitting_window_small_multiples_grid(qapp):
     window.close()
 
 
-def test_fitting_window_respects_dataset_initials(qapp, monkeypatch):
-    """Global fitting window must forward per-dataset initials to the worker."""
+def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monkeypatch):
+    """Global fitting window must flush the visible dataset weight before starting a fit."""
     from kindred.core.analysis.dataset_parameter_overrides import split_fit_dataset_parameter_overrides
     from kindred.gui.fitting.window import FittingWindow
 
@@ -315,14 +315,40 @@ def test_fitting_window_respects_dataset_initials(qapp, monkeypatch):
         dataset_weights={"ds1": 1.0, "ds2": 0.5},
         apply_callback=lambda params: None,
     )
-    window._weight_mode_combo.setCurrentIndex(1)
+    top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
+    assert top_tabs is not None
+    assert window._tabs is top_tabs
+    targets_idx = [top_tabs.tabText(i) for i in range(top_tabs.count())].index("Targets & Weights")
+    window._tabs.setCurrentIndex(targets_idx)
+    qapp.processEvents()
+
+    dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+    weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
+    weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
+    assert dataset_list is not None
+    assert weight_mode is not None
+    assert weight_edit is not None
+
+    for row in range(dataset_list.count()):
+        item = dataset_list.item(row)
+        if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == "ds2":
+            dataset_list.setCurrentRow(row)
+            break
+    else:
+        raise AssertionError("ds2 not present in targets dataset list")
+    qapp.processEvents()
+
+    weight_mode.setCurrentIndex(1)
+    weight_edit.setText("0.75")
+    qapp.processEvents()
+
     window._start_fit()
     assert captured["dataset_params"] is None
     assert captured["dataset_variable_params"] is None
     dataset_params_forwarded, _variable_params_forwarded = split_fit_dataset_parameter_overrides(captured["dataset_overrides"])
     assert dataset_params_forwarded["ds1"]["init:A"] == pytest.approx(1.0)
     assert dataset_params_forwarded["ds2"]["init:A"] == pytest.approx(2.0)
-    assert captured["weights"]["ds2"] == 0.5
+    assert captured["weights"]["ds2"] == pytest.approx(0.75)
     window._set_running_state(False)
     window.close()
 

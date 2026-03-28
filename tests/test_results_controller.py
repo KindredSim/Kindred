@@ -41,6 +41,7 @@ def _make_results_ui(plot: object) -> SimpleNamespace:
         main_plot_stats_table=lambda: MagicMock(),
         set_results_table=lambda _table: None,
         set_main_plot_data=lambda *_args, **_kwargs: None,
+        sync_main_plot_copy_labels=lambda _primary_set_id, _selected_set_ids: None,
         show_simulation_tab=lambda: None,
         refresh_simulation_plot_views=lambda: None,
         schedule_main_plot_refresh=lambda _delays: None,
@@ -307,6 +308,74 @@ def test_display_cached_batch_selection_outcome_excludes_invalidated_selected_ov
     assert ui.set_main_plot_data.call_args.kwargs["overlays"] == []
 
 
+def test_display_cached_batch_selection_outcome_includes_set_id_on_clean_cached_overlays() -> None:
+    plot = MagicMock()
+    ui = _make_results_ui(plot)
+    ui.batch_name_for_id = lambda set_id: {"set1": "set1", "set2": "set2"}.get(str(set_id))
+    ui.batch_id_for_name = lambda name: {"set1": "set1", "set2": "set2"}.get(str(name))
+    ui.set_main_plot_data = MagicMock()
+    controller = ResultsController(ui)
+    store = {
+        "cache-key::set1": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([1.0, 0.5], dtype=float)},
+            "algebra_scalars": {},
+        },
+        "cache-key::set2": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([2.0, 1.5], dtype=float)},
+            "algebra_scalars": {},
+        },
+    }
+
+    outcome = controller.display_cached_batch_selection_outcome(
+        cache_key="cache-key",
+        selected_sets=["set1", "set2"],
+        prefer_set="set2",
+        cache_store=store,
+        allow_fallback=False,
+    )
+
+    assert outcome == CachedBatchSelectionDisplayOutcome(True, reason=None)
+    overlays = ui.set_main_plot_data.call_args.kwargs["overlays"]
+    assert len(overlays) == 1
+    assert overlays[0]["label"] == "set1"
+    assert overlays[0]["set_id"] == "set1"
+
+
+def test_display_cached_batch_selection_outcome_syncs_copy_labels_for_duplicate_names() -> None:
+    plot = MagicMock()
+    ui = _make_results_ui(plot)
+    ui.batch_name_for_id = lambda set_id: {"set1": "dup", "set2": "dup"}.get(str(set_id))
+    ui.batch_id_for_name = lambda name: None
+    ui.set_main_plot_data = MagicMock()
+    ui.sync_main_plot_copy_labels = MagicMock()
+    controller = ResultsController(ui)
+    store = {
+        "cache-key::set1": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([1.0, 0.5], dtype=float)},
+            "algebra_scalars": {},
+        },
+        "cache-key::set2": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([2.0, 1.5], dtype=float)},
+            "algebra_scalars": {},
+        },
+    }
+
+    outcome = controller.display_cached_batch_selection_outcome(
+        cache_key="cache-key",
+        selected_sets=["set1", "set2"],
+        prefer_set="set2",
+        cache_store=store,
+        allow_fallback=False,
+    )
+
+    assert outcome == CachedBatchSelectionDisplayOutcome(True, reason=None)
+    ui.sync_main_plot_copy_labels.assert_called_once_with("set2", ["set1", "set2"])
+
+
 def test_display_cached_batch_selection_forwards_valid_subset_without_fallback() -> None:
     plot = MagicMock()
     controller = ResultsController(_make_results_ui(plot))
@@ -392,3 +461,19 @@ def test_fallback_path_must_not_return_invalidated_cached_result_as_available() 
     assert outcome.displayed is False, (
         "Fallback path returned an invalidated cache entry as available"
     )
+
+
+def test_set_data_updates_success_status_text() -> None:
+    plot = MagicMock()
+    ui = _make_results_ui(plot)
+    ui.set_status_text = MagicMock()
+    controller = ResultsController(ui)
+
+    controller.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 0.5], dtype=float)},
+        label="set1",
+        overlays=[],
+    )
+
+    ui.set_status_text.assert_called_once_with("Loaded 1 species, 2 timepoints")

@@ -100,20 +100,63 @@ class ConfigController(QtCore.QObject):
             logger.warning("Invalid integer setting %s=%r; using %s", key, raw_value, int(default))
             return int(default)
 
+    @staticmethod
+    def _discard_invalid_gui_state(settings: QtCore.QSettings, key: str) -> None:
+        with suppress(RuntimeError, TypeError):
+            settings.remove(key)
+            settings.sync()
+
+    def _read_gui_state_setting(self, settings: QtCore.QSettings, key: str) -> object | None:
+        try:
+            return settings.value(key)
+        except (EOFError, TypeError, ValueError) as exc:
+            logger.warning("Ignoring unreadable persisted GUI state %s: %s", key, exc)
+            self._discard_invalid_gui_state(settings, key)
+            return None
+
+    def _restore_gui_state_setting(
+        self,
+        settings: QtCore.QSettings,
+        key: str,
+        restore_state: Callable[[object], object],
+        *,
+        state_name: str,
+    ) -> bool:
+        state = self._read_gui_state_setting(settings, key)
+        if not state:
+            return False
+        try:
+            restored = restore_state(state)
+        except (EOFError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("Ignoring invalid persisted %s %s: %s", state_name, key, exc)
+            self._discard_invalid_gui_state(settings, key)
+            return False
+        if restored is False:
+            logger.warning("Ignoring invalid persisted %s %s: restore rejected stored state", state_name, key)
+            self._discard_invalid_gui_state(settings, key)
+            return False
+        return True
+
     def load_settings(self) -> None:
         settings = self._settings()
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
 
         restore_maximized = settings.value("window/is_maximized", False, type=bool)
-        geometry = settings.value("window/geometry")
-        if geometry:
-            self._ui.restore_geometry(geometry)
+        self._restore_gui_state_setting(
+            settings,
+            "window/geometry",
+            self._ui.restore_geometry,
+            state_name="window geometry",
+        )
 
-        splitter_state = settings.value("window/splitter_state")
-        if splitter_state:
-            splitter = self._ui.splitter()
-            if splitter:
-                splitter.restoreState(splitter_state)
+        splitter = self._ui.splitter()
+        if splitter:
+            self._restore_gui_state_setting(
+                settings,
+                "window/splitter_state",
+                splitter.restoreState,
+                state_name="workspace splitter state",
+            )
 
         temperature = settings.value("simulation/temperature", 298.15, type=float)
         self._ui.set_temperature(temperature)
@@ -195,9 +238,12 @@ class ConfigController(QtCore.QObject):
         preview_cap = self._read_int_setting(settings, "simulation/preview_cache_cap", default_preview_cap)
         self._ui.set_cache_caps(result_cap=result_cap, preview_cap=preview_cap, persist=False)
 
-        dock_state = settings.value("window/dock_state")
-        if dock_state:
-            self._ui.restore_window_state(dock_state)
+        if self._restore_gui_state_setting(
+            settings,
+            "window/dock_state",
+            self._ui.restore_window_state,
+            state_name="window dock state",
+        ):
             self._ui.schedule_restored_floating_dock_recovery()
 
         if restore_maximized:

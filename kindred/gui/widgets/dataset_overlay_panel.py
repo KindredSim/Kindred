@@ -65,19 +65,21 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._dataset_style = DatasetStyle()
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
 
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
         header = QtWidgets.QLabel("Dataset Overlays")
         header.setStyleSheet("font-weight: bold;")
-        layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        layout.addLayout(header_row)
 
-        hint = QtWidgets.QLabel(
-            "Select datasets and species to overlay.\n"
-            "Expand a dataset to inspect species-owned color swatches."
-        )
+        hint = QtWidgets.QLabel("Select datasets and species to overlay experimental points.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("font-size: 11px;")
+        hint.setStyleSheet("font-size: 11px; color: palette(mid);")
         hint.setToolTip(
             "Overlay datasets show experimental points on simulation curves.\n"
             "Species colors are owned globally. Dataset identity is shown with markers."
@@ -107,21 +109,24 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._status_label.setVisible(False)
         layout.addWidget(self._status_label)
 
-        # Flat styling controls (bold header replaces nested QGroupBox)
-        style_header = QtWidgets.QLabel("Global Point Style")
-        style_header.setStyleSheet("font-weight: bold;")
-        layout.addWidget(style_header)
-        style_layout = QtWidgets.QFormLayout()
-        style_layout.setContentsMargins(4, 4, 4, 4)
-        style_layout.setSpacing(4)
+        style_row = QtWidgets.QHBoxLayout()
+        style_row.setContentsMargins(0, 0, 0, 0)
+        style_row.setSpacing(6)
+        style_label = QtWidgets.QLabel("Point Style")
+        style_label.setStyleSheet("font-weight: bold;")
+        style_row.addWidget(style_label)
 
         # Point size control
         self._size_spin = QtWidgets.QSpinBox()
         self._size_spin.setRange(1, 20)
         self._size_spin.setValue(self._dataset_style.size)
         self._size_spin.setToolTip("Size of dataset scatter points")
+        self._size_spin.setMinimumWidth(60)
         self._size_spin.valueChanged.connect(self._on_style_changed)
-        style_layout.addRow("Size:", self._size_spin)
+        size_label = QtWidgets.QLabel("Size")
+        size_label.setBuddy(self._size_spin)
+        style_row.addWidget(size_label)
+        style_row.addWidget(self._size_spin)
 
         # Opacity control (0-100 for user-friendliness, converted to 0-255 internally)
         self._opacity_spin = QtWidgets.QSpinBox()
@@ -129,10 +134,14 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._opacity_spin.setValue(int(self._dataset_style.opacity * 100 / 255))
         self._opacity_spin.setSuffix("%")
         self._opacity_spin.setToolTip("Opacity/transparency of dataset points")
+        self._opacity_spin.setMinimumWidth(60)
         self._opacity_spin.valueChanged.connect(self._on_style_changed)
-        style_layout.addRow("Opacity:", self._opacity_spin)
-
-        layout.addLayout(style_layout)
+        opacity_label = QtWidgets.QLabel("Opacity")
+        opacity_label.setBuddy(self._opacity_spin)
+        style_row.addWidget(opacity_label)
+        style_row.addWidget(self._opacity_spin)
+        style_row.addStretch(1)
+        layout.addLayout(style_row)
 
     # ------------------------------------------------------------------
     # Public API

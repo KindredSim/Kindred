@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
 import logging
-from typing import Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -22,7 +23,35 @@ from ..ui_helpers import make_pyqtgraph_fallback_widget
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PyQtGraphPlotPanel", "PYQTGRAPH_AVAILABLE"]
+__all__ = [
+    "CopyAllExportPlan",
+    "CopyAllMissingItem",
+    "CopyAllShownBlock",
+    "PyQtGraphPlotPanel",
+    "PYQTGRAPH_AVAILABLE",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllShownBlock:
+    set_id: str
+    label: str
+    t: np.ndarray
+    series: Dict[str, np.ndarray]
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllMissingItem:
+    set_id: str
+    label: str
+    popup_label: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CopyAllExportPlan:
+    shown_blocks: List[CopyAllShownBlock]
+    missing_items: List[CopyAllMissingItem]
 
 
 def _try_float(value: object) -> Optional[float]:
@@ -57,6 +86,9 @@ if PYQTGRAPH_AVAILABLE:
         species: str
         x: np.ndarray
         y: np.ndarray
+        logical_x_axis_name: str
+        resolved_x_column: Optional[str]
+        resolved_y_column: str
 
     class _DetailInspectorDock(QtWidgets.QFrame):
         """Compact secondary inspector wrapper with a small default height hint."""
@@ -76,13 +108,6 @@ if PYQTGRAPH_AVAILABLE:
         def minimumSizeHint(self) -> QtCore.QSize:
             hint = super().minimumSizeHint()
             return QtCore.QSize(max(hint.width(), 260), 120)
-
-    class _NearestHit(NamedTuple):
-        x: float
-        y: float
-        label: str
-        dataset: Optional[str]
-        color: Tuple[int, int, int]
 
     def _resolve_dataset_species(
         species_name: str,
@@ -152,7 +177,6 @@ if PYQTGRAPH_AVAILABLE:
         - Parametric mode support
         - Legend with show/hide toggle
         - Dark theme support
-        - Mouse tracking with exact value tooltips
 
         Performance:
         - Handles 1M+ points smoothly with GPU acceleration
@@ -167,6 +191,9 @@ if PYQTGRAPH_AVAILABLE:
             *,
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
+            enable_axis_inversion_actions: bool = False,
+            enable_canonical_ghost_toggle_action: bool = False,
+            enable_copy_visible_data_action: bool = False,
         ):
             """
             Initialize PyQtGraph plot panel.
@@ -191,11 +218,16 @@ if PYQTGRAPH_AVAILABLE:
             self._overlay_datasets: Dict[str, Dict[str, np.ndarray]] = {}
             self._overlay_symbols: Dict[str, str] = {}
             self._active_overlay_series: List[_OverlaySeries] = []
+            self._export_all_overlay_series: List[_OverlaySeries] = []
+            self._active_overlay_warnings: List[str] = []
+            self._export_all_overlay_warnings: List[str] = []
+            self._export_all_overlay_cache_dirty: bool = True
             self._dark_mode = False
             self._scalar_values: Dict[str, float] = {}
 
             # Batch simulation overlays (multiple initial-condition sets overlaid as lines)
             self._simulation_set_label: Optional[str] = None
+            self._simulation_set_popup_label: Optional[str] = None
             self._simulation_overlays: List[Dict[str, object]] = []
 
             # Axis control (for parametric mode and custom X-axis)
@@ -203,10 +235,15 @@ if PYQTGRAPH_AVAILABLE:
             self._parametric_mode: bool = False  # Parametric plotting mode
 
             # Plot enhancements (v0.2.0)
-            self._secondary_y_axis: Optional[pg.ViewBox] = None
-            self._secondary_y_items: Dict[str, pg.PlotDataItem] = {}
             self._log_x: bool = False
             self._log_y: bool = False
+            self._invert_x_axis: bool = False
+            self._invert_y_axis: bool = False
+            self._enable_axis_inversion_actions = bool(enable_axis_inversion_actions)
+            self._show_canonical_ghost_lines: bool = True
+            self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
+            self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
+            self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
             self._annotations: List[pg.TextItem] = []
             self._sampling_mode: str = "dense"
             self._sampling_target: int = 1000
@@ -222,6 +259,7 @@ if PYQTGRAPH_AVAILABLE:
             # Create PyQtGraph PlotWidget
             self._plot_widget = pg.PlotWidget()
             self._plot_item = self._plot_widget.getPlotItem()
+            self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
 
             # Set white background (user requested light background)
             self._plot_widget.setBackground('w')
@@ -244,20 +282,7 @@ if PYQTGRAPH_AVAILABLE:
             self._plot_item.setMenuEnabled(False)
             vb = self._plot_item.getViewBox()
             vb.setMenuEnabled(False)
-
-            # Enable mouse tracking for crosshair and tooltip
-            self._plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
-            self._crosshair_v = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('g', width=1, style=Qt.DashLine))
-            self._crosshair_h = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('g', width=1, style=Qt.DashLine))
-            self._plot_item.addItem(self._crosshair_v, ignoreBounds=True)
-            self._plot_item.addItem(self._crosshair_h, ignoreBounds=True)
-            self._crosshair_v.setVisible(False)
-            self._crosshair_h.setVisible(False)
-
-            # Tooltip label for exact values
-            self._tooltip_text = pg.TextItem(anchor=(0, 1), color='k', fill=pg.mkBrush(255, 255, 220, 230), border=pg.mkPen(100, 100, 100))
-            self._plot_item.addItem(self._tooltip_text)
-            self._tooltip_text.setVisible(False)
+            self._apply_axis_inversion_state()
 
             self._toolbar = AxisToolbar(self, orientation="horizontal")
             self._toolbar.setSizePolicy(
@@ -348,7 +373,6 @@ if PYQTGRAPH_AVAILABLE:
 
             self._details_tabs.addTab(stats_container, "Statistics")
             self._details_tabs.addTab(self._param_table, "Parameters")
-            self._details_tabs.addTab(self._overlay_panel, "Overlays")
             self._details_tabs.setCurrentWidget(stats_container)
 
             self._main_splitter.addWidget(self._details_dock)
@@ -384,6 +408,9 @@ if PYQTGRAPH_AVAILABLE:
                 return
             detail = max(120, int(round(total * 0.16)))
             detail = min(detail, max(140, int(total * 0.18)))
+            # Ensure the plot surface keeps at least 200px
+            if total - detail < 200:
+                detail = max(0, total - 200)
             plot = max(1, total - detail)
             splitter.setSizes([plot, detail])
 
@@ -458,6 +485,7 @@ if PYQTGRAPH_AVAILABLE:
                     color_manager.seed_species(sorted(self._owned_species_keys))
 
             self._simulation_set_label = str(label) if label else None
+            self._simulation_set_popup_label = None
             self._workspace_preview_display_provenance_by_set_id = {}
             normalized_overlays: List[Dict[str, object]] = []
             for entry in (overlays or []):
@@ -481,12 +509,14 @@ if PYQTGRAPH_AVAILABLE:
                 set_id = str(entry.get("set_id") or "").strip()
                 if set_id:
                     normalized_entry["set_id"] = set_id
+                popup_label = str(entry.get("popup_label") or "").strip()
+                if popup_label:
+                    normalized_entry["popup_label"] = popup_label
                 curve_role = str(entry.get("curve_role") or "").strip()
                 if curve_role:
                     normalized_entry["curve_role"] = curve_role
                 normalized_overlays.append(normalized_entry)
             self._simulation_overlays = normalized_overlays
-
             # Assign colors
             self._assign_colors()
             self._overlay_panel.refresh_color_swatches()
@@ -596,6 +626,10 @@ if PYQTGRAPH_AVAILABLE:
             """Return the solver-parameter table widget."""
             return self._param_table
 
+        def overlay_panel(self) -> DatasetOverlayPanel:
+            """Return the dataset overlay panel widget."""
+            return self._overlay_panel
+
         def set_scalar_values(self, scalars: Dict[str, float]) -> None:
             """Store algebra scalar outputs for guide selection."""
             cleaned: Dict[str, float] = {}
@@ -615,6 +649,14 @@ if PYQTGRAPH_AVAILABLE:
         def get_export_scope_preference(self) -> str:
             """Return the preferred export scope for CSV dialogs."""
             return self._export_scope_preference
+
+        def _get_clipboard(self):
+            """Clipboard accessor seam (monkeypatchable in tests)."""
+            try:
+                app = QtWidgets.QApplication.instance()
+                return app.clipboard() if app is not None else None
+            except Exception:
+                return None
 
         def export_payload(self) -> Optional[Dict[str, object]]:
             """
@@ -637,6 +679,518 @@ if PYQTGRAPH_AVAILABLE:
             valid = [n for n in names if n in self._series]
             self._toolbar.select_y(valid)
             self._on_y_selection_changed(valid)
+
+        def _series_names_compatible_with_x(
+            self,
+            names: Sequence[str],
+            series_map: Dict[str, object],
+            x_array: np.ndarray,
+            *,
+            require_visible: bool,
+        ) -> List[str]:
+            compatible: List[str] = []
+            seen: Set[str] = set()
+            for raw_name in names:
+                name = str(raw_name)
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name not in series_map:
+                    continue
+                if require_visible and not self._visible.get(name, True):
+                    continue
+                y_array = _try_1d_float_array(series_map.get(name))
+                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                    continue
+                compatible.append(name)
+            return compatible
+
+        def _visible_selected_series_names(self) -> List[str]:
+            toolbar = getattr(self, "_toolbar", None)
+            if toolbar is None:
+                return []
+            names: List[str] = []
+            seen: Set[str] = set()
+            for raw_name in toolbar.selected_y():
+                name = str(raw_name)
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name not in self._series:
+                    continue
+                if not self._visible.get(name, True):
+                    continue
+                names.append(name)
+            return names
+
+        def _current_primary_renderable_series_names(
+            self,
+            names: Sequence[str],
+            *,
+            require_visible: bool,
+        ) -> List[str]:
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
+                return []
+            return self._series_names_compatible_with_x(
+                names,
+                self._series,
+                primary_basis[2],
+                require_visible=require_visible,
+            )
+
+        def _axis_scope_series_names(self) -> List[str]:
+            return list(self._visible_selected_series_names())
+
+        def _series_header_text(self, series_name: str) -> str:
+            return str(series_name)
+
+        def _visible_overlay_copy_series_names(self) -> List[str]:
+            return self._axis_scope_series_names()
+
+        def _visible_primary_copy_series_names(self) -> List[str]:
+            return list(
+                self._current_primary_renderable_series_names(
+                    self._axis_scope_series_names(),
+                    require_visible=False,
+                )
+            )
+
+        @staticmethod
+        def _apply_sample_indices(array: np.ndarray, sample_idx: object) -> np.ndarray:
+            values = _try_1d_float_array(array)
+            if values.size == 0:
+                return values
+            if isinstance(sample_idx, slice):
+                return values
+            return values[sample_idx]
+
+        def _current_primary_plot_basis(
+            self,
+        ) -> Optional[Tuple[str, str, np.ndarray, np.ndarray, Optional[np.ndarray], object]]:
+            x_name = str(self._x_axis_name or "t")
+            x_data, x_label = self._get_x_data()
+            x_array = _try_1d_float_array(x_data)
+            if x_array.size == 0:
+                return None
+            sample_idx = self._get_sampling_indices(x_array.shape[0])
+            x_plot = self._apply_sample_indices(x_array, sample_idx)
+            t_array = _try_1d_float_array(self._t)
+            t_plot: Optional[np.ndarray] = None
+            if t_array.size != 0 and t_array.shape[0] == x_array.shape[0]:
+                t_plot = self._apply_sample_indices(t_array, sample_idx)
+            return x_name, x_label, x_array, x_plot, t_plot, sample_idx
+
+        @staticmethod
+        def _qualified_copy_header(block_label: Optional[str], column_label: str) -> str:
+            label = str(block_label or "").strip()
+            column = str(column_label or "").strip()
+            if not label:
+                return column
+            return f"{label}::{column}"
+
+        def _copy_series_header(self, block_label: Optional[str], series_name: str) -> str:
+            return self._qualified_copy_header(block_label, self._series_header_text(series_name))
+
+        def _primary_copy_block_label(self) -> str:
+            return str(self._simulation_set_popup_label or self._simulation_set_label or "").strip()
+
+        @staticmethod
+        def _overlay_copy_block_label(entry: object) -> str:
+            if not isinstance(entry, dict):
+                return ""
+            return str(entry.get("popup_label") or entry.get("label") or "").strip()
+
+        def _append_copy_column(
+            self,
+            columns: List[Tuple[str, np.ndarray]],
+            *,
+            header: str,
+            values: object,
+        ) -> None:
+            array = _try_1d_float_array(values)
+            if array.size == 0:
+                return
+            columns.append((str(header), array))
+
+        def set_copy_all_export_plan_provider(
+            self,
+            provider: Optional[Callable[[], Optional[CopyAllExportPlan]]],
+        ) -> None:
+            self._copy_all_export_plan_provider = provider if callable(provider) else None
+
+        def _current_copy_axis_spec(self) -> Tuple[str, str]:
+            x_name = str(self._x_axis_name or "t")
+            _, x_label = self._get_x_data()
+            if x_name != "t" and x_name not in self._series:
+                return "t", "Time (s)"
+            return x_name, str(x_label or "Time (s)")
+
+        def _build_visible_overlay_copy_blocks(
+            self,
+            *,
+            x_name: str,
+            x_label: str,
+            visible_y_names: Sequence[str],
+            excluded_set_ids: Optional[Set[str]] = None,
+        ) -> List[List[Tuple[str, np.ndarray]]]:
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            excluded = {str(set_id) for set_id in (excluded_set_ids or set()) if str(set_id)}
+            for entry in list(self._simulation_overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                    continue
+                entry_set_id = str(entry.get("set_id") or "").strip()
+                if entry_set_id and entry_set_id in excluded:
+                    continue
+                block_label = self._overlay_copy_block_label(entry)
+                overlay_series = entry.get("series") or {}
+                if not isinstance(overlay_series, dict):
+                    continue
+                if x_name == "t":
+                    x_overlay = entry.get("t")
+                else:
+                    x_overlay = overlay_series.get(x_name)
+                x_overlay_array = _try_1d_float_array(x_overlay)
+                if x_overlay_array.size == 0:
+                    continue
+                overlay_sample_idx = self._get_sampling_indices(x_overlay_array.shape[0])
+                x_overlay_plot = self._apply_sample_indices(x_overlay_array, overlay_sample_idx)
+
+                overlay_columns: List[Tuple[str, np.ndarray]] = []
+                self._append_copy_column(
+                    overlay_columns,
+                    header=self._qualified_copy_header(block_label, x_label),
+                    values=x_overlay_plot,
+                )
+
+                overlay_y_added = 0
+                for name in visible_y_names:
+                    y_array = _try_1d_float_array(overlay_series.get(name))
+                    if y_array.size == 0 or y_array.shape[0] != x_overlay_array.shape[0]:
+                        continue
+                    y_plot = self._apply_sample_indices(y_array, overlay_sample_idx)
+                    self._append_copy_column(
+                        overlay_columns,
+                        header=self._copy_series_header(block_label, name),
+                        values=y_plot,
+                    )
+                    overlay_y_added += 1
+                if overlay_y_added:
+                    blocks.append(overlay_columns)
+            return blocks
+
+        def _build_dataset_overlay_copy_blocks(
+            self,
+            *,
+            x_label: str,
+        ) -> List[List[Tuple[str, np.ndarray]]]:
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            for overlay in list(self._active_overlay_series or []):
+                x_overlay_array = _try_1d_float_array(overlay.x)
+                y_overlay_array = _try_1d_float_array(overlay.y)
+                if x_overlay_array.size == 0 or y_overlay_array.size == 0:
+                    continue
+                x_overlay_plot, y_overlay_plot = self._sample_xy(x_overlay_array, y_overlay_array)
+                block_label = str(overlay.dataset or "").strip()
+                dataset_columns: List[Tuple[str, np.ndarray]] = []
+                self._append_copy_column(
+                    dataset_columns,
+                    header=self._qualified_copy_header(block_label, x_label),
+                    values=x_overlay_plot,
+                )
+                self._append_copy_column(
+                    dataset_columns,
+                    header=self._copy_series_header(block_label, str(overlay.species)),
+                    values=y_overlay_plot,
+                )
+                if dataset_columns:
+                    blocks.append(dataset_columns)
+            return blocks
+
+        def _shown_block_current_x_values(
+            self,
+            *,
+            t_values: np.ndarray,
+            series_values: Dict[str, np.ndarray],
+            x_name: str,
+        ) -> np.ndarray:
+            if x_name == "t":
+                return t_values
+            x_values = _try_1d_float_array(series_values.get(x_name))
+            if x_values.size == 0 or x_values.shape[0] != t_values.shape[0]:
+                return np.asarray([], dtype=float)
+            return x_values
+
+        def _build_shown_simulation_copy_block(
+            self,
+            shown_block: CopyAllShownBlock,
+            *,
+            x_name: str,
+            x_label: str,
+            visible_y_names: Sequence[str],
+        ) -> Tuple[Optional[List[Tuple[str, np.ndarray]]], Optional[str]]:
+            t_values = _try_1d_float_array(shown_block.t)
+            if t_values.size == 0:
+                return None, "no_simulation_data"
+            x_values = self._shown_block_current_x_values(t_values=t_values, series_values=shown_block.series, x_name=x_name)
+            if x_values.size == 0:
+                return None, "current_x_unavailable"
+
+            block_label = str(shown_block.label or "").strip()
+            shown_columns: List[Tuple[str, np.ndarray]] = []
+            self._append_copy_column(
+                shown_columns,
+                header=self._qualified_copy_header(block_label, "Time (s)"),
+                values=t_values,
+            )
+            if x_name != "t":
+                self._append_copy_column(
+                    shown_columns,
+                    header=self._qualified_copy_header(block_label, x_label),
+                    values=x_values,
+                )
+
+            y_added = 0
+            for name in visible_y_names:
+                y_values = _try_1d_float_array(shown_block.series.get(name))
+                if y_values.size == 0 or y_values.shape[0] != x_values.shape[0]:
+                    continue
+                self._append_copy_column(
+                    shown_columns,
+                    header=self._copy_series_header(block_label, name),
+                    values=y_values,
+                )
+                y_added += 1
+            if y_added <= 0:
+                return None, "no_visible_series"
+            return shown_columns, None
+
+        def _build_copy_all_blocks(
+            self,
+            plan: CopyAllExportPlan,
+        ) -> Tuple[List[List[Tuple[str, np.ndarray]]], List[CopyAllMissingItem]]:
+            if self._t is None or not self._series:
+                raise ValueError("No simulation data is available to copy.")
+
+            visible_overlay_y_names = self._visible_overlay_copy_series_names()
+            x_name, x_label = self._current_copy_axis_spec()
+
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            missing_items: List[CopyAllMissingItem] = list(plan.missing_items or [])
+            # Provider-owned shown-set IDs are the only truthful source for shown simulations.
+            shown_set_ids: Set[str] = {
+                str(item.set_id or "").strip()
+                for item in list(plan.missing_items or [])
+                if str(item.set_id or "").strip()
+            }
+
+            for shown_block in list(plan.shown_blocks or []):
+                set_id = str(shown_block.set_id or "").strip()
+                if set_id:
+                    shown_set_ids.add(set_id)
+                block_columns, missing_reason = self._build_shown_simulation_copy_block(
+                    shown_block,
+                    x_name=x_name,
+                    x_label=x_label,
+                    visible_y_names=self._axis_scope_series_names(),
+                )
+                if block_columns is not None:
+                    blocks.append(block_columns)
+                    continue
+                missing_items.append(
+                    CopyAllMissingItem(
+                        set_id=set_id,
+                        label=str(shown_block.label or ""),
+                        popup_label=str(shown_block.label or set_id or "Shown simulation"),
+                        reason=str(missing_reason or "no_simulation_data"),
+                    )
+                )
+
+            blocks.extend(
+                self._build_visible_overlay_copy_blocks(
+                    x_name=x_name,
+                    x_label=x_label,
+                    visible_y_names=visible_overlay_y_names,
+                    excluded_set_ids=shown_set_ids,
+                )
+            )
+            blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
+            if not blocks:
+                raise ValueError("No visible simulation series are available to copy.")
+            return blocks, missing_items
+
+        @staticmethod
+        def _copy_all_reason_text(reason: str) -> str:
+            reason_key = str(reason or "").strip()
+            return {
+                "preview_pending": "Preview pending",
+                "no_cached_results": "Result not cached (evicted)",
+                "invalid_cache_entry": "Invalid cached result",
+                "current_x_unavailable": "Current X-axis data unavailable",
+                "no_visible_series": "No visible series available",
+                "no_simulation_data": "No simulation data available",
+            }.get(reason_key, "Unavailable")
+
+        def _confirm_copy_all_missing_items(self, missing_items: Sequence[CopyAllMissingItem]) -> bool:
+            entries = [item for item in missing_items if isinstance(item, CopyAllMissingItem)]
+            if not entries:
+                return True
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            box.setWindowTitle("Copy All")
+            box.setText("Some shown simulations are unavailable for truthful export.")
+            lines = [
+                f"{str(item.popup_label or item.label or item.set_id or 'Shown simulation')}: "
+                f"{self._copy_all_reason_text(item.reason)}"
+                for item in entries
+            ]
+            box.setInformativeText("\n".join(lines) + "\n\nCopy available data anyway?")
+            yes_button = box.addButton("Yes", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            no_button = box.addButton("No", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(no_button)
+            box.setEscapeButton(no_button)
+            box.exec()
+            return box.clickedButton() is yes_button
+
+        def _build_visible_copy_blocks(self) -> List[List[Tuple[str, np.ndarray]]]:
+            if self._t is None or not self._series:
+                raise ValueError("No simulation data is available to copy.")
+
+            primary_visible_y_names = self._visible_primary_copy_series_names()
+            overlay_visible_y_names = self._visible_overlay_copy_series_names()
+
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
+                raise ValueError("The current X-axis has no visible data to copy.")
+            x_name, x_label, x_array, x_plot, t_plot, sample_idx = primary_basis
+
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            primary_label = self._primary_copy_block_label()
+            primary_columns: List[Tuple[str, np.ndarray]] = []
+
+            if t_plot is not None:
+                self._append_copy_column(
+                    primary_columns,
+                    header=self._qualified_copy_header(primary_label, "Time (s)"),
+                    values=t_plot,
+                )
+            if x_name != "t":
+                self._append_copy_column(
+                    primary_columns,
+                    header=self._qualified_copy_header(primary_label, x_label),
+                    values=x_plot,
+                )
+
+            primary_y_added = 0
+            for name in primary_visible_y_names:
+                y_array = _try_1d_float_array(self._series.get(name))
+                if y_array.size == 0 or y_array.shape[0] != x_array.shape[0]:
+                    continue
+                y_array = self._apply_sample_indices(y_array, sample_idx)
+                if y_array.size == 0 or y_array.shape[0] != x_plot.shape[0]:
+                    continue
+                self._append_copy_column(
+                    primary_columns,
+                    header=self._copy_series_header(primary_label, name),
+                    values=y_array,
+                )
+                primary_y_added += 1
+            if primary_y_added:
+                blocks.append(primary_columns)
+
+            blocks.extend(
+                self._build_visible_overlay_copy_blocks(
+                    x_name=x_name,
+                    x_label=x_label,
+                    visible_y_names=overlay_visible_y_names,
+                )
+            )
+            blocks.extend(self._build_dataset_overlay_copy_blocks(x_label=x_label))
+
+            return blocks
+
+        @staticmethod
+        def _flatten_copy_blocks(blocks: Sequence[Sequence[Tuple[str, np.ndarray]]]) -> List[Tuple[str, np.ndarray]]:
+            columns: List[Tuple[str, np.ndarray]] = []
+            non_empty_blocks = [list(block) for block in blocks if list(block)]
+            for idx, block in enumerate(non_empty_blocks):
+                if idx > 0:
+                    columns.append(("", np.asarray([], dtype=float)))
+                columns.extend(block)
+            return columns
+
+        @staticmethod
+        def _copy_columns_to_rows(columns: Sequence[Tuple[str, np.ndarray]]) -> Tuple[List[str], List[List[object]]]:
+            if not columns:
+                raise ValueError("No visible plot data is available to copy.")
+            max_len = max(values.shape[0] for _, values in columns)
+            header = [label for label, _ in columns]
+            rows: List[List[object]] = []
+            for idx in range(max_len):
+                row: List[object] = []
+                for _, values in columns:
+                    row.append(values[idx] if idx < values.shape[0] else "")
+                rows.append(row)
+            return header, rows
+
+        @staticmethod
+        def _rows_to_tsv(header: Sequence[object], rows: Sequence[Sequence[object]]) -> str:
+            def _cell(value: object) -> str:
+                if value == "":
+                    return ""
+                return str(value)
+
+            lines = ["\t".join(_cell(cell) for cell in header)]
+            for row in rows:
+                lines.append("\t".join(_cell(cell) for cell in row))
+            return "\n".join(lines)
+
+        def _copy_visible_data(self) -> None:
+            try:
+                columns = self._flatten_copy_blocks(self._build_visible_copy_blocks())
+                header, rows = self._copy_columns_to_rows(columns)
+                clipboard = self._get_clipboard()
+                if clipboard is None:
+                    raise ValueError("Clipboard is unavailable.")
+                clipboard.setText(self._rows_to_tsv(header, rows))
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Copy Visible Data", str(exc))
+            except Exception as exc:
+                logger.exception("Failed to copy visible plot data: %s", exc)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Copy Visible Data",
+                    f"Failed to copy visible plot data: {exc}",
+                )
+
+        def _copy_all(self) -> None:
+            try:
+                provider = self._copy_all_export_plan_provider
+                if provider is None:
+                    raise ValueError("Copy All is unavailable.")
+                plan = provider()
+                if plan is None:
+                    raise ValueError("Copy All is unavailable.")
+                blocks, missing_items = self._build_copy_all_blocks(plan)
+                if missing_items and not self._confirm_copy_all_missing_items(missing_items):
+                    return
+                columns = self._flatten_copy_blocks(blocks)
+                header, rows = self._copy_columns_to_rows(columns)
+                clipboard = self._get_clipboard()
+                if clipboard is None:
+                    raise ValueError("Clipboard is unavailable.")
+                clipboard.setText(self._rows_to_tsv(header, rows))
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "Copy All", str(exc))
+            except Exception as exc:
+                logger.exception("Failed to copy all plot data: %s", exc)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Copy All",
+                    f"Failed to copy all plot data: {exc}",
+                )
 
         def update_statistics(
             self,
@@ -822,13 +1376,10 @@ if PYQTGRAPH_AVAILABLE:
             for idx, name in enumerate(sorted(self._overlay_datasets.keys())):
                 self._overlay_symbols[name] = color_manager.get_dataset_symbol(idx)
 
-        def _overlay_display_color(self, dataset_name: str, species_key: str) -> tuple[int, int, int]:
-            """Return the current display color for an overlay dataset column."""
+        def _overlay_display_color(self, species_key: str) -> tuple[int, int, int]:
+            """Return the current display color for a resolved overlay dataset column."""
             color_manager = ColorManager.instance()
-            payload = self._overlay_datasets.get(str(dataset_name)) or {}
-            species_dict = (payload or {}).get("species") or {}
-            resolved_key, _ = _resolve_dataset_species(str(species_key), species_dict)
-            color_key = str(resolved_key or species_key)
+            color_key = str(species_key or "").strip()
             current_species_color = color_manager.get_current_species_color(color_key)
             color = (
                 current_species_color
@@ -840,8 +1391,54 @@ if PYQTGRAPH_AVAILABLE:
         def refresh_overlay_presentation_for_current_roster(self) -> None:
             """Keep visible overlay markers aligned with current-roster swatch semantics."""
             self._overlay_panel.refresh_color_swatches()
-            if self._active_overlay_series:
-                self._draw_overlay_series(list(self._active_overlay_series))
+            self._draw_overlay_series(list(self._active_overlay_series))
+
+        def _clear_overlay_series_caches(self) -> None:
+            self._active_overlay_series = []
+            self._export_all_overlay_series = []
+            self._active_overlay_warnings = []
+            self._export_all_overlay_warnings = []
+            self._export_all_overlay_cache_dirty = True
+
+        def _resolve_overlay_x_source(
+            self,
+            x_name: str,
+            payload: Dict[str, Dict[str, np.ndarray]],
+        ) -> Tuple[Optional[str], Optional[np.ndarray]]:
+            """Resolve overlay X values once while preserving current exact-match semantics."""
+            if x_name == "t":
+                return None, _try_1d_float_array(payload.get("t"))
+            species_payload = payload.get("species") or {}
+            if not isinstance(species_payload, dict):
+                return None, None
+            x_source = species_payload.get(x_name)
+            if x_source is None:
+                return None, None
+            return x_name, _try_1d_float_array(x_source)
+
+        def _rebuild_overlay_series_caches(self, axis_scope_series: Sequence[str]) -> None:
+            """
+            Rebuild all overlay-record caches before any downstream consumer uses them.
+
+            Built overlay records are fully resolved snapshots. Draw, refresh,
+            copy, and export paths must use only these records and must
+            not call _resolve_dataset_species() again.
+            """
+            axis_candidate_names = list(axis_scope_series or [])
+            self._active_overlay_series, self._active_overlay_warnings = self._build_overlay_series(axis_candidate_names)
+
+        def _ensure_export_all_overlay_cache(self) -> None:
+            if not self._export_all_overlay_cache_dirty:
+                return
+            overlay_series, raw_warnings = self._build_overlay_series(
+                list(self._series.keys())
+            )
+            self._export_all_overlay_series = overlay_series
+            self._export_all_overlay_warnings = [
+                msg for msg in raw_warnings
+                if ": no column matching species " not in msg
+            ]
+            self._export_all_overlay_cache_dirty = False
 
         def _get_sampling_indices(self, length: int):
             """Return slice or index array for downsampling plots."""
@@ -1036,19 +1633,21 @@ if PYQTGRAPH_AVAILABLE:
 
         def _update_plot(self):
             """Update plot with current data, visibility settings, and axis configuration."""
+            self._clear_overlay_series_caches()
+            self._overlay_panel.set_status_messages([])
             if self._t is None:
                 return
 
-            # Get X-axis data and label
-            x_data, x_label = self._get_x_data()
-            if x_data is None:
+            primary_basis = self._current_primary_plot_basis()
+            if primary_basis is None:
                 return
-            x_array = np.asarray(x_data, dtype=float).reshape(-1)
-            if x_array.size == 0:
-                return
-
-            sample_idx = self._get_sampling_indices(x_array.shape[0])
-            x_plot = x_array if isinstance(sample_idx, slice) else x_array[sample_idx]
+            _x_name, x_label, x_array, x_plot, _t_plot, sample_idx = primary_basis
+            selected_visible_series = self._visible_selected_series_names()
+            axis_scope_series = self._axis_scope_series_names()
+            selected_primary_series = self._current_primary_renderable_series_names(
+                selected_visible_series,
+                require_visible=False,
+            )
 
             # Update axis labels dynamically
             self._plot_item.setLabel('bottom', x_label)
@@ -1056,27 +1655,17 @@ if PYQTGRAPH_AVAILABLE:
                 self._plot_item.setLabel('left', 'Concentration', units='M')
             else:
                 # In parametric mode, Y label depends on selected series
-                selected = self._toolbar.selected_y()
-                if selected:
-                    self._plot_item.setLabel('left', f'{selected[0]}', units='M')
+                if selected_primary_series:
+                    self._plot_item.setLabel('left', f'{selected_primary_series[0]}', units='M')
 
             # Add visible series (only those selected in toolbar)
-            selected_series = list(self._toolbar.selected_y())
             active_curve_keys: Set[str] = set()
-            for name in selected_series:
-                if name not in self._series:
-                    continue
-                if not self._visible.get(name, True):
-                    continue
-
+            for name in selected_primary_series:
                 y_data = np.asarray(self._series[name], dtype=float).reshape(-1)
-                if y_data.shape[0] != x_array.shape[0]:
-                    logger.debug("Skipping series '%s': length mismatch with X axis", name)
-                    continue
                 color = self._colors.get(name, (100, 100, 100))
                 pen = pg.mkPen(color=color, width=2)
 
-                y_plot = y_data if isinstance(sample_idx, slice) else y_data[sample_idx]
+                y_plot = self._apply_sample_indices(y_data, sample_idx)
                 label = self._format_species_set_label(name, self._simulation_set_label)
                 active_curve_keys.add(label)
                 self._upsert_curve_item(
@@ -1096,6 +1685,8 @@ if PYQTGRAPH_AVAILABLE:
                         continue
                     set_label = str(entry.get("label") or "")
                     curve_role = str(entry.get("curve_role") or "")
+                    if curve_role == "canonical_ghost" and not self._show_canonical_ghost_lines:
+                        continue
                     if not set_label:
                         continue
                     t_overlay = entry.get("t")
@@ -1103,8 +1694,6 @@ if PYQTGRAPH_AVAILABLE:
                     if t_overlay is None or not isinstance(series_overlay, dict):
                         continue
                     t_arr = _try_1d_float_array(t_overlay)
-                    if t_arr.size == 0:
-                        continue
                     if t_arr.size == 0:
                         continue
                     if x_name == "t":
@@ -1120,8 +1709,13 @@ if PYQTGRAPH_AVAILABLE:
                     idx_overlay = self._get_sampling_indices(x_overlay.shape[0])
                     x_plot_overlay = x_overlay if isinstance(idx_overlay, slice) else x_overlay[idx_overlay]
                     style = color_manager.get_dataset_line_style(idx)
-
-                    for species in selected_series:
+                    overlay_species = self._series_names_compatible_with_x(
+                        axis_scope_series,
+                        series_overlay,
+                        x_overlay,
+                        require_visible=False,
+                    )
+                    for species in overlay_species:
                         y_source = series_overlay.get(species)
                         if y_source is None:
                             continue
@@ -1156,10 +1750,9 @@ if PYQTGRAPH_AVAILABLE:
 
             self._prune_curve_items(active_curve_keys)
 
-            overlays, warnings = self._build_overlay_series(selected_series)
-            self._active_overlay_series = overlays
-            self._overlay_panel.set_status_messages(warnings)
-            self._draw_overlay_series(overlays)
+            self._rebuild_overlay_series_caches(axis_scope_series)
+            self._overlay_panel.set_status_messages(self._active_overlay_warnings)
+            self._draw_overlay_series(list(self._active_overlay_series))
             self._refresh_view_after_plot_update()
 
         def _refresh_view_after_plot_update(self) -> None:
@@ -1174,7 +1767,7 @@ if PYQTGRAPH_AVAILABLE:
                 logger.debug("Failed to auto-range plot after data update: %s", exc, exc_info=True)
 
         def _build_overlay_series(self, selected_series: List[str]) -> Tuple[List[_OverlaySeries], List[str]]:
-            """Compute overlay series respecting current axis selection and per-dataset column filters."""
+            """Compute fully resolved overlay records for the current axis and dataset subset."""
             overlays: List[_OverlaySeries] = []
             warnings: List[str] = []
             x_name = self._x_axis_name or "t"
@@ -1187,36 +1780,50 @@ if PYQTGRAPH_AVAILABLE:
                 payload = self._overlay_datasets.get(dataset_name)
                 if not payload:
                     continue
-                if x_name == "t":
-                    x_source = payload["t"]
-                else:
-                    x_source = payload["species"].get(x_name)
-                if x_source is None:
+                species_payload = payload["species"]
+                enabled_for_dataset = enabled_by_dataset.get(dataset_name)
+                enabled_species = None
+                if enabled_for_dataset is not None:
+                    enabled_species = {
+                        key: species_payload[key]
+                        for key in enabled_for_dataset
+                        if key in species_payload
+                    }
+                resolved_x_column, x_array = self._resolve_overlay_x_source(x_name, payload)
+                if x_array is None:
                     warnings.append(f"{dataset_name}: missing '{x_name}' values")
                     continue
-
-                x_array = np.asarray(x_source, dtype=float).reshape(-1)
                 if x_array.size == 0:
-                    warnings.append(f"{dataset_name}: '{x_name}' has no data")
+                    warnings.append(f"{dataset_name}: '{resolved_x_column or x_name}' has no data")
                     continue
 
                 for species in selected_series:
-                    # Use flexible species name resolution to handle naming variations
-                    resolved_key, y_source = _resolve_dataset_species(species, payload["species"])
+                    # Enabled dataset columns are authoritative for what can render/export.
+                    # Species-X views skip silently when the enabled subset does not expose
+                    # a given simulation species. Time-axis views still warn on true dataset
+                    # mismatches, so probe the full payload only to classify misses.
+                    resolved_key = None
+                    y_source = None
+                    if enabled_species is not None:
+                        resolved_key, y_source = _resolve_dataset_species(species, enabled_species)
+                    else:
+                        resolved_key, y_source = _resolve_dataset_species(species, species_payload)
                     if y_source is None:
-                        # Generate clear warning about missing species match
-                        available = sorted(payload["species"].keys())
+                        if enabled_species is not None:
+                            if x_name != "t":
+                                continue
+                            full_resolved_key, _ = _resolve_dataset_species(species, species_payload)
+                            if full_resolved_key is not None:
+                                continue
+                        available = sorted(species_payload.keys())
                         warnings.append(
                             f"{dataset_name}: no column matching species '{species}'. "
                             f"Available: {', '.join(available[:5])}" +
                             (f" (and {len(available) - 5} more)" if len(available) > 5 else "")
                         )
                         continue
-
-                    # Check if this dataset column is enabled in the overlay panel
-                    enabled_for_dataset = enabled_by_dataset.get(dataset_name)
-                    if enabled_for_dataset is not None and resolved_key not in enabled_for_dataset:
-                        # User disabled this dataset column in the overlay panel; skip silently
+                    if enabled_species is not None and resolved_key not in enabled_species:
+                        # Guard against future resolver changes selecting a disabled column.
                         continue
 
                     y_array = np.asarray(y_source, dtype=float).reshape(-1)
@@ -1228,7 +1835,17 @@ if PYQTGRAPH_AVAILABLE:
                             f"{dataset_name}: '{resolved_key}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
                         )
                         continue
-                    overlays.append(_OverlaySeries(dataset_name, species, x_array, y_array))
+                    overlays.append(
+                        _OverlaySeries(
+                            dataset_name,
+                            species,
+                            x_array,
+                            y_array,
+                            x_name,
+                            resolved_x_column,
+                            str(resolved_key),
+                        )
+                    )
 
             return overlays, warnings
 
@@ -1236,21 +1853,10 @@ if PYQTGRAPH_AVAILABLE:
             """Render overlay scatter markers using species-owned colors and dataset markers."""
             # Get current dataset styling from overlay panel (size and opacity)
             style = self._overlay_panel.dataset_style()
-            active_keys: Set[Tuple[str, str]] = set()
+            active_overlay_keys: Set[Tuple[str, str]] = set()
 
             for entry in overlays:
-                # Determine the dataset column key that was resolved for this overlay
-                # We need to look it up again to get the actual dataset column name
-                payload = self._overlay_datasets.get(entry.dataset)
-                if not payload:
-                    continue
-
-                # Resolve the species again to get the dataset column key
-                resolved_key, _ = _resolve_dataset_species(entry.species, payload["species"])
-                if resolved_key is None:
-                    continue
-
-                color = self._overlay_display_color(entry.dataset, str(resolved_key))
+                color = self._overlay_display_color(entry.resolved_y_column)
                 symbol = self._overlay_symbols.get(entry.dataset, 'o')
 
                 # Apply user-configured opacity to alpha channel
@@ -1264,7 +1870,7 @@ if PYQTGRAPH_AVAILABLE:
                     np.asarray(entry.y, dtype=float).reshape(-1),
                 )
                 overlay_key = (entry.dataset, entry.species)
-                active_keys.add(overlay_key)
+                active_overlay_keys.add(overlay_key)
                 self._upsert_dataset_overlay_item(
                     key=overlay_key,
                     x_data=x_plot,
@@ -1275,7 +1881,7 @@ if PYQTGRAPH_AVAILABLE:
                     symbol=symbol,
                     name=name,
                 )
-            self._prune_dataset_overlay_items(active_keys)
+            self._prune_dataset_overlay_items(active_overlay_keys)
 
         def build_visible_export(self, scope: str) -> Tuple[List[str], List[List[object]]]:
             """
@@ -1295,15 +1901,16 @@ if PYQTGRAPH_AVAILABLE:
                 raise ValueError("No simulation data available to export.")
 
             if scope == "axis":
-                y_names = toolbar.selected_y()
-                if not y_names:
+                candidate_names = self._axis_scope_series_names()
+                if not candidate_names:
                     raise ValueError("Select at least one Y-series before exporting.")
+                overlay_series = list(self._active_overlay_series)
+                warnings = list(self._active_overlay_warnings)
             else:
-                y_names = list(series.keys())
-
-            y_names = [name for name in y_names if name in series]
-            if not y_names:
-                raise ValueError("No valid Y-series found to export.")
+                self._ensure_export_all_overlay_cache()
+                candidate_names = list(series.keys())
+                overlay_series = list(self._export_all_overlay_series)
+                warnings = list(self._export_all_overlay_warnings)
 
             x_name = toolbar.current_x() or "t"
             x_data, derived_label = self._get_x_data()
@@ -1314,19 +1921,59 @@ if PYQTGRAPH_AVAILABLE:
             if x_array.size == 0:
                 raise ValueError("X-axis has no points to export.")
 
-            columns: List[Tuple[str, np.ndarray]] = []
             x_header = derived_label or x_name
-            columns.append((x_header, x_array))
+            blocks: List[List[Tuple[str, np.ndarray]]] = []
+            primary_y_names = self._series_names_compatible_with_x(
+                candidate_names,
+                series,
+                x_array,
+                require_visible=False,
+            )
+            if primary_y_names:
+                primary_columns: List[Tuple[str, np.ndarray]] = [(x_header, x_array)]
+                for name in primary_y_names:
+                    arr = np.asarray(series[name], dtype=float).reshape(-1)
+                    if arr.shape[0] != x_array.shape[0]:
+                        continue
+                    primary_columns.append((self._series_header_text(name), arr))
+                if len(primary_columns) > 1:
+                    blocks.append(primary_columns)
 
-            for name in y_names:
-                arr = np.asarray(series[name], dtype=float).reshape(-1)
-                if arr.shape[0] != x_array.shape[0]:
-                    raise ValueError(
-                        f"Series '{name}' length ({arr.shape[0]}) does not match X-axis length ({x_array.shape[0]})."
-                    )
-                columns.append((name, arr))
+            for entry in list(self._simulation_overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                    continue
+                block_label = self._overlay_copy_block_label(entry)
+                overlay_series_map = entry.get("series") or {}
+                if not isinstance(overlay_series_map, dict):
+                    continue
+                if x_name == "t":
+                    x_overlay = entry.get("t")
+                else:
+                    x_overlay = overlay_series_map.get(x_name)
+                x_overlay_array = _try_1d_float_array(x_overlay)
+                if x_overlay_array.size == 0:
+                    continue
+                overlay_y_names = self._series_names_compatible_with_x(
+                    candidate_names,
+                    overlay_series_map,
+                    x_overlay_array,
+                    require_visible=False,
+                )
+                if not overlay_y_names:
+                    continue
+                overlay_columns: List[Tuple[str, np.ndarray]] = [
+                    (f"{block_label}::{x_header}", x_overlay_array)
+                ]
+                for name in overlay_y_names:
+                    arr = np.asarray(overlay_series_map[name], dtype=float).reshape(-1)
+                    if arr.shape[0] != x_overlay_array.shape[0]:
+                        continue
+                    overlay_columns.append((f"{block_label}::{self._series_header_text(name)}", arr))
+                if len(overlay_columns) > 1:
+                    blocks.append(overlay_columns)
 
-            overlay_series, warnings = self._build_overlay_series(list(self._toolbar.selected_y()))
             active_overlays = self._overlay_panel.selected_datasets()
             if warnings and active_overlays:
                 warning_msg = "\n".join(f" - {msg}" for msg in warnings)
@@ -1336,9 +1983,12 @@ if PYQTGRAPH_AVAILABLE:
 
             for entry in overlay_series:
                 x_header_ds = f"{entry.dataset}::{x_header}"
-                y_header_ds = f"{entry.dataset}::{entry.species}"
-                columns.append((x_header_ds, entry.x))
-                columns.append((y_header_ds, entry.y))
+                y_header_ds = f"{entry.dataset}::{self._series_header_text(entry.species)}"
+                blocks.append([(x_header_ds, entry.x), (y_header_ds, entry.y)])
+
+            columns: List[Tuple[str, np.ndarray]] = [col for block in blocks for col in block]
+            if not columns:
+                raise ValueError("No valid Y-series found to export.")
 
             max_len = max(col[1].shape[0] for col in columns)
             header = [col[0] for col in columns]
@@ -1571,164 +2221,6 @@ if PYQTGRAPH_AVAILABLE:
                     self._plot_item.setYRange(y_min, y_max, padding=0)
                     logger.debug(f"Applied manual Y range: [{y_min}, {y_max}]")
 
-        def _on_mouse_moved(self, pos) -> None:
-            """
-            Handle mouse movement for crosshair and tooltip.
-
-            Parameters
-            ----------
-            pos : QPointF
-                Mouse position in scene coordinates
-            """
-            if self._t is None or not self._series:
-                return
-
-            # Map scene position to plot coordinates
-            mouse_point = self._plot_item.vb.mapSceneToView(pos)
-            x_mouse = mouse_point.x()
-            y_mouse = mouse_point.y()
-
-            # Get X data
-            x_data, x_label = self._get_x_data()
-            if x_data is None or len(x_data) == 0:
-                self._crosshair_v.setVisible(False)
-                self._crosshair_h.setVisible(False)
-                self._tooltip_text.setVisible(False)
-                return
-
-            # Check if mouse is within plot bounds
-            view_box = self._plot_item.vb.viewRange()
-            x_range = view_box[0]
-            y_range = view_box[1]
-
-            if not (x_range[0] <= x_mouse <= x_range[1] and y_range[0] <= y_mouse <= y_range[1]):
-                self._crosshair_v.setVisible(False)
-                self._crosshair_h.setVisible(False)
-                self._tooltip_text.setVisible(False)
-                return
-
-            # Find nearest data point
-            nearest = self._find_nearest_data_point(x_mouse, y_mouse, x_data)
-
-            if nearest is not None:
-                color = nearest.color or (0, 180, 0)
-                pen = pg.mkPen(color=color, width=1.2, style=Qt.DashLine)
-                self._crosshair_v.setPen(pen)
-                self._crosshair_h.setPen(pen)
-                # Show crosshair at exact data point
-                self._crosshair_v.setPos(nearest.x)
-                self._crosshair_h.setPos(nearest.y)
-                self._crosshair_v.setVisible(True)
-                self._crosshair_h.setVisible(True)
-
-                # Show tooltip with exact values
-                kind = "Sim" if nearest.dataset is None else f"Dataset {nearest.dataset}"
-                tooltip_text = (
-                    f"{kind}: {nearest.label}\n"
-                    f"{self._x_axis_name} = {self._format_number(nearest.x)}\n"
-                    f"{nearest.label} = {self._format_number(nearest.y)}"
-                )
-                self._tooltip_text.setText(tooltip_text)
-                self._tooltip_text.setPos(x_mouse, y_mouse)
-                self._tooltip_text.setVisible(True)
-            else:
-                self._crosshair_v.setVisible(False)
-                self._crosshair_h.setVisible(False)
-                self._tooltip_text.setVisible(False)
-
-        def _find_nearest_data_point(self, x_mouse: float, y_mouse: float, x_data: np.ndarray) -> Optional[_NearestHit]:
-            """
-            Find the nearest data point to the mouse cursor.
-
-            Parameters
-            ----------
-            x_mouse, y_mouse : float
-                Mouse coordinates in plot space
-            x_data : np.ndarray
-                X-axis data
-
-            Returns
-            -------
-            tuple or None
-                (x_value, y_value, series_name) if found within threshold, None otherwise
-            """
-            best_match: Optional[_NearestHit] = None
-            best_distance = float('inf')
-            threshold = 0.05  # Relative threshold (5% of plot range)
-
-            # Get current view range for normalizing distance
-            view_box = self._plot_item.vb.viewRange()
-            x_range = view_box[0][1] - view_box[0][0]
-            y_range = view_box[1][1] - view_box[1][0]
-
-            # Check each visible series
-            for name in self._toolbar.selected_y():
-                if name not in self._series:
-                    continue
-                if not self._visible.get(name, True):
-                    continue
-
-                y_data = self._series[name]
-
-                # Find nearest point in this series
-                # Normalize distances to account for different axis scales
-                distances = np.sqrt(((x_data - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
-                min_idx = np.argmin(distances)
-                min_distance = distances[min_idx]
-
-                if min_distance < best_distance:
-                    color = self._colors.get(name, (0, 160, 0))
-                    best_match = _NearestHit(
-                        x_data[min_idx],
-                        y_data[min_idx],
-                        name,
-                        None,
-                        color,
-                    )
-                    best_distance = min_distance
-
-            # Check dataset overlays
-            for overlay in self._active_overlay_series:
-                y_data = overlay.y
-                x_overlay = overlay.x
-                distances = np.sqrt(((x_overlay - x_mouse) / x_range) ** 2 + ((y_data - y_mouse) / y_range) ** 2)
-                min_idx = np.argmin(distances)
-                min_distance = distances[min_idx]
-
-                if min_distance < best_distance:
-                    color = self._overlay_display_color(overlay.dataset, overlay.species)
-                    best_match = _NearestHit(
-                        x_overlay[min_idx],
-                        y_data[min_idx],
-                        overlay.species,
-                        overlay.dataset,
-                        color,
-                    )
-                    best_distance = min_distance
-
-            # Return match only if within threshold
-            if best_match and best_distance <= threshold:
-                return best_match
-            return None
-
-        def _format_number(self, value: float) -> str:
-            """Format number for display with appropriate precision."""
-            import math
-            if not math.isfinite(value):
-                return str(value)
-
-            abs_val = abs(value)
-            if abs_val == 0:
-                return "0"
-            elif abs_val >= 1000:
-                return f"{value:.2e}"
-            elif abs_val >= 10:
-                return f"{value:.1f}"
-            elif abs_val >= 0.01:
-                return f"{value:.3f}"
-            else:
-                return f"{value:.2e}"
-
         def clear(self):
             """Clear all plot data."""
             self._plot_item.clear()
@@ -1741,26 +2233,22 @@ if PYQTGRAPH_AVAILABLE:
             self._dataset_model_items = {}
             self._overlay_items = {}
             self._active_overlay_series = []
+            self._export_all_overlay_series = []
+            self._active_overlay_warnings = []
+            self._export_all_overlay_warnings = []
+            self._export_all_overlay_cache_dirty = True
             self._annotations = []
             self._guide_items = []
             self._scalar_values = {}
+            self._simulation_set_label = None
+            self._simulation_set_popup_label = None
+            self._simulation_overlays = []
 
         # ==================== Plot Enhancements (v0.2.0) ====================
 
         def _show_context_menu(self, position):
             """Show context menu for plot enhancements."""
             menu = QtWidgets.QMenu(self)
-
-            # Secondary Y-axis actions
-            secondary_menu = menu.addMenu("Secondary Y-Axis")
-            if self._secondary_y_axis is None:
-                add_secondary_action = secondary_menu.addAction("Add Secondary Y-Axis")
-                add_secondary_action.triggered.connect(self._add_secondary_y_axis)
-            else:
-                remove_secondary_action = secondary_menu.addAction("Remove Secondary Y-Axis")
-                remove_secondary_action.triggered.connect(self._remove_secondary_y_axis)
-
-            menu.addSeparator()
 
             # Log scale actions
             log_menu = menu.addMenu("Log Scale")
@@ -1775,7 +2263,28 @@ if PYQTGRAPH_AVAILABLE:
             log_y_action.setChecked(self._log_y)
             log_y_action.triggered.connect(self._toggle_log_y)
 
+            if self._enable_axis_inversion_actions:
+                direction_menu = menu.addMenu("Axis Direction")
+
+                invert_x_action = direction_menu.addAction("Invert X-Axis")
+                invert_x_action.setCheckable(True)
+                invert_x_action.setChecked(self._invert_x_axis)
+                invert_x_action.triggered.connect(self._toggle_invert_x)
+
+                invert_y_action = direction_menu.addAction("Invert Y-Axis")
+                invert_y_action.setCheckable(True)
+                invert_y_action.setChecked(self._invert_y_axis)
+                invert_y_action.triggered.connect(self._toggle_invert_y)
+
             menu.addSeparator()
+
+            if self._enable_canonical_ghost_toggle_action:
+                ghost_action = menu.addAction("Show Canonical Reference Lines")
+                ghost_action.setCheckable(True)
+                ghost_action.setChecked(self._show_canonical_ghost_lines)
+                ghost_action.setEnabled(self._has_canonical_ghost_overlays())
+                ghost_action.toggled.connect(self._set_canonical_ghost_lines_visible)
+                menu.addSeparator()
 
             # Axis range actions
             axis_range_action = menu.addAction("Custom Axis Ranges...")
@@ -1794,9 +2303,16 @@ if PYQTGRAPH_AVAILABLE:
 
             menu.addSeparator()
 
+            if self._copy_all_export_plan_provider is not None:
+                copy_all_action = menu.addAction("Copy All")
+                copy_all_action.triggered.connect(self._copy_all)
+
+            if self._enable_copy_visible_data_action:
+                copy_visible_action = menu.addAction("Copy Visible Data")
+                copy_visible_action.triggered.connect(self._copy_visible_data)
+
             export_action = menu.addAction("Export Plot...")
             export_action.triggered.connect(self._export_plot)
-
             mouse_menu = menu.addMenu("Mouse Mode")
             vb = self._plot_item.getViewBox()
 
@@ -1819,91 +2335,37 @@ if PYQTGRAPH_AVAILABLE:
             # Show menu at cursor position
             menu.exec_(self._plot_widget.mapToGlobal(position))
 
-        def _add_secondary_y_axis(self):
-            """Add secondary Y-axis for selected series."""
-            if self._secondary_y_axis is not None:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Secondary Axis",
-                    "Secondary Y-axis already exists. Remove it first to add a new one."
-                )
+        def _has_canonical_ghost_overlays(self) -> bool:
+            for entry in (self._simulation_overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
+                    return True
+            return False
+
+        def _set_canonical_ghost_lines_visible(self, visible: bool) -> None:
+            show = bool(visible)
+            if self._show_canonical_ghost_lines == show:
                 return
+            self._show_canonical_ghost_lines = show
+            self._update_plot()
 
-            # Ask user which series to plot on secondary axis
-            available_series = list(self._series.keys())
-            if not available_series:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "No Data",
-                    "No series available to plot on secondary axis."
-                )
-                return
+        def _apply_axis_inversion_state(self) -> None:
+            viewbox = self._plot_item.getViewBox()
+            viewbox.invertX(self._invert_x_axis)
+            viewbox.invertY(self._invert_y_axis)
 
-            # Show selection dialog
-            item, ok = QtWidgets.QInputDialog.getItem(
-                self,
-                "Select Series",
-                "Choose series for secondary Y-axis:",
-                available_series,
-                0,
-                False
-            )
+        def _toggle_invert_x(self):
+            """Toggle X-axis inversion."""
+            self._invert_x_axis = not self._invert_x_axis
+            self._apply_axis_inversion_state()
+            logger.info(f"X-axis inverted: {self._invert_x_axis}")
 
-            if not ok or not item:
-                return
-
-            # Create secondary ViewBox
-            self._secondary_y_axis = pg.ViewBox()
-            self._plot_item.showAxis('right')
-            self._plot_item.scene().addItem(self._secondary_y_axis)
-            self._plot_item.getAxis('right').linkToView(self._secondary_y_axis)
-            self._secondary_y_axis.setXLink(self._plot_item)
-
-            # Update views when resizing
-            def update_views():
-                self._secondary_y_axis.setGeometry(self._plot_item.vb.sceneBoundingRect())
-                self._secondary_y_axis.linkedViewChanged(self._plot_item.vb, self._secondary_y_axis.XAxis)
-
-            self._plot_item.vb.sigResized.connect(update_views)
-
-            # Plot selected series on secondary axis
-            x_data, _ = self._get_x_data()
-            if x_data is not None and item in self._series:
-                y_data = self._series[item]
-                color = self._colors.get(item, (100, 100, 100))
-                pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
-
-                plot_item = pg.PlotDataItem(x_data, y_data, pen=pen, name=f"{item} (secondary)")
-                self._secondary_y_axis.addItem(plot_item)
-                self._secondary_y_items[item] = plot_item
-
-                # Set label
-                self._plot_item.setLabel('right', item, units='M')
-                self._plot_item.getAxis('right').setPen('k' if not self._dark_mode else '#e0e0e0')
-                self._plot_item.getAxis('right').setTextPen('k' if not self._dark_mode else '#e0e0e0')
-
-                update_views()
-
-                logger.info(f"Added secondary Y-axis for series: {item}")
-
-        def _remove_secondary_y_axis(self):
-            """Remove secondary Y-axis."""
-            if self._secondary_y_axis is None:
-                return
-
-            # Remove plot items
-            for item in self._secondary_y_items.values():
-                self._secondary_y_axis.removeItem(item)
-            self._secondary_y_items.clear()
-
-            # Remove ViewBox
-            self._plot_item.scene().removeItem(self._secondary_y_axis)
-            self._secondary_y_axis = None
-
-            # Hide right axis
-            self._plot_item.hideAxis('right')
-
-            logger.info("Removed secondary Y-axis")
+        def _toggle_invert_y(self):
+            """Toggle Y-axis inversion."""
+            self._invert_y_axis = not self._invert_y_axis
+            self._apply_axis_inversion_state()
+            logger.info(f"Y-axis inverted: {self._invert_y_axis}")
 
         def _toggle_log_x(self):
             """Toggle X-axis log scale."""
@@ -2025,6 +2487,7 @@ if PYQTGRAPH_AVAILABLE:
         def _reset_view(self):
             """Reset plot view to auto range."""
             self._plot_item.autoRange()
+            self._apply_axis_inversion_state()
             logger.info("Reset plot view to auto range")
 
         def set_theme(self, dark_mode: bool = False):
@@ -2076,9 +2539,15 @@ else:
             *,
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
+            enable_axis_inversion_actions: bool = False,
+            enable_canonical_ghost_toggle_action: bool = False,
+            enable_copy_visible_data_action: bool = False,
         ):
             super().__init__(parent)
             _ = workspace_splitter_object_name
+            _ = enable_axis_inversion_actions
+            _ = enable_canonical_ghost_toggle_action
+            _ = enable_copy_visible_data_action
             layout = QtWidgets.QVBoxLayout(self)
             layout.addWidget(make_pyqtgraph_fallback_widget(self))
             self._main_splitter = None

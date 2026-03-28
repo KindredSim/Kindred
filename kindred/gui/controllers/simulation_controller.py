@@ -3368,6 +3368,10 @@ class SimulationController(QtCore.QObject):
                         owned_species = list(mechanism.species_names())
                     except Exception:
                         owned_species = None
+                if str(batch_set_id or "").strip():
+                    self.ui.batch.set_active_batch_selection(str(batch_set_id), str(batch_set or ""), [str(batch_set_id)])
+                else:
+                    self.ui.batch.clear_display_selection_state()
                 self.ui.results.set_data(
                     t,
                     series,
@@ -3375,6 +3379,11 @@ class SimulationController(QtCore.QObject):
                     overlays=[],
                     owned_species=owned_species,
                 )
+                if hasattr(self.ui.results, "sync_main_plot_copy_labels"):
+                    self.ui.results.sync_main_plot_copy_labels(
+                        str(batch_set_id or ""),
+                        [str(batch_set_id)] if str(batch_set_id or "").strip() else [],
+                    )
                 plot = self.ui.results.main_plot()
                 if hasattr(plot, "set_scalar_values"):
                     plot.set_scalar_values(algebra_scalars)

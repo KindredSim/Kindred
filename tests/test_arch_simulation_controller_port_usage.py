@@ -22,7 +22,9 @@ BATCH_TARGET_METHODS = {
     "batch_set_ids_for_scope",
     "batch_current_row",
     "batch_set_id_for_row",
+    "clear_display_selection_state",
     "display_cached_batch_selection",
+    "set_active_batch_selection",
 }
 
 QUEUE_CONTEXT_BATCH_TARGET_METHODS = {
@@ -610,7 +612,9 @@ def test_simulation_controller_mechanism_clusters_use_explicit_mechanism_port(
                 "batch_set_ids_for_scope",
                 "batch_current_row",
                 "batch_set_id_for_row",
+                "clear_display_selection_state",
                 "display_cached_batch_selection",
+                "set_active_batch_selection",
             },
         ),
     ),

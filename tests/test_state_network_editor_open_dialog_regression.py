@@ -113,7 +113,7 @@ def test_locked_state_network_dialog_opens_read_only_and_blocks_mutation(main_wi
         assert info_label is not None
         info_text = info_label.text().lower()
         assert "read-only" in info_text
-        assert "unlock reactions editing" in info_text
+        assert "allow editing" in info_text
 
         assert editor._add_state_btn.isEnabled() is False
         assert editor._remove_state_btn.isEnabled() is False
@@ -235,7 +235,7 @@ def test_state_network_dialog_updates_lock_banner_while_open(
         _process_events_bounded()
         observed["locked_text"] = info_label.text()
         assert "read-only" in observed["locked_text"].lower()
-        assert "unlock reactions editing" in observed["locked_text"].lower()
+        assert "allow editing" in observed["locked_text"].lower()
 
         main_window._set_mechanism_edit_locked(False)
         _process_events_bounded()
@@ -281,7 +281,7 @@ def test_load_project_then_open_state_network_remains_locked_and_read_only(
         info_label = dialog.findChild(QtWidgets.QLabel, "stateNetworkDialogInfoLabel")
         assert info_label is not None
         assert "read-only" in info_label.text().lower()
-        assert "unlock reactions editing" in info_label.text().lower()
+        assert "allow editing" in info_label.text().lower()
 
         assert editor._add_state_btn.isEnabled() is False
         assert editor._remove_state_btn.isEnabled() is False

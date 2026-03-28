@@ -41,7 +41,6 @@ RUFF_CMD=(
   --force-exclude
   --extend-exclude
   _audit_reports
-  --extend-exclude
 )
 
 {
@@ -76,4 +75,3 @@ else
 fi
 
 exit 0
-

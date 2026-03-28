@@ -607,9 +607,9 @@ class GlobalFitWorker(QtCore.QThread):
                     plot_vals = np.asarray(y_sim_raw, dtype=float).reshape(-1)
                     plot_for_ds[species_name] = np.asarray(plot_vals[plot_mask], dtype=float).reshape(-1)
 
-            residual = y_sim_resid - y_exp
+            residual = np.asarray(y_sim_resid, dtype=float).reshape(-1) - y_exp
             residual_for_ds[species_name] = residual
-            residual_blocks.append(y_exp - y_sim_resid)
+            residual_blocks.append(residual)
             exp_blocks.append(y_exp)
 
         stats_for_ds: Optional[dict[str, float]] = None

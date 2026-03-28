@@ -120,6 +120,10 @@ class SimulationBatchPort(Protocol):
 
     def batch_preferred_primary_set_id(self, rows: Sequence[int]) -> Optional[str]: ...
 
+    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: Sequence[str]) -> None: ...
+
+    def clear_display_selection_state(self) -> None: ...
+
     def batch_cache_key(
         self,
         *,
@@ -250,6 +254,8 @@ class SimulationResultsPort(Protocol):
     def update_main_plot_parameter_summary(self, parameters: Dict[str, Tuple[float, str]]) -> None: ...
 
     def set_results_table(self, table: object) -> None: ...
+
+    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None: ...
 
 
 class SimulationProvenancePort(Protocol):

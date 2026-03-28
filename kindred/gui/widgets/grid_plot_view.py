@@ -71,18 +71,19 @@ class GridPlotView(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
-        # Control panel for grid view options
         controls_layout = QtWidgets.QHBoxLayout()
-        controls_layout.setContentsMargins(4, 4, 4, 4)
+        controls_layout.setContentsMargins(2, 2, 2, 0)
+        controls_layout.setSpacing(6)
 
         self._legend_toggle_btn = QtWidgets.QCheckBox("Show Legend")
         self._legend_toggle_btn.setChecked(True)
         self._legend_toggle_btn.toggled.connect(self._toggle_legend)
         controls_layout.addWidget(self._legend_toggle_btn)
 
-        # Species selection (applies to all datasets) - multi-select like main plot
-        controls_layout.addWidget(QtWidgets.QLabel("Species:"))
+        species_label = QtWidgets.QLabel("Species")
+        controls_layout.addWidget(species_label)
         self._species_list = QtWidgets.QListWidget()
         self._species_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
         self._species_list.setSizePolicy(
@@ -90,6 +91,7 @@ class GridPlotView(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Minimum,
         )
         self._species_list.itemSelectionChanged.connect(self._on_species_selection_changed)
+        species_label.setBuddy(self._species_list)
         controls_layout.addWidget(self._species_list)
 
         controls_layout.addStretch()

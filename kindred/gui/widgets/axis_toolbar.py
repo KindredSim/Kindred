@@ -108,17 +108,19 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_selector_btn.setMenu(self._y_menu)
 
         self._parametric = QtWidgets.QCheckBox("Parametric", self)
-        self._parametric.setToolTip("Plot X(t) vs each selected Y(t)")
+        self._parametric.setToolTip("Plot selected Y variables against each other instead of against time")
 
         self._options_btn = QtWidgets.QToolButton(self)
         self._options_btn.setText("Options")
+        self._options_btn.setToolTip("Plot display options")
         self._options_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self._options_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._options_btn.setIcon(QtGui.QIcon.fromTheme("preferences-other"))
 
         self._menu = QtWidgets.QMenu(self)
-        self._action_sampling_dense = self._menu.addAction("Sampling: Dense")
-        self._action_sampling_coarse = self._menu.addAction("Sampling: Coarse")
+        self._action_downsampling = self._menu.addAction("Downsampling: 1k points/curve")
+        self._action_downsampling.setCheckable(True)
+        self._action_downsampling.setChecked(False)
         self._menu.addSeparator()
         self._action_add_guide = self._menu.addAction("Add Guide from Scalar…")
         self._menu.addSeparator()
@@ -133,7 +135,7 @@ class AxisToolbar(QtWidgets.QWidget):
         # Axis range controls
         self._auto_range = QtWidgets.QCheckBox("Auto", self)
         self._auto_range.setChecked(True)
-        self._auto_range.setToolTip("Automatically fit axes to data")
+        self._auto_range.setToolTip("Auto-scale axes to fit all visible data")
 
         self._x_min = QtWidgets.QLineEdit(self)
         self._x_min.setPlaceholderText("X min")
@@ -170,8 +172,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self._parametric.toggled.connect(self._on_parametric_toggled)
         self._y_list.itemChanged.connect(self._on_y_item_changed)
 
-        self._action_sampling_dense.triggered.connect(lambda: self._emit_option("sampling", "dense"))
-        self._action_sampling_coarse.triggered.connect(lambda: self._emit_option("sampling", "coarse"))
+        self._action_downsampling.toggled.connect(
+            lambda on: self._emit_option("sampling", "coarse" if on else "dense")
+        )
         self._action_add_guide.triggered.connect(lambda: self.addGuideRequested.emit(None))
         self._action_export_scope_visible.triggered.connect(lambda: self._emit_option("export_scope", "visible"))
         self._action_export_scope_all.triggered.connect(lambda: self._emit_option("export_scope", "all"))
@@ -329,7 +332,7 @@ class AxisToolbar(QtWidgets.QWidget):
         x_label: QtWidgets.QLabel,
         y_label: QtWidgets.QLabel
     ) -> None:
-        _ = y_label
+        y_label.setVisible(False)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)

@@ -292,7 +292,7 @@ def test_shell_contract_exposes_all_five_docks_and_detached_slider_surface(main_
 
     assert main_window.centralWidget() is main_window._plot_tabs
     assert panel_actions == {"Mechanism", "Interactive Sliders", "Batch Initial Conditions", "Data", "Analysis"}
-    assert set(surface_actions) == {"Statistics", "Parameters", "Overlays"}
+    assert set(surface_actions) == {"Statistics", "Parameters"}
     assert panel_layout_tips_action.objectName() == "panelLayoutTipsAction"
     for dock in _all_shell_docks(main_window):
         assert dock.allowedAreas() == _ALL_DOCK_AREAS
@@ -310,7 +310,6 @@ def test_shell_contract_exposes_all_five_docks_and_detached_slider_surface(main_
     assert [details_tabs.tabText(i) for i in range(details_tabs.count())] == [
         "Statistics",
         "Parameters",
-        "Overlays",
     ]
 
 
@@ -344,7 +343,6 @@ def test_minimal_view_ribbon_host_sits_beneath_menu_bar_and_reuses_shared_view_a
         "Analysis",
         "Statistics",
         "Parameters",
-        "Overlays",
         "Panel Layout Tips...",
         "Reset Layout",
         "Dark Mode",
@@ -402,7 +400,6 @@ def test_view_ribbon_exposes_first_class_page_group_contract(main_window, qt_app
     assert set(analysis_group.compact_action_texts()) == {
         "Statistics",
         "Parameters",
-        "Overlays",
     }
 
 
@@ -489,7 +486,7 @@ def test_panel_layout_tips_action_explains_same_side_docking(main_window, monkey
     assert "Reset Layout" in message
 
 
-@pytest.mark.parametrize("surface_name", ["Statistics", "Parameters", "Overlays"])
+@pytest.mark.parametrize("surface_name", ["Statistics", "Parameters"])
 def test_analysis_surface_action_shows_dock_and_selects_requested_tab(main_window, qt_app, surface_name) -> None:
     details_tabs = main_window._analysis_dock.findChild(QtWidgets.QTabWidget, "mainPlotDetailTabs")
     assert details_tabs is not None

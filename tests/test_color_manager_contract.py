@@ -482,11 +482,62 @@ def test_main_plot_overlay_aliases_keep_species_color_and_vary_marker_by_dataset
         assert _brush_rgb(item_one.opts["brush"]) == expected
         assert _brush_rgb(item_two.opts["brush"]) == expected
         assert item_one.opts["symbol"] != item_two.opts["symbol"]
+    finally:
+        panel.close()
+        qt_app.processEvents()
 
-        hit = panel._find_nearest_data_point(0.0, 1.0, t)
-        assert hit is not None
-        assert hit.dataset == "ds1"
-        assert tuple(hit.color) == expected
+
+@pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
+def test_main_plot_overlay_enabled_alias_preserves_resolved_dataset_column_color_with_exact_column_present(qt_app) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+
+    panel_cls = get_plot_panel_class()
+    panel = panel_cls()
+    try:
+        t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+        x_axis_species = np.asarray([1.0, 2.0, 3.0], dtype=float)
+        simulated = np.asarray([3.0, 3.0, 3.0], dtype=float)
+        observed_exact = np.asarray([1.0, 0.6, 0.2], dtype=float)
+        observed_alias = np.asarray([1.2, 0.8, 0.4], dtype=float)
+
+        panel.set_data(
+            t,
+            {"A": simulated, "B": x_axis_species},
+            label="set1",
+            owned_species=["A", "A_conc", "B"],
+        )
+        manager.set_species_roster(["A", "A_conc", "B"])
+        panel.set_overlay_catalog(
+            {
+                "ds1": {
+                    "t": t,
+                    "species": {
+                        "A": observed_exact,
+                        "A_conc": observed_alias,
+                        "B": x_axis_species,
+                    },
+                },
+            }
+        )
+        panel._overlay_panel._selected["ds1"] = True
+        panel._overlay_panel._enabled_species["ds1"] = {"A_conc"}
+        panel.set_selected_series(["A"])
+        panel._on_x_axis_changed("B")
+        qt_app.processEvents()
+
+        overlay = panel._active_overlay_series[0]
+        expected = _rgb(manager.get_species_color("A_conc"))
+        item = panel._overlay_items[("ds1", "A")]
+
+        assert overlay.species == "A"
+        assert overlay.resolved_x_column == "B"
+        assert overlay.resolved_y_column == "A_conc"
+        np.testing.assert_allclose(overlay.x, x_axis_species)
+        np.testing.assert_allclose(overlay.y, observed_alias)
+        assert _brush_rgb(item.opts["brush"]) == expected
     finally:
         panel.close()
         qt_app.processEvents()

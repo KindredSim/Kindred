@@ -73,6 +73,61 @@ def test_simulation_curve_items_reused_without_remove_all(qt_app, monkeypatch):
 
 
 @pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
+def test_dataset_overlay_scatter_items_reused_across_plot_refresh(qt_app, monkeypatch):
+    panel_cls = get_plot_panel_class()
+    panel = panel_cls()
+
+    try:
+        t = np.array([0.0, 1.0, 2.0], dtype=float)
+        panel.set_data(
+            t,
+            {"A": np.array([1.0, 0.5, 0.2], dtype=float)},
+            label="set1",
+            owned_species=["A", "A_conc"],
+        )
+        panel.set_overlay_catalog(
+            {
+                "ds1": {
+                    "t": t,
+                    "species": {
+                        "A": np.array([0.8, 0.4, 0.1], dtype=float),
+                        "A_conc": np.array([0.9, 0.45, 0.15], dtype=float),
+                    },
+                }
+            }
+        )
+        panel._overlay_panel._selected["ds1"] = True
+        panel._overlay_panel._enabled_species["ds1"] = {"A_conc"}
+        panel.set_selected_series(["A"])
+        panel._on_x_axis_changed("t")
+        for _ in range(3):
+            qt_app.processEvents()
+
+        overlay_key = ("ds1", "A")
+        first_item = panel._overlay_items[overlay_key]
+        first_id = id(first_item)
+
+        removed: list[object] = []
+        original_remove_item = panel._plot_item.removeItem
+
+        def _spy_remove_item(item):
+            removed.append(item)
+            return original_remove_item(item)
+
+        monkeypatch.setattr(panel._plot_item, "removeItem", _spy_remove_item, raising=True)
+
+        panel._update_plot()
+        for _ in range(3):
+            qt_app.processEvents()
+
+        assert overlay_key in panel._overlay_items
+        assert id(panel._overlay_items[overlay_key]) == first_id
+        assert first_item not in removed
+    finally:
+        panel.deleteLater()
+
+
+@pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
 def test_simulation_plot_auto_range_refits_view_on_successive_set_data(qt_app):
     panel_cls = get_plot_panel_class()
     panel = panel_cls()
