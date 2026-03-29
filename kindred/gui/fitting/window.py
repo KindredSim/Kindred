@@ -72,20 +72,6 @@ _PROJECT_APPLY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Parameters and initial conditions", _PROJECT_APPLY_SCOPE_BOTH),
 )
 
-def _get_clipboard():
-    """
-    Clipboard accessor seam (monkeypatchable in tests).
-
-    Returns a Qt clipboard-like object with `setText(str)` / `text()` when available,
-    otherwise returns None.
-    """
-    try:
-        app = QtWidgets.QApplication.instance()
-        return app.clipboard() if app is not None else None
-    except Exception:
-        return None
-
-
 DEFAULT_PARALLEL_STARTS = 4
 
 __all__ = [
@@ -791,6 +777,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_plot_model_x = {}
         self._last_result = None
         self._closing = False
+        self._subset_view_stale = False
         self._pending_best_payload = None
         self._pending_best_worker = None
         self._pending_best_timer = QtCore.QTimer(self)
@@ -840,6 +827,7 @@ class FittingWindow(QtWidgets.QDialog):
             atol_default = 1e-12
         return str(solver_default), float(rtol_default), float(atol_default)
 
+    # transitional — remove when callers use TargetsWeightsTab API directly
     def _applied_selected_target_weights_for_dataset(self, dataset_id: str) -> Dict[str, float]:
         return self._targets_weights_tab.applied_target_weights_for_dataset(dataset_id)
 
@@ -1078,7 +1066,7 @@ class FittingWindow(QtWidgets.QDialog):
             fit_targets_full_t_getter=lambda ds_id: _w()._targets_weights_tab.full_t_by_dataset.get(ds_id, np.asarray([])) if _w() is not None else np.asarray([]),
             fit_targets_available_getter=lambda ds_id: list(_w()._targets_weights_tab.available_by_dataset.get(ds_id, [])) if _w() is not None else [],
             fit_targets_full_series_getter=lambda ds_id: _w()._targets_weights_tab.full_series_by_dataset.get(ds_id, {}) if _w() is not None else {},
-            fit_targets_selection_applied_getter=lambda ds_id: list(_w()._targets_weights_tab._fit_targets_selection_applied.get(ds_id, [])) if _w() is not None else [],
+            fit_targets_selection_applied_getter=lambda ds_id: list(_w()._targets_weights_tab.fit_targets_selection_applied.get(ds_id, [])) if _w() is not None else [],
             modeled_series_getter=lambda: _w()._modeled_series_names_for_x_axis() if _w() is not None else set(),
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
             parent=self,
@@ -1151,7 +1139,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.statusMessage.connect(self._status_label.setText)
         self._targets_weights_tab.targetsApplied.connect(self._on_targets_applied)
         self._targets_weights_tab.validityChanged.connect(self._on_targets_validity_changed)
-        self._targets_weights_tab.statusMessage.connect(self._status_label.setText)
+        self._targets_weights_tab.statusMessage.connect(self._on_targets_status_message)
         self._data_tab.datasetIncludeChanged.connect(self._on_data_tab_include_changed)
         self._data_tab.addDatasetsRequested.connect(self._open_add_datasets_dialog)
         self._data_tab.removeDatasetsRequested.connect(self._remove_datasets_from_session)
@@ -1354,11 +1342,6 @@ class FittingWindow(QtWidgets.QDialog):
     @property
     def _fit_target_weights_pending_invalid(self):
         return self._targets_weights_tab._fit_target_weights_pending_invalid
-
-    # transitional — remove when tests are updated to use TargetsWeightsTab API directly
-    @property
-    def _fit_targets_dirty(self):
-        return self._targets_weights_tab._fit_targets_dirty
 
     # transitional — forwarding for tests
     def _invalid_pending_target_weight_dataset_ids(self) -> List[str]:
@@ -1641,6 +1624,12 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._refresh_run_button_enabled_state()
 
+    def _on_targets_status_message(self, msg: str) -> None:
+        if self._subset_view_stale:
+            msg = msg + " (subset view stale)"
+            self._subset_view_stale = False
+        self._status_label.setText(msg)
+
     def _on_targets_applied(self) -> None:
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._rebuild_selected_payload_lookup()
@@ -1648,7 +1637,8 @@ class FittingWindow(QtWidgets.QDialog):
         try:
             self._subset_widget.set_dataset_entries(self._dataset_entries)
         except Exception:
-            pass
+            self._subset_view_stale = True
+            logger.warning("Subset widget update failed after targets applied", exc_info=True)
 
     def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
         if 0 <= row < len(self._dataset_entries):
@@ -3244,32 +3234,6 @@ class FittingWindow(QtWidgets.QDialog):
             dataset_stats=dataset_stats,
             dataset_ids=dataset_ids,
         )
-
-    def _sync_dataset_initials(self, result: GlobalFitResult) -> None:
-        """Persist dataset-specific initial concentration updates."""
-        if not result.dataset_params:
-            return
-        prefix = "init:"
-        for dataset_id, param_map in result.dataset_params.items():
-            if not param_map:
-                continue
-            updates: Dict[str, float] = {}
-            for key, value in param_map.items():
-                if not key.startswith(prefix):
-                    continue
-                species = key[len(prefix):]
-                updates[species] = value
-                self._global_dataset_params.setdefault(dataset_id, {})[key] = value
-                if dataset_id in self._global_dataset_variable_params:
-                    spec = self._global_dataset_variable_params[dataset_id].get(key)
-                    if spec is not None:
-                        spec["initial"] = value
-            if updates and self._dataset_settings_updater:
-                try:
-                    self._dataset_settings_updater(dataset_id, updates)
-                except Exception as exc:
-                    self._best_effort_failures.add(f"dataset_settings_updater:{dataset_id}")
-                    logger.warning("Failed to update dataset settings for %s: %s", dataset_id, exc)
 
     def _on_worker_error(self, error: object, *, worker: Optional[QtCore.QThread] = None) -> None:
         if not self._is_active_worker_callback(worker):

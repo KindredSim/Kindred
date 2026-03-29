@@ -253,7 +253,6 @@ class TargetsWeightsTab(QtWidgets.QWidget):
 
         # -- Initial refresh --
         self._refresh_fit_targets_dataset_list_items()
-        self._refresh_internal_validity_ui()
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -938,6 +937,7 @@ class TargetsWeightsTab(QtWidgets.QWidget):
 
     def refresh_dataset_list(self) -> None:
         self._refresh_fit_targets_dataset_list_items()
+        self._refresh_internal_validity_ui()
 
     # ------------------------------------------------------------------
     # Public API -- Tab activation
