@@ -151,7 +151,13 @@ def _make_fitting_window():
 # ===================================================================
 
 def test_on_targets_applied_subset_failure(qt_app):
-    """When subset widget update fails, status shows '(subset view stale)' suffix."""
+    """When subset widget update fails, status shows '(subset view stale)' suffix.
+
+    Note: signal ordering (targetsApplied before statusMessage) is verified
+    structurally at targets_weights_tab.py:834,840 — line 834 emits
+    targetsApplied, line 840 emits statusMessage. This test exercises the
+    FittingWindow handler logic directly, not the signal dispatch order.
+    """
     window = _make_fitting_window()
     try:
         window._subset_widget.set_dataset_entries = lambda *a, **kw: (_ for _ in ()).throw(
@@ -211,7 +217,7 @@ def test_refresh_dataset_list_clears_footer_on_empty(qt_app):
         assert tab._fit_targets_footer._error_text == "Stale error from previous dataset"
 
         entries.clear()
-        tab.remove_dataset_state("ds1")
+        tab.remove_dataset_state({"ds1"})
         tab.refresh_dataset_list()
         qt_app.processEvents()
 
@@ -285,6 +291,7 @@ def test_algebraic_observable_add_preserves_metadata(qt_app):
         payload = received[0]
         assert "dataset_ids" in payload
         assert isinstance(payload["dataset_ids"], list)
+        assert payload["dataset_ids"] == ["ds1"]
         assert "persist" in payload
         assert payload["persist"] is True
     finally:

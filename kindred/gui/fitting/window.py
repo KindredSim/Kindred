@@ -57,12 +57,11 @@ from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.widgets.dataset_subset_widget import DatasetSubsetWidget
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
+from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
 
 logger = logging.getLogger(__name__)
 
-INITIAL_PREFIX = "init:"
 _FIT_TARGETS_INVALID_MARK_ROLE = int(Qt.UserRole) + 4095
-_SAMPLING_ALL_POINTS_SENTINEL = 0
 _PROJECT_APPLY_SCOPE_PARAMETERS = "parameters"
 _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS = "initial_conditions"
 _PROJECT_APPLY_SCOPE_BOTH = "both"
@@ -71,8 +70,6 @@ _PROJECT_APPLY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Initial conditions only", _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS),
     ("Parameters and initial conditions", _PROJECT_APPLY_SCOPE_BOTH),
 )
-
-DEFAULT_PARALLEL_STARTS = 4
 
 __all__ = [
     "DEFAULT_PARALLEL_STARTS",
@@ -1654,7 +1651,7 @@ class FittingWindow(QtWidgets.QDialog):
         try:
             self._subset_widget.set_dataset_entries(self._dataset_entries)
         except Exception:
-            return
+            pass
         self._refresh_sampling_validity_ui()
         self._status_label.setText("Sampling applied")
 

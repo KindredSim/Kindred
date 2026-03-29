@@ -18,8 +18,7 @@ from PySide6.QtCore import Qt, Signal
 
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
 from kindred.core.analysis.dataset_sampling import compute_windowed_indices
-
-_SAMPLING_ALL_POINTS_SENTINEL = 0
+from kindred.gui.fitting.constants import _SAMPLING_ALL_POINTS_SENTINEL
 
 
 class DataTab(QtWidgets.QWidget):
@@ -177,7 +176,7 @@ class DataTab(QtWidgets.QWidget):
 
     def load_sampling_for_selected_row(self) -> None:
         """Load sampling controls for whichever dataset row is currently selected."""
-        ds_id = self._selected_dataset_id_from_table()
+        ds_id = self.selected_dataset_id()
         self._load_sampling_controls_for_dataset(ds_id)
 
     def refresh_remove_button_state(self) -> None:
@@ -321,18 +320,8 @@ class DataTab(QtWidgets.QWidget):
     # Sampling — internal helpers (moved from FittingWindow)
     # ------------------------------------------------------------------
 
-    def _selected_dataset_id_from_table(self) -> Optional[str]:
-        rows = sorted({item.row() for item in self._dataset_table.selectedItems()})
-        if not rows:
-            return None
-        item = self._dataset_table.item(int(rows[0]), 0)
-        if item is None:
-            return None
-        ds_id = str(item.data(Qt.UserRole) or "").strip()
-        return ds_id or None
-
     def _load_sampling_for_selected_dataset_row(self) -> None:
-        ds_id = self._selected_dataset_id_from_table()
+        ds_id = self.selected_dataset_id()
         self._load_sampling_controls_for_dataset(ds_id)
 
     def _load_sampling_controls_for_dataset(self, dataset_id: Optional[str]) -> None:

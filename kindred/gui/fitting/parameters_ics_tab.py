@@ -12,11 +12,9 @@ from PySide6.QtCore import Qt, Signal
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
 from kindred.gui.widgets.collapsible_section import CollapsibleSection
+from kindred.gui.fitting.constants import INITIAL_PREFIX, DEFAULT_PARALLEL_STARTS
 
 logger = logging.getLogger(__name__)
-
-INITIAL_PREFIX = "init:"
-DEFAULT_PARALLEL_STARTS = 4
 
 
 class _AddFittableParameterDialog(QtWidgets.QDialog):
