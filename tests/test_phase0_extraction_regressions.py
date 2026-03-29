@@ -339,3 +339,21 @@ def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
     finally:
         tab.close()
         qt_app.processEvents()
+
+
+# ===================================================================
+# ITEM 21 — Subset stale suffix on sampling-applied failure
+# ===================================================================
+
+def test_on_sampling_applied_subset_failure(qt_app):
+    """When subset widget update fails during sampling-applied, status shows stale suffix."""
+    window = _make_fitting_window()
+    try:
+        window._subset_widget.set_dataset_entries = lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("test subset failure")
+        )
+        window._on_data_tab_sampling_applied("ds1", {"n_points": 10})
+        assert window._status_label.text().endswith("(subset view stale)")
+    finally:
+        window.close()
+        qt_app.processEvents()

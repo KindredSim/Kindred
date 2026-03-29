@@ -1651,9 +1651,14 @@ class FittingWindow(QtWidgets.QDialog):
         try:
             self._subset_widget.set_dataset_entries(self._dataset_entries)
         except Exception:
-            pass
+            self._subset_view_stale = True
+            logger.warning("Subset widget update failed after sampling applied", exc_info=True)
         self._refresh_sampling_validity_ui()
-        self._status_label.setText("Sampling applied")
+        msg = "Sampling applied"
+        if self._subset_view_stale:
+            msg += " (subset view stale)"
+            self._subset_view_stale = False
+        self._status_label.setText(msg)
 
     def _open_add_datasets_dialog(self) -> None:
         present = {str(entry.get("id") or "").strip() for entry in (self._dataset_entries or []) if entry.get("id")}
