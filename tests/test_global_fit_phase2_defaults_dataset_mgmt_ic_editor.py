@@ -1647,7 +1647,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         assert set(second_result["species"]) == {"A", "B", "C"}
         assert "C" in second_result["species"]
 
-        prepared_stamp = window._last_run_stamp.get("prepared_simulation") or {}
+        prepared_stamp = window._run_results_tab._last_run_stamp.get("prepared_simulation") or {}
         assert prepared_stamp.get("mechanism_text_sha256") == hashlib.sha256(mechanism_b.encode("utf-8")).hexdigest()
         assert prepared_stamp.get("param_names") == ["k1", "k2"]
     finally:

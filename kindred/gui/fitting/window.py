@@ -7,7 +7,6 @@ This module is the physical implementation root for the fitting subsystem UI.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import math
 import weakref
@@ -50,6 +49,7 @@ from kindred.gui.fitting.run_stamp import (
     build_global_fit_run_stamp,
     hash_global_fit_run_stamp,
 )
+from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
@@ -84,6 +84,7 @@ def _get_clipboard():
         return app.clipboard() if app is not None else None
     except Exception:
         return None
+
 
 DEFAULT_PARALLEL_STARTS = 4
 
@@ -1084,9 +1085,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_plot_model_series = {}
         self._latest_plot_model_x = {}
         self._last_result = None
-        self._last_run_stamp = {}
-        self._last_run_stamp_hash = ""
-        self._last_run_stamp_short = ""
         self._closing = False
         self._pending_best_payload = None
         self._pending_best_worker = None
@@ -1613,7 +1611,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab = self._create_data_tab()
         self._targets_weights_tab = self._create_targets_weights_tab()
         self._params_ics_tab = self._create_parameters_ics_tab()
-        self._run_results_tab = self._create_run_results_tab()
+        self._run_results_tab = RunResultsTab(parent=self)
 
         self._tabs = QtWidgets.QTabBar(self)
         self._tabs.setObjectName("global_fit_top_tabs")
@@ -1656,6 +1654,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._current_tab_stack.setCurrentIndex(self._tabs.currentIndex())
 
         layout.addWidget(self._create_footer(), stretch=0)
+        self._run_results_tab.statusMessage.connect(self._status_label.setText)
         self._refresh_project_apply_controls()
 
     def _create_footer(self) -> QtWidgets.QWidget:
@@ -1816,81 +1815,6 @@ class FittingWindow(QtWidgets.QDialog):
         splitter.setSizes([460, 300])
         layout.addWidget(splitter, stretch=1)
         return widget
-
-    def _create_run_stamp_panel(self) -> QtWidgets.QWidget:
-        group = QtWidgets.QGroupBox("Run Stamp")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        info_label = QtWidgets.QLabel("Review and copy the most recent fit run stamp.")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("font-size: 11px;")
-        layout.addWidget(info_label)
-
-        row = QtWidgets.QHBoxLayout()
-        self._run_stamp_label = QtWidgets.QLabel("")
-        self._run_stamp_label.setObjectName("global_fit_run_stamp_label")
-        self._run_stamp_label.setStyleSheet("font-size: 11px;")
-        self._run_stamp_label.setVisible(False)
-
-        self._copy_stamp_button = QtWidgets.QPushButton("Copy")
-        self._copy_stamp_button.setObjectName("global_fit_copy_stamp_button")
-        self._copy_stamp_button.setEnabled(False)
-        self._copy_stamp_button.clicked.connect(self._on_copy_run_stamp_short)
-
-        self._copy_stamp_json_button = QtWidgets.QPushButton("Copy JSON")
-        self._copy_stamp_json_button.setObjectName("global_fit_copy_stamp_json_button")
-        self._copy_stamp_json_button.setEnabled(False)
-        self._copy_stamp_json_button.clicked.connect(self._on_copy_run_stamp_json)
-
-        row.addWidget(self._run_stamp_label, stretch=1)
-        row.addWidget(self._copy_stamp_button)
-        row.addWidget(self._copy_stamp_json_button)
-        layout.addLayout(row)
-        return group
-
-    def _create_run_results_tab(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(widget)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(10)
-        layout.addWidget(self._create_run_stamp_panel(), stretch=0)
-        layout.addWidget(self._create_stats_tab(), stretch=1)
-        return widget
-
-    def _on_copy_run_stamp_short(self) -> None:
-        stamp_short = str(getattr(self, "_last_run_stamp_short", "") or "").strip()
-        if not stamp_short:
-            return
-        clipboard = _get_clipboard()
-        if clipboard is None:
-            self._status_label.setText("Clipboard unavailable")
-            return
-        try:
-            clipboard.setText(stamp_short)
-        except Exception:
-            self._status_label.setText("Failed to copy stamp")
-            return
-        self._status_label.setText("Copied stamp hash")
-
-    def _on_copy_run_stamp_json(self) -> None:
-        stamp = getattr(self, "_last_run_stamp", None)
-        if not isinstance(stamp, dict) or not stamp:
-            return
-        clipboard = _get_clipboard()
-        if clipboard is None:
-            self._status_label.setText("Clipboard unavailable")
-            return
-        try:
-            text = json.dumps(stamp, sort_keys=True, indent=2, ensure_ascii=True)
-        except Exception:
-            self._status_label.setText("Failed to serialize stamp")
-            return
-        try:
-            clipboard.setText(text)
-        except Exception:
-            self._status_label.setText("Failed to copy stamp")
-            return
-        self._status_label.setText("Copied stamp JSON")
 
     def refresh_grid_view(
         self,
@@ -3757,16 +3681,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._update_fit_targets_dirty_state()
         self._refresh_fit_targets_checklist()
 
-    def _create_stats_tab(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(widget)
-        self._stats_labels: Dict[str, QtWidgets.QLabel] = {}
-        for label in ["Datasets", "Series", "Points", "Parameters", "DF", "SSQ", "Weighted SSQ", "-logL"]:
-            value_label = QtWidgets.QLabel("—")
-            form.addRow(f"{label}:", value_label)
-            self._stats_labels[label] = value_label
-        return widget
-
     # ------------------------------------------------------------------
     # Table population
     # ------------------------------------------------------------------
@@ -5580,16 +5494,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
         stamp_hash = hash_global_fit_run_stamp(stamp)
         stamp_short = str(stamp_hash)[:12]
-        self._last_run_stamp = dict(stamp)
-        self._last_run_stamp_hash = str(stamp_hash)
-        self._last_run_stamp_short = str(stamp_short)
-        if hasattr(self, "_run_stamp_label"):
-            self._run_stamp_label.setText(f"Stamp: {stamp_short}")
-            self._run_stamp_label.setVisible(True)
-        if hasattr(self, "_copy_stamp_button"):
-            self._copy_stamp_button.setEnabled(True)
-        if hasattr(self, "_copy_stamp_json_button"):
-            self._copy_stamp_json_button.setEnabled(True)
+        self._run_results_tab.set_run_stamp(dict(stamp), str(stamp_hash), str(stamp_short))
         return stamp, str(stamp_hash), str(stamp_short)
 
     @staticmethod
@@ -6387,14 +6292,7 @@ class FittingWindow(QtWidgets.QDialog):
         }
 
     def _update_statistics(self, stats: Dict[str, Any]) -> None:
-        for key, label in self._stats_labels.items():
-            value = stats.get(key)
-            if value is None:
-                label.setText("—")
-            elif isinstance(value, float):
-                label.setText(f"{value:.6g}")
-            else:
-                label.setText(str(value))
+        self._run_results_tab.update_statistics(stats)
 
     def _apply_parameters(self) -> None:
         if not (self._apply_callback and self._last_fit_params):

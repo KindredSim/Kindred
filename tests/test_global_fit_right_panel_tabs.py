@@ -151,8 +151,8 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert params_widget.isAncestorOf(ic_table)
 
         assert run_widget.isAncestorOf(run_stamp)
-        assert run_widget.isAncestorOf(window._copy_stamp_button)
-        assert run_widget.isAncestorOf(window._copy_stamp_json_button)
+        assert run_widget.isAncestorOf(window._run_results_tab._copy_stamp_button)
+        assert run_widget.isAncestorOf(window._run_results_tab._copy_stamp_json_button)
         assert footer.isAncestorOf(run_block)
 
         shell_sizes = shell_splitter.sizes()

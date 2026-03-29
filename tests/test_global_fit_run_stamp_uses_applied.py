@@ -135,21 +135,22 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)
 
-        assert hasattr(window, "_last_run_stamp")
-        assert window._last_run_stamp["fit_targets_applied"]["ds1"] == ["A"]
-        assert window._last_run_stamp.get("prepared_simulation") is not None
-        assert window._last_run_stamp["prepared_simulation"]["solver_requested"] == "LSODA"
-        assert window._last_run_stamp["prepared_simulation"]["solver_normalized"] == "LSODA"
-        assert "solver" not in window._last_run_stamp["prepared_simulation"]
-        assert window._last_run_stamp.get("kindred_version") == kindred_version
-        assert window._last_run_stamp.get("dataset_params") is not None
-        assert window._last_run_stamp["dataset_params"]["ds1"]["init:A"] == "1"
-        assert window._last_run_stamp.get("dataset_variable_params") is not None
-        assert window._last_run_stamp["dataset_variable_params"]["ds1"]["init:B"]["max"] == "10"
-        assert window._last_run_stamp.get("shared_params") is not None
-        assert window._last_run_stamp["shared_params"]["fit_initial"]["k1"] == "0.2"
-        json.dumps(window._last_run_stamp, sort_keys=True)
-        assert window._last_run_stamp_hash
+        rrt = window._run_results_tab
+        assert hasattr(rrt, "_last_run_stamp")
+        assert rrt._last_run_stamp["fit_targets_applied"]["ds1"] == ["A"]
+        assert rrt._last_run_stamp.get("prepared_simulation") is not None
+        assert rrt._last_run_stamp["prepared_simulation"]["solver_requested"] == "LSODA"
+        assert rrt._last_run_stamp["prepared_simulation"]["solver_normalized"] == "LSODA"
+        assert "solver" not in rrt._last_run_stamp["prepared_simulation"]
+        assert rrt._last_run_stamp.get("kindred_version") == kindred_version
+        assert rrt._last_run_stamp.get("dataset_params") is not None
+        assert rrt._last_run_stamp["dataset_params"]["ds1"]["init:A"] == "1"
+        assert rrt._last_run_stamp.get("dataset_variable_params") is not None
+        assert rrt._last_run_stamp["dataset_variable_params"]["ds1"]["init:B"]["max"] == "10"
+        assert rrt._last_run_stamp.get("shared_params") is not None
+        assert rrt._last_run_stamp["shared_params"]["fit_initial"]["k1"] == "0.2"
+        json.dumps(rrt._last_run_stamp, sort_keys=True)
+        assert rrt._last_run_stamp_hash
 
         stamp_label = window.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
         assert stamp_label is not None
@@ -195,9 +196,10 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)
 
-        assert window._last_run_stamp["version"] == 3
-        assert window._last_run_stamp["target_weights_applied"]["ds1"] == {"A": "1"}
-        assert window._last_run_stamp["datasets"][0]["target_weights_applied"] == {"A": "1"}
+        rrt = window._run_results_tab
+        assert rrt._last_run_stamp["version"] == 3
+        assert rrt._last_run_stamp["target_weights_applied"]["ds1"] == {"A": "1"}
+        assert rrt._last_run_stamp["datasets"][0]["target_weights_applied"] == {"A": "1"}
     finally:
         window.close()
         qt_app.processEvents()
