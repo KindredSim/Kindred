@@ -173,7 +173,7 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
         dataset_weights={"ds1": 1.0},
     )
     try:
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)

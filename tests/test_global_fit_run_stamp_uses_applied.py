@@ -130,7 +130,7 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         assert window._fit_targets_selection_applied["ds1"] == ["A"]
         assert window._fit_targets_selection_pending["ds1"] == {"B"}
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)
@@ -191,7 +191,7 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
         edit_b.setText("9.0")
         qt_app.processEvents()
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)

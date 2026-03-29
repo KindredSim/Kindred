@@ -135,7 +135,7 @@ def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
 
     window = _make_window()
     try:
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)

@@ -44,8 +44,8 @@ def test_global_fit_window_default_max_evaluations_is_1000(qt_app):
         dataset_weights={"ds1": 1.0},
     )
     try:
-        assert window._max_eval_spin.value() == 1000
-        config = window._collect_parameter_config()
+        assert window._params_ics_tab._max_eval_spin.value() == 1000
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         assert config["max_nfev"] == 1000
     finally:
@@ -127,8 +127,8 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
         dataset_weights={"ds1": 1.0},
     )
     try:
-        window._max_eval_spin.setValue(123)
-        config = window._collect_parameter_config()
+        window._params_ics_tab._max_eval_spin.setValue(123)
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         dataset_selection = window._collect_dataset_selection()
         window._start_global_fit(config, dataset_selection)

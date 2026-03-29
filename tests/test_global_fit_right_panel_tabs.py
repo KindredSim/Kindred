@@ -147,7 +147,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert _targets_dataset_ids(targets_list) == ["ds1"]
 
         assert params_widget.isAncestorOf(window._param_table)
-        assert params_widget.isAncestorOf(window._method_combo)
+        assert params_widget.isAncestorOf(window._params_ics_tab._method_combo)
         assert params_widget.isAncestorOf(ic_table)
 
         assert run_widget.isAncestorOf(run_stamp)

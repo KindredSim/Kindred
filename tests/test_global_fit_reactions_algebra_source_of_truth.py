@@ -52,7 +52,7 @@ def test_global_fit_observable_dropdown_reads_from_reactions_dsl_algebra_block(q
         def selection(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.window._AddFittableParameterDialog", _FakeDialog)
+    monkeypatch.setattr("kindred.gui.fitting.parameters_ics_tab._AddFittableParameterDialog", _FakeDialog)
 
     window = FittingWindow(
         mode="global",
@@ -69,7 +69,7 @@ def test_global_fit_observable_dropdown_reads_from_reactions_dsl_algebra_block(q
     )
     try:
         monkeypatch.setattr(window, "_selected_dataset_ids", lambda: ["ds1"])
-        window._add_parameter()
+        window._params_ics_tab._add_parameter()
         obs = captured.get("available_observables") or {}
         assert "total_PBMP" in obs
         assert "selectivity" in obs
