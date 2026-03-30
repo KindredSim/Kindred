@@ -687,8 +687,10 @@ class FittingWindow(QtWidgets.QDialog):
         self.resize(1280, 720)
         self.setWindowFlags(
             self.windowFlags()
+            | Qt.CustomizeWindowHint
             | Qt.WindowMinMaxButtonsHint
             | Qt.WindowSystemMenuHint
+            | Qt.WindowCloseButtonHint
         )
 
         self._build_ui()
@@ -1414,11 +1416,11 @@ class FittingWindow(QtWidgets.QDialog):
         actions_row.addWidget(self._pause_button)
         actions_row.addWidget(self._resume_button)
 
-        self._run_stamp_button = QtWidgets.QPushButton("Run Stamp")
-        self._run_stamp_button.setObjectName("global_fit_run_stamp_footer_button")
-        self._run_stamp_button.setEnabled(False)
-        self._run_stamp_button.clicked.connect(self._run_results_tab.open_run_stamp_dialog)
-        actions_row.addWidget(self._run_stamp_button)
+        self._results_summary_button = QtWidgets.QPushButton("Results Summary")
+        self._results_summary_button.setObjectName("global_fit_results_summary_footer_button")
+        self._results_summary_button.setEnabled(False)
+        self._results_summary_button.clicked.connect(self._run_results_tab.open_results_summary_dialog)
+        actions_row.addWidget(self._results_summary_button)
 
         self._apply_scope_combo = QtWidgets.QComboBox(footer)
         self._apply_scope_combo.setObjectName("global_fit_apply_scope_combo")
@@ -1432,10 +1434,6 @@ class FittingWindow(QtWidgets.QDialog):
         actions_row.addWidget(self._apply_scope_combo)
         actions_row.addWidget(self._apply_to_project_button)
 
-        self._close_button = QtWidgets.QPushButton("Close")
-        self._close_button.setFlat(True)
-        self._close_button.clicked.connect(self.close)
-        actions_row.addWidget(self._close_button)
         control_row.addLayout(actions_row)
         return footer
 
@@ -2581,7 +2579,7 @@ class FittingWindow(QtWidgets.QDialog):
         stamp_hash = hash_global_fit_run_stamp(stamp)
         stamp_short = str(stamp_hash)[:12]
         self._run_results_tab.set_run_stamp(dict(stamp), str(stamp_hash), str(stamp_short))
-        self._run_stamp_button.setEnabled(True)
+        self._results_summary_button.setEnabled(True)
         return stamp, str(stamp_hash), str(stamp_short)
 
     @staticmethod

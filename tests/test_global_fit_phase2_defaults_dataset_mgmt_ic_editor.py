@@ -106,12 +106,13 @@ def _parameter_table_rows(window) -> list[dict[str, object]]:
 
 def _ic_table_species(window) -> list[str]:
     from PySide6 import QtWidgets
+    from kindred.gui.fitting.parameters_ics_tab import _ICCol
 
     table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
     assert table is not None
     species: list[str] = []
     for row in range(table.rowCount()):
-        item = table.item(row, 0)
+        item = table.item(row, _ICCol.SPECIES)
         if item is not None and item.text().strip():
             species.append(item.text().strip())
     return species
@@ -356,19 +357,20 @@ def test_global_fit_initial_conditions_editor_apply_persists_to_dataset_manager(
             raise AssertionError("ds1 not present in Initial Conditions dataset combo")
 
         # Change initial(A) and enable fitting for init:A with bounds.
+        from kindred.gui.fitting.parameters_ics_tab import _ICCol
         row_a = None
         for row in range(table.rowCount()):
-            if (table.item(row, 0) or QtWidgets.QTableWidgetItem()).text().strip() == "A":
+            if (table.item(row, _ICCol.SPECIES) or QtWidgets.QTableWidgetItem()).text().strip() == "A":
                 row_a = row
                 break
         assert row_a is not None
 
-        table.item(row_a, 1).setText("2.5")  # Initial
-        fit_item = table.item(row_a, 2)
+        table.item(row_a, _ICCol.INITIAL).setText("2.5")  # Initial
+        fit_item = table.item(row_a, _ICCol.FIT)
         assert fit_item is not None
         fit_item.setCheckState(QtCore.Qt.Checked)
-        table.item(row_a, 4).setText("0.1")
-        table.item(row_a, 5).setText("10.0")
+        table.item(row_a, _ICCol.MIN).setText("0.1")
+        table.item(row_a, _ICCol.MAX).setText("10.0")
 
         apply_btn.click()
 

@@ -17,6 +17,16 @@ from kindred.gui.fitting.constants import INITIAL_PREFIX, DEFAULT_PARALLEL_START
 logger = logging.getLogger(__name__)
 
 
+class _ICCol:
+    """Column indices for the initial conditions table."""
+    FIT = 0
+    LOG10 = 1
+    SPECIES = 2
+    INITIAL = 3
+    MIN = 4
+    MAX = 5
+
+
 class _AddFittableParameterDialog(QtWidgets.QDialog):
     def __init__(
         self,
@@ -400,7 +410,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table = QtWidgets.QTableWidget()
         self._param_table.setColumnCount(7)
         self._param_table.setHorizontalHeaderLabels(["Fit", "Log10", "Name", "Value", "Min", "Max", "Last Fit"])
-        self._param_table.horizontalHeader().setStretchLastSection(True)
+        _ph = self._param_table.horizontalHeader()
+        _ph.setStretchLastSection(False)
+        _ph.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)  # Fit
+        _ph.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)  # Log10
+        _ph.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)           # Name
+        _ph.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  # Value
+        _ph.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)  # Min
+        _ph.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)  # Max
+        _ph.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeToContents)  # Last Fit
         self._param_table.itemChanged.connect(self._on_param_table_item_changed)
         self._param_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._param_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -527,8 +545,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._ic_table = QtWidgets.QTableWidget(group)
         self._ic_table.setObjectName("global_fit_initial_conditions_table")
         self._ic_table.setColumnCount(6)
-        self._ic_table.setHorizontalHeaderLabels(["Species", "Initial", "Fit?", "Log10", "Min", "Max"])
-        self._ic_table.horizontalHeader().setStretchLastSection(True)
+        self._ic_table.setHorizontalHeaderLabels(["Fit", "Log10", "Species", "Initial", "Min", "Max"])
+        _ih = self._ic_table.horizontalHeader()
+        _ih.setStretchLastSection(False)
+        _ih.setSectionResizeMode(_ICCol.FIT, QtWidgets.QHeaderView.ResizeToContents)
+        _ih.setSectionResizeMode(_ICCol.LOG10, QtWidgets.QHeaderView.ResizeToContents)
+        _ih.setSectionResizeMode(_ICCol.SPECIES, QtWidgets.QHeaderView.Stretch)
+        _ih.setSectionResizeMode(_ICCol.INITIAL, QtWidgets.QHeaderView.ResizeToContents)
+        _ih.setSectionResizeMode(_ICCol.MIN, QtWidgets.QHeaderView.ResizeToContents)
+        _ih.setSectionResizeMode(_ICCol.MAX, QtWidgets.QHeaderView.ResizeToContents)
         self._ic_table.verticalHeader().setVisible(False)
         self._ic_table.setAlternatingRowColors(True)
         self._ic_table.setMinimumHeight(200)
@@ -669,25 +694,25 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
                 species_item = QtWidgets.QTableWidgetItem(str(species))
                 species_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self._ic_table.setItem(row, 0, species_item)
-
-                init_item = QtWidgets.QTableWidgetItem(f"{init_val:.6g}")
-                self._ic_table.setItem(row, 1, init_item)
+                self._ic_table.setItem(row, _ICCol.SPECIES, species_item)
 
                 fit_item = QtWidgets.QTableWidgetItem()
                 fit_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 fit_item.setCheckState(Qt.Checked if fit_flag else Qt.Unchecked)
-                self._ic_table.setItem(row, 2, fit_item)
+                self._ic_table.setItem(row, _ICCol.FIT, fit_item)
 
                 log_item = QtWidgets.QTableWidgetItem()
                 log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 log_item.setCheckState(Qt.Checked if log10_flag else Qt.Unchecked)
-                self._ic_table.setItem(row, 3, log_item)
+                self._ic_table.setItem(row, _ICCol.LOG10, log_item)
+
+                init_item = QtWidgets.QTableWidgetItem(f"{init_val:.6g}")
+                self._ic_table.setItem(row, _ICCol.INITIAL, init_item)
 
                 min_item = QtWidgets.QTableWidgetItem(f"{min_val:.6g}")
                 max_item = QtWidgets.QTableWidgetItem(f"{max_val:.6g}")
-                self._ic_table.setItem(row, 4, min_item)
-                self._ic_table.setItem(row, 5, max_item)
+                self._ic_table.setItem(row, _ICCol.MIN, min_item)
+                self._ic_table.setItem(row, _ICCol.MAX, max_item)
         finally:
             self._ic_editor_is_refreshing = False
 
@@ -706,11 +731,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         updates: Dict[str, Dict[str, object]] = {}
         fit_flags_updates: Dict[str, bool] = {}
         for row, species in enumerate(self._mechanism_species):
-            init_item = self._ic_table.item(row, 1)
-            fit_item = self._ic_table.item(row, 2)
-            log_item = self._ic_table.item(row, 3)
-            min_item = self._ic_table.item(row, 4)
-            max_item = self._ic_table.item(row, 5)
+            init_item = self._ic_table.item(row, _ICCol.INITIAL)
+            fit_item = self._ic_table.item(row, _ICCol.FIT)
+            log_item = self._ic_table.item(row, _ICCol.LOG10)
+            min_item = self._ic_table.item(row, _ICCol.MIN)
+            max_item = self._ic_table.item(row, _ICCol.MAX)
             try:
                 init_val = float(init_item.text())
             except Exception:

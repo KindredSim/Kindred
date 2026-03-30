@@ -22,8 +22,7 @@ def test_construction(qt_app):
         stamp_groups = [g for g in groups if g.title() == "Run Stamp"]
         assert len(stamp_groups) == 0
 
-        assert hasattr(tab, "open_run_stamp_dialog")
-        assert len(tab._stats_labels) == 8
+        assert hasattr(tab, "open_results_summary_dialog")
     finally:
         tab.close()
         qt_app.processEvents()
@@ -58,16 +57,15 @@ def test_set_run_stamp(qt_app):
 
 
 def test_update_statistics(qt_app):
-    """update_statistics writes values into stat labels."""
+    """update_statistics stores values internally."""
     tab = _make_tab()
     try:
         tab.update_statistics({"Datasets": 3, "SSQ": 1.5, "Points": 100})
         qt_app.processEvents()
 
-        assert tab._stats_labels["Datasets"].text() == "3"
-        assert tab._stats_labels["SSQ"].text() == "1.5"
-        assert tab._stats_labels["Points"].text() == "100"
-        assert tab._stats_labels["DF"].text() == "\u2014"
+        assert tab._last_stats["Datasets"] == 3
+        assert tab._last_stats["SSQ"] == 1.5
+        assert tab._last_stats["Points"] == 100
     finally:
         tab.close()
         qt_app.processEvents()

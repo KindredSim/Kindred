@@ -95,7 +95,7 @@ def test_copy_buttons_disabled_before_any_run(qt_app):
 
     window = _make_window()
     try:
-        btn = window.findChild(QtWidgets.QPushButton, "global_fit_run_stamp_footer_button")
+        btn = window.findChild(QtWidgets.QPushButton, "global_fit_results_summary_footer_button")
         assert btn is not None
         assert btn.isEnabled() is False
     finally:

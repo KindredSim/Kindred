@@ -86,7 +86,9 @@ def test_fitting_window_has_min_max_buttons(qt_app):
     window = _make_window()
     try:
         flags = window.windowFlags()
+        assert flags & Qt.CustomizeWindowHint
         assert flags & Qt.WindowMinMaxButtonsHint
+        assert flags & Qt.WindowCloseButtonHint
     finally:
         window.close()
         qt_app.processEvents()
@@ -139,10 +141,10 @@ def test_run_results_tab_has_no_run_stamp_groupbox(qt_app):
         qt_app.processEvents()
 
 
-def test_footer_has_run_stamp_button(qt_app):
+def test_footer_has_results_summary_button(qt_app):
     window = _make_window()
     try:
-        btn = window.findChild(QtWidgets.QPushButton, "global_fit_run_stamp_footer_button")
+        btn = window.findChild(QtWidgets.QPushButton, "global_fit_results_summary_footer_button")
         assert btn is not None
         assert not btn.isEnabled()
     finally:

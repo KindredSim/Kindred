@@ -1,18 +1,18 @@
 """
 Run & Results tab widget for the fitting window.
 
-Extracted from FittingWindow — owns the statistics summary panel and
-run-stamp data (displayed via a popup dialog triggered from the footer).
+Extracted from FittingWindow — owns the run-stamp data and statistics
+(displayed via a non-modal popup dialog triggered from the footer).
 Read-only display with one-way data flow from fit-completion results.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from PySide6 import QtWidgets
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 
 
 def _get_clipboard():
@@ -29,8 +29,8 @@ def _get_clipboard():
         return None
 
 
-class RunStampDialog(QtWidgets.QDialog):
-    """Modal popup that displays a fit run stamp with copy controls."""
+class ResultsSummaryDialog(QtWidgets.QDialog):
+    """Non-modal popup displaying fit run stamp and statistics."""
 
     statusMessage = Signal(str)
 
@@ -39,12 +39,13 @@ class RunStampDialog(QtWidgets.QDialog):
         stamp: dict,
         stamp_hash: str,
         stamp_short: str,
+        stats: Optional[Dict[str, Any]] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Run Stamp")
-        self.setModal(True)
-        self.resize(480, 160)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowTitle("Results Summary")
+        self.resize(480, 360)
 
         self._stamp = dict(stamp)
         self._stamp_hash = str(stamp_hash)
@@ -74,6 +75,33 @@ class RunStampDialog(QtWidgets.QDialog):
         row.addWidget(self._copy_stamp_button)
         row.addWidget(self._copy_stamp_json_button)
         layout.addLayout(row)
+
+        # Statistics form
+        stats_group = QtWidgets.QGroupBox("Fit Statistics")
+        form = QtWidgets.QFormLayout(stats_group)
+        self._stats_labels: Dict[str, QtWidgets.QLabel] = {}
+        for label_text in ["Datasets", "Series", "Points", "Parameters", "DF", "SSQ", "Weighted SSQ", "-logL"]:
+            value_label = QtWidgets.QLabel("\u2014")
+            form.addRow(f"{label_text}:", value_label)
+            self._stats_labels[label_text] = value_label
+        layout.addWidget(stats_group)
+
+        if stats:
+            self._update_stats(stats)
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    def _update_stats(self, stats: Dict[str, Any]) -> None:
+        for key, label in self._stats_labels.items():
+            value = stats.get(key)
+            if value is None:
+                label.setText("\u2014")
+            elif isinstance(value, float):
+                label.setText(f"{value:.6g}")
+            else:
+                label.setText(str(value))
 
     # ------------------------------------------------------------------
     # Copy handlers
@@ -115,6 +143,10 @@ class RunStampDialog(QtWidgets.QDialog):
         self.statusMessage.emit("Copied stamp JSON")
 
 
+# Keep old name importable for tests that reference it directly.
+RunStampDialog = ResultsSummaryDialog
+
+
 class RunResultsTab(QtWidgets.QWidget):
     """Drop-in replacement for FittingWindow._create_run_results_tab()."""
 
@@ -125,11 +157,17 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_run_stamp: dict = {}
         self._last_run_stamp_hash: str = ""
         self._last_run_stamp_short: str = ""
+        self._last_stats: Dict[str, Any] = {}
+        self._stamp_dialog: Optional[ResultsSummaryDialog] = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(10)
-        layout.addWidget(self._create_stats_panel(), stretch=1)
+
+        placeholder = QtWidgets.QLabel("Run a fit to see results here.")
+        placeholder.setAlignment(Qt.AlignCenter)
+        placeholder.setStyleSheet("color: #888; font-size: 12px;")
+        layout.addWidget(placeholder, stretch=1)
 
     # ------------------------------------------------------------------
     # Public API
@@ -141,40 +179,28 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_run_stamp_hash = str(stamp_hash)
         self._last_run_stamp_short = str(stamp_short)
 
-    def open_run_stamp_dialog(self) -> None:
-        """Show the run stamp popup dialog with the stored stamp data."""
+    def open_results_summary_dialog(self) -> None:
+        """Show the results summary popup dialog."""
         if not self._last_run_stamp:
             return
-        dialog = RunStampDialog(
+        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
+            self._stamp_dialog.raise_()
+            self._stamp_dialog.activateWindow()
+            return
+        dialog = ResultsSummaryDialog(
             self._last_run_stamp,
             self._last_run_stamp_hash,
             self._last_run_stamp_short,
+            stats=self._last_stats or None,
             parent=self,
         )
         dialog.statusMessage.connect(self.statusMessage)
-        dialog.exec()
+        dialog.destroyed.connect(lambda: setattr(self, '_stamp_dialog', None))
+        self._stamp_dialog = dialog
+        dialog.show()
 
     def update_statistics(self, stats: Dict[str, Any]) -> None:
-        """Write stat values into the stats labels."""
-        for key, label in self._stats_labels.items():
-            value = stats.get(key)
-            if value is None:
-                label.setText("\u2014")
-            elif isinstance(value, float):
-                label.setText(f"{value:.6g}")
-            else:
-                label.setText(str(value))
-
-    # ------------------------------------------------------------------
-    # Layout construction
-    # ------------------------------------------------------------------
-
-    def _create_stats_panel(self) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(widget)
-        self._stats_labels: Dict[str, QtWidgets.QLabel] = {}
-        for label in ["Datasets", "Series", "Points", "Parameters", "DF", "SSQ", "Weighted SSQ", "-logL"]:
-            value_label = QtWidgets.QLabel("\u2014")
-            form.addRow(f"{label}:", value_label)
-            self._stats_labels[label] = value_label
-        return widget
+        """Store stat values; update dialog if open."""
+        self._last_stats = dict(stats)
+        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
+            self._stamp_dialog._update_stats(stats)

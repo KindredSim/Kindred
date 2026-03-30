@@ -116,7 +116,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
         weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
         ic_table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
-        run_stamp_button = window.findChild(QtWidgets.QPushButton, "global_fit_run_stamp_footer_button")
+        results_summary_button = window.findChild(QtWidgets.QPushButton, "global_fit_results_summary_footer_button")
         run_block = window.findChild(QtWidgets.QLabel, "global_fit_run_block_reason_label")
 
         assert sampling_panel is not None
@@ -124,7 +124,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert weight_mode is not None
         assert weight_edit is not None
         assert ic_table is not None
-        assert run_stamp_button is not None
+        assert results_summary_button is not None
         assert run_block is not None
 
         assert window._dataset_table.columnCount() == 3
@@ -149,7 +149,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert params_widget.isAncestorOf(window._params_ics_tab._method_combo)
         assert params_widget.isAncestorOf(ic_table)
 
-        assert footer.isAncestorOf(run_stamp_button)
+        assert footer.isAncestorOf(results_summary_button)
         assert footer.isAncestorOf(run_block)
 
         # On Data tab (config): subset_widget is hidden
