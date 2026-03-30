@@ -1097,7 +1097,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._tabs.addTab("Data")
         self._targets_tab_index = self._tabs.addTab("Targets & Weights")
         self._tabs.addTab("Parameters & ICs")
-        self._tabs.addTab("Run & Results")
+        self._results_tab_index = self._tabs.addTab("Run & Results")
         layout.addWidget(self._tabs, stretch=0)
 
         self._main_splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
@@ -1125,6 +1125,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._main_splitter.setStretchFactor(0, 7)
         self._main_splitter.setStretchFactor(1, 4)
         self._main_splitter.setSizes([760, 440])
+        self._splitter_sizes_backup = [760, 440]
+        self._subset_widget.hide()
 
         self._tabs.currentChanged.connect(self._current_tab_stack.setCurrentIndex)
         self._tabs.currentChanged.connect(self._on_right_tabs_current_changed)
@@ -1445,11 +1447,19 @@ class FittingWindow(QtWidgets.QDialog):
         return self._data_tab.selected_dataset_id()
 
     def _on_right_tabs_current_changed(self, index: int) -> None:
-        if int(index) != int(getattr(self, "_targets_tab_index", -1)):
-            return
-        self._targets_weights_tab.on_tab_activated(
-            seed_dataset_id=self._selected_data_table_dataset_id()
-        )
+        # Show/hide left plot panel based on active tab
+        if int(index) == int(self._results_tab_index):
+            self._subset_widget.show()
+            self._main_splitter.setSizes(self._splitter_sizes_backup)
+        else:
+            if self._subset_widget.isVisible():
+                self._splitter_sizes_backup = self._main_splitter.sizes()
+            self._subset_widget.hide()
+
+        if int(index) == int(getattr(self, "_targets_tab_index", -1)):
+            self._targets_weights_tab.on_tab_activated(
+                seed_dataset_id=self._selected_data_table_dataset_id()
+            )
 
     def _dataset_entry_for_id(self, dataset_id: str) -> Optional[Dict[str, Any]]:
         ds_id = str(dataset_id or "").strip()

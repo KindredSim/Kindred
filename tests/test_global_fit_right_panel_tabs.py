@@ -155,6 +155,13 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert run_widget.isAncestorOf(window._run_results_tab._copy_stamp_json_button)
         assert footer.isAncestorOf(run_block)
 
+        # On Data tab (config): subset_widget is hidden
+        assert not window._subset_widget.isVisible()
+
+        # Switch to Run & Results to verify splitter sizing
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Run & Results"))
+        qt_app.processEvents()
+        assert window._subset_widget.isVisible()
         shell_sizes = shell_splitter.sizes()
         assert len(shell_sizes) == 2
         assert shell_sizes[0] > shell_sizes[1]
@@ -251,9 +258,48 @@ def test_shell_uses_single_top_navigation_host_and_survives_narrow_resize(qt_app
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
 
         assert top_tabs.count() == 4
-        assert window._subset_widget.width() >= 300
+        # On Data tab (default): subset hidden, content_stack gets full width
+        assert not window._subset_widget.isVisible()
         assert content_stack.width() >= 260
         assert window._subset_widget.parentWidget() is shell_splitter
         assert content_stack.parentWidget() is shell_splitter
+
+        # Switch to Run & Results: subset visible with expected width
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Run & Results"))
+        qt_app.processEvents()
+        assert window._subset_widget.isVisible()
+        assert window._subset_widget.width() >= 300
+        assert content_stack.width() >= 260
+    finally:
+        window.close()
+
+
+def test_subset_widget_visible_only_on_run_results_tab(qt_app):
+    """Regression: left plot panel hidden on config tabs, visible on Run & Results."""
+    window = _make_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        top_tabs = window._tabs
+
+        # On construction (Data tab, index 0): subset_widget hidden
+        assert not window._subset_widget.isVisible()
+
+        # Switch to each config tab — still hidden
+        for title in ("Targets & Weights", "Parameters & ICs"):
+            top_tabs.setCurrentIndex(_tab_index(top_tabs, title))
+            qt_app.processEvents()
+            assert not window._subset_widget.isVisible(), f"subset visible on {title}"
+
+        # Switch to Run & Results — visible
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Run & Results"))
+        qt_app.processEvents()
+        assert window._subset_widget.isVisible()
+
+        # Switch back to Data — hidden again
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data"))
+        qt_app.processEvents()
+        assert not window._subset_widget.isVisible()
     finally:
         window.close()
