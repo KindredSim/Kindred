@@ -685,6 +685,11 @@ class FittingWindow(QtWidgets.QDialog):
 
         self.setWindowTitle("Fitting Window")
         self.resize(1280, 720)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowSystemMenuHint
+        )
 
         self._build_ui()
         # _apply_config_defaults and _populate_parameter_table are handled
