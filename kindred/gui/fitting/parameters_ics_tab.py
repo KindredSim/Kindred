@@ -1,4 +1,4 @@
-"""Parameters & ICs tab for the fitting window."""
+"""Parameters tab for the fitting window."""
 
 from __future__ import annotations
 
@@ -328,9 +328,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
         reactions_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
+        ic_panel: Optional[InitialConditionsPanel] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        # transitional — ic_panel is passed for forwarder reach-through
+        # only. FittingWindow owns all IC signal wiring. This parameter
+        # and the associated forwarders are removed in Session 3.
+        self._ic_panel = ic_panel
         # Deep-copy transferred state
         self._parameter_state = [dict(row) for row in parameter_state]
         self._initial_parameter_snapshot = [dict(row) for row in initial_parameter_snapshot]
@@ -364,29 +369,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _build_ui(self, integration_defaults: Tuple[str, float, float]) -> None:
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
-        # --- Parameters panel (left) ---
         params_widget = self._build_parameters_panel(integration_defaults)
-        # --- IC panel (right) ---
-        self._ic_panel = InitialConditionsPanel(
-            dataset_entries=list(self._dataset_entries),
-            mechanism_species=list(self._mechanism_species),
-            dataset_manager_getter=self._dataset_manager_getter,
-            worker_running_getter=self._worker_running_getter,
-            parent=self,
-        )
-        self._ic_panel.setMinimumWidth(300)
-        splitter.addWidget(params_widget)
-        splitter.addWidget(self._ic_panel)
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([640, 560])
-        outer.addWidget(splitter, stretch=1)
-        # Wire IC panel signals
-        self._ic_panel.icApplied.connect(self._on_ic_applied)
-        self._ic_panel.statusMessage.connect(self.statusMessage)
+        outer.addWidget(params_widget, stretch=1)
 
     def _build_parameters_panel(self, integration_defaults: Tuple[str, float, float]) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
@@ -521,10 +505,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     @property
     def _ic_table(self):
+        if self._ic_panel is None:
+            return None
         return self._ic_panel._ic_table
 
     @property
     def _ic_dataset_combo(self):
+        if self._ic_panel is None:
+            return None
         return self._ic_panel._ic_dataset_combo
 
     # ------------------------------------------------------------------
@@ -1706,7 +1694,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 param_name = f"{INITIAL_PREFIX}{species}"
                 if param_name in fixed_map or param_name in variable_map:
                     continue
-                fit_flag, default_spec = self._ic_panel.initial_parameter_defaults_for_species(ds_id, species)
+                if self._ic_panel is not None:
+                    fit_flag, default_spec = self._ic_panel.initial_parameter_defaults_for_species(ds_id, species)
+                else:
+                    fit_flag, default_spec = False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
                 if fit_flag:
                     variable_map[param_name] = dict(default_spec)
                 else:
@@ -1815,8 +1806,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
         self._dataset_entries = list(dataset_entries)
         self._populate_parameter_table()
-        self._ic_panel.set_mechanism_species(list(self._mechanism_species))
-        self._ic_panel.refresh_dataset_combo(list(self._dataset_entries))
+        if self._ic_panel is not None:
+            self._ic_panel.set_mechanism_species(list(self._mechanism_species))
+            self._ic_panel.refresh_dataset_combo(list(self._dataset_entries))
         return list(self._prepared_param_names)
 
     # ------------------------------------------------------------------
@@ -1950,7 +1942,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._remove_param_button.setEnabled(
                 (not running) and bool({item.row() for item in self._param_table.selectedItems()})
             )
-        if hasattr(self, "_ic_panel"):
+        if self._ic_panel is not None:
             self._ic_panel.set_running_state(running)
 
     # ------------------------------------------------------------------
@@ -1959,7 +1951,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def refresh_ic_dataset_combo(self, dataset_entries: List[Dict[str, Any]]) -> None:
         self._dataset_entries = list(dataset_entries)
-        self._ic_panel.refresh_dataset_combo(dataset_entries)
+        if self._ic_panel is not None:
+            self._ic_panel.refresh_dataset_combo(dataset_entries)
 
     def remove_dataset_parameter_rows(self, dataset_ids: Sequence[str]) -> None:
         remove_set = {str(x) for x in dataset_ids}

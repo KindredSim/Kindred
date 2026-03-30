@@ -105,11 +105,10 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert window._tabs is top_tabs
 
         titles = [top_tabs.tabText(i) for i in range(top_tabs.count())]
-        assert titles == ["Data", "Targets & Weights", "Parameters & ICs", "Run & Results"]
+        assert titles == ["Data and Targets", "Parameters", "Results"]
 
-        data_widget = content_stack.widget(_tab_index(top_tabs, "Data"))
-        targets_widget = content_stack.widget(_tab_index(top_tabs, "Targets & Weights"))
-        params_widget = content_stack.widget(_tab_index(top_tabs, "Parameters & ICs"))
+        data_targets_widget = content_stack.widget(_tab_index(top_tabs, "Data and Targets"))
+        params_widget = content_stack.widget(_tab_index(top_tabs, "Parameters"))
 
         sampling_panel = window.findChild(QtWidgets.QWidget, "global_fit_sampling_panel")
         targets_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
@@ -134,29 +133,29 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
             "Species",
         ]
 
-        assert data_widget.isAncestorOf(window._dataset_table)
-        assert data_widget.isAncestorOf(sampling_panel)
-        assert not data_widget.isAncestorOf(weight_mode)
-        assert not data_widget.isAncestorOf(weight_edit)
-
-        assert targets_widget.isAncestorOf(targets_list)
-        assert targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel"))
-        assert targets_widget.isAncestorOf(weight_mode)
-        assert targets_widget.isAncestorOf(weight_edit)
+        # Data and Targets tab contains Data, Targets, and IC as subtabs
+        assert data_targets_widget.isAncestorOf(window._dataset_table)
+        assert data_targets_widget.isAncestorOf(sampling_panel)
+        assert data_targets_widget.isAncestorOf(targets_list)
+        assert data_targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel"))
+        assert data_targets_widget.isAncestorOf(weight_mode)
+        assert data_targets_widget.isAncestorOf(weight_edit)
+        assert data_targets_widget.isAncestorOf(ic_table)
         assert _targets_dataset_ids(targets_list) == ["ds1"]
 
+        # Parameters tab contains param table and method combo, but not IC
         assert params_widget.isAncestorOf(window._param_table)
         assert params_widget.isAncestorOf(window._params_ics_tab._method_combo)
-        assert params_widget.isAncestorOf(ic_table)
+        assert not params_widget.isAncestorOf(ic_table)
 
         assert footer.isAncestorOf(results_summary_button)
         assert footer.isAncestorOf(run_block)
 
-        # On Data tab (config): subset_widget is hidden
+        # On Data and Targets tab (config): subset_widget is hidden
         assert not window._subset_widget.isVisible()
 
-        # Switch to Run & Results to verify splitter sizing
-        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Run & Results"))
+        # Switch to Results to verify splitter sizing
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
         assert window._subset_widget.isVisible()
         shell_sizes = shell_splitter.sizes()
@@ -173,8 +172,9 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
         table.selectRow(1)
         qt_app.processEvents()
 
-        targets_idx = _tab_index(window._tabs, "Targets & Weights")
-        window._tabs.setCurrentIndex(targets_idx)
+        dt_idx = _tab_index(window._tabs, "Data and Targets")
+        window._tabs.setCurrentIndex(dt_idx)
+        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
         qt_app.processEvents()
 
         dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
@@ -189,13 +189,12 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
         assert current is not None
         assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
 
-        data_idx = _tab_index(window._tabs, "Data")
-        window._tabs.setCurrentIndex(data_idx)
+        window._data_targets_tab.subtabs.setCurrentIndex(0)  # Data subtab
         qt_app.processEvents()
         table.selectRow(1)
         qt_app.processEvents()
 
-        window._tabs.setCurrentIndex(targets_idx)
+        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
         qt_app.processEvents()
         current = dataset_list.currentItem()
         assert current is not None
@@ -207,8 +206,9 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
 def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
     window = _make_two_dataset_window()
     try:
-        targets_idx = _tab_index(window._tabs, "Targets & Weights")
-        window._tabs.setCurrentIndex(targets_idx)
+        dt_idx = _tab_index(window._tabs, "Data and Targets")
+        window._tabs.setCurrentIndex(dt_idx)
+        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
         qt_app.processEvents()
 
         dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
@@ -254,15 +254,15 @@ def test_shell_uses_single_top_navigation_host_and_survives_narrow_resize(qt_app
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
 
-        assert top_tabs.count() == 4
-        # On Data tab (default): subset hidden, content_stack gets full width
+        assert top_tabs.count() == 3
+        # On Data and Targets tab (default): subset hidden, content_stack gets full width
         assert not window._subset_widget.isVisible()
         assert content_stack.width() >= 260
         assert window._subset_widget.parentWidget() is shell_splitter
         assert content_stack.parentWidget() is shell_splitter
 
-        # Switch to Run & Results: subset visible with expected width
-        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Run & Results"))
+        # Switch to Results: subset visible with expected width
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
         assert window._subset_widget.isVisible()
         assert window._subset_widget.width() >= 300
@@ -271,8 +271,8 @@ def test_shell_uses_single_top_navigation_host_and_survives_narrow_resize(qt_app
         window.close()
 
 
-def test_subset_widget_visible_only_on_run_results_tab(qt_app):
-    """Regression: left plot panel hidden on config tabs, visible on Run & Results."""
+def test_subset_widget_visible_only_on_results_tab(qt_app):
+    """Regression: left plot panel hidden on config tabs, visible on Results."""
     window = _make_window()
     try:
         window.show()
@@ -280,23 +280,85 @@ def test_subset_widget_visible_only_on_run_results_tab(qt_app):
 
         top_tabs = window._tabs
 
-        # On construction (Data tab, index 0): subset_widget hidden
+        # On construction (Data and Targets tab, index 0): subset_widget hidden
         assert not window._subset_widget.isVisible()
 
         # Switch to each config tab — still hidden
-        for title in ("Targets & Weights", "Parameters & ICs"):
+        for title in ("Data and Targets", "Parameters"):
             top_tabs.setCurrentIndex(_tab_index(top_tabs, title))
             qt_app.processEvents()
             assert not window._subset_widget.isVisible(), f"subset visible on {title}"
 
-        # Switch to Run & Results — visible
-        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Run & Results"))
+        # Switch to Results — visible
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
         assert window._subset_widget.isVisible()
 
-        # Switch back to Data — hidden again
-        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data"))
+        # Switch back to Data and Targets — hidden again
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data and Targets"))
         qt_app.processEvents()
         assert not window._subset_widget.isVisible()
+    finally:
+        window.close()
+
+
+def test_three_tab_structure_with_data_targets_subtabs(qt_app):
+    """Regression: 3 top-level tabs, DataTargetsTab hosts subtabs, subset visibility correct."""
+    from kindred.gui.fitting.data_tab import DataTab
+    from kindred.gui.fitting.data_targets_tab import DataTargetsTab
+    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
+
+    window = _make_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        top_tabs = window._tabs
+
+        # Exactly 3 top-level tabs with correct names
+        assert top_tabs.count() == 3
+        titles = [top_tabs.tabText(i) for i in range(top_tabs.count())]
+        assert titles == ["Data and Targets", "Parameters", "Results"]
+
+        # Page 0 is DataTargetsTab
+        dt_tab = window._data_targets_tab
+        assert isinstance(dt_tab, DataTargetsTab)
+
+        # DataTargetsTab contains the expected child widgets
+        assert isinstance(dt_tab.data_tab, DataTab)
+        assert dt_tab.isAncestorOf(dt_tab.data_tab)
+        assert dt_tab.isAncestorOf(dt_tab.targets_weights_tab)
+        assert dt_tab.isAncestorOf(dt_tab.ic_panel)
+        assert isinstance(dt_tab.ic_panel, InitialConditionsPanel)
+
+        # Subtabs have correct names
+        subtab_titles = [dt_tab.subtabs.tabText(i) for i in range(dt_tab.subtabs.count())]
+        assert subtab_titles == ["Data", "Targets & Weights", "Initial Conditions"]
+
+        # Subset widget hidden on Data and Targets
+        assert not window._subset_widget.isVisible()
+
+        # Subset widget hidden on Parameters
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Parameters"))
+        qt_app.processEvents()
+        assert not window._subset_widget.isVisible()
+
+        # Subset widget visible on Results
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
+        qt_app.processEvents()
+        assert window._subset_widget.isVisible()
+
+        # Back to Data and Targets — hidden again
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data and Targets"))
+        qt_app.processEvents()
+        assert not window._subset_widget.isVisible()
+
+        # Targets subtab activation fires on_tab_activated
+        dt_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
+        qt_app.processEvents()
+        # Verify the targets dataset list is populated (proves on_tab_activated ran)
+        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        assert dataset_list is not None
+        assert dataset_list.count() >= 1
     finally:
         window.close()

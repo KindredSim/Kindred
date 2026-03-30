@@ -9,6 +9,7 @@ pytestmark = [pytest.mark.gui]
 
 
 def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6, 1e-12)):
+    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
     if entries is None:
@@ -16,6 +17,12 @@ def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6
     if species is None:
         species = ["A", "B"]
 
+    ic_panel = InitialConditionsPanel(
+        dataset_entries=list(entries),
+        mechanism_species=list(species),
+        dataset_manager_getter=lambda: None,
+        worker_running_getter=lambda: False,
+    )
     tab = ParametersIcsTab(
         parameter_state=[],
         initial_parameter_snapshot=[],
@@ -33,6 +40,7 @@ def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6
         reactions_text_getter=lambda: "",
         integration_defaults=integration_defaults,
         config_defaults={},
+        ic_panel=ic_panel,
     )
     return tab
 
@@ -44,12 +52,12 @@ def test_construction(qt_app):
         assert tab._param_table is not None
         assert isinstance(tab._param_table, QtWidgets.QTableWidget)
 
-        ic_table = tab.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
-        assert ic_table is not None
-
-        ic_combo = tab.findChild(QtWidgets.QComboBox, "global_fit_initial_conditions_dataset_combo")
-        assert ic_combo is not None
+        # IC widgets are accessible via _ic_panel reference (no longer children of tab)
+        assert tab._ic_panel is not None
+        assert tab._ic_table is not None
+        assert tab._ic_dataset_combo is not None
     finally:
+        tab._ic_panel.close()
         tab.close()
         qt_app.processEvents()
 
@@ -108,15 +116,17 @@ def test_state_getters_return_initial_values(qt_app):
 
 
 def test_ic_panel_is_standalone_widget(qt_app):
-    """InitialConditionsPanel is a child widget of ParametersIcsTab."""
+    """InitialConditionsPanel is a standalone widget referenced by ParametersIcsTab."""
     from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
 
     tab = _make_tab()
     try:
         assert hasattr(tab, "_ic_panel")
         assert isinstance(tab._ic_panel, InitialConditionsPanel)
-        assert tab.isAncestorOf(tab._ic_panel)
+        # IC panel is no longer a child of the tab — it is hosted externally
+        assert not tab.isAncestorOf(tab._ic_panel)
     finally:
+        tab._ic_panel.close()
         tab.close()
         qt_app.processEvents()
 
@@ -147,6 +157,8 @@ def test_ic_panel_apply_signal_round_trip(qt_app):
         entries=[{"id": ds_id, "label": "DS 1"}],
         species=species,
     )
+    # Wire icApplied -> _on_ic_applied (done by FittingWindow in production)
+    tab._ic_panel.icApplied.connect(tab._on_ic_applied)
     # Replace dataset_manager_getter to return our fake manager
     tab._dataset_manager_getter = lambda: FakeManager()
     tab._ic_panel._dataset_manager_getter = lambda: FakeManager()

@@ -1,5 +1,5 @@
 """
-Run & Results tab widget for the fitting window.
+Results tab widget for the fitting window.
 
 Extracted from FittingWindow — owns the run-stamp data and statistics
 (displayed via a non-modal popup dialog triggered from the footer).

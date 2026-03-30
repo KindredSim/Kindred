@@ -86,6 +86,7 @@ def _make_data_tab(*, worker_running=False):
 
 def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
                      entries=None, species=None):
+    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
     if entries is None:
@@ -93,6 +94,12 @@ def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
     if species is None:
         species = ["A", "B"]
 
+    ic_panel = InitialConditionsPanel(
+        dataset_entries=list(entries),
+        mechanism_species=list(species),
+        dataset_manager_getter=lambda: None,
+        worker_running_getter=lambda: False,
+    )
     tab = ParametersIcsTab(
         parameter_state=[],
         initial_parameter_snapshot=[],
@@ -110,6 +117,7 @@ def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
         reactions_text_getter=lambda: "",
         integration_defaults=integration_defaults,
         config_defaults={},
+        ic_panel=ic_panel,
     )
     return tab
 

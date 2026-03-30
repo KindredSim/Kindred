@@ -50,6 +50,8 @@ from kindred.gui.fitting.run_stamp import (
     hash_global_fit_run_stamp,
 )
 from kindred.gui.fitting.data_tab import DataTab
+from kindred.gui.fitting.data_targets_tab import DataTargetsTab
+from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.targets_weights_tab import TargetsWeightsTab
@@ -238,13 +240,12 @@ class _SimulationWithFixedParams:
 
 class FittingWindow(QtWidgets.QDialog):
     """
-    Persistent Dynochem-style fitting window that drives global fits.
+    Persistent fitting window that drives global fits.
 
-    The window combines four workflow tabs:
-        - Data (datasets + sampling)
-        - Targets & Weights (dataset-local target and weighting detail)
-        - Parameters & ICs (parameter table and IC editor)
-        - Run & Results (fit diagnostics and run stamp review)
+    The window combines three workflow tabs:
+        - Data and Targets (datasets, sampling, targets & weights, initial conditions)
+        - Parameters (parameter table and integration settings)
+        - Results (fit diagnostics and run stamp review)
 
     It owns the lifetime of GlobalFitWorker instances and updates plots +
     parameter tables after each run, enabling iterative workflows.
@@ -729,6 +730,13 @@ class FittingWindow(QtWidgets.QDialog):
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
             parent=self,
         )
+        self._ic_panel = InitialConditionsPanel(
+            dataset_entries=list(self._dataset_entries),
+            mechanism_species=list(self.__dict__.get("_mechanism_species", [])),
+            dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
+            worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
+            parent=self,
+        )
         self._params_ics_tab = ParametersIcsTab(
             parameter_state=self.__dict__.pop("_parameter_state"),
             initial_parameter_snapshot=self.__dict__.pop("_initial_parameter_snapshot"),
@@ -746,19 +754,25 @@ class FittingWindow(QtWidgets.QDialog):
             reactions_text_getter=lambda: str(_w()._reactions_text_getter() or "") if _w() is not None and callable(getattr(_w(), "_reactions_text_getter", None)) else "",
             integration_defaults=self._active_integration_defaults_for_ui(),
             config_defaults=self._config_defaults,
+            ic_panel=self._ic_panel,
             parent=self,
         )
         self._params_ics_tab.addAlgebraicObservableRequested.connect(self._on_algebraic_observable_requested)
         self._run_results_tab = RunResultsTab(parent=self)
+        self._data_targets_tab = DataTargetsTab(
+            data_tab=self._data_tab,
+            targets_weights_tab=self._targets_weights_tab,
+            ic_panel=self._ic_panel,
+            parent=self,
+        )
 
         self._tabs = QtWidgets.QTabBar(self)
         self._tabs.setObjectName("global_fit_top_tabs")
         self._tabs.setDocumentMode(True)
         self._tabs.setDrawBase(False)
-        self._tabs.addTab("Data")
-        self._targets_tab_index = self._tabs.addTab("Targets & Weights")
-        self._tabs.addTab("Parameters & ICs")
-        self._results_tab_index = self._tabs.addTab("Run & Results")
+        self._tabs.addTab("Data and Targets")
+        self._tabs.addTab("Parameters")
+        self._results_tab_index = self._tabs.addTab("Results")
         layout.addWidget(self._tabs, stretch=0)
 
         self._main_splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
@@ -776,8 +790,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._current_tab_stack = QtWidgets.QStackedWidget(self)
         self._current_tab_stack.setObjectName("global_fit_current_tab_stack")
         self._current_tab_stack.setMinimumWidth(320)
-        self._current_tab_stack.addWidget(self._data_tab)
-        self._current_tab_stack.addWidget(self._targets_weights_tab)
+        self._current_tab_stack.addWidget(self._data_targets_tab)
         self._current_tab_stack.addWidget(self._params_ics_tab)
         self._current_tab_stack.addWidget(self._run_results_tab)
         self._main_splitter.addWidget(self._current_tab_stack)
@@ -792,8 +805,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._tabs.currentChanged.connect(self._current_tab_stack.setCurrentIndex)
         self._tabs.currentChanged.connect(self._on_right_tabs_current_changed)
         self._current_tab_stack.setCurrentIndex(self._tabs.currentIndex())
+        self._data_targets_tab.subtabChanged.connect(self._on_data_targets_subtab_changed)
 
         layout.addWidget(self._create_footer(), stretch=0)
+        self._ic_panel.icApplied.connect(self._params_ics_tab._on_ic_applied)
+        self._ic_panel.statusMessage.connect(self._status_label.setText)
         self._params_ics_tab.statusMessage.connect(self._status_label.setText)
         self._run_results_tab.statusMessage.connect(self._status_label.setText)
         self._data_tab.statusMessage.connect(self._status_label.setText)
@@ -958,10 +974,10 @@ class FittingWindow(QtWidgets.QDialog):
     def _param_table(self):
         return self._params_ics_tab._param_table
 
-    # transitional — remove when all callers use ParametersIcsTab API directly
+    # transitional — remove when all callers use InitialConditionsPanel API directly
     @property
     def _ic_table(self):
-        return self._params_ics_tab._ic_table
+        return self._ic_panel._ic_table
 
     # transitional — remove when all callers use TargetsWeightsTab API directly
     @property
@@ -1119,7 +1135,14 @@ class FittingWindow(QtWidgets.QDialog):
                 self._splitter_sizes_backup = self._main_splitter.sizes()
             self._subset_widget.hide()
 
-        if int(index) == int(getattr(self, "_targets_tab_index", -1)):
+        # If switching to Data & Targets while Targets subtab is active, fire activation
+        if int(index) == 0 and self._data_targets_tab.subtabs.currentIndex() == 1:
+            self._targets_weights_tab.on_tab_activated(
+                seed_dataset_id=self._selected_data_table_dataset_id()
+            )
+
+    def _on_data_targets_subtab_changed(self, subtab_index: int) -> None:
+        if subtab_index == 1:  # "Targets & Weights" subtab
             self._targets_weights_tab.on_tab_activated(
                 seed_dataset_id=self._selected_data_table_dataset_id()
             )
@@ -1286,7 +1309,7 @@ class FittingWindow(QtWidgets.QDialog):
                 f"Run Fit disabled: {joined} has no applied fit targets. Select targets and Apply, or uncheck Use."
             )
             if hasattr(self, "_run_block_reason_label"):
-                self._run_block_reason_label.setText(f"{message} Open Targets & Weights to apply targets.")
+                self._run_block_reason_label.setText(f"{message} Open Data and Targets to apply targets.")
                 self._run_block_reason_label.show()
         else:
             if hasattr(self, "_run_block_reason_label"):

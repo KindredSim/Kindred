@@ -96,7 +96,7 @@ def test_fitting_window_has_min_max_buttons(qt_app):
 
 # ---- Fix 2: Parameters/ICs splitter is horizontal ----
 
-def test_parameters_ics_splitter_is_horizontal(qt_app):
+def test_parameters_tab_has_no_splitter_after_ic_extraction(qt_app):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
     tab = ParametersIcsTab(
@@ -119,8 +119,7 @@ def test_parameters_ics_splitter_is_horizontal(qt_app):
     )
     try:
         splitter = tab.findChild(QtWidgets.QSplitter)
-        assert splitter is not None
-        assert splitter.orientation() == Qt.Horizontal
+        assert splitter is None  # IC panel extracted, no splitter needed
     finally:
         tab.close()
         qt_app.processEvents()
