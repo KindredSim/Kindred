@@ -109,11 +109,10 @@ def test_copy_buttons_disabled_before_any_run(qt_app):
 def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
     from PySide6 import QtCore, QtWidgets
 
-    import kindred.gui.fitting.window as fit_window
+    import kindred.gui.fitting.run_results_tab as run_results_tab_mod
 
     dummy_clipboard = _DummyClipboard()
-    assert hasattr(fit_window, "_get_clipboard")
-    monkeypatch.setattr(fit_window, "_get_clipboard", lambda: dummy_clipboard)
+    monkeypatch.setattr(run_results_tab_mod, "_get_clipboard", lambda: dummy_clipboard)
 
     captured = {"payloads": []}
 
@@ -136,20 +135,20 @@ def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
 
     window = _make_window()
     try:
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)
         qt_app.processEvents()
 
-        assert window._last_run_stamp_short
+        assert window._run_results_tab._last_run_stamp_short
 
         copy_button = window.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_button")
         assert copy_button is not None
         assert copy_button.isEnabled() is True
         copy_button.click()
         qt_app.processEvents()
-        assert dummy_clipboard.last_text == window._last_run_stamp_short
+        assert dummy_clipboard.last_text == window._run_results_tab._last_run_stamp_short
 
         copy_json_button = window.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_json_button")
         assert copy_json_button is not None

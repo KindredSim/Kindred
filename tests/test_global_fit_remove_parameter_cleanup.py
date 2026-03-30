@@ -31,14 +31,14 @@ def test_remove_global_initial_parameter_allows_readd(qt_app, monkeypatch):
         dataset_params={"ds1": {"init:A": 1.0}},
     )
     try:
-        window._add_global_initial_parameter("A", ["ds1"])
+        window._params_ics_tab._add_global_initial_parameter("A", ["ds1"])
         rows = [
             idx
             for idx, entry in enumerate(window._parameter_state)
             if entry.get("scope") == "shared" and entry.get("param_name") == "init:A"
         ]
         assert len(rows) == 1
-        window._remove_parameter_rows(rows)
+        window._params_ics_tab._remove_parameter_rows(rows)
 
         calls = []
 
@@ -47,7 +47,7 @@ def test_remove_global_initial_parameter_allows_readd(qt_app, monkeypatch):
             return QtWidgets.QMessageBox.StandardButton.Ok
 
         monkeypatch.setattr(QtWidgets.QMessageBox, "information", _fake_information)
-        window._add_global_initial_parameter("A", ["ds1"])
+        window._params_ics_tab._add_global_initial_parameter("A", ["ds1"])
 
         assert not calls, "Re-adding a removed global initial parameter should not claim it already exists."
         rows2 = [
