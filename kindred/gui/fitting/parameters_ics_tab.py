@@ -365,19 +365,19 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _build_ui(self, integration_defaults: Tuple[str, float, float]) -> None:
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        splitter = QtWidgets.QSplitter(Qt.Vertical, self)
-        # --- Parameters panel ---
+        splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
+        # --- Parameters panel (left) ---
         params_widget = self._build_parameters_panel(integration_defaults)
-        # --- IC panel ---
+        # --- IC panel (right) ---
         ic_panel = self._build_initial_conditions_panel()
-        ic_panel.setMinimumHeight(220)
+        ic_panel.setMinimumWidth(300)
         splitter.addWidget(params_widget)
         splitter.addWidget(ic_panel)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([460, 300])
+        splitter.setSizes([640, 560])
         outer.addWidget(splitter, stretch=1)
 
     def _build_parameters_panel(self, integration_defaults: Tuple[str, float, float]) -> QtWidgets.QWidget:
