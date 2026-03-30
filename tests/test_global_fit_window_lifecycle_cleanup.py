@@ -399,7 +399,7 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
             stamp_short="new",
         )
         new_worker = workers[-1]
-        window._last_fit_params = {"k": 77.0}
+        window._params_ics_tab.set_last_fit_params({"k": 77.0})
         window._best_cost = 123.0
         window._status_label.setText("Running newer fit")
 
@@ -415,7 +415,7 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
         window._apply_pending_best_update()
 
         assert window._worker is new_worker
-        assert window._last_fit_params == {"k": 77.0}
+        assert window._params_ics_tab.get_last_fit_params() == {"k": 77.0}
         assert window._best_cost == 123.0
         assert window._status_label.text() == "Running newer fit"
 

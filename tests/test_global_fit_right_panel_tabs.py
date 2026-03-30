@@ -126,15 +126,15 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert results_summary_button is not None
         assert run_block is not None
 
-        assert window._dataset_table.columnCount() == 3
-        assert [window._dataset_table.horizontalHeaderItem(i).text() for i in range(window._dataset_table.columnCount())] == [
+        assert window._data_tab._dataset_table.columnCount() == 3
+        assert [window._data_tab._dataset_table.horizontalHeaderItem(i).text() for i in range(window._data_tab._dataset_table.columnCount())] == [
             "Use",
             "Dataset",
             "Species",
         ]
 
         # Data and Targets tab contains Data, Targets, and IC as subtabs
-        assert data_targets_widget.isAncestorOf(window._dataset_table)
+        assert data_targets_widget.isAncestorOf(window._data_tab._dataset_table)
         assert data_targets_widget.isAncestorOf(sampling_panel)
         assert data_targets_widget.isAncestorOf(targets_list)
         assert data_targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel"))
@@ -144,7 +144,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert _targets_dataset_ids(targets_list) == ["ds1"]
 
         # Parameters tab contains param table and method combo, but not IC
-        assert params_widget.isAncestorOf(window._param_table)
+        assert params_widget.isAncestorOf(window._params_ics_tab._param_table)
         assert params_widget.isAncestorOf(window._params_ics_tab._method_combo)
         assert not params_widget.isAncestorOf(ic_table)
 
@@ -168,7 +168,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
 def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(qt_app):
     window = _make_two_dataset_window()
     try:
-        table = window._dataset_table
+        table = window._data_tab._dataset_table
         table.selectRow(1)
         qt_app.processEvents()
 

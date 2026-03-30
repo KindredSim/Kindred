@@ -117,7 +117,7 @@ def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
 
 def _dataset_table_row_for(window, dataset_id: str) -> int:
     from PySide6 import QtCore
-    table = window._dataset_table
+    table = window._data_tab._dataset_table
     for row in range(table.rowCount()):
         item = table.item(row, 0)
         if item is None:
@@ -274,8 +274,8 @@ def test_preloaded_target_weights_seed_applied_state_from_dataset_entry_before_p
         payload_target_weights={"A": 9.0},
     )
     try:
-        assert window._fit_target_weights_applied["ds1"] == {"A": 2.5}
-        assert window._fit_target_weights_pending["ds1"]["A"] == 2.5
+        assert window._targets_weights_tab._fit_target_weights_applied["ds1"] == {"A": 2.5}
+        assert window._targets_weights_tab._fit_target_weights_pending["ds1"]["A"] == 2.5
         assert window._dataset_entries[0]["target_weights"] == {"A": 2.5}
         assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 2.5}
     finally:
@@ -289,8 +289,8 @@ def test_preloaded_target_weights_fall_back_to_seeded_payload_when_entry_omits_t
         payload_target_weights={"A": 3.5},
     )
     try:
-        assert window._fit_target_weights_applied["ds1"] == {"A": 3.5}
-        assert window._fit_target_weights_pending["ds1"]["A"] == 3.5
+        assert window._targets_weights_tab._fit_target_weights_applied["ds1"] == {"A": 3.5}
+        assert window._targets_weights_tab._fit_target_weights_pending["ds1"]["A"] == 3.5
         assert window._dataset_entries[0]["target_weights"] == {"A": 3.5}
         assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 3.5}
     finally:
@@ -309,20 +309,20 @@ def test_fit_targets_apply_keeps_invalid_used_dataset_pending_and_highlights_row
         apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
         assert apply_btn is not None
 
-        applied_before = list(window._fit_targets_selection_applied["ds1"])
+        applied_before = list(window._targets_weights_tab.fit_targets_selection_applied["ds1"])
 
         _set_fit_targets_dataset(panel, dataset_id="ds1")
         for cb in [cb for cb in panel.findChildren(QtWidgets.QCheckBox) if cb.text().strip() in {"A", "B"}]:
             cb.setChecked(False)
         qt_app.processEvents()
-        assert window._fit_targets_selection_pending["ds1"] == set()
+        assert window._targets_weights_tab._fit_targets_selection_pending["ds1"] == set()
 
         apply_btn.click()
         qt_app.processEvents()
 
         # Used dataset with empty pending selection must not be applied.
-        assert window._fit_targets_selection_applied["ds1"] == applied_before
-        assert window._fit_targets_selection_pending["ds1"] == set()
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == applied_before
+        assert window._targets_weights_tab._fit_targets_selection_pending["ds1"] == set()
         assert apply_btn.isEnabled(), "Apply should remain enabled while invalid pending changes exist."
 
         error_label = panel.findChild(QtWidgets.QLabel, "global_fit_fit_targets_error")
@@ -331,7 +331,7 @@ def test_fit_targets_apply_keeps_invalid_used_dataset_pending_and_highlights_row
         assert "no fit targets" in error_label.text().lower()
 
         row = _dataset_table_row_for(window, "ds1")
-        mark_item = window._dataset_table.item(row, 1)
+        mark_item = window._data_tab._dataset_table.item(row, 1)
         assert mark_item is not None
         bg = mark_item.background()
         assert bg is not None and bg.color().isValid()
@@ -360,18 +360,18 @@ def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, mon
         qt_app.processEvents()
 
         row = _dataset_table_row_for(window, "ds1")
-        use_item = window._dataset_table.item(row, 0)
+        use_item = window._data_tab._dataset_table.item(row, 0)
         assert use_item is not None
         use_item.setCheckState(QtCore.Qt.Unchecked)
         qt_app.processEvents()
 
         apply_btn.click()
         qt_app.processEvents()
-        assert window._fit_targets_selection_applied["ds1"] == []
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == []
 
         # Re-enable Use; Run Fit must disable immediately due to invalid applied targets.
         row = _dataset_table_row_for(window, "ds1")
-        use_item = window._dataset_table.item(row, 0)
+        use_item = window._data_tab._dataset_table.item(row, 0)
         assert use_item is not None
         use_item.setCheckState(QtCore.Qt.Checked)
         qt_app.processEvents()
@@ -390,7 +390,7 @@ def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, mon
         apply_btn.click()
         qt_app.processEvents()
 
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == ["A"]
         assert window._run_button.isEnabled()
         assert status.isHidden()
     finally:
@@ -417,19 +417,19 @@ def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_
         edit_a.setText("0")
         qt_app.processEvents()
 
-        assert "ds1" in window._invalid_pending_target_weight_dataset_ids()
+        assert "ds1" in window._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
         assert "invalid target weights" in error_label.text().lower()
 
         row = _dataset_table_row_for(window, "ds1")
-        use_item = window._dataset_table.item(row, 0)
-        mark_item = window._dataset_table.item(row, 1)
+        use_item = window._data_tab._dataset_table.item(row, 0)
+        mark_item = window._data_tab._dataset_table.item(row, 1)
         assert use_item is not None
         assert mark_item is not None
 
         use_item.setCheckState(QtCore.Qt.Unchecked)
         qt_app.processEvents()
 
-        assert "ds1" not in window._invalid_pending_target_weight_dataset_ids()
+        assert "ds1" not in window._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
         assert "invalid target weights" not in error_label.text().lower()
         assert not bool(mark_item.data(_DATASET_INVALID_MARK_ROLE))
         assert window._run_button.isEnabled()
@@ -438,18 +438,18 @@ def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_
         qt_app.processEvents()
 
         assert window._status_label.text() == "Fit targets applied"
-        assert window._fit_target_weights_pending_invalid["ds1"] == {"A": "0"}
+        assert window._targets_weights_tab._fit_target_weights_pending_invalid["ds1"] == {"A": "0"}
         assert _target_weight_edit(panel, target_name="A").text() == "0"
 
         row = _dataset_table_row_for(window, "ds1")
-        use_item = window._dataset_table.item(row, 0)
-        mark_item = window._dataset_table.item(row, 1)
+        use_item = window._data_tab._dataset_table.item(row, 0)
+        mark_item = window._data_tab._dataset_table.item(row, 1)
         assert use_item is not None
         assert mark_item is not None
         use_item.setCheckState(QtCore.Qt.Checked)
         qt_app.processEvents()
 
-        assert "ds1" in window._invalid_pending_target_weight_dataset_ids()
+        assert "ds1" in window._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
         assert "invalid target weights" in error_label.text().lower()
         assert bool(mark_item.data(_DATASET_INVALID_MARK_ROLE))
         assert window._run_button.isEnabled()

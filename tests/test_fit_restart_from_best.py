@@ -56,7 +56,7 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
         dataset_weights={"ds1": 1.0},
     )
     try:
-        window._staged_dataset_params = {"ds1": {"init:A": 0.6}}
+        window._params_ics_tab.set_staged_dataset_params({"ds1": {"init:A": 0.6}})
         window._start_global_fit(
             {"parameters": {"k1": 0.2}, "bounds": {"k1": (0.01, 1.0)}, "method": "trf", "max_nfev": 10, "seed": None},
             {"ids": ["ds1"], "rows": [{"id": "ds1", "include": True, "weight": 1.0}]},

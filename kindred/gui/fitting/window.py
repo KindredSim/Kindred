@@ -325,7 +325,7 @@ class FittingWindow(QtWidgets.QDialog):
             for d in (parameter_defs or [])
             if isinstance(d, dict) and str(d.get("name") or "").strip()
         ]
-        self._parameter_state = self._build_parameter_state(parameter_defs)
+        self._parameter_state = ParametersIcsTab._build_parameter_state(self, parameter_defs)
         self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
         self._dataset_entries = self._normalize_dataset_entries(dataset_entries)
         if not self._dataset_entries:
@@ -358,13 +358,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.load_sampling_for_selected_row()
         self._refresh_plot_baselines()
 
-    def _build_parameter_state(self, definitions):
-        """Forwarding to ParametersIcsTab — called during __init__ before tab exists.
-
-        Works because state attributes are stored in __dict__ via property fallback
-        and _build_parameter_state only reads/writes those attributes.
-        """
-        return ParametersIcsTab._build_parameter_state(self, definitions)
 
     def _load_dataset_pool_from_entries(self) -> None:
         # Snapshot of datasets available to this Global Fit session (already-loaded at window launch).
@@ -486,12 +479,8 @@ class FittingWindow(QtWidgets.QDialog):
             atol_default = 1e-12
         return str(solver_default), float(rtol_default), float(atol_default)
 
-    # transitional — remove when callers use TargetsWeightsTab API directly
-    def _applied_selected_target_weights_for_dataset(self, dataset_id: str) -> Dict[str, float]:
-        return self._targets_weights_tab.applied_target_weights_for_dataset(dataset_id)
-
     def _modeled_series_names_for_x_axis(self) -> set[str]:
-        modeled = {str(x) for x in (self._mechanism_species or []) if str(x).strip()}
+        modeled = {str(x) for x in (self._params_ics_tab.get_mechanism_species() or []) if str(x).strip()}
         if callable(getattr(self, "_reactions_text_getter", None)):
             try:
                 from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
@@ -543,31 +532,35 @@ class FittingWindow(QtWidgets.QDialog):
                 "x_name": str(cfg.get("x_name") or "t").strip() or "t",
                 "x_mapping_mode": str(cfg.get("x_mapping_mode") or "auto").strip() or "auto",
             }
-        full_t = self._fit_targets_full_t_by_dataset.get(ds_id, np.asarray([]))
+        full_t = self._targets_weights_tab.full_t_by_dataset.get(ds_id, np.asarray([]))
         return self._sampling_default_config_for_time_axis(full_t)
 
     def _init_sampling_state(self) -> None:
+        full_t_map = self._targets_weights_tab.full_t_by_dataset
         applied: Dict[str, Dict[str, float | int | str]] = {}
         for entry in self._dataset_entries or []:
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
-            full_t = self._fit_targets_full_t_by_dataset.get(ds_id, np.asarray(entry.get("t", [])))
+            full_t = full_t_map.get(ds_id, np.asarray(entry.get("t", [])))
             applied[ds_id] = self._sampling_default_config_for_time_axis(full_t)
         self._sampling_applied = applied
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._rebuild_selected_payload_lookup()
 
     def _refresh_dataset_entries_from_applied_fit_targets_and_sampling(self) -> None:
+        applied_sel = self._targets_weights_tab.fit_targets_selection_applied
+        full_t_map = self._targets_weights_tab.full_t_by_dataset
+        full_series_map = self._targets_weights_tab.full_series_by_dataset
         for entry in self._dataset_entries or []:
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
-            selection = list(self._fit_targets_selection_applied.get(ds_id, []))
+            selection = list(applied_sel.get(ds_id, []))
             entry["selected_species"] = list(selection)
-            entry["target_weights"] = self._applied_selected_target_weights_for_dataset(ds_id)
+            entry["target_weights"] = self._targets_weights_tab.applied_target_weights_for_dataset(ds_id)
 
-            full_t = self._fit_targets_full_t_by_dataset.get(ds_id, np.asarray(entry.get("t", []), dtype=float).reshape(-1))
+            full_t = full_t_map.get(ds_id, np.asarray(entry.get("t", []), dtype=float).reshape(-1))
             cfg = self._sampling_applied_config_for_dataset(ds_id)
             t_min = float(cfg.get("t_min", 0.0))
             t_max = float(cfg.get("t_max", 0.0))
@@ -581,7 +574,7 @@ class FittingWindow(QtWidgets.QDialog):
             sampled_t = np.asarray(full_t[idx], dtype=float).reshape(-1) if idx.size else np.asarray([], dtype=float)
             entry["t"] = sampled_t
 
-            full_series = self._fit_targets_full_series_by_dataset.get(ds_id, {})
+            full_series = full_series_map.get(ds_id, {})
             sampled_series: Dict[str, np.ndarray] = {}
             if selection and isinstance(full_series, dict) and idx.size:
                 for name in selection:
@@ -616,7 +609,7 @@ class FittingWindow(QtWidgets.QDialog):
     def _rebuild_selected_payload_lookup(self) -> None:
         rebuilt: Dict[str, Dict[str, Any]] = {}
         rebuilt_results: Dict[str, FitDatasetPayloadResult] = {}
-        for ds_id, selection in (self._fit_targets_selection_applied or {}).items():
+        for ds_id, selection in (self._targets_weights_tab.fit_targets_selection_applied or {}).items():
             entry = next((e for e in (self._dataset_entries or []) if str(e.get("id") or "").strip() == str(ds_id)), None)
             if not isinstance(entry, dict):
                 rebuilt_results[str(ds_id)] = FitDatasetPayloadResult.absent()
@@ -638,7 +631,7 @@ class FittingWindow(QtWidgets.QDialog):
                 t=t_values,
                 species_data=series_map,
                 selected_species=selection,
-                target_weights=self._applied_selected_target_weights_for_dataset(ds_id),
+                target_weights=self._targets_weights_tab.applied_target_weights_for_dataset(ds_id),
                 x_name=x_name,
                 x_obs=x_obs,  # already sampled against the same indices as t/y
                 x_mapping_mode=x_mapping_mode,
@@ -821,207 +814,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.removeDatasetsRequested.connect(self._remove_datasets_from_session)
         self._data_tab.samplingApplied.connect(self._on_data_tab_sampling_applied)
         self._refresh_project_apply_controls()
-
-    # transitional — remove when tests are updated to use DataTab API directly
-    @property
-    def _dataset_table(self):
-        return self._data_tab._dataset_table
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    # All property getters check __dict__ first to support pre-_build_ui init phase,
-    # when _params_ics_tab does not exist yet. __dict__.pop() in _build_ui transfers values.
-    @property
-    def _parameter_state(self):
-        if "_parameter_state" in self.__dict__:
-            return self.__dict__["_parameter_state"]
-        return self._params_ics_tab.get_parameter_state()
-
-    @_parameter_state.setter
-    def _parameter_state(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_parameter_state(value)
-        else:
-            self.__dict__["_parameter_state"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _initial_parameter_snapshot(self):
-        if "_initial_parameter_snapshot" in self.__dict__:
-            return self.__dict__["_initial_parameter_snapshot"]
-        return self._params_ics_tab.get_initial_parameter_snapshot()
-
-    @_initial_parameter_snapshot.setter
-    def _initial_parameter_snapshot(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            pass  # read-only after tab construction; tab owns it
-        else:
-            self.__dict__["_initial_parameter_snapshot"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _global_dataset_params(self):
-        if "_global_dataset_params" in self.__dict__:
-            return self.__dict__["_global_dataset_params"]
-        return self._params_ics_tab.get_global_dataset_params()
-
-    @_global_dataset_params.setter
-    def _global_dataset_params(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_global_dataset_params(value)
-        else:
-            self.__dict__["_global_dataset_params"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _global_dataset_variable_params(self):
-        if "_global_dataset_variable_params" in self.__dict__:
-            return self.__dict__["_global_dataset_variable_params"]
-        return self._params_ics_tab.get_global_dataset_variable_params()
-
-    @_global_dataset_variable_params.setter
-    def _global_dataset_variable_params(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_global_dataset_variable_params(value)
-        else:
-            self.__dict__["_global_dataset_variable_params"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _fixed_shared_params(self):
-        if "_fixed_shared_params" in self.__dict__:
-            return self.__dict__["_fixed_shared_params"]
-        return self._params_ics_tab.get_fixed_shared_params()
-
-    @_fixed_shared_params.setter
-    def _fixed_shared_params(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_fixed_shared_params(value)
-        else:
-            self.__dict__["_fixed_shared_params"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _shared_param_definitions(self):
-        if "_shared_param_definitions" in self.__dict__:
-            return self.__dict__["_shared_param_definitions"]
-        return self._params_ics_tab.get_shared_param_definitions()
-
-    @_shared_param_definitions.setter
-    def _shared_param_definitions(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_shared_param_definitions(value)
-        else:
-            self.__dict__["_shared_param_definitions"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _mechanism_species(self):
-        if "_mechanism_species" in self.__dict__:
-            return self.__dict__["_mechanism_species"]
-        return self._params_ics_tab.get_mechanism_species()
-
-    @_mechanism_species.setter
-    def _mechanism_species(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_mechanism_species(value)
-        else:
-            self.__dict__["_mechanism_species"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _prepared_param_names(self):
-        if "_prepared_param_names" in self.__dict__:
-            return self.__dict__["_prepared_param_names"]
-        return self._params_ics_tab.get_prepared_param_names()
-
-    @_prepared_param_names.setter
-    def _prepared_param_names(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_prepared_param_names(value)
-        else:
-            self.__dict__["_prepared_param_names"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _last_fit_params(self):
-        if "_last_fit_params" in self.__dict__:
-            return self.__dict__["_last_fit_params"]
-        return self._params_ics_tab.get_last_fit_params()
-
-    @_last_fit_params.setter
-    def _last_fit_params(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_last_fit_params(value)
-        else:
-            self.__dict__["_last_fit_params"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _staged_dataset_params(self):
-        if "_staged_dataset_params" in self.__dict__:
-            return self.__dict__["_staged_dataset_params"]
-        return self._params_ics_tab.get_staged_dataset_params()
-
-    @_staged_dataset_params.setter
-    def _staged_dataset_params(self, value):
-        if hasattr(self, "_params_ics_tab"):
-            self._params_ics_tab.set_staged_dataset_params(value)
-        else:
-            self.__dict__["_staged_dataset_params"] = value
-
-    # transitional — remove when all callers use ParametersIcsTab API directly
-    @property
-    def _param_table(self):
-        return self._params_ics_tab._param_table
-
-    # transitional — remove when all callers use InitialConditionsPanel API directly
-    @property
-    def _ic_table(self):
-        return self._ic_panel._ic_table
-
-    # transitional — remove when all callers use TargetsWeightsTab API directly
-    @property
-    def _fit_targets_selection_applied(self):
-        return self._targets_weights_tab._fit_targets_selection_applied
-
-    # transitional — remove when all callers use TargetsWeightsTab API directly
-    @property
-    def _fit_target_weights_applied(self):
-        return self._targets_weights_tab._fit_target_weights_applied
-
-    # transitional — remove when all callers use TargetsWeightsTab API directly
-    @property
-    def _fit_targets_full_series_by_dataset(self):
-        return self._targets_weights_tab.full_series_by_dataset
-
-    # transitional — remove when all callers use TargetsWeightsTab API directly
-    @property
-    def _fit_targets_full_t_by_dataset(self):
-        return self._targets_weights_tab.full_t_by_dataset
-
-    # transitional — remove when all callers use TargetsWeightsTab API directly
-    @property
-    def _fit_targets_available_by_dataset(self):
-        return self._targets_weights_tab.available_by_dataset
-
-    # transitional — remove when tests are updated to use TargetsWeightsTab API directly
-    @property
-    def _fit_targets_selection_pending(self):
-        return self._targets_weights_tab._fit_targets_selection_pending
-
-    # transitional — remove when tests are updated to use TargetsWeightsTab API directly
-    @property
-    def _fit_target_weights_pending(self):
-        return self._targets_weights_tab._fit_target_weights_pending
-
-    # transitional — remove when tests are updated to use TargetsWeightsTab API directly
-    @property
-    def _fit_target_weights_pending_invalid(self):
-        return self._targets_weights_tab._fit_target_weights_pending_invalid
-
-    # transitional — forwarding for tests
-    def _invalid_pending_target_weight_dataset_ids(self) -> List[str]:
-        return self._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
 
     def _on_algebraic_observable_requested(self, selection: dict) -> None:
         """Handle algebraic observable add request from ParametersIcsTab."""
@@ -1239,10 +1031,10 @@ class FittingWindow(QtWidgets.QDialog):
         ds_id = str(dataset_id or "").strip()
         if not ds_id:
             return None
-        if not hasattr(self, "_dataset_table"):
+        if not hasattr(self, "_data_tab"):
             return None
-        for row in range(self._dataset_table.rowCount()):
-            item = self._dataset_table.item(row, 0)
+        for row in range(self._data_tab._dataset_table.rowCount()):
+            item = self._data_tab._dataset_table.item(row, 0)
             if item is None:
                 continue
             if str(item.data(Qt.UserRole) or "").strip() == ds_id:
@@ -1260,8 +1052,8 @@ class FittingWindow(QtWidgets.QDialog):
         else:
             brush = QtGui.QBrush()
 
-        for col in range(self._dataset_table.columnCount()):
-            item = self._dataset_table.item(row, col)
+        for col in range(self._data_tab._dataset_table.columnCount()):
+            item = self._data_tab._dataset_table.item(row, col)
             if item is None:
                 continue
             item.setBackground(brush)
@@ -1546,7 +1338,7 @@ class FittingWindow(QtWidgets.QDialog):
             return
         obs_name, obs_expr = normalized
 
-        mechanism_species = {str(x) for x in (self._mechanism_species or []) if str(x).strip()}
+        mechanism_species = {str(x) for x in (self._params_ics_tab.get_mechanism_species() or []) if str(x).strip()}
         if not self._validate_observable_name_rules(obs_name, mechanism_species=mechanism_species, symbol_table=SymbolTable()):
             return
 
@@ -1728,14 +1520,14 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _known_identifiers_for_observable(self, *, existing_observables: set[str]) -> set[str]:
         known: set[str] = set()
-        known |= {str(k) for k in (getattr(self, "_shared_param_definitions", {}) or {}).keys() if str(k).strip()}
-        known |= {str(k) for k in (self._fixed_shared_params or {}).keys() if str(k).strip()}
+        known |= {str(k) for k in (self._params_ics_tab.get_shared_param_definitions() or {}).keys() if str(k).strip()}
+        known |= {str(k) for k in (self._params_ics_tab.get_fixed_shared_params() or {}).keys() if str(k).strip()}
         known |= {
             str(entry.get("param_name") or "")
-            for entry in (self._parameter_state or [])
+            for entry in (self._params_ics_tab.get_parameter_state() or [])
             if str(entry.get("param_name") or "").strip()
         }
-        for _ds_id, specs in (self._global_dataset_variable_params or {}).items():
+        for _ds_id, specs in (self._params_ics_tab.get_global_dataset_variable_params() or {}).items():
             if not isinstance(specs, dict):
                 continue
             known |= {str(k) for k in specs.keys() if str(k).strip()}
@@ -1811,12 +1603,12 @@ class FittingWindow(QtWidgets.QDialog):
     def _collect_dataset_selection(self) -> Dict[str, Any]:
         rows = []
         included_ids: List[str] = []
-        for row in range(self._dataset_table.rowCount()):
-            item = self._dataset_table.item(row, 0)
+        for row in range(self._data_tab._dataset_table.rowCount()):
+            item = self._data_tab._dataset_table.item(row, 0)
             dataset_id = str(item.data(Qt.UserRole) or "")
             include = item.checkState() == Qt.Checked
-            label = self._dataset_table.item(row, 1).text()
-            species = self._dataset_table.item(row, 2).text()
+            label = self._data_tab._dataset_table.item(row, 1).text()
+            species = self._data_tab._dataset_table.item(row, 2).text()
             weight = self._dataset_weight_for_id(dataset_id)
             if row < len(self._dataset_entries):
                 self._dataset_entries[row]["weight"] = weight
@@ -1935,7 +1727,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._set_running_state(False)
             return
 
-        staged_params = self._staged_dataset_params if isinstance(getattr(self, "_staged_dataset_params", None), dict) else {}
+        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
         shared_param_keys = self._shared_param_keys_for_run(config)
         dataset_params_for_run = self._dataset_params_for_run(selected_ids, shared_param_keys, staged_params)
         variable_params = self._variable_params_for_run(selected_ids, shared_param_keys, staged_params)
@@ -2017,9 +1809,10 @@ class FittingWindow(QtWidgets.QDialog):
         shared_param_keys: set[str],
         staged_params: Dict[str, Dict[str, float]],
     ) -> dict[str, dict[str, float]]:
+        global_ds_params = self._params_ics_tab.get_global_dataset_params()
         dataset_params_for_run: dict[str, dict[str, float]] = {}
         for ds_id in selected_ids:
-            merged = dict(self._global_dataset_params.get(ds_id, {}))
+            merged = dict(global_ds_params.get(ds_id, {}))
             stage_map = staged_params.get(ds_id)
             if isinstance(stage_map, dict):
                 merged.update(stage_map)
@@ -2034,9 +1827,10 @@ class FittingWindow(QtWidgets.QDialog):
         shared_param_keys: set[str],
         staged_params: Dict[str, Dict[str, float]],
     ) -> dict[str, dict[str, dict[str, float]]]:
+        global_ds_var_params = self._params_ics_tab.get_global_dataset_variable_params()
         variable_params: dict[str, dict[str, dict[str, float]]] = {}
         for ds_id in selected_ids:
-            specs = self._global_dataset_variable_params.get(ds_id)
+            specs = global_ds_var_params.get(ds_id)
             if not isinstance(specs, dict) or not specs:
                 continue
             stage_map = staged_params.get(ds_id) if isinstance(staged_params.get(ds_id), dict) else {}
@@ -2119,18 +1913,18 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _refresh_parameter_definitions_for_mechanism(self, mechanism_text: str) -> list[str]:
         param_defs = self._params_ics_tab._scan_parameter_definitions_for_mechanism(mechanism_text)
-        self._shared_param_definitions = {str(d.get("name")): dict(d) for d in (param_defs or []) if d.get("name")}
+        self._params_ics_tab.set_shared_param_definitions({str(d.get("name")): dict(d) for d in (param_defs or []) if d.get("name")})
         param_names = [str(d.get("name")) for d in (param_defs or []) if d.get("name")]
-        self._prepared_param_names = list(param_names)
+        self._params_ics_tab.set_prepared_param_names(list(param_names))
         return list(param_names)
 
     def _param_names_for_fit_run(self, prepared_simulation: Optional[PreparedSimulationMetadata]) -> list[str]:
-        param_names = list(getattr(self, "_prepared_param_names", []) or [])
+        param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
         if prepared_simulation is not None and prepared_simulation.param_names:
             try:
                 param_names = [str(x) for x in prepared_simulation.param_names if str(x).strip()]
             except Exception:
-                param_names = list(getattr(self, "_prepared_param_names", []) or [])
+                param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
         return list(param_names)
 
     def _ensure_simulation_for_integration_settings(
@@ -2176,7 +1970,7 @@ class FittingWindow(QtWidgets.QDialog):
         try:
             if not callable(self._simulation_builder):
                 raise RuntimeError("Simulation builder unavailable.")
-            current_param_names = list(getattr(self, "_prepared_param_names", []) or [])
+            current_param_names = list(self._params_ics_tab.get_prepared_param_names() or [])
             if not current_param_names:
                 current_param_names = self._refresh_parameter_definitions_for_mechanism(mechanism_text)
             if not current_param_names:
@@ -2223,11 +2017,7 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_overrides: Sequence[FitDatasetParameterOverrides],
     ) -> tuple[dict[str, Any], str, str]:
         weight_mode = "equal" if weights is None else "custom"
-        applied_targets = (
-            dict(self._fit_targets_selection_applied or {})
-            if isinstance(getattr(self, "_fit_targets_selection_applied", None), dict)
-            else {}
-        )
+        applied_targets = dict(self._targets_weights_tab.fit_targets_selection_applied or {})
         applied_target_weights = {
             str(ds_id): self._targets_weights_tab.applied_target_weights_for_dataset(str(ds_id))
             for ds_id in applied_targets.keys()
@@ -2717,7 +2507,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _staged_initial_condition_parameters(self) -> Dict[str, Dict[str, float]]:
         staged: Dict[str, Dict[str, float]] = {}
-        for dataset_id, param_map in (self._staged_dataset_params or {}).items():
+        for dataset_id, param_map in (self._params_ics_tab.get_staged_dataset_params() or {}).items():
             if not isinstance(param_map, dict):
                 continue
             updates: Dict[str, float] = {}
@@ -2735,7 +2525,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _available_project_apply_scopes(self) -> set[str]:
         scopes: set[str] = set()
-        has_parameters = bool(self._last_fit_params)
+        has_parameters = bool(self._params_ics_tab.get_last_fit_params())
         has_initial_conditions = bool(self._staged_initial_condition_parameters())
         if has_parameters:
             scopes.add(_PROJECT_APPLY_SCOPE_PARAMETERS)
@@ -2821,10 +2611,10 @@ class FittingWindow(QtWidgets.QDialog):
         scope = self._selected_project_apply_scope()
         if not scope or scope not in self._available_project_apply_scopes():
             return
-        shared_params = {str(name): float(value) for name, value in (self._last_fit_params or {}).items()}
+        shared_params = {str(name): float(value) for name, value in (self._params_ics_tab.get_last_fit_params() or {}).items()}
         dataset_params = {
             str(dataset_id): dict(param_map)
-            for dataset_id, param_map in (self._staged_dataset_params or {}).items()
+            for dataset_id, param_map in (self._params_ics_tab.get_staged_dataset_params() or {}).items()
             if isinstance(param_map, dict)
         }
         apply_warning_text = ""

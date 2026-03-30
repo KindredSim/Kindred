@@ -127,8 +127,8 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
 
         _toggle_fit_targets_pending(panel)
         qt_app.processEvents()
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
-        assert window._fit_targets_selection_pending["ds1"] == {"B"}
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == ["A"]
+        assert window._targets_weights_tab._fit_targets_selection_pending["ds1"] == {"B"}
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None

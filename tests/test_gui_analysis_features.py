@@ -162,12 +162,12 @@ def test_fitting_window_smoke(qapp):
         dataset_entries=dataset_entries,
         apply_callback=lambda params: None,
     )
-    assert window._param_table.rowCount() == 1
-    assert window._dataset_table.rowCount() == 1
-    assert window._param_table.item(0, 2).text() == "k1"
-    assert pytest.approx(float(window._param_table.item(0, 3).text()), rel=1e-9) == 0.2
-    assert pytest.approx(float(window._param_table.item(0, 4).text()), rel=1e-9) == 0.01
-    assert pytest.approx(float(window._param_table.item(0, 5).text()), rel=1e-9) == 1.0
+    assert window._params_ics_tab._param_table.rowCount() == 1
+    assert window._data_tab._dataset_table.rowCount() == 1
+    assert window._params_ics_tab._param_table.item(0, 2).text() == "k1"
+    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 3).text()), rel=1e-9) == 0.2
+    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 4).text()), rel=1e-9) == 0.01
+    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 5).text()), rel=1e-9) == 1.0
     window.close()
 
 
@@ -455,8 +455,8 @@ def test_fitting_window_applies_dataset_initial_updates(qapp):
     )
 
     window._handle_global_fit_complete({"result": result})
-    assert window._staged_dataset_params["ds1"]["init:A"] == pytest.approx(0.6)
-    assert window._staged_dataset_params["ds2"]["init:A"] == pytest.approx(1.6)
+    assert window._params_ics_tab.get_staged_dataset_params()["ds1"]["init:A"] == pytest.approx(0.6)
+    assert window._params_ics_tab.get_staged_dataset_params()["ds2"]["init:A"] == pytest.approx(1.6)
     assert applied == []
     window.close()
 
@@ -493,14 +493,14 @@ def test_global_fit_parameter_toggles_persist_across_best_updates_and_affect_con
     )
     try:
         # Toggle: k1 uses log10; k2 excluded from fitting.
-        window._param_table.item(0, 1).setCheckState(QtCore.Qt.Checked)   # Log10
-        window._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)  # Fit
+        window._params_ics_tab._param_table.item(0, 1).setCheckState(QtCore.Qt.Checked)   # Log10
+        window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)  # Fit
 
         # Simulate a best update which repopulates the parameter table.
         window._handle_global_best_update({"cost": 1.0, "shared_params": {"k1": 0.25, "k2": 0.35}})
 
-        assert window._param_table.item(0, 1).checkState() == QtCore.Qt.Checked
-        assert window._param_table.item(1, 0).checkState() == QtCore.Qt.Unchecked
+        assert window._params_ics_tab._param_table.item(0, 1).checkState() == QtCore.Qt.Checked
+        assert window._params_ics_tab._param_table.item(1, 0).checkState() == QtCore.Qt.Unchecked
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
@@ -574,8 +574,8 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
     )
     try:
         # Exclude k2 from fitting but set its fixed value.
-        window._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
-        window._param_table.item(1, 3).setText("9.87")
+        window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
+        window._params_ics_tab._param_table.item(1, 3).setText("9.87")
 
         config = window._params_ics_tab._collect_parameter_config()
         dataset_selection = window._collect_dataset_selection()

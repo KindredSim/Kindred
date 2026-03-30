@@ -76,7 +76,7 @@ def _set_fit_targets_pending(panel, *, dataset_id: str, enabled_species: set[str
 
 
 def _parameter_table_names(window) -> list[str]:
-    table = getattr(window, "_param_table", None)
+    table = getattr(window._params_ics_tab, "_param_table", None)
     assert table is not None
     names: list[str] = []
     for row in range(table.rowCount()):
@@ -89,7 +89,7 @@ def _parameter_table_names(window) -> list[str]:
 def _parameter_table_rows(window) -> list[dict[str, object]]:
     from PySide6 import QtCore
 
-    table = getattr(window, "_param_table", None)
+    table = getattr(window._params_ics_tab, "_param_table", None)
     assert table is not None
     rows: list[dict[str, object]] = []
     for row in range(table.rowCount()):
@@ -238,11 +238,11 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        assert window._dataset_table.rowCount() == 2
+        assert window._data_tab._dataset_table.rowCount() == 2
 
         # Default: no fit targets applied for any included dataset.
-        assert window._fit_targets_selection_applied.get("ds1") == []
-        assert window._fit_targets_selection_applied.get("ds2") == []
+        assert window._targets_weights_tab.fit_targets_selection_applied.get("ds1") == []
+        assert window._targets_weights_tab.fit_targets_selection_applied.get("ds2") == []
 
         # Default: all datasets included (Use checked), but Run Fit is blocked until Apply.
         assert window._run_button.isEnabled() is False
@@ -290,7 +290,7 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        assert window._dataset_table.rowCount() == 2
+        assert window._data_tab._dataset_table.rowCount() == 2
         panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
         assert panel is not None
         apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
@@ -305,18 +305,18 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
         assert selector.selected_dataset_species() == {"ds1": {"A"}, "ds2": {"B"}}
 
         window._remove_datasets_from_session(["ds2"])
-        assert window._dataset_table.rowCount() == 1
+        assert window._data_tab._dataset_table.rowCount() == 1
         assert [entry["id"] for entry in window._dataset_entries] == ["ds1"]
         assert selector.selected_dataset_species() == {"ds1": {"A"}}
 
         window._add_datasets_to_session(["ds2"])
-        assert window._dataset_table.rowCount() == 2
+        assert window._data_tab._dataset_table.rowCount() == 2
         ids = [entry["id"] for entry in window._dataset_entries]
         assert set(ids) == {"ds1", "ds2"}
         ds2_entry = next(entry for entry in window._dataset_entries if entry["id"] == "ds2")
         assert ds2_entry.get("include") is True
         assert float(ds2_entry.get("weight")) == pytest.approx(1.0)
-        assert window._fit_targets_selection_applied.get("ds2") == []
+        assert window._targets_weights_tab.fit_targets_selection_applied.get("ds2") == []
         assert selector.selected_dataset_species() == {"ds1": {"A"}}
     finally:
         window.close()
@@ -381,8 +381,8 @@ def test_global_fit_initial_conditions_editor_apply_persists_to_dataset_manager(
         assert settings.bounds.get("A") == pytest.approx((0.1, 10.0))
 
         # Ensure the fitting window rebuild path now reflects the updated IC settings.
-        assert "init:A" in (window._global_dataset_variable_params.get("ds1") or {})
-        spec = window._global_dataset_variable_params["ds1"]["init:A"]
+        assert "init:A" in (window._params_ics_tab.get_global_dataset_variable_params().get("ds1") or {})
+        spec = window._params_ics_tab.get_global_dataset_variable_params()["ds1"]["init:A"]
         assert float(spec.get("initial")) == pytest.approx(2.5)
     finally:
         window.close()
@@ -1734,7 +1734,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _parameter_table_names(window) == ["k2"]
-        assert [str(entry.get("param_name") or "") for entry in window._parameter_state] == ["k2"]
+        assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k2"]
     finally:
         window.close()
 
@@ -1821,7 +1821,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
         window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _ic_table_species(window) == ["A", "C"]
-        assert window._mechanism_species == ["A", "C"]
+        assert window._params_ics_tab.get_mechanism_species() == ["A", "C"]
     finally:
         window.close()
 
@@ -1973,7 +1973,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         window._params_ics_tab._populate_parameter_table()
         qt_app.processEvents()
 
-        table = getattr(window, "_param_table", None)
+        table = getattr(window._params_ics_tab, "_param_table", None)
         assert table is not None
         row_index = next(
             idx for idx, row in enumerate(_parameter_table_rows(window)) if row["name"] == "A_0 (ds1)"

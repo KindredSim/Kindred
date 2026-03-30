@@ -34,7 +34,7 @@ def test_remove_global_initial_parameter_allows_readd(qt_app, monkeypatch):
         window._params_ics_tab._add_global_initial_parameter("A", ["ds1"])
         rows = [
             idx
-            for idx, entry in enumerate(window._parameter_state)
+            for idx, entry in enumerate(window._params_ics_tab.get_parameter_state())
             if entry.get("scope") == "shared" and entry.get("param_name") == "init:A"
         ]
         assert len(rows) == 1
@@ -52,7 +52,7 @@ def test_remove_global_initial_parameter_allows_readd(qt_app, monkeypatch):
         assert not calls, "Re-adding a removed global initial parameter should not claim it already exists."
         rows2 = [
             idx
-            for idx, entry in enumerate(window._parameter_state)
+            for idx, entry in enumerate(window._params_ics_tab.get_parameter_state())
             if entry.get("scope") == "shared" and entry.get("param_name") == "init:A"
         ]
         assert len(rows2) == 1

@@ -77,37 +77,37 @@ def test_fit_targets_bulk_buttons_update_pending_only_and_require_apply(qt_app):
 
         _set_fit_targets_dataset(panel, dataset_id="ds1")
 
-        available = set(window._fit_targets_available_by_dataset["ds1"])
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
-        assert set(window._fit_targets_selection_pending["ds1"]) == {"A"}
+        available = set(window._targets_weights_tab.available_by_dataset["ds1"])
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == ["A"]
+        assert set(window._targets_weights_tab._fit_targets_selection_pending["ds1"]) == {"A"}
         assert window._global_payload_lookup["ds1"]["species"] == ["A"]
 
         bulk_none.click()
         qt_app.processEvents()
-        assert set(window._fit_targets_selection_pending["ds1"]) == set()
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
+        assert set(window._targets_weights_tab._fit_targets_selection_pending["ds1"]) == set()
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == ["A"]
         assert window._global_payload_lookup["ds1"]["species"] == ["A"]
         assert apply_btn.isEnabled()
 
         bulk_invert.click()
         qt_app.processEvents()
-        assert set(window._fit_targets_selection_pending["ds1"]) == available
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
+        assert set(window._targets_weights_tab._fit_targets_selection_pending["ds1"]) == available
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == ["A"]
         assert window._global_payload_lookup["ds1"]["species"] == ["A"]
 
         bulk_invert.click()
         qt_app.processEvents()
-        assert set(window._fit_targets_selection_pending["ds1"]) == set()
+        assert set(window._targets_weights_tab._fit_targets_selection_pending["ds1"]) == set()
 
         bulk_all.click()
         qt_app.processEvents()
-        assert set(window._fit_targets_selection_pending["ds1"]) == available
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
+        assert set(window._targets_weights_tab._fit_targets_selection_pending["ds1"]) == available
+        assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == ["A"]
         assert window._global_payload_lookup["ds1"]["species"] == ["A"]
 
         apply_btn.click()
         qt_app.processEvents()
-        assert set(window._fit_targets_selection_applied["ds1"]) == available
+        assert set(window._targets_weights_tab.fit_targets_selection_applied["ds1"]) == available
         assert set(window._global_payload_lookup["ds1"]["species"]) == available
     finally:
         window.close()
