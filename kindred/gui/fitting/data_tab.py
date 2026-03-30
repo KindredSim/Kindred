@@ -73,8 +73,8 @@ class DataTab(QtWidgets.QWidget):
         layout.setSpacing(10)
 
         # --- Dataset table group ---
-        dataset_group = QtWidgets.QGroupBox("Datasets")
-        dataset_layout = QtWidgets.QVBoxLayout(dataset_group)
+        self._dataset_group = QtWidgets.QGroupBox("Datasets")
+        dataset_layout = QtWidgets.QVBoxLayout(self._dataset_group)
         self._dataset_table = QtWidgets.QTableWidget()
         self._dataset_table.setColumnCount(3)
         self._dataset_table.setHorizontalHeaderLabels(["Use", "Dataset", "Species"])
@@ -99,12 +99,31 @@ class DataTab(QtWidgets.QWidget):
         dataset_buttons.addStretch(1)
         dataset_layout.addLayout(dataset_buttons)
 
-        layout.addWidget(dataset_group, stretch=3)
+        layout.addWidget(self._dataset_group, stretch=3)
         layout.addWidget(self._create_sampling_panel(), stretch=2)
 
     # ------------------------------------------------------------------
     # Public API (FittingWindow -> DataTab)
     # ------------------------------------------------------------------
+
+    def select_dataset(self, dataset_id: str) -> None:
+        """Load sampling controls for the given dataset (public entry point)."""
+        ds_id = str(dataset_id or "").strip()
+        if not ds_id:
+            self._load_sampling_controls_for_dataset("")
+            return
+        row = None
+        for r in range(self._dataset_table.rowCount()):
+            item = self._dataset_table.item(r, 0)
+            if item is not None and str(item.data(Qt.UserRole) or "").strip() == ds_id:
+                row = r
+                break
+        if row is None:
+            return
+        self._dataset_table.blockSignals(True)
+        self._dataset_table.selectRow(row)
+        self._dataset_table.blockSignals(False)
+        self._load_sampling_controls_for_dataset(ds_id)
 
     def populate_table(self, entries: List[Dict[str, Any]]) -> None:
         """Fill the dataset table from the given entry list."""

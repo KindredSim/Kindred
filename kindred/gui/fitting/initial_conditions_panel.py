@@ -116,15 +116,20 @@ class InitialConditionsPanel(QtWidgets.QGroupBox):
     def load_for_dataset(self, dataset_id: str) -> None:
         ds_id = str(dataset_id or "").strip()
         combo = self._ic_dataset_combo
+        found = False
         combo.blockSignals(True)
         try:
             for i in range(combo.count()):
                 if str(combo.itemData(i) or "").strip() == ds_id:
                     combo.setCurrentIndex(i)
+                    found = True
                     break
         finally:
             combo.blockSignals(False)
+        if not found:
+            return
         self._ic_editor_current_dataset_id = ds_id or None
+        self._set_ic_editor_dirty_state(False)
         self._populate_initial_conditions_table(ds_id)
 
     def set_running_state(self, running: bool) -> None:

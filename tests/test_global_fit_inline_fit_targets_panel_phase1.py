@@ -4,7 +4,15 @@ import pytest
 
 pytestmark = [pytest.mark.gui]
 
-_DATASET_INVALID_MARK_ROLE = 0x10FF  # Qt.UserRole + offset, internal-only for tests
+def _unified_list_item_for(window, dataset_id: str):
+    """Return the QListWidgetItem in the unified list matching *dataset_id*."""
+    from PySide6 import QtCore
+    ulist = window._data_targets_tab.unified_list._list
+    for i in range(ulist.count()):
+        item = ulist.item(i)
+        if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
+            return item
+    raise AssertionError(f"Unified list item not found: {dataset_id!r}")
 
 
 def _make_window(
@@ -115,16 +123,15 @@ def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
     raise AssertionError(f"Dataset id not in list: {dataset_id!r}")
 
 
-def _dataset_table_row_for(window, dataset_id: str) -> int:
+def _set_unified_list_include(window, dataset_id: str, checked: bool) -> None:
     from PySide6 import QtCore
-    table = window._data_tab._dataset_table
-    for row in range(table.rowCount()):
-        item = table.item(row, 0)
-        if item is None:
-            continue
-        if str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
-            return row
-    raise AssertionError(f"Dataset row not found: {dataset_id!r}")
+    ulist = window._data_targets_tab.unified_list._list
+    for row in range(ulist.count()):
+        item = ulist.item(row)
+        if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
+            item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            return
+    raise AssertionError(f"Unified list item not found: {dataset_id!r}")
 
 
 def _target_weight_edit(panel, *, target_name: str):
@@ -330,20 +337,17 @@ def test_fit_targets_apply_keeps_invalid_used_dataset_pending_and_highlights_row
         assert "ds1" in error_label.text()
         assert "no fit targets" in error_label.text().lower()
 
-        row = _dataset_table_row_for(window, "ds1")
-        mark_item = window._data_tab._dataset_table.item(row, 1)
-        assert mark_item is not None
-        bg = mark_item.background()
+        unified_item = _unified_list_item_for(window, "ds1")
+        bg = unified_item.background()
         assert bg is not None and bg.color().isValid()
         assert bg.color() != QtGui.QColor(), "Expected a non-default highlight brush for invalid dataset row."
-        assert bool(mark_item.data(_DATASET_INVALID_MARK_ROLE)), "Expected invalid-row mark role set for tests."
     finally:
         window.close()
         qt_app.processEvents()
 
 
 def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, monkeypatch):
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtWidgets
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
 
     window = _make_two_dataset_window(ds1_selected=["A"], ds2_selected=["C"])
@@ -359,10 +363,7 @@ def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, mon
             cb.setChecked(False)
         qt_app.processEvents()
 
-        row = _dataset_table_row_for(window, "ds1")
-        use_item = window._data_tab._dataset_table.item(row, 0)
-        assert use_item is not None
-        use_item.setCheckState(QtCore.Qt.Unchecked)
+        _set_unified_list_include(window, "ds1", False)
         qt_app.processEvents()
 
         apply_btn.click()
@@ -370,10 +371,7 @@ def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, mon
         assert window._targets_weights_tab.fit_targets_selection_applied["ds1"] == []
 
         # Re-enable Use; Run Fit must disable immediately due to invalid applied targets.
-        row = _dataset_table_row_for(window, "ds1")
-        use_item = window._data_tab._dataset_table.item(row, 0)
-        assert use_item is not None
-        use_item.setCheckState(QtCore.Qt.Checked)
+        _set_unified_list_include(window, "ds1", True)
         qt_app.processEvents()
 
         assert not window._run_button.isEnabled()
@@ -399,7 +397,7 @@ def test_run_fit_disabled_when_used_dataset_has_zero_applied_targets(qt_app, mon
 
 
 def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_reincluded(qt_app, monkeypatch):
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtGui, QtWidgets
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
 
@@ -420,18 +418,14 @@ def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_
         assert "ds1" in window._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
         assert "invalid target weights" in error_label.text().lower()
 
-        row = _dataset_table_row_for(window, "ds1")
-        use_item = window._data_tab._dataset_table.item(row, 0)
-        mark_item = window._data_tab._dataset_table.item(row, 1)
-        assert use_item is not None
-        assert mark_item is not None
+        unified_item = _unified_list_item_for(window, "ds1")
 
-        use_item.setCheckState(QtCore.Qt.Unchecked)
+        _set_unified_list_include(window, "ds1", False)
         qt_app.processEvents()
 
         assert "ds1" not in window._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
         assert "invalid target weights" not in error_label.text().lower()
-        assert not bool(mark_item.data(_DATASET_INVALID_MARK_ROLE))
+        assert unified_item.background() == QtGui.QBrush()
         assert window._run_button.isEnabled()
 
         apply_btn.click()
@@ -441,17 +435,13 @@ def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_
         assert window._targets_weights_tab._fit_target_weights_pending_invalid["ds1"] == {"A": "0"}
         assert _target_weight_edit(panel, target_name="A").text() == "0"
 
-        row = _dataset_table_row_for(window, "ds1")
-        use_item = window._data_tab._dataset_table.item(row, 0)
-        mark_item = window._data_tab._dataset_table.item(row, 1)
-        assert use_item is not None
-        assert mark_item is not None
-        use_item.setCheckState(QtCore.Qt.Checked)
+        _set_unified_list_include(window, "ds1", True)
         qt_app.processEvents()
 
         assert "ds1" in window._targets_weights_tab.invalid_pending_target_weight_dataset_ids()
         assert "invalid target weights" in error_label.text().lower()
-        assert bool(mark_item.data(_DATASET_INVALID_MARK_ROLE))
+        unified_item = _unified_list_item_for(window, "ds1")
+        assert unified_item.background().color() != QtGui.QColor()
         assert window._run_button.isEnabled()
     finally:
         window.close()

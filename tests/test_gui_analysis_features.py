@@ -320,7 +320,6 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
     assert window._tabs is top_tabs
     dt_idx = [top_tabs.tabText(i) for i in range(top_tabs.count())].index("Data and Targets")
     window._tabs.setCurrentIndex(dt_idx)
-    window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
     qapp.processEvents()
 
     dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")

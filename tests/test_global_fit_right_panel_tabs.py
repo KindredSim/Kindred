@@ -133,7 +133,7 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
             "Species",
         ]
 
-        # Data and Targets tab contains Data, Targets, and IC as subtabs
+        # Data and Targets tab contains Data, Targets, and IC panels
         assert data_targets_widget.isAncestorOf(window._data_tab._dataset_table)
         assert data_targets_widget.isAncestorOf(sampling_panel)
         assert data_targets_widget.isAncestorOf(targets_list)
@@ -165,16 +165,12 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         window.close()
 
 
-def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(qt_app):
+def test_unified_list_drives_targets_dataset_selection(qt_app):
     window = _make_two_dataset_window()
     try:
-        table = window._data_tab._dataset_table
-        table.selectRow(1)
-        qt_app.processEvents()
-
-        dt_idx = _tab_index(window._tabs, "Data and Targets")
-        window._tabs.setCurrentIndex(dt_idx)
-        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
+        # Unified list drives all panels — select ds2 in the unified list.
+        unified_list = window._data_targets_tab.unified_list
+        unified_list.select_dataset("ds2")
         qt_app.processEvents()
 
         dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
@@ -183,22 +179,19 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
         assert current is not None
         assert str(current.data(QtCore.Qt.UserRole) or "") == "ds2"
 
-        dataset_list.setCurrentRow(0)
+        # Select ds1 via unified list.
+        unified_list.select_dataset("ds1")
         qt_app.processEvents()
         current = dataset_list.currentItem()
         assert current is not None
         assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
 
-        window._data_targets_tab.subtabs.setCurrentIndex(0)  # Data subtab
-        qt_app.processEvents()
-        table.selectRow(1)
-        qt_app.processEvents()
-
-        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
+        # Switch back to ds2 via unified list — targets follows.
+        unified_list.select_dataset("ds2")
         qt_app.processEvents()
         current = dataset_list.currentItem()
         assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
+        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds2"
     finally:
         window.close()
 
@@ -206,9 +199,7 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
 def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
     window = _make_two_dataset_window()
     try:
-        dt_idx = _tab_index(window._tabs, "Data and Targets")
-        window._tabs.setCurrentIndex(dt_idx)
-        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
+        # Targets panel is always visible in unified layout — no subtab switch needed.
         qt_app.processEvents()
 
         dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
@@ -302,11 +293,12 @@ def test_subset_widget_visible_only_on_results_tab(qt_app):
         window.close()
 
 
-def test_three_tab_structure_with_data_targets_subtabs(qt_app):
-    """Regression: 3 top-level tabs, DataTargetsTab hosts subtabs, subset visibility correct."""
+def test_unified_layout_structure_and_subset_visibility(qt_app):
+    """Regression: 3 top-level tabs, DataTargetsTab has unified master/detail layout, subset visibility correct."""
     from kindred.gui.fitting.data_tab import DataTab
     from kindred.gui.fitting.data_targets_tab import DataTargetsTab
     from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
+    from kindred.gui.fitting.unified_dataset_list import UnifiedDatasetList
 
     window = _make_window()
     try:
@@ -324,16 +316,23 @@ def test_three_tab_structure_with_data_targets_subtabs(qt_app):
         dt_tab = window._data_targets_tab
         assert isinstance(dt_tab, DataTargetsTab)
 
-        # DataTargetsTab contains the expected child widgets
+        # DataTargetsTab contains a QSplitter, NOT a QTabWidget for subtabs.
+        assert dt_tab.findChild(QtWidgets.QTabWidget) is None
+        assert dt_tab.findChild(QtWidgets.QSplitter) is not None
+
+        # UnifiedDatasetList is present
+        assert isinstance(dt_tab.unified_list, UnifiedDatasetList)
+        assert dt_tab.isAncestorOf(dt_tab.unified_list)
+
+        # All three panels are children of the DataTargetsTab
         assert isinstance(dt_tab.data_tab, DataTab)
         assert dt_tab.isAncestorOf(dt_tab.data_tab)
         assert dt_tab.isAncestorOf(dt_tab.targets_weights_tab)
         assert dt_tab.isAncestorOf(dt_tab.ic_panel)
         assert isinstance(dt_tab.ic_panel, InitialConditionsPanel)
 
-        # Subtabs have correct names
-        subtab_titles = [dt_tab.subtabs.tabText(i) for i in range(dt_tab.subtabs.count())]
-        assert subtab_titles == ["Data", "Targets & Weights", "Initial Conditions"]
+        # Unified list is populated with 1 dataset
+        assert dt_tab.unified_list.selected_dataset_id() == "ds1"
 
         # Subset widget hidden on Data and Targets
         assert not window._subset_widget.isVisible()
@@ -353,10 +352,7 @@ def test_three_tab_structure_with_data_targets_subtabs(qt_app):
         qt_app.processEvents()
         assert not window._subset_widget.isVisible()
 
-        # Targets subtab activation fires on_tab_activated
-        dt_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
-        qt_app.processEvents()
-        # Verify the targets dataset list is populated (proves on_tab_activated ran)
+        # Targets dataset list is populated (proves on_tab_activated ran during construction)
         dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
         assert dataset_list is not None
         assert dataset_list.count() >= 1

@@ -258,7 +258,6 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
 
         dt_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Data and Targets")
         window._tabs.setCurrentIndex(dt_idx)
-        window._data_targets_tab.subtabs.setCurrentIndex(1)  # Targets & Weights subtab
         QtWidgets.QApplication.processEvents()
         blocked = window.findChild(QtWidgets.QLabel, "global_fit_fit_targets_run_blocked")
         assert blocked is not None

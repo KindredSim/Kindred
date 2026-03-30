@@ -151,22 +151,22 @@ class TargetsWeightsTab(QtWidgets.QWidget):
         layout.addWidget(splitter, stretch=1)
 
         # -- Left column: dataset list --
-        list_column = QtWidgets.QWidget(splitter)
-        list_layout = QtWidgets.QVBoxLayout(list_column)
+        self._list_column = QtWidgets.QWidget(splitter)
+        list_layout = QtWidgets.QVBoxLayout(self._list_column)
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(6)
         list_label = QtWidgets.QLabel("Datasets")
         list_label.setStyleSheet("font-weight: bold;")
         list_layout.addWidget(list_label)
 
-        self._fit_targets_dataset_list = QtWidgets.QListWidget(list_column)
+        self._fit_targets_dataset_list = QtWidgets.QListWidget(self._list_column)
         self._fit_targets_dataset_list.setObjectName("global_fit_fit_targets_dataset_list")
         self._fit_targets_dataset_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self._fit_targets_dataset_list.currentItemChanged.connect(self._on_fit_targets_dataset_list_selection_changed)
         list_layout.addWidget(self._fit_targets_dataset_list, stretch=1)
 
         # -- Right column: fit targets panel --
-        group = QtWidgets.QGroupBox("Targets & Weights")
+        group = QtWidgets.QGroupBox("Targets and Weights")
         group.setObjectName("global_fit_fit_targets_panel")
         group_layout = QtWidgets.QVBoxLayout(group)
 
@@ -243,7 +243,7 @@ class TargetsWeightsTab(QtWidgets.QWidget):
         self._dataset_weight_edit.editingFinished.connect(self._commit_selected_dataset_weight_edit)
 
         # -- Assemble splitter --
-        splitter.addWidget(list_column)
+        splitter.addWidget(self._list_column)
         splitter.addWidget(group)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)

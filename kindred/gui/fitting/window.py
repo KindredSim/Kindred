@@ -63,7 +63,6 @@ from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_S
 
 logger = logging.getLogger(__name__)
 
-_FIT_TARGETS_INVALID_MARK_ROLE = int(Qt.UserRole) + 4095
 _PROJECT_APPLY_SCOPE_PARAMETERS = "parameters"
 _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS = "initial_conditions"
 _PROJECT_APPLY_SCOPE_BOTH = "both"
@@ -353,9 +352,14 @@ class FittingWindow(QtWidgets.QDialog):
         # internally by ParametersIcsTab during construction
         self._init_sampling_state()
         self._populate_dataset_table()
+        self._targets_weights_tab.on_tab_activated(
+            seed_dataset_id=self._selected_data_table_dataset_id()
+        )
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
-        self._data_tab.load_sampling_for_selected_row()
+        ds_id = self._data_targets_tab.unified_list.selected_dataset_id()
+        if ds_id:
+            self._data_tab.select_dataset(ds_id)
         self._refresh_plot_baselines()
 
 
@@ -702,7 +706,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._targets_weights_tab = TargetsWeightsTab(
             dataset_entries=list(self._dataset_entries),
             dataset_entries_getter=lambda: list(_w()._dataset_entries) if _w() is not None else [],
-            included_dataset_ids_getter=lambda: _w()._included_dataset_ids_from_table() if _w() is not None else [],
+            included_dataset_ids_getter=lambda: _w()._included_dataset_ids() if _w() is not None else [],
             dataset_label_getter=lambda ds_id: _w()._dataset_label_for_id(ds_id) if _w() is not None else str(ds_id),
             dataset_weight_getter=lambda ds_id: _w()._dataset_weight_for_id(ds_id) if _w() is not None else 1.0,
             persist_dataset_weight_callback=lambda ds_id, w: _w()._persist_dataset_weight(ds_id, w) if _w() is not None else None,
@@ -798,8 +802,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._tabs.currentChanged.connect(self._current_tab_stack.setCurrentIndex)
         self._tabs.currentChanged.connect(self._on_right_tabs_current_changed)
         self._current_tab_stack.setCurrentIndex(self._tabs.currentIndex())
-        self._data_targets_tab.subtabChanged.connect(self._on_data_targets_subtab_changed)
-
         layout.addWidget(self._create_footer(), stretch=0)
         self._ic_panel.icApplied.connect(self._params_ics_tab._on_ic_applied)
         self._ic_panel.statusMessage.connect(self._status_label.setText)
@@ -809,9 +811,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._targets_weights_tab.targetsApplied.connect(self._on_targets_applied)
         self._targets_weights_tab.validityChanged.connect(self._on_targets_validity_changed)
         self._targets_weights_tab.statusMessage.connect(self._on_targets_status_message)
-        self._data_tab.datasetIncludeChanged.connect(self._on_data_tab_include_changed)
-        self._data_tab.addDatasetsRequested.connect(self._open_add_datasets_dialog)
-        self._data_tab.removeDatasetsRequested.connect(self._remove_datasets_from_session)
+        self._data_targets_tab.unified_list.datasetIncludeChanged.connect(self._on_data_tab_include_changed)
+        self._data_targets_tab.unified_list.addRequested.connect(self._open_add_datasets_dialog)
+        self._data_targets_tab.unified_list.removeRequested.connect(self._remove_datasets_from_session)
         self._data_tab.samplingApplied.connect(self._on_data_tab_sampling_applied)
         self._refresh_project_apply_controls()
 
@@ -915,7 +917,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _selected_data_table_dataset_id(self) -> Optional[str]:
-        return self._data_tab.selected_dataset_id()
+        return self._data_targets_tab.unified_list.selected_dataset_id()
 
     def _on_right_tabs_current_changed(self, index: int) -> None:
         # Show/hide left plot panel based on active tab
@@ -927,14 +929,8 @@ class FittingWindow(QtWidgets.QDialog):
                 self._splitter_sizes_backup = self._main_splitter.sizes()
             self._subset_widget.hide()
 
-        # If switching to Data & Targets while Targets subtab is active, fire activation
-        if int(index) == 0 and self._data_targets_tab.subtabs.currentIndex() == 1:
-            self._targets_weights_tab.on_tab_activated(
-                seed_dataset_id=self._selected_data_table_dataset_id()
-            )
-
-    def _on_data_targets_subtab_changed(self, subtab_index: int) -> None:
-        if subtab_index == 1:  # "Targets & Weights" subtab
+        # Targets panel is always visible in unified layout; activate on tab switch.
+        if int(index) == 0:
             self._targets_weights_tab.on_tab_activated(
                 seed_dataset_id=self._selected_data_table_dataset_id()
             )
@@ -990,7 +986,7 @@ class FittingWindow(QtWidgets.QDialog):
                 pass
 
     def _invalid_sampling_applied_used_dataset_ids(self) -> List[str]:
-        used = set(self._included_dataset_ids_from_table())
+        used = set(self._included_dataset_ids())
         invalid: List[str] = []
         for ds_id in sorted(used):
             cfg = self._sampling_applied_config_for_dataset(ds_id)
@@ -1014,50 +1010,19 @@ class FittingWindow(QtWidgets.QDialog):
             self._data_tab.set_sampling_secondary_error(None)
         self._refresh_run_button_enabled_state()
 
-    def _included_dataset_ids_from_table(self) -> List[str]:
-        if not hasattr(self, "_data_tab"):
-            return [str(e.get("id") or "").strip() for e in (self._dataset_entries or []) if e.get("include", True) and str(e.get("id") or "").strip()]
-        return self._data_tab.included_dataset_ids()
+    def _included_dataset_ids(self) -> List[str]:
+        return [
+            str(e.get("id") or "").strip()
+            for e in (self._dataset_entries or [])
+            if e.get("include", True) and str(e.get("id") or "").strip()
+        ]
 
     def _dataset_label_for_id(self, dataset_id: str) -> str:
-        if not hasattr(self, "_data_tab"):
-            for entry in self._dataset_entries or []:
-                if str(entry.get("id") or "").strip() == str(dataset_id or "").strip():
-                    return str(entry.get("label") or dataset_id)
-            return str(dataset_id)
-        return self._data_tab.dataset_label_for_id(dataset_id)
-
-    def _row_for_dataset_id(self, dataset_id: str) -> Optional[int]:
         ds_id = str(dataset_id or "").strip()
-        if not ds_id:
-            return None
-        if not hasattr(self, "_data_tab"):
-            return None
-        for row in range(self._data_tab._dataset_table.rowCount()):
-            item = self._data_tab._dataset_table.item(row, 0)
-            if item is None:
-                continue
-            if str(item.data(Qt.UserRole) or "").strip() == ds_id:
-                return int(row)
-        return None
-
-    def _set_dataset_row_validation_state(self, dataset_id: str, state: str) -> None:
-        row = self._row_for_dataset_id(dataset_id)
-        if row is None:
-            return
-        if state == "invalid_applied":
-            brush = QtGui.QBrush(QtGui.QColor(255, 225, 225))
-        elif state == "invalid_pending":
-            brush = QtGui.QBrush(QtGui.QColor(255, 245, 210))
-        else:
-            brush = QtGui.QBrush()
-
-        for col in range(self._data_tab._dataset_table.columnCount()):
-            item = self._data_tab._dataset_table.item(row, col)
-            if item is None:
-                continue
-            item.setBackground(brush)
-            item.setData(_FIT_TARGETS_INVALID_MARK_ROLE, bool(state))
+        for entry in self._dataset_entries or []:
+            if str(entry.get("id") or "").strip() == ds_id:
+                return str(entry.get("label") or dataset_id)
+        return str(dataset_id)
 
     def _invalid_applied_used_dataset_ids_for_run(self) -> List[str]:
         invalid = set(self._targets_weights_tab.invalid_applied_used_dataset_ids())
@@ -1087,11 +1052,12 @@ class FittingWindow(QtWidgets.QDialog):
             if not ds_id:
                 continue
             if ds_id in invalid_applied:
-                self._set_dataset_row_validation_state(ds_id, "invalid_applied")
+                state = "invalid_applied"
             elif ds_id in invalid_pending or ds_id in invalid_pending_weights:
-                self._set_dataset_row_validation_state(ds_id, "invalid_pending")
+                state = "invalid_pending"
             else:
-                self._set_dataset_row_validation_state(ds_id, "")
+                state = ""
+            self._data_targets_tab.unified_list.set_validation_state(ds_id, state)
 
         # Run Fit disabling while invalid applied.
         if invalid_applied:
@@ -1124,6 +1090,7 @@ class FittingWindow(QtWidgets.QDialog):
         except Exception:
             self._subset_view_stale = True
             logger.warning("Subset widget update failed after targets applied", exc_info=True)
+        self._refresh_sampling_validity_ui()
 
     def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
         if 0 <= row < len(self._dataset_entries):
@@ -1285,12 +1252,12 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _sync_after_session_dataset_change(self) -> None:
         self._populate_dataset_table()
-        self._data_tab.refresh_remove_button_state()
+        ds_id = self._data_targets_tab.unified_list.selected_dataset_id()
+        self._data_tab.select_dataset(ds_id or "")
         self._targets_weights_tab.refresh_dataset_list()
         self._params_ics_tab.refresh_ic_dataset_combo(self._dataset_entries)
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
-        self._data_tab.load_sampling_for_selected_row()
         try:
             self._subset_widget.set_dataset_entries(self._dataset_entries)
         except Exception:
@@ -1301,6 +1268,7 @@ class FittingWindow(QtWidgets.QDialog):
     # ------------------------------------------------------------------
     def _populate_dataset_table(self) -> None:
         self._data_tab.populate_table(self._dataset_entries)
+        self._data_targets_tab.unified_list.populate(self._dataset_entries)
 
     # ------------------------------------------------------------------
     # Actions
@@ -1603,16 +1571,14 @@ class FittingWindow(QtWidgets.QDialog):
     def _collect_dataset_selection(self) -> Dict[str, Any]:
         rows = []
         included_ids: List[str] = []
-        for row in range(self._data_tab._dataset_table.rowCount()):
-            item = self._data_tab._dataset_table.item(row, 0)
-            dataset_id = str(item.data(Qt.UserRole) or "")
-            include = item.checkState() == Qt.Checked
-            label = self._data_tab._dataset_table.item(row, 1).text()
-            species = self._data_tab._dataset_table.item(row, 2).text()
+        for entry in self._dataset_entries:
+            dataset_id = str(entry.get("id") or "").strip()
+            include = entry.get("include", True)
+            label = str(entry.get("label") or dataset_id)
+            species = ", ".join(entry.get("selected_species", []))
             weight = self._dataset_weight_for_id(dataset_id)
-            if row < len(self._dataset_entries):
-                self._dataset_entries[row]["weight"] = weight
-                self._dataset_entries[row]["include"] = include
+            entry["weight"] = weight
+            entry["include"] = include
             rows.append({"id": dataset_id, "label": label, "species": species, "include": include, "weight": weight})
             if include:
                 included_ids.append(dataset_id)
@@ -2262,6 +2228,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._best_effort_failures.add("set_running_state.subset_autorange_lock")
                 logger.debug("Failed to update subset view autorange lock state: %s", exc, exc_info=True)
         self._params_ics_tab.set_running_state(running)
+        self._data_targets_tab.unified_list.set_running_state(running)
         self._paused = False
         self._pause_button.setEnabled(False)
         self._resume_button.setEnabled(False)
