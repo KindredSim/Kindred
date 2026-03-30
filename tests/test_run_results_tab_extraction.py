@@ -69,3 +69,39 @@ def test_update_statistics(qt_app):
     finally:
         tab.close()
         qt_app.processEvents()
+
+
+def test_stamp_stats_sync_across_runs(qt_app):
+    """set_run_stamp clears stale stats; dialog reflects new state."""
+    tab = _make_tab()
+    try:
+        # Run A: stamp + stats
+        tab.set_run_stamp({"run": "A"}, "hashA", "shortA")
+        tab.update_statistics({"Datasets": 5, "SSQ": 2.0})
+        assert tab._last_stats == {"Datasets": 5, "SSQ": 2.0}
+
+        # Run B starts: stamp overwritten, stats must be cleared
+        tab.set_run_stamp({"run": "B"}, "hashB", "shortB")
+        assert tab._last_stats == {}  # old stats cleared
+
+        # Open dialog during run B (before stats arrive)
+        tab.open_results_summary_dialog()
+        qt_app.processEvents()
+        dialog = tab._stamp_dialog
+        assert dialog is not None
+        assert dialog._stamp_short == "shortB"
+        # All stats show dash
+        for label in dialog._stats_labels.values():
+            assert label.text() == "\u2014"
+
+        # Run B completes with new stats
+        tab.update_statistics({"Datasets": 10, "SSQ": 0.5})
+        qt_app.processEvents()
+        assert dialog._stamp_short == "shortB"
+        assert dialog._stats_labels["Datasets"].text() == "10"
+        assert dialog._stats_labels["SSQ"].text() == "0.5"
+    finally:
+        if tab._stamp_dialog is not None:
+            tab._stamp_dialog.close()
+        tab.close()
+        qt_app.processEvents()

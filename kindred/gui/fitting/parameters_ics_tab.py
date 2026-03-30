@@ -411,14 +411,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table.setColumnCount(7)
         self._param_table.setHorizontalHeaderLabels(["Fit", "Log10", "Name", "Value", "Min", "Max", "Last Fit"])
         _ph = self._param_table.horizontalHeader()
-        _ph.setStretchLastSection(False)
-        _ph.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)  # Fit
-        _ph.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)  # Log10
-        _ph.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)           # Name
-        _ph.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  # Value
-        _ph.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)  # Min
-        _ph.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)  # Max
-        _ph.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeToContents)  # Last Fit
+        _ph.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        _ph.setStretchLastSection(True)
         self._param_table.itemChanged.connect(self._on_param_table_item_changed)
         self._param_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._param_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -547,13 +541,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._ic_table.setColumnCount(6)
         self._ic_table.setHorizontalHeaderLabels(["Fit", "Log10", "Species", "Initial", "Min", "Max"])
         _ih = self._ic_table.horizontalHeader()
-        _ih.setStretchLastSection(False)
-        _ih.setSectionResizeMode(_ICCol.FIT, QtWidgets.QHeaderView.ResizeToContents)
-        _ih.setSectionResizeMode(_ICCol.LOG10, QtWidgets.QHeaderView.ResizeToContents)
-        _ih.setSectionResizeMode(_ICCol.SPECIES, QtWidgets.QHeaderView.Stretch)
-        _ih.setSectionResizeMode(_ICCol.INITIAL, QtWidgets.QHeaderView.ResizeToContents)
-        _ih.setSectionResizeMode(_ICCol.MIN, QtWidgets.QHeaderView.ResizeToContents)
-        _ih.setSectionResizeMode(_ICCol.MAX, QtWidgets.QHeaderView.ResizeToContents)
+        _ih.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        _ih.setStretchLastSection(True)
         self._ic_table.verticalHeader().setVisible(False)
         self._ic_table.setAlternatingRowColors(True)
         self._ic_table.setMinimumHeight(200)

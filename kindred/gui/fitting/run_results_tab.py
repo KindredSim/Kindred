@@ -122,6 +122,20 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             return
         self.statusMessage.emit("Copied stamp hash")
 
+    def refresh(
+        self,
+        stamp: dict,
+        stamp_hash: str,
+        stamp_short: str,
+        stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update all stamp and stats content from the owning tab."""
+        self._stamp = dict(stamp)
+        self._stamp_hash = str(stamp_hash)
+        self._stamp_short = str(stamp_short)
+        self._run_stamp_label.setText(f"Stamp: {stamp_short}")
+        self._update_stats(stats or {})
+
     def _on_copy_run_stamp_json(self) -> None:
         stamp = self._stamp
         if not isinstance(stamp, dict) or not stamp:
@@ -178,6 +192,14 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_run_stamp = dict(stamp)
         self._last_run_stamp_hash = str(stamp_hash)
         self._last_run_stamp_short = str(stamp_short)
+        self._last_stats = {}
+        if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
+            self._stamp_dialog.refresh(
+                self._last_run_stamp,
+                self._last_run_stamp_hash,
+                self._last_run_stamp_short,
+                None,
+            )
 
     def open_results_summary_dialog(self) -> None:
         """Show the results summary popup dialog."""
@@ -203,4 +225,9 @@ class RunResultsTab(QtWidgets.QWidget):
         """Store stat values; update dialog if open."""
         self._last_stats = dict(stats)
         if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
-            self._stamp_dialog._update_stats(stats)
+            self._stamp_dialog.refresh(
+                self._last_run_stamp,
+                self._last_run_stamp_hash,
+                self._last_run_stamp_short,
+                self._last_stats,
+            )
