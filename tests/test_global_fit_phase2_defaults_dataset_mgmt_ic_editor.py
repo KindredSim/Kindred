@@ -1617,7 +1617,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         apply_btn.click()
         qt_app.processEvents()
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
 
@@ -1647,7 +1647,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         assert set(second_result["species"]) == {"A", "B", "C"}
         assert "C" in second_result["species"]
 
-        prepared_stamp = window._last_run_stamp.get("prepared_simulation") or {}
+        prepared_stamp = window._run_results_tab._last_run_stamp.get("prepared_simulation") or {}
         assert prepared_stamp.get("mechanism_text_sha256") == hashlib.sha256(mechanism_b.encode("utf-8")).hexdigest()
         assert prepared_stamp.get("param_names") == ["k1", "k2"]
     finally:
@@ -1711,7 +1711,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
 
         assert _parameter_table_names(window) == ["k1"]
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
 
@@ -1798,7 +1798,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
 
         assert _ic_table_species(window) == ["A", "B"]
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
 
@@ -1878,13 +1878,13 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         apply_btn.click()
         qt_app.processEvents()
 
-        window._add_global_initial_parameter("A", ["ds1", "ds2"])
-        window._populate_parameter_table()
+        window._params_ics_tab._add_global_initial_parameter("A", ["ds1", "ds2"])
+        window._params_ics_tab._populate_parameter_table()
         qt_app.processEvents()
 
         assert "Global A_0" in _parameter_table_names(window)
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         assert "init:A" in config["parameters"]
         selection = window._collect_dataset_selection()
@@ -1906,7 +1906,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         assert len(captured_runs) == 2
         assert "Global A_0" in _parameter_table_names(window)
 
-        config_after = window._collect_parameter_config()
+        config_after = window._params_ics_tab._collect_parameter_config()
         assert config_after is not None
         assert "init:A" in config_after["parameters"]
         assert "k2" in config_after["parameters"]
@@ -1966,8 +1966,8 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         apply_btn.click()
         qt_app.processEvents()
 
-        window._add_local_initial_parameter("A", ["ds1"])
-        window._populate_parameter_table()
+        window._params_ics_tab._add_local_initial_parameter("A", ["ds1"])
+        window._params_ics_tab._populate_parameter_table()
         qt_app.processEvents()
 
         table = getattr(window, "_param_table", None)
@@ -1981,7 +1981,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         rows_before = _parameter_table_rows(window)
         assert any(row["name"] == "A_0 (ds1)" and row["fit"] is False for row in rows_before)
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
 
@@ -2074,7 +2074,7 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         apply_btn.click()
         qt_app.processEvents()
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
 

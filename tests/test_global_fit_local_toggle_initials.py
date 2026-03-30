@@ -70,7 +70,7 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
         # Uncheck "Fit" for the local initial condition row.
         window._param_table.item(row, 0).setCheckState(QtCore.Qt.Unchecked)
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         dataset_selection = window._collect_dataset_selection()
         window._start_global_fit(config, dataset_selection)

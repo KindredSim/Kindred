@@ -32,9 +32,9 @@ def test_global_fit_window_applies_ftol_xtol_defaults_to_ui(qt_app):
         config_defaults={"ftol": 1e-8, "xtol": 1e-9},
     )
     try:
-        assert window._ftol_edit.text() == "1e-8"
-        assert window._xtol_edit.text() == "1e-9"
-        config = window._collect_parameter_config()
+        assert window._params_ics_tab._ftol_edit.text() == "1e-8"
+        assert window._params_ics_tab._xtol_edit.text() == "1e-9"
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         assert config["ftol"] == pytest.approx(1e-8)
         assert config["xtol"] == pytest.approx(1e-9)

@@ -187,7 +187,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         qt_app.processEvents()
         assert window._global_payload_lookup["ds1"]["species"] == ["A"]
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)
@@ -247,7 +247,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
 
         assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 1.0}
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         selection = window._collect_dataset_selection()
         window._start_global_fit(config, selection)

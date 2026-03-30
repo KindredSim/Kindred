@@ -501,7 +501,7 @@ def test_global_fit_parameter_toggles_persist_across_best_updates_and_affect_con
         assert window._param_table.item(0, 1).checkState() == QtCore.Qt.Checked
         assert window._param_table.item(1, 0).checkState() == QtCore.Qt.Unchecked
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
         assert set(config["parameters"].keys()) == {"k1"}
         assert config["log10_params"] == {"k1": True}
@@ -576,7 +576,7 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         window._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
         window._param_table.item(1, 3).setText("9.87")
 
-        config = window._collect_parameter_config()
+        config = window._params_ics_tab._collect_parameter_config()
         dataset_selection = window._collect_dataset_selection()
         window._start_global_fit(config, dataset_selection)
 
