@@ -15,18 +15,14 @@ def _make_tab():
 
 
 def test_construction(qt_app):
-    """RunResultsTab builds expected widget hierarchy."""
+    """RunResultsTab builds expected widget hierarchy (no Run Stamp GroupBox)."""
     tab = _make_tab()
     try:
-        stamp_label = tab.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
-        assert stamp_label is not None
+        groups = tab.findChildren(QtWidgets.QGroupBox)
+        stamp_groups = [g for g in groups if g.title() == "Run Stamp"]
+        assert len(stamp_groups) == 0
 
-        copy_btn = tab.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_button")
-        assert copy_btn is not None
-
-        copy_json_btn = tab.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_json_button")
-        assert copy_json_btn is not None
-
+        assert hasattr(tab, "open_run_stamp_dialog")
         assert len(tab._stats_labels) == 8
     finally:
         tab.close()
@@ -47,18 +43,15 @@ def test_signals_defined(qt_app):
 
 
 def test_set_run_stamp(qt_app):
-    """set_run_stamp populates label and enables copy buttons."""
+    """set_run_stamp stores stamp data internally."""
     tab = _make_tab()
     try:
-        assert not tab._copy_stamp_button.isEnabled()
-        assert not tab._copy_stamp_json_button.isEnabled()
-
         tab.set_run_stamp({"solver": "LSODA"}, "abc123hash", "abc123")
         qt_app.processEvents()
 
-        assert tab._run_stamp_label.text() == "Stamp: abc123"
-        assert tab._copy_stamp_button.isEnabled()
-        assert tab._copy_stamp_json_button.isEnabled()
+        assert tab._last_run_stamp == {"solver": "LSODA"}
+        assert tab._last_run_stamp_hash == "abc123hash"
+        assert tab._last_run_stamp_short == "abc123"
     finally:
         tab.close()
         qt_app.processEvents()

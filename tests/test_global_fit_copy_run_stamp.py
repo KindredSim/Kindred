@@ -90,17 +90,14 @@ def _make_window():
 
 
 def test_copy_buttons_disabled_before_any_run(qt_app):
+    """Before any fit run, the Run Stamp footer button is disabled."""
     from PySide6 import QtWidgets
 
     window = _make_window()
     try:
-        copy_button = window.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_button")
-        assert copy_button is not None
-        assert copy_button.isEnabled() is False
-
-        copy_json_button = window.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_json_button")
-        assert copy_json_button is not None
-        assert copy_json_button.isEnabled() is False
+        btn = window.findChild(QtWidgets.QPushButton, "global_fit_run_stamp_footer_button")
+        assert btn is not None
+        assert btn.isEnabled() is False
     finally:
         window.close()
         qt_app.processEvents()
@@ -143,23 +140,31 @@ def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
 
         assert window._run_results_tab._last_run_stamp_short
 
-        copy_button = window.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_button")
-        assert copy_button is not None
-        assert copy_button.isEnabled() is True
-        copy_button.click()
-        qt_app.processEvents()
-        assert dummy_clipboard.last_text == window._run_results_tab._last_run_stamp_short
+        # Open the stamp dialog to access the copy buttons
+        dialog = run_results_tab_mod.RunStampDialog(
+            window._run_results_tab._last_run_stamp,
+            window._run_results_tab._last_run_stamp_hash,
+            window._run_results_tab._last_run_stamp_short,
+            parent=window,
+        )
+        try:
+            copy_button = dialog.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_button")
+            assert copy_button is not None
+            copy_button.click()
+            qt_app.processEvents()
+            assert dummy_clipboard.last_text == window._run_results_tab._last_run_stamp_short
 
-        copy_json_button = window.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_json_button")
-        assert copy_json_button is not None
-        assert copy_json_button.isEnabled() is True
-        copy_json_button.click()
-        qt_app.processEvents()
-        parsed = json.loads(dummy_clipboard.last_text)
-        assert parsed["mode"] == "global"
-        assert "kindred_version" in parsed
-        assert "datasets" in parsed
-        assert "fit_targets_applied" in parsed
+            copy_json_button = dialog.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_json_button")
+            assert copy_json_button is not None
+            copy_json_button.click()
+            qt_app.processEvents()
+            parsed = json.loads(dummy_clipboard.last_text)
+            assert parsed["mode"] == "global"
+            assert "kindred_version" in parsed
+            assert "datasets" in parsed
+            assert "fit_targets_applied" in parsed
+        finally:
+            dialog.close()
     finally:
         window.close()
         qt_app.processEvents()

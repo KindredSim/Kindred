@@ -1414,6 +1414,12 @@ class FittingWindow(QtWidgets.QDialog):
         actions_row.addWidget(self._pause_button)
         actions_row.addWidget(self._resume_button)
 
+        self._run_stamp_button = QtWidgets.QPushButton("Run Stamp")
+        self._run_stamp_button.setObjectName("global_fit_run_stamp_footer_button")
+        self._run_stamp_button.setEnabled(False)
+        self._run_stamp_button.clicked.connect(self._run_results_tab.open_run_stamp_dialog)
+        actions_row.addWidget(self._run_stamp_button)
+
         self._apply_scope_combo = QtWidgets.QComboBox(footer)
         self._apply_scope_combo.setObjectName("global_fit_apply_scope_combo")
         for label, scope in _PROJECT_APPLY_OPTIONS:
@@ -2575,6 +2581,7 @@ class FittingWindow(QtWidgets.QDialog):
         stamp_hash = hash_global_fit_run_stamp(stamp)
         stamp_short = str(stamp_hash)[:12]
         self._run_results_tab.set_run_stamp(dict(stamp), str(stamp_hash), str(stamp_short))
+        self._run_stamp_button.setEnabled(True)
         return stamp, str(stamp_hash), str(stamp_short)
 
     @staticmethod

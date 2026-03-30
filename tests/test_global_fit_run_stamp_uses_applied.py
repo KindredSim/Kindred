@@ -152,10 +152,8 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         json.dumps(rrt._last_run_stamp, sort_keys=True)
         assert rrt._last_run_stamp_hash
 
-        stamp_label = window.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
-        assert stamp_label is not None
-        assert stamp_label.isHidden() is False
-        assert "stamp" in stamp_label.text().lower()
+        assert rrt._last_run_stamp_short
+        assert rrt._last_run_stamp_hash
     finally:
         window.close()
         qt_app.processEvents()
