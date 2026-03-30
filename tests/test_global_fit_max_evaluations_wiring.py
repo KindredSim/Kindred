@@ -4,20 +4,6 @@ import pytest
 
 pytestmark = [pytest.mark.gui]
 
-def test_fit_config_dialog_default_max_iterations_is_1000(qt_app):
-    from kindred.gui.fitting.window import FitConfigDialog
-
-    dialog = FitConfigDialog(
-        mechanism_text="",
-        dataset_name="ds1",
-        parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
-    )
-    try:
-        assert dialog._max_nfev_spin.value() == 1000
-    finally:
-        dialog.close()
-
-
 def test_global_fit_window_default_max_evaluations_is_1000(qt_app):
     from kindred.gui.fitting.window import FittingWindow
 

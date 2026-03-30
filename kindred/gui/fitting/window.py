@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CH
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 
 if TYPE_CHECKING:
     from kindred.core.api.fitting import GlobalFitResult
@@ -73,11 +73,8 @@ _PROJECT_APPLY_OPTIONS: tuple[tuple[str, str], ...] = (
 
 __all__ = [
     "DEFAULT_PARALLEL_STARTS",
-    "FitConfigDialog",
-    "FitResultsDialog",
     "FittingWindow",
     "GlobalFitWorker",
-    "build_selected_fit_dataset_payload",
     "fit_global",
     "validate_de_bounds",
 ]
@@ -165,37 +162,6 @@ class _FitDialogWorkerRegistry(QtCore.QObject):
         QtCore.QTimer.singleShot(0, _attempt_delete)
 
 
-def build_selected_fit_dataset_payload(
-    *,
-    dataset_id: str,
-    t: np.ndarray,
-    species_data: Dict[str, np.ndarray],
-    selected_species: Sequence[str],
-    target_weights: Optional[Dict[str, float]] = None,
-    x_name: str = "t",
-    x_obs: Optional[np.ndarray] = None,
-    x_mapping_mode: str = "auto",
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    from kindred.core.analysis.fit_dataset_payload import build_fit_dataset_payload as _impl
-
-    return _impl(
-        dataset_id=dataset_id,
-        t=t,
-        species_data=species_data,
-        selected_species=selected_species,
-        target_weights=target_weights,
-        x_name=x_name,
-        x_obs=x_obs,
-        x_mapping_mode=x_mapping_mode,
-    )
-
-
-_build_selected_fit_dataset_payload = build_selected_fit_dataset_payload
-
-# _AddFittableParameterDialog moved to parameters_ics_tab.py
-from kindred.gui.fitting.parameters_ics_tab import _AddFittableParameterDialog  # noqa: F401, E402 — re-export for test compatibility
-
-
 # ============================================================================
 # VALIDATION FUNCTIONS
 # ============================================================================
@@ -268,318 +234,6 @@ class _SimulationWithFixedParams:
         merged = dict(self.fixed_params)
         merged.update(dict(params or {}))
         return self.base_simulation(merged)
-
-
-# ============================================================================
-# FIT CONFIGURATION DIALOG
-# ============================================================================
-
-class FitConfigDialog(QtWidgets.QDialog):
-    """Dialog for configuring fitting parameters."""
-
-    def __init__(
-        self,
-        mechanism_text: str,
-        dataset_name: str,
-        parameter_defs: List[Dict[str, Any]],
-        parent: Optional[QtWidgets.QWidget] = None
-    ):
-        super().__init__(parent)
-        self.setWindowTitle("Configure Fitting")
-        self.setMinimumWidth(600)
-        self.setMinimumHeight(400)
-
-        self._mechanism_text = mechanism_text
-        self._dataset_name = dataset_name
-        self._parameter_defs = parameter_defs or []
-        self._definition_map: Dict[str, Dict[str, Any]] = {
-            str(defn.get("name")): defn for defn in self._parameter_defs if "name" in defn
-        }
-        self._parameters: Dict[str, float] = {}
-
-        self._init_ui()
-        self._populate_parameters()
-
-    def _init_ui(self):
-        """Initialize UI components."""
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # Dataset info
-        info_label = QtWidgets.QLabel(f"Fitting dataset: <b>{self._dataset_name}</b>")
-        layout.addWidget(info_label)
-
-        # Parameters table
-        table_label = QtWidgets.QLabel("Select parameters to fit and set bounds:")
-        layout.addWidget(table_label)
-
-        self._params_table = QtWidgets.QTableWidget()
-        self._params_table.setColumnCount(5)
-        self._params_table.setHorizontalHeaderLabels([
-            "Fit?", "Parameter", "Initial", "Min", "Max"
-        ])
-        self._params_table.horizontalHeader().setStretchLastSection(True)
-        self._params_table.setAlternatingRowColors(True)
-        layout.addWidget(self._params_table)
-
-        # Algorithm selection
-        algo_layout = QtWidgets.QHBoxLayout()
-        algo_layout.addWidget(QtWidgets.QLabel("Algorithm:"))
-
-        self._algo_combo = QtWidgets.QComboBox()
-        self._algo_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
-        self._algo_combo.setCurrentText("lm")
-        algo_layout.addWidget(self._algo_combo)
-
-        algo_layout.addWidget(QtWidgets.QLabel("Max iterations:"))
-        self._max_nfev_spin = QtWidgets.QSpinBox()
-        self._max_nfev_spin.setRange(10, 10000)
-        self._max_nfev_spin.setValue(1000)
-        algo_layout.addWidget(self._max_nfev_spin)
-
-        algo_layout.addStretch()
-        layout.addLayout(algo_layout)
-
-        # Parallel fitting toggle
-        self._parallel_checkbox = QtWidgets.QCheckBox("Use parallel multi-start fitting")
-        self._parallel_checkbox.setToolTip(
-            "Runs multiple optimization starts in parallel when available. "
-            "Falls back to serial execution if multiprocessing is not allowed."
-        )
-        layout.addWidget(self._parallel_checkbox)
-
-        # Determinism option
-        seed_layout = QtWidgets.QHBoxLayout()
-        self._use_seed_check = QtWidgets.QCheckBox("Use random seed for reproducibility:")
-        self._use_seed_check.setChecked(True)
-        seed_layout.addWidget(self._use_seed_check)
-
-        self._seed_spin = QtWidgets.QSpinBox()
-        self._seed_spin.setRange(0, 999999)
-        self._seed_spin.setValue(42)
-        seed_layout.addWidget(self._seed_spin)
-        seed_layout.addStretch()
-        layout.addLayout(seed_layout)
-
-        # Buttons
-        button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def _populate_parameters(self):
-        """Populate the table using provided parameter definitions."""
-        self._parameters.clear()
-        if not self._parameter_defs:
-            logger.warning("Fit configuration dialog opened with no parameter definitions.")
-
-        for definition in self._parameter_defs:
-            try:
-                name = definition["name"]
-                value = float(definition.get("value", 1.0))
-                self._parameters[name] = value
-            except (KeyError, TypeError, ValueError):
-                logger.debug("Invalid parameter definition encountered: %s", definition)
-                continue
-
-        # Populate table
-        self._params_table.setRowCount(len(self._parameters))
-        for row, (param_name, value) in enumerate(self._parameters.items()):
-            definition = self._definition_map.get(param_name, {})
-            # Column 0: Checkbox
-            check_item = QtWidgets.QTableWidgetItem()
-            check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            check_item.setCheckState(Qt.Checked)
-            self._params_table.setItem(row, 0, check_item)
-
-            # Column 1: Parameter name
-            name_item = QtWidgets.QTableWidgetItem(param_name)
-            context = definition.get("context") or ""
-            source = definition.get("source") or ""
-            if context or source:
-                name_item.setToolTip(f"{context}\nSource: {source}".strip())
-            self._params_table.setItem(row, 1, name_item)
-
-            # Column 2: Initial value
-            self._params_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{value:.6g}"))
-
-            # Column 3: Min bound (0.1 * value)
-            min_val = float(definition.get("min", value * 0.1 if value != 0 else -10.0))
-            self._params_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{min_val:.6g}"))
-
-            # Column 4: Max bound (10 * value)
-            max_val = float(definition.get("max", value * 10.0 if value != 0 else 10.0))
-            self._params_table.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{max_val:.6g}"))
-
-        self._params_table.resizeColumnsToContents()
-
-        logger.info(f"Scanned {len(self._parameters)} parameters: {list(self._parameters.keys())}")
-
-    def get_fit_config(self) -> Dict[str, Any]:
-        """
-        Get fitting configuration.
-
-        Returns
-        -------
-        dict
-            Configuration with keys: parameters, bounds, method, max_nfev, seed
-        """
-        parameters = {}
-        bounds = {}
-
-        for row in range(self._params_table.rowCount()):
-            # Check if parameter is selected
-            check_item = self._params_table.item(row, 0)
-            if check_item.checkState() != Qt.Checked:
-                continue
-
-            param_name = self._params_table.item(row, 1).text()
-            initial_str = self._params_table.item(row, 2).text()
-            min_str = self._params_table.item(row, 3).text()
-            max_str = self._params_table.item(row, 4).text()
-
-            try:
-                parameters[param_name] = float(initial_str)
-                bounds[param_name] = (float(min_str), float(max_str))
-            except ValueError:
-                logger.warning(f"Invalid value for parameter {param_name}, skipping")
-                continue
-
-        config = {
-            "parameters": parameters,
-            "bounds": bounds,
-            "method": self._algo_combo.currentText(),
-            "max_nfev": self._max_nfev_spin.value(),
-            "seed": self._seed_spin.value() if self._use_seed_check.isChecked() else None,
-            "use_parallel": self._parallel_checkbox.isChecked(),
-            "parallel_starts": DEFAULT_PARALLEL_STARTS,
-        }
-
-        return config
-
-
-# ============================================================================
-# FIT RESULTS DIALOG
-# ============================================================================
-
-class FitResultsDialog(QtWidgets.QDialog):
-    """Dialog showing fitting results with uncertainties."""
-
-    writeToMechanism = Signal(dict)  # Emits fitted parameters dict
-
-    def __init__(
-        self,
-        result: Dict[str, Any],
-        parent: Optional[QtWidgets.QWidget] = None
-    ):
-        super().__init__(parent)
-        self.setWindowTitle("Fitting Results")
-        self.setMinimumWidth(500)
-        self.setMinimumHeight(400)
-
-        self._result = result
-        self._init_ui()
-
-    def _init_ui(self):
-        """Initialize UI components."""
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # Success indicator
-        if self._result["success"]:
-            status_label = QtWidgets.QLabel("✅ <b>Fit Converged</b>")
-            status_label.setStyleSheet("font-size: 12pt;")
-        else:
-            status_label = QtWidgets.QLabel("⚠️ <b>Fit Did Not Converge</b>")
-            status_label.setStyleSheet("font-size: 12pt;")
-        layout.addWidget(status_label)
-
-        # Fit statistics
-        stats_group = QtWidgets.QGroupBox("Fit Statistics")
-        stats_layout = QtWidgets.QFormLayout(stats_group)
-
-        chi_sq = self._result.get("chi_squared", float('nan'))
-        r_sq = self._result.get("r_squared", float('nan'))
-        nfev = self._result.get("nfev", 0)
-
-        stats_layout.addRow("χ² (Chi-squared):", QtWidgets.QLabel(f"{chi_sq:.6g}"))
-        stats_layout.addRow("R² (R-squared):", QtWidgets.QLabel(f"{r_sq:.6g}"))
-        stats_layout.addRow("Function evaluations:", QtWidgets.QLabel(f"{nfev}"))
-
-        layout.addWidget(stats_group)
-
-        # Parameters table
-        params_label = QtWidgets.QLabel("<b>Fitted Parameters:</b>")
-        layout.addWidget(params_label)
-
-        self._params_table = QtWidgets.QTableWidget()
-        self._params_table.setColumnCount(3)
-        self._params_table.setHorizontalHeaderLabels(["Parameter", "Value", "Uncertainty"])
-        self._params_table.horizontalHeader().setStretchLastSection(True)
-        self._params_table.setAlternatingRowColors(True)
-
-        parameters = self._result.get("parameters", {})
-        uncertainties = self._result.get("uncertainties", {})
-
-        self._params_table.setRowCount(len(parameters))
-        for row, (param_name, value) in enumerate(parameters.items()):
-            # Parameter name
-            self._params_table.setItem(row, 0, QtWidgets.QTableWidgetItem(param_name))
-
-            # Value
-            self._params_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{value:.6g}"))
-
-            # Uncertainty
-            uncertainty = uncertainties.get(param_name, float('nan'))
-            if np.isnan(uncertainty):
-                self._params_table.setItem(row, 2, QtWidgets.QTableWidgetItem("—"))
-            else:
-                self._params_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"± {uncertainty:.6g}"))
-
-        self._params_table.resizeColumnsToContents()
-        layout.addWidget(self._params_table)
-
-        # Message
-        message = self._result.get("message", "")
-        if message:
-            msg_label = QtWidgets.QLabel(f"<i>{message}</i>")
-            msg_label.setWordWrap(True)
-            layout.addWidget(msg_label)
-
-        # Buttons
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        button_box.rejected.connect(self.accept)
-
-        # Add "Write to Mechanism" button
-        write_btn = button_box.addButton("Write to Mechanism", QtWidgets.QDialogButtonBox.ActionRole)
-        write_btn.clicked.connect(self._on_write_to_mechanism)
-
-        layout.addWidget(button_box)
-
-    def _on_write_to_mechanism(self):
-        """Handle Write to Mechanism button click."""
-        parameters = self._result.get("parameters", {})
-        if parameters:
-            self.writeToMechanism.emit(parameters)
-            QtWidgets.QMessageBox.information(
-                self,
-                "Parameters Written",
-                f"Updated {len(parameters)} parameter(s) in mechanism editor."
-            )
-        else:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "No Parameters",
-                "No fitted parameters to write."
-            )
-
-    def get_fitted_parameters(self) -> Dict[str, float]:
-        """Get fitted parameters as dict."""
-        return self._result.get("parameters", {})
-
-    def get_uncertainties(self) -> Dict[str, float]:
-        """Get parameter uncertainties as dict."""
-        return self._result.get("uncertainties", {})
 
 
 class FittingWindow(QtWidgets.QDialog):
@@ -1726,14 +1380,6 @@ class FittingWindow(QtWidgets.QDialog):
             if ds_id:
                 chosen.append(ds_id)
         self._add_datasets_to_session(chosen)
-
-    def _fit_targets_dataset_ids(self) -> List[str]:
-        ids: List[str] = []
-        for entry in self._dataset_entries or []:
-            ds_id = str(entry.get("id") or "").strip()
-            if ds_id:
-                ids.append(ds_id)
-        return ids
 
     def _add_datasets_to_session(self, dataset_ids: Sequence[str]) -> None:
         """Add datasets into this Global Fit session (from already-loaded pool only)."""
@@ -3064,9 +2710,6 @@ class FittingWindow(QtWidgets.QDialog):
                 staged[str(dataset_id)] = updates
         return staged
 
-    def _can_apply_dataset_initials(self) -> bool:
-        return bool(self._dataset_settings_updater and self._staged_initial_condition_parameters())
-
     def _available_project_apply_scopes(self) -> set[str]:
         scopes: set[str] = set()
         has_parameters = bool(self._last_fit_params)
@@ -3150,18 +2793,6 @@ class FittingWindow(QtWidgets.QDialog):
                 self._dataset_settings_updater(dataset_id, updates)
                 total_updates += len(updates)
         return total_updates
-
-    def _apply_dataset_initials(self) -> None:
-        """Apply staged best-fit initial conditions back to dataset settings."""
-        if not self._dataset_settings_updater:
-            return
-        total_updates = self._apply_dataset_initials_via_updater()
-        if total_updates:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Apply Initial Conditions",
-                f"Applied {total_updates} initial condition value(s) to dataset settings.",
-            )
 
     def _apply_to_project(self) -> None:
         scope = self._selected_project_apply_scope()
@@ -3313,16 +2944,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _update_statistics(self, stats: Dict[str, Any]) -> None:
         self._run_results_tab.update_statistics(stats)
-
-    def _apply_parameters(self) -> None:
-        if not (self._apply_callback and self._last_fit_params):
-            return
-        try:
-            self._apply_callback(dict(self._last_fit_params))
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Apply Parameters", str(exc))
-        else:
-            QtWidgets.QMessageBox.information(self, "Apply Parameters", "Parameters written to mechanism.")
 
     # ------------------------------------------------------------------
     # Qt overrides

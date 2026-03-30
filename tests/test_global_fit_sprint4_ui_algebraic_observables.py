@@ -1,6 +1,6 @@
 import pytest
 
-from kindred.gui.fitting.window import _AddFittableParameterDialog
+from kindred.gui.fitting.parameters_ics_tab import _AddFittableParameterDialog
 
 
 pytestmark = [pytest.mark.gui]

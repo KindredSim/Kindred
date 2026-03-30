@@ -7,7 +7,7 @@ from kindred.core.analysis.fit_dataset_payload import (
     coerce_fit_dataset_specs,
     normalize_dataset_species_and_y,
 )
-from kindred.gui.fitting.window import build_selected_fit_dataset_payload
+from kindred.core.analysis.fit_dataset_payload import build_fit_dataset_payload as build_selected_fit_dataset_payload
 
 
 @pytest.mark.unit

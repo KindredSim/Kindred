@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import numpy as np
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 try:
     from scipy.integrate import trapezoid as _scipy_trapezoid
 except Exception:  # pragma: no cover - scipy is a dependency but keep a safe fallback
@@ -83,7 +83,11 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             "• Species → C_final: ∫|C - C_final| dt (deviation from equilibrium)"
         )
 
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
+        for col in range(self.columnCount()):
+            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Interactive)  # Species
+        self.setColumnWidth(0, 140)
         self.setAlternatingRowColors(True)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -112,26 +116,36 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             self.insertRow(i)
 
             # Column 0: Species name
-            self.setItem(i, 0, QtWidgets.QTableWidgetItem(species_name))
+            _item0 = QtWidgets.QTableWidgetItem(species_name)
+            _item0.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(i, 0, _item0)
 
             # Column 1: Final concentration
             final_conc = concentrations[-1]
-            self.setItem(i, 1, QtWidgets.QTableWidgetItem(f"{final_conc:.6g}"))
+            _item1 = QtWidgets.QTableWidgetItem(f"{final_conc:.6g}")
+            _item1.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(i, 1, _item1)
 
             # Column 2: Maximum concentration
             max_conc = np.max(concentrations)
-            self.setItem(i, 2, QtWidgets.QTableWidgetItem(f"{max_conc:.6g}"))
+            _item2 = QtWidgets.QTableWidgetItem(f"{max_conc:.6g}")
+            _item2.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(i, 2, _item2)
 
             # Column 3: Time at maximum (t@Max)
             idx_max = np.argmax(concentrations)
             t_at_max = t[idx_max]
-            self.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{t_at_max:.6g}"))
+            _item3 = QtWidgets.QTableWidgetItem(f"{t_at_max:.6g}")
+            _item3.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(i, 3, _item3)
 
             # Column 4: χ² (only if provided, from fitting)
             if chi_squared is not None:
-                self.setItem(i, 4, QtWidgets.QTableWidgetItem(f"{chi_squared:.6g}"))
+                _item4 = QtWidgets.QTableWidgetItem(f"{chi_squared:.6g}")
             else:
-                self.setItem(i, 4, QtWidgets.QTableWidgetItem("—"))
+                _item4 = QtWidgets.QTableWidgetItem("—")
+            _item4.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(i, 4, _item4)
 
             # Column 5: CTC (Concentration-Time Curve)
             # Baseline-corrected integral measuring deviation from equilibrium:
@@ -152,10 +166,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 deviation = np.abs(concentrations - final_conc)
                 ctc = _trapezoid_integral(deviation, t)
 
-            self.setItem(i, 5, QtWidgets.QTableWidgetItem(f"{ctc:.6g}"))
-
-        # Auto-resize columns to content
-        self.resizeColumnsToContents()
+            _item5 = QtWidgets.QTableWidgetItem(f"{ctc:.6g}")
+            _item5.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(i, 5, _item5)
 
         # Force immediate visual update for WSL/X11 environments
         self.viewport().repaint()
