@@ -165,10 +165,9 @@ def test_data_targets_tab_unified_layout(qt_app):
         assert dt_tab.unified_list is not None
         assert dt_tab.isAncestorOf(dt_tab.unified_list)
 
-        # All three panels are children.
+        # Both panels are children.
         assert dt_tab.isAncestorOf(dt_tab.data_tab)
-        assert dt_tab.isAncestorOf(dt_tab.targets_weights_tab)
-        assert dt_tab.isAncestorOf(dt_tab.ic_panel)
+        assert dt_tab.isAncestorOf(dt_tab.species_table)
     finally:
         window.close()
 
@@ -194,10 +193,10 @@ def test_unified_list_drives_all_panels(qt_app):
         assert window._data_tab._sampling_current_dataset_id == "ds2"
 
         # TargetsWeightsTab reflects ds2.
-        assert window._targets_weights_tab._fit_targets_current_dataset_id == "ds2"
+        assert window._species_table._current_dataset_id == "ds2"
 
         # InitialConditionsPanel reflects ds2.
-        assert window._ic_panel._ic_editor_current_dataset_id == "ds2"
+        assert window._species_table._ic_editor_current_dataset_id == "ds2"
     finally:
         window.close()
 
@@ -213,7 +212,7 @@ def test_ic_load_for_dataset_rejects_unknown_id(qt_app):
         window.show()
         qt_app.processEvents()
 
-        ic = window._ic_panel
+        ic = window._species_table
         original_id = ic._ic_editor_current_dataset_id
 
         ic.load_for_dataset("nonexistent_dataset")
@@ -304,12 +303,12 @@ def test_ic_dirty_state_cleared_on_external_switch(qt_app):
         qt_app.processEvents()
 
         unified_list = window._data_targets_tab.unified_list
-        ic = window._ic_panel
+        ic = window._species_table
 
         unified_list.select_dataset("ds1")
         qt_app.processEvents()
 
-        ic._set_ic_editor_dirty_state(True)
+        ic._ic_editor_dirty = True
         assert ic._ic_editor_dirty is True
 
         unified_list.select_dataset("ds2")
@@ -439,7 +438,7 @@ def test_sampling_clears_when_last_dataset_removed(qt_app):
         assert not window._data_tab._sampling_t_min_spin.isEnabled()
 
         # IC table should be empty / blank.
-        assert window._ic_panel._ic_editor_current_dataset_id is None
+        assert window._species_table._ic_editor_current_dataset_id is None
     finally:
         window.close()
 
@@ -566,17 +565,15 @@ def test_detail_panels_not_reloaded_on_duplicate_dataset_signal(qt_app):
 
         # Patch the three panel methods to track calls.
         with mock.patch.object(dt_tab.data_tab, "select_dataset", wraps=dt_tab.data_tab.select_dataset) as m_data, \
-             mock.patch.object(dt_tab.targets_weights_tab, "_select_fit_targets_dataset_by_id",
-                               wraps=dt_tab.targets_weights_tab._select_fit_targets_dataset_by_id) as m_targets, \
-             mock.patch.object(dt_tab.ic_panel, "load_for_dataset", wraps=dt_tab.ic_panel.load_for_dataset) as m_ic:
+             mock.patch.object(dt_tab.species_table, "load_for_dataset",
+                               wraps=dt_tab.species_table.load_for_dataset) as m_species:
 
             # Directly emit the signal with the already-active dataset id.
             unified_list.currentDatasetChanged.emit("ds1")
             qt_app.processEvents()
 
             assert m_data.call_count == 0, f"data_tab.select_dataset called {m_data.call_count} times on duplicate"
-            assert m_targets.call_count == 0, f"targets._select called {m_targets.call_count} times on duplicate"
-            assert m_ic.call_count == 0, f"ic.load_for_dataset called {m_ic.call_count} times on duplicate"
+            assert m_species.call_count == 0, f"species_table.load_for_dataset called {m_species.call_count} times on duplicate"
     finally:
         window.close()
 
@@ -596,7 +593,7 @@ def test_sampling_validity_refreshed_on_targets_apply(qt_app):
         window._params_ics_tab._mechanism_species = ["A", "B"]
 
         # Apply sampling with x_name = "A" for ds1.
-        full_t = window._targets_weights_tab.full_t_by_dataset.get("ds1", np.linspace(0.0, 1.0, 5))
+        full_t = window._species_table.full_t_by_dataset.get("ds1", np.linspace(0.0, 1.0, 5))
         t_min = float(full_t[0]) if full_t.size else 0.0
         t_max = float(full_t[-1]) if full_t.size else 1.0
         window._sampling_applied["ds1"] = {
@@ -608,7 +605,7 @@ def test_sampling_validity_refreshed_on_targets_apply(qt_app):
         }
 
         # Apply fit targets that include "A" for ds1.
-        window._targets_weights_tab._fit_targets_selection_applied["ds1"] = ["A"]
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
 
         # Trigger _on_targets_applied — this should refresh sampling validity.
         window._on_targets_applied()

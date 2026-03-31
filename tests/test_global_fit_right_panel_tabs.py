@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from kindred.gui.fitting.window import FittingWindow
 
@@ -69,15 +69,6 @@ def _make_two_dataset_window() -> FittingWindow:
     )
 
 
-def _targets_dataset_ids(dataset_list: QtWidgets.QListWidget) -> list[str]:
-    ids: list[str] = []
-    for row in range(dataset_list.count()):
-        item = dataset_list.item(row)
-        assert item is not None
-        ids.append(str(item.data(QtCore.Qt.UserRole) or ""))
-    return ids
-
-
 def _tab_index(tab_bar: QtWidgets.QTabBar, title: str) -> int:
     titles = [tab_bar.tabText(i) for i in range(tab_bar.count())]
     return titles.index(title)
@@ -111,18 +102,16 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         params_widget = content_stack.widget(_tab_index(top_tabs, "Parameters"))
 
         sampling_panel = window.findChild(QtWidgets.QWidget, "global_fit_sampling_panel")
-        targets_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        species_table_widget = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
         weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
         weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
-        ic_table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
         results_summary_button = window.findChild(QtWidgets.QPushButton, "global_fit_results_summary_footer_button")
         run_block = window.findChild(QtWidgets.QLabel, "global_fit_run_block_reason_label")
 
         assert sampling_panel is not None
-        assert targets_list is not None
+        assert species_table_widget is not None
         assert weight_mode is not None
         assert weight_edit is not None
-        assert ic_table is not None
         assert results_summary_button is not None
         assert run_block is not None
 
@@ -133,20 +122,19 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
             "Species",
         ]
 
-        # Data and Targets tab contains Data, Targets, and IC panels
+        # Data and Targets tab contains Data, Targets/IC unified species table
         assert data_targets_widget.isAncestorOf(window._data_tab._dataset_table)
         assert data_targets_widget.isAncestorOf(sampling_panel)
-        assert data_targets_widget.isAncestorOf(targets_list)
-        assert data_targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel"))
+        assert data_targets_widget.isAncestorOf(species_table_widget)
+        assert data_targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group"))
         assert data_targets_widget.isAncestorOf(weight_mode)
         assert data_targets_widget.isAncestorOf(weight_edit)
-        assert data_targets_widget.isAncestorOf(ic_table)
-        assert _targets_dataset_ids(targets_list) == ["ds1"]
+        assert window._data_targets_tab.unified_list._list.count() == 1
 
-        # Parameters tab contains param table and method combo, but not IC
+        # Parameters tab contains param table and method combo, but not species table
         assert params_widget.isAncestorOf(window._params_ics_tab._param_table)
         assert params_widget.isAncestorOf(window._params_ics_tab._method_combo)
-        assert not params_widget.isAncestorOf(ic_table)
+        assert not params_widget.isAncestorOf(species_table_widget)
 
         assert footer.isAncestorOf(results_summary_button)
         assert footer.isAncestorOf(run_block)
@@ -168,30 +156,18 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
 def test_unified_list_drives_targets_dataset_selection(qt_app):
     window = _make_two_dataset_window()
     try:
-        # Unified list drives all panels — select ds2 in the unified list.
         unified_list = window._data_targets_tab.unified_list
         unified_list.select_dataset("ds2")
         qt_app.processEvents()
+        assert window._species_table._current_dataset_id == "ds2"
 
-        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
-        assert dataset_list is not None
-        current = dataset_list.currentItem()
-        assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds2"
-
-        # Select ds1 via unified list.
         unified_list.select_dataset("ds1")
         qt_app.processEvents()
-        current = dataset_list.currentItem()
-        assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
+        assert window._species_table._current_dataset_id == "ds1"
 
-        # Switch back to ds2 via unified list — targets follows.
         unified_list.select_dataset("ds2")
         qt_app.processEvents()
-        current = dataset_list.currentItem()
-        assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds2"
+        assert window._species_table._current_dataset_id == "ds2"
     finally:
         window.close()
 
@@ -202,25 +178,24 @@ def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
         # Targets panel is always visible in unified layout — no subtab switch needed.
         qt_app.processEvents()
 
-        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        unified_list = window._data_targets_tab.unified_list
         weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
         weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
-        assert dataset_list is not None
         assert weight_mode is not None
         assert weight_edit is not None
 
-        dataset_list.setCurrentRow(0)
+        unified_list.select_dataset("ds1")
         qt_app.processEvents()
         weight_mode.setCurrentIndex(1)
         weight_edit.setText("0.75")
         qt_app.processEvents()
 
-        dataset_list.setCurrentRow(1)
+        unified_list.select_dataset("ds2")
         qt_app.processEvents()
 
         assert window._dataset_entries[0]["weight"] == pytest.approx(0.75)
 
-        dataset_list.setCurrentRow(0)
+        unified_list.select_dataset("ds1")
         qt_app.processEvents()
         assert weight_edit.text() == "0.75"
     finally:
@@ -297,8 +272,8 @@ def test_unified_layout_structure_and_subset_visibility(qt_app):
     """Regression: 3 top-level tabs, DataTargetsTab has unified master/detail layout, subset visibility correct."""
     from kindred.gui.fitting.data_tab import DataTab
     from kindred.gui.fitting.data_targets_tab import DataTargetsTab
-    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
     from kindred.gui.fitting.unified_dataset_list import UnifiedDatasetList
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     window = _make_window()
     try:
@@ -324,12 +299,11 @@ def test_unified_layout_structure_and_subset_visibility(qt_app):
         assert isinstance(dt_tab.unified_list, UnifiedDatasetList)
         assert dt_tab.isAncestorOf(dt_tab.unified_list)
 
-        # All three panels are children of the DataTargetsTab
+        # Data and species table panels are children of the DataTargetsTab
         assert isinstance(dt_tab.data_tab, DataTab)
         assert dt_tab.isAncestorOf(dt_tab.data_tab)
-        assert dt_tab.isAncestorOf(dt_tab.targets_weights_tab)
-        assert dt_tab.isAncestorOf(dt_tab.ic_panel)
-        assert isinstance(dt_tab.ic_panel, InitialConditionsPanel)
+        assert dt_tab.isAncestorOf(dt_tab.species_table)
+        assert isinstance(dt_tab.species_table, UnifiedSpeciesTable)
 
         # Unified list is populated with 1 dataset
         assert dt_tab.unified_list.selected_dataset_id() == "ds1"
@@ -352,9 +326,7 @@ def test_unified_layout_structure_and_subset_visibility(qt_app):
         qt_app.processEvents()
         assert not window._subset_widget.isVisible()
 
-        # Targets dataset list is populated (proves on_tab_activated ran during construction)
-        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
-        assert dataset_list is not None
-        assert dataset_list.count() >= 1
+        # Species table is loaded for a dataset (proves on_tab_activated ran during construction)
+        assert window._species_table._current_dataset_id is not None
     finally:
         window.close()

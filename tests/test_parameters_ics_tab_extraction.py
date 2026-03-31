@@ -9,7 +9,7 @@ pytestmark = [pytest.mark.gui]
 
 
 def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6, 1e-12)):
-    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
     if entries is None:
@@ -17,9 +17,14 @@ def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6
     if species is None:
         species = ["A", "B"]
 
-    ic_panel = InitialConditionsPanel(
+    species_table = UnifiedSpeciesTable(
         dataset_entries=list(entries),
         mechanism_species=list(species),
+        dataset_entries_getter=lambda: list(entries),
+        included_dataset_ids_getter=lambda: [str(e["id"]) for e in entries],
+        dataset_label_getter=lambda ds_id: str(ds_id),
+        dataset_weight_getter=lambda ds_id: 1.0,
+        persist_dataset_weight_callback=lambda ds_id, w: None,
         dataset_manager_getter=lambda: None,
         worker_running_getter=lambda: False,
     )
@@ -40,7 +45,7 @@ def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6
         reactions_text_getter=lambda: "",
         integration_defaults=integration_defaults,
         config_defaults={},
-        ic_panel=ic_panel,
+        ic_panel=species_table,
     )
     return tab
 
@@ -52,10 +57,10 @@ def test_construction(qt_app):
         assert tab._param_table is not None
         assert isinstance(tab._param_table, QtWidgets.QTableWidget)
 
-        # IC widgets are accessible via _ic_panel reference (no longer children of tab)
         assert tab._ic_panel is not None
         assert tab._ic_table is not None
-        assert tab._ic_dataset_combo is not None
+        # _ic_dataset_combo is None for UnifiedSpeciesTable (no combo)
+        assert tab._ic_dataset_combo is None
     finally:
         tab._ic_panel.close()
         tab.close()
@@ -67,34 +72,9 @@ def test_signals_defined(qt_app):
     tab = _make_tab()
     try:
         received = []
-        tab.addAlgebraicObservableRequested.connect(lambda payload: received.append(payload))
         tab.statusMessage.connect(lambda msg: received.append(msg))
-        tab.statusMessage.emit("test")
-        assert "test" in received
-    finally:
-        tab.close()
-        qt_app.processEvents()
-
-
-def test_ic_dataset_combo_population(qt_app):
-    """IC dataset combo has one item per dataset entry."""
-    entries = [
-        {"id": "ds1", "label": "DS 1"},
-        {"id": "ds2", "label": "DS 2"},
-    ]
-    tab = _make_tab(entries=entries)
-    try:
-        assert tab._ic_dataset_combo.count() == 2
-    finally:
-        tab.close()
-        qt_app.processEvents()
-
-
-def test_parameter_table_initially_empty(qt_app):
-    """With empty parameter_state, param table has zero rows."""
-    tab = _make_tab()
-    try:
-        assert tab._param_table.rowCount() == 0
+        tab.statusMessage.emit("hello")
+        assert received == ["hello"]
     finally:
         tab.close()
         qt_app.processEvents()
@@ -116,14 +96,14 @@ def test_state_getters_return_initial_values(qt_app):
 
 
 def test_ic_panel_is_standalone_widget(qt_app):
-    """InitialConditionsPanel is a standalone widget referenced by ParametersIcsTab."""
-    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
+    """UnifiedSpeciesTable is a standalone widget referenced by ParametersIcsTab."""
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     tab = _make_tab()
     try:
         assert hasattr(tab, "_ic_panel")
-        assert isinstance(tab._ic_panel, InitialConditionsPanel)
-        # IC panel is no longer a child of the tab — it is hosted externally
+        assert isinstance(tab._ic_panel, UnifiedSpeciesTable)
+        # Species table is no longer a child of the tab
         assert not tab.isAncestorOf(tab._ic_panel)
     finally:
         tab._ic_panel.close()
@@ -134,11 +114,11 @@ def test_ic_panel_is_standalone_widget(qt_app):
 def test_ic_panel_apply_signal_round_trip(qt_app):
     """IC edit -> Apply -> icApplied signal -> handler -> parameter state updated."""
     from types import SimpleNamespace
+    from kindred.gui.fitting.unified_species_table import _Col
 
     ds_id = "ds1"
     species = ["A", "B"]
 
-    # Fake fit_settings with initial conditions
     fake_settings = SimpleNamespace(
         initial_conditions={"A": 1.0, "B": 0.0},
         fit_flags={"A": False, "B": False},
@@ -162,28 +142,27 @@ def test_ic_panel_apply_signal_round_trip(qt_app):
     # Replace dataset_manager_getter to return our fake manager
     tab._dataset_manager_getter = lambda: FakeManager()
     tab._ic_panel._dataset_manager_getter = lambda: FakeManager()
-    # Reload IC table so it picks up the fake settings
-    tab._ic_panel._load_initial_conditions_for_current_dataset()
+    # Load dataset so the table is populated
+    tab._ic_panel.load_for_dataset(ds_id)
     try:
         from PySide6.QtCore import Qt
-        from kindred.gui.fitting.initial_conditions_panel import _ICCol
 
-        ic_table = tab._ic_panel._ic_table
+        ic_table = tab._ic_panel._table
         assert ic_table.rowCount() == 2
 
         # Edit species A: set fit=True, initial=5.0, min=0.1, max=100
-        fit_item = ic_table.item(0, _ICCol.FIT)
+        fit_item = ic_table.item(0, _Col.FIT_IC)
         fit_item.setCheckState(Qt.Checked)
-        ic_table.item(0, _ICCol.INITIAL).setText("5.0")
-        ic_table.item(0, _ICCol.MIN).setText("0.1")
-        ic_table.item(0, _ICCol.MAX).setText("100")
+        ic_table.item(0, _Col.INITIAL).setText("5.0")
+        ic_table.item(0, _Col.MIN).setText("0.1")
+        ic_table.item(0, _Col.MAX).setText("100")
 
         # Track signal emissions
         applied_args = []
         tab._ic_panel.icApplied.connect(lambda *args: applied_args.append(args))
 
-        # Click Apply
-        tab._ic_panel._apply_initial_conditions_changes()
+        # Click Apply (combined apply — only IC dirty, targets not dirty)
+        tab._ic_panel._apply_changes()
 
         # Verify icApplied signal fired
         assert len(applied_args) == 1

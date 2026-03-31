@@ -322,20 +322,19 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
     window._tabs.setCurrentIndex(dt_idx)
     qapp.processEvents()
 
-    dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+    ulist = window._data_targets_tab.unified_list._list
     weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
     weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
-    assert dataset_list is not None
     assert weight_mode is not None
     assert weight_edit is not None
 
-    for row in range(dataset_list.count()):
-        item = dataset_list.item(row)
+    for i in range(ulist.count()):
+        item = ulist.item(i)
         if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == "ds2":
-            dataset_list.setCurrentRow(row)
+            ulist.setCurrentRow(i)
             break
     else:
-        raise AssertionError("ds2 not present in targets dataset list")
+        raise AssertionError("ds2 not present in unified dataset list")
     qapp.processEvents()
 
     weight_mode.setCurrentIndex(1)

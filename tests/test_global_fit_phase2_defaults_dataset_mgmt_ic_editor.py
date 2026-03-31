@@ -51,27 +51,32 @@ def _show_only_batch_set(main_window, *, row: int, qt_app) -> tuple[str, str]:
     return set_id, set_name
 
 
-def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
-    from PySide6 import QtCore, QtWidgets
-
-    dataset_list = panel.window().findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
-    assert dataset_list is not None
-    for i in range(dataset_list.count()):
-        item = dataset_list.item(i)
+def _set_fit_targets_dataset(widget, *, dataset_id: str) -> None:
+    from PySide6 import QtCore
+    window = widget if hasattr(widget, '_data_targets_tab') else widget.window()
+    ulist = window._data_targets_tab.unified_list._list
+    for i in range(ulist.count()):
+        item = ulist.item(i)
         if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
-            dataset_list.setCurrentRow(i)
+            ulist.setCurrentRow(i)
             return
     raise AssertionError(f"Dataset id not in list: {dataset_id!r}")
 
 
-def _set_fit_targets_pending(panel, *, dataset_id: str, enabled_species: set[str], qt_app) -> None:
-    from PySide6 import QtWidgets
-
-    _set_fit_targets_dataset(panel, dataset_id=dataset_id)
-    for checkbox in panel.findChildren(QtWidgets.QCheckBox):
-        label = checkbox.text().strip()
-        if label:
-            checkbox.setChecked(label in enabled_species)
+def _set_fit_targets_pending(widget, *, dataset_id: str, enabled_species: set[str], qt_app) -> None:
+    from PySide6.QtCore import Qt
+    from kindred.gui.fitting.unified_species_table import _Col
+    window = widget if hasattr(widget, '_data_targets_tab') else widget.window()
+    _set_fit_targets_dataset(window, dataset_id=dataset_id)
+    table = window._species_table._table
+    for row in range(table.rowCount()):
+        species_item = table.item(row, _Col.SPECIES)
+        include_item = table.item(row, _Col.INCLUDE)
+        if species_item is None or include_item is None:
+            continue
+        if not (include_item.flags() & Qt.ItemIsEnabled):
+            continue
+        include_item.setCheckState(Qt.Checked if species_item.text() in enabled_species else Qt.Unchecked)
     qt_app.processEvents()
 
 
@@ -106,13 +111,13 @@ def _parameter_table_rows(window) -> list[dict[str, object]]:
 
 def _ic_table_species(window) -> list[str]:
     from PySide6 import QtWidgets
-    from kindred.gui.fitting.parameters_ics_tab import _ICCol
+    from kindred.gui.fitting.unified_species_table import _Col
 
-    table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
+    table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
     assert table is not None
     species: list[str] = []
     for row in range(table.rowCount()):
-        item = table.item(row, _ICCol.SPECIES)
+        item = table.item(row, _Col.SPECIES)
         if item is not None and item.text().strip():
             species.append(item.text().strip())
     return species
@@ -241,8 +246,8 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
         assert window._data_tab._dataset_table.rowCount() == 2
 
         # Default: no fit targets applied for any included dataset.
-        assert window._targets_weights_tab.fit_targets_selection_applied.get("ds1") == []
-        assert window._targets_weights_tab.fit_targets_selection_applied.get("ds2") == []
+        assert window._species_table.fit_targets_selection_applied.get("ds1") == []
+        assert window._species_table.fit_targets_selection_applied.get("ds2") == []
 
         # Default: all datasets included (Use checked), but Run Fit is blocked until Apply.
         assert window._run_button.isEnabled() is False
@@ -259,7 +264,7 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
         dt_idx = [window._tabs.tabText(i) for i in range(window._tabs.count())].index("Data and Targets")
         window._tabs.setCurrentIndex(dt_idx)
         QtWidgets.QApplication.processEvents()
-        blocked = window.findChild(QtWidgets.QLabel, "global_fit_fit_targets_run_blocked")
+        blocked = window.findChild(QtWidgets.QLabel, "global_fit_species_table_run_blocked")
         assert blocked is not None
         assert blocked.isVisible()
         text = blocked.text().lower()
@@ -290,9 +295,9 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
     window = _latest_fit_window(main_window)
     try:
         assert window._data_tab._dataset_table.rowCount() == 2
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
@@ -315,7 +320,7 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
         ds2_entry = next(entry for entry in window._dataset_entries if entry["id"] == "ds2")
         assert ds2_entry.get("include") is True
         assert float(ds2_entry.get("weight")) == pytest.approx(1.0)
-        assert window._targets_weights_tab.fit_targets_selection_applied.get("ds2") == []
+        assert window._species_table.fit_targets_selection_applied.get("ds2") == []
         assert selector.selected_dataset_species() == {"ds1": {"A"}}
     finally:
         window.close()
@@ -341,36 +346,28 @@ def test_global_fit_initial_conditions_editor_apply_persists_to_dataset_manager(
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        combo = window.findChild(QtWidgets.QComboBox, "global_fit_initial_conditions_dataset_combo")
-        table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
-        apply_btn = window.findChild(QtWidgets.QPushButton, "global_fit_initial_conditions_apply")
-        assert combo is not None
+        from kindred.gui.fitting.unified_species_table import _Col
+
+        _set_fit_targets_dataset(window, dataset_id="ds1")
+        table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
+        apply_btn = window.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert table is not None
         assert apply_btn is not None
 
-        # Select ds1 in the IC editor.
-        for i in range(combo.count()):
-            if str(combo.itemData(i)) == "ds1":
-                combo.setCurrentIndex(i)
-                break
-        else:
-            raise AssertionError("ds1 not present in Initial Conditions dataset combo")
-
         # Change initial(A) and enable fitting for init:A with bounds.
-        from kindred.gui.fitting.parameters_ics_tab import _ICCol
         row_a = None
         for row in range(table.rowCount()):
-            if (table.item(row, _ICCol.SPECIES) or QtWidgets.QTableWidgetItem()).text().strip() == "A":
+            if (table.item(row, _Col.SPECIES) or QtWidgets.QTableWidgetItem()).text().strip() == "A":
                 row_a = row
                 break
         assert row_a is not None
 
-        table.item(row_a, _ICCol.INITIAL).setText("2.5")  # Initial
-        fit_item = table.item(row_a, _ICCol.FIT)
+        table.item(row_a, _Col.INITIAL).setText("2.5")  # Initial
+        fit_item = table.item(row_a, _Col.FIT_IC)
         assert fit_item is not None
         fit_item.setCheckState(QtCore.Qt.Checked)
-        table.item(row_a, _ICCol.MIN).setText("0.1")
-        table.item(row_a, _ICCol.MAX).setText("10.0")
+        table.item(row_a, _Col.MIN).setText("0.1")
+        table.item(row_a, _Col.MAX).setText("10.0")
 
         apply_btn.click()
 
@@ -1609,9 +1606,9 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
@@ -1701,9 +1698,9 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
@@ -1780,22 +1777,16 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
-        ic_combo = window.findChild(QtWidgets.QComboBox, "global_fit_initial_conditions_dataset_combo")
-        assert ic_combo is not None
-
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
         _set_fit_targets_pending(panel, dataset_id="ds2", enabled_species={"A"}, qt_app=qt_app)
         apply_btn.click()
         qt_app.processEvents()
 
-        for i in range(ic_combo.count()):
-            if str(ic_combo.itemData(i)) == "ds1":
-                ic_combo.setCurrentIndex(i)
-                break
+        _set_fit_targets_dataset(window, dataset_id="ds1")
         qt_app.processEvents()
 
         assert _ic_table_species(window) == ["A", "B"]
@@ -1870,9 +1861,9 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
@@ -1958,9 +1949,9 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
@@ -2066,9 +2057,9 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)

@@ -51,10 +51,9 @@ from kindred.gui.fitting.run_stamp import (
 )
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
-from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
-from kindred.gui.fitting.targets_weights_tab import TargetsWeightsTab
+from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.widgets.dataset_subset_widget import DatasetSubsetWidget
@@ -352,7 +351,7 @@ class FittingWindow(QtWidgets.QDialog):
         # internally by ParametersIcsTab during construction
         self._init_sampling_state()
         self._populate_dataset_table()
-        self._targets_weights_tab.on_tab_activated(
+        self._species_table.on_tab_activated(
             seed_dataset_id=self._selected_data_table_dataset_id()
         )
         self._on_targets_validity_changed()
@@ -536,11 +535,11 @@ class FittingWindow(QtWidgets.QDialog):
                 "x_name": str(cfg.get("x_name") or "t").strip() or "t",
                 "x_mapping_mode": str(cfg.get("x_mapping_mode") or "auto").strip() or "auto",
             }
-        full_t = self._targets_weights_tab.full_t_by_dataset.get(ds_id, np.asarray([]))
+        full_t = self._species_table.full_t_by_dataset.get(ds_id, np.asarray([]))
         return self._sampling_default_config_for_time_axis(full_t)
 
     def _init_sampling_state(self) -> None:
-        full_t_map = self._targets_weights_tab.full_t_by_dataset
+        full_t_map = self._species_table.full_t_by_dataset
         applied: Dict[str, Dict[str, float | int | str]] = {}
         for entry in self._dataset_entries or []:
             ds_id = str(entry.get("id") or "").strip()
@@ -553,16 +552,16 @@ class FittingWindow(QtWidgets.QDialog):
         self._rebuild_selected_payload_lookup()
 
     def _refresh_dataset_entries_from_applied_fit_targets_and_sampling(self) -> None:
-        applied_sel = self._targets_weights_tab.fit_targets_selection_applied
-        full_t_map = self._targets_weights_tab.full_t_by_dataset
-        full_series_map = self._targets_weights_tab.full_series_by_dataset
+        applied_sel = self._species_table.fit_targets_selection_applied
+        full_t_map = self._species_table.full_t_by_dataset
+        full_series_map = self._species_table.full_series_by_dataset
         for entry in self._dataset_entries or []:
             ds_id = str(entry.get("id") or "").strip()
             if not ds_id:
                 continue
             selection = list(applied_sel.get(ds_id, []))
             entry["selected_species"] = list(selection)
-            entry["target_weights"] = self._targets_weights_tab.applied_target_weights_for_dataset(ds_id)
+            entry["target_weights"] = self._species_table.applied_target_weights_for_dataset(ds_id)
 
             full_t = full_t_map.get(ds_id, np.asarray(entry.get("t", []), dtype=float).reshape(-1))
             cfg = self._sampling_applied_config_for_dataset(ds_id)
@@ -613,7 +612,7 @@ class FittingWindow(QtWidgets.QDialog):
     def _rebuild_selected_payload_lookup(self) -> None:
         rebuilt: Dict[str, Dict[str, Any]] = {}
         rebuilt_results: Dict[str, FitDatasetPayloadResult] = {}
-        for ds_id, selection in (self._targets_weights_tab.fit_targets_selection_applied or {}).items():
+        for ds_id, selection in (self._species_table.fit_targets_selection_applied or {}).items():
             entry = next((e for e in (self._dataset_entries or []) if str(e.get("id") or "").strip() == str(ds_id)), None)
             if not isinstance(entry, dict):
                 rebuilt_results[str(ds_id)] = FitDatasetPayloadResult.absent()
@@ -635,7 +634,7 @@ class FittingWindow(QtWidgets.QDialog):
                 t=t_values,
                 species_data=series_map,
                 selected_species=selection,
-                target_weights=self._targets_weights_tab.applied_target_weights_for_dataset(ds_id),
+                target_weights=self._species_table.applied_target_weights_for_dataset(ds_id),
                 x_name=x_name,
                 x_obs=x_obs,  # already sampled against the same indices as t/y
                 x_mapping_mode=x_mapping_mode,
@@ -703,13 +702,15 @@ class FittingWindow(QtWidgets.QDialog):
         # cycle, causing RuntimeError on double-close during test teardown.
         _w = weakref.ref(self)
         _empty_cfg = {"t_min": 0.0, "t_max": 0.0, "n_points": 0, "x_name": "t", "x_mapping_mode": "auto"}
-        self._targets_weights_tab = TargetsWeightsTab(
+        self._species_table = UnifiedSpeciesTable(
             dataset_entries=list(self._dataset_entries),
+            mechanism_species=list(self.__dict__.get("_mechanism_species", [])),
             dataset_entries_getter=lambda: list(_w()._dataset_entries) if _w() is not None else [],
             included_dataset_ids_getter=lambda: _w()._included_dataset_ids() if _w() is not None else [],
             dataset_label_getter=lambda ds_id: _w()._dataset_label_for_id(ds_id) if _w() is not None else str(ds_id),
             dataset_weight_getter=lambda ds_id: _w()._dataset_weight_for_id(ds_id) if _w() is not None else 1.0,
             persist_dataset_weight_callback=lambda ds_id, w: _w()._persist_dataset_weight(ds_id, w) if _w() is not None else None,
+            dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
             parent=self,
         )
@@ -719,18 +720,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab = DataTab(
             sampling_applied_config_getter=lambda ds_id: _w()._sampling_applied_config_for_dataset(ds_id) if _w() is not None else dict(_empty_cfg),
             sampling_default_config_getter=lambda t_values: _w()._sampling_default_config_for_time_axis(t_values) if _w() is not None else dict(_empty_cfg),
-            fit_targets_full_t_getter=lambda ds_id: _w()._targets_weights_tab.full_t_by_dataset.get(ds_id, np.asarray([])) if _w() is not None else np.asarray([]),
-            fit_targets_available_getter=lambda ds_id: list(_w()._targets_weights_tab.available_by_dataset.get(ds_id, [])) if _w() is not None else [],
-            fit_targets_full_series_getter=lambda ds_id: _w()._targets_weights_tab.full_series_by_dataset.get(ds_id, {}) if _w() is not None else {},
-            fit_targets_selection_applied_getter=lambda ds_id: list(_w()._targets_weights_tab.fit_targets_selection_applied.get(ds_id, [])) if _w() is not None else [],
+            fit_targets_full_t_getter=lambda ds_id: _w()._species_table.full_t_by_dataset.get(ds_id, np.asarray([])) if _w() is not None else np.asarray([]),
+            fit_targets_available_getter=lambda ds_id: list(_w()._species_table.available_by_dataset.get(ds_id, [])) if _w() is not None else [],
+            fit_targets_full_series_getter=lambda ds_id: _w()._species_table.full_series_by_dataset.get(ds_id, {}) if _w() is not None else {},
+            fit_targets_selection_applied_getter=lambda ds_id: list(_w()._species_table.fit_targets_selection_applied.get(ds_id, [])) if _w() is not None else [],
             modeled_series_getter=lambda: _w()._modeled_series_names_for_x_axis() if _w() is not None else set(),
-            worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
-            parent=self,
-        )
-        self._ic_panel = InitialConditionsPanel(
-            dataset_entries=list(self._dataset_entries),
-            mechanism_species=list(self.__dict__.get("_mechanism_species", [])),
-            dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
             parent=self,
         )
@@ -751,15 +745,14 @@ class FittingWindow(QtWidgets.QDialog):
             reactions_text_getter=lambda: str(_w()._reactions_text_getter() or "") if _w() is not None and callable(getattr(_w(), "_reactions_text_getter", None)) else "",
             integration_defaults=self._active_integration_defaults_for_ui(),
             config_defaults=self._config_defaults,
-            ic_panel=self._ic_panel,
+            ic_panel=self._species_table,
             parent=self,
         )
         self._params_ics_tab.addAlgebraicObservableRequested.connect(self._on_algebraic_observable_requested)
         self._run_results_tab = RunResultsTab(parent=self)
         self._data_targets_tab = DataTargetsTab(
             data_tab=self._data_tab,
-            targets_weights_tab=self._targets_weights_tab,
-            ic_panel=self._ic_panel,
+            species_table=self._species_table,
             parent=self,
         )
 
@@ -803,14 +796,13 @@ class FittingWindow(QtWidgets.QDialog):
         self._tabs.currentChanged.connect(self._on_right_tabs_current_changed)
         self._current_tab_stack.setCurrentIndex(self._tabs.currentIndex())
         layout.addWidget(self._create_footer(), stretch=0)
-        self._ic_panel.icApplied.connect(self._params_ics_tab._on_ic_applied)
-        self._ic_panel.statusMessage.connect(self._status_label.setText)
+        self._species_table.icApplied.connect(self._params_ics_tab._on_ic_applied)
+        self._species_table.targetsApplied.connect(self._on_targets_applied)
+        self._species_table.validityChanged.connect(self._on_targets_validity_changed)
+        self._species_table.statusMessage.connect(self._on_targets_status_message)
         self._params_ics_tab.statusMessage.connect(self._status_label.setText)
         self._run_results_tab.statusMessage.connect(self._status_label.setText)
         self._data_tab.statusMessage.connect(self._status_label.setText)
-        self._targets_weights_tab.targetsApplied.connect(self._on_targets_applied)
-        self._targets_weights_tab.validityChanged.connect(self._on_targets_validity_changed)
-        self._targets_weights_tab.statusMessage.connect(self._on_targets_status_message)
         self._data_targets_tab.unified_list.datasetIncludeChanged.connect(self._on_data_tab_include_changed)
         self._data_targets_tab.unified_list.addRequested.connect(self._open_add_datasets_dialog)
         self._data_targets_tab.unified_list.removeRequested.connect(self._remove_datasets_from_session)
@@ -931,7 +923,7 @@ class FittingWindow(QtWidgets.QDialog):
 
         # Targets panel is always visible in unified layout; activate on tab switch.
         if int(index) == 0:
-            self._targets_weights_tab.on_tab_activated(
+            self._species_table.on_tab_activated(
                 seed_dataset_id=self._selected_data_table_dataset_id()
             )
 
@@ -1025,7 +1017,7 @@ class FittingWindow(QtWidgets.QDialog):
         return str(dataset_id)
 
     def _invalid_applied_used_dataset_ids_for_run(self) -> List[str]:
-        invalid = set(self._targets_weights_tab.invalid_applied_used_dataset_ids())
+        invalid = set(self._species_table.invalid_applied_used_dataset_ids())
         try:
             invalid |= set(self._invalid_sampling_applied_used_dataset_ids())
         except Exception:
@@ -1042,9 +1034,9 @@ class FittingWindow(QtWidgets.QDialog):
     def _on_targets_validity_changed(self) -> None:
         if not hasattr(self, "_run_button"):
             return
-        invalid_pending = set(self._targets_weights_tab.invalid_pending_used_dataset_ids())
-        invalid_pending_weights = set(self._targets_weights_tab.invalid_pending_target_weight_dataset_ids())
-        invalid_applied = set(self._targets_weights_tab.invalid_applied_used_dataset_ids())
+        invalid_pending = set(self._species_table.invalid_pending_used_dataset_ids())
+        invalid_pending_weights = set(self._species_table.invalid_pending_target_weight_dataset_ids())
+        invalid_applied = set(self._species_table.invalid_applied_used_dataset_ids())
 
         # Row highlighting: applied-invalid is stronger than pending-invalid.
         for entry in self._dataset_entries:
@@ -1095,7 +1087,7 @@ class FittingWindow(QtWidgets.QDialog):
     def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
         if 0 <= row < len(self._dataset_entries):
             self._dataset_entries[row]["include"] = included
-        self._targets_weights_tab.refresh_dataset_list()
+        self._species_table.refresh_dataset_list()
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
 
@@ -1209,7 +1201,7 @@ class FittingWindow(QtWidgets.QDialog):
                 }
             )
 
-            self._targets_weights_tab.add_dataset_state(
+            self._species_table.add_dataset_state(
                 ds_id,
                 full_series=dict(series_map),
                 full_t=t_values,
@@ -1237,7 +1229,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._dataset_entries = [entry for entry in self._dataset_entries if entry.get("id") not in remove_set]
 
         # Remove fit-target session state (keep loaded pool intact).
-        self._targets_weights_tab.remove_dataset_state(remove_set)
+        self._species_table.remove_dataset_state(remove_set)
         for ds_id in list(remove_set):
             self._sampling_applied.pop(ds_id, None)
             self._global_payload_results.pop(ds_id, None)
@@ -1254,7 +1246,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._populate_dataset_table()
         ds_id = self._data_targets_tab.unified_list.selected_dataset_id()
         self._data_tab.select_dataset(ds_id or "")
-        self._targets_weights_tab.refresh_dataset_list()
+        self._species_table.refresh_dataset_list()
         self._params_ics_tab.refresh_ic_dataset_combo(self._dataset_entries)
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
@@ -1591,8 +1583,8 @@ class FittingWindow(QtWidgets.QDialog):
         if self._worker and self._worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
             return
-        self._targets_weights_tab.flush_visible_weight_edits()
-        self._targets_weights_tab.flush_dataset_weight_editor()
+        self._species_table.flush_visible_weight_edits()
+        self._species_table.flush_dataset_weight_editor()
         config = self._params_ics_tab._collect_parameter_config()
         if not config:
             return
@@ -1638,7 +1630,7 @@ class FittingWindow(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Global Fit", "Simulation callback is unavailable.")
             self._set_running_state(False)
             return
-        self._targets_weights_tab.flush_visible_weight_edits()
+        self._species_table.flush_visible_weight_edits()
 
         selected_ids = list(dataset_selection.get("ids") or [])
         mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
@@ -1826,7 +1818,7 @@ class FittingWindow(QtWidgets.QDialog):
         return variable_params
 
     def _weights_for_run(self, dataset_selection: Dict[str, Any]) -> Optional[dict[str, float]]:
-        if self._targets_weights_tab.weight_mode_is_implicit():
+        if self._species_table.weight_mode_is_implicit():
             return None
         return {row["id"]: row["weight"] for row in dataset_selection.get("rows") or [] if row.get("include")}
 
@@ -1983,9 +1975,9 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_overrides: Sequence[FitDatasetParameterOverrides],
     ) -> tuple[dict[str, Any], str, str]:
         weight_mode = "equal" if weights is None else "custom"
-        applied_targets = dict(self._targets_weights_tab.fit_targets_selection_applied or {})
+        applied_targets = dict(self._species_table.fit_targets_selection_applied or {})
         applied_target_weights = {
-            str(ds_id): self._targets_weights_tab.applied_target_weights_for_dataset(str(ds_id))
+            str(ds_id): self._species_table.applied_target_weights_for_dataset(str(ds_id))
             for ds_id in applied_targets.keys()
         }
         stamp = build_global_fit_run_stamp(
@@ -2243,7 +2235,7 @@ class FittingWindow(QtWidgets.QDialog):
                     logger.debug("Failed to stop pending-best timer: %s", exc, exc_info=True)
             self._pending_best_payload = None
             self._pending_best_worker = None
-        self._targets_weights_tab.refresh_validity_ui()
+        self._species_table.refresh_validity_ui()
         self._refresh_sampling_validity_ui()
         self._refresh_project_apply_controls(running=running)
 

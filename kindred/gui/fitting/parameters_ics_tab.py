@@ -507,13 +507,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _ic_table(self):
         if self._ic_panel is None:
             return None
-        return self._ic_panel._ic_table
+        return getattr(self._ic_panel, "_table", None)
 
     @property
     def _ic_dataset_combo(self):
-        if self._ic_panel is None:
-            return None
-        return self._ic_panel._ic_dataset_combo
+        return None
 
     # ------------------------------------------------------------------
     # IC applied handler

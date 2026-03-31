@@ -17,14 +17,12 @@ class DataTargetsTab(QtWidgets.QWidget):
         self,
         *,
         data_tab: QtWidgets.QWidget,
-        targets_weights_tab: QtWidgets.QWidget,
-        ic_panel: QtWidgets.QWidget,
+        species_table: QtWidgets.QWidget,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.data_tab = data_tab
-        self.targets_weights_tab = targets_weights_tab
-        self.ic_panel = ic_panel
+        self.species_table = species_table
         self._current_detail_dataset_id: Optional[str] = None
         self._build_ui()
 
@@ -52,8 +50,7 @@ class DataTargetsTab(QtWidgets.QWidget):
         detail_layout.setSpacing(10)
 
         detail_layout.addWidget(self.data_tab)
-        detail_layout.addWidget(self.targets_weights_tab)
-        detail_layout.addWidget(self.ic_panel)
+        detail_layout.addWidget(self.species_table)
         detail_layout.addStretch(1)
 
         scroll.setWidget(container)
@@ -69,20 +66,18 @@ class DataTargetsTab(QtWidgets.QWidget):
 
         # Hide child navigators — unified list drives all selection.
         self.data_tab._dataset_group.hide()
-        self.targets_weights_tab._list_column.hide()
-        self.ic_panel._ic_dataset_combo.hide()
 
         # Override MinimumExpanding policies so the scroll area can scroll.
-        for panel in (self.data_tab, self.targets_weights_tab, self.ic_panel):
+        for panel in (self.data_tab, self.species_table):
             sp = panel.sizePolicy()
             if sp.verticalPolicy() == QtWidgets.QSizePolicy.MinimumExpanding:
                 sp.setVerticalPolicy(QtWidgets.QSizePolicy.Preferred)
                 panel.setSizePolicy(sp)
 
-        # Ensure targets panel doesn't collapse inside scroll area.
-        self.targets_weights_tab.setMinimumHeight(300)
+        # Ensure species table doesn't collapse inside scroll area.
+        self.species_table.setMinimumHeight(300)
 
-        # Wire unified list selection to all three panels.
+        # Wire unified list selection to both panels.
         self.unified_list.currentDatasetChanged.connect(self._on_unified_dataset_selected)
 
     def _on_unified_dataset_selected(self, dataset_id: str) -> None:
@@ -93,5 +88,4 @@ class DataTargetsTab(QtWidgets.QWidget):
             return
         self._current_detail_dataset_id = ds_id
         self.data_tab.select_dataset(ds_id)
-        self.targets_weights_tab._select_fit_targets_dataset_by_id(ds_id)
-        self.ic_panel.load_for_dataset(ds_id)
+        self.species_table.load_for_dataset(ds_id)

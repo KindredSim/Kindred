@@ -330,7 +330,7 @@ def test_push_best_update_empty_dataset_params_clears_staged(qt_app):
 # ===================================================================
 
 def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
-    """rebuild_for_mechanism updates _dataset_entries before refreshing IC combo."""
+    """rebuild_for_mechanism updates _dataset_entries before refreshing IC panel."""
     initial_entries = [{"id": "ds1", "label": "DS 1"}]
     tab = _make_params_tab(entries=initial_entries, species=["A"])
     try:
@@ -340,10 +340,10 @@ def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
         ]
         tab.rebuild_for_mechanism("", new_entries)
 
-        combo = tab._ic_dataset_combo
-        combo_ids = [str(combo.itemData(i) or "") for i in range(combo.count())]
-        assert "ds1" in combo_ids
-        assert "ds2" in combo_ids
+        # IC panel receives updated dataset entries via refresh_dataset_combo
+        ic_entry_ids = [str(e.get("id") or "") for e in tab._ic_panel._dataset_entries]
+        assert "ds1" in ic_entry_ids
+        assert "ds2" in ic_entry_ids
     finally:
         tab.close()
         qt_app.processEvents()
