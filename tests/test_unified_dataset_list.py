@@ -620,3 +620,33 @@ def test_sampling_validity_refreshed_on_targets_apply(qt_app):
         )
     finally:
         window.close()
+
+
+# ------------------------------------------------------------------
+# Validation foreground delegate
+# ------------------------------------------------------------------
+
+
+def test_dataset_list_has_validation_delegate(qt_app):
+    """UnifiedDatasetList must install _ValidationForegroundDelegate on its QListWidget."""
+    from kindred.gui.fitting.unified_dataset_list import _ValidationForegroundDelegate
+
+    widget = UnifiedDatasetList()
+    try:
+        assert isinstance(widget._list.itemDelegate(), _ValidationForegroundDelegate)
+    finally:
+        widget.close()
+
+
+def test_dataset_list_delegate_reads_foreground_role(qt_app):
+    """After set_validation_state, the item's ForegroundRole stores the correct brush."""
+    widget = UnifiedDatasetList()
+    widget.populate(_sample_entries())
+
+    widget.set_validation_state("ds1", "invalid_applied")
+    item = widget._list.item(0)
+    assert item is not None
+    fg = item.data(QtCore.Qt.ForegroundRole)
+    assert isinstance(fg, QtGui.QBrush)
+    assert fg.color() == QtGui.QColor(80, 0, 0)
+    widget.close()

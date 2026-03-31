@@ -1315,3 +1315,46 @@ def test_first_set_mechanism_species_noop_after_cache_seeded(qt_app):
     finally:
         tbl.close()
         qt_app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Validation foreground delegate
+# ---------------------------------------------------------------------------
+
+
+def test_species_table_has_validation_delegate(qt_app):
+    """UnifiedSpeciesTable must install _ValidationCellDelegate on its QTableWidget."""
+    from kindred.gui.fitting.unified_species_table import _ValidationCellDelegate
+
+    tbl = _make_table()
+    try:
+        assert isinstance(tbl._table.itemDelegate(), _ValidationCellDelegate)
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_species_table_delegate_reads_foreground_role(qt_app):
+    """Invalid weight cells store _INVALID_FG via ForegroundRole."""
+    from PySide6.QtGui import QBrush, QColor
+
+    mgr = _make_manager(species=["A"])
+    tbl = _make_table(manager=mgr, species=["A"])
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+
+        # Set an invalid weight value — _on_table_item_changed triggers
+        # validation and calls setForeground(_INVALID_FG) on the weight cell.
+        weight_item = tbl._table.item(row, _Col.WEIGHT)
+        assert weight_item is not None
+        weight_item.setText("abc")
+        qt_app.processEvents()
+
+        weight_item = tbl._table.item(row, _Col.WEIGHT)
+        fg = weight_item.data(Qt.ForegroundRole)
+        assert isinstance(fg, QBrush), f"Expected QBrush, got {type(fg)}"
+        assert fg.color() == QColor(80, 0, 0), f"Expected dark red (80,0,0), got {fg.color().getRgb()}"
+    finally:
+        tbl.close()
+        qt_app.processEvents()

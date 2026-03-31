@@ -8,6 +8,33 @@ from PySide6 import QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 
+class _ValidationForegroundDelegate(QtWidgets.QStyledItemDelegate):
+    """Paints item text using ForegroundRole color, bypassing stylesheet overrides."""
+
+    def paint(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        fg_variant = index.data(Qt.ForegroundRole)
+        if isinstance(fg_variant, QtGui.QBrush) and fg_variant.style() != Qt.BrushStyle.NoBrush:
+            text = opt.text
+            opt.text = ""
+            style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
+            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+            painter.save()
+            if opt.state & QtWidgets.QStyle.StateFlag.State_Selected:
+                painter.setPen(opt.palette.color(QtGui.QPalette.ColorRole.HighlightedText))
+            else:
+                painter.setPen(fg_variant.color())
+            text_rect = style.subElementRect(QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, option.widget)
+            alignment = opt.displayAlignment
+            metrics = QtGui.QFontMetrics(opt.font)
+            elided = metrics.elidedText(text, Qt.ElideRight, text_rect.width())
+            painter.drawText(text_rect, alignment, elided)
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
+
+
 class UnifiedDatasetList(QtWidgets.QWidget):
     """Checkable dataset list with Add/Remove buttons for unified navigation."""
 
@@ -31,6 +58,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
 
         self._list = QtWidgets.QListWidget(self)
         self._list.setObjectName("global_fit_unified_dataset_list")
+        self._list.setItemDelegate(_ValidationForegroundDelegate(self._list))
         self._list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self._list.currentItemChanged.connect(self._on_current_item_changed)
         self._list.itemChanged.connect(self._on_item_changed)

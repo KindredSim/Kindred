@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
@@ -42,6 +42,33 @@ _INVALID_BG = QBrush(QColor(255, 200, 200))
 _INVALID_FG = QBrush(QColor(80, 0, 0))
 _DEFAULT_BG = QBrush()
 _DEFAULT_FG = QBrush()
+
+
+class _ValidationCellDelegate(QtWidgets.QStyledItemDelegate):
+    """Paints cell text using ForegroundRole color, bypassing stylesheet overrides."""
+
+    def paint(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        fg_variant = index.data(Qt.ForegroundRole)
+        if isinstance(fg_variant, QBrush) and fg_variant.style() != Qt.BrushStyle.NoBrush:
+            text = opt.text
+            opt.text = ""
+            style = option.widget.style() if option.widget else QtWidgets.QApplication.style()
+            style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+            painter.save()
+            if opt.state & QtWidgets.QStyle.StateFlag.State_Selected:
+                painter.setPen(opt.palette.color(QPalette.ColorRole.HighlightedText))
+            else:
+                painter.setPen(fg_variant.color())
+            text_rect = style.subElementRect(QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, option.widget)
+            alignment = opt.displayAlignment
+            metrics = QFontMetrics(opt.font)
+            elided = metrics.elidedText(text, Qt.ElideRight, text_rect.width())
+            painter.drawText(text_rect, alignment, elided)
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
 
 
 class UnifiedSpeciesTable(QtWidgets.QWidget):
@@ -543,6 +570,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         # Table
         self._table = QtWidgets.QTableWidget(group)
         self._table.setObjectName("global_fit_unified_species_table")
+        self._table.setItemDelegate(_ValidationCellDelegate(self._table))
         self._table.setColumnCount(_Col.COUNT)
         self._table.setHorizontalHeaderLabels(_Col.HEADERS)
         _ih = self._table.horizontalHeader()
