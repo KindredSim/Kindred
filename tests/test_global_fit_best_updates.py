@@ -54,6 +54,7 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
         simulation_func=simulation,
         fit_func=fake_fit_global,
         best_update_interval_s=0.0,
+        plot_update_interval_s=0.0,
     )
     worker.bestUpdated.connect(lambda payload: emitted.append(payload))
 

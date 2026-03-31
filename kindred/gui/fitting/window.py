@@ -408,6 +408,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _init_fit_run_state(self) -> None:
         self._worker = None
+        self._results_rebuild_pending = False
         self._worker_registry = _FitDialogWorkerRegistry()
         self_ref = weakref.ref(self)
         self._worker_stop_policy = FitWorkerStopPolicy(
@@ -434,6 +435,16 @@ class FittingWindow(QtWidgets.QDialog):
         self._pending_best_timer.setSingleShot(True)
         self._pending_best_timer.setInterval(150)
         self._pending_best_timer.timeout.connect(self._apply_pending_best_update)
+
+    @property
+    def _is_fit_running(self) -> bool:
+        return bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
+
+    def _request_rebuild_subtabs(self) -> None:
+        if self._is_fit_running:
+            self._results_rebuild_pending = True
+        else:
+            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
 
     def _active_integration_defaults_for_ui(self) -> Tuple[str, float, float]:
         """
@@ -878,18 +889,41 @@ class FittingWindow(QtWidgets.QDialog):
         datasets: Sequence[Dict[str, Any]],
         current_models: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
     ) -> None:
-        if datasets is not self._dataset_entries:
-            self._dataset_entries = self._normalize_dataset_entries(datasets)
-        fit_targets_by_dataset = {
-            str(entry.get("id") or "").strip(): [
+        """Compatibility / test-facing API for refreshing Results tab plots.
+
+        Not called in production; live updates go through ``push_live_update()``
+        and ``push_final_result()``. Retained for test infrastructure.
+        """
+        raw_fit_targets_by_dataset: Dict[str, Optional[List[str]]] = {}
+        for entry in datasets or []:
+            ds_id = str(entry.get("id") or "").strip()
+            if not ds_id:
+                continue
+            if "selected_species" not in entry or entry.get("selected_species") is None:
+                raw_fit_targets_by_dataset[ds_id] = None
+                continue
+            raw_fit_targets_by_dataset[ds_id] = [
                 str(name).strip()
                 for name in (entry.get("selected_species") or [])
                 if str(name).strip()
             ]
-            for entry in self._dataset_entries
-            if str(entry.get("id") or "").strip()
-        }
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, fit_targets_by_dataset)
+        if datasets is not self._dataset_entries:
+            self._dataset_entries = self._normalize_dataset_entries(datasets)
+        applied_fit_targets = self._results_fit_targets_by_dataset()
+        fit_targets_by_dataset: Dict[str, List[str]] = {}
+        for entry in self._dataset_entries:
+            ds_id = str(entry.get("id") or "").strip()
+            if not ds_id:
+                continue
+            selected_species = raw_fit_targets_by_dataset.get(ds_id)
+            if selected_species is None:
+                fit_targets_by_dataset[ds_id] = list(applied_fit_targets.get(ds_id, []))
+                continue
+            fit_targets_by_dataset[ds_id] = list(selected_species)
+        if self._is_fit_running:
+            self._results_rebuild_pending = True
+        else:
+            self._run_results_tab.rebuild_subtabs(self._dataset_entries, fit_targets_by_dataset)
 
         model_lookup = current_models if isinstance(current_models, dict) else {}
         if model_lookup:
@@ -897,7 +931,8 @@ class FittingWindow(QtWidgets.QDialog):
                 {
                     "model_series": model_lookup,
                     "dataset_stats": self._latest_dataset_stats,
-                }
+                },
+                refresh_all=True,
             )
 
     def _selected_data_table_dataset_id(self) -> Optional[str]:
@@ -1092,7 +1127,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._rebuild_selected_payload_lookup()
         self._populate_dataset_table()
         self._on_targets_validity_changed()
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
+        self._request_rebuild_subtabs()
         self._refresh_sampling_validity_ui()
 
     def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
@@ -1101,13 +1136,13 @@ class FittingWindow(QtWidgets.QDialog):
         self._species_table.refresh_dataset_list()
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
+        self._request_rebuild_subtabs()
 
     def _on_data_tab_sampling_applied(self, dataset_id: str, config: dict) -> None:
         self._sampling_applied[str(dataset_id)] = dict(config)
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._rebuild_selected_payload_lookup()
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
+        self._request_rebuild_subtabs()
         self._refresh_sampling_validity_ui()
         self._status_label.setText("Sampling applied")
 
@@ -1254,7 +1289,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._params_ics_tab.refresh_ic_dataset_combo(self._dataset_entries)
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
+        self._request_rebuild_subtabs()
 
     # ------------------------------------------------------------------
     # Table population
@@ -2048,6 +2083,7 @@ class FittingWindow(QtWidgets.QDialog):
             rtol=float(requested_rtol),
             atol=float(requested_atol),
             best_update_interval_s=0.25,
+            plot_update_interval_s=2.0,
             run_stamp=dict(stamp),
             run_stamp_hash=str(stamp_hash),
             run_stamp_short=str(stamp_short),
@@ -2298,6 +2334,9 @@ class FittingWindow(QtWidgets.QDialog):
             return
         self._last_result = result
         self._best_cost = None
+        if self._results_rebuild_pending:
+            self._results_rebuild_pending = False
+            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._params_ics_tab.push_fit_results(
             dict(result.shared_params),
             {k: dict(v) for k, v in (result.dataset_params or {}).items()},
@@ -2395,6 +2434,10 @@ class FittingWindow(QtWidgets.QDialog):
             cost = None
         self._best_cost = cost
 
+        tracker_panel = getattr(self._run_results_tab, "_tracker_panel", None)
+        if tracker_panel is not None and any(key in payload for key in ("iteration", "cost", "shared_params")):
+            tracker_panel.update_from_best(payload)
+
         shared_params = payload.get("shared_params") or {}
         dataset_params = payload.get("dataset_params") or {}
         if isinstance(shared_params, dict):
@@ -2404,16 +2447,36 @@ class FittingWindow(QtWidgets.QDialog):
                 ds_params,
             )
 
-        model_series = payload.get("model_series") or {}
-        plot_model_series = payload.get("plot_model_series") or {}
-        plot_model_x = payload.get("plot_model_x") or {}
-        dataset_stats = payload.get("dataset_stats") or {}
+        model_series = payload.get("model_series")
+        plot_model_series = payload.get("plot_model_series")
+        plot_model_x = payload.get("plot_model_x")
+        dataset_stats = payload.get("dataset_stats")
+        has_plot_data = any(
+            value is not None
+            for value in (
+                model_series,
+                plot_model_series,
+                plot_model_x,
+                dataset_stats,
+            )
+        )
         running = bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
+        self._refresh_project_apply_controls(prefer_broadest=True, running=running)
+        if not has_plot_data:
+            if not running:
+                self._params_ics_tab.repaint_parameter_table()
+            return
+
         if isinstance(model_series, dict):
             self._latest_model_series = {k: dict(v) for k, v in model_series.items() if isinstance(v, dict)}
+        else:
+            self._latest_model_series = {}
+        if isinstance(dataset_stats, dict):
             self._latest_dataset_stats = {
                 str(ds_id): dict(stats) for ds_id, stats in dataset_stats.items() if isinstance(stats, dict)
             }
+        else:
+            self._latest_dataset_stats = {}
         if isinstance(plot_model_series, dict):
             self._latest_plot_model_series = {k: dict(v) for k, v in plot_model_series.items() if isinstance(v, dict)}
         else:
@@ -2422,9 +2485,8 @@ class FittingWindow(QtWidgets.QDialog):
             self._latest_plot_model_x = {str(k): np.asarray(v, dtype=float).reshape(-1) for k, v in plot_model_x.items()}
         else:
             self._latest_plot_model_x = {}
-        self._refresh_project_apply_controls(prefer_broadest=True, running=running)
         if not running:
-            self._run_results_tab.push_live_update(payload)
+            self._run_results_tab.push_live_update(payload, update_tracker=False)
             self._params_ics_tab.repaint_parameter_table()
             return
         self._pending_best_payload = dict(payload)
@@ -2445,7 +2507,7 @@ class FittingWindow(QtWidgets.QDialog):
             return
         if not self._is_active_worker_callback(worker):
             return
-        self._run_results_tab.push_live_update(payload)
+        self._run_results_tab.push_live_update(payload, update_tracker=False)
 
     def _staged_initial_condition_parameters(self) -> Dict[str, Dict[str, float]]:
         staged: Dict[str, Dict[str, float]] = {}
@@ -2649,6 +2711,9 @@ class FittingWindow(QtWidgets.QDialog):
     def _on_worker_error(self, error: object, *, worker: Optional[QtCore.QThread] = None) -> None:
         if not self._is_active_worker_callback(worker):
             return
+        if self._results_rebuild_pending:
+            self._results_rebuild_pending = False
+            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._set_running_state(False)
         payload = coerce_simulation_failure(error)
         message = simulation_failure_user_message(payload)
@@ -2666,7 +2731,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_dataset_stats = {}
         self._latest_plot_model_series = {}
         self._latest_plot_model_x = {}
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
+        self._request_rebuild_subtabs()
 
     def _update_global_plots(self, result: GlobalFitResult) -> None:
         self._run_results_tab.push_final_result(result, self._dataset_entries)

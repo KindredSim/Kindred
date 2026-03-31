@@ -673,6 +673,37 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table.blockSignals(False)
         self._update_remove_button_state()
 
+    def _refresh_live_fit_value_cells(self) -> None:
+        if self._param_table.rowCount() != len(self._parameter_state):
+            self._populate_parameter_table()
+            return
+
+        needs_full_rebuild = False
+        self._param_table.blockSignals(True)
+        try:
+            for row, entry in enumerate(self._parameter_state):
+                value_item = self._param_table.item(row, 3)
+                last_fit_item = self._param_table.item(row, 6)
+                if value_item is None or last_fit_item is None:
+                    needs_full_rebuild = True
+                    break
+
+                value_text = f"{float(entry['value']):.6g}"
+                last_fit = entry.get("last_fit")
+                last_fit_text = "—" if last_fit is None else f"{float(last_fit):.6g}"
+
+                if value_item.text() != value_text:
+                    value_item.setText(value_text)
+                if last_fit_item.text() != last_fit_text:
+                    last_fit_item.setText(last_fit_text)
+        finally:
+            self._param_table.blockSignals(False)
+
+        if needs_full_rebuild:
+            self._populate_parameter_table()
+            return
+        self._update_remove_button_state()
+
     def _on_param_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         """
         Keep `_parameter_state` as the source of truth for per-parameter flags.
@@ -1918,7 +1949,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     if isinstance(ds_map, dict) and param_name in ds_map:
                         entry["value"] = float(ds_map[param_name])
                         entry["last_fit"] = float(ds_map[param_name])
-        self._populate_parameter_table()
+        self._refresh_live_fit_value_cells()
 
     # ------------------------------------------------------------------
     # Public API — running state

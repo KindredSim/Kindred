@@ -96,6 +96,7 @@ class GlobalFitWorker(QtCore.QThread):
         rtol: float = 1e-6,
         atol: float = 1e-12,
         best_update_interval_s: float = 0.25,
+        plot_update_interval_s: float = 2.0,
         run_stamp: Optional[Dict[str, Any]] = None,
         run_stamp_hash: Optional[str] = None,
         run_stamp_short: Optional[str] = None,
@@ -143,6 +144,7 @@ class GlobalFitWorker(QtCore.QThread):
         self._solver = str(solver_method)
         # Tolerances are baked into the simulation closure; kwargs accepted here for API consistency.
         self._best_update_interval_s = max(0.0, float(best_update_interval_s))
+        self._heavy_update_interval_s = max(0.0, float(plot_update_interval_s))
         self._cancelled = False
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -155,6 +157,8 @@ class GlobalFitWorker(QtCore.QThread):
         self._best_params: Dict[str, float] = {}
         self._pending_best = False
         self._last_best_emit_ts = 0.0
+        self._last_heavy_emit_ts = time.monotonic()
+        self._last_best_emit_had_plot_payload = False
         self._best_payload_exception_counts: Dict[str, int] = {}
 
     def _record_best_payload_exception(self, key: str, *, message: str, exc: Exception) -> None:
@@ -254,6 +258,8 @@ class GlobalFitWorker(QtCore.QThread):
         self._best_params = {}
         self._pending_best = False
         self._last_best_emit_ts = 0.0
+        self._last_heavy_emit_ts = time.monotonic()
+        self._last_best_emit_had_plot_payload = False
 
         self.progress.emit(5, f"Running global fit... [{self._solver}]")
         result = self._fit_func(
@@ -309,21 +315,39 @@ class GlobalFitWorker(QtCore.QThread):
             self._emit_best_payload()
 
     def _flush_pending_best(self) -> None:
-        if self._pending_best:
-            self._emit_best_payload()
+        if not self._best_params:
+            return
+        if not self._pending_best and self._last_best_emit_had_plot_payload:
+            return
+        self._pending_best = True
+        self._emit_best_payload(force_heavy=True)
 
-    def _emit_best_payload(self) -> None:
+    def _emit_best_payload(self, *, force_heavy: bool = False) -> None:
         self._wait_if_paused()
         if self._cancelled or not self._pending_best or not self._best_params:
             self._pending_best = False
             return
 
+        now = time.monotonic()
         shared_params = self._best_payload_shared_params()
         dataset_params = self._best_payload_dataset_params()
-        model_series, residual_series, plot_model_series, plot_model_x, dataset_stats = self._build_best_payload_series(
-            shared_params=shared_params,
-            dataset_params=dataset_params,
+        include_plot_payload = bool(
+            force_heavy
+            or self._heavy_update_interval_s <= 0.0
+            or (now - self._last_heavy_emit_ts) >= self._heavy_update_interval_s
         )
+        if include_plot_payload:
+            model_series, residual_series, plot_model_series, plot_model_x, dataset_stats = self._build_best_payload_series(
+                shared_params=shared_params,
+                dataset_params=dataset_params,
+            )
+            self._last_heavy_emit_ts = now
+        else:
+            model_series = None
+            residual_series = None
+            plot_model_series = None
+            plot_model_x = None
+            dataset_stats = None
 
         payload: GlobalFitBestUpdatedPayloadV1 = {
             "version": 1,
@@ -338,7 +362,8 @@ class GlobalFitWorker(QtCore.QThread):
             "dataset_stats": dataset_stats,
         }
         self._pending_best = False
-        self._last_best_emit_ts = time.monotonic()
+        self._last_best_emit_ts = now
+        self._last_best_emit_had_plot_payload = include_plot_payload
         self.bestUpdated.emit(payload)
 
     def _best_payload_shared_params(self) -> dict[str, float]:

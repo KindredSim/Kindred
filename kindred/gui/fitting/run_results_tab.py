@@ -277,6 +277,7 @@ class RunResultsTab(QtWidgets.QWidget):
     """Drop-in replacement for FittingWindow._create_run_results_tab()."""
 
     statusMessage = Signal(str)
+    _ALL_DATASETS_TAB_KEY = "__all_datasets__"
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -287,9 +288,14 @@ class RunResultsTab(QtWidgets.QWidget):
         self._stamp_dialog: Optional[ResultsSummaryDialog] = None
         self._dark_mode = False
         self._dataset_entries: List[Dict[str, Any]] = []
+        self._dataset_tab_ids: List[str] = []
         self._fit_targets_by_dataset: Dict[str, List[str]] = {}
         self._dataset_plot_views: Dict[str, GridPlotView] = {}
         self._all_datasets_plot_view: Optional[GridPlotView] = None
+        self._latest_model_series_by_dataset: Dict[str, Dict[str, np.ndarray]] = {}
+        self._latest_model_x_by_dataset: Dict[str, np.ndarray] = {}
+        self._latest_dataset_stats_by_dataset: Dict[str, Dict[str, float]] = {}
+        self._stale_plot_view_keys: set[str] = set()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -310,6 +316,7 @@ class RunResultsTab(QtWidgets.QWidget):
         layout.addWidget(self._subtab_stack, stretch=1)
 
         self._subtabs.currentChanged.connect(self._subtab_stack.setCurrentIndex)
+        self._subtabs.currentChanged.connect(self._on_subtab_changed)
 
     # ------------------------------------------------------------------
     # Public API
@@ -321,8 +328,12 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_run_stamp_hash = str(stamp_hash)
         self._last_run_stamp_short = str(stamp_short)
         self._last_stats = {}
+        self._latest_model_series_by_dataset = {}
+        self._latest_model_x_by_dataset = {}
+        self._latest_dataset_stats_by_dataset = {}
+        self._stale_plot_view_keys.clear()
         self._tracker_panel.clear()
-        self._refresh_plot_views()
+        self._refresh_plot_views(refresh_all=True)
         if self._stamp_dialog is not None and self._stamp_dialog.isVisible():
             self._stamp_dialog.refresh(
                 self._last_run_stamp,
@@ -378,6 +389,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._tracker_panel.clear()
         self._clear_subtabs()
         self._dataset_plot_views = {}
+        self._dataset_tab_ids = []
 
         for entry in self._dataset_entries:
             ds_id = str(entry.get("id") or "").strip()
@@ -385,6 +397,7 @@ class RunResultsTab(QtWidgets.QWidget):
                 continue
             title = str(entry.get("label") or ds_id)
             plot_view = self._create_plot_view(f"global_fit_results_plot_{ds_id}")
+            self._dataset_tab_ids.append(ds_id)
             self._dataset_plot_views[ds_id] = plot_view
             self._subtab_stack.addWidget(plot_view)
             self._subtabs.addTab(title)
@@ -399,10 +412,16 @@ class RunResultsTab(QtWidgets.QWidget):
         if self._subtabs.count() > 0:
             self._subtabs.setCurrentIndex(0)
             self._subtab_stack.setCurrentIndex(0)
-        self._refresh_plot_views()
+        self._refresh_plot_views(refresh_all=True)
 
-    def push_live_update(self, payload: Dict[str, Any]) -> None:
-        if any(key in payload for key in ("iteration", "cost", "shared_params")):
+    def push_live_update(
+        self,
+        payload: Dict[str, Any],
+        *,
+        refresh_all: bool = False,
+        update_tracker: bool = True,
+    ) -> None:
+        if update_tracker and any(key in payload for key in ("iteration", "cost", "shared_params")):
             self._tracker_panel.update_from_best(payload)
         plot_model_series = payload.get("plot_model_series")
         model_series = plot_model_series if isinstance(plot_model_series, dict) and plot_model_series else (payload.get("model_series") or {})
@@ -412,6 +431,7 @@ class RunResultsTab(QtWidgets.QWidget):
             model_series_by_dataset=model_series if isinstance(model_series, dict) else {},
             model_x_by_dataset=plot_model_x if isinstance(plot_model_x, dict) else {},
             dataset_stats_by_dataset=dataset_stats if isinstance(dataset_stats, dict) else {},
+            refresh_all=bool(refresh_all),
         )
 
     def push_final_result(self, result: "GlobalFitResult", dataset_entries: Sequence[Dict[str, Any]]) -> None:
@@ -444,13 +464,19 @@ class RunResultsTab(QtWidgets.QWidget):
             model_series_by_dataset=model_series if isinstance(model_series, dict) else {},
             model_x_by_dataset=model_x_by_dataset if isinstance(model_x_by_dataset, dict) else {},
             dataset_stats_by_dataset=dataset_stats,
+            refresh_all=True,
         )
 
     def clear(self) -> None:
         self._dataset_entries = []
+        self._dataset_tab_ids = []
         self._fit_targets_by_dataset = {}
         self._dataset_plot_views = {}
         self._all_datasets_plot_view = None
+        self._latest_model_series_by_dataset = {}
+        self._latest_model_x_by_dataset = {}
+        self._latest_dataset_stats_by_dataset = {}
+        self._stale_plot_view_keys.clear()
         self._tracker_panel.clear()
         self._clear_subtabs()
 
@@ -478,6 +504,7 @@ class RunResultsTab(QtWidgets.QWidget):
             widget = self._subtab_stack.widget(0)
             self._subtab_stack.removeWidget(widget)
             widget.deleteLater()
+        self._stale_plot_view_keys.clear()
         self._subtabs.hide()
 
     def _create_plot_view(self, object_name: str) -> GridPlotView:
@@ -493,38 +520,143 @@ class RunResultsTab(QtWidgets.QWidget):
         model_series_by_dataset: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
         model_x_by_dataset: Optional[Dict[str, np.ndarray]] = None,
         dataset_stats_by_dataset: Optional[Dict[str, Dict[str, float]]] = None,
+        refresh_all: bool = True,
     ) -> None:
-        model_series_by_dataset = model_series_by_dataset or {}
-        model_x_by_dataset = model_x_by_dataset or {}
-        dataset_stats_by_dataset = dataset_stats_by_dataset or {}
-        overlay_payloads: List[Dict[str, Any]] = []
-        overlay_species: set[str] = set()
-        for entry in self._dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            plot_view = self._dataset_plot_views.get(ds_id)
-            if plot_view is None:
-                continue
-            payload = self._build_grid_dataset_payload(
-                entry,
-                self._fit_targets_by_dataset.get(ds_id, []),
-                model_series=model_series_by_dataset.get(ds_id),
-                model_x=model_x_by_dataset.get(ds_id),
-                dataset_stats=dataset_stats_by_dataset.get(ds_id),
-            )
-            species_names = sorted((payload or {}).get("all_species", {}).keys())
-            plot_view.set_datasets([payload] if payload is not None else [])
-            plot_view.set_species_selection(species_names)
-            plot_view.set_dark_mode(self._dark_mode)
-            if payload is not None:
-                overlay_payloads.append(payload)
-                overlay_species.update(species_names)
+        self._latest_model_series_by_dataset = {
+            str(ds_id): {
+                str(name): _as_float_array(values)
+                for name, values in (series or {}).items()
+            }
+            for ds_id, series in (model_series_by_dataset or {}).items()
+            if isinstance(series, dict)
+        }
+        self._latest_model_x_by_dataset = {
+            str(ds_id): _as_float_array(values)
+            for ds_id, values in (model_x_by_dataset or {}).items()
+        }
+        self._latest_dataset_stats_by_dataset = {
+            str(ds_id): dict(stats)
+            for ds_id, stats in (dataset_stats_by_dataset or {}).items()
+            if isinstance(stats, dict)
+        }
 
+        plot_keys = self._all_plot_view_keys()
+        if refresh_all:
+            for key in plot_keys:
+                self._refresh_plot_view_for_key(key)
+            self._stale_plot_view_keys.clear()
+            return
+
+        visible_key = self._current_plot_view_key()
+        if visible_key is None:
+            self._stale_plot_view_keys.update(plot_keys)
+            return
+
+        self._refresh_plot_view_for_key(visible_key)
+        self._stale_plot_view_keys.update(plot_keys)
+        self._stale_plot_view_keys.discard(visible_key)
+
+    def _apply_plot_species_selection(self, plot_view: GridPlotView, species_names: Sequence[str]) -> None:
+        species = [str(name).strip() for name in species_names if str(name).strip()]
+        if not species:
+            return
+
+        def _safe_set() -> None:
+            try:
+                plot_view.set_species_selection(species)
+            except RuntimeError:
+                return
+            except Exception:
+                return
+
+        redraw_timer = getattr(plot_view, "_redraw_timer", None)
+        if redraw_timer is not None and getattr(redraw_timer, "isActive", lambda: False)():
+            def _apply_after_redraw() -> None:
+                try:
+                    redraw_timer.timeout.disconnect(_apply_after_redraw)
+                except (RuntimeError, TypeError):
+                    pass
+                _safe_set()
+
+            redraw_timer.timeout.connect(_apply_after_redraw)
+            return
+
+        _safe_set()
+
+    def _all_plot_view_keys(self) -> List[str]:
+        keys = list(self._dataset_tab_ids)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_datasets(overlay_payloads)
-            self._all_datasets_plot_view.set_species_selection(sorted(overlay_species))
-            self._all_datasets_plot_view.set_dark_mode(self._dark_mode)
+            keys.append(self._ALL_DATASETS_TAB_KEY)
+        return keys
+
+    def _current_plot_view_key(self) -> Optional[str]:
+        return self._plot_view_key_for_index(self._subtabs.currentIndex())
+
+    def _plot_view_key_for_index(self, index: int) -> Optional[str]:
+        if index < 0:
+            return None
+        if 0 <= index < len(self._dataset_tab_ids):
+            return self._dataset_tab_ids[index]
+        if (
+            index == len(self._dataset_tab_ids)
+            and self._all_datasets_plot_view is not None
+        ):
+            return self._ALL_DATASETS_TAB_KEY
+        return None
+
+    def _dataset_entry_for_id(self, dataset_id: str) -> Optional[Dict[str, Any]]:
+        for entry in self._dataset_entries:
+            if str(entry.get("id") or "").strip() == str(dataset_id or "").strip():
+                return entry
+        return None
+
+    def _refresh_plot_view_for_key(self, key: str) -> None:
+        if key == self._ALL_DATASETS_TAB_KEY:
+            plot_view = self._all_datasets_plot_view
+            if plot_view is None:
+                return
+            overlay_payloads: List[Dict[str, Any]] = []
+            overlay_species: set[str] = set()
+            for ds_id in self._dataset_tab_ids:
+                entry = self._dataset_entry_for_id(ds_id)
+                if entry is None:
+                    continue
+                payload = self._build_grid_dataset_payload(
+                    entry,
+                    self._fit_targets_by_dataset.get(ds_id, []),
+                    model_series=self._latest_model_series_by_dataset.get(ds_id),
+                    model_x=self._latest_model_x_by_dataset.get(ds_id),
+                    dataset_stats=self._latest_dataset_stats_by_dataset.get(ds_id),
+                )
+                if payload is None:
+                    continue
+                overlay_payloads.append(payload)
+                overlay_species.update((payload.get("all_species") or {}).keys())
+            plot_view.set_datasets(overlay_payloads)
+            self._apply_plot_species_selection(plot_view, sorted(overlay_species))
+            return
+
+        plot_view = self._dataset_plot_views.get(key)
+        entry = self._dataset_entry_for_id(key)
+        if plot_view is None or entry is None:
+            return
+        payload = self._build_grid_dataset_payload(
+            entry,
+            self._fit_targets_by_dataset.get(key, []),
+            model_series=self._latest_model_series_by_dataset.get(key),
+            model_x=self._latest_model_x_by_dataset.get(key),
+            dataset_stats=self._latest_dataset_stats_by_dataset.get(key),
+        )
+        species_names = sorted((payload or {}).get("all_species", {}).keys())
+        plot_view.set_datasets([payload] if payload is not None else [])
+        self._apply_plot_species_selection(plot_view, species_names)
+
+    def _on_subtab_changed(self, index: int) -> None:
+        key = self._plot_view_key_for_index(int(index))
+        if key is None or key not in self._stale_plot_view_keys:
+            return
+        self._refresh_plot_view_for_key(key)
+        self._stale_plot_view_keys.discard(key)
 
     def _build_grid_dataset_payload(
         self,
