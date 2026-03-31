@@ -89,13 +89,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         self._init_fit_targets_state(dataset_entries)
 
-        # If no mechanism species provided, derive from available data so the
+        # If no mechanism species provided, derive from raw data columns so the
         # table is always populated when datasets have species_data.
         if not self._mechanism_species:
-            all_available: set[str] = set()
-            for avail in self._fit_targets_available_by_dataset.values():
-                all_available.update(avail)
-            self._mechanism_species = sorted(all_available)
+            all_columns: set[str] = set()
+            for series_map in self._fit_targets_full_series_by_dataset.values():
+                all_columns.update(series_map.keys())
+            self._mechanism_species = sorted(all_columns)
 
         self._current_row_species: list[str] = []
         self._ic_pending: Dict[str, Dict[str, dict[str, object]]] = {}
@@ -109,8 +109,66 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._is_refreshing = False
         self._dataset_weight_is_refreshing = False
         self._cached_modeled_series: frozenset = frozenset()
+        self._fit_universe_initialized = False
 
         self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Fit-universe helpers
+    # ------------------------------------------------------------------
+    def _safe_modeled_series(self) -> set[str]:
+        """Return the modeled species set with defensive error handling."""
+        try:
+            modeled = self._modeled_series_getter()
+            result = {str(s) for s in (modeled or set()) if str(s).strip()}
+            if result:
+                return result
+        except Exception:
+            pass
+        return {str(s) for s in self._mechanism_species if str(s).strip()}
+
+    def _recompute_fit_universe(self) -> None:
+        """Recompute available_by_dataset as observed AND modeled for ALL datasets.
+
+        Also prunes pending/applied selections and weights to the new fit-universe.
+        Emits targetsApplied if any applied selection was actually pruned so that
+        FittingWindow rebuilds its run payloads.
+        """
+        modeled = self._safe_modeled_series()
+        applied_changed = False
+        for ds_id in list(self._fit_targets_full_series_by_dataset.keys()):
+            all_columns = sorted(self._fit_targets_full_series_by_dataset[ds_id].keys())
+            fit_universe = [s for s in all_columns if s in modeled]
+            fit_universe_set = set(fit_universe)
+            self._fit_targets_available_by_dataset[ds_id] = fit_universe
+
+            if ds_id in self._fit_targets_selection_pending:
+                self._fit_targets_selection_pending[ds_id] &= fit_universe_set
+            if ds_id in self._fit_targets_selection_applied:
+                old_applied = self._fit_targets_selection_applied[ds_id]
+                pruned = [s for s in old_applied if s in fit_universe_set]
+                if len(pruned) != len(old_applied):
+                    applied_changed = True
+                self._fit_targets_selection_applied[ds_id] = pruned
+            if ds_id in self._fit_target_weights_pending:
+                self._fit_target_weights_pending[ds_id] = {
+                    k: v for k, v in self._fit_target_weights_pending[ds_id].items()
+                    if k in fit_universe_set
+                }
+            if ds_id in self._fit_target_weights_applied:
+                applied_set = set(self._fit_targets_selection_applied.get(ds_id, []))
+                self._fit_target_weights_applied[ds_id] = {
+                    k: v for k, v in self._fit_target_weights_applied[ds_id].items()
+                    if k in applied_set
+                }
+            if ds_id in self._fit_target_weights_pending_invalid:
+                self._fit_target_weights_pending_invalid[ds_id] = {
+                    k: v for k, v in self._fit_target_weights_pending_invalid[ds_id].items()
+                    if k in fit_universe_set
+                }
+
+        if applied_changed:
+            self.targetsApplied.emit()
 
     # ------------------------------------------------------------------
     # State initialization (ported from TargetsWeightsTab)
@@ -610,9 +668,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             mechanism_set = {str(species) for species in self._mechanism_species if str(species).strip()}
             pending_ic = self._pending_ic_state_for_dataset(ds_id)
             self._current_row_species = self._displayed_row_species_for_dataset(ds_id)
-            displayable_with_data = set(self._current_row_species) & available
-            if ds_id in self._fit_targets_selection_pending:
-                self._fit_targets_selection_pending[ds_id] &= displayable_with_data
 
             self._table.setRowCount(len(self._current_row_species))
             for row, species in enumerate(self._current_row_species):
@@ -696,6 +751,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         self._table.setItem(row, col, disabled_item)
         finally:
             self._is_refreshing = False
+            if not self._cached_modeled_series:
+                self._cached_modeled_series = frozenset(self._safe_modeled_series())
+            if not self._fit_universe_initialized:
+                self._fit_universe_initialized = True
+                self._recompute_fit_universe()
 
     # ------------------------------------------------------------------
     # Table event handling
@@ -961,9 +1021,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         for ds_id in sorted(set(self._fit_targets_selection_pending.keys()) | set(new_applied.keys())):
             available = list(self._fit_targets_available_by_dataset.get(ds_id, []))
-            displayed = set(self._displayed_row_species_for_dataset(ds_id))
             pending_set = self._fit_targets_selection_pending.get(ds_id, set()) or set()
-            pending_list = [name for name in available if name in pending_set and name in displayed]
+            pending_list = [name for name in available if name in pending_set]
             if ds_id in used_ids and not pending_list:
                 invalid_pending_used.add(ds_id)
                 continue
@@ -1241,7 +1300,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     ) -> None:
         self._fit_targets_full_series_by_dataset[dataset_id] = dict(full_series)
         self._fit_targets_full_t_by_dataset[dataset_id] = full_t
-        self._fit_targets_available_by_dataset[dataset_id] = list(available)
+        modeled = self._safe_modeled_series()
+        fit_universe = [s for s in available if s in modeled]
+        self._fit_targets_available_by_dataset[dataset_id] = fit_universe
         self._fit_targets_selection_applied[dataset_id] = []
         self._fit_targets_selection_pending[dataset_id] = set()
         self._fit_target_weights_applied[dataset_id] = {}
@@ -1306,14 +1367,23 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
         except Exception:
             current_modeled = frozenset()
-        if species == self._mechanism_species and current_modeled == self._cached_modeled_series:
+
+        mechanism_changed = (species != self._mechanism_species)
+        modeled_changed = (current_modeled != self._cached_modeled_series)
+
+        if not mechanism_changed and not modeled_changed:
             return
+
         self._cached_modeled_series = current_modeled
-        self._mechanism_species = list(species)
-        self._seed_all_ic_state_from_dataset_manager()
+
+        if mechanism_changed:
+            self._mechanism_species = list(species)
+            self._seed_all_ic_state_from_dataset_manager()
+            self._ic_editor_dirty = False
+            self._clear_ic_error()
+
+        self._recompute_fit_universe()
         self._current_row_species = []
-        self._ic_editor_dirty = False
-        self._clear_ic_error()
         if self._current_dataset_id:
             self._populate_table()
         self._update_combined_dirty_state()

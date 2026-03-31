@@ -1009,8 +1009,8 @@ def test_bulk_invert_excludes_hidden_species(qt_app):
         qt_app.processEvents()
 
 
-def test_populate_table_prunes_pending(qt_app):
-    """_populate_table must remove hidden species from pending selection."""
+def test_non_modeled_species_excluded_from_available_at_source(qt_app):
+    """Non-modeled species are excluded from available_by_dataset at construction."""
     entries = _make_entries(
         species_data={
             "A": np.linspace(1, 0, 5),
@@ -1023,14 +1023,12 @@ def test_populate_table_prunes_pending(qt_app):
     tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
     try:
         tbl.load_for_dataset("ds1")
-        # Inject hidden species into pending
-        tbl._fit_targets_selection_pending["ds1"].add("pH")
-        tbl._populate_table()
-        qt_app.processEvents()
-
-        assert "pH" not in tbl._fit_targets_selection_pending.get("ds1", set())
-        assert "A" in tbl._fit_targets_selection_pending["ds1"]
-        assert "B" in tbl._fit_targets_selection_pending["ds1"]
+        avail = set(tbl._fit_targets_available_by_dataset.get("ds1", []))
+        assert "pH" not in avail, "pH should be excluded from fit-universe at source"
+        assert "A" in avail
+        assert "B" in avail
+        # pH data is still in full_series for plotting
+        assert "pH" in tbl._fit_targets_full_series_by_dataset.get("ds1", {})
     finally:
         tbl.close()
         qt_app.processEvents()
@@ -1063,6 +1061,257 @@ def test_set_mechanism_species_detects_modeled_series_change(qt_app):
         assert tbl._table.rowCount() == 3
         species_names = [tbl._table.item(r, _Col.SPECIES).text() for r in range(3)]
         assert "selectivity" in species_names
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Fit-universe invariant tests
+# ---------------------------------------------------------------------------
+
+
+def test_available_by_dataset_is_fit_universe(qt_app):
+    """available_by_dataset must contain only observed AND modeled species."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "pH": np.linspace(7.0, 7.5, 5),
+        },
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(
+        entries=entries,
+        species=["A", "B"],
+        manager=mgr,
+        modeled_series={"A", "B"},
+    )
+    try:
+        tbl.load_for_dataset("ds1")
+        avail = tbl._fit_targets_available_by_dataset["ds1"]
+        assert sorted(avail) == ["A", "B"], (
+            f"pH should be excluded at source; got {avail}"
+        )
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_initial_selection_cannot_contain_non_modeled(qt_app):
+    """After first load, pending and applied selections contain only fit-universe species."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "pH": np.linspace(7.0, 7.5, 5),
+        },
+        selected=["A", "pH"],
+    )
+    mgr = _make_manager(["A"])
+    tbl = _make_table(
+        entries=entries,
+        species=["A"],
+        manager=mgr,
+        modeled_series={"A"},
+    )
+    try:
+        # Fit-universe is computed on first _populate_table (deferred from init)
+        tbl.load_for_dataset("ds1")
+        pending = tbl._fit_targets_selection_pending.get("ds1", set())
+        applied = tbl._fit_targets_selection_applied.get("ds1", [])
+        assert pending == {"A"}, f"Pending should be {{A}} only; got {pending}"
+        assert applied == ["A"], f"Applied should be [A] only; got {applied}"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_add_dataset_state_filters_to_fit_universe(qt_app):
+    """add_dataset_state must filter available to fit-universe."""
+    entries = _make_entries()
+    mgr = _make_manager(["A", "B", "C"])
+    tbl = _make_table(
+        entries=entries,
+        species=["A", "B", "C"],
+        manager=mgr,
+        modeled_series={"A", "B", "C"},
+    )
+    try:
+        tbl.add_dataset_state(
+            "ds2",
+            full_series={
+                "A": np.linspace(1, 0, 5),
+                "C": np.linspace(0.1, 0.5, 5),
+                "pH": np.linspace(7.0, 7.5, 5),
+            },
+            full_t=np.linspace(0, 1, 5),
+            available=["A", "C", "pH"],
+        )
+        avail = tbl._fit_targets_available_by_dataset["ds2"]
+        assert sorted(avail) == ["A", "C"], (
+            f"pH should be excluded from fit-universe; got {avail}"
+        )
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_set_mechanism_species_preserves_ic_when_only_modeled_changes(qt_app):
+    """IC edits must survive when only modeled_series changes (not mechanism)."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+        },
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B"])
+    modeled = [{"A", "B"}]
+    tbl = _make_table(
+        entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"},
+    )
+    try:
+        tbl._modeled_series_getter = lambda: modeled[0]
+        tbl.load_for_dataset("ds1")
+
+        # Manually edit IC pending for species A
+        pending_ic = tbl._pending_ic_state_for_dataset("ds1")
+        pending_ic["A"]["initial"] = 9.9
+        tbl._ic_editor_dirty = True
+
+        # Change modeled set (add observable), but keep mechanism species the same
+        modeled[0] = {"A", "B", "selectivity"}
+        tbl.set_mechanism_species(["A", "B"])
+
+        # IC edits must survive
+        refreshed = tbl._pending_ic_state_for_dataset("ds1")
+        assert refreshed["A"]["initial"] == 9.9, (
+            f"IC edit lost; got {refreshed['A']['initial']}"
+        )
+        assert tbl._ic_editor_dirty is True, "IC dirty flag was reset"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_set_mechanism_species_reseeds_ic_when_mechanism_changes(qt_app):
+    """IC must be reseeded from dataset_manager when mechanism species change."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+        },
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B", "C"])
+    tbl = _make_table(
+        entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"},
+    )
+    try:
+        tbl.load_for_dataset("ds1")
+
+        # Edit IC pending
+        pending_ic = tbl._pending_ic_state_for_dataset("ds1")
+        pending_ic["A"]["initial"] = 9.9
+        tbl._ic_editor_dirty = True
+
+        # Change mechanism species (add C)
+        tbl.set_mechanism_species(["A", "B", "C"])
+
+        refreshed = tbl._pending_ic_state_for_dataset("ds1")
+        assert refreshed["A"]["initial"] != 9.9, (
+            "IC edit should have been reseeded from manager"
+        )
+        assert tbl._ic_editor_dirty is False, "IC dirty flag should be reset"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_recompute_fit_universe_prunes_all_datasets(qt_app):
+    """When modeled_series shrinks, ALL datasets must have stale selections pruned."""
+    t = np.linspace(0, 1, 5)
+    entries = [
+        {
+            "id": "ds1", "label": "DS 1", "t": t,
+            "species_data": {
+                "A": np.linspace(1, 0, 5),
+                "B": np.linspace(0.2, 0.9, 5),
+                "X": np.linspace(0.5, 0.3, 5),
+            },
+            "selected_species": ["A", "B", "X"], "weight": 1.0, "include": True,
+        },
+        {
+            "id": "ds2", "label": "DS 2", "t": t,
+            "species_data": {
+                "A": np.linspace(0.5, 1, 5),
+                "X": np.linspace(0.1, 0.2, 5),
+            },
+            "selected_species": ["A", "X"], "weight": 1.0, "include": True,
+        },
+    ]
+    modeled = [{"A", "B", "X"}]
+    mgr = _make_manager(
+        ["A", "B"],
+        by_dataset={
+            "ds1": {"initial_conditions": {"A": 1.0, "B": 0.5}, "fit_flags": {}, "log10_flags": {}, "bounds": {}},
+            "ds2": {"initial_conditions": {"A": 1.0, "B": 0.5}, "fit_flags": {}, "log10_flags": {}, "bounds": {}},
+        },
+    )
+    tbl = _make_table(
+        entries=entries, species=["A", "B"], manager=mgr,
+        modeled_series={"A", "B", "X"},
+    )
+    try:
+        tbl._modeled_series_getter = lambda: modeled[0]
+        tbl.load_for_dataset("ds1")
+
+        # Apply targets so that X is in applied selection for both datasets
+        tbl._apply_changes()
+
+        # Verify X is in applied for both
+        assert "X" in tbl._fit_targets_selection_applied.get("ds1", [])
+        assert "X" in tbl._fit_targets_selection_applied.get("ds2", [])
+
+        # Now shrink modeled (remove X)
+        modeled[0] = {"A", "B"}
+        tbl.set_mechanism_species(["A", "B"])
+
+        # X must be pruned from ALL datasets' pending and applied
+        for ds_id in ["ds1", "ds2"]:
+            pending = tbl._fit_targets_selection_pending.get(ds_id, set())
+            applied = tbl._fit_targets_selection_applied.get(ds_id, [])
+            assert "X" not in pending, f"X still in pending for {ds_id}: {pending}"
+            assert "X" not in applied, f"X still in applied for {ds_id}: {applied}"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_first_set_mechanism_species_noop_after_cache_seeded(qt_app):
+    """After cache is seeded, set_mechanism_species with same args is a no-op."""
+    entries = _make_entries()
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(
+        entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"},
+    )
+    try:
+        tbl.load_for_dataset("ds1")
+
+        # Edit IC
+        pending_ic = tbl._pending_ic_state_for_dataset("ds1")
+        pending_ic["A"]["initial"] = 7.7
+        tbl._ic_editor_dirty = True
+
+        # Call with identical species + identical modeled -- should be a true no-op
+        tbl.set_mechanism_species(["A", "B"])
+
+        refreshed = tbl._pending_ic_state_for_dataset("ds1")
+        assert refreshed["A"]["initial"] == 7.7, (
+            f"IC edit was destroyed by spurious reset; got {refreshed['A']['initial']}"
+        )
+        assert tbl._ic_editor_dirty is True, "IC dirty flag was reset by no-op call"
     finally:
         tbl.close()
         qt_app.processEvents()
