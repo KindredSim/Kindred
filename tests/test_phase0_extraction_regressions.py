@@ -155,28 +155,16 @@ def _make_fitting_window():
 
 
 # ===================================================================
-# ITEM 19 — Subset stale suffix on apply failure
+# ITEM 19 — Results tab rebuild on apply
 # ===================================================================
 
-def test_on_targets_applied_subset_failure(qt_app):
-    """When subset widget update fails, status shows '(subset view stale)' suffix.
-
-    Note: signal ordering (targetsApplied before statusMessage) is verified
-    structurally at targets_weights_tab.py:834,840 — line 834 emits
-    targetsApplied, line 840 emits statusMessage. This test exercises the
-    FittingWindow handler logic directly, not the signal dispatch order.
-    """
+def test_on_targets_applied_rebuilds_results_tab(qt_app):
+    """Applied targets rebuild the eager Results tab plot surface."""
     window = _make_fitting_window()
     try:
-        window._subset_widget.set_dataset_entries = lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("test subset failure")
-        )
         window._on_targets_applied()
-        assert window._subset_view_stale is True
-
-        window._on_targets_status_message("Fit targets applied")
-        assert window._status_label.text().endswith("(subset view stale)")
-        assert window._subset_view_stale is False
+        assert "ds1" in window._run_results_tab._dataset_plot_views
+        assert window._run_results_tab._dataset_plot_views["ds1"]._datasets
     finally:
         window.close()
         qt_app.processEvents()
@@ -350,18 +338,19 @@ def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
 
 
 # ===================================================================
-# ITEM 21 — Subset stale suffix on sampling-applied failure
+# ITEM 21 — Results tab rebuild on sampling apply
 # ===================================================================
 
-def test_on_sampling_applied_subset_failure(qt_app):
-    """When subset widget update fails during sampling-applied, status shows stale suffix."""
+def test_on_sampling_applied_rebuilds_results_tab(qt_app):
+    """Sampling apply rebuilds Results tab data and keeps a clean status message."""
     window = _make_fitting_window()
     try:
-        window._subset_widget.set_dataset_entries = lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("test subset failure")
+        window._on_data_tab_sampling_applied(
+            "ds1",
+            {"t_min": 0.0, "t_max": 1.0, "n_points": 10, "x_name": "t", "x_mapping_mode": "auto"},
         )
-        window._on_data_tab_sampling_applied("ds1", {"n_points": 10})
-        assert window._status_label.text().endswith("(subset view stale)")
+        assert window._status_label.text() == "Sampling applied"
+        assert "ds1" in window._run_results_tab._dataset_plot_views
     finally:
         window.close()
         qt_app.processEvents()

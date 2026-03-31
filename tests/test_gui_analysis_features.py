@@ -174,7 +174,6 @@ def test_fitting_window_smoke(qapp):
 def test_fitting_window_small_multiples_grid(qapp):
     pytest.importorskip("pyqtgraph", reason="pyqtgraph is required for the fitting window small-multiples grid.")
     from kindred.gui.fitting.window import FittingWindow
-    from kindred.gui.widgets.dataset_subset_widget import DatasetSubsetWidget
 
     parameter_defs = [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}]
     t_axis = np.linspace(0, 2, 8)
@@ -216,8 +215,8 @@ def test_fitting_window_small_multiples_grid(qapp):
     )
 
     assert hasattr(window, "refresh_grid_view")
-    assert isinstance(window._subset_widget, DatasetSubsetWidget)
-    assert {ds["name"] for ds in getattr(window._subset_widget._grid, "_datasets", [])} == {"ds1", "ds2", "ds3"}
+    assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1", "ds2", "ds3"}
+    assert {ds["name"] for ds in getattr(window._run_results_tab._all_datasets_plot_view, "_datasets", [])} == {"ds1", "ds2", "ds3"}
 
     model_series = {
         "ds1": {"A": np.exp(-0.25 * t_axis)},
@@ -225,7 +224,7 @@ def test_fitting_window_small_multiples_grid(qapp):
         "ds3": {"A": np.exp(-0.45 * t_axis)},
     }
     window.refresh_grid_view(dataset_entries, current_models=model_series)
-    ds1_payload = next(ds for ds in window._subset_widget._grid._datasets if ds.get("name") == "ds1")
+    ds1_payload = next(ds for ds in window._run_results_tab._all_datasets_plot_view._datasets if ds.get("name") == "ds1")
     assert ds1_payload.get("model_y") is not None
     assert np.allclose(ds1_payload["model_y"], model_series["ds1"]["A"])
 

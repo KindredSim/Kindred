@@ -73,7 +73,9 @@ class GridPlotView(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        controls_layout = QtWidgets.QHBoxLayout()
+        self._controls_widget = QtWidgets.QWidget(self)
+        self._controls_widget.setObjectName("grid_plot_view_controls")
+        controls_layout = QtWidgets.QHBoxLayout(self._controls_widget)
         controls_layout.setContentsMargins(2, 2, 2, 0)
         controls_layout.setSpacing(6)
 
@@ -95,7 +97,7 @@ class GridPlotView(QtWidgets.QWidget):
         controls_layout.addWidget(self._species_list)
 
         controls_layout.addStretch()
-        layout.addLayout(controls_layout)
+        layout.addWidget(self._controls_widget)
 
         ok, pg, _exc = try_import_pyqtgraph()
         self._pg = pg if ok else None
@@ -808,6 +810,10 @@ class GridPlotView(QtWidgets.QWidget):
         self._species_list.clear()
         self._species_list.blockSignals(False)
         self._schedule_redraw()
+
+    def set_controls_visible(self, visible: bool) -> None:
+        """Show or hide the built-in legend/species control row."""
+        self._controls_widget.setVisible(bool(visible))
 
     def set_autorange_locked(self, locked: bool) -> None:
         """

@@ -305,13 +305,15 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
         apply_btn.click()
         qt_app.processEvents()
 
-        selector = window._subset_widget._selector
-        assert selector.selected_dataset_species() == {"ds1": {"A"}, "ds2": {"B"}}
+        assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1", "ds2"}
+        assert set(window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]["all_species"].keys()) == {"A"}
+        assert set(window._run_results_tab._dataset_plot_views["ds2"]._datasets[0]["all_species"].keys()) == {"B"}
 
         window._remove_datasets_from_session(["ds2"])
         assert window._data_tab._dataset_table.rowCount() == 1
         assert [entry["id"] for entry in window._dataset_entries] == ["ds1"]
-        assert selector.selected_dataset_species() == {"ds1": {"A"}}
+        assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1"}
+        assert set(window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]["all_species"].keys()) == {"A"}
 
         window._add_datasets_to_session(["ds2"])
         assert window._data_tab._dataset_table.rowCount() == 2
@@ -321,7 +323,9 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
         assert ds2_entry.get("include") is True
         assert float(ds2_entry.get("weight")) == pytest.approx(1.0)
         assert window._species_table.fit_targets_selection_applied.get("ds2") == []
-        assert selector.selected_dataset_species() == {"ds1": {"A"}}
+        assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1", "ds2"}
+        assert set(window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]["all_species"].keys()) == {"A"}
+        assert window._run_results_tab._dataset_plot_views["ds2"]._datasets == []
     finally:
         window.close()
 

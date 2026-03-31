@@ -81,14 +81,15 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         qt_app.processEvents()
 
         top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
-        shell_splitter = window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter")
         content_stack = window.findChild(QtWidgets.QStackedWidget, "global_fit_current_tab_stack")
+        results_subtabs = window.findChild(QtWidgets.QTabBar, "global_fit_results_subtabs")
         footer = window.findChild(QtWidgets.QWidget, "global_fit_footer")
 
         assert top_tabs is not None
-        assert shell_splitter is not None
         assert content_stack is not None
+        assert results_subtabs is not None
         assert footer is not None
+        assert window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_right_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
@@ -139,16 +140,13 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert footer.isAncestorOf(results_summary_button)
         assert footer.isAncestorOf(run_block)
 
-        # On Data and Targets tab (config): subset_widget is hidden
-        assert not window._subset_widget.isVisible()
+        # Results subtab host is populated eagerly even before the Results page is active.
+        assert [results_subtabs.tabText(i) for i in range(results_subtabs.count())] == ["ds1", "All Datasets"]
 
-        # Switch to Results to verify splitter sizing
+        # Switch to Results and verify the current page only; no shell splitter remains.
         top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
-        assert window._subset_widget.isVisible()
-        shell_sizes = shell_splitter.sizes()
-        assert len(shell_sizes) == 2
-        assert shell_sizes[0] > shell_sizes[1]
+        assert content_stack.currentWidget() is window._run_results_tab
     finally:
         window.close()
 
@@ -210,35 +208,29 @@ def test_shell_uses_single_top_navigation_host_and_survives_narrow_resize(qt_app
         qt_app.processEvents()
 
         top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
-        shell_splitter = window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter")
         content_stack = window.findChild(QtWidgets.QStackedWidget, "global_fit_current_tab_stack")
 
         assert top_tabs is not None
-        assert shell_splitter is not None
         assert content_stack is not None
+        assert window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_right_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
 
         assert top_tabs.count() == 3
-        # On Data and Targets tab (default): subset hidden, content_stack gets full width
-        assert not window._subset_widget.isVisible()
         assert content_stack.width() >= 260
-        assert window._subset_widget.parentWidget() is shell_splitter
-        assert content_stack.parentWidget() is shell_splitter
+        assert content_stack.parentWidget() is window
 
-        # Switch to Results: subset visible with expected width
+        # Switch to Results: stack still occupies the shell directly.
         top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
-        assert window._subset_widget.isVisible()
-        assert window._subset_widget.width() >= 300
         assert content_stack.width() >= 260
     finally:
         window.close()
 
 
-def test_subset_widget_visible_only_on_results_tab(qt_app):
-    """Regression: left plot panel hidden on config tabs, visible on Results."""
+def test_results_page_switches_without_subset_panel_logic(qt_app):
+    """Regression: Results page is stack-driven and no subset shell remains."""
     window = _make_window()
     try:
         window.show()
@@ -246,24 +238,18 @@ def test_subset_widget_visible_only_on_results_tab(qt_app):
 
         top_tabs = window._tabs
 
-        # On construction (Data and Targets tab, index 0): subset_widget hidden
-        assert not window._subset_widget.isVisible()
+        assert not hasattr(window, "_subset_widget")
 
-        # Switch to each config tab — still hidden
+        # Switch to each page — the stack updates without any left-panel show/hide behavior.
         for title in ("Data and Targets", "Parameters"):
             top_tabs.setCurrentIndex(_tab_index(top_tabs, title))
             qt_app.processEvents()
-            assert not window._subset_widget.isVisible(), f"subset visible on {title}"
+            assert window._current_tab_stack.currentIndex() == _tab_index(top_tabs, title)
 
-        # Switch to Results — visible
+        # Switch to Results — the Results page becomes current.
         top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
-        assert window._subset_widget.isVisible()
-
-        # Switch back to Data and Targets — hidden again
-        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data and Targets"))
-        qt_app.processEvents()
-        assert not window._subset_widget.isVisible()
+        assert window._current_tab_stack.currentWidget() is window._run_results_tab
     finally:
         window.close()
 
@@ -309,23 +295,19 @@ def test_unified_layout_structure_and_subset_visibility(qt_app):
         # Unified list is populated with 1 dataset
         assert dt_tab.unified_list.selected_dataset_id() == "ds1"
 
-        # Subset widget hidden on Data and Targets
-        assert not window._subset_widget.isVisible()
-
-        # Subset widget hidden on Parameters
+        # Results page is a normal stack page; no separate subset widget remains.
+        assert not hasattr(window, "_subset_widget")
         top_tabs.setCurrentIndex(_tab_index(top_tabs, "Parameters"))
         qt_app.processEvents()
-        assert not window._subset_widget.isVisible()
+        assert window._current_tab_stack.currentWidget() is window._params_ics_tab
 
-        # Subset widget visible on Results
         top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
         qt_app.processEvents()
-        assert window._subset_widget.isVisible()
+        assert window._current_tab_stack.currentWidget() is window._run_results_tab
 
-        # Back to Data and Targets — hidden again
         top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data and Targets"))
         qt_app.processEvents()
-        assert not window._subset_widget.isVisible()
+        assert window._current_tab_stack.currentWidget() is window._data_targets_tab
 
         # Species table is loaded for a dataset (proves on_tab_activated ran during construction)
         assert window._species_table._current_dataset_id is not None

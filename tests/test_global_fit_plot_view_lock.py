@@ -54,7 +54,10 @@ def test_global_fit_running_state_disables_subset_grid_autorange(qt_app):
         window.show()
         qt_app.processEvents()
 
-        grid = window._subset_widget._grid
+        window._tabs.setCurrentIndex([window._tabs.tabText(i) for i in range(window._tabs.count())].index("Results"))
+        qt_app.processEvents()
+
+        grid = window._run_results_tab._dataset_plot_views["ds1"]
         assert grid._plot_items, "Expected at least one plot item in the subset grid."
         vb = grid._plot_items[0].getViewBox()
 
@@ -72,7 +75,10 @@ def test_global_fit_best_updates_do_not_change_view_range_while_running(qt_app):
         window.show()
         qt_app.processEvents()
 
-        grid = window._subset_widget._grid
+        window._tabs.setCurrentIndex([window._tabs.tabText(i) for i in range(window._tabs.count())].index("Results"))
+        qt_app.processEvents()
+
+        grid = window._run_results_tab._dataset_plot_views["ds1"]
         assert grid._plot_items, "Expected at least one plot item in the subset grid."
 
         window._set_running_state(True)

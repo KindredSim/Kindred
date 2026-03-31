@@ -62,11 +62,9 @@ def test_apply_fit_targets_refreshes_overlay_and_plot_without_manual_toggle(qt_a
 
     window = _make_window(selected_species=["A"])
     try:
-        subset = window._subset_widget
-        selector = subset._selector
-
-        assert selector.selected_dataset_species() == {"ds1": {"A"}}
-        assert {ds["name"] for ds in getattr(subset._grid, "_datasets", [])} == {"ds1"}
+        ds1_grid = window._run_results_tab._dataset_plot_views["ds1"]
+        assert {ds["name"] for ds in getattr(ds1_grid, "_datasets", [])} == {"ds1"}
+        assert set(getattr(ds1_grid, "_datasets", [])[0]["all_species"].keys()) == {"A"}
 
         panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
@@ -88,8 +86,9 @@ def test_apply_fit_targets_refreshes_overlay_and_plot_without_manual_toggle(qt_a
         apply_btn.click()
         qt_app.processEvents()
 
-        assert selector.selected_dataset_species() == {"ds1": {"B"}}
-        assert {ds["name"] for ds in getattr(subset._grid, "_datasets", [])} == {"ds1"}
+        ds1_payload = getattr(window._run_results_tab._dataset_plot_views["ds1"], "_datasets", [])[0]
+        assert set(ds1_payload["all_species"].keys()) == {"B"}
+        assert {ds["name"] for ds in getattr(window._run_results_tab._dataset_plot_views["ds1"], "_datasets", [])} == {"ds1"}
     finally:
         window.close()
         qt_app.processEvents()

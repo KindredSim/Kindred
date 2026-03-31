@@ -56,7 +56,6 @@ from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 from kindred.gui.fitting.worker import GlobalFitWorker
-from kindred.gui.widgets.dataset_subset_widget import DatasetSubsetWidget
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
 from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
 
@@ -429,7 +428,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_plot_model_x = {}
         self._last_result = None
         self._closing = False
-        self._subset_view_stale = False
         self._pending_best_payload = None
         self._pending_best_worker = None
         self._pending_best_timer = QtCore.QTimer(self)
@@ -713,7 +711,7 @@ class FittingWindow(QtWidgets.QDialog):
             parent=self,
         )
         # Rewrite dataset_entries species_data to match applied fit-target selection
-        # before the SubsetWidget is created, so it sees only applied species.
+        # before result views are built, so they see only applied species.
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._data_tab = DataTab(
             sampling_applied_config_getter=lambda ds_id: _w()._sampling_applied_config_for_dataset(ds_id) if _w() is not None else dict(_empty_cfg),
@@ -748,6 +746,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._params_ics_tab.addAlgebraicObservableRequested.connect(self._on_algebraic_observable_requested)
         self._run_results_tab = RunResultsTab(parent=self)
+        self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
         self._data_targets_tab = DataTargetsTab(
             data_tab=self._data_tab,
             species_table=self._species_table,
@@ -763,17 +762,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._results_tab_index = self._tabs.addTab("Results")
         layout.addWidget(self._tabs, stretch=0)
 
-        self._main_splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
-        self._main_splitter.setObjectName("global_fit_shell_splitter")
-        self._main_splitter.setChildrenCollapsible(False)
-        self._main_splitter.setHandleWidth(8)
-        layout.addWidget(self._main_splitter, stretch=1)
-
-        # Left: subset viewer (plots + overlay selector)
-        self._subset_widget = DatasetSubsetWidget(dataset_entries=self._dataset_entries, parent=self)
-        self._subset_widget.setMinimumWidth(360)
-        self._main_splitter.addWidget(self._subset_widget)
-
         # Right: current tab content
         self._current_tab_stack = QtWidgets.QStackedWidget(self)
         self._current_tab_stack.setObjectName("global_fit_current_tab_stack")
@@ -781,14 +769,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._current_tab_stack.addWidget(self._data_targets_tab)
         self._current_tab_stack.addWidget(self._params_ics_tab)
         self._current_tab_stack.addWidget(self._run_results_tab)
-        self._main_splitter.addWidget(self._current_tab_stack)
-        self._main_splitter.setCollapsible(0, False)
-        self._main_splitter.setCollapsible(1, False)
-        self._main_splitter.setStretchFactor(0, 7)
-        self._main_splitter.setStretchFactor(1, 4)
-        self._main_splitter.setSizes([760, 440])
-        self._splitter_sizes_backup = [760, 440]
-        self._subset_widget.hide()
+        layout.addWidget(self._current_tab_stack, stretch=1)
 
         self._tabs.currentChanged.connect(self._current_tab_stack.setCurrentIndex)
         self._tabs.currentChanged.connect(self._on_right_tabs_current_changed)
@@ -805,6 +786,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_targets_tab.unified_list.addRequested.connect(self._open_add_datasets_dialog)
         self._data_targets_tab.unified_list.removeRequested.connect(self._remove_datasets_from_session)
         self._data_tab.samplingApplied.connect(self._on_data_tab_sampling_applied)
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._refresh_project_apply_controls()
 
     def _on_algebraic_observable_requested(self, selection: dict) -> None:
@@ -898,32 +880,69 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> None:
         if datasets is not self._dataset_entries:
             self._dataset_entries = self._normalize_dataset_entries(datasets)
-            self._subset_widget.set_dataset_entries(self._dataset_entries)
+        fit_targets_by_dataset = {
+            str(entry.get("id") or "").strip(): [
+                str(name).strip()
+                for name in (entry.get("selected_species") or [])
+                if str(name).strip()
+            ]
+            for entry in self._dataset_entries
+            if str(entry.get("id") or "").strip()
+        }
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, fit_targets_by_dataset)
 
         model_lookup = current_models if isinstance(current_models, dict) else {}
-        self._subset_widget.set_best_fit(
-            model_series=model_lookup,
-            dataset_stats=self._latest_dataset_stats,
-        )
+        if model_lookup:
+            self._run_results_tab.push_live_update(
+                {
+                    "model_series": model_lookup,
+                    "dataset_stats": self._latest_dataset_stats,
+                }
+            )
 
     def _selected_data_table_dataset_id(self) -> Optional[str]:
         return self._data_targets_tab.unified_list.selected_dataset_id()
 
     def _on_right_tabs_current_changed(self, index: int) -> None:
-        # Show/hide left plot panel based on active tab
-        if int(index) == int(self._results_tab_index):
-            self._subset_widget.show()
-            self._main_splitter.setSizes(self._splitter_sizes_backup)
-        else:
-            if self._subset_widget.isVisible():
-                self._splitter_sizes_backup = self._main_splitter.sizes()
-            self._subset_widget.hide()
-
         # Targets panel is always visible in unified layout; activate on tab switch.
         if int(index) == 0:
             self._species_table.on_tab_activated(
                 seed_dataset_id=self._selected_data_table_dataset_id()
             )
+
+    def _results_fit_targets_by_dataset(self) -> Dict[str, List[str]]:
+        if not hasattr(self, "_species_table"):
+            return {}
+        applied = dict(self._species_table.fit_targets_selection_applied or {})
+        out: Dict[str, List[str]] = {}
+        for entry in self._dataset_entries or []:
+            ds_id = str(entry.get("id") or "").strip()
+            if not ds_id:
+                continue
+            selected = applied.get(ds_id)
+            if selected is None:
+                selected = entry.get("selected_species") or []
+            out[ds_id] = [str(name).strip() for name in selected if str(name).strip()]
+        return out
+
+    def _current_results_dark_mode(self) -> bool:
+        for candidate in (self.parentWidget(), self.parent()):
+            if candidate is not None and hasattr(candidate, "_dark_mode"):
+                return bool(getattr(candidate, "_dark_mode"))
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return False
+        window_color = app.palette().color(QtGui.QPalette.ColorRole.Window)
+        return int(window_color.lightness()) < 128
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if hasattr(self, "_run_results_tab") and event.type() in (
+            QtCore.QEvent.Type.PaletteChange,
+            QtCore.QEvent.Type.ApplicationPaletteChange,
+            QtCore.QEvent.Type.StyleChange,
+        ):
+            self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
 
     def _dataset_entry_for_id(self, dataset_id: str) -> Optional[Dict[str, Any]]:
         ds_id = str(dataset_id or "").strip()
@@ -1066,9 +1085,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_run_button_enabled_state()
 
     def _on_targets_status_message(self, msg: str) -> None:
-        if self._subset_view_stale:
-            msg = msg + " (subset view stale)"
-            self._subset_view_stale = False
         self._status_label.setText(msg)
 
     def _on_targets_applied(self) -> None:
@@ -1076,11 +1092,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._rebuild_selected_payload_lookup()
         self._populate_dataset_table()
         self._on_targets_validity_changed()
-        try:
-            self._subset_widget.set_dataset_entries(self._dataset_entries)
-        except Exception:
-            self._subset_view_stale = True
-            logger.warning("Subset widget update failed after targets applied", exc_info=True)
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._refresh_sampling_validity_ui()
 
     def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
@@ -1089,22 +1101,15 @@ class FittingWindow(QtWidgets.QDialog):
         self._species_table.refresh_dataset_list()
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
 
     def _on_data_tab_sampling_applied(self, dataset_id: str, config: dict) -> None:
         self._sampling_applied[str(dataset_id)] = dict(config)
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._rebuild_selected_payload_lookup()
-        try:
-            self._subset_widget.set_dataset_entries(self._dataset_entries)
-        except Exception:
-            self._subset_view_stale = True
-            logger.warning("Subset widget update failed after sampling applied", exc_info=True)
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._refresh_sampling_validity_ui()
-        msg = "Sampling applied"
-        if self._subset_view_stale:
-            msg += " (subset view stale)"
-            self._subset_view_stale = False
-        self._status_label.setText(msg)
+        self._status_label.setText("Sampling applied")
 
     def _open_add_datasets_dialog(self) -> None:
         present = {str(entry.get("id") or "").strip() for entry in (self._dataset_entries or []) if entry.get("id")}
@@ -1249,10 +1254,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._params_ics_tab.refresh_ic_dataset_combo(self._dataset_entries)
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
-        try:
-            self._subset_widget.set_dataset_entries(self._dataset_entries)
-        except Exception:
-            return
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
 
     # ------------------------------------------------------------------
     # Table population
@@ -2212,12 +2214,11 @@ class FittingWindow(QtWidgets.QDialog):
         invalid_applied = bool(self._invalid_applied_used_dataset_ids_for_run())
         self._run_button.setEnabled((not running) and not invalid_applied)
         self._stop_button.setEnabled(running)
-        if hasattr(self, "_subset_widget"):
-            try:
-                self._subset_widget.set_view_autorange_locked(running)
-            except Exception as exc:
-                self._best_effort_failures.add("set_running_state.subset_autorange_lock")
-                logger.debug("Failed to update subset view autorange lock state: %s", exc, exc_info=True)
+        try:
+            self._run_results_tab.set_view_autorange_locked(running)
+        except Exception as exc:
+            self._best_effort_failures.add("set_running_state.results_autorange_lock")
+            logger.debug("Failed to update Results tab autorange lock state: %s", exc, exc_info=True)
         self._params_ics_tab.set_running_state(running)
         self._data_targets_tab.unified_list.set_running_state(running)
         self._paused = False
@@ -2301,8 +2302,7 @@ class FittingWindow(QtWidgets.QDialog):
             dict(result.shared_params),
             {k: dict(v) for k, v in (result.dataset_params or {}).items()},
         )
-
-        self._update_global_plots(result)
+        self._run_results_tab.push_final_result(result, self._dataset_entries)
         self._update_dataset_views_from_global(result)
         stats = self._build_global_stats(result)
         self._update_statistics(stats)
@@ -2424,13 +2424,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._latest_plot_model_x = {}
         self._refresh_project_apply_controls(prefer_broadest=True, running=running)
         if not running:
-            series_for_plot = self._latest_plot_model_series or self._latest_model_series
-            x_for_plot = self._latest_plot_model_x if self._latest_plot_model_series else None
-            self._update_global_plots_from_maps(
-                series_for_plot,
-                self._latest_dataset_stats,
-                model_x_by_dataset=(x_for_plot or None),
-            )
+            self._run_results_tab.push_live_update(payload)
             self._params_ics_tab.repaint_parameter_table()
             return
         self._pending_best_payload = dict(payload)
@@ -2451,17 +2445,7 @@ class FittingWindow(QtWidgets.QDialog):
             return
         if not self._is_active_worker_callback(worker):
             return
-        model_series = payload.get("model_series") or {}
-        plot_model_series = payload.get("plot_model_series") or {}
-        plot_model_x = payload.get("plot_model_x") or {}
-        series_for_plot = plot_model_series if isinstance(plot_model_series, dict) and plot_model_series else model_series
-        x_for_plot = plot_model_x if isinstance(plot_model_series, dict) and plot_model_series else None
-        if isinstance(series_for_plot, dict) and series_for_plot:
-            self._update_global_plots_from_maps(
-                series_for_plot,
-                self._latest_dataset_stats,
-                model_x_by_dataset=(x_for_plot if isinstance(x_for_plot, dict) else None),
-            )
+        self._run_results_tab.push_live_update(payload)
 
     def _staged_initial_condition_parameters(self) -> Dict[str, Dict[str, float]]:
         staged: Dict[str, Dict[str, float]] = {}
@@ -2612,10 +2596,13 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_stats: Dict[str, Dict[str, float]],
         model_x_by_dataset: Optional[Dict[str, np.ndarray]] = None,
     ) -> None:
-        self._subset_widget.set_best_fit(
-            model_series=model_series,
-            dataset_stats=dataset_stats,
-            model_x_by_dataset=model_x_by_dataset,
+        self._run_results_tab.push_live_update(
+            {
+                "plot_model_series": model_series if model_x_by_dataset else {},
+                "model_series": model_series if not model_x_by_dataset else {},
+                "dataset_stats": dataset_stats,
+                "plot_model_x": model_x_by_dataset or {},
+            }
         )
 
     def _update_dataset_views_from_maps(
@@ -2679,20 +2666,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_dataset_stats = {}
         self._latest_plot_model_series = {}
         self._latest_plot_model_x = {}
-        self.refresh_grid_view(self._dataset_entries, current_models=None)
+        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
 
     def _update_global_plots(self, result: GlobalFitResult) -> None:
-        dataset_stats = {
-            info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
-            for info in (result.dataset_info or [])
-        }
-        plot_series = getattr(result, "plot_model_series", None) or {}
-        use_plot_x = bool(isinstance(plot_series, dict) and plot_series)
-        self._subset_widget.set_best_fit(
-            model_series=(plot_series if use_plot_x else (result.model_series or {})),
-            dataset_stats=dataset_stats,
-            model_x_by_dataset=((getattr(result, "plot_model_x", None) or None) if use_plot_x else None),
-        )
+        self._run_results_tab.push_final_result(result, self._dataset_entries)
 
     def _build_global_stats(self, result: GlobalFitResult) -> Dict[str, float]:
         total_points = sum(info.n_points for info in result.dataset_info)
