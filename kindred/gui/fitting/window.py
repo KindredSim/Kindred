@@ -340,10 +340,7 @@ class FittingWindow(QtWidgets.QDialog):
         self.resize(1280, 720)
         self.setWindowFlags(
             self.windowFlags()
-            | Qt.CustomizeWindowHint
             | Qt.WindowMinMaxButtonsHint
-            | Qt.WindowSystemMenuHint
-            | Qt.WindowCloseButtonHint
         )
 
         self._build_ui()
@@ -1078,6 +1075,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_dataset_entries_from_applied_fit_targets_and_sampling()
         self._rebuild_selected_payload_lookup()
         self._populate_dataset_table()
+        self._on_targets_validity_changed()
         try:
             self._subset_widget.set_dataset_entries(self._dataset_entries)
         except Exception:

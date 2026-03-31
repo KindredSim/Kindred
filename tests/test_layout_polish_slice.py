@@ -348,3 +348,98 @@ def test_recompute_fit_universe_before_row_building(qt_app):
     finally:
         tbl.close()
         qt_app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# E) Validation colors survive _on_targets_applied
+# ---------------------------------------------------------------------------
+
+
+def test_validation_colors_survive_targets_applied(qt_app):
+    """After _on_targets_applied recreates list items, validation colors
+    (background + foreground) must be reapplied immediately."""
+    from kindred.gui.fitting.window import FittingWindow
+
+    t = np.linspace(0.0, 1.0, 5)
+    y_a = np.linspace(1.0, 0.5, t.size)
+    # ds1 has applied targets; ds2 has none (will be invalid_applied).
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 10.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": t.copy(),
+                "species_data": {"A": y_a.copy()},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+            {
+                "id": "ds2",
+                "label": "Dataset 2",
+                "t": t.copy(),
+                "species_data": {"A": y_a.copy()},
+                "selected_species": [],
+                "weight": 1.0,
+                "include": True,
+            },
+        ],
+        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": y_a.copy()}},
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
+            {"id": "ds2", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
+        ],
+        dataset_weights={"ds1": 1.0, "ds2": 1.0},
+    )
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        # Trigger _on_targets_applied which recreates all list items.
+        window._on_targets_applied()
+        qt_app.processEvents()
+
+        # ds2 has no applied targets, so it should be invalid_applied:
+        # pink background + dark red foreground.
+        unified_list = window._data_targets_tab.unified_list
+        ds2_item = None
+        for i in range(unified_list._list.count()):
+            item = unified_list._list.item(i)
+            if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == "ds2":
+                ds2_item = item
+                break
+        assert ds2_item is not None, "ds2 item not found in unified list"
+        assert ds2_item.background().color() == QtGui.QColor(255, 225, 225), (
+            f"Expected pink background, got {ds2_item.background().color().name()}"
+        )
+        assert ds2_item.foreground().color() == QtGui.QColor(80, 0, 0), (
+            f"Expected dark red foreground, got {ds2_item.foreground().color().name()}"
+        )
+    finally:
+        window.close()
+
+
+# ---------------------------------------------------------------------------
+# F) FittingWindow flags: no CustomizeWindowHint, has MinMaxButtons and Dialog
+# ---------------------------------------------------------------------------
+
+
+def test_fitting_window_flags_no_customize_hint(qt_app):
+    """FittingWindow must not set Qt.CustomizeWindowHint (breaks taskbar grouping).
+    It must retain Qt.WindowMinMaxButtonsHint and Qt.Dialog."""
+    window = _make_fitting_window()
+    try:
+        flags = window.windowFlags()
+        assert not (flags & QtCore.Qt.CustomizeWindowHint), (
+            "CustomizeWindowHint should not be set (breaks taskbar grouping)"
+        )
+        assert flags & QtCore.Qt.WindowMinMaxButtonsHint, (
+            "WindowMinMaxButtonsHint should be set"
+        )
+        assert flags & QtCore.Qt.Dialog, (
+            "Dialog flag should be set for parent-child taskbar grouping"
+        )
+    finally:
+        window.close()

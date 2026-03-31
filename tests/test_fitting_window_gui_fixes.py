@@ -86,7 +86,7 @@ def test_fitting_window_has_min_max_buttons(qt_app):
     window = _make_window()
     try:
         flags = window.windowFlags()
-        assert flags & Qt.CustomizeWindowHint
+        assert not (flags & Qt.CustomizeWindowHint), "CustomizeWindowHint breaks taskbar grouping"
         assert flags & Qt.WindowMinMaxButtonsHint
         assert flags & Qt.WindowCloseButtonHint
     finally:
