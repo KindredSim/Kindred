@@ -712,6 +712,7 @@ class FittingWindow(QtWidgets.QDialog):
             persist_dataset_weight_callback=lambda ds_id, w: _w()._persist_dataset_weight(ds_id, w) if _w() is not None else None,
             dataset_manager_getter=lambda: _w()._dataset_manager if _w() is not None else None,
             worker_running_getter=lambda: bool(_w() is not None and _w()._worker and hasattr(_w()._worker, "isRunning") and _w()._worker.isRunning()),
+            modeled_series_getter=lambda: _w()._modeled_series_names_for_x_axis() if _w() is not None else set(),
             parent=self,
         )
         # Rewrite dataset_entries species_data to match applied fit-target selection

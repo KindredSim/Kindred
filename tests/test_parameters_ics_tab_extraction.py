@@ -58,7 +58,7 @@ def test_construction(qt_app):
         assert isinstance(tab._param_table, QtWidgets.QTableWidget)
 
         assert tab._ic_panel is not None
-        assert tab._ic_table is not None
+        assert getattr(tab._ic_panel, "_table", None) is not None
         # _ic_dataset_combo is None for UnifiedSpeciesTable (no combo)
         assert tab._ic_dataset_combo is None
     finally:

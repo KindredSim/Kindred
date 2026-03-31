@@ -19,5 +19,6 @@
 kindred/core/parallel_fitting.py  # KEEP: test-only parallel-fitting module; not wired into current production flows
 kindred/core/simulator/fast_eq.py  # KEEP: compatibility re-export for fast-equilibrium policy; used by tools/tests, not wired in production
 kindred/gui/fitting/global_fit_config.py  # KEEP: dialog module exercised by GUI tests; not wired in production
+kindred/gui/fitting/targets_weights_tab.py  # KEEP: standalone phase-0 extraction widget retained for extraction/regression tests after UnifiedSpeciesTable replaced production wiring
 kindred/gui/widgets/dataset_selector_dialog.py  # KEEP: test-only dataset selector dialog; not wired in production
 kindred/gui/widgets/pyqtgraph_plot_panel.py  # KEEP: compatibility stub that avoids PyQtGraph import side effects during import-time checks

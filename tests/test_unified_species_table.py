@@ -1,6 +1,8 @@
 """Tests for the UnifiedSpeciesTable widget."""
 from __future__ import annotations
 
+from copy import deepcopy
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,26 +38,63 @@ def _make_entries(species_data=None, ds_id="ds1", label="DS 1", selected=None):
     }]
 
 
-def _make_manager(species, ds_id="ds1"):
-    """Return a fake dataset manager with default fit settings."""
-    settings = SimpleNamespace(
-        initial_conditions={s: 1.0 for s in species},
-        fit_flags={s: False for s in species},
-        log10_flags={},
-        bounds={},
-    )
+def _make_manager(
+    species=None,
+    ds_id="ds1",
+    *,
+    initials=None,
+    fit_flags=None,
+    log10_flags=None,
+    bounds=None,
+    by_dataset=None,
+):
+    """Return a fake dataset manager with per-dataset fit settings."""
+    if by_dataset is None:
+        species = list(species or [])
+        by_dataset = {
+            str(ds_id): {
+                "initial_conditions": dict(initials or {s: 1.0 for s in species}),
+                "fit_flags": dict(fit_flags or {s: False for s in species}),
+                "log10_flags": dict(log10_flags or {}),
+                "bounds": dict(bounds or {}),
+            }
+        }
+
+    def _normalize_settings(raw):
+        return SimpleNamespace(
+            initial_conditions=dict((raw or {}).get("initial_conditions") or {}),
+            fit_flags=dict((raw or {}).get("fit_flags") or {}),
+            log10_flags=dict((raw or {}).get("log10_flags") or {}),
+            bounds=dict((raw or {}).get("bounds") or {}),
+        )
 
     class FakeManager:
-        def get_fit_settings(self, _ds_id):
-            return settings
+        def __init__(self):
+            self.settings_by_dataset = {
+                str(name): _normalize_settings(raw) for name, raw in dict(by_dataset or {}).items()
+            }
+            self.update_calls: list[tuple[str, SimpleNamespace]] = []
 
-        def update_fit_settings(self, _ds_id, _settings):
-            pass
+        def get_fit_settings(self, dataset_id):
+            return self.settings_by_dataset[str(dataset_id)]
+
+        def update_fit_settings(self, dataset_id, settings):
+            normalized = _normalize_settings(
+                {
+                    "initial_conditions": deepcopy(getattr(settings, "initial_conditions", {}) or {}),
+                    "fit_flags": deepcopy(getattr(settings, "fit_flags", {}) or {}),
+                    "log10_flags": deepcopy(getattr(settings, "log10_flags", {}) or {}),
+                    "bounds": deepcopy(getattr(settings, "bounds", {}) or {}),
+                }
+            )
+            ds_key = str(dataset_id)
+            self.settings_by_dataset[ds_key] = normalized
+            self.update_calls.append((ds_key, normalized))
 
     return FakeManager()
 
 
-def _make_table(*, entries=None, species=None, manager=None, included_ids=None):
+def _make_table(*, entries=None, species=None, manager=None, included_ids=None, modeled_series=None):
     if entries is None:
         entries = _make_entries()
     if species is None:
@@ -63,10 +102,12 @@ def _make_table(*, entries=None, species=None, manager=None, included_ids=None):
     ds_ids = [str(e["id"]) for e in entries]
     if included_ids is None:
         included_ids = list(ds_ids)
+    if modeled_series is None:
+        modeled_series = {str(name) for name in (species or []) if str(name).strip()}
     weights = {str(e["id"]): float(e.get("weight", 1.0)) for e in entries}
     persisted_weights: dict[str, float] = {}
 
-    tbl = UnifiedSpeciesTable(
+    kwargs = dict(
         dataset_entries=list(entries),
         mechanism_species=list(species),
         dataset_entries_getter=lambda: list(entries),
@@ -77,8 +118,19 @@ def _make_table(*, entries=None, species=None, manager=None, included_ids=None):
         dataset_manager_getter=lambda: manager,
         worker_running_getter=lambda: False,
     )
+    if "modeled_series_getter" in inspect.signature(UnifiedSpeciesTable).parameters:
+        kwargs["modeled_series_getter"] = lambda: set(modeled_series)
+    tbl = UnifiedSpeciesTable(**kwargs)
     tbl._persisted_weights = persisted_weights  # for test introspection
     return tbl
+
+
+def _row_for_species(tbl: UnifiedSpeciesTable, species: str) -> int:
+    for row in range(tbl._table.rowCount()):
+        item = tbl._table.item(row, _Col.SPECIES)
+        if item is not None and item.text() == str(species):
+            return row
+    raise AssertionError(f"Species row not found: {species}")
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +212,38 @@ def test_ic_edit_sets_dirty(qt_app):
         qt_app.processEvents()
 
 
+def test_ic_pending_seeded_from_dataset_manager(qt_app):
+    mgr = _make_manager(
+        by_dataset={
+            "ds1": {
+                "initial_conditions": {"A": 2.5, "B": 3.5},
+                "fit_flags": {"A": True, "B": False},
+                "log10_flags": {"A": True},
+                "bounds": {"A": (0.5, 5.0), "B": (0.0, 9.0)},
+            }
+        }
+    )
+    tbl = _make_table(manager=mgr, species=["A", "B"])
+    try:
+        assert tbl._ic_pending["ds1"]["A"] == {
+            "initial": pytest.approx(2.5),
+            "fit": True,
+            "log10": True,
+            "min": pytest.approx(0.5),
+            "max": pytest.approx(5.0),
+        }
+        assert tbl._ic_applied["ds1"]["B"] == {
+            "initial": pytest.approx(3.5),
+            "fit": False,
+            "log10": False,
+            "min": pytest.approx(0.0),
+            "max": pytest.approx(9.0),
+        }
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
 def test_log10_greyed_unless_fit_ic_checked(qt_app):
     """Log10 column is non-interactive unless Fit IC is checked."""
     mgr = _make_manager(["A", "B"])
@@ -193,6 +277,43 @@ def test_log10_greyed_unless_fit_ic_checked(qt_app):
         qt_app.processEvents()
 
 
+def test_ic_state_survives_bulk_action(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("9.9")
+        qt_app.processEvents()
+
+        tbl._apply_bulk_action("all")
+        qt_app.processEvents()
+
+        assert tbl._table.item(row, _Col.INITIAL).text() == "9.9"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_ic_state_survives_tab_revisit(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("8.8")
+        qt_app.processEvents()
+
+        tbl.on_tab_activated()
+        qt_app.processEvents()
+
+        row = _row_for_species(tbl, "A")
+        assert tbl._table.item(row, _Col.INITIAL).text() == "8.8"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
 def test_bulk_all_skips_greyed_rows(qt_app):
     """Bulk All selects only species with available data (not greyed rows)."""
     # Create entries with only species A having data, but mechanism has A and C
@@ -207,6 +328,25 @@ def test_bulk_all_skips_greyed_rows(qt_app):
         pending = tbl._fit_targets_selection_pending.get("ds1", set())
         assert "A" in pending
         assert "C" not in pending  # C has no data, row greyed
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_apply_ic_failure_preserves_edits_and_error(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.MIN).setText("abc")
+        qt_app.processEvents()
+
+        tbl._apply_changes()
+        qt_app.processEvents()
+
+        assert "numeric bounds" in tbl._footer.error_label.text().lower()
+        assert tbl._table.item(row, _Col.MIN).text() == "abc"
     finally:
         tbl.close()
         qt_app.processEvents()
@@ -254,6 +394,25 @@ def test_apply_commits_targets_and_ic(qt_app):
         qt_app.processEvents()
 
 
+def test_apply_ic_success_updates_manager(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("5.0")
+        qt_app.processEvents()
+
+        tbl._apply_changes()
+        qt_app.processEvents()
+
+        assert mgr.settings_by_dataset["ds1"].initial_conditions["A"] == pytest.approx(5.0)
+        assert tbl._ic_applied["ds1"]["A"]["initial"] == pytest.approx(5.0)
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
 def test_revert_restores_state(qt_app):
     """Revert restores pending selection to applied state and clears IC dirty."""
     mgr = _make_manager(["A", "B"])
@@ -278,6 +437,72 @@ def test_revert_restores_state(qt_app):
         # Pending should match applied (both A and B selected)
         assert set(tbl._fit_targets_selection_pending["ds1"]) == set(tbl._fit_targets_selection_applied["ds1"])
         assert tbl._ic_editor_dirty is False
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_revert_reads_live_dataset_manager(qt_app):
+    mgr = _make_manager(
+        by_dataset={
+            "ds1": {
+                "initial_conditions": {"A": 1.0},
+                "fit_flags": {"A": False},
+                "log10_flags": {},
+                "bounds": {"A": (0.0, 10.0)},
+            }
+        }
+    )
+    tbl = _make_table(manager=mgr, species=["A"])
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("1.0")
+        qt_app.processEvents()
+
+        tbl._apply_changes()
+        qt_app.processEvents()
+
+        settings = SimpleNamespace(
+            initial_conditions={"A": 9.9},
+            fit_flags={"A": False},
+            log10_flags={},
+            bounds={"A": (0.0, 10.0)},
+        )
+        mgr.update_fit_settings("ds1", settings)
+
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("4.4")
+        qt_app.processEvents()
+
+        tbl._revert_changes()
+        qt_app.processEvents()
+
+        row = _row_for_species(tbl, "A")
+        assert tbl._table.item(row, _Col.INITIAL).text() == "9.9"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_ic_error_clears_on_cell_edit(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.MIN).setText("abc")
+        qt_app.processEvents()
+
+        tbl._apply_changes()
+        qt_app.processEvents()
+
+        assert "numeric bounds" in tbl._footer.error_label.text().lower()
+
+        tbl._table.item(row, _Col.INITIAL).setText("5.0")
+        qt_app.processEvents()
+
+        assert tbl._footer.error_label.text() == ""
     finally:
         tbl.close()
         qt_app.processEvents()
@@ -311,6 +536,83 @@ def test_dataset_switch_flushes_targets(qt_app):
         qt_app.processEvents()
 
 
+def test_dataset_switch_discards_ic_pending(qt_app):
+    t = np.linspace(0, 1, 5)
+    entries = [
+        {
+            "id": "ds1", "label": "DS 1", "t": t,
+            "species_data": {"A": np.linspace(1, 0, 5)},
+            "selected_species": ["A"], "weight": 1.0, "include": True,
+        },
+        {
+            "id": "ds2", "label": "DS 2", "t": t,
+            "species_data": {"A": np.linspace(0.5, 0.1, 5)},
+            "selected_species": ["A"], "weight": 2.0, "include": True,
+        },
+    ]
+    mgr = _make_manager(
+        by_dataset={
+            "ds1": {
+                "initial_conditions": {"A": 1.0},
+                "fit_flags": {"A": False},
+                "log10_flags": {},
+                "bounds": {"A": (0.0, 10.0)},
+            },
+            "ds2": {
+                "initial_conditions": {"A": 4.0},
+                "fit_flags": {"A": False},
+                "log10_flags": {},
+                "bounds": {"A": (0.0, 10.0)},
+            },
+        }
+    )
+    tbl = _make_table(entries=entries, species=["A"], manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("9.0")
+        qt_app.processEvents()
+
+        tbl.load_for_dataset("ds2")
+        tbl.load_for_dataset("ds1")
+        qt_app.processEvents()
+
+        row = _row_for_species(tbl, "A")
+        assert tbl._table.item(row, _Col.INITIAL).text() == "1"
+        assert tbl._ic_pending["ds1"]["A"]["initial"] == pytest.approx(1.0)
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_apply_partial_targets_ok_ic_fail(qt_app):
+    entries = _make_entries(selected=["A"])
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row_b = _row_for_species(tbl, "B")
+        tbl._table.item(row_b, _Col.INCLUDE).setCheckState(Qt.Checked)
+        row_a = _row_for_species(tbl, "A")
+        tbl._table.item(row_a, _Col.MIN).setText("abc")
+        qt_app.processEvents()
+
+        applied_targets = []
+        applied_ic = []
+        tbl.targetsApplied.connect(lambda: applied_targets.append(True))
+        tbl.icApplied.connect(lambda *args: applied_ic.append(args))
+
+        tbl._apply_changes()
+        qt_app.processEvents()
+
+        assert applied_targets == [True]
+        assert applied_ic == []
+        assert "numeric bounds" in tbl._footer.error_label.text().lower()
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
 def test_add_remove_dataset_state(qt_app):
     """add_dataset_state / remove_dataset_state manage internal dictionaries."""
     tbl = _make_table()
@@ -329,6 +631,55 @@ def test_add_remove_dataset_state(qt_app):
         tbl.remove_dataset_state({"ds_new"})
         assert "ds_new" not in tbl.available_by_dataset
         assert tbl._current_dataset_id is None
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_non_modeled_column_excluded_from_rows(qt_app):
+    entries = _make_entries(
+        species_data={"A": np.linspace(1, 0, 5), "B": np.linspace(0.2, 0.9, 5), "pH": np.linspace(6.8, 7.2, 5)},
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl.load_for_dataset("ds1")
+
+        assert tbl._table.rowCount() == 2
+        species_names = [tbl._table.item(row, _Col.SPECIES).text() for row in range(tbl._table.rowCount())]
+        assert species_names == ["A", "B"]
+        assert "pH" not in species_names
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_row_order_mechanism_then_observed(qt_app):
+    entries = _make_entries(species_data={"A": np.linspace(1, 0, 5), "B": np.linspace(0.2, 0.9, 5), "C": np.linspace(0.3, 0.7, 5), "D": np.linspace(0.8, 0.1, 5)})
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, species=["B", "A"], manager=mgr, modeled_series={"A", "B", "C", "D"})
+    try:
+        tbl.load_for_dataset("ds1")
+        assert [tbl._table.item(row, _Col.SPECIES).text() for row in range(tbl._table.rowCount())] == ["B", "A", "C", "D"]
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_bulk_all_includes_observed_only(qt_app):
+    entries = _make_entries(species_data={"A": np.linspace(1, 0, 5), "B": np.linspace(0.2, 0.9, 5)}, selected=["A"])
+    mgr = _make_manager(["A"])
+    tbl = _make_table(entries=entries, species=["A"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._apply_bulk_action("all")
+        qt_app.processEvents()
+
+        row_a = _row_for_species(tbl, "A")
+        row_b = _row_for_species(tbl, "B")
+        assert tbl._table.item(row_a, _Col.INCLUDE).checkState() == Qt.Checked
+        assert tbl._table.item(row_b, _Col.INCLUDE).checkState() == Qt.Checked
     finally:
         tbl.close()
         qt_app.processEvents()
@@ -354,6 +705,23 @@ def test_validity_empty_selection_invalid(qt_app):
         qt_app.processEvents()
 
 
+def test_weight_editor_disabled_after_run_implicit_mode(qt_app):
+    tbl = _make_table()
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._weight_mode_combo.setCurrentIndex(0)
+        qt_app.processEvents()
+
+        tbl.set_running_state(True)
+        tbl.set_running_state(False)
+        qt_app.processEvents()
+
+        assert tbl._dataset_weight_edit.isEnabled() is False
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
 def test_weight_mode_implicit(qt_app):
     """weight_mode_is_implicit returns True when combo is at index 0."""
     tbl = _make_table()
@@ -363,6 +731,135 @@ def test_weight_mode_implicit(qt_app):
         assert tbl.weight_mode_is_implicit() is False
         tbl._weight_mode_combo.setCurrentIndex(0)
         assert tbl.weight_mode_is_implicit() is True
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_parameter_defaults_read_live_settings(qt_app):
+    mgr = _make_manager(
+        by_dataset={
+            "ds1": {
+                "initial_conditions": {"A": 0.5, "B": 1.0},
+                "fit_flags": {"A": False, "B": False},
+                "log10_flags": {},
+                "bounds": {"A": (0.0, 5.0), "B": (0.0, 10.0)},
+            }
+        }
+    )
+    tbl = _make_table(manager=mgr, species=["A", "B"])
+    try:
+        mgr.settings_by_dataset["ds1"].initial_conditions["A"] = 9.9
+        fit_flag, defaults = tbl.initial_parameter_defaults_for_species("ds1", "A")
+
+        assert fit_flag is False
+        assert defaults["initial"] == pytest.approx(9.9)
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_tab_reentry_picks_up_external_changes(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        assert tbl._table.item(row, _Col.INITIAL).text() == "1"
+
+        mgr.settings_by_dataset["ds1"].initial_conditions["A"] = 7.7
+        tbl.on_tab_activated()
+        qt_app.processEvents()
+
+        row = _row_for_species(tbl, "A")
+        assert tbl._table.item(row, _Col.INITIAL).text() == "7.7"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_tab_reentry_preserves_dirty_edits(qt_app):
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(manager=mgr)
+    try:
+        tbl.load_for_dataset("ds1")
+        row = _row_for_species(tbl, "A")
+        tbl._table.item(row, _Col.INITIAL).setText("8.8")
+        qt_app.processEvents()
+
+        tbl.on_tab_activated()
+        qt_app.processEvents()
+
+        row = _row_for_species(tbl, "A")
+        assert tbl._table.item(row, _Col.INITIAL).text() == "8.8"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_empty_session_clears_table(qt_app):
+    tbl = _make_table()
+    try:
+        tbl.load_for_dataset("ds1")
+        assert tbl._table.rowCount() == 2
+
+        tbl.remove_dataset_state({"ds1"})
+        qt_app.processEvents()
+
+        assert tbl._table.rowCount() == 0
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_empty_session_clears_weight_controls(qt_app):
+    tbl = _make_table()
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._weight_mode_combo.setCurrentIndex(1)
+        qt_app.processEvents()
+        assert tbl._dataset_weight_edit.isEnabled() is True
+        assert "ds1" in tbl._context_label.text().lower()
+
+        tbl.remove_dataset_state({"ds1"})
+        qt_app.processEvents()
+
+        assert tbl._dataset_weight_edit.isEnabled() is False
+        assert str(tbl._dataset_weight_edit.text() or "").strip() in {"", "1", "1.0"}
+        assert "ds1" not in tbl._context_label.text().lower()
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_algebra_observable_still_shown(qt_app):
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "selectivity": np.linspace(0.1, 0.5, 5),
+        },
+        selected=["A", "B", "selectivity"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(
+        entries=entries,
+        species=["A", "B"],
+        manager=mgr,
+        modeled_series={"A", "B", "selectivity"},
+    )
+    try:
+        tbl.load_for_dataset("ds1")
+
+        assert tbl._table.rowCount() == 3
+        row = _row_for_species(tbl, "selectivity")
+        assert tbl._table.item(row, _Col.INCLUDE).flags() & Qt.ItemIsEnabled
+        assert tbl._table.item(row, _Col.WEIGHT).flags() & Qt.ItemIsEnabled
+        assert not (tbl._table.item(row, _Col.INITIAL).flags() & Qt.ItemIsEnabled)
+        assert not (tbl._table.item(row, _Col.FIT_IC).flags() & Qt.ItemIsEnabled)
+        assert not (tbl._table.item(row, _Col.LOG10).flags() & Qt.ItemIsEnabled)
+        assert not (tbl._table.item(row, _Col.MIN).flags() & Qt.ItemIsEnabled)
+        assert not (tbl._table.item(row, _Col.MAX).flags() & Qt.ItemIsEnabled)
     finally:
         tbl.close()
         qt_app.processEvents()
@@ -423,6 +920,149 @@ def test_public_api_surface(qt_app):
         # Compatibility aliases
         assert hasattr(tbl, "_ic_editor_current_dataset_id")
         assert hasattr(tbl, "_table")
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Hidden-species pruning tests
+# ---------------------------------------------------------------------------
+
+def test_apply_prunes_hidden_species_from_applied(qt_app):
+    """Hidden non-modeled species in pending must not reach applied state."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "pH": np.linspace(6.8, 7.2, 5),
+        },
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl.load_for_dataset("ds1")
+        # Inject hidden species into pending
+        tbl._fit_targets_selection_pending["ds1"].add("pH")
+        tbl._fit_targets_dirty = True
+        tbl._apply_changes()
+        qt_app.processEvents()
+
+        assert "pH" not in tbl._fit_targets_selection_applied.get("ds1", [])
+        assert "A" in tbl._fit_targets_selection_applied["ds1"]
+        assert "B" in tbl._fit_targets_selection_applied["ds1"]
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_bulk_all_excludes_hidden_species(qt_app):
+    """Bulk All must not select hidden non-modeled species."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "pH": np.linspace(6.8, 7.2, 5),
+        },
+        selected=["A"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._apply_bulk_action("all")
+        qt_app.processEvents()
+
+        pending = tbl._fit_targets_selection_pending.get("ds1", set())
+        assert "A" in pending
+        assert "B" in pending
+        assert "pH" not in pending
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_bulk_invert_excludes_hidden_species(qt_app):
+    """Bulk Invert must not toggle hidden non-modeled species."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "pH": np.linspace(6.8, 7.2, 5),
+        },
+        selected=["A"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._apply_bulk_action("invert")
+        qt_app.processEvents()
+
+        pending = tbl._fit_targets_selection_pending.get("ds1", set())
+        assert "B" in pending
+        assert "A" not in pending
+        assert "pH" not in pending
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_populate_table_prunes_pending(qt_app):
+    """_populate_table must remove hidden species from pending selection."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "pH": np.linspace(6.8, 7.2, 5),
+        },
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B"])
+    tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl.load_for_dataset("ds1")
+        # Inject hidden species into pending
+        tbl._fit_targets_selection_pending["ds1"].add("pH")
+        tbl._populate_table()
+        qt_app.processEvents()
+
+        assert "pH" not in tbl._fit_targets_selection_pending.get("ds1", set())
+        assert "A" in tbl._fit_targets_selection_pending["ds1"]
+        assert "B" in tbl._fit_targets_selection_pending["ds1"]
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_set_mechanism_species_detects_modeled_series_change(qt_app):
+    """set_mechanism_species must repopulate when modeled_series_getter output changes."""
+    entries = _make_entries(
+        species_data={
+            "A": np.linspace(1, 0, 5),
+            "B": np.linspace(0.2, 0.9, 5),
+            "selectivity": np.linspace(0.1, 0.5, 5),
+        },
+        selected=["A", "B"],
+    )
+    mgr = _make_manager(["A", "B"])
+    # Use mutable container so the getter result can change
+    modeled = [{"A", "B"}]
+    tbl = _make_table(entries=entries, species=["A", "B"], manager=mgr, modeled_series={"A", "B"})
+    try:
+        tbl._modeled_series_getter = lambda: modeled[0]
+        tbl.load_for_dataset("ds1")
+        assert tbl._table.rowCount() == 2
+
+        # Change modeled set to include selectivity (simulates algebra observable added)
+        modeled[0] = {"A", "B", "selectivity"}
+        # Call with same species list -- should still repopulate
+        tbl.set_mechanism_species(["A", "B"])
+
+        assert tbl._table.rowCount() == 3
+        species_names = [tbl._table.item(r, _Col.SPECIES).text() for r in range(3)]
+        assert "selectivity" in species_names
     finally:
         tbl.close()
         qt_app.processEvents()

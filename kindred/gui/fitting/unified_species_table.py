@@ -68,6 +68,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         persist_dataset_weight_callback: Callable[[str, float], None],
         dataset_manager_getter: Callable[[], Any],
         worker_running_getter: Callable[[], bool],
+        modeled_series_getter: Optional[Callable[[], set[str]]] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -82,6 +83,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         self._mechanism_species: list[str] = list(mechanism_species)
         self._dataset_entries: list = list(dataset_entries)
+        self._modeled_series_getter = modeled_series_getter or (
+            lambda: {str(species) for species in self._mechanism_species if str(species).strip()}
+        )
 
         self._init_fit_targets_state(dataset_entries)
 
@@ -93,11 +97,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 all_available.update(avail)
             self._mechanism_species = sorted(all_available)
 
+        self._current_row_species: list[str] = []
+        self._ic_pending: Dict[str, Dict[str, dict[str, object]]] = {}
+        self._ic_applied: Dict[str, Dict[str, dict[str, object]]] = {}
+        self._ic_error_text: Optional[str] = None
+        self._seed_all_ic_state_from_dataset_manager()
+
         self._ic_editor_dirty = False
         self._ic_editor_is_refreshing = False
         self._current_dataset_id: Optional[str] = None
         self._is_refreshing = False
         self._dataset_weight_is_refreshing = False
+        self._cached_modeled_series: frozenset = frozenset()
 
         self._build_ui()
 
@@ -164,6 +175,150 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_target_weights_pending = {ds: dict(weights) for ds, weights in applied_target_weights.items()}
         self._fit_target_weights_pending_invalid: Dict[str, Dict[str, str]] = {}
         self._fit_targets_dirty = False
+
+    def _seed_all_ic_state_from_dataset_manager(self) -> None:
+        self._ic_pending = {}
+        self._ic_applied = {}
+        for ds_id in self._fit_targets_available_by_dataset.keys():
+            self._seed_ic_state_for_dataset(ds_id)
+
+    @staticmethod
+    def _copy_ic_dataset_state(state: Optional[Dict[str, dict[str, object]]]) -> Dict[str, dict[str, object]]:
+        copied: Dict[str, dict[str, object]] = {}
+        for species, spec in (state or {}).items():
+            copied[str(species)] = {
+                "initial": float(spec.get("initial", 0.0)),
+                "fit": bool(spec.get("fit", False)),
+                "log10": bool(spec.get("log10", False)),
+                "min": float(spec.get("min", 0.0)),
+                "max": float(spec.get("max", 10.0)),
+            }
+        return copied
+
+    @staticmethod
+    def _ic_entry_from_settings_maps(
+        species: str,
+        *,
+        initials: Dict[str, object],
+        fit_flags: Dict[str, object],
+        log10_flags: Dict[str, object],
+        bounds_map: Dict[str, object],
+    ) -> dict[str, object]:
+        init_val = float(initials.get(species, 0.0))
+        fit_flag = bool(fit_flags.get(species, False))
+        log10_flag = bool(log10_flags.get(species, False))
+        bounds = bounds_map.get(species)
+        if not bounds:
+            bounds = (0.0, max(10.0, init_val * 10 or 10.0))
+        try:
+            min_val = float(bounds[0])
+            max_val = float(bounds[1])
+        except Exception:
+            min_val, max_val = (0.0, max(10.0, init_val * 10 or 10.0))
+        return {
+            "initial": float(init_val),
+            "fit": bool(fit_flag),
+            "log10": bool(log10_flag),
+            "min": float(min_val),
+            "max": float(max_val),
+        }
+
+    def _seed_ic_state_for_dataset(self, dataset_id: str) -> None:
+        ds_id = str(dataset_id or "").strip()
+        if not ds_id:
+            return
+        settings = None
+        dataset_manager = self._dataset_manager_getter()
+        if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
+            try:
+                settings = dataset_manager.get_fit_settings(ds_id)
+            except Exception:
+                settings = None
+        initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
+        fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
+        log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
+        bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
+
+        seeded = {
+            str(species): self._ic_entry_from_settings_maps(
+                str(species),
+                initials=initials,
+                fit_flags=fit_flags,
+                log10_flags=log10_flags,
+                bounds_map=bounds_map,
+            )
+            for species in self._mechanism_species
+            if str(species).strip()
+        }
+        self._ic_applied[ds_id] = self._copy_ic_dataset_state(seeded)
+        self._ic_pending[ds_id] = self._copy_ic_dataset_state(seeded)
+
+    def _pending_ic_state_for_dataset(self, dataset_id: str) -> Dict[str, dict[str, object]]:
+        ds_id = str(dataset_id or "").strip()
+        if not ds_id:
+            return {}
+        state = self._ic_pending.get(ds_id)
+        if state is None:
+            self._seed_ic_state_for_dataset(ds_id)
+            state = self._ic_pending.get(ds_id, {})
+        return state
+
+    def _displayed_row_species_for_dataset(self, dataset_id: str) -> list[str]:
+        ds_id = str(dataset_id or "").strip()
+        mechanism_species = [str(species) for species in self._mechanism_species if str(species).strip()]
+        mechanism_set = set(mechanism_species)
+        try:
+            modeled = {
+                str(species)
+                for species in (self._modeled_series_getter() or set())
+                if str(species).strip()
+            }
+        except Exception:
+            modeled = set(mechanism_species)
+        observed_only = sorted(
+            {
+                str(species)
+                for species in self._fit_targets_available_by_dataset.get(ds_id, [])
+                if str(species).strip()
+                and str(species) not in mechanism_set
+                and str(species) in modeled
+            }
+        )
+        return mechanism_species + observed_only
+
+    def _clear_ic_error(self) -> None:
+        self._ic_error_text = None
+        if hasattr(self, "_footer"):
+            self._footer.set_error(None)
+
+    def _clear_table_for_no_dataset(self) -> None:
+        self._current_row_species = []
+        if hasattr(self, "_table"):
+            self._table.setRowCount(0)
+        if hasattr(self, "_context_label"):
+            self._context_label.setText("No dataset selected")
+        if hasattr(self, "_dataset_weight_edit"):
+            self._dataset_weight_edit.clear()
+            self._dataset_weight_edit.setEnabled(False)
+        self._clear_ic_error()
+        self._ic_editor_dirty = False
+        self._refresh_dataset_weight_editor_state()
+
+    def _sync_visible_include_states(self) -> None:
+        ds_id = str(self._current_dataset_id or "").strip()
+        if not ds_id or not hasattr(self, "_table"):
+            return
+        available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
+        pending_sel = self._fit_targets_selection_pending.get(ds_id, set())
+        self._is_refreshing = True
+        try:
+            for row, species in enumerate(self._current_row_species):
+                include_item = self._table.item(row, _Col.INCLUDE)
+                if include_item is None or species not in available:
+                    continue
+                include_item.setCheckState(Qt.Checked if species in pending_sel else Qt.Unchecked)
+        finally:
+            self._is_refreshing = False
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -420,21 +575,21 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         ds_id = str(self._current_dataset_id or "").strip()
         if not ds_id:
             return
-        available = list(self._fit_targets_available_by_dataset.get(ds_id, []))
-        if not available:
+        available_set = set(self._fit_targets_available_by_dataset.get(ds_id, []))
+        effective = available_set & set(self._current_row_species)
+        if not effective:
             return
-        available_set = set(available)
         pending = self._fit_targets_selection_pending.setdefault(ds_id, set())
         if action == "all":
-            updated = set(available_set)
+            updated = set(effective)
         elif action == "none":
             updated = set()
         elif action == "invert":
-            updated = set(available_set) - pending
+            updated = effective - pending
         else:
             return
         self._fit_targets_selection_pending[ds_id] = updated
-        self._populate_table()
+        self._sync_visible_include_states()
         self._update_combined_dirty_state()
 
     # ------------------------------------------------------------------
@@ -444,35 +599,25 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         ds_id = str(self._current_dataset_id or "").strip()
         self._is_refreshing = True
         try:
-            if hasattr(self, "_footer"):
-                self._footer.set_error(None)
-
-            if not self._mechanism_species:
+            if not ds_id:
+                self._current_row_species = []
                 self._table.setRowCount(0)
                 return
 
             available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
             pending_sel = self._fit_targets_selection_pending.get(ds_id, set())
             invalid_weights = self._fit_target_weights_pending_invalid.get(ds_id, {})
+            mechanism_set = {str(species) for species in self._mechanism_species if str(species).strip()}
+            pending_ic = self._pending_ic_state_for_dataset(ds_id)
+            self._current_row_species = self._displayed_row_species_for_dataset(ds_id)
+            displayable_with_data = set(self._current_row_species) & available
+            if ds_id in self._fit_targets_selection_pending:
+                self._fit_targets_selection_pending[ds_id] &= displayable_with_data
 
-            # IC data from dataset manager
-            settings = None
-            if ds_id:
-                dataset_manager = self._dataset_manager_getter()
-                if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
-                    try:
-                        settings = dataset_manager.get_fit_settings(ds_id)
-                    except Exception:
-                        settings = None
-
-            initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings else {}
-            fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings else {}
-            log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings else {}
-            bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings else {}
-
-            self._table.setRowCount(len(self._mechanism_species))
-            for row, species in enumerate(self._mechanism_species):
+            self._table.setRowCount(len(self._current_row_species))
+            for row, species in enumerate(self._current_row_species):
                 has_data = species in available
+                is_mechanism_species = species in mechanism_set
 
                 # --- Col 0: Include in Fit ---
                 include_item = QtWidgets.QTableWidgetItem()
@@ -504,48 +649,51 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 species_item.setTextAlignment(Qt.AlignCenter)
                 self._table.setItem(row, _Col.SPECIES, species_item)
 
-                # --- IC data for this species ---
-                init_val = float(initials.get(species, 0.0))
-                fit_flag = bool(fit_flags.get(species, False))
-                log10_flag = bool(log10_flags.get(species, False))
-                bounds = bounds_map.get(species)
-                if not bounds:
-                    bounds = (0.0, max(10.0, init_val * 10 or 10.0))
-                try:
-                    min_val = float(bounds[0])
-                    max_val = float(bounds[1])
-                except Exception:
-                    min_val, max_val = (0.0, max(10.0, init_val * 10 or 10.0))
+                if is_mechanism_species:
+                    spec = dict(pending_ic.get(species) or {})
+                    init_val = float(spec.get("initial", 0.0))
+                    fit_flag = bool(spec.get("fit", False))
+                    log10_flag = bool(spec.get("log10", False))
+                    min_val = float(spec.get("min", 0.0))
+                    max_val = float(spec.get("max", max(10.0, init_val * 10 or 10.0)))
 
-                # --- Col 3: Initial Value ---
-                init_item = QtWidgets.QTableWidgetItem(f"{init_val:.6g}")
-                init_item.setTextAlignment(Qt.AlignCenter)
-                self._table.setItem(row, _Col.INITIAL, init_item)
+                    # --- Col 3: Initial Value ---
+                    init_item = QtWidgets.QTableWidgetItem(f"{init_val:.6g}")
+                    init_item.setTextAlignment(Qt.AlignCenter)
+                    self._table.setItem(row, _Col.INITIAL, init_item)
 
-                # --- Col 4: Fit IC ---
-                fit_item = QtWidgets.QTableWidgetItem()
-                fit_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                fit_item.setCheckState(Qt.Checked if fit_flag else Qt.Unchecked)
-                self._table.setItem(row, _Col.FIT_IC, fit_item)
+                    # --- Col 4: Fit IC ---
+                    fit_item = QtWidgets.QTableWidgetItem()
+                    fit_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    fit_item.setCheckState(Qt.Checked if fit_flag else Qt.Unchecked)
+                    self._table.setItem(row, _Col.FIT_IC, fit_item)
 
-                # --- Col 5: Log10 ---
-                log_item = QtWidgets.QTableWidgetItem()
-                if fit_flag:
-                    log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    # --- Col 5: Log10 ---
+                    log_item = QtWidgets.QTableWidgetItem()
+                    if fit_flag:
+                        log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    else:
+                        log_item.setFlags(Qt.ItemIsSelectable)
+                    log_item.setCheckState(Qt.Checked if log10_flag else Qt.Unchecked)
+                    self._table.setItem(row, _Col.LOG10, log_item)
+
+                    # --- Col 6: Min ---
+                    min_item = QtWidgets.QTableWidgetItem(f"{min_val:.6g}")
+                    min_item.setTextAlignment(Qt.AlignCenter)
+                    self._table.setItem(row, _Col.MIN, min_item)
+
+                    # --- Col 7: Max ---
+                    max_item = QtWidgets.QTableWidgetItem(f"{max_val:.6g}")
+                    max_item.setTextAlignment(Qt.AlignCenter)
+                    self._table.setItem(row, _Col.MAX, max_item)
                 else:
-                    log_item.setFlags(Qt.ItemIsSelectable)
-                log_item.setCheckState(Qt.Checked if log10_flag else Qt.Unchecked)
-                self._table.setItem(row, _Col.LOG10, log_item)
-
-                # --- Col 6: Min ---
-                min_item = QtWidgets.QTableWidgetItem(f"{min_val:.6g}")
-                min_item.setTextAlignment(Qt.AlignCenter)
-                self._table.setItem(row, _Col.MIN, min_item)
-
-                # --- Col 7: Max ---
-                max_item = QtWidgets.QTableWidgetItem(f"{max_val:.6g}")
-                max_item.setTextAlignment(Qt.AlignCenter)
-                self._table.setItem(row, _Col.MAX, max_item)
+                    for col in (_Col.INITIAL, _Col.FIT_IC, _Col.LOG10, _Col.MIN, _Col.MAX):
+                        disabled_item = QtWidgets.QTableWidgetItem("")
+                        disabled_item.setFlags(Qt.ItemIsSelectable)
+                        disabled_item.setTextAlignment(Qt.AlignCenter)
+                        if col in (_Col.FIT_IC, _Col.LOG10):
+                            disabled_item.setCheckState(Qt.Unchecked)
+                        self._table.setItem(row, col, disabled_item)
         finally:
             self._is_refreshing = False
 
@@ -557,13 +705,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         col = item.column()
         row = item.row()
-        if row < 0 or row >= len(self._mechanism_species):
+        if row < 0 or row >= len(self._current_row_species):
             return
-        species = self._mechanism_species[row]
+        species = self._current_row_species[row]
         ds_id = str(self._current_dataset_id or "").strip()
+        mechanism_set = {str(name) for name in self._mechanism_species if str(name).strip()}
+        available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
 
         if col == _Col.INCLUDE:
-            if not ds_id:
+            if not ds_id or species not in available:
                 return
             checked = item.checkState() == Qt.Checked
             pending = self._fit_targets_selection_pending.setdefault(ds_id, set())
@@ -574,7 +724,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._update_combined_dirty_state()
 
         elif col == _Col.WEIGHT:
-            if not ds_id:
+            if not ds_id or species not in available:
                 return
             self._set_pending_fit_target_weight_text(ds_id, species, item.text())
             if self._fit_target_weight_is_pending_invalid(ds_id, species):
@@ -584,13 +734,34 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._update_combined_dirty_state()
 
         elif col in (_Col.INITIAL, _Col.MIN, _Col.MAX):
+            if not ds_id or species not in mechanism_set:
+                return
+            self._clear_ic_error()
             self._ic_editor_dirty = True
+            field = {
+                _Col.INITIAL: "initial",
+                _Col.MIN: "min",
+                _Col.MAX: "max",
+            }[col]
+            try:
+                value = float(item.text())
+            except Exception:
+                value = None
+            if value is not None:
+                pending_ic = self._pending_ic_state_for_dataset(ds_id)
+                if species in pending_ic:
+                    pending_ic[species][field] = float(value)
             self._update_combined_dirty_state()
 
         elif col == _Col.FIT_IC:
+            if not ds_id or species not in mechanism_set:
+                return
+            self._clear_ic_error()
             self._ic_editor_dirty = True
-            # Toggle Log10 enabled state
             fit_checked = item.checkState() == Qt.Checked
+            pending_ic = self._pending_ic_state_for_dataset(ds_id)
+            if species in pending_ic:
+                pending_ic[species]["fit"] = bool(fit_checked)
             log_item = self._table.item(row, _Col.LOG10)
             if log_item is not None:
                 self._is_refreshing = True
@@ -600,12 +771,20 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     else:
                         log_item.setFlags(Qt.ItemIsSelectable)
                         log_item.setCheckState(Qt.Unchecked)
+                        if species in pending_ic:
+                            pending_ic[species]["log10"] = False
                 finally:
                     self._is_refreshing = False
             self._update_combined_dirty_state()
 
         elif col == _Col.LOG10:
+            if not ds_id or species not in mechanism_set:
+                return
+            self._clear_ic_error()
             self._ic_editor_dirty = True
+            pending_ic = self._pending_ic_state_for_dataset(ds_id)
+            if species in pending_ic:
+                pending_ic[species]["log10"] = bool(item.checkState() == Qt.Checked)
             self._update_combined_dirty_state()
 
     # ------------------------------------------------------------------
@@ -625,9 +804,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if old_id and old_id != ds_id:
             self._flush_visible_weight_edits_internal()
             self._flush_dataset_weight_editor_for_dataset(old_id)
+            self._ic_pending[old_id] = self._copy_ic_dataset_state(self._ic_applied.get(old_id, {}))
 
+        self._seed_ic_state_for_dataset(ds_id)
         self._current_dataset_id = ds_id
         self._ic_editor_dirty = False
+        self._clear_ic_error()
         self._populate_table()
         self._refresh_dataset_weight_editor_state()
         self._update_combined_dirty_state()
@@ -717,14 +899,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         invalid_applied = set(self._invalid_applied_used_dataset_ids())
 
         current = str(getattr(self, "_current_dataset_id", "") or "").strip()
+        target_error: Optional[str] = None
         if current and current in invalid_pending:
             label = self._dataset_label_getter(current)
-            message = f"Dataset {label} has no fit targets. Select at least one series or uncheck Use."
-            self._footer.set_error(message)
+            target_error = f"Dataset {label} has no fit targets. Select at least one series or uncheck Use."
         elif current and current in invalid_pending_weights:
             label = self._dataset_label_getter(current)
-            message = f"Dataset {label} has invalid target weights. Use finite values > 0."
-            self._footer.set_error(message)
+            target_error = f"Dataset {label} has invalid target weights. Use finite values > 0."
+
+        if target_error:
+            self._footer.set_error(target_error)
+        elif self._ic_error_text:
+            self._footer.set_error(self._ic_error_text)
         else:
             self._footer.set_error(None)
 
@@ -745,19 +931,20 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def _apply_changes(self) -> None:
         targets_applied = self._apply_targets()
-        ic_applied = self._apply_ic()
+        ic_status = self._apply_ic()
 
         if targets_applied:
             self.targetsApplied.emit()
-        self._populate_table()
+        if ic_status != "failed" and (targets_applied or ic_status == "applied"):
+            self._populate_table()
         self._update_combined_dirty_state()
 
         messages = []
         if targets_applied:
             messages.append("Fit targets applied")
-        if ic_applied:
+        if ic_status == "applied":
             messages.append("Initial conditions applied")
-        if not targets_applied and not ic_applied:
+        if not targets_applied and ic_status != "applied":
             messages.append("No changes applied")
         self.statusMessage.emit("; ".join(messages))
 
@@ -774,8 +961,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         for ds_id in sorted(set(self._fit_targets_selection_pending.keys()) | set(new_applied.keys())):
             available = list(self._fit_targets_available_by_dataset.get(ds_id, []))
+            displayed = set(self._displayed_row_species_for_dataset(ds_id))
             pending_set = self._fit_targets_selection_pending.get(ds_id, set()) or set()
-            pending_list = [name for name in available if name in pending_set]
+            pending_list = [name for name in available if name in pending_set and name in displayed]
             if ds_id in used_ids and not pending_list:
                 invalid_pending_used.add(ds_id)
                 continue
@@ -808,41 +996,55 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._fit_target_weights_pending_invalid.pop(ds_id, None)
         return True
 
-    def _apply_ic(self) -> bool:
+    def _apply_ic(self) -> str:
         if not self._ic_editor_dirty:
-            return False
-        updates, fit_flags_updates, error = self._collect_initial_conditions_from_table()
+            return "skipped"
+        error = self._validate_ic_cells()
         if error:
+            self._ic_error_text = str(error)
             if hasattr(self, "_footer"):
                 self._footer.set_error(str(error))
-            return False
-        assert updates is not None
-        assert fit_flags_updates is not None
+            return "failed"
         ds_id = str(self._current_dataset_id or "").strip()
         if not ds_id:
-            return False
+            self._ic_error_text = "No dataset selected."
+            if hasattr(self, "_footer"):
+                self._footer.set_error(self._ic_error_text)
+            return "failed"
         dataset_manager = self._dataset_manager_getter()
         if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings") or not hasattr(dataset_manager, "update_fit_settings"):
+            self._ic_error_text = "Dataset manager unavailable; cannot persist Initial Conditions."
             if hasattr(self, "_footer"):
-                self._footer.set_error("Dataset manager unavailable; cannot persist Initial Conditions.")
-            return False
+                self._footer.set_error(self._ic_error_text)
+            return "failed"
         try:
             settings = dataset_manager.get_fit_settings(ds_id)
         except Exception:
+            self._ic_error_text = f"Failed to load fit settings for dataset {ds_id}."
             if hasattr(self, "_footer"):
-                self._footer.set_error(f"Failed to load fit settings for dataset {ds_id}.")
-            return False
+                self._footer.set_error(self._ic_error_text)
+            return "failed"
 
         initials = dict(getattr(settings, "initial_conditions", {}) or {})
         fit_flags = dict(getattr(settings, "fit_flags", {}) or {})
         log10_flags = dict(getattr(settings, "log10_flags", {}) or {})
         bounds_map = dict(getattr(settings, "bounds", {}) or {})
-        for species, spec in updates.items():
+        promoted = self._copy_ic_dataset_state(self._pending_ic_state_for_dataset(ds_id))
+        updates: Dict[str, Dict[str, object]] = {}
+        fit_flags_updates: Dict[str, bool] = {}
+        for species, spec in promoted.items():
             species_key = str(species)
-            initials[str(species)] = float(spec["initial"])
-            fit_flags[species_key] = bool(fit_flags_updates.get(species_key, False))
-            log10_flags[str(species)] = bool(spec["log10"])
-            bounds_map[str(species)] = (float(spec["min"]), float(spec["max"]))
+            initials[species_key] = float(spec["initial"])
+            fit_flags[species_key] = bool(spec["fit"])
+            log10_flags[species_key] = bool(spec["log10"])
+            bounds_map[species_key] = (float(spec["min"]), float(spec["max"]))
+            updates[species_key] = {
+                "initial": float(spec["initial"]),
+                "log10": bool(spec["log10"]),
+                "min": float(spec["min"]),
+                "max": float(spec["max"]),
+            }
+            fit_flags_updates[species_key] = bool(spec["fit"])
 
         settings.initial_conditions = initials
         settings.fit_flags = fit_flags
@@ -851,23 +1053,28 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         try:
             dataset_manager.update_fit_settings(ds_id, settings)
         except Exception:
+            self._ic_error_text = f"Failed to persist fit settings for dataset {ds_id}."
             if hasattr(self, "_footer"):
-                self._footer.set_error(f"Failed to persist fit settings for dataset {ds_id}.")
-            return False
+                self._footer.set_error(self._ic_error_text)
+            return "failed"
 
+        self._ic_applied[ds_id] = self._copy_ic_dataset_state(promoted)
+        self._ic_pending[ds_id] = self._copy_ic_dataset_state(promoted)
+        self._clear_ic_error()
         self.icApplied.emit(ds_id, updates, fit_flags_updates)
         self._ic_editor_dirty = False
-        return True
+        return "applied"
 
-    def _collect_initial_conditions_from_table(self):
+    def _validate_ic_cells(self) -> Optional[str]:
         ds_id = str(self._current_dataset_id or "").strip()
         if not ds_id:
-            return None, None, "No dataset selected."
-        if not self._mechanism_species:
-            return None, None, "No mechanism species available."
-        updates: Dict[str, Dict[str, object]] = {}
-        fit_flags_updates: Dict[str, bool] = {}
-        for row, species in enumerate(self._mechanism_species):
+            return "No dataset selected."
+        mechanism_set = {str(species) for species in self._mechanism_species if str(species).strip()}
+        if not mechanism_set:
+            return "No mechanism species available."
+        for row, species in enumerate(self._current_row_species):
+            if species not in mechanism_set:
+                continue
             init_item = self._table.item(row, _Col.INITIAL)
             fit_item = self._table.item(row, _Col.FIT_IC)
             log_item = self._table.item(row, _Col.LOG10)
@@ -876,30 +1083,20 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             try:
                 init_val = float(init_item.text())
             except Exception:
-                return (None, None, f"Species '{species}' requires a numeric initial concentration.")
+                return f"Species '{species}' requires a numeric initial concentration."
             fit_flag = bool(fit_item and fit_item.checkState() == Qt.Checked)
             log10_flag = bool(log_item and log_item.checkState() == Qt.Checked)
             try:
                 min_val = float(min_item.text())
                 max_val = float(max_item.text())
             except Exception:
-                return None, None, f"Species '{species}' requires numeric bounds."
+                return f"Species '{species}' requires numeric bounds."
             if fit_flag and not (min_val < max_val):
-                return None, None, f"Species '{species}' bounds must satisfy min < max."
+                return f"Species '{species}' bounds must satisfy min < max."
             if fit_flag and log10_flag:
                 if not (init_val > 0.0 and min_val > 0.0 and max_val > 0.0):
-                    return (
-                        None, None,
-                        f"Species '{species}' requires initial/min/max > 0 when Log10 is enabled.",
-                    )
-            updates[str(species)] = {
-                "initial": float(init_val),
-                "log10": bool(log10_flag),
-                "min": float(min_val),
-                "max": float(max_val),
-            }
-            fit_flags_updates[str(species)] = bool(fit_flag)
-        return updates, fit_flags_updates, None
+                    return f"Species '{species}' requires initial/min/max > 0 when Log10 is enabled."
+        return None
 
     def _revert_changes(self) -> None:
         # Revert targets
@@ -912,8 +1109,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             }
             self._fit_target_weights_pending_invalid = {}
 
-        # Revert IC (repopulate from dataset_manager)
+        self._seed_all_ic_state_from_dataset_manager()
         self._ic_editor_dirty = False
+        self._clear_ic_error()
         self._populate_table()
         self._update_combined_dirty_state()
 
@@ -926,9 +1124,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
         for row in range(self._table.rowCount()):
-            if row >= len(self._mechanism_species):
+            if row >= len(self._current_row_species):
                 break
-            species = self._mechanism_species[row]
+            species = self._current_row_species[row]
             if species not in available:
                 continue
             weight_item = self._table.item(row, _Col.WEIGHT)
@@ -940,11 +1138,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # IC helpers (ported from InitialConditionsPanel)
     # ------------------------------------------------------------------
     def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str):
+        ds_id = str(dataset_id or "").strip()
         settings = None
         dataset_manager = self._dataset_manager_getter()
         if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
             try:
-                settings = dataset_manager.get_fit_settings(str(dataset_id))
+                settings = dataset_manager.get_fit_settings(ds_id)
             except Exception:
                 settings = None
         initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
@@ -952,23 +1151,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
         bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
 
-        init_val = float(initials.get(species, 0.0))
-        fit_flag = bool(fit_flags.get(species, False))
-        log10_flag = bool(log10_flags.get(species, False))
-        bounds = bounds_map.get(species)
-        if not bounds:
-            bounds = (0.0, max(10.0, init_val * 10 or 10.0))
-        try:
-            min_val = float(bounds[0])
-            max_val = float(bounds[1])
-        except Exception:
-            min_val = 0.0
-            max_val = max(10.0, init_val * 10 or 10.0)
-        return fit_flag, {
-            "initial": float(init_val),
-            "min": float(min_val),
-            "max": float(max_val),
-            "log10": bool(log10_flag),
+        state = self._ic_entry_from_settings_maps(
+            str(species),
+            initials=initials,
+            fit_flags=fit_flags,
+            log10_flags=log10_flags,
+            bounds_map=bounds_map,
+        )
+        return bool(state.get("fit", False)), {
+            "initial": float(state.get("initial", 0.0)),
+            "min": float(state.get("min", 0.0)),
+            "max": float(state.get("max", 10.0)),
+            "log10": bool(state.get("log10", False)),
         }
 
     # ------------------------------------------------------------------
@@ -1053,6 +1247,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_target_weights_applied[dataset_id] = {}
         self._fit_target_weights_pending[dataset_id] = {}
         self._fit_target_weights_pending_invalid.pop(dataset_id, None)
+        self._seed_ic_state_for_dataset(dataset_id)
 
     def remove_dataset_state(self, dataset_ids: set[str]) -> None:
         for ds_id in list(dataset_ids):
@@ -1064,11 +1259,20 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._fit_targets_available_by_dataset.pop(ds_id, None)
             self._fit_targets_full_series_by_dataset.pop(ds_id, None)
             self._fit_targets_full_t_by_dataset.pop(ds_id, None)
+            self._ic_pending.pop(ds_id, None)
+            self._ic_applied.pop(ds_id, None)
         if self._current_dataset_id in dataset_ids:
             self._current_dataset_id = None
-            self._ic_editor_dirty = False
+            self._clear_table_for_no_dataset()
+        self._update_combined_dirty_state()
 
     def refresh_dataset_list(self) -> None:
+        if self._current_dataset_id and self._current_dataset_id not in self._fit_targets_available_by_dataset:
+            self._current_dataset_id = None
+        if self._current_dataset_id is None:
+            self._clear_table_for_no_dataset()
+            self._update_combined_dirty_state()
+            return
         self._refresh_dataset_weight_editor_state()
         self._refresh_internal_validity_ui()
 
@@ -1079,8 +1283,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if self._current_dataset_id is None and seed_dataset_id:
             self.load_for_dataset(seed_dataset_id)
         else:
-            self._populate_table()
+            if self._current_dataset_id:
+                if not self._ic_editor_dirty:
+                    self._seed_ic_state_for_dataset(self._current_dataset_id)
+                self._populate_table()
             self._refresh_dataset_weight_editor_state()
+            self._refresh_internal_validity_ui()
 
     # ------------------------------------------------------------------
     # Public API -- Refresh
@@ -1092,11 +1300,23 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # Public API -- IC interface (ported from InitialConditionsPanel)
     # ------------------------------------------------------------------
     def set_mechanism_species(self, species: list[str]) -> None:
-        if species == self._mechanism_species:
+        try:
+            current_modeled = frozenset(
+                str(s) for s in (self._modeled_series_getter() or set()) if str(s).strip()
+            )
+        except Exception:
+            current_modeled = frozenset()
+        if species == self._mechanism_species and current_modeled == self._cached_modeled_series:
             return
+        self._cached_modeled_series = current_modeled
         self._mechanism_species = list(species)
+        self._seed_all_ic_state_from_dataset_manager()
+        self._current_row_species = []
+        self._ic_editor_dirty = False
+        self._clear_ic_error()
         if self._current_dataset_id:
             self._populate_table()
+        self._update_combined_dirty_state()
 
     def refresh_dataset_combo(self, dataset_entries: list) -> None:
         self._dataset_entries = list(dataset_entries)
@@ -1110,7 +1330,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if hasattr(self, "_weight_mode_combo"):
             self._weight_mode_combo.setEnabled(not running)
         if hasattr(self, "_dataset_weight_edit"):
-            self._dataset_weight_edit.setEnabled(not running)
+            if running:
+                self._dataset_weight_edit.setEnabled(False)
+            else:
+                self._refresh_dataset_weight_editor_state()
         if hasattr(self, "_footer"):
             self._footer.setEnabled(not running)
         for btn in (getattr(self, "_bulk_all_button", None),

@@ -12,10 +12,7 @@ from PySide6.QtCore import Qt, Signal
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.widgets.collapsible_section import CollapsibleSection
 from kindred.gui.fitting.constants import INITIAL_PREFIX, DEFAULT_PARALLEL_STARTS
-from kindred.gui.fitting.initial_conditions_panel import (  # noqa: F401
-    _ICCol,
-    InitialConditionsPanel,
-)
+from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -502,12 +499,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Transitional forwarders for IC panel widgets
     # ------------------------------------------------------------------
-
-    @property
-    def _ic_table(self):
-        if self._ic_panel is None:
-            return None
-        return getattr(self._ic_panel, "_table", None)
 
     @property
     def _ic_dataset_combo(self):

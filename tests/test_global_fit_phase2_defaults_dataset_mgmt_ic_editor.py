@@ -1737,6 +1737,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
 
 def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism_edit(main_window, monkeypatch, qt_app):
     from PySide6 import QtCore, QtWidgets
+    from kindred.gui.fitting.unified_species_table import _Col
 
     _seed_two_datasets(main_window)
     _seed_simple_mechanism(main_window)
@@ -1811,6 +1812,12 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
         window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _ic_table_species(window) == ["A", "C"]
+        table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
+        assert table is not None
+        assert all(
+            table.item(row, _Col.SPECIES) is None or table.item(row, _Col.SPECIES).text() != "B"
+            for row in range(table.rowCount())
+        )
         assert window._params_ics_tab.get_mechanism_species() == ["A", "C"]
     finally:
         window.close()
