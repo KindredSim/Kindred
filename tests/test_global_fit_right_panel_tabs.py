@@ -122,8 +122,8 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
             "Species",
         ]
 
-        # Data and Targets tab contains Data, Targets/IC unified species table
-        assert data_targets_widget.isAncestorOf(window._data_tab._dataset_table)
+        # Data and Targets tab contains unified list, sampling panel, species table
+        assert data_targets_widget.isAncestorOf(window._data_targets_tab.unified_list)
         assert data_targets_widget.isAncestorOf(sampling_panel)
         assert data_targets_widget.isAncestorOf(species_table_widget)
         assert data_targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group"))
@@ -299,9 +299,10 @@ def test_unified_layout_structure_and_subset_visibility(qt_app):
         assert isinstance(dt_tab.unified_list, UnifiedDatasetList)
         assert dt_tab.isAncestorOf(dt_tab.unified_list)
 
-        # Data and species table panels are children of the DataTargetsTab
+        # Species table and sampling panel are children of the DataTargetsTab.
+        # DataTab itself is hidden (signals/state owner only, not a layout child).
         assert isinstance(dt_tab.data_tab, DataTab)
-        assert dt_tab.isAncestorOf(dt_tab.data_tab)
+        assert dt_tab.isAncestorOf(dt_tab.data_tab._sampling_panel_widget)
         assert dt_tab.isAncestorOf(dt_tab.species_table)
         assert isinstance(dt_tab.species_table, UnifiedSpeciesTable)
 

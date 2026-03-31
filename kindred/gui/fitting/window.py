@@ -678,7 +678,7 @@ class FittingWindow(QtWidgets.QDialog):
             normalized.append(
                 {
                     "id": dataset_id,
-                    "label": entry.get("label", dataset_id),
+                    "label": str(entry.get("label", "") or "").strip() or dataset_id,
                     "t": t_values,
                     "species_data": species_data,
                     "selected_species": list(selected_species),
@@ -1014,7 +1014,7 @@ class FittingWindow(QtWidgets.QDialog):
         ds_id = str(dataset_id or "").strip()
         for entry in self._dataset_entries or []:
             if str(entry.get("id") or "").strip() == ds_id:
-                return str(entry.get("label") or dataset_id)
+                return str(entry.get("label", "") or "").strip() or str(dataset_id)
         return str(dataset_id)
 
     def _invalid_applied_used_dataset_ids_for_run(self) -> List[str]:
@@ -1192,7 +1192,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._dataset_entries.append(
                 {
                     "id": ds_id,
-                    "label": str(pool_entry.get("label") or ds_id),
+                    "label": str(pool_entry.get("label", "") or "").strip() or ds_id,
                     "t": t_values,
                     "species_data": {},  # applied selection starts empty
                     "selected_species": [],

@@ -39,7 +39,9 @@ class _Col:
 
 
 _INVALID_BG = QBrush(QColor(255, 200, 200))
+_INVALID_FG = QBrush(QColor(80, 0, 0))
 _DEFAULT_BG = QBrush()
+_DEFAULT_FG = QBrush()
 
 
 class UnifiedSpeciesTable(QtWidgets.QWidget):
@@ -654,6 +656,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     # Table population
     # ------------------------------------------------------------------
     def _populate_table(self) -> None:
+        if not self._fit_universe_initialized:
+            self._fit_universe_initialized = True
+            self._recompute_fit_universe()
+        if not self._cached_modeled_series:
+            self._cached_modeled_series = frozenset(self._safe_modeled_series())
         ds_id = str(self._current_dataset_id or "").strip()
         self._is_refreshing = True
         try:
@@ -696,6 +703,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     weight_item.setFlags(Qt.ItemIsSelectable)
                 if has_data and self._fit_target_weight_is_pending_invalid(ds_id, species):
                     weight_item.setBackground(_INVALID_BG)
+                    weight_item.setForeground(_INVALID_FG)
                 self._table.setItem(row, _Col.WEIGHT, weight_item)
 
                 # --- Col 2: Species (read-only) ---
@@ -751,11 +759,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         self._table.setItem(row, col, disabled_item)
         finally:
             self._is_refreshing = False
-            if not self._cached_modeled_series:
-                self._cached_modeled_series = frozenset(self._safe_modeled_series())
-            if not self._fit_universe_initialized:
-                self._fit_universe_initialized = True
-                self._recompute_fit_universe()
 
     # ------------------------------------------------------------------
     # Table event handling
@@ -789,8 +792,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._set_pending_fit_target_weight_text(ds_id, species, item.text())
             if self._fit_target_weight_is_pending_invalid(ds_id, species):
                 item.setBackground(_INVALID_BG)
+                item.setForeground(_INVALID_FG)
             else:
                 item.setBackground(_DEFAULT_BG)
+                item.setForeground(_DEFAULT_FG)
             self._update_combined_dirty_state()
 
         elif col in (_Col.INITIAL, _Col.MIN, _Col.MAX):

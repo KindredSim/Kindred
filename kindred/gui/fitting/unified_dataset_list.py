@@ -64,7 +64,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         self._check_states.clear()
         for entry in dataset_entries:
             ds_id = str(entry.get("id") or "").strip()
-            label = str(entry.get("label") or ds_id)
+            label = str(entry.get("label", "") or "").strip() or str(ds_id)
             include = entry.get("include", True)
             item = QtWidgets.QListWidgetItem(label)
             item.setData(Qt.UserRole, ds_id)
@@ -110,10 +110,13 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             if str(item.data(Qt.UserRole) or "").strip() == ds_id:
                 if state == "invalid_applied":
                     item.setBackground(QtGui.QBrush(QtGui.QColor(255, 225, 225)))
+                    item.setForeground(QtGui.QBrush(QtGui.QColor(80, 0, 0)))
                 elif state == "invalid_pending":
                     item.setBackground(QtGui.QBrush(QtGui.QColor(255, 245, 210)))
+                    item.setForeground(QtGui.QBrush(QtGui.QColor(80, 60, 0)))
                 else:
                     item.setBackground(QtGui.QBrush())
+                    item.setForeground(QtGui.QBrush())
                 break
 
     def set_remove_button_enabled(self, enabled: bool) -> None:

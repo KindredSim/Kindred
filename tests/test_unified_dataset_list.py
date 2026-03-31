@@ -165,9 +165,12 @@ def test_data_targets_tab_unified_layout(qt_app):
         assert dt_tab.unified_list is not None
         assert dt_tab.isAncestorOf(dt_tab.unified_list)
 
-        # Both panels are children.
-        assert dt_tab.isAncestorOf(dt_tab.data_tab)
+        # Species table is a child of the right panel.
         assert dt_tab.isAncestorOf(dt_tab.species_table)
+
+        # Sampling panel is reparented into the left panel.
+        sampling_panel = dt_tab.data_tab._sampling_panel_widget
+        assert dt_tab.isAncestorOf(sampling_panel)
     finally:
         window.close()
 

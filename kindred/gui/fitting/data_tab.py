@@ -100,7 +100,8 @@ class DataTab(QtWidgets.QWidget):
         dataset_layout.addLayout(dataset_buttons)
 
         layout.addWidget(self._dataset_group, stretch=3)
-        layout.addWidget(self._create_sampling_panel(), stretch=2)
+        self._sampling_panel_widget = self._create_sampling_panel()
+        layout.addWidget(self._sampling_panel_widget, stretch=2)
 
     # ------------------------------------------------------------------
     # Public API (FittingWindow -> DataTab)
@@ -239,10 +240,15 @@ class DataTab(QtWidgets.QWidget):
         self._sampling_footer.revertRequested.connect(self._revert_sampling_changes)
         self._sampling_footer.resetRequested.connect(self._reset_sampling_pending_to_defaults)
 
-        form = QtWidgets.QFormLayout()
+        # Stacked label-above-control layout for narrow (~240px) left panel.
+        controls_layout = QtWidgets.QVBoxLayout()
+        controls_layout.setSpacing(4)
+
         self._sampling_x_axis_combo = QtWidgets.QComboBox(container)
         self._sampling_x_axis_combo.setObjectName("global_fit_sampling_x_axis")
         self._sampling_x_axis_combo.setEnabled(False)
+        controls_layout.addWidget(QtWidgets.QLabel("X axis:"))
+        controls_layout.addWidget(self._sampling_x_axis_combo)
 
         self._sampling_x_mode_combo = QtWidgets.QComboBox(container)
         self._sampling_x_mode_combo.setObjectName("global_fit_sampling_x_mode")
@@ -251,6 +257,10 @@ class DataTab(QtWidgets.QWidget):
         self._sampling_x_mode_combo.addItem("Auto", "auto")
         self._sampling_x_mode_combo.addItem("Monotone only (fast)", "monotone")
         self._sampling_x_mode_combo.addItem("Time-guided (non-monotone)", "time_guided")
+        self._sampling_x_mode_label = QtWidgets.QLabel("X mapping:")
+        self._sampling_x_mode_label.setVisible(False)
+        controls_layout.addWidget(self._sampling_x_mode_label)
+        controls_layout.addWidget(self._sampling_x_mode_combo)
 
         self._sampling_t_min_spin = QtWidgets.QDoubleSpinBox(container)
         self._sampling_t_min_spin.setObjectName("global_fit_sampling_t_min")
@@ -258,6 +268,8 @@ class DataTab(QtWidgets.QWidget):
         self._sampling_t_min_spin.setRange(-1e18, 1e18)
         self._sampling_t_min_spin.setSingleStep(1.0)
         self._sampling_t_min_spin.setEnabled(False)
+        controls_layout.addWidget(QtWidgets.QLabel("t_min:"))
+        controls_layout.addWidget(self._sampling_t_min_spin)
 
         self._sampling_t_max_spin = QtWidgets.QDoubleSpinBox(container)
         self._sampling_t_max_spin.setObjectName("global_fit_sampling_t_max")
@@ -265,6 +277,8 @@ class DataTab(QtWidgets.QWidget):
         self._sampling_t_max_spin.setRange(-1e18, 1e18)
         self._sampling_t_max_spin.setSingleStep(1.0)
         self._sampling_t_max_spin.setEnabled(False)
+        controls_layout.addWidget(QtWidgets.QLabel("t_max:"))
+        controls_layout.addWidget(self._sampling_t_max_spin)
 
         self._sampling_n_points_spin = QtWidgets.QSpinBox(container)
         self._sampling_n_points_spin.setObjectName("global_fit_sampling_n_points")
@@ -272,13 +286,10 @@ class DataTab(QtWidgets.QWidget):
         self._sampling_n_points_spin.setSpecialValueText("All")
         self._sampling_n_points_spin.setValue(0)
         self._sampling_n_points_spin.setEnabled(False)
+        controls_layout.addWidget(QtWidgets.QLabel("N:"))
+        controls_layout.addWidget(self._sampling_n_points_spin)
 
-        form.addRow("X axis:", self._sampling_x_axis_combo)
-        form.addRow("X mapping:", self._sampling_x_mode_combo)
-        form.addRow("t_min:", self._sampling_t_min_spin)
-        form.addRow("t_max:", self._sampling_t_max_spin)
-        form.addRow("N:", self._sampling_n_points_spin)
-        self._sampling_footer.body_layout.addLayout(form)
+        self._sampling_footer.body_layout.addLayout(controls_layout)
 
         self._sampling_used_label = QtWidgets.QLabel("Used: \u2014")
         self._sampling_used_label.setObjectName("global_fit_sampling_used_label")
@@ -374,6 +385,7 @@ class DataTab(QtWidgets.QWidget):
                 self._sampling_footer.set_secondary_error(None)
                 self._sampling_footer.set_dirty(False)
                 self._sampling_x_mode_combo.setVisible(False)
+                self._sampling_x_mode_label.setVisible(False)
                 try:
                     self._sampling_x_axis_combo.clear()
                     self._sampling_x_mode_combo.setCurrentIndex(0)
@@ -428,6 +440,7 @@ class DataTab(QtWidgets.QWidget):
                 self._sampling_x_mode_combo.blockSignals(False)
             show_mode = x_name != "t"
             self._sampling_x_mode_combo.setVisible(bool(show_mode))
+            self._sampling_x_mode_label.setVisible(bool(show_mode))
             self._sampling_x_mode_combo.setEnabled(bool(show_mode))
 
             self._sampling_t_min_spin.setRange(t_min_full, t_max_full)
@@ -519,6 +532,7 @@ class DataTab(QtWidgets.QWidget):
         x_name = str(pending.get("x_name") or "t").strip() or "t"
         show_mode = x_name != "t"
         self._sampling_x_mode_combo.setVisible(bool(show_mode))
+        self._sampling_x_mode_label.setVisible(bool(show_mode))
         self._sampling_x_mode_combo.setEnabled(bool(show_mode))
         used, total = self._sampling_used_count_for_pending(dataset_id=ds_id, pending=pending)
         self._sampling_used_label.setText(f"Used: {used}/{total} points")

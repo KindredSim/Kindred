@@ -32,11 +32,28 @@ class DataTargetsTab(QtWidgets.QWidget):
 
         splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
 
-        # LEFT: unified dataset list
-        self.unified_list = UnifiedDatasetList(parent=splitter)
-        splitter.addWidget(self.unified_list)
+        # LEFT: unified dataset list + sampling panel, scrollable
+        left_panel = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
 
-        # RIGHT: scroll area with stacked detail panels
+        self.unified_list = UnifiedDatasetList(parent=left_panel)
+        left_layout.addWidget(self.unified_list, stretch=1)
+
+        # Reparent sampling panel from data_tab to the left panel.
+        sampling = self.data_tab._sampling_panel_widget
+        sampling.setParent(left_panel)
+        left_layout.addWidget(sampling)
+        sampling.show()
+
+        left_scroll = QtWidgets.QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        left_scroll.setWidget(left_panel)
+        splitter.addWidget(left_scroll)
+
+        # RIGHT: scroll area with species table only
         scroll = QtWidgets.QScrollArea(splitter)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -49,9 +66,7 @@ class DataTargetsTab(QtWidgets.QWidget):
         detail_layout.setContentsMargins(0, 0, 0, 0)
         detail_layout.setSpacing(10)
 
-        detail_layout.addWidget(self.data_tab)
         detail_layout.addWidget(self.species_table)
-        detail_layout.addStretch(1)
 
         scroll.setWidget(container)
         splitter.addWidget(scroll)
@@ -64,15 +79,17 @@ class DataTargetsTab(QtWidgets.QWidget):
 
         layout.addWidget(splitter)
 
-        # Hide child navigators — unified list drives all selection.
+        # Hide DataTab entirely — its visible content (dataset group) is replaced
+        # by UnifiedDatasetList, and sampling panel is reparented above.
+        # DataTab remains instantiated for its signals and internal state.
         self.data_tab._dataset_group.hide()
+        self.data_tab.hide()
 
         # Override MinimumExpanding policies so the scroll area can scroll.
-        for panel in (self.data_tab, self.species_table):
-            sp = panel.sizePolicy()
-            if sp.verticalPolicy() == QtWidgets.QSizePolicy.MinimumExpanding:
-                sp.setVerticalPolicy(QtWidgets.QSizePolicy.Preferred)
-                panel.setSizePolicy(sp)
+        sp = self.species_table.sizePolicy()
+        if sp.verticalPolicy() == QtWidgets.QSizePolicy.MinimumExpanding:
+            sp.setVerticalPolicy(QtWidgets.QSizePolicy.Preferred)
+            self.species_table.setSizePolicy(sp)
 
         # Ensure species table doesn't collapse inside scroll area.
         self.species_table.setMinimumHeight(300)
