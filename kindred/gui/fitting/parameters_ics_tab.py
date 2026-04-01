@@ -12,7 +12,7 @@ from PySide6.QtCore import Qt, Signal
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.widgets.collapsible_section import CollapsibleSection
 from kindred.gui.fitting.constants import INITIAL_PREFIX, DEFAULT_PARALLEL_STARTS
-from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel  # noqa: F401
+from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +325,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         reactions_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
-        ic_panel: Optional[InitialConditionsPanel] = None,
+        ic_panel: Optional[UnifiedSpeciesTable] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)

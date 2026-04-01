@@ -195,10 +195,10 @@ def test_unified_list_drives_all_panels(qt_app):
         # DataTab sampling reflects ds2.
         assert window._data_tab._sampling_current_dataset_id == "ds2"
 
-        # TargetsWeightsTab reflects ds2.
+        # Target-selection state reflects ds2.
         assert window._species_table._current_dataset_id == "ds2"
 
-        # InitialConditionsPanel reflects ds2.
+        # Initial-condition editor state reflects ds2.
         assert window._species_table._ic_editor_current_dataset_id == "ds2"
     finally:
         window.close()

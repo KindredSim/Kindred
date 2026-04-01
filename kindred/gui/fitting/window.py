@@ -884,57 +884,6 @@ class FittingWindow(QtWidgets.QDialog):
         control_row.addLayout(actions_row)
         return footer
 
-    def refresh_grid_view(
-        self,
-        datasets: Sequence[Dict[str, Any]],
-        current_models: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
-    ) -> None:
-        """Compatibility / test-facing API for refreshing Results tab plots.
-
-        Not called in production; live updates go through ``push_live_update()``
-        and ``push_final_result()``. Retained for test infrastructure.
-        """
-        raw_fit_targets_by_dataset: Dict[str, Optional[List[str]]] = {}
-        for entry in datasets or []:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            if "selected_species" not in entry or entry.get("selected_species") is None:
-                raw_fit_targets_by_dataset[ds_id] = None
-                continue
-            raw_fit_targets_by_dataset[ds_id] = [
-                str(name).strip()
-                for name in (entry.get("selected_species") or [])
-                if str(name).strip()
-            ]
-        if datasets is not self._dataset_entries:
-            self._dataset_entries = self._normalize_dataset_entries(datasets)
-        applied_fit_targets = self._results_fit_targets_by_dataset()
-        fit_targets_by_dataset: Dict[str, List[str]] = {}
-        for entry in self._dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            if not ds_id:
-                continue
-            selected_species = raw_fit_targets_by_dataset.get(ds_id)
-            if selected_species is None:
-                fit_targets_by_dataset[ds_id] = list(applied_fit_targets.get(ds_id, []))
-                continue
-            fit_targets_by_dataset[ds_id] = list(selected_species)
-        if self._is_fit_running:
-            self._results_rebuild_pending = True
-        else:
-            self._run_results_tab.rebuild_subtabs(self._dataset_entries, fit_targets_by_dataset)
-
-        model_lookup = current_models if isinstance(current_models, dict) else {}
-        if model_lookup:
-            self._run_results_tab.push_live_update(
-                {
-                    "model_series": model_lookup,
-                    "dataset_stats": self._latest_dataset_stats,
-                },
-                refresh_all=True,
-            )
-
     def _selected_data_table_dataset_id(self) -> Optional[str]:
         return self._data_targets_tab.unified_list.selected_dataset_id()
 

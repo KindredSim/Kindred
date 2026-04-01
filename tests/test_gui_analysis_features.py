@@ -116,14 +116,6 @@ def test_global_fit_handler_invokes_backend(monkeypatch, analysis_window):
         raising=False,
     )
 
-    class _DialogMustNotBeConstructed:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-    monkeypatch.setattr(
-        "kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog",
-        _DialogMustNotBeConstructed,
-    )
     monkeypatch.setattr(
         MainWindow,
         "_simulate_mechanism",
@@ -214,7 +206,6 @@ def test_fitting_window_small_multiples_grid(qapp):
         apply_callback=lambda params: None,
     )
 
-    assert hasattr(window, "refresh_grid_view")
     assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1", "ds2", "ds3"}
     assert {ds["name"] for ds in getattr(window._run_results_tab._all_datasets_plot_view, "_datasets", [])} == {"ds1", "ds2", "ds3"}
 
@@ -223,7 +214,7 @@ def test_fitting_window_small_multiples_grid(qapp):
         "ds2": {"A": np.exp(-0.35 * t_axis)},
         "ds3": {"A": np.exp(-0.45 * t_axis)},
     }
-    window.refresh_grid_view(dataset_entries, current_models=model_series)
+    window._run_results_tab.push_live_update({"model_series": model_series, "dataset_stats": {}}, refresh_all=True)
     ds1_payload = next(ds for ds in window._run_results_tab._all_datasets_plot_view._datasets if ds.get("name") == "ds1")
     assert ds1_payload.get("model_y") is not None
     assert np.allclose(ds1_payload["model_y"], model_series["ds1"]["A"])

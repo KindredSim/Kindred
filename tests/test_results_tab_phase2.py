@@ -841,7 +841,7 @@ def test_window_palette_change_reapplies_results_tab_dark_mode(qt_app, monkeypat
         qt_app.processEvents()
 
 
-def test_refresh_grid_view_honors_passed_selected_species(qt_app):
+def test_results_subtab_rebuild_honors_passed_selected_species(qt_app):
     t = np.linspace(0.0, 1.0, 5)
     entries = [
         {
@@ -863,7 +863,7 @@ def test_refresh_grid_view_honors_passed_selected_species(qt_app):
         assert initial_payload["current_species"] == "A"
 
         updated_entries = [dict(entries[0], selected_species=["B"])]
-        window.refresh_grid_view(updated_entries)
+        window._run_results_tab.rebuild_subtabs(updated_entries, {"ds1": ["B"]})
 
         payload = window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]
         assert payload["current_species"] == "B"
@@ -873,7 +873,7 @@ def test_refresh_grid_view_honors_passed_selected_species(qt_app):
         qt_app.processEvents()
 
 
-def test_refresh_grid_view_falls_back_to_applied_targets_when_selection_missing(qt_app):
+def test_results_subtab_rebuild_falls_back_to_applied_targets_when_selection_missing(qt_app):
     t = np.linspace(0.0, 1.0, 5)
     entries = [
         {
@@ -904,7 +904,8 @@ def test_refresh_grid_view_falls_back_to_applied_targets_when_selection_missing(
                 "include": True,
             }
         ]
-        window.refresh_grid_view(updated_entries)
+        window._dataset_entries = updated_entries
+        window._run_results_tab.rebuild_subtabs(window._dataset_entries, window._results_fit_targets_by_dataset())
 
         payload = window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]
         assert payload["current_species"] == "A"
@@ -970,7 +971,6 @@ def test_window_source_has_no_subset_widget_or_splitter_references() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     window_py = (repo_root / "kindred" / "gui" / "fitting" / "window.py").read_text(encoding="utf-8")
     assert "_subset_widget" not in window_py
-    assert "DatasetSubsetWidget" not in window_py
     assert "_main_splitter" not in window_py
     assert "global_fit_shell_splitter" not in window_py
 

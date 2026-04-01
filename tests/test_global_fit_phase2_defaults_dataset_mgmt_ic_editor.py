@@ -234,12 +234,6 @@ def test_global_fit_opens_without_config_dialog_and_defaults_targets_none(main_w
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
 
-    class _DialogMustNotBeConstructed:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-    monkeypatch.setattr("kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog", _DialogMustNotBeConstructed)
-
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
     try:
@@ -284,12 +278,6 @@ def test_global_fit_can_add_remove_datasets_in_window(main_window, monkeypatch, 
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-
-    class _DialogMustNotBeConstructed:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-    monkeypatch.setattr("kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog", _DialogMustNotBeConstructed)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -340,12 +328,6 @@ def test_global_fit_initial_conditions_editor_apply_persists_to_dataset_manager(
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-
-    class _DialogMustNotBeConstructed:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-    monkeypatch.setattr("kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog", _DialogMustNotBeConstructed)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)

@@ -16,47 +16,6 @@ pytestmark = [pytest.mark.gui]
 
 
 # ---------------------------------------------------------------------------
-# Helpers — TargetsWeightsTab
-# ---------------------------------------------------------------------------
-
-def _make_tw_tab(*, entries=None, included_ids=None):
-    from kindred.gui.fitting.targets_weights_tab import TargetsWeightsTab
-
-    if entries is None:
-        t = np.linspace(0.0, 1.0, 6)
-        entries = [
-            {
-                "id": "ds1",
-                "label": "Dataset 1",
-                "t": t.copy(),
-                "species_data": {"A": np.linspace(0, 1, t.size)},
-                "selected_species": ["A"],
-                "weight": 1.0,
-                "include": True,
-            }
-        ]
-
-    _entries = list(entries)
-
-    if included_ids is None:
-        included_ids = [str(e["id"]) for e in _entries if e.get("include", True)]
-
-    tab = TargetsWeightsTab(
-        dataset_entries=list(_entries),
-        dataset_entries_getter=lambda: list(_entries),
-        included_dataset_ids_getter=lambda: list(included_ids),
-        dataset_label_getter=lambda ds_id: next(
-            (str(e.get("label") or ds_id) for e in _entries if str(e.get("id")) == ds_id),
-            str(ds_id),
-        ),
-        dataset_weight_getter=lambda ds_id: 1.0,
-        persist_dataset_weight_callback=lambda ds_id, w: None,
-        worker_running_getter=lambda: False,
-    )
-    return tab
-
-
-# ---------------------------------------------------------------------------
 # Helpers — DataTab
 # ---------------------------------------------------------------------------
 
@@ -86,17 +45,25 @@ def _make_data_tab(*, worker_running=False):
 
 def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
                      entries=None, species=None):
-    from kindred.gui.fitting.initial_conditions_panel import InitialConditionsPanel
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     if entries is None:
         entries = [{"id": "ds1", "label": "DS 1"}]
     if species is None:
         species = ["A", "B"]
 
-    ic_panel = InitialConditionsPanel(
+    ic_panel = UnifiedSpeciesTable(
         dataset_entries=list(entries),
         mechanism_species=list(species),
+        dataset_entries_getter=lambda: list(entries),
+        included_dataset_ids_getter=lambda: [str(e["id"]) for e in entries],
+        dataset_label_getter=lambda ds_id: next(
+            (str(e.get("label") or ds_id) for e in entries if str(e.get("id")) == ds_id),
+            str(ds_id),
+        ),
+        dataset_weight_getter=lambda _ds_id: 1.0,
+        persist_dataset_weight_callback=lambda _ds_id, _weight: None,
         dataset_manager_getter=lambda: None,
         worker_running_getter=lambda: False,
     )
@@ -168,60 +135,6 @@ def test_on_targets_applied_rebuilds_results_tab(qt_app):
     finally:
         window.close()
         qt_app.processEvents()
-
-
-# ===================================================================
-# ITEM 20 — Footer cleared after last dataset removal
-# ===================================================================
-
-def test_refresh_dataset_list_clears_footer_on_empty(qt_app):
-    """refresh_dataset_list clears footer errors when dataset list becomes empty."""
-    entries = []
-
-    def entries_getter():
-        return list(entries)
-
-    t = np.linspace(0.0, 1.0, 6)
-    initial_entries = [
-        {
-            "id": "ds1",
-            "label": "Dataset 1",
-            "t": t.copy(),
-            "species_data": {"A": np.linspace(0, 1, t.size)},
-            "selected_species": ["A"],
-            "weight": 1.0,
-            "include": True,
-        }
-    ]
-    entries.extend(initial_entries)
-
-    from kindred.gui.fitting.targets_weights_tab import TargetsWeightsTab
-    tab = TargetsWeightsTab(
-        dataset_entries=list(entries),
-        dataset_entries_getter=entries_getter,
-        included_dataset_ids_getter=lambda: [e["id"] for e in entries if e.get("include", True)],
-        dataset_label_getter=lambda ds_id: next(
-            (str(e.get("label") or ds_id) for e in entries if str(e.get("id")) == ds_id),
-            str(ds_id),
-        ),
-        dataset_weight_getter=lambda ds_id: 1.0,
-        persist_dataset_weight_callback=lambda ds_id, w: None,
-        worker_running_getter=lambda: False,
-    )
-    try:
-        tab._fit_targets_footer.set_error("Stale error from previous dataset")
-        assert tab._fit_targets_footer._error_text == "Stale error from previous dataset"
-
-        entries.clear()
-        tab.remove_dataset_state({"ds1"})
-        tab.refresh_dataset_list()
-        qt_app.processEvents()
-
-        assert tab._fit_targets_footer._error_text == ""
-    finally:
-        tab.close()
-        qt_app.processEvents()
-
 
 # ===================================================================
 # ITEM 6 — Remove button disabled during active fit

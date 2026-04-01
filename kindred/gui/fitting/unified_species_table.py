@@ -1,8 +1,7 @@
 """Unified species table widget for the fitting window.
 
-Replaces the stacked TargetsWeightsTab + InitialConditionsPanel with a single
-8-column QTableWidget that shows target selection, target weights, and
-initial-condition editing for all mechanism species per dataset.
+Provides a single 8-column table that combines target selection, target
+weights, and initial-condition editing for all mechanism species per dataset.
 """
 
 from __future__ import annotations
@@ -200,7 +199,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self.targetsApplied.emit()
 
     # ------------------------------------------------------------------
-    # State initialization (ported from TargetsWeightsTab)
+    # State initialization
     # ------------------------------------------------------------------
     def _init_fit_targets_state(self, dataset_entries: List[Dict[str, Any]]) -> None:
         full_series: Dict[str, Dict[str, np.ndarray]] = {}
@@ -419,7 +418,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         return bool(np.isfinite(numeric) and numeric > 0.0)
 
     # ------------------------------------------------------------------
-    # State tier helpers (ported from TargetsWeightsTab)
+    # State tier helpers
     # ------------------------------------------------------------------
     def _normalize_fit_target_weights_for_selection(
         self, dataset_id: str, selection: Sequence[str], raw_weights: object,
@@ -588,7 +587,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         layout.addWidget(group, stretch=1)
 
     # ------------------------------------------------------------------
-    # Dataset weight editor (ported from TargetsWeightsTab)
+    # Dataset weight editor
     # ------------------------------------------------------------------
     def _refresh_dataset_weight_editor_state(self) -> None:
         if not hasattr(self, "_dataset_weight_edit"):
@@ -951,7 +950,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_targets_dirty = bool(dirty)
 
     # ------------------------------------------------------------------
-    # Validity checks (ported from TargetsWeightsTab)
+    # Validity checks
     # ------------------------------------------------------------------
     def _invalid_pending_used_dataset_ids(self) -> List[str]:
         used = set(self._included_dataset_ids_getter())
@@ -1227,7 +1226,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._set_pending_fit_target_weight_text(ds_id, species, weight_item.text())
 
     # ------------------------------------------------------------------
-    # IC helpers (ported from InitialConditionsPanel)
+    # IC helpers
     # ------------------------------------------------------------------
     def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str):
         ds_id = str(dataset_id or "").strip()
@@ -1258,7 +1257,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         }
 
     # ------------------------------------------------------------------
-    # Public API -- Properties (ported from TargetsWeightsTab)
+    # Public API -- Properties
     # ------------------------------------------------------------------
     @property
     def fit_targets_selection_applied(self) -> Dict[str, List[str]]:
@@ -1391,7 +1390,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_internal_validity_ui()
 
     # ------------------------------------------------------------------
-    # Public API -- IC interface (ported from InitialConditionsPanel)
+    # Public API -- IC interface
     # ------------------------------------------------------------------
     def set_mechanism_species(self, species: list[str]) -> None:
         try:
