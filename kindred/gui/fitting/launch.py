@@ -8,12 +8,22 @@ import os
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from kindred.core.analysis.fit_dataset_payload import FitDatasetPayloadResult, read_fit_dataset_payload
-from kindred.core.batch_initial_conditions import dataset_base_label, seed_batch_set_from_dataset_first_row
 from kindred.core.simulation_preparation import build_prepared_simulation_func
 from kindred.gui.controllers.dataset_manager import DatasetManagerError
+from kindred.gui.fitting.batch_mapping import (
+    T0_SEED_TOL_S,
+    apply_batch_mapping_to_settings,
+    create_and_seed_batch_set,
+    default_batch_set_name_for_dataset,
+    pick_existing_batch_set,
+    prompt_dataset_batch_mapping_choice,
+    resolve_saved_batch_mapping,
+    select_batch_set,
+    unique_batch_set_name,
+)
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
 if TYPE_CHECKING:
@@ -148,66 +158,9 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             exc=exc,
         )
 
-    T0_SEED_TOL_S = 1e-9
     batch_store = context.batch_store
     batch_model = context.batch_model
     batch_table = context.batch_table
-
-    def _ensure_batch_set_row(set_name: str) -> tuple[int, bool]:
-        if batch_store is None or batch_model is None:
-            raise RuntimeError("Batch initial conditions table is unavailable.")
-        existing = batch_store.row_for_set(set_name)
-        if existing is not None:
-            return int(existing), False
-        insert_at = int(batch_store.row_count())
-        batch_model.beginInsertRows(QtCore.QModelIndex(), insert_at, insert_at)
-        try:
-            idx = int(batch_store.ensure_set(set_name))
-        finally:
-            batch_model.endInsertRows()
-        return idx, True
-
-    def _select_batch_set(set_name: str) -> None:
-        if batch_store is None or batch_model is None or batch_table is None:
-            return
-        row = batch_store.row_for_set(set_name)
-        if row is None:
-            return
-        idx = batch_model.index(int(row), 0)
-        batch_table.setCurrentIndex(idx)
-        sel = batch_table.selectionModel()
-        if sel is not None:
-            try:
-                sel.blockSignals(True)
-            except Exception as exc:
-                _record_failure(
-                    context,
-                    "global_fit.batch_table.blockSignals.true",
-                    message="Failed to block selection-model signals while selecting batch set for global fit",
-                    exc=exc,
-                )
-            try:
-                sel.clearSelection()
-                sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-            finally:
-                try:
-                    sel.blockSignals(False)
-                except Exception as exc:
-                    _record_failure(
-                        context,
-                        "global_fit.batch_table.blockSignals.false",
-                        message="Failed to unblock selection-model signals while selecting batch set for global fit",
-                        exc=exc,
-                    )
-        try:
-            batch_table.scrollTo(idx)
-        except Exception as exc:
-            _record_failure(
-                context,
-                "global_fit.batch_table.scrollTo",
-                message="Failed to scroll batch table to selected row while preparing global fit",
-                exc=exc,
-            )
 
     def _defaults_for_batch_set(set_name: str) -> Optional[Dict[str, float]]:
         if batch_store is None:
@@ -240,134 +193,65 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
     batch_set_names = list(batch_store.set_names()) if batch_store is not None else []
     running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
-    def _unique_batch_set_name(preferred: str) -> str:
-        base_name = str(preferred or "").strip() or "set"
-        existing = set(batch_set_names)
-        if base_name not in existing:
-            return base_name
-        counter = 1
-        while True:
-            candidate = f"{base_name}_{counter}"
-            if candidate not in existing:
-                return candidate
-            counter += 1
-
     for dataset_name in selected_names:
         settings = context.dataset_manager.get_fit_settings(dataset_name)
-        mapped = str(getattr(settings, "batch_set", "") or "").strip() or None
-        mapped_id = str(getattr(settings, "batch_set_id", "") or "").strip() or None
-        base = dataset_base_label(dataset_name) or str(dataset_name)
+        base = default_batch_set_name_for_dataset(dataset_name) or str(dataset_name)
 
-        target_set: Optional[str] = None
-        if mapped_id and batch_store is not None:
-            mapped_row = batch_store.row_for_set_id(mapped_id)
-            if mapped_row is not None:
-                target_set = batch_store.set_name_for_row(int(mapped_row))
-                settings.batch_set = target_set
-                settings.batch_set_id = mapped_id
-
-        if target_set is None and mapped and mapped in batch_set_names:
-            target_set = mapped
-            if batch_store is not None:
-                mapped_row = batch_store.row_for_set(target_set)
-                if mapped_row is not None:
-                    settings.batch_set_id = batch_store.set_id_for_row(int(mapped_row))
-        elif target_set is None:
-            create_set_name = _unique_batch_set_name(base)
-            if running_under_pytest:
-                resp = QtWidgets.QMessageBox.StandardButton.Ok
-            else:
-                resp = QtWidgets.QMessageBox.warning(
-                    context.parent,
-                    "Global Fit – Batch Mapping",
-                    (
-                        f"Dataset '{dataset_name}' has no saved batch mapping.\n\n"
-                        f"OK: Create new batch set '{create_set_name}'\n"
-                        "Open: Map to an existing batch set\n"
-                        "Cancel: Cancel global fit"
-                    ),
-                    QtWidgets.QMessageBox.StandardButton.Ok
-                    | QtWidgets.QMessageBox.StandardButton.Open
-                    | QtWidgets.QMessageBox.StandardButton.Cancel,
-                    QtWidgets.QMessageBox.StandardButton.Ok,
-                )
-            if resp == QtWidgets.QMessageBox.StandardButton.Cancel:
+        resolved_mapping = resolve_saved_batch_mapping(settings, batch_store)
+        target_set: Optional[str] = resolved_mapping.batch_set if resolved_mapping.status == "mapped" else None
+        if target_set is None:
+            create_set_name = unique_batch_set_name(batch_set_names, base)
+            action = prompt_dataset_batch_mapping_choice(
+                context.parent,
+                dataset_name,
+                create_set_name,
+                title="Global Fit – Batch Mapping",
+                skip_label="Cancel",
+                skip_description="Cancel global fit",
+                running_under_pytest=running_under_pytest,
+                pytest_default_action="create",
+            )
+            if action == "skip":
                 context.set_status("Global fit cancelled")
                 return None
-            if resp == QtWidgets.QMessageBox.StandardButton.Open:
-                if not batch_set_names:
-                    QtWidgets.QMessageBox.warning(
-                        context.parent,
-                        "Global Fit",
-                        "No batch sets exist to map to. Create a batch set first.",
-                    )
-                    context.set_status("Global fit cancelled")
-                    return None
-                choice, ok = QtWidgets.QInputDialog.getItem(
+            if action == "map":
+                target_set = pick_existing_batch_set(
                     context.parent,
-                    "Map Dataset to Batch Set",
-                    f"Select a batch set for dataset '{dataset_name}':",
+                    dataset_name,
                     batch_set_names,
-                    0,
-                    False,
+                    title="Map Dataset to Batch Set",
+                    empty_message_title="Global Fit",
+                    empty_message_text="No batch sets exist to map to. Create a batch set first.",
                 )
-                if not ok or not str(choice).strip():
+                if not target_set:
                     context.set_status("Global fit cancelled")
                     return None
-                target_set = str(choice).strip()
-                settings.batch_set = target_set
-                if batch_store is not None:
-                    selected_row = batch_store.row_for_set(target_set)
-                    if selected_row is not None:
-                        settings.batch_set_id = batch_store.set_id_for_row(int(selected_row))
+                apply_batch_mapping_to_settings(settings, batch_store, target_set)
             else:
-                row_idx, created = _ensure_batch_set_row(create_set_name)
+                dataset_payload = datasets_map.get(dataset_name) or {}
+                row_idx, created, seeded = create_and_seed_batch_set(
+                    dataset_name=dataset_name,
+                    dataset_payload=dataset_payload,
+                    mechanism_species=mechanism_species,
+                    batch_store=batch_store,
+                    batch_model=batch_model,
+                    set_name=create_set_name,
+                    record_failure=lambda key, **kwargs: _record_failure(context, key, **kwargs),
+                    failure_key_prefix="global_fit",
+                    tol=T0_SEED_TOL_S,
+                )
                 target_set = create_set_name
-                settings.batch_set = target_set
-                if batch_store is not None:
-                    settings.batch_set_id = batch_store.set_id_for_row(int(row_idx))
-
-                if created and batch_store is not None:
-                    dataset_payload = datasets_map.get(dataset_name) or {}
-                    seeded = seed_batch_set_from_dataset_first_row(
-                        dataset_payload,
-                        mechanism_species,
-                        tol=T0_SEED_TOL_S,
-                    )
-                    if seeded:
-                        for sp, val in seeded.items():
-                            try:
-                                batch_store.set_value(int(row_idx), str(sp), f"{float(val):.6g}")
-                            except Exception as exc:
-                                _record_failure(
-                                    context,
-                                    "global_fit.seed_batch_set.set_value",
-                                    message=f"Failed to seed batch set value for species '{sp}' while launching global fit",
-                                    exc=exc,
-                                )
-                                continue
-                        try:
-                            if batch_model is not None and batch_model.columnCount() > 1:
-                                top_left = batch_model.index(int(row_idx), 1)
-                                bottom_right = batch_model.index(int(row_idx), max(1, batch_model.columnCount() - 1))
-                                batch_model.dataChanged.emit(
-                                    top_left,
-                                    bottom_right,
-                                    [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
-                                )
-                        except Exception as exc:
-                            _record_failure(
-                                context,
-                                "global_fit.seed_batch_set.dataChanged",
-                                message="Failed to emit dataChanged after seeding a new batch set for global fit",
-                                exc=exc,
-                            )
-                    else:
-                        try:
-                            t_arr = np.asarray((dataset_payload or {}).get("t", []), dtype=float).reshape(-1)
-                            t0 = float(t_arr[0]) if t_arr.size else float("nan")
-                        except Exception:
-                            t0 = float("nan")
+                if created and not seeded and not mechanism_species:
+                    context.set_status("Global fit cancelled")
+                    return None
+                apply_batch_mapping_to_settings(settings, batch_store, target_set)
+                if created and batch_store is not None and not seeded:
+                    try:
+                        t_arr = np.asarray((dataset_payload or {}).get("t", []), dtype=float).reshape(-1)
+                        t0 = float(t_arr[0]) if t_arr.size else float("nan")
+                    except Exception:
+                        t0 = float("nan")
+                    if not (abs(t0) <= T0_SEED_TOL_S):
                         if running_under_pytest:
                             resp2 = QtWidgets.QMessageBox.StandardButton.Ok
                         else:
@@ -375,7 +259,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                                 context.parent,
                                 "Global Fit – Initial Conditions",
                                 (
-                                    f"Dataset '{dataset_name}' does not start at t≈0 "
+                                    f"Dataset '{dataset_name}' does not start at t\u22480 "
                                     f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
                                     "OK: Create set with zeros and continue\n"
                                     "Cancel: Create set and edit manually (then restart Global Fit)"
@@ -384,7 +268,14 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                                 QtWidgets.QMessageBox.StandardButton.Ok,
                             )
                         if resp2 == QtWidgets.QMessageBox.StandardButton.Cancel:
-                            _select_batch_set(target_set)
+                            select_batch_set(
+                                batch_store,
+                                batch_model,
+                                batch_table,
+                                target_set,
+                                record_failure=lambda key, **kwargs: _record_failure(context, key, **kwargs),
+                                failure_key_prefix="global_fit",
+                            )
                             QtWidgets.QMessageBox.information(
                                 context.parent,
                                 "Global Fit",
@@ -401,10 +292,6 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         if defaults is None:
             context.set_status("Global fit cancelled")
             return None
-        if batch_store is not None:
-            mapped_row = batch_store.row_for_set(target_set)
-            if mapped_row is not None:
-                settings.batch_set_id = batch_store.set_id_for_row(int(mapped_row))
         defaults_by_dataset[dataset_name] = defaults
         batch_set_names = list(batch_store.set_names()) if batch_store is not None else batch_set_names
 

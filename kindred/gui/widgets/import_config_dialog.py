@@ -28,7 +28,7 @@ __all__ = ["ImportConfig", "ImportConfigDialog", "ImportDialogResult"]
 
 _TIME_CANDIDATES = ["time", "time_s", "t", "Time", "T", "x"]
 _MAX_PREVIEW_ROWS = 20
-_UNIT_ROW_BG = QtGui.QColor(255, 255, 210)  # pale yellow highlight
+_UNIT_ROW_BG = QtGui.QColor(80, 65, 20)  # dark muted amber for dark-theme readability
 
 
 @dataclass
@@ -452,6 +452,20 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 "Selected sheets have different column structures. Import each sheet individually.",
             )
             return
+        if self._file_type == "excel":
+            missing = self._selected_columns_missing_from_checked_sheets()
+            if missing:
+                lines = [
+                    f"  {sheet}: missing {', '.join(cols)}"
+                    for sheet, cols in missing
+                ]
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Import Configuration",
+                    "Selected columns not found in all checked sheets:\n\n"
+                    + "\n".join(lines),
+                )
+                return
         self._result = self._build_result("import")
         self.accept()
 
@@ -576,6 +590,31 @@ class ImportConfigDialog(QtWidgets.QDialog):
             if set(self._sheet_columns(sheet_name)) != reference_columns:
                 return False
         return True
+
+    def _selected_columns_missing_from_checked_sheets(self) -> List[tuple]:
+        """Return [(sheet, [missing_cols])] for checked sheets missing selected columns."""
+        checked = self._get_checked_sheet_names()
+        if not checked:
+            return []
+        time_col = self._time_combo.currentText()
+        species = [
+            cb.property("column_name")
+            for cb in self._species_checkboxes
+            if cb.isChecked()
+        ]
+        required: set = set()
+        if time_col:
+            required.add(time_col)
+        required.update(species)
+        if not required:
+            return []
+        result: List[tuple] = []
+        for name in checked:
+            cols = set(self._sheet_columns(name))
+            missing = sorted(required - cols)
+            if missing:
+                result.append((name, missing))
+        return result
 
     def get_result(self) -> ImportDialogResult:
         """Return the dialog result after exec()."""

@@ -2073,6 +2073,8 @@ class FittingWindow(QtWidgets.QDialog):
         if worker is None or not self._worker_is_running(worker):
             return
 
+        self._disconnect_fit_worker_signals(worker)
+
         self._last_teardown_reason = str(reason)
         self._set_teardown_status_label(str(reason))
         self._disable_ui_for_worker_teardown(disable_ui=bool(disable_ui))
@@ -2356,6 +2358,8 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _on_worker_progress(self, percent: int, message: str, *, worker: Optional[QtCore.QThread] = None) -> None:
         if not self._is_active_worker_callback(worker):
+            return
+        if self._closing:
             return
         self._progress_bar.setValue(percent)
         self._status_label.setText(message)

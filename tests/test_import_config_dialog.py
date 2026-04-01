@@ -514,3 +514,119 @@ class TestErrorHandling:
         assert not dlg._btn_import.isEnabled()
         assert dlg._build_result("skip").action == "skip"
         assert dlg._build_result("cancel").action == "cancel"
+
+
+# ---------------------------------------------------------------------------
+# 9. Sheet column mismatch validation
+# ---------------------------------------------------------------------------
+
+
+class TestSheetColumnMismatch:
+    """Regression: config built from previewed sheet columns, not checked sheets."""
+
+    def test_sheet_column_mismatch_preview_vs_checked_single_sheet_rejects(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """Check sheet A, preview sheet B: species from B must be rejected."""
+        fp = _write_xlsx(tmp_path / "mismatch.xlsx", {
+            "SheetA": (["time", "A", "B"], [["0", "1", "2"]]),
+            "SheetB": (["time", "X", "Y"], [["0", "3", "4"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        # Uncheck SheetB, keep SheetA checked
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "SheetB":
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+
+        # Click SheetB to preview (species checkboxes switch to X, Y)
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "SheetB":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        dlg._on_import()
+
+        assert dlg._result is None
+        assert criticals
+        assert any("missing" in str(c).lower() for c in criticals)
+
+    def test_sheet_column_mismatch_preview_vs_all_checked_sheets_rejects(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """Both sheets checked but incompatible: import must be rejected."""
+        fp = _write_xlsx(tmp_path / "both_checked.xlsx", {
+            "SheetA": (["time", "A", "B"], [["0", "1", "2"]]),
+            "SheetB": (["time", "X", "Y"], [["0", "3", "4"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        # Click SheetB to preview
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "SheetB":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        warnings: list[tuple] = []
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "warning",
+            lambda *args, **kwargs: warnings.append(args),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        dlg._on_import()
+
+        assert dlg._result is None
+
+    def test_sheet_column_mismatch_absent_when_checked_matches_preview(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        """Check only sheet B and preview B: species X, Y are valid, import succeeds."""
+        fp = _write_xlsx(tmp_path / "match.xlsx", {
+            "SheetA": (["time", "A", "B"], [["0", "1", "2"]]),
+            "SheetB": (["time", "X", "Y"], [["0", "3", "4"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        # Uncheck SheetA
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "SheetA":
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+
+        # Click SheetB to preview
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "SheetB":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        dlg._on_import()
+
+        assert dlg._result is not None
+        assert dlg._result.action == "import"
+        assert set(dlg._result.config.species_columns) == {"X", "Y"}
+        assert dlg._result.config.sheet_names == ["SheetB"]
+        assert not criticals

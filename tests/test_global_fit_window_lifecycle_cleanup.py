@@ -752,6 +752,97 @@ def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
         window.close()
 
 
+def test_close_teardown_disconnects_worker_signals(qt_app, monkeypatch):
+    """_hard_teardown_worker must disconnect signals so queued emissions
+    after closeEvent cannot reach handlers on a partially-destroyed window."""
+    workers: list[_SignalWorker] = []
+
+    class _TeardownWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.wait_calls: list[int] = []
+            workers.append(self)
+
+        def wait(self, msecs: int | None = None) -> bool:
+            self.wait_calls.append(int(msecs or 0))
+            self._running = False
+            return True
+
+        def quit(self) -> None:
+            return None
+
+        def deleteLater(self) -> None:
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _TeardownWorker)
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+        window._set_running_state(True)
+        window._start_global_fit_worker(
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="LSODA",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            simulation_func=lambda _params: {},
+            stamp={},
+            stamp_hash="teardown",
+            stamp_short="teardown",
+        )
+        worker = workers[-1]
+        assert window._worker is worker
+
+        # Track calls through downstream handlers (not dispatch slots) so that
+        # _disconnect_fit_worker_signals sees the original slot methods.
+        best_handler_calls: list[dict] = []
+        progress_handler_calls: list[tuple] = []
+        window._handle_global_best_update = lambda payload, *, worker=None: best_handler_calls.append(dict(payload))
+        window._on_worker_progress = lambda p, m, *, worker=None: progress_handler_calls.append((p, m))
+
+        window._hard_teardown_worker(reason="test teardown", disable_ui=False)
+
+        worker.bestUpdated.emit({"cost": 42.0})
+        worker.progress.emit(50, "should not arrive")
+        QtCore.QCoreApplication.processEvents()
+        QtCore.QCoreApplication.processEvents()
+
+        assert best_handler_calls == [], "bestUpdated signal should be disconnected after hard teardown"
+        assert progress_handler_calls == [], "progress signal should be disconnected after hard teardown"
+    finally:
+        window.close()
+
+
+def test_on_worker_progress_returns_early_when_closing(qt_app):
+    """_on_worker_progress must not touch widgets when _closing is True."""
+    window = _build_window()
+    try:
+        set_value_calls: list[int] = []
+        set_text_calls: list[str] = []
+        window._progress_bar.setValue = lambda v: set_value_calls.append(v)
+        window._status_label.setText = lambda t: set_text_calls.append(t)
+
+        window._closing = True
+        window._on_worker_progress(50, "should be ignored")
+
+        assert set_value_calls == [], "_progress_bar.setValue called despite _closing=True"
+        assert set_text_calls == [], "_status_label.setText called despite _closing=True"
+    finally:
+        window._closing = False
+        window.close()
+
+
 def test_start_fit_clears_cached_state_before_launch(monkeypatch):
     window = _build_window()
     try:

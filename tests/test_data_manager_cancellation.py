@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import pytest
+from openpyxl import Workbook
 from PySide6 import QtWidgets
 from PySide6.QtTest import QSignalSpy
 
+from kindred.core.datasets.csv_import import CsvImportInterrupted
 from kindred.gui.widgets.data_manager import DataManagerPanel
+from kindred.gui.widgets.import_config_dialog import ImportConfig, ImportDialogResult
 
 pytestmark = pytest.mark.gui
 
@@ -17,6 +21,18 @@ def _write_csv(path: Path, rows: int = 20000) -> None:
         handle.write("time,A,B\n")
         for i in range(rows):
             handle.write(f"{i},{i * 0.1},{i * 0.2}\n")
+
+
+def _write_workbook(path: Path) -> None:
+    workbook = Workbook()
+    sheet_a = workbook.active
+    sheet_a.title = "SheetA"
+    sheet_a.append(["time", "A"])
+    sheet_a.append([0.0, 1.0])
+    sheet_b = workbook.create_sheet(title="SheetB")
+    sheet_b.append(["time", "A"])
+    sheet_b.append([0.0, 2.0])
+    workbook.save(path)
 
 
 def test_multi_file_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
@@ -35,6 +51,32 @@ def test_multi_file_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
         "getOpenFileNames",
         lambda *args, **kwargs: (files, ""),
     )
+    queued_results = [
+        ImportDialogResult(
+            config=ImportConfig(
+                filepath=files[0],
+                file_type="csv",
+                time_column="time",
+                species_columns=["A", "B"],
+                time_unit="s",
+                concentration_unit="M",
+                apply_to_remaining=True,
+            ),
+            action="import",
+        )
+    ]
+
+    class _FakeDialog:
+        def __init__(self, filepath: str, remaining_count: int = 0, parent=None) -> None:
+            self._result = queued_results.pop(0)
+
+        def exec(self) -> int:
+            return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+        def get_result(self) -> ImportDialogResult:
+            return self._result
+
+    monkeypatch.setattr("kindred.gui.widgets.data_manager.ImportConfigDialog", _FakeDialog)
 
     finished_spy = QSignalSpy(panel.loadFinished)
 
@@ -49,3 +91,122 @@ def test_multi_file_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
     assert panel._progress_dialog is None
     assert panel._pending_files_count == 0
     assert panel._completed_files_count == 0
+
+
+def test_excel_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
+    """Cancel Excel import and ensure worker bookkeeping cleans up properly."""
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+
+    workbook_path = tmp_path / "dataset.xlsx"
+    _write_workbook(workbook_path)
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(workbook_path)], ""),
+    )
+    queued_results = [
+        ImportDialogResult(
+            config=ImportConfig(
+                filepath=str(workbook_path),
+                file_type="excel",
+                sheet_names=["SheetA", "SheetB"],
+                time_column="time",
+                species_columns=["A"],
+                time_unit="s",
+                concentration_unit="M",
+            ),
+            action="import",
+        )
+    ]
+
+    class _FakeDialog:
+        def __init__(self, filepath: str, remaining_count: int = 0, parent=None) -> None:
+            self._result = queued_results.pop(0)
+
+        def exec(self) -> int:
+            return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+        def get_result(self) -> ImportDialogResult:
+            return self._result
+
+    def _slow_excel_loader(self, sheet_name: str):
+        for _ in range(200):
+            if self.isInterruptionRequested():
+                raise CsvImportInterrupted()
+            time.sleep(0.001)
+        return f"{Path(self.filepath).name}::{sheet_name}", {"t": [], "species": {}, "metadata": {}}
+
+    monkeypatch.setattr("kindred.gui.widgets.data_manager.ImportConfigDialog", _FakeDialog)
+    monkeypatch.setattr("kindred.gui.widgets.data_manager.ExcelLoaderWorker._load_sheet_payload", _slow_excel_loader)
+
+    finished_spy = QSignalSpy(panel.loadFinished)
+
+    panel._load_dataset()
+    panel._on_load_canceled()
+
+    qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
+
+    assert finished_spy.count() == 1
+    assert bool(finished_spy.at(0)[0]) is True
+    assert not panel._csv_workers
+    assert panel._progress_dialog is None
+    assert panel._pending_files_count == 0
+    assert panel._completed_files_count == 0
+
+
+def test_clear_datasets_cancels_inflight_import_and_prevents_late_commit(tmp_path, monkeypatch, qtbot):
+    """Clearing datasets should discard active imports instead of letting them repopulate the panel."""
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+
+    csv_path = tmp_path / "late.csv"
+    _write_csv(csv_path, rows=10)
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(csv_path)], ""),
+    )
+    queued_results = [
+        ImportDialogResult(
+            config=ImportConfig(
+                filepath=str(csv_path),
+                file_type="csv",
+                time_column="time",
+                species_columns=["A", "B"],
+                time_unit="s",
+                concentration_unit="M",
+            ),
+            action="import",
+        )
+    ]
+
+    class _FakeDialog:
+        def __init__(self, filepath: str, remaining_count: int = 0, parent=None) -> None:
+            self._result = queued_results.pop(0)
+
+        def exec(self) -> int:
+            return int(QtWidgets.QDialog.DialogCode.Accepted)
+
+        def get_result(self) -> ImportDialogResult:
+            return self._result
+
+    def _slow_payload(self):
+        for _ in range(100):
+            if self.isInterruptionRequested():
+                raise CsvImportInterrupted()
+            time.sleep(0.002)
+        return {"t": [0.0, 1.0], "species": {"A": [1.0, 2.0], "B": [2.0, 3.0]}, "metadata": {}}
+
+    monkeypatch.setattr("kindred.gui.widgets.data_manager.ImportConfigDialog", _FakeDialog)
+    monkeypatch.setattr("kindred.gui.widgets.data_manager.CSVLoaderWorker._load_csv_payload", _slow_payload)
+
+    panel._load_dataset()
+    qtbot.wait(20)
+    panel.clear_datasets()
+    qtbot.wait(400)
+
+    assert panel.get_datasets() == {}
+    assert panel._progress_dialog is None
