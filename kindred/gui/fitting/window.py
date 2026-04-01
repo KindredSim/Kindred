@@ -1615,10 +1615,20 @@ class FittingWindow(QtWidgets.QDialog):
     # ------------------------------------------------------------------
     # Fit lifecycle
     # ------------------------------------------------------------------
+    def _reset_fit_run_cached_state(self) -> None:
+        self._latest_model_series = {}
+        self._latest_dataset_stats = {}
+        self._latest_plot_model_series = {}
+        self._latest_plot_model_x = {}
+        self._best_cost = None
+        self._best_effort_failures.clear()
+        self._teardown_disable_failures.clear()
+
     def _start_fit(self) -> None:
         if self._worker and self._worker.isRunning():
             QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
             return
+        self._reset_fit_run_cached_state()
         self._species_table.flush_visible_weight_edits()
         self._species_table.flush_dataset_weight_editor()
         config = self._params_ics_tab._collect_parameter_config()
@@ -2285,6 +2295,67 @@ class FittingWindow(QtWidgets.QDialog):
             return None
         return worker if worker is not None else None
 
+    def _dispatch_fit_worker_target(self) -> Optional[QtCore.QThread]:
+        worker = self._fit_worker_sender()
+        if worker is not None:
+            return worker
+        current_worker = getattr(self, "_worker", None)
+        return current_worker if current_worker is not None else None
+
+    def _disconnect_fit_worker_signals(self, worker: Optional[QtCore.QThread]) -> None:
+        if worker is None:
+            return
+        signal = getattr(worker, "progress", None)
+        if signal is not None and hasattr(signal, "disconnect"):
+            try:
+                signal.disconnect(self._dispatch_fit_worker_progress)
+            except (RuntimeError, TypeError):
+                pass
+        signal = getattr(worker, "bestUpdated", None)
+        if signal is not None and hasattr(signal, "disconnect"):
+            try:
+                signal.disconnect(self._dispatch_fit_worker_best_update)
+            except (RuntimeError, TypeError):
+                pass
+        signal = getattr(worker, "finished", None)
+        if signal is not None and hasattr(signal, "disconnect"):
+            try:
+                signal.disconnect(self._dispatch_fit_worker_finished)
+            except (RuntimeError, TypeError):
+                pass
+        signal = getattr(worker, "error", None)
+        if signal is not None and hasattr(signal, "disconnect"):
+            try:
+                signal.disconnect(self._dispatch_fit_worker_error)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _stop_finished_worker(self, worker: Optional[QtCore.QThread]) -> None:
+        if worker is None:
+            return
+        quit_worker = getattr(worker, "quit", None)
+        if callable(quit_worker):
+            try:
+                quit_worker()
+            except Exception:
+                pass
+        wait_for_worker = getattr(worker, "wait", None)
+        if callable(wait_for_worker):
+            try:
+                wait_for_worker(2000)
+            except Exception:
+                pass
+
+    def _clear_pending_best_update_state(self) -> None:
+        if hasattr(self, "_pending_best_timer"):
+            try:
+                self._pending_best_timer.stop()
+            except Exception as exc:
+                self._best_effort_failures.add("clear_pending_best_update_state.pending_best_timer_stop")
+                logger.debug("Failed to stop pending-best timer during worker completion cleanup: %s", exc, exc_info=True)
+        self._pending_best_payload = None
+        self._pending_best_worker = None
+
     @QtCore.Slot(int, str)
     def _dispatch_fit_worker_progress(self, percent: int, message: str) -> None:
         self._on_worker_progress(percent, message, worker=self._fit_worker_sender())
@@ -2295,19 +2366,41 @@ class FittingWindow(QtWidgets.QDialog):
 
     @QtCore.Slot(dict)
     def _dispatch_fit_worker_finished(self, payload: Dict[str, Any]) -> None:
-        worker = self._fit_worker_sender()
-        try:
-            self._handle_global_fit_complete(payload, worker=worker)
-        finally:
+        worker = self._dispatch_fit_worker_target()
+        current_worker = getattr(self, "_worker", None)
+        if worker is not None and current_worker is not None and worker is not current_worker:
+            self._disconnect_fit_worker_signals(worker)
+            self._stop_finished_worker(worker)
             self._schedule_worker_cleanup(worker)
+            return
+        old_worker = current_worker if current_worker is not None else worker
+        self._disconnect_fit_worker_signals(old_worker)
+        if getattr(self, "_worker", None) is old_worker:
+            self._worker = None
+        self._stop_finished_worker(old_worker)
+        try:
+            self._handle_global_fit_complete(payload, worker=old_worker)
+        finally:
+            self._schedule_worker_cleanup(old_worker)
 
     @QtCore.Slot(object)
     def _dispatch_fit_worker_error(self, error: object) -> None:
-        worker = self._fit_worker_sender()
-        try:
-            self._on_worker_error(error, worker=worker)
-        finally:
+        worker = self._dispatch_fit_worker_target()
+        current_worker = getattr(self, "_worker", None)
+        if worker is not None and current_worker is not None and worker is not current_worker:
+            self._disconnect_fit_worker_signals(worker)
+            self._stop_finished_worker(worker)
             self._schedule_worker_cleanup(worker)
+            return
+        old_worker = current_worker if current_worker is not None else worker
+        self._disconnect_fit_worker_signals(old_worker)
+        if getattr(self, "_worker", None) is old_worker:
+            self._worker = None
+        self._stop_finished_worker(old_worker)
+        try:
+            self._on_worker_error(error, worker=old_worker)
+        finally:
+            self._schedule_worker_cleanup(old_worker)
 
     def _is_active_worker_callback(self, worker: Optional[QtCore.QThread]) -> bool:
         if worker is None:
@@ -2326,7 +2419,12 @@ class FittingWindow(QtWidgets.QDialog):
         *,
         worker: Optional[QtCore.QThread] = None,
     ) -> None:
-        if not self._is_active_worker_callback(worker):
+        if worker is not None:
+            current_worker = getattr(self, "_worker", None)
+            if current_worker is not None and current_worker is not worker:
+                return
+        self._clear_pending_best_update_state()
+        if self._closing:
             return
         result: GlobalFitResult = payload.get("result")
         if result is None:
@@ -2362,14 +2460,13 @@ class FittingWindow(QtWidgets.QDialog):
             status = f"Global fit failed: {failure_message}"
             logger.warning("Global fit failed: %s", failure_message)
 
+        self._status_label.setText(status)
+        self._set_running_state(False)
         if self.isVisible() and not self._closing:
             if severity == "ok":
                 QtWidgets.QMessageBox.information(self, title, text)
             else:
                 QtWidgets.QMessageBox.warning(self, title, text)
-
-        self._status_label.setText(status)
-        self._set_running_state(False)
 
     def _global_fit_completion_dialog_spec(self, result: GlobalFitResult) -> tuple[str, str, str]:
         """Return (severity, title, text) for the completion dialog."""
@@ -2709,7 +2806,12 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def _on_worker_error(self, error: object, *, worker: Optional[QtCore.QThread] = None) -> None:
-        if not self._is_active_worker_callback(worker):
+        if worker is not None:
+            current_worker = getattr(self, "_worker", None)
+            if current_worker is not None and current_worker is not worker:
+                return
+        self._clear_pending_best_update_state()
+        if self._closing:
             return
         if self._results_rebuild_pending:
             self._results_rebuild_pending = False

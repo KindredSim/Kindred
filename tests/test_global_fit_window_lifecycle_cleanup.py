@@ -545,3 +545,263 @@ def test_detached_fit_worker_late_emissions_do_not_reenter_deleted_dialog(qt_app
     QtCore.QCoreApplication.processEvents()
 
     assert callbacks == []
+
+
+def test_consecutive_fit_dispatch_cycles_leave_clean_state(qt_app, monkeypatch):
+    workers: list[_SignalWorker] = []
+
+    class _FactoryWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.quit_called = False
+            self.wait_calls: list[int] = []
+            workers.append(self)
+
+        def quit(self) -> None:
+            self.quit_called = True
+
+        def wait(self, msecs: int | None = None) -> bool:
+            self.wait_calls.append(int(msecs or 0))
+            self._running = False
+            return True
+
+        def deleteLater(self) -> None:
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.warning", lambda *_args, **_kwargs: None)
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+
+        for run_index in range(3):
+            window._set_running_state(True)
+            window._start_global_fit_worker(
+                datasets=[],
+                config=config,
+                dataset_overrides=[],
+                weights=None,
+                requested_solver="LSODA",
+                requested_rtol=1e-6,
+                requested_atol=1e-12,
+                simulation_func=lambda _params: {},
+                stamp={},
+                stamp_hash=f"run-{run_index}",
+                stamp_short=f"run-{run_index}",
+            )
+            worker = workers[-1]
+            window._pending_best_payload = {"iteration": run_index + 1}
+            window._pending_best_worker = worker
+            window._pending_best_timer.start()
+
+            worker._running = False
+            worker.finished.emit({"result": _build_success_result(value=float(run_index + 1))})
+            QtCore.QCoreApplication.processEvents()
+
+            assert window._worker is None
+            assert not window._pending_best_timer.isActive()
+            assert window._pending_best_payload is None
+            assert window._pending_best_worker is None
+            assert worker.quit_called is True
+            assert worker.wait_calls == [2000]
+    finally:
+        window.close()
+
+
+def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeypatch):
+    workers: list[_SignalWorker] = []
+
+    class _FactoryWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.wait_calls: list[int] = []
+            workers.append(self)
+
+        def quit(self) -> None:
+            return None
+
+        def wait(self, msecs: int | None = None) -> bool:
+            self.wait_calls.append(int(msecs or 0))
+            self._running = False
+            return True
+
+        def deleteLater(self) -> None:
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", lambda *_args, **_kwargs: None)
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+        callbacks: list[dict] = []
+        monkeypatch.setattr(
+            window,
+            "_dispatch_fit_worker_best_update",
+            lambda payload: callbacks.append(dict(payload)),
+        )
+
+        window._set_running_state(True)
+        window._start_global_fit_worker(
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="LSODA",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            simulation_func=lambda _params: {},
+            stamp={},
+            stamp_hash="done",
+            stamp_short="done",
+        )
+        worker = workers[-1]
+        worker._running = False
+        worker.finished.emit({"result": _build_success_result()})
+        QtCore.QCoreApplication.processEvents()
+
+        worker.bestUpdated.emit({"cost": 99.0})
+        QtCore.QCoreApplication.processEvents()
+
+        assert callbacks == []
+    finally:
+        window.close()
+
+
+def test_completion_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        worker = _SignalWorker()
+        worker._running = False
+        window._worker = worker
+        window._pending_best_payload = {"cost": 1.0}
+        window._pending_best_worker = worker
+        window._pending_best_timer.start()
+
+        states: list[tuple[bool, object, object]] = []
+
+        def _capture_dialog(*_args, **_kwargs):
+            states.append(
+                (
+                    window._pending_best_timer.isActive(),
+                    window._pending_best_payload,
+                    window._pending_best_worker,
+                )
+            )
+            return None
+
+        monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", _capture_dialog)
+
+        window._handle_global_fit_complete({"result": _build_success_result()}, worker=worker)
+
+        assert states == [(False, None, None)]
+    finally:
+        window.close()
+
+
+def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        worker = _SignalWorker()
+        worker._running = False
+        window._worker = worker
+        window._pending_best_payload = {"cost": 1.0}
+        window._pending_best_worker = worker
+        window._pending_best_timer.start()
+
+        states: list[tuple[bool, object, object]] = []
+
+        def _capture_dialog(*_args, **_kwargs):
+            states.append(
+                (
+                    window._pending_best_timer.isActive(),
+                    window._pending_best_payload,
+                    window._pending_best_worker,
+                )
+            )
+            return None
+
+        monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.warning", _capture_dialog)
+
+        window._on_worker_error({"kind": "fitting_error", "message": "boom"}, worker=worker)
+
+        assert states == [(False, None, None)]
+    finally:
+        window.close()
+
+
+def test_start_fit_clears_cached_state_before_launch(monkeypatch):
+    window = _build_window()
+    try:
+        window._latest_model_series = {"stale": {"A": np.asarray([1.0], dtype=float)}}
+        window._latest_dataset_stats = {"stale": {"chi_squared": 1.0}}
+        window._latest_plot_model_series = {"stale": {"A": np.asarray([1.0], dtype=float)}}
+        window._latest_plot_model_x = {"stale": np.asarray([0.0], dtype=float)}
+        window._best_cost = 9.0
+        window._best_effort_failures.add("stale.best_effort")
+        window._teardown_disable_failures.add("stale.disable")
+
+        monkeypatch.setattr(
+            window._params_ics_tab,
+            "_collect_parameter_config",
+            lambda: {
+                "parameters": {"k": 1.0},
+                "bounds": {"k": (0.0, 2.0)},
+                "fixed_params": {},
+                "method": "trf",
+                "max_nfev": 2,
+                "seed": None,
+                "log10_params": {},
+            },
+        )
+        monkeypatch.setattr(
+            window,
+            "_collect_dataset_selection",
+            lambda: {
+                "rows": [{"id": "ds1", "label": "Dataset 1", "species": "A", "include": True, "weight": 1.0}],
+                "ids": ["ds1"],
+            },
+        )
+        launch_state: list[tuple[dict, dict]] = []
+        monkeypatch.setattr(
+            window,
+            "_start_global_fit",
+            lambda config, dataset_selection, *, solver="Radau", rtol=1e-6, atol=1e-12: launch_state.append(
+                (dict(config), dict(dataset_selection))
+            ),
+        )
+
+        window._start_fit()
+
+        assert launch_state
+        assert window._latest_model_series == {}
+        assert window._latest_dataset_stats == {}
+        assert window._latest_plot_model_series == {}
+        assert window._latest_plot_model_x == {}
+        assert window._best_cost is None
+        assert window._best_effort_failures == set()
+        assert window._teardown_disable_failures == set()
+    finally:
+        window.close()
