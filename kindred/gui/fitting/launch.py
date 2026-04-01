@@ -13,8 +13,8 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.analysis.fit_dataset_payload import FitDatasetPayloadResult, read_fit_dataset_payload
 from kindred.core.batch_initial_conditions import dataset_base_label, seed_batch_set_from_dataset_first_row
 from kindred.core.simulation_preparation import build_prepared_simulation_func
-from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
 from kindred.gui.controllers.dataset_manager import DatasetManagerError
+from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
 if TYPE_CHECKING:
     from kindred.gui.controllers.dataset_manager import DatasetFitSettings
@@ -516,7 +516,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         t_end=max_time,
         num_points=grid_points,
         temperature_K=float(context.temperature_getter()),
-        solver=str(solver_settings.get("solver") or DEFAULT_SOLVER_NAME),
+        solver=str(solver_settings.get("solver") or FITTING_DEFAULT_SOLVER),
         rtol=float(solver_settings.get("rtol") or 1e-6),
         atol=float(solver_settings.get("atol") or 1e-12),
         use_sparse_jacobian=bool(solver_settings.get("use_sparse_jacobian")),
@@ -541,13 +541,13 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         current_solver_settings = dict(current_solver_settings or {})
         from kindred.core.simulator.solvers import normalize_solver_name
 
-        current_solver_settings.setdefault("solver", str(DEFAULT_SOLVER_NAME))
+        current_solver_settings.setdefault("solver", FITTING_DEFAULT_SOLVER)
         current_solver_settings.setdefault("rtol", 1e-6)
         current_solver_settings.setdefault("atol", 1e-12)
         current_solver_settings.setdefault("use_sparse_jacobian", False)
         current_solver_settings.setdefault("wegscheider_cyclicity_enabled", False)
 
-        solver_label = str(solver or current_solver_settings.get("solver") or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
+        solver_label = str(solver or current_solver_settings.get("solver") or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_value, _solver_warning = normalize_solver_name(solver_label)
         rtol_value = float(rtol if rtol is not None else (current_solver_settings.get("rtol") or 1e-6))
         atol_value = float(atol if atol is not None else (current_solver_settings.get("atol") or 1e-12))

@@ -41,6 +41,7 @@ from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     coerce_prepared_simulation_metadata,
 )
+from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     simulation_failure_user_message,
@@ -454,7 +455,7 @@ class FittingWindow(QtWidgets.QDialog):
         application's active solver settings at window launch.
         """
         allowed = ("LSODA", "Radau", "BDF")
-        solver_default = "LSODA"
+        solver_default = FITTING_DEFAULT_SOLVER
         rtol_default = 1e-6
         atol_default = 1e-12
 
@@ -481,7 +482,7 @@ class FittingWindow(QtWidgets.QDialog):
                 atol_default = 1e-12
 
         if solver_default not in allowed:
-            solver_default = "LSODA"
+            solver_default = FITTING_DEFAULT_SOLVER
         if not (np.isfinite(rtol_default) and rtol_default > 0.0):
             rtol_default = 1e-6
         if not (np.isfinite(atol_default) and atol_default > 0.0):
@@ -1530,7 +1531,7 @@ class FittingWindow(QtWidgets.QDialog):
                 raise RuntimeError("Simulation builder unavailable.")
             integration = self._params_ics_tab.collect_integration_settings()
             if integration is None:
-                solver, rtol, atol = ("LSODA", 1e-6, 1e-12)
+                solver, rtol, atol = (FITTING_DEFAULT_SOLVER, 1e-6, 1e-12)
             else:
                 solver, rtol, atol = integration
             self._simulation_func = self._simulation_builder(
@@ -1617,7 +1618,7 @@ class FittingWindow(QtWidgets.QDialog):
         config: Dict[str, Any],
         dataset_selection: Dict[str, Any],
         *,
-        solver: str = "Radau",
+        solver: str = FITTING_DEFAULT_SOLVER,
         rtol: float = 1e-6,
         atol: float = 1e-12,
     ) -> None:
@@ -1631,9 +1632,9 @@ class FittingWindow(QtWidgets.QDialog):
         mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
         reactions_text = self._safe_text_from_getter(getattr(self, "_reactions_text_getter", None))
 
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+        from kindred.core.simulator.solvers import normalize_solver_name
 
-        solver_label = str(solver or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
+        solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         requested_solver, solver_warning = normalize_solver_name(solver_label)
         if solver_warning:
             QtWidgets.QMessageBox.information(

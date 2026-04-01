@@ -405,7 +405,7 @@ class GridPlotView(QtWidgets.QWidget):
                 [],
                 [],
                 pen=self._pg.mkPen(color=color, width=2),
-                name=f"{species_name} (model)",
+                name=species_name,
             )
         else:
             item = plot.plot(
@@ -416,7 +416,7 @@ class GridPlotView(QtWidgets.QWidget):
                 symbolSize=5,
                 symbolBrush=self._pg.mkBrush(*color, 150),
                 symbolPen=self._pg.mkPen(color=color, width=1),
-                name=f"{species_name} (data)",
+                name=None,
             )
         series_map[key] = item
         return item
@@ -1029,7 +1029,7 @@ class GridPlotView(QtWidgets.QWidget):
                 symbolSize=5,
                 symbolBrush=self._pg.mkBrush(*color, 150),
                 symbolPen=self._pg.mkPen(color=color, width=1),
-                name=f"{species_name} (data)",
+                name=None,
             )
 
             # Plot model overlay (multi-series preferred, fallback to single model_y)
@@ -1045,7 +1045,7 @@ class GridPlotView(QtWidgets.QWidget):
                     x_model,
                     y_model,
                     pen=self._pg.mkPen(color=color, width=2),
-                    name=f"{species_name} (model)",
+                    name=species_name,
                 )
 
         # Add legend if we have multiple species

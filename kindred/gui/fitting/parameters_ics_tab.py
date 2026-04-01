@@ -10,8 +10,7 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
-from kindred.gui.widgets.collapsible_section import CollapsibleSection
-from kindred.gui.fitting.constants import INITIAL_PREFIX, DEFAULT_PARALLEL_STARTS
+from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
 logger = logging.getLogger(__name__)
@@ -452,13 +451,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         algo_form.addRow(self._seed_check, self._seed_spin)
         params_layout.addLayout(algo_form)
 
-        integration_section = CollapsibleSection("Advanced Integration Settings", parent=params_group)
-        integration_section.setObjectName("global_fit_advanced_integration_section")
-        integration_section.set_collapsed(True)
-        integration_widget = QtWidgets.QWidget(integration_section)
-        integration_form = QtWidgets.QFormLayout(integration_widget)
-
         default_solver, default_rtol, default_atol = integration_defaults
+        default_solver = str(default_solver or FITTING_DEFAULT_SOLVER)
 
         def _fmt(value: float) -> str:
             text = f"{float(value):g}"
@@ -473,15 +467,23 @@ class ParametersIcsTab(QtWidgets.QWidget):
             digits = digits.lstrip("0") or "0"
             return f"{base}e{sign}{digits}"
 
-        self._integration_solver_combo = QtWidgets.QComboBox(integration_widget)
+        integration_header = QtWidgets.QLabel("Integration Settings", params_group)
+        header_font = integration_header.font()
+        header_font.setBold(True)
+        integration_header.setFont(header_font)
+        params_layout.addWidget(integration_header)
+
+        integration_form = QtWidgets.QFormLayout()
+
+        self._integration_solver_combo = QtWidgets.QComboBox(params_group)
         self._integration_solver_combo.setObjectName("global_fit_integration_solver")
         self._integration_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._integration_solver_combo.setCurrentText(str(default_solver))
+        self._integration_solver_combo.setCurrentText(default_solver)
 
-        self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), integration_widget)
+        self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), params_group)
         self._integration_rtol_edit.setObjectName("global_fit_integration_rtol")
 
-        self._integration_atol_edit = QtWidgets.QLineEdit(_fmt(default_atol), integration_widget)
+        self._integration_atol_edit = QtWidgets.QLineEdit(_fmt(default_atol), params_group)
         self._integration_atol_edit.setObjectName("global_fit_integration_atol")
 
         setup_scientific_validator(self._integration_rtol_edit)
@@ -490,8 +492,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         integration_form.addRow("Solver:", self._integration_solver_combo)
         integration_form.addRow("rtol:", self._integration_rtol_edit)
         integration_form.addRow("atol:", self._integration_atol_edit)
-        integration_section.set_content_widget(integration_widget)
-        params_layout.addWidget(integration_section)
+        params_layout.addLayout(integration_form)
 
         layout.addWidget(params_group, stretch=1)
         return widget
@@ -1545,13 +1546,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return state
 
     def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+        from kindred.core.simulator.solvers import normalize_solver_name
 
         allowed = ("LSODA", "Radau", "BDF")
         combo = getattr(self, "_integration_solver_combo", None)
-        solver_label = str(combo.currentText()).strip() if combo is not None else str(DEFAULT_SOLVER_NAME)
+        solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
         if solver_label not in allowed:
-            solver_label = str(DEFAULT_SOLVER_NAME)
+            solver_label = FITTING_DEFAULT_SOLVER
         solver_method, solver_warning = normalize_solver_name(solver_label)
         if solver_warning:
             QtWidgets.QMessageBox.information(
