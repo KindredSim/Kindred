@@ -3,6 +3,13 @@ from __future__ import annotations
 import pytest
 
 
+def test_public_unit_display_tuples_use_ascii_micro_forms() -> None:
+    from kindred.core.datasets.units import CONCENTRATION_UNIT_DISPLAY, TIME_UNIT_DISPLAY
+
+    assert TIME_UNIT_DISPLAY == ("fs", "ps", "ns", "us", "ms", "s", "min", "h")
+    assert CONCENTRATION_UNIT_DISPLAY == ("fM", "pM", "nM", "uM", "mM", "M")
+
+
 def test_parse_time_unit_supports_all_declared_units() -> None:
     from kindred.core.datasets.units import parse_time_unit
 

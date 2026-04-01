@@ -8,6 +8,7 @@ preview content, and the apply-to-remaining checkbox.
 from __future__ import annotations
 
 import csv
+from pathlib import Path
 from typing import List
 
 import pytest
@@ -97,6 +98,16 @@ class TestCsvAutoDetection:
         assert dlg._time_unit_combo.currentText() == "s"
         assert dlg._conc_unit_combo.currentText() == "uM"
 
+    def test_unicode_micro_units_normalize_to_ascii_combo_entries(self, qapp, tmp_path):
+        fp = _write_csv(tmp_path / "unicode_units.csv", ["time", "A", "B"], [
+            ["µs", "µM", "μM"],
+            ["0", "1.0", "2.0"],
+            ["1", "1.1", "2.1"],
+        ])
+        dlg = ImportConfigDialog(fp)
+        assert dlg._time_unit_combo.currentText() == "us"
+        assert dlg._conc_unit_combo.currentText() == "uM"
+
     def test_no_unit_row(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "e.csv", ["time", "A", "B"], [
             ["0", "1.0", "2.0"],
@@ -156,6 +167,107 @@ class TestExcelSheetHandling:
         item.setCheckState(QtCore.Qt.CheckState.Unchecked)
         dlg._update_import_enabled()
         assert not dlg._btn_import.isEnabled()
+
+    def test_incompatible_checked_sheets_are_blocked_on_import(self, qapp, tmp_path, monkeypatch):
+        fp = _write_xlsx(tmp_path / "mismatch.xlsx", {
+            "Run1": (["time", "A"], [["0", "1.0"]]),
+            "Run2": (["time", "B", "C"], [["0", "2.0", "3.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+        warnings = []
+
+        def _warning(parent, title, text):
+            warnings.append((title, text))
+            return QtWidgets.QMessageBox.StandardButton.Ok
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
+
+        dlg._on_import()
+
+        assert warnings
+        assert "different column structures" in warnings[0][1]
+        assert dlg._result is None
+
+    def test_checked_sheet_compatibility_uses_checked_set_not_previewed_sheet(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "compatible_checked.xlsx", {
+            "Run1": (["time", "A"], [["0", "1.0"]]),
+            "Run2": (["time", "B"], [["0", "2.0"]]),
+            "Run3": (["time", "B"], [["0", "3.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Run1":
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+
+        assert dlg._checked_excel_sheets_are_compatible() is True
+
+    def test_reordered_checked_sheet_headers_are_compatible(self, qapp, tmp_path, monkeypatch):
+        fp = _write_xlsx(tmp_path / "reordered.xlsx", {
+            "Run1": (["time", "A", "B"], [["0", "1.0", "2.0"]]),
+            "Run2": (["B", "time", "A"], [["3.0", "0", "4.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+        warnings = []
+
+        def _warning(parent, title, text):
+            warnings.append((title, text))
+            return QtWidgets.QMessageBox.StandardButton.Ok
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
+
+        assert dlg._checked_excel_sheets_are_compatible() is True
+
+        dlg._on_import()
+
+        assert warnings == []
+        assert dlg._result is not None
+
+    def test_excel_preview_stops_after_preview_limit(self, qapp, tmp_path, monkeypatch):
+        from kindred.core.datasets import excel_import
+        from kindred.gui.widgets import import_config_dialog as dialog_module
+
+        class _PreviewSheet:
+            def __init__(self) -> None:
+                self.data_rows_yielded = 0
+
+            def iter_rows(self, values_only: bool = True):
+                yield ("time", "A")
+                for index in range(100):
+                    self.data_rows_yielded += 1
+                    if self.data_rows_yielded > dialog_module._MAX_PREVIEW_ROWS + 1:
+                        raise AssertionError("preview consumed more rows than needed")
+                    yield (index, index + 1.0)
+
+        class _FakeWorkbook:
+            def __init__(self) -> None:
+                self.sheetnames = ["Data"]
+                self.closed = 0
+                self._sheet = _PreviewSheet()
+
+            def __getitem__(self, name: str):
+                assert name == "Data"
+                return self._sheet
+
+            def close(self) -> None:
+                self.closed += 1
+
+        workbooks: list[_FakeWorkbook] = []
+
+        def _open_workbook(_path: str):
+            workbook = _FakeWorkbook()
+            workbooks.append(workbook)
+            return workbook
+
+        monkeypatch.setattr(excel_import, "_open_workbook", _open_workbook)
+
+        dlg = ImportConfigDialog(str(tmp_path / "preview.xlsx"))
+
+        preview_workbook = workbooks[-1]
+        assert dlg._preview_table.rowCount() == dialog_module._MAX_PREVIEW_ROWS
+        assert preview_workbook._sheet.data_rows_yielded == dialog_module._MAX_PREVIEW_ROWS + 1
+        assert preview_workbook.closed == 1
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +409,18 @@ class TestUnitRowOverride:
         assert result.config.concentration_unit == "M"
         assert result.config.unit_row_detected is False
 
+    def test_mixed_concentration_units_show_warning_and_allow_override(self, qapp, tmp_path):
+        fp = _write_csv(tmp_path / "mixed_units.csv", ["time", "A", "B"], [
+            ["s", "uM", "nM"],
+            ["0", "1.0", "2.0"],
+        ])
+        dlg = ImportConfigDialog(fp)
+        assert "Multiple concentration units detected" in dlg._unit_warning_label.text()
+        assert dlg._conc_unit_combo.currentText() == "uM"
+        dlg._conc_unit_combo.setCurrentText("nM")
+        result = dlg._build_result("import")
+        assert result.config.concentration_unit == "nM"
+
 
 # ---------------------------------------------------------------------------
 # 7. Preview content
@@ -369,3 +493,24 @@ class TestApplyToRemaining:
         dlg._apply_remaining_cb.setChecked(True)
         r2 = dlg._build_result("import")
         assert r2.config.apply_to_remaining is True
+
+
+class TestErrorHandling:
+    def test_legacy_xls_is_rejected(self, qapp, tmp_path):
+        path = tmp_path / "legacy.xls"
+        path.write_bytes(b"legacy-xls")
+
+        with pytest.raises(ValueError, match="Legacy \\.xls format is not supported"):
+            ImportConfigDialog(str(path))
+
+    def test_latin1_csv_shows_encoding_error_and_allows_skip_cancel(self, qapp, tmp_path):
+        path = Path(tmp_path) / "latin1.csv"
+        path.write_bytes(b"time,A\n0,\xff\n")
+
+        dlg = ImportConfigDialog(str(path))
+
+        assert "encoding error" in dlg._preview_error_label.text().lower()
+        assert "utf-8" in dlg._preview_error_label.text().lower()
+        assert not dlg._btn_import.isEnabled()
+        assert dlg._build_result("skip").action == "skip"
+        assert dlg._build_result("cancel").action == "cancel"

@@ -10,22 +10,25 @@ from __future__ import annotations
 
 import csv
 import os
+from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.datasets.excel_import import list_sheets, read_excel_sheet_rows
-from kindred.core.datasets.units import looks_like_unit_row, parse_unit
+from kindred.core.datasets.units import (
+    CONCENTRATION_UNIT_DISPLAY,
+    TIME_UNIT_DISPLAY,
+    looks_like_unit_row,
+    parse_unit,
+)
 
 __all__ = ["ImportConfig", "ImportConfigDialog", "ImportDialogResult"]
 
 _TIME_CANDIDATES = ["time", "time_s", "t", "Time", "T", "x"]
 _MAX_PREVIEW_ROWS = 20
 _UNIT_ROW_BG = QtGui.QColor(255, 255, 210)  # pale yellow highlight
-
-_TIME_UNIT_OPTIONS = ("fs", "ps", "ns", "us", "ms", "s", "min", "h")
-_CONC_UNIT_OPTIONS = ("fM", "pM", "nM", "uM", "mM", "M")
 
 
 @dataclass
@@ -59,7 +62,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self._filepath = filepath
         self._remaining_count = remaining_count
-        self._file_type = "excel" if filepath.lower().endswith(".xlsx") else "csv"
+        lower_path = filepath.lower()
+        if lower_path.endswith(".xls") and not lower_path.endswith(".xlsx"):
+            raise ValueError("Legacy .xls format is not supported. Please save as .xlsx.")
+        self._file_type = "excel" if lower_path.endswith(".xlsx") else "csv"
         self._result: Optional[ImportDialogResult] = None
 
         # State populated during preview reading
@@ -68,10 +74,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._unit_row_detected: bool = False
         self._detected_time_unit: Optional[str] = None
         self._detected_conc_unit: Optional[str] = None
+        self._detected_conc_units: List[str] = []
         self._species_checkboxes: List[QtWidgets.QCheckBox] = []
 
         # Excel-specific
         self._sheet_names: List[str] = []
+        self._previewed_sheet_name: Optional[str] = None
 
         self.setWindowTitle(f"Import: {os.path.basename(filepath)}")
         self.setModal(True)
@@ -109,6 +117,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._preview_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self._preview_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         layout.addWidget(self._preview_table, 1)
+        self._preview_error_label = QtWidgets.QLabel("", self)
+        self._preview_error_label.setStyleSheet("QLabel { color: #c00; font-size: 11px; }")
+        self._preview_error_label.hide()
+        layout.addWidget(self._preview_error_label)
 
         # --- Time column ---
         time_row = QtWidgets.QHBoxLayout()
@@ -125,18 +137,22 @@ class ImportConfigDialog(QtWidgets.QDialog):
         # --- Unit controls ---
         self._unit_info_label = QtWidgets.QLabel("", self)
         layout.addWidget(self._unit_info_label)
+        self._unit_warning_label = QtWidgets.QLabel("", self)
+        self._unit_warning_label.setStyleSheet("QLabel { color: #c60; font-size: 11px; }")
+        self._unit_warning_label.hide()
+        layout.addWidget(self._unit_warning_label)
 
         unit_row = QtWidgets.QHBoxLayout()
         unit_row.addWidget(QtWidgets.QLabel("Time unit:", self))
         self._time_unit_combo = QtWidgets.QComboBox(self)
-        for u in _TIME_UNIT_OPTIONS:
+        for u in TIME_UNIT_DISPLAY:
             self._time_unit_combo.addItem(u)
         self._time_unit_combo.setMaximumWidth(90)
         unit_row.addWidget(self._time_unit_combo)
         unit_row.addSpacing(16)
         unit_row.addWidget(QtWidgets.QLabel("Conc unit:", self))
         self._conc_unit_combo = QtWidgets.QComboBox(self)
-        for u in _CONC_UNIT_OPTIONS:
+        for u in CONCENTRATION_UNIT_DISPLAY:
             self._conc_unit_combo.addItem(u)
         self._conc_unit_combo.setMaximumWidth(90)
         unit_row.addWidget(self._conc_unit_combo)
@@ -206,16 +222,27 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._load_csv_preview()
 
     def _load_csv_preview(self) -> None:
-        with open(self._filepath, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-            if header is None:
-                return
-            self._columns = [h.strip() for h in header]
-            rows: List[List[str]] = []
-            for _, row in zip(range(_MAX_PREVIEW_ROWS), reader):
-                rows.append([c.strip() if c else "" for c in row])
-            self._preview_rows = rows
+        self._clear_preview_error()
+        try:
+            with open(self._filepath, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    self._columns = []
+                    self._preview_rows = []
+                    self._detect_and_populate()
+                    return
+                self._columns = [h.strip() for h in header]
+                rows: List[List[str]] = []
+                for _, row in zip(range(_MAX_PREVIEW_ROWS), reader):
+                    rows.append([c.strip() if c else "" for c in row])
+                self._preview_rows = rows
+        except UnicodeError:
+            self._columns = []
+            self._preview_rows = []
+            self._detect_and_populate()
+            self._set_preview_error("Cannot read file: encoding error. Expected UTF-8.")
+            return
         self._detect_and_populate()
 
     def _load_excel_preview(self) -> None:
@@ -233,15 +260,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._load_excel_sheet_preview(self._sheet_names[0])
 
     def _load_excel_sheet_preview(self, sheet_name: str) -> None:
-        row_iter = read_excel_sheet_rows(self._filepath, sheet_name)
+        self._previewed_sheet_name = sheet_name
         rows_raw: List[Dict[str, str]] = []
         columns: List[str] = []
-        for i, row_dict in enumerate(row_iter):
-            if i == 0:
-                columns = list(row_dict.keys())
-            if i >= _MAX_PREVIEW_ROWS:
-                break
-            rows_raw.append(row_dict)
+        with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as row_iter:
+            for i, row_dict in enumerate(row_iter):
+                if i == 0:
+                    columns = list(row_dict.keys())
+                if i >= _MAX_PREVIEW_ROWS:
+                    break
+                rows_raw.append(row_dict)
         self._columns = columns
         self._preview_rows = [
             [str(row_dict.get(c, "")) for c in columns] for row_dict in rows_raw
@@ -264,11 +292,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._unit_row_detected = False
         self._detected_time_unit = None
         self._detected_conc_unit = None
+        self._detected_conc_units = []
         if not self._preview_rows:
             return
         first_row = self._preview_rows[0]
         if looks_like_unit_row(first_row):
             self._unit_row_detected = True
+            conc_units: List[str] = []
             for i, val in enumerate(first_row):
                 val = val.strip()
                 if not val:
@@ -281,6 +311,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     self._detected_time_unit = val
                 elif category == "concentration" and self._detected_conc_unit is None:
                     self._detected_conc_unit = val
+                if category == "concentration":
+                    normalized = self._normalize_unit_for_combo(val)
+                    if normalized and normalized not in conc_units:
+                        conc_units.append(normalized)
+            self._detected_conc_units = conc_units
 
     def _populate_preview_table(self) -> None:
         self._preview_table.clear()
@@ -322,15 +357,24 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 f"Unit row detected (row 1): {', '.join(self._preview_rows[0])}"
             )
             if self._detected_time_unit:
-                idx = self._time_unit_combo.findText(self._detected_time_unit)
+                idx = self._time_unit_combo.findText(self._normalize_unit_for_combo(self._detected_time_unit))
                 if idx >= 0:
                     self._time_unit_combo.setCurrentIndex(idx)
             if self._detected_conc_unit:
-                idx = self._conc_unit_combo.findText(self._detected_conc_unit)
+                idx = self._conc_unit_combo.findText(self._normalize_unit_for_combo(self._detected_conc_unit))
                 if idx >= 0:
                     self._conc_unit_combo.setCurrentIndex(idx)
             self._no_unit_row_cb.setChecked(False)
             self._no_unit_row_cb.setEnabled(True)
+            if len(self._detected_conc_units) > 1:
+                self._unit_warning_label.setText(
+                    "Multiple concentration units detected "
+                    f"({', '.join(self._detected_conc_units)}). Verify unit selection."
+                )
+                self._unit_warning_label.show()
+            else:
+                self._unit_warning_label.clear()
+                self._unit_warning_label.hide()
         else:
             self._unit_info_label.setText("")
             # Defaults: s, M
@@ -338,6 +382,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._conc_unit_combo.setCurrentText("M")
             self._no_unit_row_cb.setChecked(True)
             self._no_unit_row_cb.setEnabled(False)
+            self._unit_warning_label.clear()
+            self._unit_warning_label.hide()
 
     def _populate_species_checkboxes(self) -> None:
         # Clear existing
@@ -383,6 +429,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._time_unit_combo.setCurrentText("s")
             self._conc_unit_combo.setCurrentText("M")
             self._unit_info_label.setText("")
+            self._unit_warning_label.clear()
+            self._unit_warning_label.hide()
         else:
             # Re-detect
             if self._preview_rows:
@@ -397,6 +445,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._load_excel_sheet_preview(sheet_name)
 
     def _on_import(self) -> None:
+        if self._file_type == "excel" and not self._checked_excel_sheets_are_compatible():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Import Configuration",
+                "Selected sheets have different column structures. Import each sheet individually.",
+            )
+            return
         self._result = self._build_result("import")
         self.accept()
 
@@ -490,6 +545,37 @@ class ImportConfigDialog(QtWidgets.QDialog):
             if item.checkState() == QtCore.Qt.CheckState.Checked:
                 names.append(item.text())
         return names
+
+    @staticmethod
+    def _normalize_unit_for_combo(unit: Optional[str]) -> str:
+        return str(unit or "").strip().replace("µ", "u").replace("μ", "u")
+
+    def _set_preview_error(self, message: str) -> None:
+        self._preview_error_label.setText(str(message))
+        self._preview_error_label.show()
+
+    def _clear_preview_error(self) -> None:
+        self._preview_error_label.clear()
+        self._preview_error_label.hide()
+
+    def _sheet_columns(self, sheet_name: str) -> List[str]:
+        if sheet_name == self._previewed_sheet_name:
+            return list(self._columns)
+        with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as rows:
+            first_row = next(iter(rows), None)
+        if first_row is None:
+            return []
+        return list(first_row.keys())
+
+    def _checked_excel_sheets_are_compatible(self) -> bool:
+        checked_sheet_names = self._get_checked_sheet_names()
+        if len(checked_sheet_names) <= 1:
+            return True
+        reference_columns = set(self._sheet_columns(checked_sheet_names[0]))
+        for sheet_name in checked_sheet_names[1:]:
+            if set(self._sheet_columns(sheet_name)) != reference_columns:
+                return False
+        return True
 
     def get_result(self) -> ImportDialogResult:
         """Return the dialog result after exec()."""

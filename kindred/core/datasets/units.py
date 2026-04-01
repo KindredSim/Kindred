@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Sequence
 
 __all__ = [
+    "CONCENTRATION_UNIT_DISPLAY",
+    "TIME_UNIT_DISPLAY",
     "default_unit_assumptions",
     "looks_like_unit_row",
     "parse_concentration_unit",
@@ -26,6 +28,7 @@ _TIME_ALIASES = {
     "us": "µs",
 }
 _TIME_DISPLAY_UNITS = ("fs", "ps", "ns", "µs", "us", "μs", "ms", "s", "min", "h")
+TIME_UNIT_DISPLAY = ("fs", "ps", "ns", "us", "ms", "s", "min", "h")
 
 _CONCENTRATION_FACTORS = {
     "fM": 1e-15,
@@ -39,6 +42,7 @@ _CONCENTRATION_ALIASES = {
     "uM": "µM",
 }
 _CONCENTRATION_DISPLAY_UNITS = ("fM", "pM", "nM", "µM", "uM", "μM", "mM", "M")
+CONCENTRATION_UNIT_DISPLAY = ("fM", "pM", "nM", "uM", "mM", "M")
 
 
 def parse_time_unit(unit: str) -> float:

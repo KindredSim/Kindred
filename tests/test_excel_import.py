@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
+import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -104,6 +107,54 @@ def test_read_excel_sheet_rows_header_only_yields_no_rows(tmp_path: Path) -> Non
     path = _save_workbook(tmp_path / "header_only.xlsx", [("Data", [["time", "A"]])])
 
     assert list(read_excel_sheet_rows(str(path), "Data")) == []
+
+
+def test_read_excel_sheet_rows_is_lazy_and_closes_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kindred.core.datasets import excel_import
+
+    class _FakeSheet:
+        def __init__(self) -> None:
+            self.data_rows_yielded = 0
+
+        def iter_rows(self, values_only: bool = True):
+            yield ("time", "A")
+            yield (0, 1.0)
+            self.data_rows_yielded += 1
+            yield (1, 2.0)
+            self.data_rows_yielded += 1
+
+    class _FakeWorkbook:
+        def __init__(self) -> None:
+            self.sheetnames = ["Data"]
+            self.closed = 0
+            self._sheet = _FakeSheet()
+
+        def __getitem__(self, name: str):
+            assert name == "Data"
+            return self._sheet
+
+        def close(self) -> None:
+            self.closed += 1
+
+    fake_workbook = _FakeWorkbook()
+    monkeypatch.setattr(excel_import, "_open_workbook", lambda _path: fake_workbook)
+
+    rows = excel_import.read_excel_sheet_rows(str(tmp_path / "rows.xlsx"), "Data")
+    row_iter = iter(rows)
+
+    assert fake_workbook.closed == 0
+    assert fake_workbook._sheet.data_rows_yielded == 0
+    assert next(row_iter) == {"time": "0", "A": "1.0"}
+    assert fake_workbook.closed == 0
+    assert fake_workbook._sheet.data_rows_yielded == 0
+    assert next(row_iter) == {"time": "1", "A": "2.0"}
+    assert fake_workbook._sheet.data_rows_yielded == 1
+
+    rows.close()
+
+    assert fake_workbook.closed == 1
 
 
 def test_load_excel_dataset_returns_csv_payload_shape(tmp_path: Path) -> None:
@@ -236,6 +287,139 @@ def test_load_excel_workbook_reports_all_failures_when_all_sheets_bad(tmp_path: 
     assert [sheet_name for sheet_name, _message in result.failures] == ["Bad1", "Bad2"]
 
 
+def test_load_excel_workbook_opens_workbook_once_for_multi_sheet_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kindred.core.datasets import excel_import
+
+    path = _save_workbook(
+        tmp_path / "open_once.xlsx",
+        [
+            ("One", [["time", "A"], [0, 1.0]]),
+            ("Two", [["time", "B"], [0, 2.0]]),
+        ],
+    )
+
+    real_load_workbook = excel_import.load_workbook
+    call_count = 0
+
+    def _counting_load_workbook(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_load_workbook(*args, **kwargs)
+
+    monkeypatch.setattr(excel_import, "load_workbook", _counting_load_workbook)
+
+    result = excel_import.load_excel_workbook(str(path))
+
+    assert len(result.successes) == 2
+    assert call_count == 1
+
+
+def test_load_excel_workbook_propagates_csv_import_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kindred.core.datasets import excel_import
+    from kindred.core.datasets.csv_import import CsvImportInterrupted
+
+    path = _save_workbook(tmp_path / "interrupt.xlsx", [("Data", [["time", "A"], [0, 1.0]])])
+
+    def _raise_interrupt(*args, **kwargs):
+        raise CsvImportInterrupted()
+
+    monkeypatch.setattr(excel_import, "parse_csv_rows", _raise_interrupt)
+
+    with pytest.raises(CsvImportInterrupted):
+        excel_import.load_excel_workbook(str(path))
+
+
+def test_load_excel_dataset_interrupts_without_materializing_whole_sheet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kindred.core.datasets import excel_import
+    from kindred.core.datasets.csv_import import CsvImportInterrupted
+
+    class _StreamingRows:
+        def __init__(self) -> None:
+            self.rows_yielded = 0
+            self.closed = 0
+
+        def __iter__(self):
+            yield {"time": "s", "A": "uM"}
+            for index in range(50):
+                self.rows_yielded += 1
+                yield {"time": str(index), "A": str(index + 1.0)}
+
+        def close(self) -> None:
+            self.closed += 1
+
+    rows = _StreamingRows()
+    monkeypatch.setattr(excel_import, "read_excel_sheet_rows", lambda *_args, **_kwargs: rows)
+
+    def _interrupt_after_first_data_row() -> bool:
+        return rows.rows_yielded > 1
+
+    with pytest.raises(CsvImportInterrupted):
+        excel_import.load_excel_dataset(
+            str(tmp_path / "interrupt_dataset.xlsx"),
+            "Data",
+            interruption_checker=_interrupt_after_first_data_row,
+        )
+
+    assert rows.rows_yielded == 2
+    assert rows.closed == 1
+
+
+def test_load_excel_workbook_interrupts_without_exhausting_current_sheet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kindred.core.datasets import excel_import
+    from kindred.core.datasets.csv_import import CsvImportInterrupted
+
+    class _FakeSheet:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.data_rows_yielded = 0
+
+        def iter_rows(self, values_only: bool = True):
+            yield ("time", "A")
+            yield ("s", "uM")
+            for index in range(50):
+                self.data_rows_yielded += 1
+                yield (index, index + 1.0)
+
+    class _FakeWorkbook:
+        def __init__(self) -> None:
+            self.sheetnames = ["Data", "Later"]
+            self.closed = 0
+            self.sheets = {
+                "Data": _FakeSheet("Data"),
+                "Later": _FakeSheet("Later"),
+            }
+
+        def __getitem__(self, name: str):
+            return self.sheets[name]
+
+        def close(self) -> None:
+            self.closed += 1
+
+    fake_workbook = _FakeWorkbook()
+    monkeypatch.setattr(excel_import, "_open_workbook", lambda _path: fake_workbook)
+
+    def _interrupt_after_first_data_row() -> bool:
+        return fake_workbook.sheets["Data"].data_rows_yielded > 1
+
+    with pytest.raises(CsvImportInterrupted):
+        excel_import.load_excel_workbook(
+            str(tmp_path / "interrupt_workbook.xlsx"),
+            interruption_checker=_interrupt_after_first_data_row,
+        )
+
+    assert fake_workbook.sheets["Data"].data_rows_yielded == 2
+    assert fake_workbook.sheets["Later"].data_rows_yielded == 0
+    assert fake_workbook.closed == 1
+
+
 def test_load_excel_dataset_matches_parse_csv_rows_for_equivalent_content(tmp_path: Path) -> None:
     from kindred.core.datasets.excel_import import load_excel_dataset
 
@@ -300,3 +484,52 @@ def test_unicode_sheet_names_and_headers_are_supported(tmp_path: Path) -> None:
     name, payload = load_excel_dataset(str(path), "Δεδομένα µ")
     assert name == "unicode.xlsx::Δεδομένα µ"
     assert list(payload["species"]) == ["κ", "β"]
+
+
+def test_load_excel_dataset_converts_datetime_time_cells_to_epoch_seconds(tmp_path: Path) -> None:
+    from kindred.core.datasets.excel_import import load_excel_dataset
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset is unavailable on this platform")
+
+    t0 = dt.datetime(2024, 1, 15, 10, 30, 0)
+    t1 = dt.datetime(2024, 1, 15, 10, 31, 30)
+    path = _save_workbook(
+        tmp_path / "datetime.xlsx",
+        [("Data", [["time", "A"], [t0, 1.0], [t1, 2.5]])],
+    )
+
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        _name, payload = load_excel_dataset(str(path), "Data")
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+
+    assert np.allclose(
+        payload["t"],
+        [
+            t0.replace(tzinfo=dt.timezone.utc).timestamp(),
+            t1.replace(tzinfo=dt.timezone.utc).timestamp(),
+        ],
+    )
+    assert np.allclose(payload["species"]["A"], [1.0, 2.5])
+
+
+def test_load_excel_dataset_converts_time_only_cells_to_seconds(tmp_path: Path) -> None:
+    from kindred.core.datasets.excel_import import load_excel_dataset
+
+    path = _save_workbook(
+        tmp_path / "time_only.xlsx",
+        [("Data", [["time", "A"], [dt.time(0, 0, 1), 1.0], [dt.time(0, 1, 30), 2.5]])],
+    )
+
+    _name, payload = load_excel_dataset(str(path), "Data")
+
+    assert np.allclose(payload["t"], [1.0, 90.0])
+    assert np.allclose(payload["species"]["A"], [1.0, 2.5])
