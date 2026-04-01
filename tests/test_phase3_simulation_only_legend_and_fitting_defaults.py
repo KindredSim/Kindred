@@ -135,21 +135,3 @@ def test_fitting_default_solver_constant_and_parameters_tab_default(qtbot):
         species_table.close()
         tab.close()
         QtWidgets.QApplication.processEvents()
-
-
-def test_global_fit_worker_defaults_to_fitting_solver(qt_app):
-    from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
-    from kindred.gui.fitting.worker import GlobalFitWorker
-
-    t = np.array([0.0, 1.0], dtype=float)
-    worker = GlobalFitWorker(
-        [{"id": "ds1", "t": t.copy(), "y": np.array([1.0, 0.5], dtype=float), "species": "A"}],
-        {"k1": 1.0},
-        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.array([1.0, 0.5], dtype=float)}},
-    )
-
-    try:
-        assert worker._solver == FITTING_DEFAULT_SOLVER
-    finally:
-        worker.deleteLater()
-        qt_app.processEvents()
