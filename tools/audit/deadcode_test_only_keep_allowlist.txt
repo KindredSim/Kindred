@@ -17,6 +17,7 @@
 # - Update the KEEP rationale when the module's ownership or wiring changes.
 
 kindred/core/parallel_fitting.py  # KEEP: test-only parallel-fitting module; not wired into current production flows
+kindred/core/datasets/units.py  # KEEP: staged dataset-import unit parser for future import wiring; intentionally test-covered before production hookup
 kindred/core/simulator/fast_eq.py  # KEEP: compatibility re-export for fast-equilibrium policy; used by tools/tests, not wired in production
 kindred/gui/widgets/dataset_selector_dialog.py  # KEEP: test-only dataset selector dialog; not wired in production
 kindred/gui/widgets/pyqtgraph_plot_panel.py  # KEEP: compatibility stub that avoids PyQtGraph import side effects during import-time checks
