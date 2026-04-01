@@ -29,7 +29,8 @@ from kindred.core.simulation_series_payload import coerce_simulation_series_payl
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.api.fitting import fit_global
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
-from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
 if TYPE_CHECKING:
     from kindred.core.api.fitting import GlobalFitResult
@@ -92,7 +93,7 @@ class GlobalFitWorker(QtCore.QThread):
         log10_params: Optional[Dict[str, bool]] = None,
         simulation_func: Optional[Callable[[Dict[str, float]], Dict[str, np.ndarray]]] = None,
         fit_func: Optional[Callable[..., "GlobalFitResult"]] = None,
-        solver: str = "Radau",
+        solver: str = FITTING_DEFAULT_SOLVER,
         rtol: float = 1e-6,
         atol: float = 1e-12,
         best_update_interval_s: float = 0.25,
@@ -139,7 +140,7 @@ class GlobalFitWorker(QtCore.QThread):
         self._log10_params = {str(k): bool(v) for k, v in (log10_params or {}).items()}
         self._simulation_func = simulation_func
         self._fit_func = fit_func or fit_global
-        solver_label = str(solver or DEFAULT_SOLVER_NAME).strip() or DEFAULT_SOLVER_NAME
+        solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_method, _solver_warning = normalize_solver_name(solver_label)
         self._solver = str(solver_method)
         # Tolerances are baked into the simulation closure; kwargs accepted here for API consistency.

@@ -41,6 +41,26 @@ def test_build_about_dialog_uses_dark_brand_asset(main_window):
         dialog.deleteLater()
 
 
+def test_build_about_dialog_shows_updated_body_copy(main_window):
+    dialog = main_window._build_about_dialog()
+    try:
+        body_label = dialog.findChild(QtWidgets.QLabel, "aboutBodyLabel")
+        assert body_label is not None
+        assert body_label.wordWrap() is True
+        assert body_label.text() == (
+            "Desktop GUI for reaction mechanism investigation, kinetic modeling, and data fitting.\n\n"
+            "The initial development of Kindred was led primarily by Pedro Helou de Oliveira.\n"
+            "Kindred is now developed and maintained jointly by Pedro Helou de Oliveira and Annabel Flook.\n\n"
+            "Certain GUI design elements were informed by ideas seen in Velocity, a kinetics software package developed and maintained by Chen Li.\n\n"
+            "Kindred source code is licensed under the MIT License.\n"
+            "Includes Qt for Python (PySide6/shiboken6) under LGPLv3/GPL terms.\n"
+            "See NOTICE.txt, COPYING, COPYING.LESSER, and THIRD_PARTY_LICENSES.txt."
+        )
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+
+
 def test_show_about_executes_built_dialog(main_window, monkeypatch):
     class _FakeDialog:
         called = 0

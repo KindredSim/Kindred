@@ -8413,8 +8413,13 @@ class MainWindow(
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         body_label = QtWidgets.QLabel(
-            "Desktop GUI for kinetic modeling and fitting.\n"
-            "MIT License.",
+            "Desktop GUI for reaction mechanism investigation, kinetic modeling, and data fitting.\n\n"
+            "The initial development of Kindred was led primarily by Pedro Helou de Oliveira.\n"
+            "Kindred is now developed and maintained jointly by Pedro Helou de Oliveira and Annabel Flook.\n\n"
+            "Certain GUI design elements were informed by ideas seen in Velocity, a kinetics software package developed and maintained by Chen Li.\n\n"
+            "Kindred source code is licensed under the MIT License.\n"
+            "Includes Qt for Python (PySide6/shiboken6) under LGPLv3/GPL terms.\n"
+            "See NOTICE.txt, COPYING, COPYING.LESSER, and THIRD_PARTY_LICENSES.txt.",
             dialog,
         )
         body_label.setObjectName("aboutBodyLabel")
