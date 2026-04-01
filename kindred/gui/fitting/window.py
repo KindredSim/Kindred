@@ -469,9 +469,6 @@ class FittingWindow(QtWidgets.QDialog):
             except Exception:
                 prepared = None
         if prepared is not None:
-            solver_raw = self._prepared_solver_normalized(prepared)
-            if solver_raw in allowed:
-                solver_default = solver_raw
             try:
                 rtol_default = float(prepared.rtol)
             except Exception:
@@ -2392,6 +2389,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.push_final_result(result, self._dataset_entries)
         self._update_dataset_views_from_global(result)
         stats = self._build_global_stats(result)
+        severity, title, text = self._global_fit_completion_dialog_spec(result)
+        if severity == "fail":
+            self._run_results_tab.clear_fitted_params()
         self._update_statistics(stats)
         self._refresh_project_apply_controls(prefer_broadest=True)
         self._latest_model_series = {k: dict(v) for k, v in (result.model_series or {}).items()}
@@ -2399,7 +2399,6 @@ class FittingWindow(QtWidgets.QDialog):
             info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
             for info in (result.dataset_info or [])
         }
-        severity, title, text = self._global_fit_completion_dialog_spec(result)
         failure_message = str(result.message or "Unknown error")
         if severity == "ok":
             status = "Global fit complete"
@@ -2448,6 +2447,8 @@ class FittingWindow(QtWidgets.QDialog):
 
             return "fail", "Global Fit Failed", "Global fit failed.\n\n" + "\n".join(lines)
 
+        param_section = self._format_params_for_completion_dialog(result)
+
         warn_lines: List[str] = []
         if not converged:
             warn_lines.append("- Optimizer did not report convergence; results may be suboptimal.")
@@ -2458,11 +2459,44 @@ class FittingWindow(QtWidgets.QDialog):
                 warn_lines.append(f"- {label}: {first_line}")
 
         if warn_lines:
-            text = [f"Final Chi-Squared (χ²): {chi_sq:.6g}", "", "Warnings:"]
+            text = [f"Final Chi-Squared (χ²): {chi_sq:.6g}"]
+            if param_section:
+                text.append("")
+                text.append(param_section)
+            text.extend(["", "Warnings:"])
             text.extend(warn_lines)
             return "warn", "Optimization Complete (Warnings)", "\n".join(text)
 
-        return "ok", "Optimization Complete", f"Final Chi-Squared (χ²): {chi_sq:.6g}"
+        text_parts = [f"Final Chi-Squared (χ²): {chi_sq:.6g}"]
+        if param_section:
+            text_parts.append("")
+            text_parts.append(param_section)
+        return "ok", "Optimization Complete", "\n".join(text_parts)
+
+    def _format_params_for_completion_dialog(self, result: GlobalFitResult) -> str:
+        """Format fitted parameters as compact text for the completion dialog."""
+        shared = dict(getattr(result, "shared_params", None) or {})
+        dataset_params = dict(getattr(result, "dataset_params", None) or {})
+        all_items: list[tuple[str, float]] = sorted(
+            shared.items(), key=lambda kv: str(kv[0])
+        )
+        for ds_id in sorted(dataset_params, key=str):
+            ds_vals = dataset_params[ds_id]
+            if not isinstance(ds_vals, dict) or not ds_vals:
+                continue
+            label = self._dataset_label_for_id(str(ds_id))
+            for name, value in sorted(ds_vals.items(), key=lambda kv: str(kv[0])):
+                all_items.append((f"{label}: {name}", float(value)))
+        if not all_items:
+            return ""
+        max_shown = 10
+        lines = ["Fitted Parameters:"]
+        for name, value in all_items[:max_shown]:
+            lines.append(f"  {name} = {value:.6g}")
+        remaining = len(all_items) - max_shown
+        if remaining > 0:
+            lines.append(f"  ...and {remaining} more")
+        return "\n".join(lines)
 
     def _handle_global_best_update(
         self,

@@ -153,3 +153,60 @@ def test_global_fit_worker_defaults_to_fitting_solver(qt_app):
     finally:
         worker.deleteLater()
         qt_app.processEvents()
+
+
+def test_fitting_window_solver_combo_defaults_to_lsoda_even_with_radau_prepared_meta(qt_app):
+    """Combo must show LSODA regardless of what the main simulation was prepared with."""
+    from dataclasses import dataclass
+    from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
+    from kindred.gui.fitting.window import FittingWindow
+
+    @dataclass
+    class _FakeMeta:
+        version: int = 1
+        mechanism_text_sha256: str = ""
+        mechanism_text_len: int = 0
+        param_names: list = None
+        t_end: float = 10.0
+        num_points: int = 100
+        temperature_K: float = 298.15
+        solver_requested: str = "Radau"
+        solver_normalized: str = "Radau"
+        solver_warning: str = ""
+        rtol: float = 1e-6
+        atol: float = 1e-12
+        use_sparse_jacobian: bool = False
+        wegscheider_cyclicity_enabled: bool = False
+        initial_prefix: str = "init_"
+
+        def __post_init__(self):
+            if self.param_names is None:
+                self.param_names = []
+
+    t = np.arange(0, 10, dtype=float)
+
+    def sim_func(_params):
+        return {"t": t.copy(), "species": {"A": t.copy()}}
+
+    sim_func._kindred_prepared_simulation_meta = _FakeMeta()
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 0.5, "min": 0.01, "max": 1.0}],
+        dataset_entries=[{
+            "id": "ds1", "label": "Dataset 1",
+            "t": t.copy(), "species_data": {"A": t.copy()},
+            "selected_species": ["A"], "weight": 1.0, "include": True,
+        }],
+        simulation_func=sim_func,
+        mechanism_species=["A"],
+    )
+    try:
+        qt_app.processEvents()
+        combo = window._params_ics_tab._integration_solver_combo
+        assert combo.currentText() == FITTING_DEFAULT_SOLVER, (
+            f"Expected {FITTING_DEFAULT_SOLVER}, got {combo.currentText()}"
+        )
+    finally:
+        window.close()
+        qt_app.processEvents()

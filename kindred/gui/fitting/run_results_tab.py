@@ -46,6 +46,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         stamp_hash: str,
         stamp_short: str,
         stats: Optional[Dict[str, Any]] = None,
+        fitted_params: Optional[Dict[str, float]] = None,
+        dataset_fitted_params: Optional[List[tuple]] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -92,12 +94,60 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             self._stats_labels[label_text] = value_label
         layout.addWidget(stats_group)
 
+        # Fitted parameters section
+        params_group = QtWidgets.QGroupBox("Fitted Parameters")
+        params_group.setObjectName("fitted_params_group")
+        params_layout = QtWidgets.QVBoxLayout(params_group)
+        params_layout.setContentsMargins(0, 0, 0, 0)
+        self._params_content_label = QtWidgets.QLabel()
+        self._params_content_label.setObjectName("fitted_params_content_label")
+        self._params_content_label.setWordWrap(True)
+        self._params_content_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._params_content_label.setStyleSheet("font-size: 11px;")
+        self._params_content_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        params_scroll = QtWidgets.QScrollArea()
+        params_scroll.setObjectName("fitted_params_scroll")
+        params_scroll.setWidgetResizable(True)
+        params_scroll.setMaximumHeight(200)
+        params_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        params_scroll.setWidget(self._params_content_label)
+        params_layout.addWidget(params_scroll)
+        self._params_group = params_group
+        layout.addWidget(params_group)
+
         if stats:
             self._update_stats(stats)
+        self._update_fitted_params(fitted_params, dataset_fitted_params)
 
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
+
+    def _update_fitted_params(
+        self,
+        fitted_params: Optional[Dict[str, float]],
+        dataset_fitted_params: Optional[List[tuple]] = None,
+    ) -> None:
+        shared = dict(fitted_params) if fitted_params else {}
+        ds_entries = list(dataset_fitted_params) if dataset_fitted_params else []
+        if not shared and not ds_entries:
+            self._params_content_label.setText("No fitted parameters available.")
+            self._params_content_label.setStyleSheet("font-size: 11px; color: #888;")
+            return
+        self._params_content_label.setStyleSheet("font-size: 11px;")
+        lines: List[str] = []
+        if shared:
+            for name, value in sorted(shared.items(), key=lambda kv: str(kv[0])):
+                lines.append(f"{name} = {value:.6g}")
+        for ds_label, vals in ds_entries:
+            if not isinstance(vals, dict) or not vals:
+                continue
+            if lines:
+                lines.append("")
+            lines.append(f"{ds_label}:")
+            for name, value in sorted(vals.items(), key=lambda kv: str(kv[0])):
+                lines.append(f"  {name} = {value:.6g}")
+        self._params_content_label.setText("\n".join(lines))
 
     def _update_stats(self, stats: Dict[str, Any]) -> None:
         for key, label in self._stats_labels.items():
@@ -134,6 +184,8 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         stamp_hash: str,
         stamp_short: str,
         stats: Optional[Dict[str, Any]] = None,
+        fitted_params: Optional[Dict[str, float]] = None,
+        dataset_fitted_params: Optional[List[tuple]] = None,
     ) -> None:
         """Update all stamp and stats content from the owning tab."""
         self._stamp = dict(stamp)
@@ -141,6 +193,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self._stamp_short = str(stamp_short)
         self._run_stamp_label.setText(f"Stamp: {stamp_short}")
         self._update_stats(stats or {})
+        self._update_fitted_params(fitted_params, dataset_fitted_params)
 
     def _on_copy_run_stamp_json(self) -> None:
         stamp = self._stamp
@@ -285,6 +338,8 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_run_stamp_hash: str = ""
         self._last_run_stamp_short: str = ""
         self._last_stats: Dict[str, Any] = {}
+        self._last_fitted_params: Dict[str, float] = {}
+        self._last_dataset_fitted_params: Dict[str, Dict[str, float]] = {}
         self._stamp_dialog: Optional[ResultsSummaryDialog] = None
         self._dark_mode = False
         self._dataset_entries: List[Dict[str, Any]] = []
@@ -328,6 +383,8 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_run_stamp_hash = str(stamp_hash)
         self._last_run_stamp_short = str(stamp_short)
         self._last_stats = {}
+        self._last_fitted_params = {}
+        self._last_dataset_fitted_params = {}
         self._latest_model_series_by_dataset = {}
         self._latest_model_x_by_dataset = {}
         self._latest_dataset_stats_by_dataset = {}
@@ -340,7 +397,21 @@ class RunResultsTab(QtWidgets.QWidget):
                 self._last_run_stamp_hash,
                 self._last_run_stamp_short,
                 None,
+                fitted_params=None,
+                dataset_fitted_params=None,
             )
+
+    def clear_fitted_params(self) -> None:
+        """Clear stored fitted params (e.g. after an invalid/failed fit)."""
+        self._last_fitted_params = {}
+        self._last_dataset_fitted_params = {}
+
+    def _dataset_label_for_id(self, dataset_id: str) -> str:
+        ds_id = str(dataset_id or "").strip()
+        for entry in self._dataset_entries or []:
+            if str(entry.get("id") or "").strip() == ds_id:
+                return str(entry.get("label", "") or "").strip() or str(dataset_id)
+        return str(dataset_id)
 
     def open_results_summary_dialog(self) -> None:
         """Show the results summary popup dialog."""
@@ -355,12 +426,40 @@ class RunResultsTab(QtWidgets.QWidget):
             self._last_run_stamp_hash,
             self._last_run_stamp_short,
             stats=self._last_stats or None,
+            fitted_params=self._last_fitted_params or None,
+            dataset_fitted_params=self._format_dataset_params_for_dialog(),
             parent=self,
         )
         dialog.statusMessage.connect(self.statusMessage)
         dialog.destroyed.connect(lambda: setattr(self, '_stamp_dialog', None))
         self._stamp_dialog = dialog
         dialog.show()
+
+    def _format_dataset_params_for_dialog(self) -> Optional[List[tuple]]:
+        """Return [(display_label, {name: value}), ...] keyed by dataset ID order.
+
+        Uses display labels with disambiguation when two datasets share a label.
+        Returns None when there are no dataset-specific fitted parameters.
+        """
+        if not self._last_dataset_fitted_params:
+            return None
+        ids = sorted(
+            (ds_id for ds_id, vals in self._last_dataset_fitted_params.items()
+             if isinstance(vals, dict) and vals),
+            key=str,
+        )
+        if not ids:
+            return None
+        raw_labels = {ds_id: self._dataset_label_for_id(ds_id) for ds_id in ids}
+        label_counts: Dict[str, int] = {}
+        for lbl in raw_labels.values():
+            label_counts[lbl] = label_counts.get(lbl, 0) + 1
+        result: List[tuple] = []
+        for ds_id in ids:
+            lbl = raw_labels[ds_id]
+            display = f"{lbl} ({ds_id})" if label_counts[lbl] > 1 else lbl
+            result.append((display, dict(self._last_dataset_fitted_params[ds_id])))
+        return result
 
     def update_statistics(self, stats: Dict[str, Any]) -> None:
         """Store stat values; update dialog if open."""
@@ -371,6 +470,8 @@ class RunResultsTab(QtWidgets.QWidget):
                 self._last_run_stamp_hash,
                 self._last_run_stamp_short,
                 self._last_stats,
+                fitted_params=self._last_fitted_params or None,
+                dataset_fitted_params=self._format_dataset_params_for_dialog(),
             )
 
     def rebuild_subtabs(
@@ -444,6 +545,13 @@ class RunResultsTab(QtWidgets.QWidget):
         if current_ids != incoming_ids:
             self.rebuild_subtabs(dataset_entries, self._fit_targets_by_dataset)
 
+        self._last_fitted_params = dict(getattr(result, "shared_params", {}) or {})
+        raw_ds_params = getattr(result, "dataset_params", None) or {}
+        self._last_dataset_fitted_params = {
+            str(ds_id): dict(vals)
+            for ds_id, vals in raw_ds_params.items()
+            if isinstance(vals, dict) and vals
+        }
         dataset_stats = {
             str(info.dataset_id): {
                 "chi_squared": float(info.chi_squared),
@@ -476,6 +584,8 @@ class RunResultsTab(QtWidgets.QWidget):
         self._latest_model_series_by_dataset = {}
         self._latest_model_x_by_dataset = {}
         self._latest_dataset_stats_by_dataset = {}
+        self._last_fitted_params = {}
+        self._last_dataset_fitted_params = {}
         self._stale_plot_view_keys.clear()
         self._tracker_panel.clear()
         self._clear_subtabs()
