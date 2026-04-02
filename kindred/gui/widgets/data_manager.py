@@ -674,11 +674,12 @@ class DataManagerPanel(QtWidgets.QWidget):
         metadata = data.setdefault("metadata", {})
         if plan.time_factor != 1.0:
             data["t"] = data["t"] * plan.time_factor
-        if plan.conc_factor != 1.0:
-            for species_name in list((data.get("species") or {}).keys()):
-                data["species"][species_name] = data["species"][species_name] * plan.conc_factor
+        for species_name in list((data.get("species") or {}).keys()):
+            factor = plan.conc_factors.get(species_name, 1.0)
+            if factor != 1.0:
+                data["species"][species_name] = data["species"][species_name] * factor
         metadata["original_time_unit"] = plan.original_time_unit
-        metadata["original_concentration_unit"] = plan.original_conc_unit
+        metadata["original_concentration_units"] = dict(plan.original_conc_units)
 
     def _finalize_loaded_dataset(self, worker: Optional[QtCore.QThread], name: str, data: dict) -> None:
         if worker is not None and int(getattr(worker, "_load_generation", -1)) != int(self._load_generation):

@@ -20,7 +20,7 @@ from kindred.core.datasets.excel_import import list_sheets, read_excel_sheet_row
 from kindred.core.datasets.units import (
     CONCENTRATION_UNIT_DISPLAY,
     TIME_UNIT_DISPLAY,
-    parse_unit,
+    parse_concentration_unit,
 )
 from kindred.gui.widgets.import_config import (
     ImportConfig,
@@ -67,8 +67,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._preview_rows: List[List[str]] = []
         self._unit_row_detected: bool = False
         self._detected_time_unit: Optional[str] = None
-        self._detected_conc_unit: Optional[str] = None
-        self._detected_conc_units: List[str] = []
+        self._detected_conc_unit_by_column: Dict[str, Optional[str]] = {}
         self._species_checkboxes: List[QtWidgets.QCheckBox] = []
         self._sheet_states: Dict[Optional[str], dict] = {}
 
@@ -145,7 +144,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._time_unit_combo.setMaximumWidth(90)
         unit_row.addWidget(self._time_unit_combo)
         unit_row.addSpacing(16)
-        unit_row.addWidget(QtWidgets.QLabel("Conc unit:", self))
+        unit_row.addWidget(QtWidgets.QLabel("Default conc unit:", self))
         self._conc_unit_combo = QtWidgets.QComboBox(self)
         for u in CONCENTRATION_UNIT_DISPLAY:
             self._conc_unit_combo.addItem(u)
@@ -301,20 +300,24 @@ class ImportConfigDialog(QtWidgets.QDialog):
             column_name: column_name != time_column
             for column_name in columns
         }
+        detected_conc_by_col = {
+            col: self._normalize_unit_for_combo(unit) if unit else None
+            for col, unit in det.detected_conc_unit_by_column.items()
+        }
+        # Pick the most common detected unit as combo default, or "M"
+        detected_units = [u for u in detected_conc_by_col.values() if u]
+        combo_default = self._most_common_unit(detected_units) if detected_units else "M"
         return {
             "time_column": time_column,
             "species_checked": species_checked,
             "time_unit": self._normalize_unit_for_combo(det.detected_time_unit) if det.detected_time_unit else "s",
-            "concentration_unit": self._normalize_unit_for_combo(det.detected_conc_unit) if det.detected_conc_unit else "M",
+            "concentration_units": detected_conc_by_col,
+            "combo_conc_unit": combo_default,
             "override_no_unit_row": False,
             "no_unit_row_cb_enabled": det.has_unit_row,
             "unit_row_detected": det.has_unit_row,
             "detected_time_unit": det.detected_time_unit,
-            "detected_conc_unit": det.detected_conc_unit,
-            "detected_conc_units": [
-                self._normalize_unit_for_combo(unit)
-                for unit in det.detected_conc_units
-            ],
+            "detected_conc_unit_by_column": dict(detected_conc_by_col),
             "columns": list(columns),
             "preview_rows": [list(row) for row in preview_rows],
         }
@@ -328,18 +331,28 @@ class ImportConfigDialog(QtWidgets.QDialog):
             "time_column": str(state.get("time_column", "")),
             "species_checked": dict(state.get("species_checked", {})),
             "time_unit": str(state.get("time_unit", "s")),
-            "concentration_unit": str(state.get("concentration_unit", "M")),
+            "concentration_units": dict(state.get("concentration_units", {})),
+            "combo_conc_unit": str(state.get("combo_conc_unit", "M")),
             "override_no_unit_row": bool(state.get("override_no_unit_row", False)),
             "no_unit_row_cb_enabled": bool(state.get("no_unit_row_cb_enabled", False)),
             "unit_row_detected": bool(state.get("unit_row_detected", False)),
             "detected_time_unit": state.get("detected_time_unit"),
-            "detected_conc_unit": state.get("detected_conc_unit"),
-            "detected_conc_units": list(state.get("detected_conc_units", [])),
+            "detected_conc_unit_by_column": dict(state.get("detected_conc_unit_by_column", {})),
             "columns": [str(column) for column in state.get("columns", [])],
             "preview_rows": [list(row) for row in state.get("preview_rows", [])],
         }
 
     def _current_state_from_widgets(self) -> dict:
+        combo_unit = self._conc_unit_combo.currentText()
+        # Build per-column concentration_units from detection + combo default
+        conc_units: Dict[str, str] = {}
+        for cb in self._species_checkboxes:
+            col = str(cb.property("column_name"))
+            detected = self._detected_conc_unit_by_column.get(col)
+            if self._unit_row_detected and not self._no_unit_row_cb.isChecked() and detected:
+                conc_units[col] = detected
+            else:
+                conc_units[col] = combo_unit
         return {
             "time_column": self._time_combo.currentText(),
             "species_checked": {
@@ -347,13 +360,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 for cb in self._species_checkboxes
             },
             "time_unit": self._time_unit_combo.currentText(),
-            "concentration_unit": self._conc_unit_combo.currentText(),
+            "concentration_units": conc_units,
+            "combo_conc_unit": combo_unit,
             "override_no_unit_row": self._no_unit_row_cb.isChecked(),
             "no_unit_row_cb_enabled": self._no_unit_row_cb.isEnabled(),
             "unit_row_detected": self._unit_row_detected,
             "detected_time_unit": self._detected_time_unit,
-            "detected_conc_unit": self._detected_conc_unit,
-            "detected_conc_units": list(self._detected_conc_units),
+            "detected_conc_unit_by_column": dict(self._detected_conc_unit_by_column),
             "columns": list(self._columns),
             "preview_rows": [list(row) for row in self._preview_rows],
         }
@@ -374,12 +387,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
             "time_column",
             "species_checked",
             "time_unit",
-            "concentration_unit",
+            "concentration_units",
+            "combo_conc_unit",
             "override_no_unit_row",
         ):
             if key in override_state:
                 value = override_state[key]
-                merged[key] = dict(value) if key == "species_checked" else value
+                if key in ("species_checked", "concentration_units"):
+                    merged[key] = dict(value)
+                else:
+                    merged[key] = value
         if not bool(merged.get("no_unit_row_cb_enabled", False)):
             merged["override_no_unit_row"] = False
         return merged
@@ -416,18 +433,17 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _detect_unit_row(self) -> None:
         self._unit_row_detected = False
         self._detected_time_unit = None
-        self._detected_conc_unit = None
-        self._detected_conc_units = []
+        self._detected_conc_unit_by_column = {}
         if not self._preview_rows:
             return
         row_mapping = dict(zip(self._columns, self._preview_rows[0]))
         det = detect_units_from_row_mapping(row_mapping)
         self._unit_row_detected = det.has_unit_row
         self._detected_time_unit = det.detected_time_unit
-        self._detected_conc_unit = det.detected_conc_unit
-        self._detected_conc_units = [
-            self._normalize_unit_for_combo(u) for u in det.detected_conc_units
-        ]
+        self._detected_conc_unit_by_column = {
+            col: self._normalize_unit_for_combo(unit) if unit else None
+            for col, unit in det.detected_conc_unit_by_column.items()
+        }
 
     def _detect_units_for_sheet(
         self,
@@ -455,12 +471,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._preview_rows = [list(row) for row in state.get("preview_rows", [])]
         self._unit_row_detected = bool(state.get("unit_row_detected", False))
         self._detected_time_unit = state.get("detected_time_unit")
-        self._detected_conc_unit = state.get("detected_conc_unit")
-        self._detected_conc_units = list(state.get("detected_conc_units", []))
+        self._detected_conc_unit_by_column = dict(state.get("detected_conc_unit_by_column", {}))
         self._populate_preview_table()
         self._populate_time_combo(selected_time=str(state.get("time_column", "")))
         self._time_unit_combo.setCurrentText(str(state.get("time_unit", "s")))
-        self._conc_unit_combo.setCurrentText(str(state.get("concentration_unit", "M")))
+        self._conc_unit_combo.setCurrentText(str(state.get("combo_conc_unit", "M")))
         no_unit_row_enabled = bool(state.get("no_unit_row_cb_enabled", False))
         self._no_unit_row_cb.setEnabled(no_unit_row_enabled)
         self._no_unit_row_cb.setChecked(
@@ -519,11 +534,15 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._unit_info_label.setText(
                 f"Unit row detected (row 1): {', '.join(self._preview_rows[0])}"
             )
-            if len(self._detected_conc_units) > 1 and not self._no_unit_row_cb.isChecked():
+            distinct_units = set(
+                u for u in self._detected_conc_unit_by_column.values() if u
+            )
+            if len(distinct_units) > 1 and not self._no_unit_row_cb.isChecked():
                 self._unit_warning_label.setText(
-                    "Multiple concentration units detected "
-                    f"({', '.join(self._detected_conc_units)}). Verify unit selection."
+                    "Different concentration units detected "
+                    "\u2014 each column will be converted independently."
                 )
+                self._unit_warning_label.setStyleSheet("QLabel { color: #8a8; font-size: 11px; }")
                 self._unit_warning_label.show()
             else:
                 self._unit_warning_label.clear()
@@ -541,8 +560,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     self._time_unit_combo.setCurrentIndex(idx)
             else:
                 self._time_unit_combo.setCurrentText("s")
-            if self._detected_conc_unit:
-                idx = self._conc_unit_combo.findText(self._normalize_unit_for_combo(self._detected_conc_unit))
+            # Set combo to most common detected conc unit, or "M"
+            detected_units = [u for u in self._detected_conc_unit_by_column.values() if u]
+            if detected_units:
+                idx = self._conc_unit_combo.findText(self._most_common_unit(detected_units))
                 if idx >= 0:
                     self._conc_unit_combo.setCurrentIndex(idx)
             else:
@@ -563,22 +584,25 @@ class ImportConfigDialog(QtWidgets.QDialog):
             cb.deleteLater()
         self._species_checkboxes.clear()
 
+        combo_unit = self._conc_unit_combo.currentText()
         time_col = self._time_combo.currentText()
         for col in self._columns:
             if col == time_col:
                 continue
             label = col
             if self._unit_row_detected and not self._no_unit_row_cb.isChecked():
-                col_idx = self._columns.index(col)
-                if col_idx < len(self._preview_rows[0]):
-                    unit_str = self._preview_rows[0][col_idx].strip()
-                    if unit_str:
-                        try:
-                            category, _f = parse_unit(unit_str)
-                            if category == "concentration":
-                                label = f"{col} ({unit_str} -> M)"
-                        except ValueError:
-                            pass
+                detected = self._detected_conc_unit_by_column.get(col)
+                unit_str = detected if detected else combo_unit
+                try:
+                    factor = parse_concentration_unit(unit_str)
+                    if factor != 1.0:
+                        if len(unit_str) > 1 and unit_str.startswith("u"):
+                            display_unit = "\u00b5" + unit_str[1:]
+                        else:
+                            display_unit = unit_str
+                        label = f"{col} ({display_unit} \u2192 M)"
+                except ValueError:
+                    pass
             cb = QtWidgets.QCheckBox(label, self._species_container)
             cb.setChecked(True)
             cb.setProperty("column_name", col)
@@ -601,8 +625,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
         elif self._unit_row_detected:
             if self._detected_time_unit:
                 self._time_unit_combo.setCurrentText(self._normalize_unit_for_combo(self._detected_time_unit))
-            if self._detected_conc_unit:
-                self._conc_unit_combo.setCurrentText(self._normalize_unit_for_combo(self._detected_conc_unit))
+            detected_units = [u for u in self._detected_conc_unit_by_column.values() if u]
+            if detected_units:
+                self._conc_unit_combo.setCurrentText(self._most_common_unit(detected_units))
         self._refresh_unit_controls()
         self._populate_species_checkboxes()
         self._update_import_enabled()
@@ -644,9 +669,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
             str(column) for column in current_state.get("columns", [])
         }
         species_ok = self._state_has_valid_species_selection(current_state)
-        units_ok = not self._state_has_conflicting_concentration_units(current_state)
         sheets_ok = True
-        all_sheet_configs_ok = time_ok and species_ok and units_ok
+        all_sheet_configs_ok = time_ok and species_ok
+        incompatible_hint = ""
         if self._file_type == "excel":
             checked_sheet_names = self._get_checked_sheet_names()
             sheets_ok = bool(checked_sheet_names)
@@ -655,7 +680,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             # Validate current sheet normally, then verify that every other
             # checked sheet has the required columns (time + species).
             if self._apply_remaining_cb.isChecked():
-                all_sheet_configs_ok = sheets_ok and time_ok and species_ok and units_ok
+                all_sheet_configs_ok = sheets_ok and time_ok and species_ok
                 if all_sheet_configs_ok:
                     required_time = str(current_state["time_column"])
                     required_species = {
@@ -671,8 +696,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
                         other_columns = {
                             str(c) for c in other_state.get("columns", [])
                         }
-                        if not required_columns.issubset(other_columns):
+                        missing = required_columns - other_columns
+                        if missing:
                             all_sheet_configs_ok = False
+                            incompatible_hint = (
+                                f"{sheet_name} is missing columns: "
+                                f"{', '.join(sorted(missing))}"
+                            )
                             break
             else:
                 all_sheet_configs_ok = sheets_ok
@@ -682,8 +712,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                         str(column) for column in state.get("columns", [])
                     }
                     sheet_species_ok = self._state_has_valid_species_selection(state)
-                    sheet_units_ok = not self._state_has_conflicting_concentration_units(state)
-                    if not (sheet_time_ok and sheet_species_ok and sheet_units_ok):
+                    if not (sheet_time_ok and sheet_species_ok):
                         all_sheet_configs_ok = False
                         break
 
@@ -698,8 +727,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         if not species_ok:
             self._species_hint.setText("Select at least one species column")
-        elif not units_ok:
-            self._species_hint.setText("Selected species use incompatible concentration units")
+        elif incompatible_hint:
+            self._species_hint.setText(incompatible_hint)
         else:
             self._species_hint.setText("")
 
@@ -750,11 +779,18 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 state.get("override_no_unit_row", False)
                 and state.get("no_unit_row_cb_enabled", False)
             )
+            # Build per-column concentration_units from state
+            conc_units_dict = dict(state.get("concentration_units", {}))
+            combo_default = str(state.get("combo_conc_unit", "M")) or "M"
+            # Ensure every species column has an entry
+            intent_conc_units = {}
+            for sp in species:
+                intent_conc_units[sp] = conc_units_dict.get(sp, combo_default)
             per_sheet_intents[key] = SheetImportIntent(
                 time_column=time_col,
                 species_columns=species,
                 time_unit=str(state.get("time_unit", "s")) or "s",
-                concentration_unit=str(state.get("concentration_unit", "M")) or "M",
+                concentration_units=intent_conc_units,
                 override_no_unit_row=override_no_units,
             )
             columns = [str(column) for column in state.get("columns", [])]
@@ -810,33 +846,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
         return str(unit or "").strip().replace("µ", "u").replace("μ", "u")
 
     @staticmethod
-    def _state_has_conflicting_concentration_units(state: dict) -> bool:
-        columns = [str(column) for column in state.get("columns", [])]
-        preview_rows = [list(row) for row in state.get("preview_rows", [])]
-        if not preview_rows:
-            return False
-        relevant_columns = [
-            str(state.get("time_column", "")),
-            *[
-                column_name
-                for column_name, checked in dict(state.get("species_checked", {})).items()
-                if checked
-            ],
-        ]
-        row_mapping = dict(zip(columns, preview_rows[0]))
-        detection = detect_units_from_row_mapping(row_mapping, relevant_columns)
-        if bool(state.get("override_no_unit_row", False)):
-            return False
-        if len(detection.detected_conc_units) <= 1:
-            return False
-        factors = set()
-        for unit_str in detection.detected_conc_units:
-            try:
-                _category, factor = parse_unit(unit_str)
-            except ValueError:
-                continue
-            factors.add(factor)
-        return len(factors) > 1
+    def _most_common_unit(units: list[str]) -> str:
+        """Return the most common unit string, breaking ties alphabetically."""
+        counts: dict[str, int] = {}
+        for u in units:
+            counts[u] = counts.get(u, 0) + 1
+        return min(counts, key=lambda u: (-counts[u], u))
 
     @staticmethod
     def _state_has_valid_species_selection(state: dict) -> bool:

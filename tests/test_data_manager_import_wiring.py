@@ -107,6 +107,9 @@ def _make_test_config(
     species = tuple(species_columns or [])
     sheets = tuple(sheet_names or [])
 
+    # Build per-column concentration_units from the single unit
+    conc_units = {col: concentration_unit for col in species}
+
     file_intent = UserImportIntent(
         sheet_names=sheets,
         apply_to_remaining=apply_to_remaining,
@@ -115,20 +118,22 @@ def _make_test_config(
         time_column=time_column,
         species_columns=species,
         time_unit=time_unit,
-        concentration_unit=concentration_unit,
+        concentration_units=conc_units,
         override_no_unit_row=override_no_unit_row,
     )
 
     if override_no_unit_row:
         t_factor = 1.0
-        c_factor = 1.0
+        c_factors = {col: 1.0 for col in species}
         t_orig = "s"
-        c_orig = "M"
+        c_origs = {col: "M" for col in species}
     else:
         t_factor = parse_time_unit(time_unit) if time_unit else 1.0
         c_factor = parse_concentration_unit(concentration_unit) if concentration_unit else 1.0
+        c_factors = {col: c_factor for col in species}
         t_orig = time_unit or "s"
         c_orig = concentration_unit or "M"
+        c_origs = {col: c_orig for col in species}
 
     if file_type == "excel":
         per_sheet_intents = tuple((sheet_name, sheet_intent) for sheet_name in sheets)
@@ -140,9 +145,9 @@ def _make_test_config(
                 species_columns=species,
                 skip_unit_row=unit_row_detected,
                 time_factor=t_factor,
-                conc_factor=c_factor,
+                conc_factors=dict(c_factors),
                 original_time_unit=t_orig,
-                original_conc_unit=c_orig,
+                original_conc_units=dict(c_origs),
             )
             for s in sheets
         )
@@ -156,9 +161,9 @@ def _make_test_config(
                 species_columns=species,
                 skip_unit_row=unit_row_detected,
                 time_factor=t_factor,
-                conc_factor=c_factor,
+                conc_factors=dict(c_factors),
                 original_time_unit=t_orig,
-                original_conc_unit=c_orig,
+                original_conc_units=dict(c_origs),
             ),
         )
 
@@ -232,7 +237,7 @@ def test_csv_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
     assert np.allclose(payload["t"], [1.0, 2.0])
     assert np.allclose(payload["species"]["A_uM"], [2.0e-6, 4.0e-6])
     assert payload["metadata"]["original_time_unit"] == "ms"
-    assert payload["metadata"]["original_concentration_unit"] == "uM"
+    assert payload["metadata"]["original_concentration_units"] == {"A_uM": "uM", "B_uM": "uM"}
 
 
 def test_csv_import_trims_whitespace_padded_headers(tmp_path, monkeypatch, qtbot):
@@ -321,7 +326,7 @@ def test_csv_import_with_detected_unit_row(tmp_path, monkeypatch, qtbot):
     assert np.allclose(payload["t"], [1.0, 2.0])
     assert np.allclose(payload["species"]["A"], [2.0e-6, 4.0e-6])
     assert payload["metadata"]["original_time_unit"] == "ms"
-    assert payload["metadata"]["original_concentration_unit"] == "uM"
+    assert payload["metadata"]["original_concentration_units"] == {"A": "uM"}
 
 
 def test_csv_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch):
@@ -339,8 +344,8 @@ def test_csv_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch):
         filepath=str(csv_path), sheet_name=None,
         time_column="time", species_columns=("A", "B"),
         skip_unit_row=False,
-        time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        time_factor=1.0, conc_factors={"A": 1.0, "B": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M", "B": "M"},
     )
     worker = CSVLoaderWorker(plan)
 
@@ -369,8 +374,8 @@ def test_excel_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch
         filepath=str(workbook_path), sheet_name="Data",
         time_column="time", species_columns=("A", "B"),
         skip_unit_row=False,
-        time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        time_factor=1.0, conc_factors={"A": 1.0, "B": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M", "B": "M"},
     )
 
     worker = ExcelLoaderWorker(str(workbook_path), [plan])
@@ -399,8 +404,8 @@ def test_csv_unit_row_authoritative_strips_with_blank_selected_columns(tmp_path,
         filepath=str(csv_path), sheet_name=None,
         time_column="time", species_columns=("A",),
         skip_unit_row=True,
-        time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        time_factor=1.0, conc_factors={"A": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M"},
     )
     worker = CSVLoaderWorker(plan)
 
@@ -429,8 +434,8 @@ def test_excel_unit_row_authoritative_strips_with_blank_selected_columns(tmp_pat
         filepath=str(workbook_path), sheet_name="Data",
         time_column="time", species_columns=("A",),
         skip_unit_row=True,
-        time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        time_factor=1.0, conc_factors={"A": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M"},
     )
 
     worker = ExcelLoaderWorker(str(workbook_path), [plan])
@@ -455,8 +460,8 @@ def test_csv_unit_row_override_true_still_strips_first_row(tmp_path, monkeypatch
         filepath=str(csv_path), sheet_name=None,
         time_column="time", species_columns=("A", "B"),
         skip_unit_row=True,
-        time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        time_factor=1.0, conc_factors={"A": 1.0, "B": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M", "B": "M"},
     )
     worker = CSVLoaderWorker(plan)
 
@@ -485,8 +490,8 @@ def test_excel_unit_row_override_true_still_strips_first_row(tmp_path, monkeypat
         filepath=str(workbook_path), sheet_name="Data",
         time_column="time", species_columns=("A", "B"),
         skip_unit_row=True,
-        time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        time_factor=1.0, conc_factors={"A": 1.0, "B": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M", "B": "M"},
     )
 
     worker = ExcelLoaderWorker(str(workbook_path), [plan])
@@ -497,7 +502,8 @@ def test_excel_unit_row_override_true_still_strips_first_row(tmp_path, monkeypat
     assert [row["B"] for row in captured["rows"]] == ["3", "6"]
 
 
-def test_csv_import_rejects_mixed_detected_concentration_units(tmp_path, monkeypatch, qtbot):
+def test_csv_import_mixed_concentration_units_applies_per_column(tmp_path, monkeypatch, qtbot):
+    """Mixed concentration units import successfully with per-column conversion."""
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     csv_path = tmp_path / "mixed_units.csv"
@@ -515,15 +521,27 @@ def test_csv_import_rejects_mixed_detected_concentration_units(tmp_path, monkeyp
     _patch_dialog_sequence(
         monkeypatch,
         [
-            ImportDialogResult(config=None, action="import"),
+            ImportDialogResult(
+                config=_make_test_config(
+                    filepath=str(csv_path),
+                    file_type="csv",
+                    time_column="time",
+                    species_columns=["A", "B"],
+                    time_unit="ms",
+                    concentration_unit="uM",
+                    unit_row_detected=True,
+                ),
+                action="import",
+            ),
         ],
     )
 
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
 
-    assert panel.get_datasets() == {}
+    assert "mixed_units.csv" in datasets
 
 
 def test_csv_import_ignores_unselected_mixed_unit_columns(tmp_path, monkeypatch, qtbot):
@@ -656,7 +674,7 @@ def test_excel_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
     assert set(datasets) == {"multi.xlsx::SheetA", "multi.xlsx::SheetB"}
 
 
-def test_excel_import_rejects_multi_sheet_unit_mismatch(tmp_path, monkeypatch, qtbot):
+def test_excel_import_no_config_returns_empty(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     workbook_path = tmp_path / "mismatch.xlsx"
@@ -687,7 +705,7 @@ def test_excel_import_rejects_multi_sheet_unit_mismatch(tmp_path, monkeypatch, q
     assert panel.get_datasets() == {}
 
 
-def test_excel_import_rejects_mixed_unit_row_presence(tmp_path, monkeypatch, qtbot):
+def test_excel_import_no_config_mixed_presence_returns_empty(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     workbook_path = tmp_path / "mixed_presence.xlsx"
@@ -802,7 +820,7 @@ def test_unit_conversion_applied_at_import(tmp_path, monkeypatch, qtbot):
     payload = datasets["microseconds.csv"]
     assert np.allclose(payload["t"], [1e-4, 2e-4, 3e-4])
     assert payload["metadata"]["original_time_unit"] == "us"
-    assert payload["metadata"]["original_concentration_unit"] == "M"
+    assert payload["metadata"]["original_concentration_units"] == {"A": "M"}
 
 
 def test_apply_to_remaining_stops_after_current_file(tmp_path, monkeypatch, qtbot):
@@ -1755,7 +1773,7 @@ def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot
         time_column="time",
         species_columns=("A",),
         time_unit="s",
-        concentration_unit="M",
+        concentration_units={"A": "M"},
         override_no_unit_row=False,
     )
 
@@ -1783,7 +1801,7 @@ def test_remaining_excel_file_detects_unit_row_from_unselected_columns(tmp_path,
         time_column="time",
         species_columns=("A",),
         time_unit="s",
-        concentration_unit="M",
+        concentration_units={"A": "M"},
         override_no_unit_row=False,
     )
 
@@ -1797,3 +1815,124 @@ def test_remaining_excel_file_detects_unit_row_from_unselected_columns(tmp_path,
         "Unit row must be detected from full row (column B has 'nM') "
         "even though selected column A has no unit text"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-column unit conversion regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_per_column_conversion_applies_independently(tmp_path, monkeypatch, qtbot):
+    """Species A and B get different conversion factors applied independently."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    csv_path = tmp_path / "mixed_factors.csv"
+    _write_csv(
+        csv_path,
+        ["time", "A", "B"],
+        [["s", "uM", "nM"], [0.0, 100.0, 200.0], [1.0, 300.0, 400.0]],
+    )
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(csv_path)], ""),
+    )
+
+    config = ImportConfig(
+        filepath=str(csv_path),
+        file_type="csv",
+        file_intent=UserImportIntent(sheet_names=(), apply_to_remaining=False),
+        per_sheet_intents=(
+            (None, SheetImportIntent(
+                time_column="time",
+                species_columns=("A", "B"),
+                time_unit="s",
+                concentration_units={"A": "uM", "B": "nM"},
+                override_no_unit_row=False,
+            )),
+        ),
+        plans=(
+            ResolvedSheetPlan(
+                filepath=str(csv_path),
+                sheet_name=None,
+                time_column="time",
+                species_columns=("A", "B"),
+                skip_unit_row=True,
+                time_factor=1.0,
+                conc_factors={"A": 1e-6, "B": 1e-9},
+                original_time_unit="s",
+                original_conc_units={"A": "uM", "B": "nM"},
+            ),
+        ),
+    )
+
+    _patch_dialog_sequence(
+        monkeypatch,
+        [ImportDialogResult(config=config, action="import")],
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    panel._load_dataset()
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
+
+    payload = datasets["mixed_factors.csv"]
+    assert np.allclose(payload["species"]["A"], [100.0e-6, 300.0e-6])
+    assert np.allclose(payload["species"]["B"], [200.0e-9, 400.0e-9])
+
+
+def test_per_column_provenance_stored(tmp_path, monkeypatch, qtbot):
+    """Provenance metadata stores per-column original concentration units."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    csv_path = tmp_path / "provenance.csv"
+    _write_csv(csv_path, ["time", "A", "B"], [[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]])
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(csv_path)], ""),
+    )
+
+    config = ImportConfig(
+        filepath=str(csv_path),
+        file_type="csv",
+        file_intent=UserImportIntent(sheet_names=(), apply_to_remaining=False),
+        per_sheet_intents=(
+            (None, SheetImportIntent(
+                time_column="time",
+                species_columns=("A", "B"),
+                time_unit="s",
+                concentration_units={"A": "uM", "B": "nM"},
+                override_no_unit_row=False,
+            )),
+        ),
+        plans=(
+            ResolvedSheetPlan(
+                filepath=str(csv_path),
+                sheet_name=None,
+                time_column="time",
+                species_columns=("A", "B"),
+                skip_unit_row=False,
+                time_factor=1.0,
+                conc_factors={"A": 1e-6, "B": 1e-9},
+                original_time_unit="s",
+                original_conc_units={"A": "uM", "B": "nM"},
+            ),
+        ),
+    )
+
+    _patch_dialog_sequence(
+        monkeypatch,
+        [ImportDialogResult(config=config, action="import")],
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    panel._load_dataset()
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
+
+    payload = datasets["provenance.csv"]
+    assert payload["metadata"]["original_concentration_units"] == {"A": "uM", "B": "nM"}
+    assert isinstance(payload["metadata"]["original_concentration_units"], dict)

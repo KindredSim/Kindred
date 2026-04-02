@@ -232,7 +232,7 @@ class TestExcelSheetHandling:
         assert result.config is not None
         intents = dict(result.config.per_sheet_intents)
         assert intents["Sheet2"].time_unit == "ms"
-        assert intents["Sheet2"].concentration_unit == "uM"
+        assert intents["Sheet2"].concentration_units["A"] == "uM"
         assert "B" not in intents["Sheet2"].species_columns
 
     def test_apply_checkbox_rejects_mismatched_columns_at_import(self, qapp, tmp_path, monkeypatch):
@@ -258,6 +258,26 @@ class TestExcelSheetHandling:
         result = dlg._build_result("import")
         assert criticals, "Mismatched columns must produce an error at import"
         assert result.config is None
+
+    def test_column_compatibility_hint_shown_when_columns_missing(self, qapp, tmp_path):
+        """When unified checkbox is checked and another sheet is missing columns,
+        Import is disabled and hint text indicates which columns are missing."""
+        fp = _write_xlsx(tmp_path / "hint_test.xlsx", {
+            "Sheet1": (
+                ["time", "A", "B"],
+                [["0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A"],
+                [["0", "3.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+        dlg._apply_remaining_cb.setChecked(True)
+        assert dlg._btn_import.isEnabled() is False
+        hint_text = dlg._species_hint.text()
+        assert "Sheet2" in hint_text
+        assert "B" in hint_text
 
     def test_apply_checkbox_keeps_no_unit_row_off_when_target_has_no_unit_row(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "apply_sheets_no_unit_row.xlsx", {
@@ -490,7 +510,7 @@ class TestImportConfigValues:
         assert dict(cfg.per_sheet_intents)[None].time_column == "time"
         assert dict(cfg.per_sheet_intents)[None].species_columns == ("Conc_A", "Conc_B")
         assert dict(cfg.per_sheet_intents)[None].time_unit == "us"
-        assert dict(cfg.per_sheet_intents)[None].concentration_unit == "uM"
+        assert dict(cfg.per_sheet_intents)[None].concentration_units["Conc_A"] == "uM"
         assert cfg.plans[0].skip_unit_row is True
 
     def test_excel_config_sheets_populated(self, qapp, tmp_path):
@@ -603,33 +623,50 @@ class TestUnitRowOverride:
         result = dlg._build_result("import")
         intent = dict(result.config.per_sheet_intents)[None]
         assert intent.time_unit == "s"
-        assert intent.concentration_unit == "M"
+        assert all(u == "M" for u in intent.concentration_units.values())
         assert result.config.plans[0].skip_unit_row is True
         assert intent.override_no_unit_row is True
 
-    def test_mixed_concentration_units_show_warning_and_allow_override(self, qapp, tmp_path, monkeypatch):
+    def test_mixed_concentration_units_show_info_and_allow_import(self, qapp, tmp_path, monkeypatch):
         fp = _write_csv(tmp_path / "mixed_units.csv", ["time", "A", "B"], [
             ["s", "uM", "nM"],
             ["0", "1.0", "2.0"],
         ])
         dlg = ImportConfigDialog(fp)
-        assert "Multiple concentration units detected" in dlg._unit_warning_label.text()
-        assert dlg._conc_unit_combo.currentText() == "uM"
+        assert "each column will be converted independently" in dlg._unit_warning_label.text()
+        assert dlg._conc_unit_combo.currentText() == "nM"  # alphabetical tiebreak
 
-        # Mixed units are rejected by the resolver
-        criticals: list[tuple] = []
-        monkeypatch.setattr(
-            QtWidgets.QMessageBox, "critical",
-            lambda *args, **kwargs: criticals.append(args),
-        )
+        # Mixed units are allowed — import succeeds with per-column units
         result = dlg._build_result("import")
-        assert result.config is None
+        assert result.config is not None
+        intent = dict(result.config.per_sheet_intents)[None]
+        assert intent.concentration_units["A"] == "uM"
+        assert intent.concentration_units["B"] == "nM"
 
-        # Override unit row allows import with default units
-        dlg._no_unit_row_cb.setChecked(True)
-        result2 = dlg._build_result("import")
-        assert result2.config is not None
-        assert dict(result2.config.per_sheet_intents)[None].override_no_unit_row is True
+        # Import button must be enabled
+        assert dlg._btn_import.isEnabled() is True
+
+    def test_combo_change_affects_undetected_columns_only(self, qapp, tmp_path):
+        """Changing the combo updates undetected columns but leaves detected ones."""
+        fp = _write_csv(tmp_path / "combo_test.csv", ["time", "A", "B"], [
+            ["s", "uM", "0.5"],
+            ["0", "1.0", "2.0"],
+        ])
+        dlg = ImportConfigDialog(fp)
+        # A has detected unit "uM"; B has no detected unit (numeric value)
+        assert dlg._detected_conc_unit_by_column.get("A") == "uM"
+        assert dlg._detected_conc_unit_by_column.get("B") is None
+
+        # Change combo from default to "nM"
+        dlg._conc_unit_combo.setCurrentText("nM")
+
+        result = dlg._build_result("import")
+        assert result.config is not None
+        intent = dict(result.config.per_sheet_intents)[None]
+        # A keeps its detected unit
+        assert intent.concentration_units["A"] == "uM"
+        # B picks up the combo value
+        assert intent.concentration_units["B"] == "nM"
 
 
 # ---------------------------------------------------------------------------

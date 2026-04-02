@@ -95,8 +95,8 @@ def test_csv_loader_worker_cancellation_interrupts_before_full_read(tmp_path, mo
     plan = ResolvedSheetPlan(
         filepath=str(csv_path), sheet_name=None,
         time_column="time", species_columns=("A",),
-        skip_unit_row=False, time_factor=1.0, conc_factor=1.0,
-        original_time_unit="s", original_conc_unit="M",
+        skip_unit_row=False, time_factor=1.0, conc_factors={"A": 1.0},
+        original_time_unit="s", original_conc_units={"A": "M"},
     )
     worker = CSVLoaderWorker(plan)
     cancelled: list[str] = []

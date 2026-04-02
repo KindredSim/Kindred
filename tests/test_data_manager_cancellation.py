@@ -58,6 +58,7 @@ def _make_test_config(
 
     species = tuple(species_columns or [])
     sheets = tuple(sheet_names or [])
+    conc_units = {col: concentration_unit for col in species}
 
     file_intent = UserImportIntent(
         sheet_names=sheets,
@@ -67,20 +68,22 @@ def _make_test_config(
         time_column=time_column,
         species_columns=species,
         time_unit=time_unit,
-        concentration_unit=concentration_unit,
+        concentration_units=conc_units,
         override_no_unit_row=override_no_unit_row,
     )
 
     if override_no_unit_row:
         t_factor = 1.0
-        c_factor = 1.0
+        c_factors = {col: 1.0 for col in species}
         t_orig = "s"
-        c_orig = "M"
+        c_origs = {col: "M" for col in species}
     else:
         t_factor = parse_time_unit(time_unit) if time_unit else 1.0
         c_factor = parse_concentration_unit(concentration_unit) if concentration_unit else 1.0
+        c_factors = {col: c_factor for col in species}
         t_orig = time_unit or "s"
         c_orig = concentration_unit or "M"
+        c_origs = {col: c_orig for col in species}
 
     if file_type == "excel":
         per_sheet_intents = tuple((sheet_name, sheet_intent) for sheet_name in sheets)
@@ -92,9 +95,9 @@ def _make_test_config(
                 species_columns=species,
                 skip_unit_row=unit_row_detected,
                 time_factor=t_factor,
-                conc_factor=c_factor,
+                conc_factors=dict(c_factors),
                 original_time_unit=t_orig,
-                original_conc_unit=c_orig,
+                original_conc_units=dict(c_origs),
             )
             for s in sheets
         )
@@ -108,9 +111,9 @@ def _make_test_config(
                 species_columns=species,
                 skip_unit_row=unit_row_detected,
                 time_factor=t_factor,
-                conc_factor=c_factor,
+                conc_factors=dict(c_factors),
                 original_time_unit=t_orig,
-                original_conc_unit=c_orig,
+                original_conc_units=dict(c_origs),
             ),
         )
 

@@ -35,16 +35,17 @@ class UnitDetection:
 
     has_unit_row: bool
     detected_time_unit: Optional[str]
-    detected_conc_unit: Optional[str]
-    detected_conc_units: Tuple[str, ...]
+    detected_conc_unit_by_column: Dict[str, Optional[str]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "detected_conc_unit_by_column", dict(self.detected_conc_unit_by_column))
 
     @staticmethod
     def empty() -> UnitDetection:
         return UnitDetection(
             has_unit_row=False,
             detected_time_unit=None,
-            detected_conc_unit=None,
-            detected_conc_units=(),
+            detected_conc_unit_by_column={},
         )
 
 
@@ -63,8 +64,11 @@ class SheetImportIntent:
     time_column: str
     species_columns: Tuple[str, ...]
     time_unit: str
-    concentration_unit: str
+    concentration_units: Dict[str, str]  # col_name → unit string
     override_no_unit_row: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "concentration_units", dict(self.concentration_units))
 
 
 @dataclass(frozen=True)
@@ -77,9 +81,13 @@ class ResolvedSheetPlan:
     species_columns: Tuple[str, ...]
     skip_unit_row: bool
     time_factor: float
-    conc_factor: float
+    conc_factors: Dict[str, float]  # col_name → factor
     original_time_unit: str
-    original_conc_unit: str
+    original_conc_units: Dict[str, str]  # col_name → unit string
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "conc_factors", dict(self.conc_factors))
+        object.__setattr__(self, "original_conc_units", dict(self.original_conc_units))
 
 
 @dataclass(frozen=True)
@@ -113,21 +121,15 @@ def detect_units_from_row_mapping(
         return UnitDetection.empty()
 
     if relevant_column_names is not None:
-        scoped_values = [
-            str(row_mapping[col]).strip()
-            for col in relevant_column_names
-            if col in row_mapping
-        ]
+        scoped_columns = [col for col in relevant_column_names if col in row_mapping]
     else:
-        scoped_values = full_values
-
-    extraction_values = scoped_values
+        scoped_columns = list(row_mapping.keys())
 
     detected_time_unit: Optional[str] = None
-    detected_conc_unit: Optional[str] = None
-    conc_units_seen: list[str] = []
+    conc_unit_by_column: Dict[str, Optional[str]] = {}
 
-    for val in extraction_values:
+    for col in scoped_columns:
+        val = str(row_mapping[col]).strip()
         if not val:
             continue
         try:
@@ -137,16 +139,12 @@ def detect_units_from_row_mapping(
         if category == "time" and detected_time_unit is None:
             detected_time_unit = val
         elif category == "concentration":
-            if detected_conc_unit is None:
-                detected_conc_unit = val
-            if val not in conc_units_seen:
-                conc_units_seen.append(val)
+            conc_unit_by_column[col] = val
 
     return UnitDetection(
         has_unit_row=True,
         detected_time_unit=detected_time_unit,
-        detected_conc_unit=detected_conc_unit,
-        detected_conc_units=tuple(conc_units_seen),
+        detected_conc_unit_by_column=conc_unit_by_column,
     )
 
 
@@ -206,45 +204,36 @@ def resolve_import_plans(
     for sheet in target_sheets:
         detection = per_sheet_detections[sheet]
         sheet_intent = per_sheet_intents[sheet]
-
-        # (e) Per-sheet: reject if >1 distinct concentration FACTOR among
-        #     detected_conc_units when has_unit_row=True and NOT override.
-        if detection.has_unit_row and not sheet_intent.override_no_unit_row:
-            if len(detection.detected_conc_units) > 1:
-                factors_seen: set[float] = set()
-                for unit_str in detection.detected_conc_units:
-                    factors_seen.add(parse_concentration_unit(unit_str))
-                if len(factors_seen) > 1:
-                    raise ValueError(
-                        f"Sheet {sheet!r} contains multiple distinct concentration "
-                        f"factors among detected units {detection.detected_conc_units}. "
-                        f"Cannot resolve a single concentration factor automatically."
-                    )
+        species_columns = sheet_intent.species_columns
 
         skip_unit_row = detection.has_unit_row
 
         if sheet_intent.override_no_unit_row:
             time_unit = "s"
-            conc_unit = "M"
             time_factor = 1.0
-            conc_factor = 1.0
+            conc_factors = {col: 1.0 for col in species_columns}
+            original_conc_units = {col: "M" for col in species_columns}
         else:
             time_unit = sheet_intent.time_unit
-            conc_unit = sheet_intent.concentration_unit
             time_factor = parse_time_unit(time_unit)
-            conc_factor = parse_concentration_unit(conc_unit)
+            conc_factors = {}
+            original_conc_units = {}
+            for col in species_columns:
+                col_unit = sheet_intent.concentration_units[col]
+                conc_factors[col] = parse_concentration_unit(col_unit)
+                original_conc_units[col] = col_unit
 
         plans.append(
             ResolvedSheetPlan(
                 filepath=filepath,
                 sheet_name=sheet,
                 time_column=sheet_intent.time_column,
-                species_columns=sheet_intent.species_columns,
+                species_columns=species_columns,
                 skip_unit_row=skip_unit_row,
                 time_factor=time_factor,
-                conc_factor=conc_factor,
+                conc_factors=conc_factors,
                 original_time_unit=time_unit,
-                original_conc_unit=conc_unit,
+                original_conc_units=original_conc_units,
             )
         )
 
