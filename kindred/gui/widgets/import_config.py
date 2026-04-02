@@ -97,23 +97,24 @@ def detect_units_from_row_mapping(
     row_mapping:
         Mapping of column name to the cell value in the candidate unit row.
     relevant_column_names:
-        If provided, unit extraction (time unit, concentration unit, and the
-        collected concentration units) is restricted to these columns.  The
-        ``has_unit_row`` check always operates on *all* values because it
-        reflects a physical fact about the row.
+        If provided, both the ``has_unit_row`` heuristic and the unit
+        extraction are restricted to these columns so that unselected
+        columns (which may contain unit-like text) do not influence the
+        result.
     """
-    all_values = [str(v).strip() for v in row_mapping.values()]
-    if not looks_like_unit_row(all_values):
-        return UnitDetection.empty()
-
     if relevant_column_names is not None:
-        extraction_values = [
+        scoped_values = [
             str(row_mapping[col]).strip()
             for col in relevant_column_names
             if col in row_mapping
         ]
     else:
-        extraction_values = all_values
+        scoped_values = [str(v).strip() for v in row_mapping.values()]
+
+    if not looks_like_unit_row(scoped_values):
+        return UnitDetection.empty()
+
+    extraction_values = scoped_values
 
     detected_time_unit: Optional[str] = None
     detected_conc_unit: Optional[str] = None
@@ -227,8 +228,8 @@ def resolve_import_plans(
             time_factor = 1.0
             conc_factor = 1.0
         elif detection.has_unit_row:
-            time_unit = detection.detected_time_unit if detection.detected_time_unit is not None else "s"
-            conc_unit = detection.detected_conc_unit if detection.detected_conc_unit is not None else "M"
+            time_unit = intent.time_unit
+            conc_unit = intent.concentration_unit
             time_factor = parse_time_unit(time_unit)
             conc_factor = parse_concentration_unit(conc_unit)
         else:

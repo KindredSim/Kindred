@@ -38,14 +38,16 @@ def _make_intent(
 
 
 def test_csv_has_unit_row_no_override():
-    """Detection has_unit_row=True with detected units; resolver uses those units."""
+    """Detection has_unit_row=True with detected units; resolver uses intent units."""
     detection = UnitDetection(
         has_unit_row=True,
         detected_time_unit="ms",
         detected_conc_unit="uM",
         detected_conc_units=("uM",),
     )
-    intent = _make_intent(override_no_unit_row=False)
+    intent = _make_intent(
+        time_unit="ms", concentration_unit="uM", override_no_unit_row=False
+    )
     plans = resolve_import_plans(
         filepath="data.csv",
         file_type="csv",
@@ -230,7 +232,7 @@ def test_detect_units_full_row():
 
 
 def test_detect_units_scoped_to_relevant():
-    """Scoped extraction limits conc_units but has_unit_row checks all values."""
+    """Scoped extraction limits both has_unit_row heuristic and conc_units to relevant columns."""
     row = {"time": "ms", "A": "uM", "B": "nM"}
     result = detect_units_from_row_mapping(row, relevant_column_names=["time", "A"])
 
@@ -245,3 +247,61 @@ def test_detect_units_no_unit_row():
 
     assert result.has_unit_row is False
     assert result.detected_time_unit is None
+
+
+# ---------------------------------------------------------------------------
+# Bug regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_intent_units_override_detected_units():
+    """Bug 1: When has_unit_row=True, user's intent units must win over detected units."""
+    from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
+
+    detection = UnitDetection(
+        has_unit_row=True,
+        detected_time_unit="ms",
+        detected_conc_unit="uM",
+        detected_conc_units=("uM",),
+    )
+    intent = _make_intent(
+        time_unit="us",
+        concentration_unit="nM",
+        override_no_unit_row=False,
+    )
+    plans = resolve_import_plans(
+        filepath="data.csv",
+        file_type="csv",
+        intent=intent,
+        per_sheet_detections={None: detection},
+        per_sheet_columns={None: ["time", "A"]},
+    )
+
+    assert len(plans) == 1
+    plan = plans[0]
+    expected_time_factor = parse_time_unit("us")  # 1e-6
+    expected_conc_factor = parse_concentration_unit("nM")  # 1e-9
+    assert plan.time_factor == pytest.approx(expected_time_factor)
+    assert plan.conc_factor == pytest.approx(expected_conc_factor)
+    assert plan.original_time_unit == "us"
+    assert plan.original_conc_unit == "nM"
+
+
+def test_detect_units_scoped_columns_numeric_only():
+    """Bug 2: selected columns with numeric data should yield has_unit_row=False
+    even when unselected columns contain unit text."""
+    row = {"time": "0.5", "A": "1.2", "unit_col1": "ms", "unit_col2": "uM"}
+    result = detect_units_from_row_mapping(
+        row, relevant_column_names=["time", "A"]
+    )
+    assert result.has_unit_row is False
+
+
+def test_detect_units_scoped_columns_with_units():
+    """Bug 2 positive case: selected columns that DO contain unit text
+    should yield has_unit_row=True."""
+    row = {"time": "ms", "A": "uM", "B": "0.5", "C": "1.2"}
+    result = detect_units_from_row_mapping(
+        row, relevant_column_names=["time", "A"]
+    )
+    assert result.has_unit_row is True
