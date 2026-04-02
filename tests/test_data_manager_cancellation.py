@@ -13,7 +13,7 @@ from kindred.gui.widgets.data_manager import DataManagerPanel
 from kindred.gui.widgets.import_config import (
     ImportConfig,
     ResolvedSheetPlan,
-    UnitDetection,
+    SheetImportIntent,
     UserImportIntent,
 )
 from kindred.gui.widgets.import_config_dialog import ImportDialogResult
@@ -53,27 +53,22 @@ def _make_test_config(
     apply_to_remaining: bool = False,
     override_no_unit_row: bool = False,
 ) -> ImportConfig:
-    """Build a test ImportConfig with detection + intent + resolved plans."""
+    """Build a test ImportConfig with file intent, sheet intents, and resolved plans."""
     from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
 
     species = tuple(species_columns or [])
     sheets = tuple(sheet_names or [])
 
-    detection = UnitDetection(
-        has_unit_row=unit_row_detected,
-        detected_time_unit=time_unit if unit_row_detected else None,
-        detected_conc_unit=concentration_unit if unit_row_detected else None,
-        detected_conc_units=(concentration_unit,) if unit_row_detected else (),
+    file_intent = UserImportIntent(
+        sheet_names=sheets,
+        apply_to_remaining=apply_to_remaining,
     )
-
-    intent = UserImportIntent(
+    sheet_intent = SheetImportIntent(
         time_column=time_column,
         species_columns=species,
         time_unit=time_unit,
         concentration_unit=concentration_unit,
         override_no_unit_row=override_no_unit_row,
-        sheet_names=sheets,
-        apply_to_remaining=apply_to_remaining,
     )
 
     if override_no_unit_row:
@@ -88,6 +83,7 @@ def _make_test_config(
         c_orig = concentration_unit or "M"
 
     if file_type == "excel":
+        per_sheet_intents = tuple((sheet_name, sheet_intent) for sheet_name in sheets)
         plans = tuple(
             ResolvedSheetPlan(
                 filepath=filepath,
@@ -103,6 +99,7 @@ def _make_test_config(
             for s in sheets
         )
     else:
+        per_sheet_intents = ((None, sheet_intent),)
         plans = (
             ResolvedSheetPlan(
                 filepath=filepath,
@@ -120,8 +117,8 @@ def _make_test_config(
     return ImportConfig(
         filepath=filepath,
         file_type=file_type,
-        detection=detection,
-        intent=intent,
+        file_intent=file_intent,
+        per_sheet_intents=per_sheet_intents,
         plans=plans,
     )
 

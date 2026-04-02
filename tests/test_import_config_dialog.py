@@ -157,6 +157,155 @@ class TestExcelSheetHandling:
         ]
         assert "Y" in headers
 
+    def test_sheet_switch_preserves_per_sheet_configuration(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "stateful.xlsx", {
+            "Sheet1": (
+                ["time", "alt_time", "A", "B"],
+                [["ms", "s", "uM", "nM"], ["0", "0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "alt_time", "A", "B"],
+                [["us", "ms", "mM", "uM"], ["0", "0", "3.0", "4.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        dlg._time_combo.setCurrentText("alt_time")
+        dlg._time_unit_combo.setCurrentText("s")
+        dlg._conc_unit_combo.setCurrentText("nM")
+        for cb in dlg._species_checkboxes:
+            if cb.property("column_name") == "B":
+                cb.setChecked(False)
+
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet2":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet1":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        species = {
+            cb.property("column_name"): cb.isChecked()
+            for cb in dlg._species_checkboxes
+        }
+        assert dlg._time_combo.currentText() == "alt_time"
+        assert dlg._time_unit_combo.currentText() == "s"
+        assert dlg._conc_unit_combo.currentText() == "nM"
+        assert species["B"] is False
+
+    def test_apply_to_other_sheets_copies_current_sheet_configuration(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "apply_sheets.xlsx", {
+            "Sheet1": (
+                ["time", "alt_time", "A", "B"],
+                [["ms", "s", "uM", "nM"], ["0", "0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "alt_time", "A", "B"],
+                [["us", "ms", "mM", "uM"], ["0", "0", "3.0", "4.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        dlg._time_combo.setCurrentText("alt_time")
+        dlg._time_unit_combo.setCurrentText("s")
+        dlg._conc_unit_combo.setCurrentText("nM")
+        for cb in dlg._species_checkboxes:
+            if cb.property("column_name") == "B":
+                cb.setChecked(False)
+
+        dlg._btn_apply_other_sheets.click()
+
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet2":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        species = {
+            cb.property("column_name"): cb.isChecked()
+            for cb in dlg._species_checkboxes
+        }
+        assert dlg._time_combo.currentText() == "alt_time"
+        assert dlg._time_unit_combo.currentText() == "s"
+        assert dlg._conc_unit_combo.currentText() == "nM"
+        assert species["B"] is False
+
+    def test_apply_to_other_sheets_disables_import_when_target_sheet_columns_do_not_match(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "apply_sheets_mismatch.xlsx", {
+            "Sheet1": (
+                ["time", "A"],
+                [["ms", "uM"], ["0", "1.0"]],
+            ),
+            "Sheet2": (
+                ["elapsed", "B"],
+                [["s", "nM"], ["0", "2.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        dlg._btn_apply_other_sheets.click()
+
+        assert not dlg._btn_import.isEnabled()
+
+    def test_apply_to_other_sheets_keeps_no_unit_row_unchecked_when_target_has_no_unit_row(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "apply_sheets_no_unit_row.xlsx", {
+            "Sheet1": (
+                ["time", "A"],
+                [["ms", "uM"], ["0", "1.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A"],
+                [["0", "2.0"], ["1", "3.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+        dlg._no_unit_row_cb.setChecked(True)
+        dlg._btn_apply_other_sheets.click()
+
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet2":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        assert not dlg._no_unit_row_cb.isEnabled()
+        assert not dlg._no_unit_row_cb.isChecked()
+
+    def test_sheet_switch_shows_each_sheets_detected_units(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "sheet_units.xlsx", {
+            "Sheet1": (
+                ["time", "A"],
+                [["ms", "uM"], ["0", "1.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A"],
+                [["us", "mM"], ["0", "2.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        assert dlg._time_unit_combo.currentText() == "ms"
+        assert dlg._conc_unit_combo.currentText() == "uM"
+
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet2":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        assert dlg._time_unit_combo.currentText() == "us"
+        assert dlg._conc_unit_combo.currentText() == "mM"
+
     def test_no_sheets_checked_disables_import(self, qapp, tmp_path):
         fp = _write_xlsx(tmp_path / "wb3.xlsx", {
             "Sheet1": (["time", "A"], [["0", "1"]]),
@@ -168,7 +317,7 @@ class TestExcelSheetHandling:
         dlg._update_import_enabled()
         assert not dlg._btn_import.isEnabled()
 
-    def test_incompatible_checked_sheets_are_blocked_on_import(self, qapp, tmp_path, monkeypatch):
+    def test_incompatible_checked_sheets_import_with_independent_defaults(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "mismatch.xlsx", {
             "Run1": (["time", "A"], [["0", "1.0"]]),
             "Run2": (["time", "B", "C"], [["0", "2.0", "3.0"]]),
@@ -183,9 +332,9 @@ class TestExcelSheetHandling:
 
         dlg._on_import()
 
-        assert criticals
-        assert "not found" in str(criticals[0]).lower()
-        assert dlg._result is None
+        assert not criticals
+        assert dlg._result is not None
+        assert [plan.sheet_name for plan in dlg._result.config.plans] == ["Run1", "Run2"]
 
     def test_checked_sheet_compatibility_uses_checked_set_not_previewed_sheet(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "compatible_checked.xlsx", {
@@ -303,13 +452,13 @@ class TestImportConfigValues:
         assert cfg is not None
         assert cfg.filepath == fp
         assert cfg.file_type == "csv"
-        assert cfg.intent.sheet_names == ()
-        assert cfg.intent.time_column == "time"
-        assert cfg.intent.species_columns == ("Conc_A", "Conc_B")
-        assert cfg.intent.time_unit == "us"
-        assert cfg.intent.concentration_unit == "uM"
-        assert cfg.detection.has_unit_row is True
-        assert cfg.intent.apply_to_remaining is False
+        assert cfg.file_intent.sheet_names == ()
+        assert cfg.file_intent.apply_to_remaining is False
+        assert dict(cfg.per_sheet_intents)[None].time_column == "time"
+        assert dict(cfg.per_sheet_intents)[None].species_columns == ("Conc_A", "Conc_B")
+        assert dict(cfg.per_sheet_intents)[None].time_unit == "us"
+        assert dict(cfg.per_sheet_intents)[None].concentration_unit == "uM"
+        assert cfg.plans[0].skip_unit_row is True
 
     def test_excel_config_sheets_populated(self, qapp, tmp_path):
         fp = _write_xlsx(tmp_path / "k.xlsx", {
@@ -320,7 +469,7 @@ class TestImportConfigValues:
         result = dlg._build_result("import")
         cfg = result.config
         assert cfg.file_type == "excel"
-        assert set(cfg.intent.sheet_names) == {"Run1", "Run2"}
+        assert set(cfg.file_intent.sheet_names) == {"Run1", "Run2"}
 
     def test_unit_row_detected_flag(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "no_units.csv", ["time", "A"], [
@@ -329,7 +478,7 @@ class TestImportConfigValues:
         ])
         dlg = ImportConfigDialog(fp)
         result = dlg._build_result("import")
-        assert result.config.detection.has_unit_row is False
+        assert result.config.plans[0].skip_unit_row is False
 
     def test_apply_to_remaining_reflects_checkbox(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "r.csv", ["time", "A"], [
@@ -338,7 +487,7 @@ class TestImportConfigValues:
         dlg = ImportConfigDialog(fp, remaining_count=3)
         dlg._apply_remaining_cb.setChecked(True)
         result = dlg._build_result("import")
-        assert result.config.intent.apply_to_remaining is True
+        assert result.config.file_intent.apply_to_remaining is True
 
 
 # ---------------------------------------------------------------------------
@@ -419,10 +568,11 @@ class TestUnitRowOverride:
         # Override
         dlg._no_unit_row_cb.setChecked(True)
         result = dlg._build_result("import")
-        assert result.config.intent.time_unit == "s"
-        assert result.config.intent.concentration_unit == "M"
-        assert result.config.detection.has_unit_row is True
-        assert result.config.intent.override_no_unit_row is True
+        intent = dict(result.config.per_sheet_intents)[None]
+        assert intent.time_unit == "s"
+        assert intent.concentration_unit == "M"
+        assert result.config.plans[0].skip_unit_row is True
+        assert intent.override_no_unit_row is True
 
     def test_mixed_concentration_units_show_warning_and_allow_override(self, qapp, tmp_path, monkeypatch):
         fp = _write_csv(tmp_path / "mixed_units.csv", ["time", "A", "B"], [
@@ -446,7 +596,7 @@ class TestUnitRowOverride:
         dlg._no_unit_row_cb.setChecked(True)
         result2 = dlg._build_result("import")
         assert result2.config is not None
-        assert result2.config.intent.override_no_unit_row is True
+        assert dict(result2.config.per_sheet_intents)[None].override_no_unit_row is True
 
 
 # ---------------------------------------------------------------------------
@@ -516,10 +666,10 @@ class TestApplyToRemaining:
         dlg = ImportConfigDialog(fp, remaining_count=2)
         dlg._apply_remaining_cb.setChecked(False)
         r1 = dlg._build_result("import")
-        assert r1.config.intent.apply_to_remaining is False
+        assert r1.config.file_intent.apply_to_remaining is False
         dlg._apply_remaining_cb.setChecked(True)
         r2 = dlg._build_result("import")
-        assert r2.config.intent.apply_to_remaining is True
+        assert r2.config.file_intent.apply_to_remaining is True
 
 
 class TestErrorHandling:
@@ -551,10 +701,10 @@ class TestErrorHandling:
 class TestSheetColumnMismatch:
     """Regression: config built from previewed sheet columns, not checked sheets."""
 
-    def test_sheet_column_mismatch_preview_vs_checked_single_sheet_rejects(
+    def test_sheet_column_mismatch_preview_vs_checked_single_sheet_uses_checked_sheet_state(
         self, qapp, tmp_path, monkeypatch,
     ):
-        """Check sheet A, preview sheet B: species from B must be rejected."""
+        """Check sheet A, preview sheet B: import uses sheet A's stored state."""
         fp = _write_xlsx(tmp_path / "mismatch.xlsx", {
             "SheetA": (["time", "A", "B"], [["0", "1", "2"]]),
             "SheetB": (["time", "X", "Y"], [["0", "3", "4"]]),
@@ -583,14 +733,16 @@ class TestSheetColumnMismatch:
 
         dlg._on_import()
 
-        assert dlg._result is None
-        assert criticals
-        assert any("not found" in str(c).lower() for c in criticals)
+        assert dlg._result is not None
+        assert dlg._result.action == "import"
+        assert [plan.sheet_name for plan in dlg._result.config.plans] == ["SheetA"]
+        assert dict(dlg._result.config.per_sheet_intents)["SheetA"].species_columns == ("A", "B")
+        assert not criticals
 
-    def test_sheet_column_mismatch_preview_vs_all_checked_sheets_rejects(
+    def test_sheet_column_mismatch_preview_vs_all_checked_sheets_imports_independently(
         self, qapp, tmp_path, monkeypatch,
     ):
-        """Both sheets checked but incompatible: import must be rejected."""
+        """Both sheets checked and incompatible: each sheet keeps its own state."""
         fp = _write_xlsx(tmp_path / "both_checked.xlsx", {
             "SheetA": (["time", "A", "B"], [["0", "1", "2"]]),
             "SheetB": (["time", "X", "Y"], [["0", "3", "4"]]),
@@ -618,7 +770,12 @@ class TestSheetColumnMismatch:
 
         dlg._on_import()
 
-        assert dlg._result is None
+        assert dlg._result is not None
+        assert [plan.sheet_name for plan in dlg._result.config.plans] == ["SheetA", "SheetB"]
+        per_sheet_intents = dict(dlg._result.config.per_sheet_intents)
+        assert per_sheet_intents["SheetA"].species_columns == ("A", "B")
+        assert per_sheet_intents["SheetB"].species_columns == ("X", "Y")
+        assert not criticals
 
     def test_sheet_column_mismatch_absent_when_checked_matches_preview(
         self, qapp, tmp_path, monkeypatch,
@@ -654,6 +811,6 @@ class TestSheetColumnMismatch:
 
         assert dlg._result is not None
         assert dlg._result.action == "import"
-        assert set(dlg._result.config.intent.species_columns) == {"X", "Y"}
-        assert list(dlg._result.config.intent.sheet_names) == ["SheetB"]
+        assert set(dict(dlg._result.config.per_sheet_intents)["SheetB"].species_columns) == {"X", "Y"}
+        assert list(dlg._result.config.file_intent.sheet_names) == ["SheetB"]
         assert not criticals

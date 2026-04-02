@@ -12,16 +12,13 @@ from kindred.core.datasets.csv_import import CsvImportInterrupted, parse_csv_row
 from kindred.core.datasets.units import looks_like_unit_row
 
 __all__ = [
-    "ExcelWorkbookLoadResult",
     "list_sheets",
-    "load_excel_dataset",
-    "load_excel_workbook",
     "read_excel_sheet_rows",
 ]
 
 
 @dataclass(frozen=True)
-class ExcelWorkbookLoadResult:
+class _ExcelWorkbookLoadResult:
     successes: List[Tuple[str, Dict[str, object]]]
     failures: List[Tuple[str, str]]
 
@@ -53,7 +50,7 @@ def read_excel_sheet_rows(filepath: str, sheet_name: str) -> Iterable[Mapping[st
     return _iter_rows()
 
 
-def load_excel_dataset(
+def _load_excel_dataset(
     filepath: str,
     sheet_name: str,
     time_column: Optional[str] = None,
@@ -73,14 +70,14 @@ def load_excel_dataset(
     return dataset_name, data
 
 
-def load_excel_workbook(
+def _load_excel_workbook(
     filepath: str,
     sheet_names: Optional[List[str]] = None,
     time_column: Optional[str] = None,
     species_columns: Optional[Sequence[str]] = None,
     *,
     interruption_checker: Optional[Callable[[], bool]] = None,
-) -> ExcelWorkbookLoadResult:
+) -> _ExcelWorkbookLoadResult:
     """Load one or more workbook sheets, collecting successes and failures."""
     workbook = _open_workbook(filepath)
     try:
@@ -115,7 +112,7 @@ def load_excel_workbook(
                 raise
             except Exception as exc:
                 failures.append((sheet_name, str(exc)))
-        return ExcelWorkbookLoadResult(successes=successes, failures=failures)
+        return _ExcelWorkbookLoadResult(successes=successes, failures=failures)
     finally:
         workbook.close()
 

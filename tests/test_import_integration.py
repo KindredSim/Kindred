@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 
 from kindred.core.datasets.excel_import import (
+    _load_excel_dataset,
+    _load_excel_workbook,
     list_sheets,
-    load_excel_dataset,
-    load_excel_workbook,
     read_excel_sheet_rows,
 )
 from kindred.core.datasets.units import (
@@ -24,7 +24,7 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "m9_test_datasets.
 
 
 def test_load_ph7_sheet_with_units() -> None:
-    _name, payload = load_excel_dataset(str(FIXTURE_PATH), "pH7_run")
+    _name, payload = _load_excel_dataset(str(FIXTURE_PATH), "pH7_run")
 
     assert payload["metadata"]["time_column"] == "time"
     assert {"A", "B", "C", "Int", "PBMP", "pinBOH"}.issubset(payload["species"])
@@ -47,7 +47,7 @@ def test_unit_row_detected_on_ph7() -> None:
 
 
 def test_unit_conversion_roundtrip() -> None:
-    _name, payload = load_excel_dataset(str(FIXTURE_PATH), "pH7_run")
+    _name, payload = _load_excel_dataset(str(FIXTURE_PATH), "pH7_run")
 
     converted_t = payload["t"] * parse_time_unit("us")
     converted_a = payload["species"]["A"] * parse_concentration_unit("uM")
@@ -61,7 +61,7 @@ def test_unit_conversion_roundtrip() -> None:
 def test_different_units_sheet() -> None:
     rows = list(read_excel_sheet_rows(str(FIXTURE_PATH), "different_units"))
     first_row = rows[0]
-    _name, payload = load_excel_dataset(str(FIXTURE_PATH), "different_units")
+    _name, payload = _load_excel_dataset(str(FIXTURE_PATH), "different_units")
 
     assert looks_like_unit_row(list(first_row.values())) is True
     converted_t = payload["t"] * parse_time_unit(first_row["time"])
@@ -73,7 +73,7 @@ def test_different_units_sheet() -> None:
 
 def test_no_unit_row_sheet() -> None:
     rows = list(read_excel_sheet_rows(str(FIXTURE_PATH), "no_unit_row"))
-    _name, payload = load_excel_dataset(str(FIXTURE_PATH), "no_unit_row")
+    _name, payload = _load_excel_dataset(str(FIXTURE_PATH), "no_unit_row")
 
     assert looks_like_unit_row(list(rows[0].values())) is False
     assert payload["t"][0] == pytest.approx(0.0)
@@ -82,7 +82,7 @@ def test_no_unit_row_sheet() -> None:
 
 
 def test_extra_columns_filtered() -> None:
-    _name, payload = load_excel_dataset(str(FIXTURE_PATH), "extra_columns")
+    _name, payload = _load_excel_dataset(str(FIXTURE_PATH), "extra_columns")
 
     assert "notes" not in payload["species"]
     assert "temperature" not in payload["species"]
@@ -117,7 +117,7 @@ def test_import_config_dialog_with_m9_workbook(qapp) -> None:
 
 
 def test_multi_sheet_load() -> None:
-    result = load_excel_workbook(str(FIXTURE_PATH))
+    result = _load_excel_workbook(str(FIXTURE_PATH))
 
     assert len(result.successes) == 7
     assert result.failures == []
@@ -141,7 +141,7 @@ def test_different_structure_sheet_detected() -> None:
 
 
 def test_parametric_x_sheet() -> None:
-    _name, payload = load_excel_dataset(str(FIXTURE_PATH), "parametric_x")
+    _name, payload = _load_excel_dataset(str(FIXTURE_PATH), "parametric_x")
 
     assert payload["metadata"]["time_column"] == "time"
     assert "observable_X" in payload["species"]

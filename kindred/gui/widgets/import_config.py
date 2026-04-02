@@ -21,6 +21,7 @@ from kindred.core.datasets.units import (
 __all__ = [
     "ImportConfig",
     "ResolvedSheetPlan",
+    "SheetImportIntent",
     "UnitDetection",
     "UserImportIntent",
     "detect_units_from_row_mapping",
@@ -51,13 +52,19 @@ class UnitDetection:
 class UserImportIntent:
     """Captures the user's choices from the import configuration dialog."""
 
+    sheet_names: Tuple[str, ...]
+    apply_to_remaining: bool
+
+
+@dataclass(frozen=True)
+class SheetImportIntent:
+    """Captures the user's choices for one sheet (or one CSV file)."""
+
     time_column: str
     species_columns: Tuple[str, ...]
     time_unit: str
     concentration_unit: str
     override_no_unit_row: bool
-    sheet_names: Tuple[str, ...]
-    apply_to_remaining: bool
 
 
 @dataclass(frozen=True)
@@ -77,12 +84,12 @@ class ResolvedSheetPlan:
 
 @dataclass(frozen=True)
 class ImportConfig:
-    """Top-level import configuration grouping detection, intent, and plans."""
+    """Top-level import configuration grouping file intent, sheet intents, and plans."""
 
     filepath: str
     file_type: str
-    detection: UnitDetection
-    intent: UserImportIntent
+    file_intent: UserImportIntent
+    per_sheet_intents: Tuple[Tuple[Optional[str], SheetImportIntent], ...]
     plans: Tuple[ResolvedSheetPlan, ...]
 
 
@@ -97,11 +104,14 @@ def detect_units_from_row_mapping(
     row_mapping:
         Mapping of column name to the cell value in the candidate unit row.
     relevant_column_names:
-        If provided, both the ``has_unit_row`` heuristic and the unit
-        extraction are restricted to these columns so that unselected
-        columns (which may contain unit-like text) do not influence the
-        result.
+        If provided, unit extraction is restricted to these columns while
+        ``has_unit_row`` still inspects the full row so unit-like text in
+        unselected columns can still identify a physical unit row.
     """
+    full_values = [str(value).strip() for value in row_mapping.values()]
+    if not looks_like_unit_row(full_values):
+        return UnitDetection.empty()
+
     if relevant_column_names is not None:
         scoped_values = [
             str(row_mapping[col]).strip()
@@ -109,10 +119,7 @@ def detect_units_from_row_mapping(
             if col in row_mapping
         ]
     else:
-        scoped_values = [str(v).strip() for v in row_mapping.values()]
-
-    if not looks_like_unit_row(scoped_values):
-        return UnitDetection.empty()
+        scoped_values = full_values
 
     extraction_values = scoped_values
 
@@ -146,24 +153,24 @@ def detect_units_from_row_mapping(
 def resolve_import_plans(
     filepath: str,
     file_type: str,
-    intent: UserImportIntent,
+    per_sheet_intents: Dict[Optional[str], SheetImportIntent],
     per_sheet_detections: Dict[Optional[str], UnitDetection],
     per_sheet_columns: Dict[Optional[str], Sequence[str]],
 ) -> List[ResolvedSheetPlan]:
     """Resolve the user's intent into concrete per-sheet import plans.
 
     Raises ``ValueError`` when the intent is inconsistent with the detected
-    file structure (missing sheets, missing columns, mixed unit rows, or
-    ambiguous concentration factors).
+    file structure (missing sheets, missing columns, or ambiguous
+    concentration factors).
     """
-    target_sheets: List[Optional[str]]
-    if file_type == "csv":
-        target_sheets = [None]
-    else:
-        target_sheets = list(intent.sheet_names)  # type: ignore[arg-type]
+    target_sheets = list(per_sheet_intents.keys())
 
     # (a) Every target sheet must have a detection and columns entry.
     for sheet in target_sheets:
+        if sheet not in per_sheet_intents:
+            raise ValueError(
+                f"No import intent available for sheet {sheet!r}."
+            )
         if sheet not in per_sheet_detections:
             raise ValueError(
                 f"No unit detection available for sheet {sheet!r}."
@@ -173,42 +180,36 @@ def resolve_import_plans(
                 f"No column information available for sheet {sheet!r}."
             )
 
-    # (b) intent.time_column exists in every target sheet's columns.
+    # (b) Each sheet's configured time column must exist.
     for sheet in target_sheets:
         columns = per_sheet_columns[sheet]
-        if intent.time_column not in columns:
+        sheet_intent = per_sheet_intents[sheet]
+        if sheet_intent.time_column not in columns:
             raise ValueError(
-                f"Time column {intent.time_column!r} not found in sheet {sheet!r}. "
+                f"Time column {sheet_intent.time_column!r} not found in sheet {sheet!r}. "
                 f"Available columns: {list(columns)}"
             )
 
-    # (c) All intent.species_columns exist in every target sheet.
+    # (c) Each sheet's configured species columns must exist.
     for sheet in target_sheets:
         columns = per_sheet_columns[sheet]
-        for species_col in intent.species_columns:
+        sheet_intent = per_sheet_intents[sheet]
+        for species_col in sheet_intent.species_columns:
             if species_col not in columns:
                 raise ValueError(
                     f"Species column {species_col!r} not found in sheet {sheet!r}. "
                     f"Available columns: {list(columns)}"
                 )
 
-    # (d) Cross-sheet: all sheets agree on has_unit_row (only when >1 sheet).
-    if len(target_sheets) > 1:
-        unit_row_flags = {per_sheet_detections[s].has_unit_row for s in target_sheets}
-        if len(unit_row_flags) > 1:
-            raise ValueError(
-                "Sheets disagree on unit-row presence. "
-                "Some sheets have a unit row and some do not."
-            )
-
     # Build plans.
     plans: List[ResolvedSheetPlan] = []
     for sheet in target_sheets:
         detection = per_sheet_detections[sheet]
+        sheet_intent = per_sheet_intents[sheet]
 
         # (e) Per-sheet: reject if >1 distinct concentration FACTOR among
         #     detected_conc_units when has_unit_row=True and NOT override.
-        if detection.has_unit_row and not intent.override_no_unit_row:
+        if detection.has_unit_row and not sheet_intent.override_no_unit_row:
             if len(detection.detected_conc_units) > 1:
                 factors_seen: set[float] = set()
                 for unit_str in detection.detected_conc_units:
@@ -222,19 +223,14 @@ def resolve_import_plans(
 
         skip_unit_row = detection.has_unit_row
 
-        if intent.override_no_unit_row:
+        if sheet_intent.override_no_unit_row:
             time_unit = "s"
             conc_unit = "M"
             time_factor = 1.0
             conc_factor = 1.0
-        elif detection.has_unit_row:
-            time_unit = intent.time_unit
-            conc_unit = intent.concentration_unit
-            time_factor = parse_time_unit(time_unit)
-            conc_factor = parse_concentration_unit(conc_unit)
         else:
-            time_unit = intent.time_unit
-            conc_unit = intent.concentration_unit
+            time_unit = sheet_intent.time_unit
+            conc_unit = sheet_intent.concentration_unit
             time_factor = parse_time_unit(time_unit)
             conc_factor = parse_concentration_unit(conc_unit)
 
@@ -242,8 +238,8 @@ def resolve_import_plans(
             ResolvedSheetPlan(
                 filepath=filepath,
                 sheet_name=sheet,
-                time_column=intent.time_column,
-                species_columns=intent.species_columns,
+                time_column=sheet_intent.time_column,
+                species_columns=sheet_intent.species_columns,
                 skip_unit_row=skip_unit_row,
                 time_factor=time_factor,
                 conc_factor=conc_factor,

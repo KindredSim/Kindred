@@ -18,16 +18,11 @@ from kindred.core.datasets.csv_import import (
     parse_csv_rows,
 )
 from kindred.core.datasets.excel_import import (
-    list_sheets,
     read_excel_sheet_rows,
 )
 from kindred.gui.widgets.import_config import (
     ImportConfig,
     ResolvedSheetPlan,
-    UnitDetection,
-    UserImportIntent,
-    detect_units_from_row_mapping,
-    resolve_import_plans,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 
@@ -353,22 +348,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                 index += 1
                 continue
             configs.append(result.config)
-            if result.config.intent.apply_to_remaining:
-                remaining_files = filenames[index + 1 :]
-                for remaining_index, remaining_filepath in enumerate(remaining_files):
-                    cloned_config = self._clone_config_for_file(result.config, str(remaining_filepath))
-                    if cloned_config is not None:
-                        configs.append(cloned_config)
-                        continue
-                    remaining_after = len(remaining_files) - remaining_index - 1
-                    fallback_result = self._collect_import_config(
-                        str(remaining_filepath),
-                        max(0, remaining_after),
-                    )
-                    if fallback_result.action == "cancel":
-                        return
-                    if fallback_result.action == "import" and fallback_result.config is not None:
-                        configs.append(fallback_result.config)
+            if result.config.file_intent.apply_to_remaining:
                 break
             index += 1
 
@@ -420,147 +400,8 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._csv_workers.append(worker)
             worker.start()
 
-    @staticmethod
-    def _file_type_for_path(filepath: str) -> Optional[str]:
-        lower_path = str(filepath).lower()
-        if lower_path.endswith(".xls") and not lower_path.endswith(".xlsx"):
-            return None
-        if lower_path.endswith(".xlsx"):
-            return "excel"
-        return "csv"
-
     def _expected_dataset_count_for_config(self, config: ImportConfig) -> int:
         return len(config.plans)
-
-    def _clone_config_for_file(self, source_config: ImportConfig, target_filepath: str) -> Optional[ImportConfig]:
-        target_file_type = self._file_type_for_path(target_filepath)
-        if target_file_type != source_config.file_type:
-            return None
-
-        intent = UserImportIntent(
-            time_column=source_config.intent.time_column,
-            species_columns=source_config.intent.species_columns,
-            time_unit=source_config.intent.time_unit,
-            concentration_unit=source_config.intent.concentration_unit,
-            override_no_unit_row=source_config.intent.override_no_unit_row,
-            sheet_names=source_config.intent.sheet_names,
-            apply_to_remaining=False,
-        )
-
-        relevant_cols: list[str] = [intent.time_column] + list(intent.species_columns)
-        per_sheet_detections: dict[str | None, UnitDetection] = {}
-        per_sheet_columns: dict[str | None, list[str]] = {}
-
-        if target_file_type == "excel":
-            try:
-                available_sheets = set(list_sheets(target_filepath))
-            except Exception:
-                return None
-            for sn in intent.sheet_names:
-                if sn not in available_sheets:
-                    return None
-                try:
-                    cols = self._excel_columns_for_sheet(target_filepath, sn)
-                except Exception:
-                    return None
-                with closing(read_excel_sheet_rows(target_filepath, sn)) as rows:
-                    first_row = next(iter(rows), None)
-                if first_row is None:
-                    return None
-                det = detect_units_from_row_mapping(dict(first_row), relevant_cols)
-                per_sheet_detections[sn] = det
-                per_sheet_columns[sn] = cols
-        else:
-            try:
-                cols = self._csv_columns_for_file(target_filepath)
-            except Exception:
-                return None
-            with open(target_filepath, "r", encoding="utf-8-sig", newline="") as handle:
-                reader = csv.reader(handle)
-                _header = next(reader, None)
-                first_data_row = next(reader, None)
-            if _header is None or first_data_row is None:
-                return None
-            normalized_header = [str(c).strip() for c in _header]
-            row_mapping = {
-                normalized_header[i]: (first_data_row[i] if i < len(first_data_row) else "")
-                for i in range(len(normalized_header))
-            }
-            det = detect_units_from_row_mapping(row_mapping, relevant_cols)
-            per_sheet_detections[None] = det
-            per_sheet_columns[None] = cols
-
-        # Compare source and target unit signatures — reject if they differ
-        source_per_sheet = self._detect_source_units(source_config, relevant_cols)
-        if source_per_sheet is None:
-            return None
-        for key in per_sheet_detections:
-            src_key = key if key in source_per_sheet else next(iter(source_per_sheet), None)
-            if src_key not in source_per_sheet:
-                return None
-            src_det = source_per_sheet[src_key]
-            tgt_det = per_sheet_detections[key]
-            if src_det.has_unit_row != tgt_det.has_unit_row:
-                return None
-            if src_det.has_unit_row and tgt_det.has_unit_row:
-                if src_det.detected_conc_units != tgt_det.detected_conc_units:
-                    return None
-                if src_det.detected_time_unit != tgt_det.detected_time_unit:
-                    return None
-
-        try:
-            plans = resolve_import_plans(
-                target_filepath, target_file_type, intent,
-                per_sheet_detections, per_sheet_columns,
-            )
-        except ValueError:
-            return None
-
-        first_key = list(per_sheet_detections.keys())[0]
-        target_detection = per_sheet_detections[first_key]
-
-        return ImportConfig(
-            filepath=target_filepath,
-            file_type=target_file_type,
-            detection=target_detection,
-            intent=intent,
-            plans=tuple(plans),
-        )
-
-    def _detect_source_units(
-        self,
-        source_config: ImportConfig,
-        relevant_cols: list[str],
-    ) -> Optional[Dict[Optional[str], UnitDetection]]:
-        """Re-detect units on the source file, scoped to relevant columns."""
-        result: Dict[Optional[str], UnitDetection] = {}
-        if source_config.file_type == "excel":
-            for sn in source_config.intent.sheet_names:
-                try:
-                    with closing(read_excel_sheet_rows(source_config.filepath, sn)) as rows:
-                        first_row = next(iter(rows), None)
-                except Exception:
-                    return None
-                if first_row is None:
-                    return None
-                result[sn] = detect_units_from_row_mapping(dict(first_row), relevant_cols)
-        else:
-            try:
-                with open(source_config.filepath, "r", encoding="utf-8-sig", newline="") as handle:
-                    reader = csv.reader(handle)
-                    header = next(reader, None)
-                    first_data_row = next(reader, None)
-            except Exception:
-                return None
-            if header is None or first_data_row is None:
-                return None
-            normalized = [str(c).strip() for c in header]
-            row_mapping = {
-                normalized[i]: (first_data_row[i] if i < len(first_data_row) else "")
-                for i in range(len(normalized))
-            }
-            result[None] = detect_units_from_row_mapping(row_mapping, relevant_cols)
-        return result
 
     def _collect_import_config(self, filepath: str, remaining_count: int) -> ImportDialogResult:
         try:
@@ -574,23 +415,6 @@ class DataManagerPanel(QtWidgets.QWidget):
             return ImportDialogResult(config=None, action="skip")
         dialog.exec()
         return dialog.get_result()
-
-    @staticmethod
-    def _csv_columns_for_file(filepath: str) -> List[str]:
-        with open(filepath, "r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.reader(handle)
-            header = next(reader, None)
-        if header is None:
-            return []
-        return [str(value).strip() for value in header]
-
-    @staticmethod
-    def _excel_columns_for_sheet(filepath: str, sheet_name: str) -> List[str]:
-        with closing(read_excel_sheet_rows(filepath, sheet_name)) as rows:
-            first_row = next(iter(rows), None)
-        if first_row is None:
-            return []
-        return [str(value) for value in first_row.keys()]
 
     def _on_load_progress(self, percent: int):
         """Handle progress updates from dataset import worker(s)."""

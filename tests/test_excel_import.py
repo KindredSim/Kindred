@@ -158,14 +158,14 @@ def test_read_excel_sheet_rows_is_lazy_and_closes_on_close(
 
 
 def test_load_excel_dataset_returns_csv_payload_shape(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "dataset.xlsx",
         [("SheetA", [["time", "A", "B"], [0, 1.0, 2.0], [1, 0.5, 1.5]])],
     )
 
-    name, payload = load_excel_dataset(str(path), "SheetA")
+    name, payload = _load_excel_dataset(str(path), "SheetA")
 
     assert name == "dataset.xlsx::SheetA"
     assert np.allclose(payload["t"], [0.0, 1.0])
@@ -179,14 +179,14 @@ def test_load_excel_dataset_returns_csv_payload_shape(tmp_path: Path) -> None:
 
 
 def test_load_excel_dataset_supports_auto_and_explicit_mapping(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "explicit.xlsx",
         [("SheetB", [["elapsed", "A", "B", "label"], [0, 1.0, 2.0, "x"], [2, 3.0, 4.0, "y"]])],
     )
 
-    name, payload = load_excel_dataset(
+    name, payload = _load_excel_dataset(
         str(path),
         "SheetB",
         time_column="elapsed",
@@ -201,21 +201,21 @@ def test_load_excel_dataset_supports_auto_and_explicit_mapping(tmp_path: Path) -
 
 
 def test_load_excel_dataset_auto_mode_drops_non_numeric_species_columns(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "auto_drop.xlsx",
         [("Data", [["time", "A", "note"], [0, 1.0, "x"], [1, 2.0, "y"]])],
     )
 
-    _name, payload = load_excel_dataset(str(path), "Data")
+    _name, payload = _load_excel_dataset(str(path), "Data")
 
     assert list(payload["species"]) == ["A"]
     assert payload["metadata"]["species_columns"] == ["A"]
 
 
 def test_load_excel_dataset_explicit_mode_errors_on_non_numeric_species_column(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "explicit_error.xlsx",
@@ -223,11 +223,11 @@ def test_load_excel_dataset_explicit_mode_errors_on_non_numeric_species_column(t
     )
 
     with pytest.raises(ValueError, match="contains non-numeric values"):
-        load_excel_dataset(str(path), "Data", species_columns=["note"])
+        _load_excel_dataset(str(path), "Data", species_columns=["note"])
 
 
 def test_load_excel_workbook_loads_all_sheets_and_reports_failures(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import ExcelWorkbookLoadResult, load_excel_workbook
+    from kindred.core.datasets.excel_import import _ExcelWorkbookLoadResult, _load_excel_workbook
 
     path = _save_workbook(
         tmp_path / "workbook.xlsx",
@@ -238,9 +238,9 @@ def test_load_excel_workbook_loads_all_sheets_and_reports_failures(tmp_path: Pat
         ],
     )
 
-    result = load_excel_workbook(str(path))
+    result = _load_excel_workbook(str(path))
 
-    assert isinstance(result, ExcelWorkbookLoadResult)
+    assert isinstance(result, _ExcelWorkbookLoadResult)
     assert [name for name, _payload in result.successes] == [
         "workbook.xlsx::Good1",
         "workbook.xlsx::Good2",
@@ -250,7 +250,7 @@ def test_load_excel_workbook_loads_all_sheets_and_reports_failures(tmp_path: Pat
 
 
 def test_load_excel_workbook_supports_selective_sheet_loading(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_workbook
+    from kindred.core.datasets.excel_import import _load_excel_workbook
 
     path = _save_workbook(
         tmp_path / "selective.xlsx",
@@ -261,7 +261,7 @@ def test_load_excel_workbook_supports_selective_sheet_loading(tmp_path: Path) ->
         ],
     )
 
-    result = load_excel_workbook(str(path), sheet_names=["Three", "One"])
+    result = _load_excel_workbook(str(path), sheet_names=["Three", "One"])
 
     assert [name for name, _payload in result.successes] == [
         "selective.xlsx::Three",
@@ -271,7 +271,7 @@ def test_load_excel_workbook_supports_selective_sheet_loading(tmp_path: Path) ->
 
 
 def test_load_excel_workbook_reports_all_failures_when_all_sheets_bad(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_workbook
+    from kindred.core.datasets.excel_import import _load_excel_workbook
 
     path = _save_workbook(
         tmp_path / "all_bad.xlsx",
@@ -281,7 +281,7 @@ def test_load_excel_workbook_reports_all_failures_when_all_sheets_bad(tmp_path: 
         ],
     )
 
-    result = load_excel_workbook(str(path))
+    result = _load_excel_workbook(str(path))
 
     assert result.successes == []
     assert [sheet_name for sheet_name, _message in result.failures] == ["Bad1", "Bad2"]
@@ -310,7 +310,7 @@ def test_load_excel_workbook_opens_workbook_once_for_multi_sheet_load(
 
     monkeypatch.setattr(excel_import, "load_workbook", _counting_load_workbook)
 
-    result = excel_import.load_excel_workbook(str(path))
+    result = excel_import._load_excel_workbook(str(path))
 
     assert len(result.successes) == 2
     assert call_count == 1
@@ -330,7 +330,7 @@ def test_load_excel_workbook_propagates_csv_import_interruption(
     monkeypatch.setattr(excel_import, "parse_csv_rows", _raise_interrupt)
 
     with pytest.raises(CsvImportInterrupted):
-        excel_import.load_excel_workbook(str(path))
+        excel_import._load_excel_workbook(str(path))
 
 
 def test_load_excel_dataset_interrupts_without_materializing_whole_sheet(
@@ -360,7 +360,7 @@ def test_load_excel_dataset_interrupts_without_materializing_whole_sheet(
         return rows.rows_yielded > 1
 
     with pytest.raises(CsvImportInterrupted):
-        excel_import.load_excel_dataset(
+        excel_import._load_excel_dataset(
             str(tmp_path / "interrupt_dataset.xlsx"),
             "Data",
             interruption_checker=_interrupt_after_first_data_row,
@@ -410,7 +410,7 @@ def test_load_excel_workbook_interrupts_without_exhausting_current_sheet(
         return fake_workbook.sheets["Data"].data_rows_yielded > 1
 
     with pytest.raises(CsvImportInterrupted):
-        excel_import.load_excel_workbook(
+        excel_import._load_excel_workbook(
             str(tmp_path / "interrupt_workbook.xlsx"),
             interruption_checker=_interrupt_after_first_data_row,
         )
@@ -421,14 +421,14 @@ def test_load_excel_workbook_interrupts_without_exhausting_current_sheet(
 
 
 def test_load_excel_dataset_matches_parse_csv_rows_for_equivalent_content(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "equivalent.xlsx",
         [("Data", [["time", "species_A", "species_B"], [0, 1.0, 2.0], [1, 1.5, 2.5]])],
     )
 
-    _name, payload = load_excel_dataset(str(path), "Data")
+    _name, payload = _load_excel_dataset(str(path), "Data")
     _time_source, expected = parse_csv_rows(
         [
             {"time": "0", "species_A": "1.0", "species_B": "2.0"},
@@ -443,14 +443,14 @@ def test_load_excel_dataset_matches_parse_csv_rows_for_equivalent_content(tmp_pa
 
 
 def test_load_excel_dataset_supports_time_column_override_with_nonstandard_header(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "override.xlsx",
         [("Data", [["elapsed_seconds", "A"], [0, 1.0], [2, 3.0]])],
     )
 
-    _name, payload = load_excel_dataset(str(path), "Data", time_column="elapsed_seconds")
+    _name, payload = _load_excel_dataset(str(path), "Data", time_column="elapsed_seconds")
 
     assert payload["metadata"]["time_column"] == "elapsed_seconds"
     assert np.allclose(payload["t"], [0.0, 2.0])
@@ -473,7 +473,7 @@ def test_float_stringification_roundtrips_cleanly_through_parse_csv_rows(tmp_pat
 
 
 def test_unicode_sheet_names_and_headers_are_supported(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import list_sheets, load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset, list_sheets
 
     path = _save_workbook(
         tmp_path / "unicode.xlsx",
@@ -481,13 +481,13 @@ def test_unicode_sheet_names_and_headers_are_supported(tmp_path: Path) -> None:
     )
 
     assert list_sheets(str(path)) == ["Δεδομένα µ"]
-    name, payload = load_excel_dataset(str(path), "Δεδομένα µ")
+    name, payload = _load_excel_dataset(str(path), "Δεδομένα µ")
     assert name == "unicode.xlsx::Δεδομένα µ"
     assert list(payload["species"]) == ["κ", "β"]
 
 
 def test_load_excel_dataset_converts_datetime_time_cells_to_epoch_seconds(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     if not hasattr(time, "tzset"):
         pytest.skip("tzset is unavailable on this platform")
@@ -503,7 +503,7 @@ def test_load_excel_dataset_converts_datetime_time_cells_to_epoch_seconds(tmp_pa
     try:
         os.environ["TZ"] = "America/Los_Angeles"
         time.tzset()
-        _name, payload = load_excel_dataset(str(path), "Data")
+        _name, payload = _load_excel_dataset(str(path), "Data")
     finally:
         if original_tz is None:
             os.environ.pop("TZ", None)
@@ -522,14 +522,14 @@ def test_load_excel_dataset_converts_datetime_time_cells_to_epoch_seconds(tmp_pa
 
 
 def test_load_excel_dataset_converts_time_only_cells_to_seconds(tmp_path: Path) -> None:
-    from kindred.core.datasets.excel_import import load_excel_dataset
+    from kindred.core.datasets.excel_import import _load_excel_dataset
 
     path = _save_workbook(
         tmp_path / "time_only.xlsx",
         [("Data", [["time", "A"], [dt.time(0, 0, 1), 1.0], [dt.time(0, 1, 30), 2.5]])],
     )
 
-    _name, payload = load_excel_dataset(str(path), "Data")
+    _name, payload = _load_excel_dataset(str(path), "Data")
 
     assert np.allclose(payload["t"], [1.0, 90.0])
     assert np.allclose(payload["species"]["A"], [1.0, 2.5])

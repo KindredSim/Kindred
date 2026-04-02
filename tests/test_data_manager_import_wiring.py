@@ -11,7 +11,7 @@ from PySide6.QtTest import QSignalSpy
 from kindred.gui.widgets.import_config import (
     ImportConfig,
     ResolvedSheetPlan,
-    UnitDetection,
+    SheetImportIntent,
     UserImportIntent,
 )
 from kindred.gui.widgets.import_config_dialog import ImportDialogResult
@@ -101,27 +101,22 @@ def _make_test_config(
     apply_to_remaining: bool = False,
     override_no_unit_row: bool = False,
 ) -> ImportConfig:
-    """Build a test ImportConfig with detection + intent + resolved plans."""
+    """Build a test ImportConfig with file intent, sheet intents, and resolved plans."""
     from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
 
     species = tuple(species_columns or [])
     sheets = tuple(sheet_names or [])
 
-    detection = UnitDetection(
-        has_unit_row=unit_row_detected,
-        detected_time_unit=time_unit if unit_row_detected else None,
-        detected_conc_unit=concentration_unit if unit_row_detected else None,
-        detected_conc_units=(concentration_unit,) if unit_row_detected else (),
+    file_intent = UserImportIntent(
+        sheet_names=sheets,
+        apply_to_remaining=apply_to_remaining,
     )
-
-    intent = UserImportIntent(
+    sheet_intent = SheetImportIntent(
         time_column=time_column,
         species_columns=species,
         time_unit=time_unit,
         concentration_unit=concentration_unit,
         override_no_unit_row=override_no_unit_row,
-        sheet_names=sheets,
-        apply_to_remaining=apply_to_remaining,
     )
 
     if override_no_unit_row:
@@ -136,6 +131,7 @@ def _make_test_config(
         c_orig = concentration_unit or "M"
 
     if file_type == "excel":
+        per_sheet_intents = tuple((sheet_name, sheet_intent) for sheet_name in sheets)
         plans = tuple(
             ResolvedSheetPlan(
                 filepath=filepath,
@@ -151,6 +147,7 @@ def _make_test_config(
             for s in sheets
         )
     else:
+        per_sheet_intents = ((None, sheet_intent),)
         plans = (
             ResolvedSheetPlan(
                 filepath=filepath,
@@ -168,8 +165,8 @@ def _make_test_config(
     return ImportConfig(
         filepath=filepath,
         file_type=file_type,
-        detection=detection,
-        intent=intent,
+        file_intent=file_intent,
+        per_sheet_intents=per_sheet_intents,
         plans=plans,
     )
 
@@ -808,7 +805,7 @@ def test_unit_conversion_applied_at_import(tmp_path, monkeypatch, qtbot):
     assert payload["metadata"]["original_concentration_unit"] == "M"
 
 
-def test_apply_to_remaining_clones_config(tmp_path, monkeypatch, qtbot):
+def test_apply_to_remaining_stops_after_current_file(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     filepaths = []
@@ -839,13 +836,12 @@ def test_apply_to_remaining_clones_config(tmp_path, monkeypatch, qtbot):
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
-    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=3)
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
 
     assert len(created) == 1
-    assert set(datasets) == {"clone_0.csv", "clone_1.csv", "clone_2.csv"}
+    assert set(datasets) == {"clone_0.csv"}
 
-
-def test_apply_to_remaining_falls_back_when_csv_unit_detection_differs(tmp_path, monkeypatch, qtbot):
+def test_apply_to_remaining_skips_later_csv_files_even_when_units_differ(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     first = tmp_path / "first.csv"
@@ -892,14 +888,12 @@ def test_apply_to_remaining_falls_back_when_csv_unit_detection_differs(tmp_path,
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
-    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=2)
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
 
-    assert len(created) == 2
-    assert np.allclose(datasets["second.csv"]["t"], [1.0, 2.0])
-    assert np.allclose(datasets["second.csv"]["species"]["A"], [3.0, 5.0])
+    assert len(created) == 1
+    assert set(datasets) == {"first.csv"}
 
-
-def test_apply_to_remaining_fallback_on_mismatch(tmp_path, monkeypatch, qtbot):
+def test_apply_to_remaining_skips_later_csv_files_even_when_columns_differ(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     first = tmp_path / "same.csv"
@@ -944,13 +938,12 @@ def test_apply_to_remaining_fallback_on_mismatch(tmp_path, monkeypatch, qtbot):
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
-    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=2)
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
 
-    assert len(created) == 2
-    assert set(datasets) == {"same.csv", "different.csv"}
+    assert len(created) == 1
+    assert set(datasets) == {"same.csv"}
 
-
-def test_apply_to_remaining_fallback_rejects_excel_unit_mismatch(tmp_path, monkeypatch, qtbot):
+def test_apply_to_remaining_skips_later_excel_files(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     first = tmp_path / "first.xlsx"
@@ -1004,7 +997,7 @@ def test_apply_to_remaining_fallback_rejects_excel_unit_mismatch(tmp_path, monke
     panel._load_dataset()
     datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=2)
 
-    assert len(created) == 2
+    assert len(created) == 1
     assert set(datasets) == {"first.xlsx::SheetA", "first.xlsx::SheetB"}
 
 

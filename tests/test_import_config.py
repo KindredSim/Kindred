@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from kindred.gui.widgets.import_config import (
+    SheetImportIntent,
     UnitDetection,
     UserImportIntent,
     detect_units_from_row_mapping,
@@ -12,23 +13,26 @@ from kindred.gui.widgets.import_config import (
 pytestmark = pytest.mark.unit
 
 
-def _make_intent(
+def _make_intent(sheet_names=(), apply_to_remaining=False):
+    return UserImportIntent(
+        sheet_names=tuple(sheet_names),
+        apply_to_remaining=apply_to_remaining,
+    )
+
+
+def _make_sheet_intent(
     time_column="time",
     species_columns=("A",),
     time_unit="s",
     concentration_unit="M",
     override_no_unit_row=False,
-    sheet_names=(),
-    apply_to_remaining=False,
 ):
-    return UserImportIntent(
+    return SheetImportIntent(
         time_column=time_column,
         species_columns=tuple(species_columns),
         time_unit=time_unit,
         concentration_unit=concentration_unit,
         override_no_unit_row=override_no_unit_row,
-        sheet_names=tuple(sheet_names),
-        apply_to_remaining=apply_to_remaining,
     )
 
 
@@ -45,13 +49,13 @@ def test_csv_has_unit_row_no_override():
         detected_conc_unit="uM",
         detected_conc_units=("uM",),
     )
-    intent = _make_intent(
+    intent = _make_sheet_intent(
         time_unit="ms", concentration_unit="uM", override_no_unit_row=False
     )
     plans = resolve_import_plans(
         filepath="data.csv",
         file_type="csv",
-        intent=intent,
+        per_sheet_intents={None: intent},
         per_sheet_detections={None: detection},
         per_sheet_columns={None: ["time", "A"]},
     )
@@ -73,11 +77,11 @@ def test_csv_has_unit_row_with_override():
         detected_conc_unit="uM",
         detected_conc_units=("uM",),
     )
-    intent = _make_intent(override_no_unit_row=True)
+    intent = _make_sheet_intent(override_no_unit_row=True)
     plans = resolve_import_plans(
         filepath="data.csv",
         file_type="csv",
-        intent=intent,
+        per_sheet_intents={None: intent},
         per_sheet_detections={None: detection},
         per_sheet_columns={None: ["time", "A"]},
     )
@@ -94,11 +98,11 @@ def test_csv_has_unit_row_with_override():
 def test_csv_no_unit_row_no_override():
     """No unit row detected; resolver falls back to intent units."""
     detection = UnitDetection.empty()
-    intent = _make_intent(time_unit="ms", concentration_unit="uM")
+    intent = _make_sheet_intent(time_unit="ms", concentration_unit="uM")
     plans = resolve_import_plans(
         filepath="data.csv",
         file_type="csv",
-        intent=intent,
+        per_sheet_intents={None: intent},
         per_sheet_detections={None: detection},
         per_sheet_columns={None: ["time", "A"]},
     )
@@ -118,11 +122,12 @@ def test_excel_two_sheets_both_have_unit_row():
         detected_conc_unit="uM",
         detected_conc_units=("uM",),
     )
-    intent = _make_intent(sheet_names=("S1", "S2"))
+    intent_a = _make_sheet_intent()
+    intent_b = _make_sheet_intent()
     plans = resolve_import_plans(
         filepath="data.xlsx",
         file_type="excel",
-        intent=intent,
+        per_sheet_intents={"S1": intent_a, "S2": intent_b},
         per_sheet_detections={"S1": detection, "S2": detection},
         per_sheet_columns={"S1": ["time", "A"], "S2": ["time", "A"]},
     )
@@ -134,8 +139,8 @@ def test_excel_two_sheets_both_have_unit_row():
     assert plans[1].skip_unit_row is True
 
 
-def test_excel_mixed_unit_row_presence_raises():
-    """Sheets that disagree on has_unit_row raise ValueError."""
+def test_excel_mixed_unit_row_presence_is_resolved_per_sheet():
+    """Sheets may disagree on has_unit_row when each sheet has its own intent."""
     det_with = UnitDetection(
         has_unit_row=True,
         detected_time_unit="ms",
@@ -143,28 +148,32 @@ def test_excel_mixed_unit_row_presence_raises():
         detected_conc_units=("uM",),
     )
     det_without = UnitDetection.empty()
-    intent = _make_intent(sheet_names=("S1", "S2"))
+    plans = resolve_import_plans(
+        filepath="data.xlsx",
+        file_type="excel",
+        per_sheet_intents={
+            "S1": _make_sheet_intent(time_unit="ms", concentration_unit="uM"),
+            "S2": _make_sheet_intent(time_unit="s", concentration_unit="M"),
+        },
+        per_sheet_detections={"S1": det_with, "S2": det_without},
+        per_sheet_columns={"S1": ["time", "A"], "S2": ["time", "A"]},
+    )
 
-    with pytest.raises(ValueError, match="disagree"):
-        resolve_import_plans(
-            filepath="data.xlsx",
-            file_type="excel",
-            intent=intent,
-            per_sheet_detections={"S1": det_with, "S2": det_without},
-            per_sheet_columns={"S1": ["time", "A"], "S2": ["time", "A"]},
-        )
+    assert [plan.sheet_name for plan in plans] == ["S1", "S2"]
+    assert plans[0].skip_unit_row is True
+    assert plans[1].skip_unit_row is False
 
 
 def test_missing_species_column_raises():
     """A species column not present in the sheet columns raises ValueError."""
     detection = UnitDetection.empty()
-    intent = _make_intent(species_columns=("A", "MISSING"))
+    intent = _make_sheet_intent(species_columns=("A", "MISSING"))
 
     with pytest.raises(ValueError, match="MISSING"):
         resolve_import_plans(
             filepath="data.csv",
             file_type="csv",
-            intent=intent,
+            per_sheet_intents={None: intent},
             per_sheet_detections={None: detection},
             per_sheet_columns={None: ["time", "A"]},
         )
@@ -178,13 +187,13 @@ def test_mixed_concentration_units_raises():
         detected_conc_unit="uM",
         detected_conc_units=("uM", "nM"),
     )
-    intent = _make_intent(override_no_unit_row=False)
+    intent = _make_sheet_intent(override_no_unit_row=False)
 
     with pytest.raises(ValueError, match="concentration"):
         resolve_import_plans(
             filepath="data.csv",
             file_type="csv",
-            intent=intent,
+            per_sheet_intents={None: intent},
             per_sheet_detections={None: detection},
             per_sheet_columns={None: ["time", "A"]},
         )
@@ -198,11 +207,11 @@ def test_override_with_physical_unit_row():
         detected_conc_unit="uM",
         detected_conc_units=("uM",),
     )
-    intent = _make_intent(override_no_unit_row=True)
+    intent = _make_sheet_intent(override_no_unit_row=True)
     plans = resolve_import_plans(
         filepath="data.csv",
         file_type="csv",
-        intent=intent,
+        per_sheet_intents={None: intent},
         per_sheet_detections={None: detection},
         per_sheet_columns={None: ["time", "A"]},
     )
@@ -232,12 +241,23 @@ def test_detect_units_full_row():
 
 
 def test_detect_units_scoped_to_relevant():
-    """Scoped extraction limits both has_unit_row heuristic and conc_units to relevant columns."""
+    """Scoped extraction limits detected units to relevant columns."""
     row = {"time": "ms", "A": "uM", "B": "nM"}
     result = detect_units_from_row_mapping(row, relevant_column_names=["time", "A"])
 
     assert result.has_unit_row is True
     assert result.detected_conc_units == ("uM",)
+
+
+def test_detect_units_has_unit_row_uses_full_row_but_extracts_only_relevant_columns():
+    row = {"time": "0.5", "A": "1.2", "notes_time": "ms", "notes_conc": "uM"}
+
+    result = detect_units_from_row_mapping(row, relevant_column_names=["time", "A"])
+
+    assert result.has_unit_row is True
+    assert result.detected_time_unit is None
+    assert result.detected_conc_unit is None
+    assert result.detected_conc_units == ()
 
 
 def test_detect_units_no_unit_row():
@@ -264,7 +284,7 @@ def test_intent_units_override_detected_units():
         detected_conc_unit="uM",
         detected_conc_units=("uM",),
     )
-    intent = _make_intent(
+    intent = _make_sheet_intent(
         time_unit="us",
         concentration_unit="nM",
         override_no_unit_row=False,
@@ -272,7 +292,7 @@ def test_intent_units_override_detected_units():
     plans = resolve_import_plans(
         filepath="data.csv",
         file_type="csv",
-        intent=intent,
+        per_sheet_intents={None: intent},
         per_sheet_detections={None: detection},
         per_sheet_columns={None: ["time", "A"]},
     )
@@ -288,13 +308,14 @@ def test_intent_units_override_detected_units():
 
 
 def test_detect_units_scoped_columns_numeric_only():
-    """Bug 2: selected columns with numeric data should yield has_unit_row=False
-    even when unselected columns contain unit text."""
+    """Bug 2: full-row detection still reports a unit row even when selected columns are numeric."""
     row = {"time": "0.5", "A": "1.2", "unit_col1": "ms", "unit_col2": "uM"}
     result = detect_units_from_row_mapping(
         row, relevant_column_names=["time", "A"]
     )
-    assert result.has_unit_row is False
+    assert result.has_unit_row is True
+    assert result.detected_time_unit is None
+    assert result.detected_conc_units == ()
 
 
 def test_detect_units_scoped_columns_with_units():
@@ -305,3 +326,53 @@ def test_detect_units_scoped_columns_with_units():
         row, relevant_column_names=["time", "A"]
     )
     assert result.has_unit_row is True
+
+
+def test_resolve_import_plans_uses_each_sheets_independent_intent():
+    plans = resolve_import_plans(
+        filepath="data.xlsx",
+        file_type="excel",
+        per_sheet_intents={
+            "S1": _make_sheet_intent(
+                time_column="time_us",
+                species_columns=("A",),
+                time_unit="us",
+                concentration_unit="nM",
+            ),
+            "S2": _make_sheet_intent(
+                time_column="elapsed_ms",
+                species_columns=("B", "C"),
+                time_unit="ms",
+                concentration_unit="uM",
+                override_no_unit_row=True,
+            ),
+        },
+        per_sheet_detections={
+            "S1": UnitDetection(
+                has_unit_row=True,
+                detected_time_unit="us",
+                detected_conc_unit="nM",
+                detected_conc_units=("nM",),
+            ),
+            "S2": UnitDetection(
+                has_unit_row=True,
+                detected_time_unit="ms",
+                detected_conc_unit="uM",
+                detected_conc_units=("uM",),
+            ),
+        },
+        per_sheet_columns={
+            "S1": ["time_us", "A"],
+            "S2": ["elapsed_ms", "B", "C"],
+        },
+    )
+
+    assert [plan.sheet_name for plan in plans] == ["S1", "S2"]
+    assert plans[0].time_column == "time_us"
+    assert plans[0].species_columns == ("A",)
+    assert plans[0].original_time_unit == "us"
+    assert plans[0].original_conc_unit == "nM"
+    assert plans[1].time_column == "elapsed_ms"
+    assert plans[1].species_columns == ("B", "C")
+    assert plans[1].original_time_unit == "s"
+    assert plans[1].original_conc_unit == "M"
