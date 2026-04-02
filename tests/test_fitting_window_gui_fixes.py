@@ -80,7 +80,7 @@ def _make_window():
     )
 
 
-# ---- Fix 1: FittingWindow has minimize/maximize buttons ----
+# ---- FittingWindow has minimize/maximize buttons ----
 
 def test_fitting_window_has_min_max_buttons(qt_app):
     window = _make_window()
@@ -94,7 +94,7 @@ def test_fitting_window_has_min_max_buttons(qt_app):
         qt_app.processEvents()
 
 
-# ---- Fix 2: Parameters/ICs splitter is horizontal ----
+# ---- Parameters/ICs splitter is horizontal ----
 
 def test_parameters_tab_has_no_splitter_after_ic_extraction(qt_app):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
@@ -125,7 +125,7 @@ def test_parameters_tab_has_no_splitter_after_ic_extraction(qt_app):
         qt_app.processEvents()
 
 
-# ---- Fix 3: Run Stamp moved to footer popup ----
+# ---- Run Stamp moved to footer popup ----
 
 def test_run_results_tab_has_no_run_stamp_groupbox(qt_app):
     from kindred.gui.fitting.run_results_tab import RunResultsTab

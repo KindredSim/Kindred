@@ -475,10 +475,9 @@ class DataManagerPanel(QtWidgets.QWidget):
             if first_row_raw is not None:
                 row_values = [c.strip() if c else "" for c in first_row_raw]
                 row_mapping = dict(zip(columns, row_values))
-                filtered_mapping = {
-                    k: v for k, v in row_mapping.items() if k in selected_keys
-                }
-                det = detect_units_from_row_mapping(filtered_mapping)
+                det = detect_units_from_row_mapping(
+                    row_mapping, list(selected_keys)
+                )
             else:
                 det = UnitDetection.empty()
             per_sheet_intents[None] = source_intent
@@ -502,13 +501,8 @@ class DataManagerPanel(QtWidgets.QWidget):
                     per_sheet_detections[sheet_name] = UnitDetection.empty()
                 else:
                     per_sheet_columns[sheet_name] = list(first_row.keys())
-                    full_mapping = dict(first_row)
-                    filtered_mapping = {
-                        k: v for k, v in full_mapping.items()
-                        if k in selected_keys
-                    }
                     per_sheet_detections[sheet_name] = detect_units_from_row_mapping(
-                        filtered_mapping
+                        dict(first_row), list(selected_keys)
                     )
                 per_sheet_intents[sheet_name] = source_intent
             target_sheet_names = tuple(sheets)

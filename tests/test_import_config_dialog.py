@@ -287,8 +287,8 @@ class TestExcelSheetHandling:
         assert intents["Sheet2"].override_no_unit_row is False
 
     def test_sheet_switch_preview_highlighting_uses_target_sheet_detection(self, qapp, tmp_path):
-        """Bug 2 regression: preview row highlighting must use the target
-        sheet's detection, not the previous sheet's stale state."""
+        """Preview row highlighting must use the target sheet's detection,
+        not the previous sheet's stale state."""
         from kindred.gui.widgets.import_config_dialog import _UNIT_ROW_BG
 
         fp = _write_xlsx(tmp_path / "mixed_detection.xlsx", {
@@ -760,13 +760,17 @@ class TestApplyToRemaining:
 
 
 class TestImportEnablementWithCheckbox:
-    """Regression: when the unified checkbox is checked for Excel,
-    import enablement must validate only the currently-viewed sheet."""
+    """When the unified checkbox is checked for Excel, import enablement
+    must validate the current sheet AND verify column compatibility of
+    other checked sheets."""
 
-    def test_import_enabled_with_checkbox_ignores_invalid_other_sheets(self, qapp, tmp_path):
+    def test_import_enabled_with_checkbox_and_invalid_other_sheet_species(self, qapp, tmp_path):
+        """Checkbox checked, other sheet has no species selected: current
+        sheet's intent will be copied at import, so only current sheet
+        validation matters -- but column compatibility must still hold."""
         fp = _write_xlsx(tmp_path / "multi.xlsx", {
             "Sheet1": (["time", "A", "B"], [["0", "1.0", "2.0"], ["1", "3.0", "4.0"]]),
-            "Sheet2": (["time", "X", "Y"], [["0", "5.0", "6.0"], ["1", "7.0", "8.0"]]),
+            "Sheet2": (["time", "A", "B"], [["0", "5.0", "6.0"], ["1", "7.0", "8.0"]]),
         })
         dlg = ImportConfigDialog(fp)
 
@@ -796,11 +800,76 @@ class TestImportEnablementWithCheckbox:
             "Import must be disabled when checkbox is unchecked and Sheet2 has no species"
         )
 
-        # With checkbox: import should be enabled (only current sheet matters)
+        # With checkbox: import should be enabled (Sheet2 has compatible columns)
         dlg._apply_remaining_cb.setChecked(True)
         dlg._update_import_enabled()
         assert dlg._btn_import.isEnabled(), (
-            "Import must be enabled when checkbox is checked - only current sheet validated"
+            "Import must be enabled when checkbox is checked and Sheet2 columns are compatible"
+        )
+
+    def test_import_disabled_with_checkbox_when_other_sheet_missing_columns(self, qapp, tmp_path):
+        """Checkbox checked but Sheet2 has different columns (elapsed
+        instead of time, C/D instead of A/B): Import must be disabled
+        because _build_result will copy current intent and resolution
+        will fail."""
+        fp = _write_xlsx(tmp_path / "incompatible.xlsx", {
+            "Sheet1": (["time", "A", "B"], [["0", "1.0", "2.0"], ["1", "3.0", "4.0"]]),
+            "Sheet2": (["elapsed", "C", "D"], [["0", "5.0", "6.0"], ["1", "7.0", "8.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        # Sheet1 is previewed and valid by default
+        dlg._apply_remaining_cb.setChecked(True)
+        dlg._update_import_enabled()
+        assert not dlg._btn_import.isEnabled(), (
+            "Import must be disabled when checkbox is checked but Sheet2 "
+            "is missing Sheet1's time column and species columns"
+        )
+
+    def test_import_disabled_with_checkbox_when_other_sheet_missing_species(self, qapp, tmp_path):
+        """Checkbox checked, Sheet2 has the time column but is missing a
+        selected species column: Import must be disabled."""
+        fp = _write_xlsx(tmp_path / "missing_species.xlsx", {
+            "Sheet1": (["time", "A", "B"], [["0", "1.0", "2.0"], ["1", "3.0", "4.0"]]),
+            "Sheet2": (["time", "B", "C"], [["0", "5.0", "6.0"], ["1", "7.0", "8.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        # Sheet1 previewed, species A and B are checked
+        dlg._apply_remaining_cb.setChecked(True)
+        dlg._update_import_enabled()
+        assert not dlg._btn_import.isEnabled(), (
+            "Import must be disabled when Sheet2 is missing species column A"
+        )
+
+    def test_import_enabled_with_checkbox_when_all_sheets_compatible(self, qapp, tmp_path):
+        """Checkbox checked, both sheets have identical columns: Import
+        must be enabled."""
+        fp = _write_xlsx(tmp_path / "compatible.xlsx", {
+            "Sheet1": (["time", "A", "B"], [["0", "1.0", "2.0"], ["1", "3.0", "4.0"]]),
+            "Sheet2": (["time", "A", "B"], [["0", "5.0", "6.0"], ["1", "7.0", "8.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        dlg._apply_remaining_cb.setChecked(True)
+        dlg._update_import_enabled()
+        assert dlg._btn_import.isEnabled(), (
+            "Import must be enabled when all sheets have compatible columns"
+        )
+
+    def test_import_unchecked_validates_sheets_independently(self, qapp, tmp_path):
+        """Checkbox unchecked: each checked sheet validated independently,
+        regardless of column differences."""
+        fp = _write_xlsx(tmp_path / "independent.xlsx", {
+            "Sheet1": (["time", "A"], [["0", "1.0"], ["1", "3.0"]]),
+            "Sheet2": (["time", "B"], [["0", "5.0"], ["1", "7.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        dlg._apply_remaining_cb.setChecked(False)
+        dlg._update_import_enabled()
+        assert dlg._btn_import.isEnabled(), (
+            "Import must be enabled when checkbox unchecked and each sheet is independently valid"
         )
 
 

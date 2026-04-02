@@ -1420,8 +1420,7 @@ def test_empty_mechanism_mapping_create_and_seed_returns_unseeded():
 
 
 def test_apply_to_remaining_imports_all_remaining_csv_files(tmp_path, monkeypatch, qtbot):
-    """Bug 1 regression: apply_to_remaining must import remaining files,
-    not silently drop them."""
+    """apply_to_remaining must import remaining files, not silently drop them."""
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
     filepaths = []
@@ -1471,7 +1470,7 @@ def test_apply_to_remaining_imports_all_remaining_csv_files(tmp_path, monkeypatc
 
 
 def test_apply_to_remaining_error_on_incompatible_remaining_file(tmp_path, monkeypatch, qtbot):
-    """Bug 1 regression: when a remaining file has incompatible columns,
+    """When a remaining file has incompatible columns,
     QMessageBox.critical must be shown and that file skipped."""
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -1734,3 +1733,67 @@ def test_apply_to_remaining_handles_unicode_decode_error(tmp_path, monkeypatch, 
     assert "good.csv" in list(panel.get_datasets().keys())[0]
     assert criticals, "QMessageBox.critical must be shown for encoding error"
     assert "bad_encoding.csv" in str(criticals[0])
+
+
+# ---------------------------------------------------------------------------
+# Remaining-file detection uses full row for has_unit_row
+# ---------------------------------------------------------------------------
+
+
+def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot):
+    """has_unit_row is a physical property of the full row.  When unit text
+    appears only in an unselected column (B has 'nM', selected columns time
+    and A are blank), _build_remaining_file_config must still detect the
+    unit row so that skip_unit_row=True in the resolved plan."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    # CSV where unit text appears ONLY in unselected column B
+    csv_path = tmp_path / "sparse_units.csv"
+    _write_csv(csv_path, ["time", "A", "B"], [["", "", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+
+    source_intent = SheetImportIntent(
+        time_column="time",
+        species_columns=("A",),
+        time_unit="s",
+        concentration_unit="M",
+        override_no_unit_row=False,
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    config = panel._build_remaining_file_config(str(csv_path), source_intent)
+
+    assert config.plans[0].skip_unit_row is True, (
+        "Unit row must be detected from full row (column B has 'nM') "
+        "even though selected column A has no unit text"
+    )
+
+
+def test_remaining_excel_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot):
+    """Excel variant: unit text only in unselected column B must still
+    trigger has_unit_row=True for the remaining file."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    xlsx_path = tmp_path / "sparse_units.xlsx"
+    _write_workbook(xlsx_path, {
+        "Data": (["time", "A", "B"], [["", "", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]]),
+    })
+
+    source_intent = SheetImportIntent(
+        time_column="time",
+        species_columns=("A",),
+        time_unit="s",
+        concentration_unit="M",
+        override_no_unit_row=False,
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    config = panel._build_remaining_file_config(
+        str(xlsx_path), source_intent, source_sheet_names=("Data",),
+    )
+
+    assert config.plans[0].skip_unit_row is True, (
+        "Unit row must be detected from full row (column B has 'nM') "
+        "even though selected column A has no unit text"
+    )

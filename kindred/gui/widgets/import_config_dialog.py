@@ -650,11 +650,30 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if self._file_type == "excel":
             checked_sheet_names = self._get_checked_sheet_names()
             sheets_ok = bool(checked_sheet_names)
-            # When the unified checkbox is checked, _build_result will
-            # copy the current sheet's state to all other checked sheets at
-            # import time, so only the current sheet's validity matters.
+            # When the unified checkbox is checked, _build_result copies
+            # the current sheet's intent to all other checked sheets.
+            # Validate current sheet normally, then verify that every other
+            # checked sheet has the required columns (time + species).
             if self._apply_remaining_cb.isChecked():
                 all_sheet_configs_ok = sheets_ok and time_ok and species_ok and units_ok
+                if all_sheet_configs_ok:
+                    required_time = str(current_state["time_column"])
+                    required_species = {
+                        str(col) for col, checked
+                        in dict(current_state.get("species_checked", {})).items()
+                        if checked
+                    }
+                    required_columns = {required_time} | required_species
+                    for sheet_name in checked_sheet_names:
+                        if sheet_name == self._previewed_sheet_name:
+                            continue
+                        other_state = self._ensure_sheet_state(sheet_name)
+                        other_columns = {
+                            str(c) for c in other_state.get("columns", [])
+                        }
+                        if not required_columns.issubset(other_columns):
+                            all_sheet_configs_ok = False
+                            break
             else:
                 all_sheet_configs_ok = sheets_ok
                 for sheet_name in checked_sheet_names:

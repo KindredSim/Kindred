@@ -275,7 +275,7 @@ def test_detect_units_no_unit_row():
 
 
 def test_intent_units_override_detected_units():
-    """Bug 1: When has_unit_row=True, user's intent units must win over detected units."""
+    """When has_unit_row=True, user's intent units must win over detected units."""
     from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
 
     detection = UnitDetection(
@@ -308,7 +308,7 @@ def test_intent_units_override_detected_units():
 
 
 def test_detect_units_scoped_columns_numeric_only():
-    """Bug 2: full-row detection still reports a unit row even when selected columns are numeric."""
+    """Full-row detection still reports a unit row even when selected columns are numeric."""
     row = {"time": "0.5", "A": "1.2", "unit_col1": "ms", "unit_col2": "uM"}
     result = detect_units_from_row_mapping(
         row, relevant_column_names=["time", "A"]
@@ -319,8 +319,7 @@ def test_detect_units_scoped_columns_numeric_only():
 
 
 def test_detect_units_scoped_columns_with_units():
-    """Bug 2 positive case: selected columns that DO contain unit text
-    should yield has_unit_row=True."""
+    """Scoped detection: selected columns with unit text yield has_unit_row=True."""
     row = {"time": "ms", "A": "uM", "B": "0.5", "C": "1.2"}
     result = detect_units_from_row_mapping(
         row, relevant_column_names=["time", "A"]
