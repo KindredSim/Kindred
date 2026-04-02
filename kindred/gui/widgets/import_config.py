@@ -69,6 +69,8 @@ class SheetImportIntent:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "concentration_units", dict(self.concentration_units))
+        if set(self.concentration_units) != set(self.species_columns):
+            raise ValueError("concentration_units keys must match species_columns")
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,7 @@ class ImportConfig:
     file_intent: UserImportIntent
     per_sheet_intents: Tuple[Tuple[Optional[str], SheetImportIntent], ...]
     plans: Tuple[ResolvedSheetPlan, ...]
+    remaining_file_template: Optional[SheetImportIntent] = None
 
 
 def detect_units_from_row_mapping(

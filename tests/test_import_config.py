@@ -388,3 +388,33 @@ def test_per_column_detection_returns_column_mapping():
     row = {"time": "ms", "A": "uM", "B": "nM"}
     result = detect_units_from_row_mapping(row, relevant_column_names=["A", "B"])
     assert result.detected_conc_unit_by_column == {"A": "uM", "B": "nM"}
+
+
+# ---------------------------------------------------------------------------
+# SheetImportIntent validation tests
+# ---------------------------------------------------------------------------
+
+
+def test_sheet_import_intent_rejects_mismatched_concentration_units_keys():
+    """SheetImportIntent must raise when concentration_units keys differ from species_columns."""
+    with pytest.raises((ValueError, AssertionError), match="concentration_units keys must match species_columns"):
+        SheetImportIntent(
+            time_column="time",
+            species_columns=("A", "B"),
+            time_unit="s",
+            concentration_units={"A": "uM"},
+            override_no_unit_row=False,
+        )
+
+
+def test_sheet_import_intent_accepts_matching_concentration_units_keys():
+    """SheetImportIntent construction succeeds when keys match species_columns."""
+    intent = SheetImportIntent(
+        time_column="time",
+        species_columns=("A", "B"),
+        time_unit="s",
+        concentration_units={"A": "uM", "B": "nM"},
+        override_no_unit_row=False,
+    )
+    assert intent.species_columns == ("A", "B")
+    assert intent.concentration_units == {"A": "uM", "B": "nM"}

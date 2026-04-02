@@ -123,6 +123,7 @@ def _make_test_config(
         file_intent=file_intent,
         per_sheet_intents=per_sheet_intents,
         plans=plans,
+        remaining_file_template=sheet_intent if apply_to_remaining else None,
     )
 
 

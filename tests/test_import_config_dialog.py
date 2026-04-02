@@ -1052,3 +1052,191 @@ class TestSheetColumnMismatch:
         assert set(dict(dlg._result.config.per_sheet_intents)["SheetB"].species_columns) == {"X", "Y"}
         assert list(dlg._result.config.file_intent.sheet_names) == ["SheetB"]
         assert not criticals
+
+
+# ---------------------------------------------------------------------------
+# 10. Per-column unit intent copying regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestApplyCheckboxUsesTargetSheetUnits:
+    """Fix A: apply checkbox must use each target sheet's own detected units."""
+
+    def test_apply_checkbox_uses_target_sheet_detected_units(self, qapp, tmp_path, monkeypatch):
+        """Sheet1 A=uM B=uM, Sheet2 A=uM B=nM.  Apply from Sheet1.
+        Sheet2's intent must have concentration_units['B'] == 'nM' (its own
+        detected unit), not 'uM' (Sheet1's)."""
+        fp = _write_xlsx(tmp_path / "target_units.xlsx", {
+            "Sheet1": (
+                ["time", "A", "B"],
+                [["s", "uM", "uM"], ["0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A", "B"],
+                [["s", "uM", "nM"], ["0", "3.0", "4.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+        dlg._apply_remaining_cb.setChecked(True)
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+        intents = dict(result.config.per_sheet_intents)
+        assert intents["Sheet2"].concentration_units["B"] == "nM", (
+            "Sheet2 column B must use Sheet2's own detected unit (nM), not Sheet1's (uM)"
+        )
+        assert intents["Sheet2"].concentration_units["A"] == "uM"
+        # Sheet1 should keep its own units
+        assert intents["Sheet1"].concentration_units["B"] == "uM"
+
+    def test_unvisited_sheet_undetected_col_uses_combo_default_not_M(self, qapp, tmp_path, monkeypatch):
+        """Sheet with detected A=uM but undetected B should fall back to the
+        sheet's combo default (uM, derived from detected columns), NOT bare M."""
+        fp = _write_xlsx(tmp_path / "partial_detect.xlsx", {
+            "Sheet1": (
+                ["time", "A", "B"],
+                [["s", "uM", "0.5"], ["0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A", "B"],
+                [["s", "uM", "0.5"], ["0", "3.0", "4.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+        dlg._apply_remaining_cb.setChecked(True)
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+        intents = dict(result.config.per_sheet_intents)
+        # Sheet2's B has no detected unit; combo default for Sheet2 is "uM"
+        # (most common detected unit on that sheet), not bare "M"
+        assert intents["Sheet2"].concentration_units["B"] == "uM", (
+            f"Undetected column B should use combo default 'uM', "
+            f"got {intents['Sheet2'].concentration_units['B']!r}"
+        )
+
+    def test_unvisited_sheets_have_complete_concentration_units(self, qapp, tmp_path, monkeypatch):
+        """Open 3-sheet Excel. Visit only Sheet1 (auto-previewed). Leave
+        'apply to all' unchecked. All sheets checked. Import. Every sheet's
+        intent must have concentration_units with all species columns present
+        and no None values."""
+        fp = _write_xlsx(tmp_path / "three_sheets.xlsx", {
+            "Sheet1": (
+                ["time", "A", "B"],
+                [["s", "uM", "0.5"], ["0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A", "B"],
+                [["s", "nM", "0.5"], ["0", "3.0", "4.0"]],
+            ),
+            "Sheet3": (
+                ["time", "A", "B"],
+                [["s", "0.5", "0.5"], ["0", "5.0", "6.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp)
+        # apply_remaining is off by default; all sheets are checked by default
+        assert not dlg._apply_remaining_cb.isChecked()
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+        intents = dict(result.config.per_sheet_intents)
+        # Sheet1 (auto-previewed): A="uM" detected, B undetected → combo default "uM"
+        assert intents["Sheet1"].concentration_units == {"A": "uM", "B": "uM"}
+        # Sheet2 (unvisited): A="nM" detected, B undetected → combo default "nM"
+        assert intents["Sheet2"].concentration_units == {"A": "nM", "B": "nM"}
+        # Sheet3 (unvisited): no unit row detected → combo default "M"
+        assert intents["Sheet3"].concentration_units == {"A": "M", "B": "M"}
+
+
+# ---------------------------------------------------------------------------
+# 11. Combo change refreshes species labels
+# ---------------------------------------------------------------------------
+
+
+class TestComboChangeRefreshesLabels:
+    """Fix C: changing the concentration combo must refresh species checkbox labels."""
+
+    def test_combo_change_updates_undetected_column_labels(self, qapp, tmp_path):
+        """Column B has no detected unit; its label should change when the
+        combo box changes from uM to nM."""
+        fp = _write_csv(tmp_path / "label_refresh.csv", ["time", "A", "B"], [
+            ["s", "uM", "0.5"],
+            ["0", "1.0", "2.0"],
+        ])
+        dlg = ImportConfigDialog(fp)
+
+        # A is detected (uM), B is not detected (numeric 0.5)
+        assert dlg._detected_conc_unit_by_column.get("B") is None
+
+        # Find B's checkbox and read its initial label
+        b_label_before = None
+        for cb in dlg._species_checkboxes:
+            if cb.property("column_name") == "B":
+                b_label_before = cb.text()
+                break
+        assert b_label_before is not None
+
+        # Change combo from default to "nM"
+        dlg._conc_unit_combo.setCurrentText("nM")
+
+        # Read B's label again
+        b_label_after = None
+        for cb in dlg._species_checkboxes:
+            if cb.property("column_name") == "B":
+                b_label_after = cb.text()
+                break
+        assert b_label_after is not None
+        assert b_label_after != b_label_before, (
+            "B's checkbox label must change after combo change (was: "
+            f"{b_label_before!r}, still: {b_label_after!r})"
+        )
+
+    def test_combo_change_preserves_unchecked_species(self, qapp, tmp_path):
+        """Changing the combo must NOT reset species checkbox checked state."""
+        fp = _write_csv(tmp_path / "preserve_checks.csv", ["time", "A", "B", "C"], [
+            ["s", "uM", "uM", "uM"],
+            ["0", "1.0", "2.0", "3.0"],
+        ])
+        dlg = ImportConfigDialog(fp)
+
+        # Uncheck B
+        for cb in dlg._species_checkboxes:
+            if cb.property("column_name") == "B":
+                cb.setChecked(False)
+                break
+
+        # Change combo
+        dlg._conc_unit_combo.setCurrentText("nM")
+
+        # B must still be unchecked
+        checked_state = {
+            str(cb.property("column_name")): cb.isChecked()
+            for cb in dlg._species_checkboxes
+        }
+        assert checked_state["A"] is True
+        assert checked_state["B"] is False, (
+            "B must remain unchecked after combo change"
+        )
+        assert checked_state["C"] is True

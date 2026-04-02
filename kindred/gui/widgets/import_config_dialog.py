@@ -211,6 +211,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._btn_skip.clicked.connect(self._on_skip)
         self._btn_cancel.clicked.connect(self._on_cancel)
         self._time_combo.currentTextChanged.connect(self._on_time_column_changed)
+        self._conc_unit_combo.currentTextChanged.connect(lambda _: self._refresh_species_labels())
         self._apply_remaining_cb.toggled.connect(lambda _: self._update_import_enabled())
         if self._file_type == "excel":
             self._sheet_list.itemClicked.connect(self._on_sheet_clicked)
@@ -307,11 +308,19 @@ class ImportConfigDialog(QtWidgets.QDialog):
         # Pick the most common detected unit as combo default, or "M"
         detected_units = [u for u in detected_conc_by_col.values() if u]
         combo_default = self._most_common_unit(detected_units) if detected_units else "M"
+        # Build concentration_units for every species column — detected unit
+        # if available, otherwise the combo default.  No None values.
+        concentration_units = {}
+        for col in columns:
+            if col == time_column:
+                continue
+            detected = detected_conc_by_col.get(col)
+            concentration_units[col] = detected if detected else combo_default
         return {
             "time_column": time_column,
             "species_checked": species_checked,
             "time_unit": self._normalize_unit_for_combo(det.detected_time_unit) if det.detected_time_unit else "s",
-            "concentration_units": detected_conc_by_col,
+            "concentration_units": concentration_units,
             "combo_conc_unit": combo_default,
             "override_no_unit_row": False,
             "no_unit_row_cb_enabled": det.has_unit_row,
@@ -467,6 +476,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._previewed_sheet_name = sheet_name
         self._time_combo.blockSignals(True)
         self._no_unit_row_cb.blockSignals(True)
+        self._conc_unit_combo.blockSignals(True)
         self._columns = [str(column) for column in state.get("columns", [])]
         self._preview_rows = [list(row) for row in state.get("preview_rows", [])]
         self._unit_row_detected = bool(state.get("unit_row_detected", False))
@@ -490,6 +500,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 cb.setChecked(bool(species_checked[column_name]))
         self._time_combo.blockSignals(False)
         self._no_unit_row_cb.blockSignals(False)
+        self._conc_unit_combo.blockSignals(False)
         self._save_current_sheet_state(sheet_name)
         self._update_import_enabled()
 
@@ -577,6 +588,25 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._no_unit_row_cb.setEnabled(False)
         self._refresh_unit_controls()
 
+    def _label_for_species_column(self, col: str) -> str:
+        """Return the display label for a species column checkbox."""
+        label = col
+        if self._unit_row_detected and not self._no_unit_row_cb.isChecked():
+            combo_unit = self._conc_unit_combo.currentText()
+            detected = self._detected_conc_unit_by_column.get(col)
+            unit_str = detected if detected else combo_unit
+            try:
+                factor = parse_concentration_unit(unit_str)
+                if factor != 1.0:
+                    if len(unit_str) > 1 and unit_str.startswith("u"):
+                        display_unit = "\u00b5" + unit_str[1:]
+                    else:
+                        display_unit = unit_str
+                    label = f"{col} ({display_unit} \u2192 M)"
+            except ValueError:
+                pass
+        return label
+
     def _populate_species_checkboxes(self) -> None:
         # Clear existing
         for cb in self._species_checkboxes:
@@ -584,31 +614,22 @@ class ImportConfigDialog(QtWidgets.QDialog):
             cb.deleteLater()
         self._species_checkboxes.clear()
 
-        combo_unit = self._conc_unit_combo.currentText()
         time_col = self._time_combo.currentText()
         for col in self._columns:
             if col == time_col:
                 continue
-            label = col
-            if self._unit_row_detected and not self._no_unit_row_cb.isChecked():
-                detected = self._detected_conc_unit_by_column.get(col)
-                unit_str = detected if detected else combo_unit
-                try:
-                    factor = parse_concentration_unit(unit_str)
-                    if factor != 1.0:
-                        if len(unit_str) > 1 and unit_str.startswith("u"):
-                            display_unit = "\u00b5" + unit_str[1:]
-                        else:
-                            display_unit = unit_str
-                        label = f"{col} ({display_unit} \u2192 M)"
-                except ValueError:
-                    pass
-            cb = QtWidgets.QCheckBox(label, self._species_container)
+            cb = QtWidgets.QCheckBox(self._label_for_species_column(col), self._species_container)
             cb.setChecked(True)
             cb.setProperty("column_name", col)
             cb.toggled.connect(lambda _: self._update_import_enabled())
             self._species_checkboxes.append(cb)
             self._species_layout.addWidget(cb)
+
+    def _refresh_species_labels(self) -> None:
+        """Update checkbox labels in place without destroying/recreating them."""
+        for cb in self._species_checkboxes:
+            col = str(cb.property("column_name"))
+            cb.setText(self._label_for_species_column(col))
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -779,13 +800,19 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 state.get("override_no_unit_row", False)
                 and state.get("no_unit_row_cb_enabled", False)
             )
-            # Build per-column concentration_units from state
-            conc_units_dict = dict(state.get("concentration_units", {}))
-            combo_default = str(state.get("combo_conc_unit", "M")) or "M"
-            # Ensure every species column has an entry
+            # Build per-column concentration_units from target's own detection,
+            # falling back to the state's stored concentration_units (which is
+            # complete — every species column has a string value, whether from
+            # _build_default_sheet_state, _current_state_from_widgets, or merge).
+            detected_conc = dict(state.get("detected_conc_unit_by_column", {}))
+            source_conc_units = dict(state.get("concentration_units", {}))
             intent_conc_units = {}
             for sp in species:
-                intent_conc_units[sp] = conc_units_dict.get(sp, combo_default)
+                target_detected = detected_conc.get(sp) if not override_no_units else None
+                if target_detected is not None:
+                    intent_conc_units[sp] = target_detected
+                else:
+                    intent_conc_units[sp] = source_conc_units[sp]
             per_sheet_intents[key] = SheetImportIntent(
                 time_column=time_col,
                 species_columns=species,
@@ -817,6 +844,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
             )
             return ImportDialogResult(config=None, action=action)
 
+        remaining_template = None
+        if file_intent.apply_to_remaining:
+            previewed_key = self._previewed_sheet_name  # None for CSV
+            remaining_template = per_sheet_intents.get(previewed_key)
+
         config = ImportConfig(
             filepath=self._filepath,
             file_type=self._file_type,
@@ -826,6 +858,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 for sheet_name in target_keys
             ),
             plans=tuple(plans),
+            remaining_file_template=remaining_template,
         )
         return ImportDialogResult(config=config, action=action)
 
