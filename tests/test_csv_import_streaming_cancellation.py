@@ -7,6 +7,7 @@ import pytest
 
 from kindred.core.datasets.csv_import import CsvImportInterrupted, load_csv_dataset
 from kindred.gui.widgets.data_manager import CSVLoaderWorker
+from kindred.gui.widgets.import_config import ResolvedSheetPlan
 
 
 class _StreamingReader:
@@ -91,7 +92,13 @@ def test_csv_loader_worker_cancellation_interrupts_before_full_read(tmp_path, mo
     state = {"yielded": 0}
     _patch_worker_reader(monkeypatch, rows, state)
 
-    worker = CSVLoaderWorker(str(csv_path))
+    plan = ResolvedSheetPlan(
+        filepath=str(csv_path), sheet_name=None,
+        time_column="time", species_columns=("A",),
+        skip_unit_row=False, time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
+    )
+    worker = CSVLoaderWorker(plan)
     cancelled: list[str] = []
     errors: list[str] = []
     loaded: list[tuple[str, dict]] = []

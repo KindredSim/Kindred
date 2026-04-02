@@ -10,7 +10,13 @@ from PySide6.QtTest import QSignalSpy
 
 from kindred.core.datasets.csv_import import CsvImportInterrupted
 from kindred.gui.widgets.data_manager import DataManagerPanel
-from kindred.gui.widgets.import_config_dialog import ImportConfig, ImportDialogResult
+from kindred.gui.widgets.import_config import (
+    ImportConfig,
+    ResolvedSheetPlan,
+    UnitDetection,
+    UserImportIntent,
+)
+from kindred.gui.widgets.import_config_dialog import ImportDialogResult
 
 pytestmark = pytest.mark.gui
 
@@ -35,6 +41,91 @@ def _write_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def _make_test_config(
+    filepath: str,
+    file_type: str = "csv",
+    sheet_names: list[str] | None = None,
+    time_column: str = "time",
+    species_columns: list[str] | None = None,
+    time_unit: str = "s",
+    concentration_unit: str = "M",
+    unit_row_detected: bool = False,
+    apply_to_remaining: bool = False,
+    override_no_unit_row: bool = False,
+) -> ImportConfig:
+    """Build a test ImportConfig with detection + intent + resolved plans."""
+    from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
+
+    species = tuple(species_columns or [])
+    sheets = tuple(sheet_names or [])
+
+    detection = UnitDetection(
+        has_unit_row=unit_row_detected,
+        detected_time_unit=time_unit if unit_row_detected else None,
+        detected_conc_unit=concentration_unit if unit_row_detected else None,
+        detected_conc_units=(concentration_unit,) if unit_row_detected else (),
+    )
+
+    intent = UserImportIntent(
+        time_column=time_column,
+        species_columns=species,
+        time_unit=time_unit,
+        concentration_unit=concentration_unit,
+        override_no_unit_row=override_no_unit_row,
+        sheet_names=sheets,
+        apply_to_remaining=apply_to_remaining,
+    )
+
+    if override_no_unit_row:
+        t_factor = 1.0
+        c_factor = 1.0
+        t_orig = "s"
+        c_orig = "M"
+    else:
+        t_factor = parse_time_unit(time_unit) if time_unit else 1.0
+        c_factor = parse_concentration_unit(concentration_unit) if concentration_unit else 1.0
+        t_orig = time_unit or "s"
+        c_orig = concentration_unit or "M"
+
+    if file_type == "excel":
+        plans = tuple(
+            ResolvedSheetPlan(
+                filepath=filepath,
+                sheet_name=s,
+                time_column=time_column,
+                species_columns=species,
+                skip_unit_row=unit_row_detected,
+                time_factor=t_factor,
+                conc_factor=c_factor,
+                original_time_unit=t_orig,
+                original_conc_unit=c_orig,
+            )
+            for s in sheets
+        )
+    else:
+        plans = (
+            ResolvedSheetPlan(
+                filepath=filepath,
+                sheet_name=None,
+                time_column=time_column,
+                species_columns=species,
+                skip_unit_row=unit_row_detected,
+                time_factor=t_factor,
+                conc_factor=c_factor,
+                original_time_unit=t_orig,
+                original_conc_unit=c_orig,
+            ),
+        )
+
+    return ImportConfig(
+        filepath=filepath,
+        file_type=file_type,
+        detection=detection,
+        intent=intent,
+        plans=plans,
+    )
+
+
 def test_multi_file_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
     """Cancel multi-file import and ensure threads/workers clean up properly."""
     panel = DataManagerPanel()
@@ -53,7 +144,7 @@ def test_multi_file_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
     )
     queued_results = [
         ImportDialogResult(
-            config=ImportConfig(
+            config=_make_test_config(
                 filepath=files[0],
                 file_type="csv",
                 time_column="time",
@@ -108,7 +199,7 @@ def test_excel_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
     )
     queued_results = [
         ImportDialogResult(
-            config=ImportConfig(
+            config=_make_test_config(
                 filepath=str(workbook_path),
                 file_type="excel",
                 sheet_names=["SheetA", "SheetB"],
@@ -131,7 +222,8 @@ def test_excel_import_cancel_cleans_workers(tmp_path, monkeypatch, qtbot):
         def get_result(self) -> ImportDialogResult:
             return self._result
 
-    def _slow_excel_loader(self, sheet_name: str):
+    def _slow_excel_loader(self, plan):
+        sheet_name = plan.sheet_name if hasattr(plan, "sheet_name") else str(plan)
         for _ in range(200):
             if self.isInterruptionRequested():
                 raise CsvImportInterrupted()
@@ -171,7 +263,7 @@ def test_clear_datasets_cancels_inflight_import_and_prevents_late_commit(tmp_pat
     )
     queued_results = [
         ImportDialogResult(
-            config=ImportConfig(
+            config=_make_test_config(
                 filepath=str(csv_path),
                 file_type="csv",
                 time_column="time",

@@ -174,21 +174,20 @@ class TestExcelSheetHandling:
             "Run2": (["time", "B", "C"], [["0", "2.0", "3.0"]]),
         })
         dlg = ImportConfigDialog(fp)
-        warnings = []
+        criticals: list[tuple] = []
 
-        def _warning(parent, title, text):
-            warnings.append((title, text))
-            return QtWidgets.QMessageBox.StandardButton.Ok
-
-        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
 
         dlg._on_import()
 
-        assert warnings
-        assert "different column structures" in warnings[0][1]
+        assert criticals
+        assert "not found" in str(criticals[0]).lower()
         assert dlg._result is None
 
-    def test_checked_sheet_compatibility_uses_checked_set_not_previewed_sheet(self, qapp, tmp_path):
+    def test_checked_sheet_compatibility_uses_checked_set_not_previewed_sheet(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "compatible_checked.xlsx", {
             "Run1": (["time", "A"], [["0", "1.0"]]),
             "Run2": (["time", "B"], [["0", "2.0"]]),
@@ -196,12 +195,30 @@ class TestExcelSheetHandling:
         })
         dlg = ImportConfigDialog(fp)
 
+        # Preview Run2 so species reflect checked sheets' columns
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Run2":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        # Uncheck Run1 (which doesn't have column B)
         for i in range(dlg._sheet_list.count()):
             item = dlg._sheet_list.item(i)
             if item.text() == "Run1":
                 item.setCheckState(QtCore.Qt.CheckState.Unchecked)
 
-        assert dlg._checked_excel_sheets_are_compatible() is True
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        dlg._on_import()
+
+        assert dlg._result is not None
+        assert not criticals
 
     def test_reordered_checked_sheet_headers_are_compatible(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "reordered.xlsx", {
@@ -209,19 +226,16 @@ class TestExcelSheetHandling:
             "Run2": (["B", "time", "A"], [["3.0", "0", "4.0"]]),
         })
         dlg = ImportConfigDialog(fp)
-        warnings = []
+        criticals: list[tuple] = []
 
-        def _warning(parent, title, text):
-            warnings.append((title, text))
-            return QtWidgets.QMessageBox.StandardButton.Ok
-
-        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
-
-        assert dlg._checked_excel_sheets_are_compatible() is True
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
 
         dlg._on_import()
 
-        assert warnings == []
+        assert not criticals
         assert dlg._result is not None
 
     def test_excel_preview_stops_after_preview_limit(self, qapp, tmp_path, monkeypatch):
@@ -289,24 +303,24 @@ class TestImportConfigValues:
         assert cfg is not None
         assert cfg.filepath == fp
         assert cfg.file_type == "csv"
-        assert cfg.sheet_names == []
-        assert cfg.time_column == "time"
-        assert cfg.species_columns == ["Conc_A", "Conc_B"]
-        assert cfg.time_unit == "us"
-        assert cfg.concentration_unit == "uM"
-        assert cfg.unit_row_detected is True
-        assert cfg.apply_to_remaining is False
+        assert cfg.intent.sheet_names == ()
+        assert cfg.intent.time_column == "time"
+        assert cfg.intent.species_columns == ("Conc_A", "Conc_B")
+        assert cfg.intent.time_unit == "us"
+        assert cfg.intent.concentration_unit == "uM"
+        assert cfg.detection.has_unit_row is True
+        assert cfg.intent.apply_to_remaining is False
 
     def test_excel_config_sheets_populated(self, qapp, tmp_path):
         fp = _write_xlsx(tmp_path / "k.xlsx", {
             "Run1": (["time", "A"], [["0", "1"]]),
-            "Run2": (["time", "B"], [["0", "2"]]),
+            "Run2": (["time", "A"], [["0", "2"]]),
         })
         dlg = ImportConfigDialog(fp)
         result = dlg._build_result("import")
         cfg = result.config
         assert cfg.file_type == "excel"
-        assert set(cfg.sheet_names) == {"Run1", "Run2"}
+        assert set(cfg.intent.sheet_names) == {"Run1", "Run2"}
 
     def test_unit_row_detected_flag(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "no_units.csv", ["time", "A"], [
@@ -315,7 +329,7 @@ class TestImportConfigValues:
         ])
         dlg = ImportConfigDialog(fp)
         result = dlg._build_result("import")
-        assert result.config.unit_row_detected is False
+        assert result.config.detection.has_unit_row is False
 
     def test_apply_to_remaining_reflects_checkbox(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "r.csv", ["time", "A"], [
@@ -324,7 +338,7 @@ class TestImportConfigValues:
         dlg = ImportConfigDialog(fp, remaining_count=3)
         dlg._apply_remaining_cb.setChecked(True)
         result = dlg._build_result("import")
-        assert result.config.apply_to_remaining is True
+        assert result.config.intent.apply_to_remaining is True
 
 
 # ---------------------------------------------------------------------------
@@ -405,11 +419,12 @@ class TestUnitRowOverride:
         # Override
         dlg._no_unit_row_cb.setChecked(True)
         result = dlg._build_result("import")
-        assert result.config.time_unit == "s"
-        assert result.config.concentration_unit == "M"
-        assert result.config.unit_row_detected is False
+        assert result.config.intent.time_unit == "s"
+        assert result.config.intent.concentration_unit == "M"
+        assert result.config.detection.has_unit_row is True
+        assert result.config.intent.override_no_unit_row is True
 
-    def test_mixed_concentration_units_show_warning_and_allow_override(self, qapp, tmp_path):
+    def test_mixed_concentration_units_show_warning_and_allow_override(self, qapp, tmp_path, monkeypatch):
         fp = _write_csv(tmp_path / "mixed_units.csv", ["time", "A", "B"], [
             ["s", "uM", "nM"],
             ["0", "1.0", "2.0"],
@@ -417,9 +432,21 @@ class TestUnitRowOverride:
         dlg = ImportConfigDialog(fp)
         assert "Multiple concentration units detected" in dlg._unit_warning_label.text()
         assert dlg._conc_unit_combo.currentText() == "uM"
-        dlg._conc_unit_combo.setCurrentText("nM")
+
+        # Mixed units are rejected by the resolver
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
         result = dlg._build_result("import")
-        assert result.config.concentration_unit == "nM"
+        assert result.config is None
+
+        # Override unit row allows import with default units
+        dlg._no_unit_row_cb.setChecked(True)
+        result2 = dlg._build_result("import")
+        assert result2.config is not None
+        assert result2.config.intent.override_no_unit_row is True
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +516,10 @@ class TestApplyToRemaining:
         dlg = ImportConfigDialog(fp, remaining_count=2)
         dlg._apply_remaining_cb.setChecked(False)
         r1 = dlg._build_result("import")
-        assert r1.config.apply_to_remaining is False
+        assert r1.config.intent.apply_to_remaining is False
         dlg._apply_remaining_cb.setChecked(True)
         r2 = dlg._build_result("import")
-        assert r2.config.apply_to_remaining is True
+        assert r2.config.intent.apply_to_remaining is True
 
 
 class TestErrorHandling:
@@ -558,7 +585,7 @@ class TestSheetColumnMismatch:
 
         assert dlg._result is None
         assert criticals
-        assert any("missing" in str(c).lower() for c in criticals)
+        assert any("not found" in str(c).lower() for c in criticals)
 
     def test_sheet_column_mismatch_preview_vs_all_checked_sheets_rejects(
         self, qapp, tmp_path, monkeypatch,
@@ -627,6 +654,6 @@ class TestSheetColumnMismatch:
 
         assert dlg._result is not None
         assert dlg._result.action == "import"
-        assert set(dlg._result.config.species_columns) == {"X", "Y"}
-        assert dlg._result.config.sheet_names == ["SheetB"]
+        assert set(dlg._result.config.intent.species_columns) == {"X", "Y"}
+        assert list(dlg._result.config.intent.sheet_names) == ["SheetB"]
         assert not criticals

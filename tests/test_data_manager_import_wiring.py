@@ -8,7 +8,13 @@ from openpyxl import Workbook
 from PySide6 import QtWidgets
 from PySide6.QtTest import QSignalSpy
 
-from kindred.gui.widgets.import_config_dialog import ImportConfig, ImportDialogResult
+from kindred.gui.widgets.import_config import (
+    ImportConfig,
+    ResolvedSheetPlan,
+    UnitDetection,
+    UserImportIntent,
+)
+from kindred.gui.widgets.import_config_dialog import ImportDialogResult
 
 pytestmark = pytest.mark.gui
 
@@ -83,6 +89,91 @@ def _capture_worker_rows(monkeypatch) -> dict[str, list[dict[str, str]]]:
     return captured
 
 
+def _make_test_config(
+    filepath: str,
+    file_type: str = "csv",
+    sheet_names: list[str] | None = None,
+    time_column: str = "time",
+    species_columns: list[str] | None = None,
+    time_unit: str = "s",
+    concentration_unit: str = "M",
+    unit_row_detected: bool = False,
+    apply_to_remaining: bool = False,
+    override_no_unit_row: bool = False,
+) -> ImportConfig:
+    """Build a test ImportConfig with detection + intent + resolved plans."""
+    from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
+
+    species = tuple(species_columns or [])
+    sheets = tuple(sheet_names or [])
+
+    detection = UnitDetection(
+        has_unit_row=unit_row_detected,
+        detected_time_unit=time_unit if unit_row_detected else None,
+        detected_conc_unit=concentration_unit if unit_row_detected else None,
+        detected_conc_units=(concentration_unit,) if unit_row_detected else (),
+    )
+
+    intent = UserImportIntent(
+        time_column=time_column,
+        species_columns=species,
+        time_unit=time_unit,
+        concentration_unit=concentration_unit,
+        override_no_unit_row=override_no_unit_row,
+        sheet_names=sheets,
+        apply_to_remaining=apply_to_remaining,
+    )
+
+    if override_no_unit_row:
+        t_factor = 1.0
+        c_factor = 1.0
+        t_orig = "s"
+        c_orig = "M"
+    else:
+        t_factor = parse_time_unit(time_unit) if time_unit else 1.0
+        c_factor = parse_concentration_unit(concentration_unit) if concentration_unit else 1.0
+        t_orig = time_unit or "s"
+        c_orig = concentration_unit or "M"
+
+    if file_type == "excel":
+        plans = tuple(
+            ResolvedSheetPlan(
+                filepath=filepath,
+                sheet_name=s,
+                time_column=time_column,
+                species_columns=species,
+                skip_unit_row=unit_row_detected,
+                time_factor=t_factor,
+                conc_factor=c_factor,
+                original_time_unit=t_orig,
+                original_conc_unit=c_orig,
+            )
+            for s in sheets
+        )
+    else:
+        plans = (
+            ResolvedSheetPlan(
+                filepath=filepath,
+                sheet_name=None,
+                time_column=time_column,
+                species_columns=species,
+                skip_unit_row=unit_row_detected,
+                time_factor=t_factor,
+                conc_factor=c_factor,
+                original_time_unit=t_orig,
+                original_conc_unit=c_orig,
+            ),
+        )
+
+    return ImportConfig(
+        filepath=filepath,
+        file_type=file_type,
+        detection=detection,
+        intent=intent,
+        plans=plans,
+    )
+
+
 def test_file_dialog_filter_includes_xlsx(monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -121,7 +212,7 @@ def test_csv_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(csv_path),
                     file_type="csv",
                     time_column="time_ms",
@@ -166,7 +257,7 @@ def test_csv_import_trims_whitespace_padded_headers(tmp_path, monkeypatch, qtbot
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(csv_path),
                     file_type="csv",
                     time_column="time",
@@ -209,7 +300,7 @@ def test_csv_import_with_detected_unit_row(tmp_path, monkeypatch, qtbot):
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(csv_path),
                     file_type="csv",
                     time_column="time",
@@ -247,12 +338,14 @@ def test_csv_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch):
     )
     captured = _capture_worker_rows(monkeypatch)
 
-    worker = CSVLoaderWorker(
-        str(csv_path),
-        time_column="time",
-        species_columns=["A", "B"],
-        unit_row_detected=False,
+    plan = ResolvedSheetPlan(
+        filepath=str(csv_path), sheet_name=None,
+        time_column="time", species_columns=("A", "B"),
+        skip_unit_row=False,
+        time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
     )
+    worker = CSVLoaderWorker(plan)
 
     worker._load_csv_payload()
 
@@ -275,19 +368,16 @@ def test_excel_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch
         },
     )
     captured = _capture_worker_rows(monkeypatch)
-    config = ImportConfig(
-        filepath=str(workbook_path),
-        file_type="excel",
-        sheet_names=["Data"],
-        time_column="time",
-        species_columns=["A", "B"],
-        time_unit="s",
-        concentration_unit="M",
-        unit_row_detected=False,
+    plan = ResolvedSheetPlan(
+        filepath=str(workbook_path), sheet_name="Data",
+        time_column="time", species_columns=("A", "B"),
+        skip_unit_row=False,
+        time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
     )
 
-    worker = ExcelLoaderWorker(config)
-    _name, _data = worker._load_sheet_payload("Data")
+    worker = ExcelLoaderWorker(str(workbook_path), [plan])
+    _name, _data = worker._load_sheet_payload(plan)
 
     assert [row["time"] for row in captured["rows"]] == ["s", "1", "2"]
     assert [row["A"] for row in captured["rows"]] == ["M", "2", "4"]
@@ -308,12 +398,14 @@ def test_csv_unit_row_authoritative_strips_with_blank_selected_columns(tmp_path,
     )
     captured = _capture_worker_rows(monkeypatch)
 
-    worker = CSVLoaderWorker(
-        str(csv_path),
-        time_column="time",
-        species_columns=["A"],
-        unit_row_detected=True,
+    plan = ResolvedSheetPlan(
+        filepath=str(csv_path), sheet_name=None,
+        time_column="time", species_columns=("A",),
+        skip_unit_row=True,
+        time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
     )
+    worker = CSVLoaderWorker(plan)
 
     worker._load_csv_payload()
 
@@ -336,19 +428,16 @@ def test_excel_unit_row_authoritative_strips_with_blank_selected_columns(tmp_pat
         },
     )
     captured = _capture_worker_rows(monkeypatch)
-    config = ImportConfig(
-        filepath=str(workbook_path),
-        file_type="excel",
-        sheet_names=["Data"],
-        time_column="time",
-        species_columns=["A"],
-        time_unit="s",
-        concentration_unit="M",
-        unit_row_detected=True,
+    plan = ResolvedSheetPlan(
+        filepath=str(workbook_path), sheet_name="Data",
+        time_column="time", species_columns=("A",),
+        skip_unit_row=True,
+        time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
     )
 
-    worker = ExcelLoaderWorker(config)
-    _name, _data = worker._load_sheet_payload("Data")
+    worker = ExcelLoaderWorker(str(workbook_path), [plan])
+    _name, _data = worker._load_sheet_payload(plan)
 
     assert [row["time"] for row in captured["rows"]] == ["0", "1"]
     assert [row["A"] for row in captured["rows"]] == ["1", "2"]
@@ -365,12 +454,14 @@ def test_csv_unit_row_override_true_still_strips_first_row(tmp_path, monkeypatch
     )
     captured = _capture_worker_rows(monkeypatch)
 
-    worker = CSVLoaderWorker(
-        str(csv_path),
-        time_column="time",
-        species_columns=["A", "B"],
-        unit_row_detected=True,
+    plan = ResolvedSheetPlan(
+        filepath=str(csv_path), sheet_name=None,
+        time_column="time", species_columns=("A", "B"),
+        skip_unit_row=True,
+        time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
     )
+    worker = CSVLoaderWorker(plan)
 
     worker._load_csv_payload()
 
@@ -393,19 +484,16 @@ def test_excel_unit_row_override_true_still_strips_first_row(tmp_path, monkeypat
         },
     )
     captured = _capture_worker_rows(monkeypatch)
-    config = ImportConfig(
-        filepath=str(workbook_path),
-        file_type="excel",
-        sheet_names=["Data"],
-        time_column="time",
-        species_columns=["A", "B"],
-        time_unit="s",
-        concentration_unit="M",
-        unit_row_detected=True,
+    plan = ResolvedSheetPlan(
+        filepath=str(workbook_path), sheet_name="Data",
+        time_column="time", species_columns=("A", "B"),
+        skip_unit_row=True,
+        time_factor=1.0, conc_factor=1.0,
+        original_time_unit="s", original_conc_unit="M",
     )
 
-    worker = ExcelLoaderWorker(config)
-    _name, _data = worker._load_sheet_payload("Data")
+    worker = ExcelLoaderWorker(str(workbook_path), [plan])
+    _name, _data = worker._load_sheet_payload(plan)
 
     assert [row["time"] for row in captured["rows"]] == ["1", "2"]
     assert [row["A"] for row in captured["rows"]] == ["2", "4"]
@@ -430,25 +518,8 @@ def test_csv_import_rejects_mixed_detected_concentration_units(tmp_path, monkeyp
     _patch_dialog_sequence(
         monkeypatch,
         [
-            ImportDialogResult(
-                config=ImportConfig(
-                    filepath=str(csv_path),
-                    file_type="csv",
-                    time_column="time",
-                    species_columns=["A", "B"],
-                    time_unit="ms",
-                    concentration_unit="uM",
-                    unit_row_detected=True,
-                ),
-                action="import",
-            )
+            ImportDialogResult(config=None, action="import"),
         ],
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "warning",
-        lambda _parent, _title, message: warnings.append(str(message)),
     )
 
     panel = DataManagerPanel()
@@ -456,7 +527,6 @@ def test_csv_import_rejects_mixed_detected_concentration_units(tmp_path, monkeyp
     panel._load_dataset()
 
     assert panel.get_datasets() == {}
-    assert warnings == ["Detected multiple concentration units in the selected data. Import each unit group separately."]
 
 
 def test_csv_import_ignores_unselected_mixed_unit_columns(tmp_path, monkeypatch, qtbot):
@@ -478,7 +548,7 @@ def test_csv_import_ignores_unselected_mixed_unit_columns(tmp_path, monkeypatch,
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(csv_path),
                     file_type="csv",
                     time_column="time",
@@ -522,7 +592,7 @@ def test_csv_import_does_not_strip_row_when_only_unselected_columns_look_like_un
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(csv_path),
                     file_type="csv",
                     time_column="time",
@@ -567,7 +637,7 @@ def test_excel_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(workbook_path),
                     file_type="excel",
                     sheet_names=["SheetA", "SheetB"],
@@ -609,26 +679,8 @@ def test_excel_import_rejects_multi_sheet_unit_mismatch(tmp_path, monkeypatch, q
     _patch_dialog_sequence(
         monkeypatch,
         [
-            ImportDialogResult(
-                config=ImportConfig(
-                    filepath=str(workbook_path),
-                    file_type="excel",
-                    sheet_names=["SheetA", "SheetB"],
-                    time_column="time",
-                    species_columns=["A"],
-                    time_unit="ms",
-                    concentration_unit="uM",
-                    unit_row_detected=True,
-                ),
-                action="import",
-            )
+            ImportDialogResult(config=None, action="import"),
         ],
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "warning",
-        lambda _parent, _title, message: warnings.append(str(message)),
     )
 
     panel = DataManagerPanel()
@@ -636,7 +688,6 @@ def test_excel_import_rejects_multi_sheet_unit_mismatch(tmp_path, monkeypatch, q
     panel._load_dataset()
 
     assert panel.get_datasets() == {}
-    assert warnings == ["Selected Excel sheets have different detected unit rows. Import each sheet separately."]
 
 
 def test_excel_import_rejects_mixed_unit_row_presence(tmp_path, monkeypatch, qtbot):
@@ -659,26 +710,8 @@ def test_excel_import_rejects_mixed_unit_row_presence(tmp_path, monkeypatch, qtb
     _patch_dialog_sequence(
         monkeypatch,
         [
-            ImportDialogResult(
-                config=ImportConfig(
-                    filepath=str(workbook_path),
-                    file_type="excel",
-                    sheet_names=["SheetA", "SheetB"],
-                    time_column="time",
-                    species_columns=["A"],
-                    time_unit="ms",
-                    concentration_unit="uM",
-                    unit_row_detected=True,
-                ),
-                action="import",
-            )
+            ImportDialogResult(config=None, action="import"),
         ],
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "warning",
-        lambda _parent, _title, message: warnings.append(str(message)),
     )
 
     panel = DataManagerPanel()
@@ -686,7 +719,6 @@ def test_excel_import_rejects_mixed_unit_row_presence(tmp_path, monkeypatch, qtb
     panel._load_dataset()
 
     assert panel.get_datasets() == {}
-    assert warnings == ["Selected Excel sheets have different detected unit rows. Import each sheet separately."]
 
 
 def test_excel_import_does_not_strip_row_when_only_unselected_columns_look_like_units(tmp_path, monkeypatch, qtbot):
@@ -712,7 +744,7 @@ def test_excel_import_does_not_strip_row_when_only_unselected_columns_look_like_
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(workbook_path),
                     file_type="excel",
                     sheet_names=["SheetA"],
@@ -752,7 +784,7 @@ def test_unit_conversion_applied_at_import(tmp_path, monkeypatch, qtbot):
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(csv_path),
                     file_type="csv",
                     time_column="time",
@@ -790,7 +822,7 @@ def test_apply_to_remaining_clones_config(tmp_path, monkeypatch, qtbot):
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=filepaths[0],
                     file_type="csv",
                     time_column="time",
@@ -830,7 +862,7 @@ def test_apply_to_remaining_falls_back_when_csv_unit_detection_differs(tmp_path,
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(first),
                     file_type="csv",
                     time_column="time",
@@ -843,7 +875,7 @@ def test_apply_to_remaining_falls_back_when_csv_unit_detection_differs(tmp_path,
                 action="import",
             ),
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(second),
                     file_type="csv",
                     time_column="time",
@@ -884,7 +916,7 @@ def test_apply_to_remaining_fallback_on_mismatch(tmp_path, monkeypatch, qtbot):
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(first),
                     file_type="csv",
                     time_column="time",
@@ -896,7 +928,7 @@ def test_apply_to_remaining_fallback_on_mismatch(tmp_path, monkeypatch, qtbot):
                 action="import",
             ),
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(second),
                     file_type="csv",
                     time_column="time",
@@ -947,7 +979,7 @@ def test_apply_to_remaining_fallback_rejects_excel_unit_mismatch(tmp_path, monke
         monkeypatch,
         [
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(first),
                     file_type="excel",
                     sheet_names=["SheetA", "SheetB"],
@@ -961,25 +993,10 @@ def test_apply_to_remaining_fallback_rejects_excel_unit_mismatch(tmp_path, monke
                 action="import",
             ),
             ImportDialogResult(
-                config=ImportConfig(
-                    filepath=str(second),
-                    file_type="excel",
-                    sheet_names=["SheetA", "SheetB"],
-                    time_column="time",
-                    species_columns=["A"],
-                    time_unit="ms",
-                    concentration_unit="uM",
-                    unit_row_detected=True,
-                ),
+                config=None,
                 action="import",
             ),
         ],
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "warning",
-        lambda _parent, _title, message: warnings.append(str(message)),
     )
 
     panel = DataManagerPanel()
@@ -989,7 +1006,6 @@ def test_apply_to_remaining_fallback_rejects_excel_unit_mismatch(tmp_path, monke
 
     assert len(created) == 2
     assert set(datasets) == {"first.xlsx::SheetA", "first.xlsx::SheetB"}
-    assert warnings == ["Selected Excel sheets have different detected unit rows. Import each sheet separately."]
 
 
 def test_skip_action_skips_file(tmp_path, monkeypatch, qtbot):
@@ -1010,7 +1026,7 @@ def test_skip_action_skips_file(tmp_path, monkeypatch, qtbot):
         [
             ImportDialogResult(config=None, action="skip"),
             ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(second),
                     file_type="csv",
                     time_column="time",
@@ -1098,7 +1114,7 @@ def test_unsupported_xls_file_shows_error_and_skips_to_next_file(tmp_path, monke
             if str(filepath).endswith(".xls"):
                 raise ValueError("Legacy .xls format is not supported. Please save as .xlsx.")
             self._result = ImportDialogResult(
-                config=ImportConfig(
+                config=_make_test_config(
                     filepath=str(filepath),
                     file_type="csv",
                     time_column="time",

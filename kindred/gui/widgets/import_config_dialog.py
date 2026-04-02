@@ -11,7 +11,7 @@ from __future__ import annotations
 import csv
 import os
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -23,25 +23,19 @@ from kindred.core.datasets.units import (
     looks_like_unit_row,
     parse_unit,
 )
+from kindred.gui.widgets.import_config import (
+    ImportConfig,
+    UnitDetection,
+    UserImportIntent,
+    detect_units_from_row_mapping,
+    resolve_import_plans,
+)
 
 __all__ = ["ImportConfig", "ImportConfigDialog", "ImportDialogResult"]
 
 _TIME_CANDIDATES = ["time", "time_s", "t", "Time", "T", "x"]
 _MAX_PREVIEW_ROWS = 20
 _UNIT_ROW_BG = QtGui.QColor(80, 65, 20)  # dark muted amber for dark-theme readability
-
-
-@dataclass
-class ImportConfig:
-    filepath: str
-    file_type: str
-    sheet_names: List[str] = field(default_factory=list)
-    time_column: str = ""
-    species_columns: List[str] = field(default_factory=list)
-    time_unit: Optional[str] = None
-    concentration_unit: Optional[str] = None
-    unit_row_detected: bool = False
-    apply_to_remaining: bool = False
 
 
 @dataclass
@@ -295,27 +289,32 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._detected_conc_units = []
         if not self._preview_rows:
             return
-        first_row = self._preview_rows[0]
-        if looks_like_unit_row(first_row):
-            self._unit_row_detected = True
-            conc_units: List[str] = []
-            for i, val in enumerate(first_row):
-                val = val.strip()
-                if not val:
-                    continue
-                try:
-                    category, _factor = parse_unit(val)
-                except ValueError:
-                    continue
-                if category == "time" and self._detected_time_unit is None:
-                    self._detected_time_unit = val
-                elif category == "concentration" and self._detected_conc_unit is None:
-                    self._detected_conc_unit = val
-                if category == "concentration":
-                    normalized = self._normalize_unit_for_combo(val)
-                    if normalized and normalized not in conc_units:
-                        conc_units.append(normalized)
-            self._detected_conc_units = conc_units
+        row_mapping = dict(zip(self._columns, self._preview_rows[0]))
+        det = detect_units_from_row_mapping(row_mapping)
+        self._unit_row_detected = det.has_unit_row
+        self._detected_time_unit = det.detected_time_unit
+        self._detected_conc_unit = det.detected_conc_unit
+        self._detected_conc_units = [
+            self._normalize_unit_for_combo(u) for u in det.detected_conc_units
+        ]
+
+    def _detect_units_for_sheet(
+        self,
+        sheet_name: str,
+        relevant_columns: list[str],
+    ) -> tuple[UnitDetection, list[str]]:
+        """Return (UnitDetection, column_names) for a specific sheet."""
+        if sheet_name == self._previewed_sheet_name:
+            row_mapping = dict(zip(self._columns, self._preview_rows[0])) if self._preview_rows else {}
+            det = detect_units_from_row_mapping(row_mapping, relevant_columns)
+            return det, list(self._columns)
+        with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as rows:
+            first_row = next(iter(rows), None)
+        if first_row is None:
+            return UnitDetection.empty(), []
+        columns = list(first_row.keys())
+        det = detect_units_from_row_mapping(dict(first_row), relevant_columns)
+        return det, columns
 
     def _populate_preview_table(self) -> None:
         self._preview_table.clear()
@@ -445,28 +444,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._load_excel_sheet_preview(sheet_name)
 
     def _on_import(self) -> None:
-        if self._file_type == "excel" and not self._checked_excel_sheets_are_compatible():
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Import Configuration",
-                "Selected sheets have different column structures. Import each sheet individually.",
-            )
+        result = self._build_result("import")
+        if result.config is None:
             return
-        if self._file_type == "excel":
-            missing = self._selected_columns_missing_from_checked_sheets()
-            if missing:
-                lines = [
-                    f"  {sheet}: missing {', '.join(cols)}"
-                    for sheet, cols in missing
-                ]
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Import Configuration",
-                    "Selected columns not found in all checked sheets:\n\n"
-                    + "\n".join(lines),
-                )
-                return
-        self._result = self._build_result("import")
+        self._result = result
         self.accept()
 
     def _on_skip(self) -> None:
@@ -510,41 +491,86 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if action in ("skip", "cancel"):
             return ImportDialogResult(config=None, action=action)
 
-        override_no_units = self._no_unit_row_cb.isChecked() and self._no_unit_row_cb.isEnabled()
+        override_no_units = (
+            self._no_unit_row_cb.isChecked() and self._no_unit_row_cb.isEnabled()
+        )
 
-        if override_no_units:
-            time_unit: Optional[str] = "s"
-            conc_unit: Optional[str] = "M"
-            unit_detected = False
-        elif self._unit_row_detected:
-            time_unit = self._time_unit_combo.currentText() or None
-            conc_unit = self._conc_unit_combo.currentText() or None
-            unit_detected = True
-        else:
-            time_unit = self._time_unit_combo.currentText() or None
-            conc_unit = self._conc_unit_combo.currentText() or None
-            unit_detected = False
-
+        time_col = self._time_combo.currentText()
         species = [
             cb.property("column_name")
             for cb in self._species_checkboxes
             if cb.isChecked()
         ]
-
-        sheet_names: List[str] = []
+        sheet_names: list[str] = []
         if self._file_type == "excel":
             sheet_names = self._get_checked_sheet_names()
+
+        # Full-row detection for ImportConfig.detection (informational)
+        if self._preview_rows:
+            full_row_mapping = dict(zip(self._columns, self._preview_rows[0]))
+            full_detection = detect_units_from_row_mapping(full_row_mapping)
+        else:
+            full_detection = UnitDetection.empty()
+
+        if override_no_units:
+            chosen_time = "s"
+            chosen_conc = "M"
+        elif self._unit_row_detected:
+            chosen_time = self._time_unit_combo.currentText() or "s"
+            chosen_conc = self._conc_unit_combo.currentText() or "M"
+        else:
+            chosen_time = self._time_unit_combo.currentText() or "s"
+            chosen_conc = self._conc_unit_combo.currentText() or "M"
+
+        intent = UserImportIntent(
+            time_column=time_col,
+            species_columns=tuple(species),
+            time_unit=chosen_time,
+            concentration_unit=chosen_conc,
+            override_no_unit_row=override_no_units,
+            sheet_names=tuple(sheet_names),
+            apply_to_remaining=self._apply_remaining_cb.isChecked(),
+        )
+
+        # Build per-sheet detections scoped to relevant columns
+        relevant_cols = [time_col] + species
+        per_sheet_detections: dict[str | None, UnitDetection] = {}
+        per_sheet_columns: dict[str | None, list[str]] = {}
+
+        if self._file_type == "excel":
+            for sn in sheet_names:
+                det, cols = self._detect_units_for_sheet(sn, relevant_cols)
+                per_sheet_detections[sn] = det
+                per_sheet_columns[sn] = cols
+        else:
+            if self._preview_rows:
+                row_mapping = dict(zip(self._columns, self._preview_rows[0]))
+                det = detect_units_from_row_mapping(row_mapping, relevant_cols)
+            else:
+                det = UnitDetection.empty()
+            per_sheet_detections[None] = det
+            per_sheet_columns[None] = list(self._columns)
+
+        try:
+            plans = resolve_import_plans(
+                self._filepath,
+                self._file_type,
+                intent,
+                per_sheet_detections,
+                per_sheet_columns,
+            )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Import Configuration", str(exc),
+            )
+            return ImportDialogResult(config=None, action=action)
 
         config = ImportConfig(
             filepath=self._filepath,
             file_type=self._file_type,
-            sheet_names=sheet_names,
-            time_column=self._time_combo.currentText(),
-            species_columns=species,
-            time_unit=time_unit,
-            concentration_unit=conc_unit,
-            unit_row_detected=unit_detected,
-            apply_to_remaining=self._apply_remaining_cb.isChecked(),
+            detection=full_detection,
+            intent=intent,
+            plans=tuple(plans),
         )
         return ImportDialogResult(config=config, action=action)
 
@@ -571,50 +597,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _clear_preview_error(self) -> None:
         self._preview_error_label.clear()
         self._preview_error_label.hide()
-
-    def _sheet_columns(self, sheet_name: str) -> List[str]:
-        if sheet_name == self._previewed_sheet_name:
-            return list(self._columns)
-        with closing(read_excel_sheet_rows(self._filepath, sheet_name)) as rows:
-            first_row = next(iter(rows), None)
-        if first_row is None:
-            return []
-        return list(first_row.keys())
-
-    def _checked_excel_sheets_are_compatible(self) -> bool:
-        checked_sheet_names = self._get_checked_sheet_names()
-        if len(checked_sheet_names) <= 1:
-            return True
-        reference_columns = set(self._sheet_columns(checked_sheet_names[0]))
-        for sheet_name in checked_sheet_names[1:]:
-            if set(self._sheet_columns(sheet_name)) != reference_columns:
-                return False
-        return True
-
-    def _selected_columns_missing_from_checked_sheets(self) -> List[tuple]:
-        """Return [(sheet, [missing_cols])] for checked sheets missing selected columns."""
-        checked = self._get_checked_sheet_names()
-        if not checked:
-            return []
-        time_col = self._time_combo.currentText()
-        species = [
-            cb.property("column_name")
-            for cb in self._species_checkboxes
-            if cb.isChecked()
-        ]
-        required: set = set()
-        if time_col:
-            required.add(time_col)
-        required.update(species)
-        if not required:
-            return []
-        result: List[tuple] = []
-        for name in checked:
-            cols = set(self._sheet_columns(name))
-            missing = sorted(required - cols)
-            if missing:
-                result.append((name, missing))
-        return result
 
     def get_result(self) -> ImportDialogResult:
         """Return the dialog result after exec()."""

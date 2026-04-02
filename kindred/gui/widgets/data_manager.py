@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import csv
 from contextlib import closing, suppress
-from dataclasses import replace
 import itertools
 import logging
 import os
@@ -22,8 +21,15 @@ from kindred.core.datasets.excel_import import (
     list_sheets,
     read_excel_sheet_rows,
 )
-from kindred.core.datasets.units import looks_like_unit_row, parse_concentration_unit, parse_time_unit, parse_unit
-from kindred.gui.widgets.import_config_dialog import ImportConfig, ImportConfigDialog, ImportDialogResult
+from kindred.gui.widgets.import_config import (
+    ImportConfig,
+    ResolvedSheetPlan,
+    UnitDetection,
+    UserImportIntent,
+    detect_units_from_row_mapping,
+    resolve_import_plans,
+)
+from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 
 logger = logging.getLogger(__name__)
 
@@ -38,26 +44,12 @@ class CSVLoaderWorker(QtCore.QThread):
     progress = QtCore.Signal(int)  # progress percentage
     done = QtCore.Signal()
 
-    def __init__(
-        self,
-        filepath: str,
-        time_column: Optional[str] = None,
-        species_columns: Optional[Sequence[str]] = None,
-        unit_row_detected: bool = False,
-    ):
-        """
-        Initialize CSV loader worker.
-
-        Parameters
-        ----------
-        filepath : str
-            Path to CSV file to load
-        """
+    def __init__(self, plan: ResolvedSheetPlan):
         super().__init__()
-        self.filepath = filepath
-        self._time_column = (time_column or "").strip() or None
-        self._species_columns = [col.strip() for col in (species_columns or []) if col and col.strip()]
-        self._unit_row_detected = bool(unit_row_detected)
+        self.filepath = plan.filepath
+        self._time_column = plan.time_column or None
+        self._species_columns = list(plan.species_columns)
+        self._skip_unit_row = plan.skip_unit_row
 
     def _load_csv_payload(self) -> dict:
         with open(self.filepath, "r", encoding="utf-8-sig", newline="") as handle:
@@ -70,7 +62,7 @@ class CSVLoaderWorker(QtCore.QThread):
             first_row = next(row_iter, None)
             if first_row is None:
                 raise ValueError("CSV file is empty")
-            if self._unit_row_detected:
+            if self._skip_unit_row:
                 rows = row_iter
             else:
                 rows = itertools.chain((first_row,), row_iter)
@@ -160,69 +152,63 @@ class ExcelLoaderWorker(QtCore.QThread):
     progress = QtCore.Signal(int)  # progress percentage
     done = QtCore.Signal()
 
-    def __init__(self, config: ImportConfig):
+    def __init__(self, filepath: str, plans: Sequence[ResolvedSheetPlan]):
         super().__init__()
-        self.filepath = str(config.filepath)
-        self._config = config
+        self.filepath = str(filepath)
+        self._plans = list(plans)
 
-    def _load_sheet_payload(self, sheet_name: str) -> Tuple[str, dict]:
-        with closing(read_excel_sheet_rows(self.filepath, sheet_name)) as rows:
+    def _load_sheet_payload(self, plan: ResolvedSheetPlan) -> Tuple[str, dict]:
+        with closing(read_excel_sheet_rows(self.filepath, plan.sheet_name)) as rows:
             row_iter = iter(rows)
             first_row = next(row_iter, None)
             if first_row is None:
-                raise ValueError(f"Sheet '{sheet_name}' is empty.")
+                raise ValueError(f"Sheet '{plan.sheet_name}' is empty.")
             first_row_mapping = dict(first_row)
-            if self._config.unit_row_detected:
+            if plan.skip_unit_row:
                 rows_to_parse = row_iter
             else:
                 rows_to_parse = itertools.chain((first_row_mapping,), row_iter)
             _time_source, data = parse_csv_rows(
                 rows_to_parse,
-                time_column=self._config.time_column,
-                species_columns=self._config.species_columns,
+                time_column=plan.time_column,
+                species_columns=list(plan.species_columns),
                 interruption_checker=self.isInterruptionRequested,
             )
-        return f"{os.path.basename(self.filepath)}::{sheet_name}", data
+        return f"{os.path.basename(self.filepath)}::{plan.sheet_name}", data
 
     def run(self):
-        """Load selected Excel sheet(s) in a background thread."""
         dataset_name = os.path.basename(self.filepath)
-        sheet_names = list(self._config.sheet_names or [])
-        total_sheets = len(sheet_names)
+        total = len(self._plans)
 
-        if total_sheets <= 0:
+        if total <= 0:
             self.error.emit("No Excel sheets were selected for import.")
             self.done.emit()
             return
 
         try:
             self.progress.emit(0)
-            for index, sheet_name in enumerate(sheet_names, start=1):
+            for index, plan in enumerate(self._plans, start=1):
                 if self.isInterruptionRequested():
-                    logger.info("Excel import interrupted before sheet %s: %s", sheet_name, dataset_name)
+                    logger.info("Excel import interrupted before sheet %s: %s", plan.sheet_name, dataset_name)
                     self.cancelled.emit(dataset_name)
                     return
                 try:
-                    loaded_name, data = self._load_sheet_payload(sheet_name)
+                    loaded_name, data = self._load_sheet_payload(plan)
                 except CsvImportInterrupted:
-                    logger.info("Excel import interrupted while parsing sheet %s: %s", sheet_name, dataset_name)
+                    logger.info("Excel import interrupted while parsing sheet %s: %s", plan.sheet_name, dataset_name)
                     self.cancelled.emit(dataset_name)
                     return
                 except Exception as exc:
                     logger.error(
                         "Excel import failed: %s sheet %s - %s: %s",
-                        dataset_name,
-                        sheet_name,
-                        type(exc).__name__,
-                        exc,
-                        exc_info=True,
+                        dataset_name, plan.sheet_name, type(exc).__name__, exc, exc_info=True,
                     )
-                    self.error.emit(f"Sheet '{sheet_name}': {type(exc).__name__}: {exc}")
+                    self.error.emit(f"Sheet '{plan.sheet_name}': {type(exc).__name__}: {exc}")
                 else:
                     self.finished.emit(loaded_name, data)
-                self.progress.emit(int((index / total_sheets) * 100))
+                self.progress.emit(int((index / total) * 100))
                 if self.isInterruptionRequested():
-                    logger.info("Excel import interrupted after sheet %s: %s", sheet_name, dataset_name)
+                    logger.info("Excel import interrupted after sheet %s: %s", plan.sheet_name, dataset_name)
                     self.cancelled.emit(dataset_name)
                     return
         except Exception as exc:
@@ -366,11 +352,8 @@ class DataManagerPanel(QtWidgets.QWidget):
             if result.config is None:
                 index += 1
                 continue
-            if not self._config_has_compatible_unit_detection(result.config):
-                index += 1
-                continue
             configs.append(result.config)
-            if result.config.apply_to_remaining:
+            if result.config.intent.apply_to_remaining:
                 remaining_files = filenames[index + 1 :]
                 for remaining_index, remaining_filepath in enumerate(remaining_files):
                     cloned_config = self._clone_config_for_file(result.config, str(remaining_filepath))
@@ -385,8 +368,6 @@ class DataManagerPanel(QtWidgets.QWidget):
                     if fallback_result.action == "cancel":
                         return
                     if fallback_result.action == "import" and fallback_result.config is not None:
-                        if not self._config_has_compatible_unit_detection(fallback_result.config):
-                            continue
                         configs.append(fallback_result.config)
                 break
             index += 1
@@ -424,15 +405,10 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._pending_import_configs[config.filepath] = config
             self._pending_import_units_remaining[config.filepath] = result_units
             if config.file_type == "excel":
-                worker: QtCore.QThread = ExcelLoaderWorker(config)
+                worker: QtCore.QThread = ExcelLoaderWorker(config.filepath, list(config.plans))
                 worker.finished.connect(self._on_excel_loaded)
             else:
-                worker = CSVLoaderWorker(
-                    config.filepath,
-                    time_column=config.time_column or None,
-                    species_columns=config.species_columns or None,
-                    unit_row_detected=bool(config.unit_row_detected),
-                )
+                worker = CSVLoaderWorker(config.plans[0])
                 worker.finished.connect(self._on_csv_loaded)
             setattr(worker, "_expected_result_count", result_units)
             setattr(worker, "_accounted_result_count", 0)
@@ -454,179 +430,137 @@ class DataManagerPanel(QtWidgets.QWidget):
         return "csv"
 
     def _expected_dataset_count_for_config(self, config: ImportConfig) -> int:
-        if str(config.file_type) == "excel":
-            return len(config.sheet_names or [])
-        return 1
+        return len(config.plans)
 
     def _clone_config_for_file(self, source_config: ImportConfig, target_filepath: str) -> Optional[ImportConfig]:
         target_file_type = self._file_type_for_path(target_filepath)
-        if target_file_type != str(source_config.file_type):
+        if target_file_type != source_config.file_type:
             return None
-        required_columns = [str(source_config.time_column)] + [str(name) for name in (source_config.species_columns or [])]
+
+        intent = UserImportIntent(
+            time_column=source_config.intent.time_column,
+            species_columns=source_config.intent.species_columns,
+            time_unit=source_config.intent.time_unit,
+            concentration_unit=source_config.intent.concentration_unit,
+            override_no_unit_row=source_config.intent.override_no_unit_row,
+            sheet_names=source_config.intent.sheet_names,
+            apply_to_remaining=False,
+        )
+
+        relevant_cols: list[str] = [intent.time_column] + list(intent.species_columns)
+        per_sheet_detections: dict[str | None, UnitDetection] = {}
+        per_sheet_columns: dict[str | None, list[str]] = {}
+
         if target_file_type == "excel":
-            selected_sheets = list(source_config.sheet_names or [])
             try:
                 available_sheets = set(list_sheets(target_filepath))
             except Exception:
                 return None
-            for sheet_name in selected_sheets:
-                if sheet_name not in available_sheets:
+            for sn in intent.sheet_names:
+                if sn not in available_sheets:
                     return None
                 try:
-                    columns = self._excel_columns_for_sheet(target_filepath, sheet_name)
+                    cols = self._excel_columns_for_sheet(target_filepath, sn)
                 except Exception:
                     return None
-                if not self._columns_cover_required_fields(columns, required_columns):
+                with closing(read_excel_sheet_rows(target_filepath, sn)) as rows:
+                    first_row = next(iter(rows), None)
+                if first_row is None:
                     return None
-                if (
-                    self._detected_excel_sheet_unit_signature(source_config.filepath, sheet_name, required_columns)
-                    != self._detected_excel_sheet_unit_signature(target_filepath, sheet_name, required_columns)
-                ):
-                    return None
-            cloned_config = replace(
-                source_config,
-                filepath=target_filepath,
-                sheet_names=list(selected_sheets),
-                apply_to_remaining=False,
-            )
-            if not self._config_has_compatible_unit_detection(cloned_config, show_message=False):
-                return None
-            return cloned_config
-        try:
-            columns = self._csv_columns_for_file(target_filepath)
-        except Exception:
-            return None
-        if not self._columns_cover_required_fields(columns, required_columns):
-            return None
-        if self._detected_csv_unit_signature(source_config.filepath, required_columns) != self._detected_csv_unit_signature(
-            target_filepath,
-            required_columns,
-        ):
-            return None
-        return replace(source_config, filepath=target_filepath, apply_to_remaining=False)
-
-    def _config_has_compatible_unit_detection(
-        self,
-        config: ImportConfig,
-        *,
-        show_message: bool = True,
-    ) -> bool:
-        relevant_columns = self._unit_detection_columns(config)
-        if str(config.file_type) == "csv":
-            detected = self._detected_csv_unit_signature(config.filepath, relevant_columns)
-            if len(tuple(detected["concentration"])) > 1:
-                if show_message:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Load Error",
-                        "Detected multiple concentration units in the selected data. Import each unit group separately.",
-                    )
-                return False
-            return True
-        if str(config.file_type) != "excel":
-            return True
-        sheet_names = list(config.sheet_names or [])
-        signatures: list[dict[str, object]] = []
-        for sheet_name in sheet_names:
-            detected = self._detected_excel_sheet_unit_signature(config.filepath, sheet_name, relevant_columns)
-            signatures.append(detected)
-            if len(tuple(detected["concentration"])) > 1:
-                if show_message:
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Load Error",
-                        "Detected multiple concentration units in the selected data. Import each unit group separately.",
-                    )
-                return False
-        if len(sheet_names) <= 1:
-            return True
-        signature_set = {
-            (
-                bool(detected["has_unit_row"]),
-                detected["time"],
-                tuple(detected["concentration"]),
-            )
-            for detected in signatures
-        }
-        if len(signature_set) > 1:
-            if show_message:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Load Error",
-                    "Selected Excel sheets have different detected unit rows. Import each sheet separately.",
-                )
-            return False
-        return True
-
-    @staticmethod
-    def _unit_detection_columns(config: ImportConfig) -> List[str]:
-        columns: List[str] = []
-        if str(config.time_column or "").strip():
-            columns.append(str(config.time_column).strip())
-        columns.extend(
-            str(name).strip()
-            for name in (config.species_columns or [])
-            if str(name).strip()
-        )
-        return columns
-
-    @staticmethod
-    def _build_unit_signature(
-        row_mapping: Dict[str, object],
-        relevant_columns: Sequence[str],
-    ) -> Dict[str, object]:
-        columns = [str(column).strip() for column in relevant_columns if str(column).strip()]
-        if not columns:
-            return {"has_unit_row": False, "time": None, "concentration": tuple()}
-        normalized_values = [str(row_mapping.get(column, "")).strip() for column in columns]
-        if not looks_like_unit_row(normalized_values):
-            return {"has_unit_row": False, "time": None, "concentration": tuple()}
-        time_factor: Optional[float] = None
-        concentration_factors: set[float] = set()
-        for value in normalized_values:
-            if not value:
-                continue
+                det = detect_units_from_row_mapping(dict(first_row), relevant_cols)
+                per_sheet_detections[sn] = det
+                per_sheet_columns[sn] = cols
+        else:
             try:
-                category, factor = parse_unit(value)
-            except ValueError:
-                continue
-            if category == "time":
-                time_factor = float(factor)
-            elif category == "concentration":
-                concentration_factors.add(float(factor))
-        return {
-            "has_unit_row": True,
-            "time": time_factor,
-            "concentration": tuple(sorted(concentration_factors)),
-        }
+                cols = self._csv_columns_for_file(target_filepath)
+            except Exception:
+                return None
+            with open(target_filepath, "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.reader(handle)
+                _header = next(reader, None)
+                first_data_row = next(reader, None)
+            if _header is None or first_data_row is None:
+                return None
+            normalized_header = [str(c).strip() for c in _header]
+            row_mapping = {
+                normalized_header[i]: (first_data_row[i] if i < len(first_data_row) else "")
+                for i in range(len(normalized_header))
+            }
+            det = detect_units_from_row_mapping(row_mapping, relevant_cols)
+            per_sheet_detections[None] = det
+            per_sheet_columns[None] = cols
 
-    @classmethod
-    def _detected_csv_unit_signature(cls, filepath: str, relevant_columns: Sequence[str]) -> Dict[str, object]:
-        with open(filepath, "r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.reader(handle)
-            header = next(reader, None)
-            first_row = next(reader, None)
-        if header is None or first_row is None:
-            return {"has_unit_row": False, "time": None, "concentration": tuple()}
-        normalized_header = [str(column).strip() for column in header]
-        row_mapping = {
-            normalized_header[index]: (first_row[index] if index < len(first_row) else "")
-            for index in range(len(normalized_header))
-        }
-        return cls._build_unit_signature(row_mapping, relevant_columns)
+        # Compare source and target unit signatures — reject if they differ
+        source_per_sheet = self._detect_source_units(source_config, relevant_cols)
+        if source_per_sheet is None:
+            return None
+        for key in per_sheet_detections:
+            src_key = key if key in source_per_sheet else next(iter(source_per_sheet), None)
+            if src_key not in source_per_sheet:
+                return None
+            src_det = source_per_sheet[src_key]
+            tgt_det = per_sheet_detections[key]
+            if src_det.has_unit_row != tgt_det.has_unit_row:
+                return None
+            if src_det.has_unit_row and tgt_det.has_unit_row:
+                if src_det.detected_conc_units != tgt_det.detected_conc_units:
+                    return None
+                if src_det.detected_time_unit != tgt_det.detected_time_unit:
+                    return None
 
-    @classmethod
-    def _detected_excel_sheet_unit_signature(
-        cls,
-        filepath: str,
-        sheet_name: str,
-        relevant_columns: Sequence[str],
-    ) -> Dict[str, object]:
-        with closing(read_excel_sheet_rows(filepath, sheet_name)) as rows:
-            first_row = next(iter(rows), None)
-        if first_row is None:
-            return {"has_unit_row": False, "time": None, "concentration": tuple()}
-        return cls._build_unit_signature(dict(first_row), relevant_columns)
+        try:
+            plans = resolve_import_plans(
+                target_filepath, target_file_type, intent,
+                per_sheet_detections, per_sheet_columns,
+            )
+        except ValueError:
+            return None
+
+        first_key = list(per_sheet_detections.keys())[0]
+        target_detection = per_sheet_detections[first_key]
+
+        return ImportConfig(
+            filepath=target_filepath,
+            file_type=target_file_type,
+            detection=target_detection,
+            intent=intent,
+            plans=tuple(plans),
+        )
+
+    def _detect_source_units(
+        self,
+        source_config: ImportConfig,
+        relevant_cols: list[str],
+    ) -> Optional[Dict[Optional[str], UnitDetection]]:
+        """Re-detect units on the source file, scoped to relevant columns."""
+        result: Dict[Optional[str], UnitDetection] = {}
+        if source_config.file_type == "excel":
+            for sn in source_config.intent.sheet_names:
+                try:
+                    with closing(read_excel_sheet_rows(source_config.filepath, sn)) as rows:
+                        first_row = next(iter(rows), None)
+                except Exception:
+                    return None
+                if first_row is None:
+                    return None
+                result[sn] = detect_units_from_row_mapping(dict(first_row), relevant_cols)
+        else:
+            try:
+                with open(source_config.filepath, "r", encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.reader(handle)
+                    header = next(reader, None)
+                    first_data_row = next(reader, None)
+            except Exception:
+                return None
+            if header is None or first_data_row is None:
+                return None
+            normalized = [str(c).strip() for c in header]
+            row_mapping = {
+                normalized[i]: (first_data_row[i] if i < len(first_data_row) else "")
+                for i in range(len(normalized))
+            }
+            result[None] = detect_units_from_row_mapping(row_mapping, relevant_cols)
+        return result
 
     def _collect_import_config(self, filepath: str, remaining_count: int) -> ImportDialogResult:
         try:
@@ -640,12 +574,6 @@ class DataManagerPanel(QtWidgets.QWidget):
             return ImportDialogResult(config=None, action="skip")
         dialog.exec()
         return dialog.get_result()
-
-    @staticmethod
-    def _columns_cover_required_fields(columns: Sequence[str], required_columns: Sequence[str]) -> bool:
-        available = {str(column).strip() for column in columns if str(column).strip()}
-        required = {str(column).strip() for column in required_columns if str(column).strip()}
-        return bool(required) and required.issubset(available)
 
     @staticmethod
     def _csv_columns_for_file(filepath: str) -> List[str]:
@@ -810,29 +738,30 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Marshal worker cleanup back onto the GUI thread."""
         self._cleanup_worker(self.sender())
 
-    def _apply_unit_conversion(self, data: dict, config: ImportConfig) -> None:
+    def _apply_unit_conversion(self, data: dict, plan: ResolvedSheetPlan) -> None:
         metadata = data.setdefault("metadata", {})
-        time_unit = config.time_unit or "s"
-        concentration_unit = config.concentration_unit or "M"
-        if config.time_unit is not None:
-            time_factor = parse_time_unit(config.time_unit)
-            if time_factor != 1.0:
-                data["t"] = data["t"] * time_factor
-        if config.concentration_unit is not None:
-            concentration_factor = parse_concentration_unit(config.concentration_unit)
-            if concentration_factor != 1.0:
-                for species_name in list((data.get("species") or {}).keys()):
-                    data["species"][species_name] = data["species"][species_name] * concentration_factor
-        metadata["original_time_unit"] = time_unit
-        metadata["original_concentration_unit"] = concentration_unit
+        if plan.time_factor != 1.0:
+            data["t"] = data["t"] * plan.time_factor
+        if plan.conc_factor != 1.0:
+            for species_name in list((data.get("species") or {}).keys()):
+                data["species"][species_name] = data["species"][species_name] * plan.conc_factor
+        metadata["original_time_unit"] = plan.original_time_unit
+        metadata["original_concentration_unit"] = plan.original_conc_unit
 
     def _finalize_loaded_dataset(self, worker: Optional[QtCore.QThread], name: str, data: dict) -> None:
         if worker is not None and int(getattr(worker, "_load_generation", -1)) != int(self._load_generation):
             return
         config = self._pending_import_configs.get(str(getattr(worker, "filepath", "") or ""))
+        plan: Optional[ResolvedSheetPlan] = None
+        if config is not None:
+            if "::" in name:
+                sheet_name = name.split("::", 1)[1]
+                plan = next((p for p in config.plans if p.sheet_name == sheet_name), None)
+            elif config.plans:
+                plan = config.plans[0]
         try:
-            if config is not None:
-                self._apply_unit_conversion(data, config)
+            if plan is not None:
+                self._apply_unit_conversion(data, plan)
         except Exception as exc:
             self._note_worker_units_processed(worker, 1)
             QtWidgets.QMessageBox.critical(
