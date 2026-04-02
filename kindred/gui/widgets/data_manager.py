@@ -356,13 +356,15 @@ class DataManagerPanel(QtWidgets.QWidget):
             configs.append(result.config)
             if result.config.file_intent.apply_to_remaining:
                 source_intent = result.config.per_sheet_intents[0][1]
+                source_sheet_names = result.config.file_intent.sheet_names
                 for remaining_idx in range(index + 1, len(filenames)):
                     remaining_path = str(filenames[remaining_idx])
                     try:
                         remaining_config = self._build_remaining_file_config(
                             remaining_path, source_intent,
+                            source_sheet_names=source_sheet_names,
                         )
-                    except (ValueError, OSError) as exc:
+                    except (ValueError, OSError, UnicodeDecodeError) as exc:
                         QtWidgets.QMessageBox.critical(
                             self,
                             "Import Error",
@@ -442,6 +444,8 @@ class DataManagerPanel(QtWidgets.QWidget):
         self,
         filepath: str,
         source_intent: SheetImportIntent,
+        *,
+        source_sheet_names: Tuple[str, ...] = (),
     ) -> ImportConfig:
         """Build an ImportConfig for a remaining file using the source intent.
 
@@ -455,6 +459,11 @@ class DataManagerPanel(QtWidgets.QWidget):
         per_sheet_columns: Dict[Optional[str], List[str]] = {}
         target_sheet_names: Tuple[str, ...] = ()
 
+        # Scope detection to source-selected columns only
+        selected_keys = set(source_intent.species_columns)
+        if source_intent.time_column:
+            selected_keys.add(source_intent.time_column)
+
         if file_type == "csv":
             with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.reader(f)
@@ -466,7 +475,10 @@ class DataManagerPanel(QtWidgets.QWidget):
             if first_row_raw is not None:
                 row_values = [c.strip() if c else "" for c in first_row_raw]
                 row_mapping = dict(zip(columns, row_values))
-                det = detect_units_from_row_mapping(row_mapping)
+                filtered_mapping = {
+                    k: v for k, v in row_mapping.items() if k in selected_keys
+                }
+                det = detect_units_from_row_mapping(filtered_mapping)
             else:
                 det = UnitDetection.empty()
             per_sheet_intents[None] = source_intent
@@ -476,6 +488,12 @@ class DataManagerPanel(QtWidgets.QWidget):
             sheets = list_sheets(filepath)
             if not sheets:
                 raise ValueError("Excel file has no sheets")
+            # Filter sheets by source's checked set
+            if source_sheet_names:
+                source_set = set(source_sheet_names)
+                sheets = [s for s in sheets if s in source_set]
+                if not sheets:
+                    raise ValueError("No matching sheets found")
             for sheet_name in sheets:
                 with closing(read_excel_sheet_rows(filepath, sheet_name)) as rows:
                     first_row = next(iter(rows), None)
@@ -484,8 +502,13 @@ class DataManagerPanel(QtWidgets.QWidget):
                     per_sheet_detections[sheet_name] = UnitDetection.empty()
                 else:
                     per_sheet_columns[sheet_name] = list(first_row.keys())
+                    full_mapping = dict(first_row)
+                    filtered_mapping = {
+                        k: v for k, v in full_mapping.items()
+                        if k in selected_keys
+                    }
                     per_sheet_detections[sheet_name] = detect_units_from_row_mapping(
-                        dict(first_row)
+                        filtered_mapping
                     )
                 per_sheet_intents[sheet_name] = source_intent
             target_sheet_names = tuple(sheets)

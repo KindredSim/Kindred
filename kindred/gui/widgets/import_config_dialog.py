@@ -212,6 +212,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._btn_skip.clicked.connect(self._on_skip)
         self._btn_cancel.clicked.connect(self._on_cancel)
         self._time_combo.currentTextChanged.connect(self._on_time_column_changed)
+        self._apply_remaining_cb.toggled.connect(lambda _: self._update_import_enabled())
         if self._file_type == "excel":
             self._sheet_list.itemClicked.connect(self._on_sheet_clicked)
             self._sheet_list.itemChanged.connect(lambda _: self._update_import_enabled())
@@ -649,17 +650,23 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if self._file_type == "excel":
             checked_sheet_names = self._get_checked_sheet_names()
             sheets_ok = bool(checked_sheet_names)
-            all_sheet_configs_ok = sheets_ok
-            for sheet_name in checked_sheet_names:
-                state = current_state if sheet_name == self._previewed_sheet_name else self._ensure_sheet_state(sheet_name)
-                sheet_time_ok = bool(state["time_column"]) and str(state["time_column"]) in {
-                    str(column) for column in state.get("columns", [])
-                }
-                sheet_species_ok = self._state_has_valid_species_selection(state)
-                sheet_units_ok = not self._state_has_conflicting_concentration_units(state)
-                if not (sheet_time_ok and sheet_species_ok and sheet_units_ok):
-                    all_sheet_configs_ok = False
-                    break
+            # When the unified checkbox is checked, _build_result will
+            # copy the current sheet's state to all other checked sheets at
+            # import time, so only the current sheet's validity matters.
+            if self._apply_remaining_cb.isChecked():
+                all_sheet_configs_ok = sheets_ok and time_ok and species_ok and units_ok
+            else:
+                all_sheet_configs_ok = sheets_ok
+                for sheet_name in checked_sheet_names:
+                    state = current_state if sheet_name == self._previewed_sheet_name else self._ensure_sheet_state(sheet_name)
+                    sheet_time_ok = bool(state["time_column"]) and str(state["time_column"]) in {
+                        str(column) for column in state.get("columns", [])
+                    }
+                    sheet_species_ok = self._state_has_valid_species_selection(state)
+                    sheet_units_ok = not self._state_has_conflicting_concentration_units(state)
+                    if not (sheet_time_ok and sheet_species_ok and sheet_units_ok):
+                        all_sheet_configs_ok = False
+                        break
 
         enabled = sheets_ok and all_sheet_configs_ok
         self._btn_import.setEnabled(enabled)

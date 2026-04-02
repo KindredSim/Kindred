@@ -754,6 +754,56 @@ class TestApplyToRemaining:
         )
 
 
+# ---------------------------------------------------------------------------
+# Regression: import enablement with unified checkbox
+# ---------------------------------------------------------------------------
+
+
+class TestImportEnablementWithCheckbox:
+    """Regression: when the unified checkbox is checked for Excel,
+    import enablement must validate only the currently-viewed sheet."""
+
+    def test_import_enabled_with_checkbox_ignores_invalid_other_sheets(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "multi.xlsx", {
+            "Sheet1": (["time", "A", "B"], [["0", "1.0", "2.0"], ["1", "3.0", "4.0"]]),
+            "Sheet2": (["time", "X", "Y"], [["0", "5.0", "6.0"], ["1", "7.0", "8.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        # Switch to Sheet2, uncheck all species to make it invalid
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet2":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+        for cb in dlg._species_checkboxes:
+            cb.setChecked(False)
+        dlg._save_current_sheet_state()
+
+        # Switch back to Sheet1 (valid)
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet1":
+                dlg._sheet_list.setCurrentItem(item)
+                dlg._on_sheet_clicked(item)
+                break
+
+        # Without checkbox: import should be disabled (Sheet2 is invalid)
+        dlg._apply_remaining_cb.setChecked(False)
+        dlg._update_import_enabled()
+        assert not dlg._btn_import.isEnabled(), (
+            "Import must be disabled when checkbox is unchecked and Sheet2 has no species"
+        )
+
+        # With checkbox: import should be enabled (only current sheet matters)
+        dlg._apply_remaining_cb.setChecked(True)
+        dlg._update_import_enabled()
+        assert dlg._btn_import.isEnabled(), (
+            "Import must be enabled when checkbox is checked - only current sheet validated"
+        )
+
+
 class TestErrorHandling:
     def test_legacy_xls_is_rejected(self, qapp, tmp_path):
         path = tmp_path / "legacy.xls"

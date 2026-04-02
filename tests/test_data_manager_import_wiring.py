@@ -1543,3 +1543,194 @@ def test_empty_mechanism_mapping_not_persisted_at_import(main_window, monkeypatc
     assert settings.batch_set_id is None, (
         "batch_set_id should be None when mechanism_species is empty"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: scoped remaining-file detection
+# ---------------------------------------------------------------------------
+
+
+def test_apply_to_remaining_scoped_detection_ignores_unselected_columns(tmp_path, monkeypatch, qtbot):
+    """Regression: remaining-file unit detection must scope to selected
+    columns only.  Mixed units in unselected columns must not reject the file."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    file1 = tmp_path / "source.csv"
+    file2 = tmp_path / "target.csv"
+    _write_csv(file1, ["time", "A", "B"], [["s", "uM", "uM"], [0.0, 1.0, 2.0], [1.0, 3.0, 4.0]])
+    _write_csv(file2, ["time", "A", "B"], [["s", "uM", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(file1), str(file2)], ""),
+    )
+    created = _patch_dialog_sequence(
+        monkeypatch,
+        [
+            ImportDialogResult(
+                config=_make_test_config(
+                    filepath=str(file1),
+                    file_type="csv",
+                    time_column="time",
+                    species_columns=["A"],
+                    time_unit="s",
+                    concentration_unit="uM",
+                    unit_row_detected=True,
+                    apply_to_remaining=True,
+                ),
+                action="import",
+            )
+        ],
+    )
+
+    criticals: list[tuple] = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "critical",
+        lambda *args, **kwargs: criticals.append(args),
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    finished_spy = QSignalSpy(panel.loadFinished)
+    panel._load_dataset()
+    qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
+
+    assert len(created) == 1
+    assert not criticals, "No error expected; column B mixed unit must be ignored"
+    assert len(panel.get_datasets()) == 2, (
+        "Both files must import when mixed units are only in unselected columns"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: sheet filtering for remaining Excel files
+# ---------------------------------------------------------------------------
+
+
+def test_apply_to_remaining_filters_sheets_by_source_checked_set(tmp_path, monkeypatch, qtbot):
+    """Regression: remaining Excel files must only import sheets that
+    were checked in the source file's configuration."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    source = tmp_path / "source.xlsx"
+    target = tmp_path / "target.xlsx"
+    _write_workbook(
+        source,
+        {
+            "Data": (["time", "A"], [[0.0, 1.0], [1.0, 2.0]]),
+            "Metadata": (["key", "val"], [["temp", "298"]]),
+        },
+    )
+    _write_workbook(
+        target,
+        {
+            "Data": (["time", "A"], [[0.0, 3.0], [1.0, 4.0]]),
+            "Metadata": (["key", "val"], [["temp", "310"]]),
+            "Extra": (["x", "y"], [[1, 2]]),
+        },
+    )
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(source), str(target)], ""),
+    )
+    created = _patch_dialog_sequence(
+        monkeypatch,
+        [
+            ImportDialogResult(
+                config=_make_test_config(
+                    filepath=str(source),
+                    file_type="excel",
+                    sheet_names=["Data"],
+                    time_column="time",
+                    species_columns=["A"],
+                    time_unit="s",
+                    concentration_unit="M",
+                    apply_to_remaining=True,
+                ),
+                action="import",
+            )
+        ],
+    )
+
+    criticals: list[tuple] = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "critical",
+        lambda *args, **kwargs: criticals.append(args),
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    finished_spy = QSignalSpy(panel.loadFinished)
+    panel._load_dataset()
+    qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
+
+    assert len(created) == 1
+    datasets = panel.get_datasets()
+    dataset_names = set(datasets.keys())
+    assert "target.xlsx::Data" in dataset_names, "Data sheet must be imported from target"
+    assert "target.xlsx::Metadata" not in dataset_names, "Metadata must be filtered out"
+    assert "target.xlsx::Extra" not in dataset_names, "Extra must be filtered out"
+    assert len(datasets) == 2, "source::Data + target::Data only"
+
+
+# ---------------------------------------------------------------------------
+# Regression: UnicodeDecodeError in remaining-file loop
+# ---------------------------------------------------------------------------
+
+
+def test_apply_to_remaining_handles_unicode_decode_error(tmp_path, monkeypatch, qtbot):
+    """Regression: UnicodeDecodeError in remaining files must trigger
+    an error dialog and not crash the import sequence."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    file1 = tmp_path / "good.csv"
+    file2 = tmp_path / "bad_encoding.csv"
+    _write_csv(file1, ["time", "A"], [[0.0, 1.0], [1.0, 2.0]])
+    file2.write_bytes(b"time,A\n\xff\xfe,1.0\n")
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(file1), str(file2)], ""),
+    )
+    created = _patch_dialog_sequence(
+        monkeypatch,
+        [
+            ImportDialogResult(
+                config=_make_test_config(
+                    filepath=str(file1),
+                    file_type="csv",
+                    time_column="time",
+                    species_columns=["A"],
+                    time_unit="s",
+                    concentration_unit="M",
+                    apply_to_remaining=True,
+                ),
+                action="import",
+            )
+        ],
+    )
+
+    criticals: list[tuple] = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "critical",
+        lambda *args, **kwargs: criticals.append(args),
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    finished_spy = QSignalSpy(panel.loadFinished)
+    panel._load_dataset()
+    qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
+
+    assert len(created) == 1
+    assert len(panel.get_datasets()) == 1, "Only the good file should be imported"
+    assert "good.csv" in list(panel.get_datasets().keys())[0]
+    assert criticals, "QMessageBox.critical must be shown for encoding error"
+    assert "bad_encoding.csv" in str(criticals[0])
