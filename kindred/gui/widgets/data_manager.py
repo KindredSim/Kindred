@@ -18,11 +18,17 @@ from kindred.core.datasets.csv_import import (
     parse_csv_rows,
 )
 from kindred.core.datasets.excel_import import (
+    list_sheets,
     read_excel_sheet_rows,
 )
 from kindred.gui.widgets.import_config import (
     ImportConfig,
     ResolvedSheetPlan,
+    SheetImportIntent,
+    UnitDetection,
+    UserImportIntent,
+    detect_units_from_row_mapping,
+    resolve_import_plans,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 
@@ -349,6 +355,22 @@ class DataManagerPanel(QtWidgets.QWidget):
                 continue
             configs.append(result.config)
             if result.config.file_intent.apply_to_remaining:
+                source_intent = result.config.per_sheet_intents[0][1]
+                for remaining_idx in range(index + 1, len(filenames)):
+                    remaining_path = str(filenames[remaining_idx])
+                    try:
+                        remaining_config = self._build_remaining_file_config(
+                            remaining_path, source_intent,
+                        )
+                    except (ValueError, OSError) as exc:
+                        QtWidgets.QMessageBox.critical(
+                            self,
+                            "Import Error",
+                            f"Cannot apply settings to "
+                            f"'{os.path.basename(remaining_path)}':\n\n{exc}",
+                        )
+                        continue
+                    configs.append(remaining_config)
                 break
             index += 1
 
@@ -415,6 +437,75 @@ class DataManagerPanel(QtWidgets.QWidget):
             return ImportDialogResult(config=None, action="skip")
         dialog.exec()
         return dialog.get_result()
+
+    def _build_remaining_file_config(
+        self,
+        filepath: str,
+        source_intent: SheetImportIntent,
+    ) -> ImportConfig:
+        """Build an ImportConfig for a remaining file using the source intent.
+
+        Raises ValueError if the source intent is incompatible with the file.
+        """
+        lower = filepath.lower()
+        file_type = "excel" if lower.endswith(".xlsx") else "csv"
+
+        per_sheet_intents: Dict[Optional[str], SheetImportIntent] = {}
+        per_sheet_detections: Dict[Optional[str], UnitDetection] = {}
+        per_sheet_columns: Dict[Optional[str], List[str]] = {}
+        target_sheet_names: Tuple[str, ...] = ()
+
+        if file_type == "csv":
+            with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    raise ValueError("CSV file is empty")
+                columns = [h.strip() for h in header]
+                first_row_raw = next(reader, None)
+            if first_row_raw is not None:
+                row_values = [c.strip() if c else "" for c in first_row_raw]
+                row_mapping = dict(zip(columns, row_values))
+                det = detect_units_from_row_mapping(row_mapping)
+            else:
+                det = UnitDetection.empty()
+            per_sheet_intents[None] = source_intent
+            per_sheet_detections[None] = det
+            per_sheet_columns[None] = columns
+        else:
+            sheets = list_sheets(filepath)
+            if not sheets:
+                raise ValueError("Excel file has no sheets")
+            for sheet_name in sheets:
+                with closing(read_excel_sheet_rows(filepath, sheet_name)) as rows:
+                    first_row = next(iter(rows), None)
+                if first_row is None:
+                    per_sheet_columns[sheet_name] = []
+                    per_sheet_detections[sheet_name] = UnitDetection.empty()
+                else:
+                    per_sheet_columns[sheet_name] = list(first_row.keys())
+                    per_sheet_detections[sheet_name] = detect_units_from_row_mapping(
+                        dict(first_row)
+                    )
+                per_sheet_intents[sheet_name] = source_intent
+            target_sheet_names = tuple(sheets)
+
+        plans = resolve_import_plans(
+            filepath, file_type,
+            per_sheet_intents, per_sheet_detections, per_sheet_columns,
+        )
+
+        file_intent = UserImportIntent(
+            sheet_names=target_sheet_names,
+            apply_to_remaining=False,
+        )
+        return ImportConfig(
+            filepath=filepath,
+            file_type=file_type,
+            file_intent=file_intent,
+            per_sheet_intents=tuple(per_sheet_intents.items()),
+            plans=tuple(plans),
+        )
 
     def _on_load_progress(self, percent: int):
         """Handle progress updates from dataset import worker(s)."""

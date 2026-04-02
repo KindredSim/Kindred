@@ -200,45 +200,42 @@ class TestExcelSheetHandling:
         assert dlg._conc_unit_combo.currentText() == "nM"
         assert species["B"] is False
 
-    def test_apply_to_other_sheets_copies_current_sheet_configuration(self, qapp, tmp_path):
+    def test_apply_checkbox_copies_current_sheet_configuration_at_import(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "apply_sheets.xlsx", {
             "Sheet1": (
-                ["time", "alt_time", "A", "B"],
-                [["ms", "s", "uM", "nM"], ["0", "0", "1.0", "2.0"]],
+                ["time", "A", "B"],
+                [["ms", "uM", "uM"], ["0", "1.0", "2.0"]],
             ),
             "Sheet2": (
-                ["time", "alt_time", "A", "B"],
-                [["us", "ms", "mM", "uM"], ["0", "0", "3.0", "4.0"]],
+                ["time", "A", "B"],
+                [["s", "uM", "uM"], ["0", "3.0", "4.0"]],
             ),
         })
         dlg = ImportConfigDialog(fp)
 
-        dlg._time_combo.setCurrentText("alt_time")
-        dlg._time_unit_combo.setCurrentText("s")
-        dlg._conc_unit_combo.setCurrentText("nM")
+        dlg._time_unit_combo.setCurrentText("ms")
+        dlg._conc_unit_combo.setCurrentText("uM")
         for cb in dlg._species_checkboxes:
             if cb.property("column_name") == "B":
                 cb.setChecked(False)
 
-        dlg._btn_apply_other_sheets.click()
+        dlg._apply_remaining_cb.setChecked(True)
 
-        for i in range(dlg._sheet_list.count()):
-            item = dlg._sheet_list.item(i)
-            if item.text() == "Sheet2":
-                dlg._sheet_list.setCurrentItem(item)
-                dlg._on_sheet_clicked(item)
-                break
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
 
-        species = {
-            cb.property("column_name"): cb.isChecked()
-            for cb in dlg._species_checkboxes
-        }
-        assert dlg._time_combo.currentText() == "alt_time"
-        assert dlg._time_unit_combo.currentText() == "s"
-        assert dlg._conc_unit_combo.currentText() == "nM"
-        assert species["B"] is False
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+        intents = dict(result.config.per_sheet_intents)
+        assert intents["Sheet2"].time_unit == "ms"
+        assert intents["Sheet2"].concentration_unit == "uM"
+        assert "B" not in intents["Sheet2"].species_columns
 
-    def test_apply_to_other_sheets_disables_import_when_target_sheet_columns_do_not_match(self, qapp, tmp_path):
+    def test_apply_checkbox_rejects_mismatched_columns_at_import(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "apply_sheets_mismatch.xlsx", {
             "Sheet1": (
                 ["time", "A"],
@@ -250,12 +247,19 @@ class TestExcelSheetHandling:
             ),
         })
         dlg = ImportConfigDialog(fp)
+        dlg._apply_remaining_cb.setChecked(True)
 
-        dlg._btn_apply_other_sheets.click()
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
 
-        assert not dlg._btn_import.isEnabled()
+        result = dlg._build_result("import")
+        assert criticals, "Mismatched columns must produce an error at import"
+        assert result.config is None
 
-    def test_apply_to_other_sheets_keeps_no_unit_row_unchecked_when_target_has_no_unit_row(self, qapp, tmp_path):
+    def test_apply_checkbox_keeps_no_unit_row_off_when_target_has_no_unit_row(self, qapp, tmp_path, monkeypatch):
         fp = _write_xlsx(tmp_path / "apply_sheets_no_unit_row.xlsx", {
             "Sheet1": (
                 ["time", "A"],
@@ -268,17 +272,46 @@ class TestExcelSheetHandling:
         })
         dlg = ImportConfigDialog(fp)
         dlg._no_unit_row_cb.setChecked(True)
-        dlg._btn_apply_other_sheets.click()
+        dlg._apply_remaining_cb.setChecked(True)
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+        intents = dict(result.config.per_sheet_intents)
+        assert intents["Sheet2"].override_no_unit_row is False
+
+    def test_sheet_switch_preview_highlighting_uses_target_sheet_detection(self, qapp, tmp_path):
+        """Bug 2 regression: preview row highlighting must use the target
+        sheet's detection, not the previous sheet's stale state."""
+        from kindred.gui.widgets.import_config_dialog import _UNIT_ROW_BG
+
+        fp = _write_xlsx(tmp_path / "mixed_detection.xlsx", {
+            "has_units": (["time", "A"], [["ms", "uM"], ["0", "1.0"]]),
+            "no_units": (["time", "A"], [["0", "2.0"], ["1", "3.0"]]),
+        })
+        dlg = ImportConfigDialog(fp)
+
+        assert dlg._unit_row_detected is True
 
         for i in range(dlg._sheet_list.count()):
             item = dlg._sheet_list.item(i)
-            if item.text() == "Sheet2":
+            if item.text() == "no_units":
                 dlg._sheet_list.setCurrentItem(item)
                 dlg._on_sheet_clicked(item)
                 break
 
-        assert not dlg._no_unit_row_cb.isEnabled()
-        assert not dlg._no_unit_row_cb.isChecked()
+        item = dlg._preview_table.item(0, 0)
+        assert item is not None
+        bg_color = item.background().color()
+        assert bg_color != _UNIT_ROW_BG, (
+            "Row 0 should not be highlighted as unit row for a sheet without units"
+        )
 
     def test_sheet_switch_shows_each_sheets_detected_units(self, qapp, tmp_path):
         fp = _write_xlsx(tmp_path / "sheet_units.xlsx", {
@@ -655,11 +688,30 @@ class TestApplyToRemaining:
         dlg = ImportConfigDialog(fp, remaining_count=0)
         assert dlg._apply_remaining_cb.isHidden()
 
-    def test_visible_with_count(self, qapp, tmp_path):
+    def test_visible_with_remaining(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "z2.csv", ["time", "A"], [["0", "1"]])
         dlg = ImportConfigDialog(fp, remaining_count=4)
         assert not dlg._apply_remaining_cb.isHidden()
-        assert "4" in dlg._apply_remaining_cb.text()
+        assert "remaining" in dlg._apply_remaining_cb.text()
+
+    def test_excel_visible_without_remaining(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "wb.xlsx", {
+            "S1": (["time", "A"], [["0", "1"]]),
+            "S2": (["time", "A"], [["0", "2"]]),
+        })
+        dlg = ImportConfigDialog(fp, remaining_count=0)
+        assert not dlg._apply_remaining_cb.isHidden()
+        assert "all other sheets" in dlg._apply_remaining_cb.text()
+
+    def test_excel_with_remaining_label(self, qapp, tmp_path):
+        fp = _write_xlsx(tmp_path / "wb.xlsx", {
+            "S1": (["time", "A"], [["0", "1"]]),
+            "S2": (["time", "A"], [["0", "2"]]),
+        })
+        dlg = ImportConfigDialog(fp, remaining_count=3)
+        assert not dlg._apply_remaining_cb.isHidden()
+        assert "all other sheets" in dlg._apply_remaining_cb.text()
+        assert "remaining" in dlg._apply_remaining_cb.text()
 
     def test_checkbox_state_in_config(self, qapp, tmp_path):
         fp = _write_csv(tmp_path / "z3.csv", ["time", "A"], [["0", "1"]])
@@ -670,6 +722,36 @@ class TestApplyToRemaining:
         dlg._apply_remaining_cb.setChecked(True)
         r2 = dlg._build_result("import")
         assert r2.config.file_intent.apply_to_remaining is True
+
+    def test_unified_apply_checkbox_copies_sheet_state_at_import(self, qapp, tmp_path, monkeypatch):
+        """UX merge regression: checking the apply checkbox and importing must
+        copy the current sheet's configuration to all other checked sheets."""
+        fp = _write_xlsx(tmp_path / "multi.xlsx", {
+            "Sheet1": (["time", "A", "B"], [["ms", "uM", "uM"], ["0", "1.0", "2.0"]]),
+            "Sheet2": (["time", "A", "B"], [["s", "uM", "uM"], ["0", "3.0", "4.0"]]),
+        })
+        dlg = ImportConfigDialog(fp, remaining_count=2)
+
+        for cb in dlg._species_checkboxes:
+            if cb.property("column_name") == "B":
+                cb.setChecked(False)
+
+        dlg._apply_remaining_cb.setChecked(True)
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+
+        intents = dict(result.config.per_sheet_intents)
+        assert "B" not in intents["Sheet2"].species_columns, (
+            "Sheet2's species should match Sheet1's configuration when apply checkbox is checked"
+        )
 
 
 class TestErrorHandling:

@@ -836,10 +836,10 @@ def test_apply_to_remaining_stops_after_current_file(tmp_path, monkeypatch, qtbo
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
-    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=3)
 
     assert len(created) == 1
-    assert set(datasets) == {"clone_0.csv"}
+    assert set(datasets) == {"clone_0.csv", "clone_1.csv", "clone_2.csv"}
 
 def test_apply_to_remaining_skips_later_csv_files_even_when_units_differ(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -888,10 +888,10 @@ def test_apply_to_remaining_skips_later_csv_files_even_when_units_differ(tmp_pat
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
-    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=2)
 
     assert len(created) == 1
-    assert set(datasets) == {"first.csv"}
+    assert set(datasets) == {"first.csv", "second.csv"}
 
 def test_apply_to_remaining_skips_later_csv_files_even_when_columns_differ(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -935,6 +935,13 @@ def test_apply_to_remaining_skips_later_csv_files_even_when_columns_differ(tmp_p
         ],
     )
 
+    criticals: list[tuple] = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "critical",
+        lambda *args, **kwargs: criticals.append(args),
+    )
+
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
@@ -942,6 +949,8 @@ def test_apply_to_remaining_skips_later_csv_files_even_when_columns_differ(tmp_p
 
     assert len(created) == 1
     assert set(datasets) == {"same.csv"}
+    assert criticals, "Error dialog must be shown for file with incompatible columns"
+    assert "different.csv" in str(criticals[0])
 
 def test_apply_to_remaining_skips_later_excel_files(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -995,10 +1004,13 @@ def test_apply_to_remaining_skips_later_excel_files(tmp_path, monkeypatch, qtbot
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
     panel._load_dataset()
-    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=2)
+    datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=4)
 
     assert len(created) == 1
-    assert set(datasets) == {"first.xlsx::SheetA", "first.xlsx::SheetB"}
+    assert set(datasets) == {
+        "first.xlsx::SheetA", "first.xlsx::SheetB",
+        "second.xlsx::SheetA", "second.xlsx::SheetB",
+    }
 
 
 def test_skip_action_skips_file(tmp_path, monkeypatch, qtbot):
@@ -1405,6 +1417,109 @@ def test_empty_mechanism_mapping_create_and_seed_returns_unseeded():
     assert created is True
     assert seeded is False
     batch_store.set_value.assert_not_called()
+
+
+def test_apply_to_remaining_imports_all_remaining_csv_files(tmp_path, monkeypatch, qtbot):
+    """Bug 1 regression: apply_to_remaining must import remaining files,
+    not silently drop them."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    filepaths = []
+    for idx in range(2):
+        path = tmp_path / f"data_{idx}.csv"
+        _write_csv(path, ["time", "A"], [
+            ["s", "uM"],
+            [0.0, 1.0 + idx],
+            [1.0, 2.0 + idx],
+        ])
+        filepaths.append(str(path))
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: (filepaths, ""),
+    )
+    created = _patch_dialog_sequence(
+        monkeypatch,
+        [
+            ImportDialogResult(
+                config=_make_test_config(
+                    filepath=filepaths[0],
+                    file_type="csv",
+                    time_column="time",
+                    species_columns=["A"],
+                    time_unit="s",
+                    concentration_unit="uM",
+                    unit_row_detected=True,
+                    apply_to_remaining=True,
+                ),
+                action="import",
+            )
+        ],
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    finished_spy = QSignalSpy(panel.loadFinished)
+    panel._load_dataset()
+    qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
+
+    assert len(created) == 1, "Dialog must only open for the first file"
+    assert len(panel.get_datasets()) == 2, (
+        "Both files must be imported when apply_to_remaining is True"
+    )
+
+
+def test_apply_to_remaining_error_on_incompatible_remaining_file(tmp_path, monkeypatch, qtbot):
+    """Bug 1 regression: when a remaining file has incompatible columns,
+    QMessageBox.critical must be shown and that file skipped."""
+    from kindred.gui.widgets.data_manager import DataManagerPanel
+
+    source = tmp_path / "source.csv"
+    target = tmp_path / "target.csv"
+    _write_csv(source, ["time", "A", "B"], [[0.0, 1.0, 2.0], [1.0, 3.0, 4.0]])
+    _write_csv(target, ["time", "A", "C"], [[0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(source), str(target)], ""),
+    )
+    _patch_dialog_sequence(
+        monkeypatch,
+        [
+            ImportDialogResult(
+                config=_make_test_config(
+                    filepath=str(source),
+                    file_type="csv",
+                    time_column="time",
+                    species_columns=["A", "B"],
+                    time_unit="s",
+                    concentration_unit="M",
+                    apply_to_remaining=True,
+                ),
+                action="import",
+            )
+        ],
+    )
+
+    criticals: list[tuple] = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "critical",
+        lambda *args, **kwargs: criticals.append(args),
+    )
+
+    panel = DataManagerPanel()
+    qtbot.addWidget(panel)
+    finished_spy = QSignalSpy(panel.loadFinished)
+    panel._load_dataset()
+    qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
+
+    assert len(panel.get_datasets()) == 1, "Only the source file should be imported"
+    assert "source.csv" in list(panel.get_datasets().keys())[0]
+    assert criticals, "QMessageBox.critical must be shown for incompatible file"
+    assert "target.csv" in str(criticals[0]), "Error must mention the filename"
 
 
 def test_empty_mechanism_mapping_not_persisted_at_import(main_window, monkeypatch):

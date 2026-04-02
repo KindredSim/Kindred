@@ -102,9 +102,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._sheet_list = QtWidgets.QListWidget(self)
         self._sheet_list.setMaximumHeight(90)
         sheet_lay.addWidget(self._sheet_list)
-        self._btn_apply_other_sheets = QtWidgets.QPushButton("Apply to other sheets", self)
-        self._btn_apply_other_sheets.setVisible(self._file_type == "excel")
-        sheet_lay.addWidget(self._btn_apply_other_sheets)
         layout.addWidget(self._sheet_section)
         self._sheet_section.setVisible(self._file_type == "excel")
 
@@ -180,9 +177,19 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         # --- Apply to remaining ---
         self._apply_remaining_cb = QtWidgets.QCheckBox("", self)
-        if self._remaining_count > 0:
+        if self._file_type == "excel" and self._remaining_count > 0:
             self._apply_remaining_cb.setText(
-                f"Apply these settings to remaining {self._remaining_count} files"
+                "Apply these settings to all other sheets and remaining files"
+            )
+            self._apply_remaining_cb.setVisible(True)
+        elif self._file_type == "excel":
+            self._apply_remaining_cb.setText(
+                "Apply these settings to all other sheets"
+            )
+            self._apply_remaining_cb.setVisible(True)
+        elif self._remaining_count > 0:
+            self._apply_remaining_cb.setText(
+                "Apply these settings to remaining files"
             )
             self._apply_remaining_cb.setVisible(True)
         else:
@@ -204,7 +211,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._btn_import.clicked.connect(self._on_import)
         self._btn_skip.clicked.connect(self._on_skip)
         self._btn_cancel.clicked.connect(self._on_cancel)
-        self._btn_apply_other_sheets.clicked.connect(self._on_apply_to_other_sheets)
         self._time_combo.currentTextChanged.connect(self._on_time_column_changed)
         if self._file_type == "excel":
             self._sheet_list.itemClicked.connect(self._on_sheet_clicked)
@@ -446,12 +452,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._no_unit_row_cb.blockSignals(True)
         self._columns = [str(column) for column in state.get("columns", [])]
         self._preview_rows = [list(row) for row in state.get("preview_rows", [])]
-        self._populate_preview_table()
-        self._populate_time_combo(selected_time=str(state.get("time_column", "")))
         self._unit_row_detected = bool(state.get("unit_row_detected", False))
         self._detected_time_unit = state.get("detected_time_unit")
         self._detected_conc_unit = state.get("detected_conc_unit")
         self._detected_conc_units = list(state.get("detected_conc_units", []))
+        self._populate_preview_table()
+        self._populate_time_combo(selected_time=str(state.get("time_column", "")))
         self._time_unit_combo.setCurrentText(str(state.get("time_unit", "s")))
         self._conc_unit_combo.setCurrentText(str(state.get("concentration_unit", "M")))
         no_unit_row_enabled = bool(state.get("no_unit_row_cb_enabled", False))
@@ -611,36 +617,6 @@ class ImportConfigDialog(QtWidgets.QDialog):
             state = self._ensure_sheet_state(sheet_name)
         self._restore_sheet_state(sheet_name, state)
 
-    def _on_apply_to_other_sheets(self) -> None:
-        if self._file_type != "excel" or self._previewed_sheet_name is None:
-            return
-        current_state = self._save_current_sheet_state(self._previewed_sheet_name)
-        if current_state is None:
-            return
-        for sheet_name in self._get_checked_sheet_names():
-            if sheet_name == self._previewed_sheet_name:
-                continue
-            target_state = self._sheet_states.get(sheet_name, {})
-            merged_state = self._merge_editable_sheet_state(
-                target_state if target_state.get("columns") else {
-                    "time_column": "",
-                    "species_checked": {},
-                    "time_unit": "s",
-                    "concentration_unit": "M",
-                    "override_no_unit_row": False,
-                    "no_unit_row_cb_enabled": False,
-                    "unit_row_detected": False,
-                    "detected_time_unit": None,
-                    "detected_conc_unit": None,
-                    "detected_conc_units": [],
-                    "columns": [],
-                    "preview_rows": [],
-                },
-                current_state,
-            )
-            self._sheet_states[sheet_name] = self._clone_sheet_state(merged_state)
-        self._update_import_enabled()
-
     def _on_import(self) -> None:
         result = self._build_result("import")
         if result.config is None:
@@ -711,6 +687,17 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._save_current_sheet_state()
 
         sheet_names: list[str] = self._get_checked_sheet_names() if self._file_type == "excel" else []
+
+        if self._apply_remaining_cb.isChecked() and self._file_type == "excel":
+            current_state = self._sheet_states.get(self._previewed_sheet_name)
+            if current_state is not None:
+                for sheet_name in sheet_names:
+                    if sheet_name == self._previewed_sheet_name:
+                        continue
+                    target_state = self._ensure_sheet_state(sheet_name)
+                    merged = self._merge_editable_sheet_state(target_state, current_state)
+                    self._sheet_states[sheet_name] = self._clone_sheet_state(merged)
+
         file_intent = UserImportIntent(
             sheet_names=tuple(sheet_names),
             apply_to_remaining=self._apply_remaining_cb.isChecked(),
