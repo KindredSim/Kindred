@@ -1,0 +1,24 @@
+This project's original source code is licensed under the MIT License.
+See the file LICENSE.
+
+Distributed Windows binaries of this project may include Qt for Python
+components, including PySide6 and shiboken6, provided for open-source use
+under the GNU Lesser General Public License version 3 (LGPLv3), or
+alternatively under GPLv2/GPLv3 terms, as provided by the Qt Project.
+
+Copies of the GNU GPLv3 and GNU LGPLv3 license texts are provided in the
+files COPYING and COPYING.LESSER.
+
+For each binary release, the exact corresponding source code for this project
+is the source code published at the matching Git tag for that release.
+
+For each binary release, the corresponding source materials for the conveyed
+Qt, PySide6, and shiboken6 components are to be provided in the assets
+attached to that same release.
+
+This distribution may also include NumPy, SciPy, Bottleneck, pyqtgraph,
+PyQtDarkTheme-fork, and openpyxl. The applicable third-party license texts
+and notices for those components are provided in THIRD_PARTY_LICENSES.txt.
+
+No term of this project is intended to restrict reverse engineering for
+debugging modifications to LGPL-covered components.
