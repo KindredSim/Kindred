@@ -757,86 +757,133 @@ class ImportConfigDialog(QtWidgets.QDialog):
     # Result building
     # ------------------------------------------------------------------
 
+    def _collect_sheet_states(self) -> List[Optional[str]]:
+        """Ensure every checked sheet has a complete state dict.
+
+        Saves the current preview state, materializes unvisited sheets,
+        and copies previewed state to other checked sheets when the
+        unified checkbox is checked.
+
+        Returns the list of checked sheet keys ([None] for CSV).
+        """
+        self._save_current_sheet_state()
+        if self._file_type != "excel":
+            return [None]
+
+        checked_sheet_names: list[str] = self._get_checked_sheet_names()
+
+        for sheet_name in checked_sheet_names:
+            self._ensure_sheet_state(sheet_name)
+
+        if self._apply_remaining_cb.isChecked():
+            current_state = self._sheet_states.get(self._previewed_sheet_name)
+            if current_state is not None:
+                for sheet_name in checked_sheet_names:
+                    if sheet_name == self._previewed_sheet_name:
+                        continue
+                    merged = self._merge_editable_sheet_state(
+                        self._sheet_states[sheet_name], current_state,
+                    )
+                    self._sheet_states[sheet_name] = self._clone_sheet_state(merged)
+
+        return checked_sheet_names
+
+    @staticmethod
+    def _build_intent_from_state(
+        state: dict, sheet_key: Optional[str],
+    ) -> tuple[SheetImportIntent, UnitDetection, list[str]]:
+        """Pure transformation: state dict → (intent, detection, columns).
+
+        No side effects, no widget reads, no I/O.
+        """
+        time_col = str(state.get("time_column", ""))
+        species = tuple(
+            column_name
+            for column_name, checked in dict(state.get("species_checked", {})).items()
+            if checked
+        )
+        override_no_units = bool(
+            state.get("override_no_unit_row", False)
+            and state.get("no_unit_row_cb_enabled", False)
+        )
+        detected_conc = dict(state.get("detected_conc_unit_by_column", {}))
+        source_conc_units = dict(state.get("concentration_units", {}))
+        intent_conc_units = {}
+        for sp in species:
+            target_detected = detected_conc.get(sp) if not override_no_units else None
+            if target_detected is not None:
+                intent_conc_units[sp] = target_detected
+            else:
+                intent_conc_units[sp] = source_conc_units[sp]
+
+        intent = SheetImportIntent(
+            time_column=time_col,
+            species_columns=species,
+            time_unit=str(state.get("time_unit", "s")) or "s",
+            concentration_units=intent_conc_units,
+            override_no_unit_row=override_no_units,
+        )
+
+        columns = [str(column) for column in state.get("columns", [])]
+        preview_rows = [list(row) for row in state.get("preview_rows", [])]
+        if preview_rows:
+            row_mapping = dict(zip(columns, preview_rows[0]))
+            relevant_cols = [time_col, *species]
+            detection = detect_units_from_row_mapping(row_mapping, relevant_cols)
+        else:
+            detection = UnitDetection.empty()
+
+        return intent, detection, columns
+
+    def _build_remaining_template(self) -> Optional[SheetImportIntent]:
+        """Build the remaining-file template from the previewed sheet's state.
+
+        Independent of per_sheet_intents and the checked-sheet set.
+        Returns SheetImportIntent if apply-to-remaining is active, None otherwise.
+        """
+        if not self._apply_remaining_cb.isChecked():
+            return None
+
+        previewed_key = self._previewed_sheet_name  # None for CSV
+        previewed_state = self._sheet_states.get(previewed_key)
+        if previewed_state is None:
+            raise RuntimeError(
+                f"No state available for previewed sheet {previewed_key!r} "
+                "while apply-to-remaining is active"
+            )
+
+        intent, _detection, _columns = self._build_intent_from_state(
+            previewed_state, previewed_key,
+        )
+        return intent
+
     def _build_result(self, action: str) -> ImportDialogResult:
         if action in ("skip", "cancel"):
             return ImportDialogResult(config=None, action=action)
-        self._save_current_sheet_state()
 
-        sheet_names: list[str] = self._get_checked_sheet_names() if self._file_type == "excel" else []
-
-        if self._apply_remaining_cb.isChecked() and self._file_type == "excel":
-            current_state = self._sheet_states.get(self._previewed_sheet_name)
-            if current_state is not None:
-                for sheet_name in sheet_names:
-                    if sheet_name == self._previewed_sheet_name:
-                        continue
-                    target_state = self._ensure_sheet_state(sheet_name)
-                    merged = self._merge_editable_sheet_state(target_state, current_state)
-                    self._sheet_states[sheet_name] = self._clone_sheet_state(merged)
+        checked_keys = self._collect_sheet_states()
 
         file_intent = UserImportIntent(
-            sheet_names=tuple(sheet_names),
+            sheet_names=tuple(k for k in checked_keys if k is not None),
             apply_to_remaining=self._apply_remaining_cb.isChecked(),
         )
 
-        per_sheet_intents: dict[str | None, SheetImportIntent] = {}
-        per_sheet_detections: dict[str | None, UnitDetection] = {}
-        per_sheet_columns: dict[str | None, list[str]] = {}
+        per_sheet_intents: dict[Optional[str], SheetImportIntent] = {}
+        per_sheet_detections: dict[Optional[str], UnitDetection] = {}
+        per_sheet_columns: dict[Optional[str], list[str]] = {}
 
-        target_keys: list[Optional[str]] = sheet_names if self._file_type == "excel" else [None]
-        for key in target_keys:
-            state = (
-                self._ensure_sheet_state(key)
-                if self._file_type == "excel" and key is not None
-                else self._sheet_states.get(None, self._current_state_from_widgets())
+        for key in checked_keys:
+            intent, detection, columns = self._build_intent_from_state(
+                self._sheet_states[key], key,
             )
-            time_col = str(state.get("time_column", ""))
-            species = tuple(
-                column_name
-                for column_name, checked in dict(state.get("species_checked", {})).items()
-                if checked
-            )
-            override_no_units = bool(
-                state.get("override_no_unit_row", False)
-                and state.get("no_unit_row_cb_enabled", False)
-            )
-            # Build per-column concentration_units from target's own detection,
-            # falling back to the state's stored concentration_units (which is
-            # complete — every species column has a string value, whether from
-            # _build_default_sheet_state, _current_state_from_widgets, or merge).
-            detected_conc = dict(state.get("detected_conc_unit_by_column", {}))
-            source_conc_units = dict(state.get("concentration_units", {}))
-            intent_conc_units = {}
-            for sp in species:
-                target_detected = detected_conc.get(sp) if not override_no_units else None
-                if target_detected is not None:
-                    intent_conc_units[sp] = target_detected
-                else:
-                    intent_conc_units[sp] = source_conc_units[sp]
-            per_sheet_intents[key] = SheetImportIntent(
-                time_column=time_col,
-                species_columns=species,
-                time_unit=str(state.get("time_unit", "s")) or "s",
-                concentration_units=intent_conc_units,
-                override_no_unit_row=override_no_units,
-            )
-            columns = [str(column) for column in state.get("columns", [])]
+            per_sheet_intents[key] = intent
+            per_sheet_detections[key] = detection
             per_sheet_columns[key] = columns
-            preview_rows = [list(row) for row in state.get("preview_rows", [])]
-            if preview_rows:
-                row_mapping = dict(zip(columns, preview_rows[0]))
-                relevant_cols = [time_col, *species]
-                per_sheet_detections[key] = detect_units_from_row_mapping(row_mapping, relevant_cols)
-            else:
-                per_sheet_detections[key] = UnitDetection.empty()
 
         try:
             plans = resolve_import_plans(
-                self._filepath,
-                self._file_type,
-                per_sheet_intents,
-                per_sheet_detections,
-                per_sheet_columns,
+                self._filepath, self._file_type,
+                per_sheet_intents, per_sheet_detections, per_sheet_columns,
             )
         except ValueError as exc:
             QtWidgets.QMessageBox.critical(
@@ -844,18 +891,14 @@ class ImportConfigDialog(QtWidgets.QDialog):
             )
             return ImportDialogResult(config=None, action=action)
 
-        remaining_template = None
-        if file_intent.apply_to_remaining:
-            previewed_key = self._previewed_sheet_name  # None for CSV
-            remaining_template = per_sheet_intents.get(previewed_key)
+        remaining_template = self._build_remaining_template()
 
         config = ImportConfig(
             filepath=self._filepath,
             file_type=self._file_type,
             file_intent=file_intent,
             per_sheet_intents=tuple(
-                (sheet_name, per_sheet_intents[sheet_name])
-                for sheet_name in target_keys
+                (key, per_sheet_intents[key]) for key in checked_keys
             ),
             plans=tuple(plans),
             remaining_file_template=remaining_template,

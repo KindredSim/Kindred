@@ -1240,3 +1240,145 @@ class TestComboChangeRefreshesLabels:
             "B must remain unchecked after combo change"
         )
         assert checked_state["C"] is True
+
+
+# ---------------------------------------------------------------------------
+# 12. Phase-split regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewedSheetUncheckedWithApply:
+    """Previewed sheet unchecked while apply-to-remaining is active must not
+    crash and must produce a remaining_file_template from the previewed sheet."""
+
+    def test_previewed_sheet_unchecked_apply_remaining_produces_template(
+        self, qapp, tmp_path, monkeypatch,
+    ):
+        fp = _write_xlsx(tmp_path / "unchecked_preview.xlsx", {
+            "Sheet1": (
+                ["time", "A", "B"],
+                [["s", "uM", "uM"], ["0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A", "B"],
+                [["s", "uM", "uM"], ["0", "3.0", "4.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp, remaining_count=1)
+
+        # Sheet1 is previewed by default. Uncheck Sheet1, keep Sheet2 checked.
+        for i in range(dlg._sheet_list.count()):
+            item = dlg._sheet_list.item(i)
+            if item.text() == "Sheet1":
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+
+        dlg._apply_remaining_cb.setChecked(True)
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals, f"Unexpected error dialog: {criticals}"
+        assert result.config is not None
+        assert result.config.remaining_file_template is not None, (
+            "remaining_file_template must come from the previewed sheet (Sheet1), "
+            "even when Sheet1 is unchecked"
+        )
+        # Template should reflect Sheet1's configuration
+        assert result.config.remaining_file_template.time_column == "time"
+        assert "A" in result.config.remaining_file_template.species_columns
+
+
+class TestBuildIntentFromStateIndependent:
+    """_build_intent_from_state must be callable without dialog widgets."""
+
+    def test_build_intent_from_state_returns_valid_tuple(self, qapp, tmp_path):
+        fp = _write_csv(tmp_path / "dummy.csv", ["time", "A", "B"], [
+            ["s", "uM", "nM"],
+            ["0", "1.0", "2.0"],
+        ])
+        dlg = ImportConfigDialog(fp)
+        state = {
+            "time_column": "time",
+            "species_checked": {"A": True, "B": True},
+            "time_unit": "s",
+            "concentration_units": {"A": "uM", "B": "nM"},
+            "combo_conc_unit": "uM",
+            "override_no_unit_row": False,
+            "no_unit_row_cb_enabled": True,
+            "unit_row_detected": True,
+            "detected_time_unit": "s",
+            "detected_conc_unit_by_column": {"A": "uM", "B": "nM"},
+            "columns": ["time", "A", "B"],
+            "preview_rows": [["s", "uM", "nM"], ["0", "1.0", "2.0"]],
+        }
+        intent, detection, columns = dlg._build_intent_from_state(state, "Sheet1")
+        assert intent.time_column == "time"
+        assert intent.species_columns == ("A", "B")
+        assert intent.time_unit == "s"
+        assert intent.concentration_units == {"A": "uM", "B": "nM"}
+        assert detection.has_unit_row is True
+        assert columns == ["time", "A", "B"]
+
+
+class TestOrchestratorBehavioralEquivalence:
+    """Orchestrator must produce identical results to the old monolithic method."""
+
+    def test_multi_sheet_excel_normal_import(self, qapp, tmp_path, monkeypatch):
+        fp = _write_xlsx(tmp_path / "equiv.xlsx", {
+            "Sheet1": (
+                ["time", "A", "B"],
+                [["s", "uM", "nM"], ["0", "1.0", "2.0"]],
+            ),
+            "Sheet2": (
+                ["time", "A", "B"],
+                [["s", "uM", "nM"], ["0", "3.0", "4.0"]],
+            ),
+        })
+        dlg = ImportConfigDialog(fp, remaining_count=1)
+
+        criticals: list[tuple] = []
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox, "critical",
+            lambda *args, **kwargs: criticals.append(args),
+        )
+
+        result = dlg._build_result("import")
+        assert not criticals
+        assert result.config is not None
+        intents = dict(result.config.per_sheet_intents)
+        assert set(intents.keys()) == {"Sheet1", "Sheet2"}
+        assert intents["Sheet1"].time_column == "time"
+        assert intents["Sheet1"].species_columns == ("A", "B")
+        assert intents["Sheet1"].concentration_units == {"A": "uM", "B": "nM"}
+        assert intents["Sheet2"].time_column == "time"
+        assert intents["Sheet2"].concentration_units == {"A": "uM", "B": "nM"}
+        assert len(result.config.plans) == 2
+        assert result.config.remaining_file_template is None  # apply not checked
+
+
+class TestCsvApplyToRemainingProducesTemplate:
+    """CSV with apply-to-remaining must populate remaining_file_template."""
+
+    def test_csv_apply_remaining_produces_template(self, qapp, tmp_path):
+        fp = _write_csv(tmp_path / "csv_apply.csv", ["time", "A", "B"], [
+            ["s", "uM", "nM"],
+            ["0", "1.0", "2.0"],
+        ])
+        dlg = ImportConfigDialog(fp, remaining_count=2)
+        dlg._apply_remaining_cb.setChecked(True)
+
+        result = dlg._build_result("import")
+        assert result.config is not None
+        assert result.config.file_intent.apply_to_remaining is True
+        assert result.config.remaining_file_template is not None, (
+            "CSV with apply-to-remaining must produce a remaining_file_template"
+        )
+        assert result.config.remaining_file_template.time_column == "time"
+        assert result.config.remaining_file_template.species_columns == ("A", "B")
+        assert result.config.remaining_file_template.concentration_units == {
+            "A": "uM", "B": "nM",
+        }
