@@ -61,7 +61,7 @@ class TutorialManager:
                         "The <b>Reactions tab</b> is where you define your chemical mechanism using Kindred's DSL syntax.<br><br>"
                         "DSL stands for Domain-Specific Language - it's a simple, readable format for writing reactions."
                     ),
-                    target_widget="mechanismEditor",  # Will need to set this object name
+                    target_widget="mechanismEditor",
                     arrow_direction="left",
                 ),
                 TutorialStep(
@@ -89,7 +89,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Run the Simulation",
                     instruction=(
-                        "Click the <b>Run</b> button (or press <b>Ctrl+R</b>) to simulate your mechanism.<br><br>"
+                        "Click the <b>Run Selected</b> button (or press <b>Ctrl+R</b>) to simulate your mechanism.<br><br>"
                         "Kindred will solve the differential equations and plot concentration vs time."
                     ),
                     target_widget="runSimulationAction",
@@ -100,7 +100,7 @@ class TutorialManager:
                     instruction=(
                         "The <b>Plot</b> panel shows your simulation results.<br><br>"
                         "You should see [A] decreasing exponentially while [B] increases to 1.0 M.<br><br>"
-                        "The table below shows time-series data that you can export."
+                        "You can export results via <b>File → Export CSV...</b>."
                     ),
                     target_widget="plotPanel",
                     arrow_direction="right",
@@ -113,7 +113,7 @@ class TutorialManager:
                         "<li>Try more complex reactions (bimolecular, reversible)</li>"
                         "<li>Explore equilibria and thermodynamics</li>"
                         "<li>Learn about parameter fitting</li></ul><br>"
-                        "Check out other tutorials from <b>Help → Tutorials</b>."
+                        "Check out other tutorials from <b>Help → Interactive Tutorials...</b>."
                     ),
                     arrow_direction="none",
                 ),
@@ -143,13 +143,12 @@ class TutorialManager:
                         "First, load your experimental data from a CSV file.<br><br>"
                         "Go to <b>File → Load Data...</b> and select a CSV with time and concentration columns."
                     ),
-                    target_widget="loadDataAction",
-                    arrow_direction="top",
+                    arrow_direction="none",
                 ),
                 TutorialStep(
                     title="The Data Panel",
                     instruction=(
-                        "The <b>Data</b> tab shows your loaded datasets.<br><br>"
+                        "The <b>Data</b> panel shows your loaded datasets.<br><br>"
                         "You can preview the data and confirm the dataset you want to fit."
                     ),
                     target_widget="dataPanel",
@@ -171,17 +170,16 @@ class TutorialManager:
                         "Click <b>Fitting → Global Fit...</b> (or <b>Ctrl+Shift+F</b>) to open the fitting window.<br><br>"
                         "Kindred will automatically detect parameter names from your mechanism."
                     ),
-                    target_widget="globalFitAction",
-                    arrow_direction="top",
+                    arrow_direction="none",
                 ),
-                    TutorialStep(
-                        title="Configure Bounds",
-                        instruction=(
-                            "In the fitting window's <b>Parameters and ICs</b> tab, set realistic bounds for each parameter:<br><br>"
-                            "• <b>Value</b>: Starting guess<br>"
-                            "• <b>Min/Max</b>: Search bounds<br><br>"
-                            "Good bounds improve convergence and prevent unphysical values."
-                        ),
+                TutorialStep(
+                    title="Configure Bounds",
+                    instruction=(
+                        "In the fitting window's <b>Parameters</b> tab, set realistic bounds for each parameter:<br><br>"
+                        "• <b>Value</b>: Starting guess<br>"
+                        "• <b>Min/Max</b>: Search bounds<br><br>"
+                        "Good bounds improve convergence and prevent unphysical values."
+                    ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
@@ -254,8 +252,7 @@ class TutorialManager:
                         "• Template presets<br>"
                         "• DSL export"
                     ),
-                    target_widget="temperatureScheduleAction",
-                    arrow_direction="top",
+                    arrow_direction="none",
                 ),
                 TutorialStep(
                     title="Create a Schedule",
@@ -320,38 +317,43 @@ class TutorialManager:
                 TutorialStep(
                     title="Access State Network Editor",
                     instruction=(
-                        "Go to <b>Edit → State Network...</b> to open the visual editor.<br><br>"
-                        "State networks are stored separately from reaction DSL but can be converted."
+                        "Go to <b>Edit → State Network Editor...</b> to open the visual editor.<br><br>"
+                        "State networks are defined using tables for states and edges. Changes are "
+                        "automatically included in the mechanism when you run a simulation."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
                     title="Define States",
                     instruction=(
-                        "In the editor, define states with:<br>"
-                        "• Name (e.g., 'A', 'B')<br>"
-                        "• Energy (relative, in kJ/mol)<br>"
-                        "• Degeneracy (statistical weight)<br><br>"
-                        "Example:<br>"
-                        "<code>state: A; energy=0.0; degeneracy=1</code>"
+                        "Click <b>Add State</b> to insert a row in the States table. "
+                        "Each state has columns:<br>"
+                        "• <b>Name</b> (e.g., 'A', 'B')<br>"
+                        "• <b>Type</b> (GS for ground state, TS for transition state)<br>"
+                        "• <b>Energy</b> (relative free energy)<br>"
+                        "• <b>Unit</b> (kJ/mol, kcal/mol, or J/mol)<br>"
+                        "• <b>Degeneracy</b> (statistical weight)"
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Add Transition States",
+                    title="Add Edges",
                     instruction=(
-                        "Connect states via transition states:<br>"
-                        "<code>edge: A -> TS1 -> B; energy=75.0</code><br><br>"
+                        "Click <b>Add Edge</b> to connect states in the Edges table. "
+                        "Each edge has columns:<br>"
+                        "• <b>State A</b>: source state name<br>"
+                        "• <b>State B</b>: target state name<br><br>"
                         "Kindred automatically calculates forward and reverse rates using Eyring theory."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Convert to Reactions",
+                    title="Accept and Run",
                     instruction=(
-                        "Click <b>Convert to Reactions</b> to generate standard DSL.<br><br>"
-                        "The state network is converted to reactions with Eyring parameters:<br>"
-                        "<code>reaction: A -> B; dG_act=75.0</code>"
+                        "Click <b>OK</b> to accept your state network changes.<br><br>"
+                        "The state network is automatically included when running simulations. "
+                        "Kindred generates Eyring-based rate constants from the energy landscape "
+                        "you defined."
                     ),
                     arrow_direction="none",
                 ),
@@ -419,16 +421,15 @@ class TutorialManager:
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Solver Settings",
+                    title="Simulation Settings",
                     instruction=(
-                        "Fine-tune simulations in <b>Tools → Solver Settings...</b>:<br><br>"
+                        "Fine-tune simulations in <b>Simulation → Simulation Settings...</b>:<br><br>"
                         "• Solver method (LSODA, Radau, BDF)<br>"
                         "• Tolerances (rtol, atol)<br>"
-                        "• Temperature<br>"
-                        "• Grid density"
+                        "• Cache management<br>"
+                        "• Worker parallelism"
                     ),
-                    target_widget="solverSettingsAction",
-                    arrow_direction="top",
+                    arrow_direction="none",
                 ),
                 TutorialStep(
                     title="All Features Unlocked!",
