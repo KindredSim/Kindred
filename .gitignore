@@ -6,6 +6,7 @@ _audit_reports/
 venv/
 .claude/
 .venv-win312/
+kindred.egg-info/
 
 # Python caches / test caches
 __pycache__/

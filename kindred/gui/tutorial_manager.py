@@ -92,7 +92,7 @@ class TutorialManager:
                         "Click the <b>Run Selected</b> button (or press <b>Ctrl+R</b>) to simulate your mechanism.<br><br>"
                         "Kindred will solve the differential equations and plot concentration vs time."
                     ),
-                    target_widget="runSimulationAction",
+                    target_widget="runSelectedButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(
@@ -143,7 +143,8 @@ class TutorialManager:
                         "First, load your experimental data from a CSV file.<br><br>"
                         "Go to <b>File → Load Data...</b> and select a CSV with time and concentration columns."
                     ),
-                    arrow_direction="none",
+                    target_widget="loadDataAction",
+                    arrow_direction="top",
                 ),
                 TutorialStep(
                     title="The Data Panel",
@@ -170,7 +171,8 @@ class TutorialManager:
                         "Click <b>Fitting → Global Fit...</b> (or <b>Ctrl+Shift+F</b>) to open the fitting window.<br><br>"
                         "Kindred will automatically detect parameter names from your mechanism."
                     ),
-                    arrow_direction="none",
+                    target_widget="globalFitAction",
+                    arrow_direction="top",
                 ),
                 TutorialStep(
                     title="Configure Bounds",
@@ -252,7 +254,8 @@ class TutorialManager:
                         "• Template presets<br>"
                         "• DSL export"
                     ),
-                    arrow_direction="none",
+                    target_widget="temperatureScheduleAction",
+                    arrow_direction="top",
                 ),
                 TutorialStep(
                     title="Create a Schedule",
@@ -429,7 +432,8 @@ class TutorialManager:
                         "• Cache management<br>"
                         "• Worker parallelism"
                     ),
-                    arrow_direction="none",
+                    target_widget="simulationSettingsAction",
+                    arrow_direction="top",
                 ),
                 TutorialStep(
                     title="All Features Unlocked!",

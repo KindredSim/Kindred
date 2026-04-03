@@ -257,6 +257,43 @@ class TutorialOverlay(QtWidgets.QWidget):
                             local_pos = self.mapFromGlobal(global_pos)
                             return QtCore.QRect(local_pos, widget.size())
 
+                    # Fallback: highlight the parent menu in the menu bar
+                    rect = self._get_menu_bar_rect_for_action(target)
+                    if rect is not None:
+                        return rect
+
+        return None
+
+    def _get_menu_bar_rect_for_action(
+        self, action: QtGui.QAction
+    ) -> Optional[QtCore.QRect]:
+        """Return the menu-bar geometry for the top-level menu that contains *action*.
+
+        Walks the QMenuBar's top-level menus (one level only — no submenu
+        recursion) and returns the menu-bar item rectangle mapped into
+        overlay coordinates.  Returns ``None`` if the action is not found
+        or the resulting rectangle is empty.
+        """
+        parent = self.parent()
+        menu_bar = getattr(parent, "menuBar", None)
+        if menu_bar is None:
+            return None
+        menu_bar = menu_bar()
+        if not isinstance(menu_bar, QtWidgets.QMenuBar):
+            return None
+
+        for top_action in menu_bar.actions():
+            menu = top_action.menu()
+            if menu is None:
+                continue
+            if action in menu.actions():
+                geom = menu_bar.actionGeometry(top_action)
+                if geom.isEmpty():
+                    return None
+                global_pos = menu_bar.mapToGlobal(geom.topLeft())
+                local_pos = self.mapFromGlobal(global_pos)
+                return QtCore.QRect(local_pos, geom.size())
+
         return None
 
     def paintEvent(self, event: QtGui.QPaintEvent):
