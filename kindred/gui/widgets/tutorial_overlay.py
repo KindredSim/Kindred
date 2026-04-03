@@ -250,9 +250,10 @@ class TutorialOverlay(QtWidgets.QWidget):
                     local_pos = self.mapFromGlobal(global_pos)
                     return QtCore.QRect(local_pos, target.size())
                 elif isinstance(target, QtGui.QAction):
-                    # For QAction, try to find associated widget
-                    for widget in target.associatedWidgets():
-                        if isinstance(widget, QtWidgets.QToolButton) or isinstance(widget, QtWidgets.QPushButton):
+                    # Try to find an associated toolbar widget (PyQt5 compat;
+                    # PySide6 does not expose associatedWidgets on QAction).
+                    for widget in getattr(target, "associatedWidgets", list)():
+                        if isinstance(widget, (QtWidgets.QToolButton, QtWidgets.QPushButton)):
                             global_pos = widget.mapToGlobal(QtCore.QPoint(0, 0))
                             local_pos = self.mapFromGlobal(global_pos)
                             return QtCore.QRect(local_pos, widget.size())
