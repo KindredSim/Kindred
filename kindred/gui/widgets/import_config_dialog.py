@@ -642,13 +642,17 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _on_no_unit_row_toggled(self, checked: bool) -> None:
         if checked:
             self._time_unit_combo.setCurrentText("s")
+            self._conc_unit_combo.blockSignals(True)
             self._conc_unit_combo.setCurrentText("M")
+            self._conc_unit_combo.blockSignals(False)
         elif self._unit_row_detected:
             if self._detected_time_unit:
                 self._time_unit_combo.setCurrentText(self._normalize_unit_for_combo(self._detected_time_unit))
             detected_units = [u for u in self._detected_conc_unit_by_column.values() if u]
             if detected_units:
+                self._conc_unit_combo.blockSignals(True)
                 self._conc_unit_combo.setCurrentText(self._most_common_unit(detected_units))
+                self._conc_unit_combo.blockSignals(False)
         self._refresh_unit_controls()
         self._populate_species_checkboxes()
         self._update_import_enabled()

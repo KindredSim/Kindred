@@ -1,13 +1,4 @@
-"""
-Test IO and export robustness.
-
-This module tests that IO operations handle edge cases gracefully:
-- Missing files
-- Corrupted data
-- Permission errors
-- Disk full scenarios
-- Invalid file formats
-"""
+"""Test selected IO, logging, and cache edge cases."""
 
 from __future__ import annotations
 
@@ -23,7 +14,6 @@ except ImportError:
 
 HAS_MULTIPROCESSING = bool(mp and hasattr(mp, "Process") and hasattr(mp, "get_start_method"))
 MULTIPROCESS_REASON = "requires multiprocessing.Process support"
-READONLY_REASON = "requires read-only filesystem to validate permission handling"
 
 
 @pytest.mark.gui
@@ -79,12 +69,6 @@ class TestProjectSaveLoad:
                     json.loads(content)
         finally:
             os.unlink(temp_path)
-
-    @pytest.mark.skip(reason=READONLY_REASON)
-    def test_save_to_readonly_directory(self):
-        """Test saving project to read-only directory (requires read-only FS setup)."""
-        pass
-
 
 class TestLoggingRobustness:
     """Test logging handles edge cases."""

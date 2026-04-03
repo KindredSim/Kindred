@@ -28,6 +28,7 @@ from kindred.gui.widgets.import_config import (
     UnitDetection,
     UserImportIntent,
     detect_units_from_row_mapping,
+    rebuild_intent_for_target,
     resolve_import_plans,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
@@ -444,35 +445,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         dialog.exec()
         return dialog.get_result()
 
-    @staticmethod
-    def _rebuild_intent_for_target(
-        source_intent: SheetImportIntent,
-        target_detection: UnitDetection,
-    ) -> SheetImportIntent:
-        """Build a new ``SheetImportIntent`` for a target sheet/file.
-
-        Uses the *target's* detected per-column concentration units,
-        falling back to the source intent's values for undetected columns.
-        All other fields are copied from *source_intent*.
-        """
-        conc_units: Dict[str, str] = {}
-        for col in source_intent.species_columns:
-            if not source_intent.override_no_unit_row:
-                target_detected = target_detection.detected_conc_unit_by_column.get(col)
-            else:
-                target_detected = None
-            if target_detected is not None:
-                conc_units[col] = target_detected
-            else:
-                conc_units[col] = source_intent.concentration_units[col]
-        return SheetImportIntent(
-            time_column=source_intent.time_column,
-            species_columns=source_intent.species_columns,
-            time_unit=source_intent.time_unit,
-            concentration_units=conc_units,
-            override_no_unit_row=source_intent.override_no_unit_row,
-        )
-
     def _build_remaining_file_config(
         self,
         filepath: str,
@@ -513,7 +485,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                 )
             else:
                 det = UnitDetection.empty()
-            per_sheet_intents[None] = self._rebuild_intent_for_target(
+            per_sheet_intents[None] = rebuild_intent_for_target(
                 source_intent, det,
             )
             per_sheet_detections[None] = det
@@ -539,7 +511,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                     per_sheet_detections[sheet_name] = detect_units_from_row_mapping(
                         dict(first_row), list(selected_keys)
                     )
-                per_sheet_intents[sheet_name] = self._rebuild_intent_for_target(
+                per_sheet_intents[sheet_name] = rebuild_intent_for_target(
                     source_intent, per_sheet_detections[sheet_name],
                 )
             target_sheet_names = tuple(sheets)

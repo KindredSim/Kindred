@@ -1,9 +1,10 @@
-"""Composed import configuration types and resolver for the dataset import pipeline.
+"""Composed import configuration types and pure helpers for dataset import.
 
 Defines the structured types that replace the flat ImportConfig dataclass:
 UnitDetection, UserImportIntent, ResolvedSheetPlan, and the top-level
-ImportConfig.  Also provides ``detect_units_from_row_mapping`` and
-``resolve_import_plans`` for building these objects from raw preview data.
+ImportConfig. Also provides ``detect_units_from_row_mapping``,
+``rebuild_intent_for_target``, and ``resolve_import_plans`` for building and
+adapting these objects from raw preview data.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ __all__ = [
     "UnitDetection",
     "UserImportIntent",
     "detect_units_from_row_mapping",
+    "rebuild_intent_for_target",
     "resolve_import_plans",
 ]
 
@@ -148,6 +150,30 @@ def detect_units_from_row_mapping(
         has_unit_row=True,
         detected_time_unit=detected_time_unit,
         detected_conc_unit_by_column=conc_unit_by_column,
+    )
+
+
+def rebuild_intent_for_target(
+    source_intent: SheetImportIntent,
+    target_detection: UnitDetection,
+) -> SheetImportIntent:
+    """Build a ``SheetImportIntent`` for a target sheet or file."""
+    conc_units: Dict[str, str] = {}
+    for col in source_intent.species_columns:
+        if not source_intent.override_no_unit_row:
+            target_detected = target_detection.detected_conc_unit_by_column.get(col)
+        else:
+            target_detected = None
+        if target_detected is not None:
+            conc_units[col] = target_detected
+        else:
+            conc_units[col] = source_intent.concentration_units[col]
+    return SheetImportIntent(
+        time_column=source_intent.time_column,
+        species_columns=source_intent.species_columns,
+        time_unit=source_intent.time_unit,
+        concentration_units=conc_units,
+        override_no_unit_row=source_intent.override_no_unit_row,
     )
 
 
