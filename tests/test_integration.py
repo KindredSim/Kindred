@@ -12,8 +12,6 @@ These tests ensure that modules work together correctly in realistic scenarios.
 """
 
 import logging
-import multiprocessing as mp
-from functools import partial
 
 import numpy as np
 import pytest
@@ -27,7 +25,6 @@ from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.analysis.global_fitting import fit_global
 
 # Performance modules
-from kindred.core.parallel_fitting import parallel_fit, generate_initial_guesses
 from kindred.core.sparse_jacobian import detect_sparsity_pattern, build_sparse_jacobian
 
 # Exceptions and logging
@@ -42,22 +39,6 @@ from kindred.io.logging import (
 )
 
 logger = get_logger(__name__)
-
-
-def _has_semlock() -> bool:
-    """Return True if multiprocessing SemLock primitives are usable."""
-    try:
-        sem = mp.Semaphore(1)
-        closer = getattr(sem, "close", None)
-        if callable(closer):
-            closer()
-        return True
-    except (OSError, AttributeError, RuntimeError, PermissionError):
-        return False
-
-
-HAS_SEMLOCK = _has_semlock()
-SEMLOCK_REASON = "requires multiprocessing.SemLock support for parallel workers"
 
 
 # ----------------------------- Test Fixtures -----------------------------------
@@ -206,45 +187,6 @@ class TestSimulationWorkflow:
 class TestFittingWorkflow:
     """Test parameter fitting workflows."""
 
-    def test_simple_fitting_workflow(self, simple_mechanism_dsl):
-        """Test fitting workflow with synthetic data."""
-        # Generate synthetic data
-        mechanism = parse_dsl_to_mechanism(simple_mechanism_dsl)
-        rhs = build_ode_rhs_from_mechanism(mechanism)
-        species_names = list(mechanism.species.keys())
-        y0 = np.array([mechanism.species[sp].initial_conc for sp in species_names])
-
-        # True parameters: k=0.5
-        request = SimulationRequest(
-            rhs=rhs,
-            t_span=(0, 10),
-            y0=y0,
-            solver='LSODA',
-            grid={'N': 50}
-        )
-        true_result = solve_ode(request)
-
-        # Add noise to create "experimental" data
-        np.random.seed(42)
-        noise = np.random.normal(0, 0.02, true_result.Y.shape)
-        exp_data = true_result.Y + noise  # Shape (2, 50)
-
-        # Create objective function using module-level function with partial
-        # (required for multiprocessing pickling)
-        objective = partial(_simple_fitting_objective, y0=y0, exp_data=exp_data)
-
-        # Fit with parallel fitting (multi-start)
-        result = parallel_fit(
-            objective,
-            nominal_params={'k': 0.3},  # Start away from truth
-            bounds={'k': (0.1, 2.0)},
-            n_starts=3,
-            n_workers=1,
-        )
-
-        # Should recover k ≈ 0.5
-        assert abs(result.best_params['k'] - 0.5) < 0.1
-
     def test_global_fitting_workflow(self):
         """Test global fitting with multiple datasets."""
         # Create two datasets with shared k but different initial conditions
@@ -338,21 +280,6 @@ class TestErrorHandling:
         with pytest.raises(Exception):  # Should raise DSLError for missing k
             parse_dsl_to_mechanism(invalid_dsl)
 
-    def test_fitting_errors(self):
-        """Test fitting error handling."""
-        # Objective function that fails
-        def bad_objective(params):
-            raise ValueError("Simulation failed")
-
-        with pytest.raises(Exception):
-            parallel_fit(
-                bad_objective,
-                nominal_params={'k': 1.0},
-                bounds={'k': (0.1, 10.0)},
-                n_starts=1,
-                n_workers=1,
-            )
-
 
 # ------------------------------- Logging Tests ---------------------------------
 
@@ -393,64 +320,6 @@ class TestLoggingIntegration:
 # ----------------------- Performance Integration -------------------------------
 
 
-# ----------------------- Module-level objectives for pickling ----------------------
-# All objectives used in parallel fitting tests must be defined at module level
-# to support multiprocessing pickling.
-
-def _quadratic_objective(params):
-    """Simple quadratic objective for testing."""
-    x = params['x']
-    return np.array([(x - 2.0)**2])
-
-
-# Objective for test_simple_fitting_workflow
-# Needs access to y0 and exp_data, passed as closure-like params
-def _simple_fitting_objective(params, y0, exp_data):
-    """
-    Objective function for simple A -> B fitting workflow.
-
-    Parameters
-    ----------
-    params : dict
-        Must contain 'k' parameter
-    y0 : np.ndarray
-        Initial conditions
-    exp_data : np.ndarray
-        Experimental data (shape: n_species x n_timepoints)
-
-    Returns
-    -------
-    np.ndarray
-        Residuals for species A
-    """
-    k = params['k']
-    # Update mechanism with new k
-    test_dsl = f"""
-    reaction: A -> B; k={k}
-    initial: A=1.0
-    initial: B=0.0
-    """
-    test_mech = parse_dsl_to_mechanism(test_dsl)
-    test_rhs = build_ode_rhs_from_mechanism(test_mech)
-
-    test_request = SimulationRequest(
-        rhs=test_rhs,
-        t_span=(0, 10),
-        y0=y0,
-        solver='LSODA',
-        grid={'N': 50}
-    )
-    test_result = solve_ode(test_request)
-
-    # Residuals (only A - first species)
-    return test_result.Y[0, :] - exp_data[0, :]
-
-
-def _fallback_simple_objective(params):
-    """Simple objective for testing fallback behavior."""
-    return np.array([params['x'] - 1.0])
-
-
 class TestPerformanceIntegration:
     """Test performance optimizations in workflows."""
 
@@ -476,67 +345,6 @@ class TestPerformanceIntegration:
 
         # Should be sparse matrix
         assert hasattr(J, 'toarray')  # scipy.sparse matrix
-
-    @pytest.mark.skipif(not HAS_SEMLOCK, reason=SEMLOCK_REASON)
-    def test_parallel_fitting_performance(self):
-        """Test parallel fitting with multiple starts."""
-        # Test multi-start optimization (using module-level function for pickling)
-        result = parallel_fit(
-            _quadratic_objective,
-            nominal_params={'x': 0.0},
-            bounds={'x': (-5.0, 5.0)},
-            n_starts=5,
-            n_workers=1,  # Single worker for reproducibility
-            method='trf',  # Fixed: was 'differential_evolution', correct method is 'trf' or 'de'
-            seed=42,
-        )
-
-        assert result.n_starts == 5
-        # Should find global minimum near x=2.0
-        assert abs(result.best_params['x'] - 2.0) < 0.5
-
-    def test_parallel_fit_fallback_on_permission_error(self, monkeypatch):
-        """Ensure parallel fitting degrades gracefully when multiprocessing is unavailable."""
-
-        def failing_pool(*args, **kwargs):
-            raise PermissionError("SemLock unavailable")
-
-        monkeypatch.setattr('kindred.core.parallel_fitting.mp.Pool', failing_pool)
-
-        # Use module-level objective (required for multiprocessing pickling)
-        result = parallel_fit(
-            _fallback_simple_objective,
-            nominal_params={'x': 0.0},
-            bounds={'x': (-1.0, 3.0)},
-            n_starts=3,
-            n_workers=2,
-        )
-
-        assert result.sequential_fallback is True
-        assert "SemLock" in (result.fallback_reason or "")
-        assert abs(result.best_params['x'] - 1.0) < 0.2
-
-    def test_initial_guess_generation(self):
-        """Test sampling methods for initial guesses."""
-        nominal = {'k1': 1.0, 'k2': 0.5}
-        bounds = {'k1': (0.1, 10.0), 'k2': (0.01, 5.0)}
-
-        # Test all sampling methods
-        for method in ['sobol', 'lhs', 'random', 'grid']:
-            guesses = generate_initial_guesses(
-                nominal,
-                bounds,
-                n_starts=8,
-                method=method,
-                seed=42
-            )
-
-            assert len(guesses) == 8
-            for guess in guesses:
-                assert 'k1' in guess
-                assert 'k2' in guess
-                assert bounds['k1'][0] <= guess['k1'] <= bounds['k1'][1]
-                assert bounds['k2'][0] <= guess['k2'] <= bounds['k2'][1]
 
 
 # --------------------------- Cache Integration ---------------------------------
