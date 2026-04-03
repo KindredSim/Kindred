@@ -116,14 +116,6 @@ def test_global_fit_handler_invokes_backend(monkeypatch, analysis_window):
         raising=False,
     )
 
-    class _DialogMustNotBeConstructed:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-    monkeypatch.setattr(
-        "kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog",
-        _DialogMustNotBeConstructed,
-    )
     monkeypatch.setattr(
         MainWindow,
         "_simulate_mechanism",
@@ -162,19 +154,18 @@ def test_fitting_window_smoke(qapp):
         dataset_entries=dataset_entries,
         apply_callback=lambda params: None,
     )
-    assert window._param_table.rowCount() == 1
-    assert window._dataset_table.rowCount() == 1
-    assert window._param_table.item(0, 2).text() == "k1"
-    assert pytest.approx(float(window._param_table.item(0, 3).text()), rel=1e-9) == 0.2
-    assert pytest.approx(float(window._param_table.item(0, 4).text()), rel=1e-9) == 0.01
-    assert pytest.approx(float(window._param_table.item(0, 5).text()), rel=1e-9) == 1.0
+    assert window._params_ics_tab._param_table.rowCount() == 1
+    assert window._data_tab._dataset_table.rowCount() == 1
+    assert window._params_ics_tab._param_table.item(0, 2).text() == "k1"
+    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 3).text()), rel=1e-9) == 0.2
+    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 4).text()), rel=1e-9) == 0.01
+    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 5).text()), rel=1e-9) == 1.0
     window.close()
 
 
 def test_fitting_window_small_multiples_grid(qapp):
     pytest.importorskip("pyqtgraph", reason="pyqtgraph is required for the fitting window small-multiples grid.")
     from kindred.gui.fitting.window import FittingWindow
-    from kindred.gui.widgets.dataset_subset_widget import DatasetSubsetWidget
 
     parameter_defs = [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}]
     t_axis = np.linspace(0, 2, 8)
@@ -215,17 +206,16 @@ def test_fitting_window_small_multiples_grid(qapp):
         apply_callback=lambda params: None,
     )
 
-    assert hasattr(window, "refresh_grid_view")
-    assert isinstance(window._subset_widget, DatasetSubsetWidget)
-    assert {ds["name"] for ds in getattr(window._subset_widget._grid, "_datasets", [])} == {"ds1", "ds2", "ds3"}
+    assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1", "ds2", "ds3"}
+    assert {ds["name"] for ds in getattr(window._run_results_tab._all_datasets_plot_view, "_datasets", [])} == {"ds1", "ds2", "ds3"}
 
     model_series = {
         "ds1": {"A": np.exp(-0.25 * t_axis)},
         "ds2": {"A": np.exp(-0.35 * t_axis)},
         "ds3": {"A": np.exp(-0.45 * t_axis)},
     }
-    window.refresh_grid_view(dataset_entries, current_models=model_series)
-    ds1_payload = next(ds for ds in window._subset_widget._grid._datasets if ds.get("name") == "ds1")
+    window._run_results_tab.push_live_update({"model_series": model_series, "dataset_stats": {}}, refresh_all=True)
+    ds1_payload = next(ds for ds in window._run_results_tab._all_datasets_plot_view._datasets if ds.get("name") == "ds1")
     assert ds1_payload.get("model_y") is not None
     assert np.allclose(ds1_payload["model_y"], model_series["ds1"]["A"])
 
@@ -318,24 +308,23 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
     top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
     assert top_tabs is not None
     assert window._tabs is top_tabs
-    targets_idx = [top_tabs.tabText(i) for i in range(top_tabs.count())].index("Targets & Weights")
-    window._tabs.setCurrentIndex(targets_idx)
+    dt_idx = [top_tabs.tabText(i) for i in range(top_tabs.count())].index("Data and Targets")
+    window._tabs.setCurrentIndex(dt_idx)
     qapp.processEvents()
 
-    dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+    ulist = window._data_targets_tab.unified_list._list
     weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
     weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
-    assert dataset_list is not None
     assert weight_mode is not None
     assert weight_edit is not None
 
-    for row in range(dataset_list.count()):
-        item = dataset_list.item(row)
+    for i in range(ulist.count()):
+        item = ulist.item(i)
         if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == "ds2":
-            dataset_list.setCurrentRow(row)
+            ulist.setCurrentRow(i)
             break
     else:
-        raise AssertionError("ds2 not present in targets dataset list")
+        raise AssertionError("ds2 not present in unified dataset list")
     qapp.processEvents()
 
     weight_mode.setCurrentIndex(1)
@@ -454,8 +443,8 @@ def test_fitting_window_applies_dataset_initial_updates(qapp):
     )
 
     window._handle_global_fit_complete({"result": result})
-    assert window._staged_dataset_params["ds1"]["init:A"] == pytest.approx(0.6)
-    assert window._staged_dataset_params["ds2"]["init:A"] == pytest.approx(1.6)
+    assert window._params_ics_tab.get_staged_dataset_params()["ds1"]["init:A"] == pytest.approx(0.6)
+    assert window._params_ics_tab.get_staged_dataset_params()["ds2"]["init:A"] == pytest.approx(1.6)
     assert applied == []
     window.close()
 
@@ -492,14 +481,14 @@ def test_global_fit_parameter_toggles_persist_across_best_updates_and_affect_con
     )
     try:
         # Toggle: k1 uses log10; k2 excluded from fitting.
-        window._param_table.item(0, 1).setCheckState(QtCore.Qt.Checked)   # Log10
-        window._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)  # Fit
+        window._params_ics_tab._param_table.item(0, 1).setCheckState(QtCore.Qt.Checked)   # Log10
+        window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)  # Fit
 
         # Simulate a best update which repopulates the parameter table.
         window._handle_global_best_update({"cost": 1.0, "shared_params": {"k1": 0.25, "k2": 0.35}})
 
-        assert window._param_table.item(0, 1).checkState() == QtCore.Qt.Checked
-        assert window._param_table.item(1, 0).checkState() == QtCore.Qt.Unchecked
+        assert window._params_ics_tab._param_table.item(0, 1).checkState() == QtCore.Qt.Checked
+        assert window._params_ics_tab._param_table.item(1, 0).checkState() == QtCore.Qt.Unchecked
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
@@ -573,8 +562,8 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
     )
     try:
         # Exclude k2 from fitting but set its fixed value.
-        window._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
-        window._param_table.item(1, 3).setText("9.87")
+        window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
+        window._params_ics_tab._param_table.item(1, 3).setText("9.87")
 
         config = window._params_ics_tab._collect_parameter_config()
         dataset_selection = window._collect_dataset_selection()

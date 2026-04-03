@@ -98,12 +98,6 @@ class TestFittingErrorHandling:
 
         monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
 
-        class _DialogMustNotBeConstructed:
-            def __init__(self, *args, **kwargs):
-                raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-        monkeypatch.setattr("kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog", _DialogMustNotBeConstructed)
-
         main_window._run_global_fit()
         assert created, "Global fitting window should be opened"
         assert "window" in main_window._status_label.text().lower()
@@ -154,12 +148,6 @@ class TestFittingErrorHandling:
                 pass
 
         monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
-
-        class _DialogMustNotBeConstructed:
-            def __init__(self, *args, **kwargs):
-                raise AssertionError("GlobalFitConfigDialog must not be used in the launch flow")
-
-        monkeypatch.setattr("kindred.gui.fitting.global_fit_config.GlobalFitConfigDialog", _DialogMustNotBeConstructed)
 
         main_window._run_global_fit()
         assert created, "Global fitting window should be opened"

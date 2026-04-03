@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from kindred.gui.fitting.window import FittingWindow
 
@@ -69,15 +69,6 @@ def _make_two_dataset_window() -> FittingWindow:
     )
 
 
-def _targets_dataset_ids(dataset_list: QtWidgets.QListWidget) -> list[str]:
-    ids: list[str] = []
-    for row in range(dataset_list.count()):
-        item = dataset_list.item(row)
-        assert item is not None
-        ids.append(str(item.data(QtCore.Qt.UserRole) or ""))
-    return ids
-
-
 def _tab_index(tab_bar: QtWidgets.QTabBar, title: str) -> int:
     titles = [tab_bar.tabText(i) for i in range(tab_bar.count())]
     return titles.index(title)
@@ -90,14 +81,15 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         qt_app.processEvents()
 
         top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
-        shell_splitter = window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter")
         content_stack = window.findChild(QtWidgets.QStackedWidget, "global_fit_current_tab_stack")
+        results_subtabs = window.findChild(QtWidgets.QTabBar, "global_fit_results_subtabs")
         footer = window.findChild(QtWidgets.QWidget, "global_fit_footer")
 
         assert top_tabs is not None
-        assert shell_splitter is not None
         assert content_stack is not None
+        assert results_subtabs is not None
         assert footer is not None
+        assert window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_right_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
@@ -105,97 +97,75 @@ def test_global_fit_right_panel_tabs_follow_workflow_and_rehome_surfaces(qt_app)
         assert window._tabs is top_tabs
 
         titles = [top_tabs.tabText(i) for i in range(top_tabs.count())]
-        assert titles == ["Data", "Targets & Weights", "Parameters & ICs", "Run & Results"]
+        assert titles == ["Data and Targets", "Parameters", "Results"]
 
-        data_widget = content_stack.widget(_tab_index(top_tabs, "Data"))
-        targets_widget = content_stack.widget(_tab_index(top_tabs, "Targets & Weights"))
-        params_widget = content_stack.widget(_tab_index(top_tabs, "Parameters & ICs"))
-        run_widget = content_stack.widget(_tab_index(top_tabs, "Run & Results"))
+        data_targets_widget = content_stack.widget(_tab_index(top_tabs, "Data and Targets"))
+        params_widget = content_stack.widget(_tab_index(top_tabs, "Parameters"))
 
         sampling_panel = window.findChild(QtWidgets.QWidget, "global_fit_sampling_panel")
-        targets_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        species_table_widget = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
         weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
         weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
-        ic_table = window.findChild(QtWidgets.QTableWidget, "global_fit_initial_conditions_table")
-        run_stamp = window.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
+        results_summary_button = window.findChild(QtWidgets.QPushButton, "global_fit_results_summary_footer_button")
         run_block = window.findChild(QtWidgets.QLabel, "global_fit_run_block_reason_label")
 
         assert sampling_panel is not None
-        assert targets_list is not None
+        assert species_table_widget is not None
         assert weight_mode is not None
         assert weight_edit is not None
-        assert ic_table is not None
-        assert run_stamp is not None
+        assert results_summary_button is not None
         assert run_block is not None
 
-        assert window._dataset_table.columnCount() == 3
-        assert [window._dataset_table.horizontalHeaderItem(i).text() for i in range(window._dataset_table.columnCount())] == [
+        assert window._data_tab._dataset_table.columnCount() == 3
+        assert [window._data_tab._dataset_table.horizontalHeaderItem(i).text() for i in range(window._data_tab._dataset_table.columnCount())] == [
             "Use",
             "Dataset",
             "Species",
         ]
 
-        assert data_widget.isAncestorOf(window._dataset_table)
-        assert data_widget.isAncestorOf(sampling_panel)
-        assert not data_widget.isAncestorOf(weight_mode)
-        assert not data_widget.isAncestorOf(weight_edit)
+        # Data and Targets tab contains unified list, sampling panel, species table
+        assert data_targets_widget.isAncestorOf(window._data_targets_tab.unified_list)
+        assert data_targets_widget.isAncestorOf(sampling_panel)
+        assert data_targets_widget.isAncestorOf(species_table_widget)
+        assert data_targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group"))
+        assert data_targets_widget.isAncestorOf(weight_mode)
+        assert data_targets_widget.isAncestorOf(weight_edit)
+        assert window._data_targets_tab.unified_list._list.count() == 1
 
-        assert targets_widget.isAncestorOf(targets_list)
-        assert targets_widget.isAncestorOf(window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel"))
-        assert targets_widget.isAncestorOf(weight_mode)
-        assert targets_widget.isAncestorOf(weight_edit)
-        assert _targets_dataset_ids(targets_list) == ["ds1"]
-
-        assert params_widget.isAncestorOf(window._param_table)
+        # Parameters tab contains param table and method combo, but not species table
+        assert params_widget.isAncestorOf(window._params_ics_tab._param_table)
         assert params_widget.isAncestorOf(window._params_ics_tab._method_combo)
-        assert params_widget.isAncestorOf(ic_table)
+        assert not params_widget.isAncestorOf(species_table_widget)
 
-        assert run_widget.isAncestorOf(run_stamp)
-        assert run_widget.isAncestorOf(window._run_results_tab._copy_stamp_button)
-        assert run_widget.isAncestorOf(window._run_results_tab._copy_stamp_json_button)
+        assert footer.isAncestorOf(results_summary_button)
         assert footer.isAncestorOf(run_block)
 
-        shell_sizes = shell_splitter.sizes()
-        assert len(shell_sizes) == 2
-        assert shell_sizes[0] > shell_sizes[1]
+        # Results subtab host is populated eagerly even before the Results page is active.
+        assert [results_subtabs.tabText(i) for i in range(results_subtabs.count())] == ["ds1", "All Datasets"]
+
+        # Switch to Results and verify the current page only; no shell splitter remains.
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
+        qt_app.processEvents()
+        assert content_stack.currentWidget() is window._run_results_tab
     finally:
         window.close()
 
 
-def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(qt_app):
+def test_unified_list_drives_targets_dataset_selection(qt_app):
     window = _make_two_dataset_window()
     try:
-        table = window._dataset_table
-        table.selectRow(1)
+        unified_list = window._data_targets_tab.unified_list
+        unified_list.select_dataset("ds2")
         qt_app.processEvents()
+        assert window._species_table._current_dataset_id == "ds2"
 
-        targets_idx = _tab_index(window._tabs, "Targets & Weights")
-        window._tabs.setCurrentIndex(targets_idx)
+        unified_list.select_dataset("ds1")
         qt_app.processEvents()
+        assert window._species_table._current_dataset_id == "ds1"
 
-        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
-        assert dataset_list is not None
-        current = dataset_list.currentItem()
-        assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds2"
-
-        dataset_list.setCurrentRow(0)
+        unified_list.select_dataset("ds2")
         qt_app.processEvents()
-        current = dataset_list.currentItem()
-        assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
-
-        data_idx = _tab_index(window._tabs, "Data")
-        window._tabs.setCurrentIndex(data_idx)
-        qt_app.processEvents()
-        table.selectRow(1)
-        qt_app.processEvents()
-
-        window._tabs.setCurrentIndex(targets_idx)
-        qt_app.processEvents()
-        current = dataset_list.currentItem()
-        assert current is not None
-        assert str(current.data(QtCore.Qt.UserRole) or "") == "ds1"
+        assert window._species_table._current_dataset_id == "ds2"
     finally:
         window.close()
 
@@ -203,29 +173,27 @@ def test_targets_tab_initializes_from_data_selection_then_keeps_local_selection(
 def test_targets_dataset_switch_flushes_visible_weight_edit(qt_app):
     window = _make_two_dataset_window()
     try:
-        targets_idx = _tab_index(window._tabs, "Targets & Weights")
-        window._tabs.setCurrentIndex(targets_idx)
+        # Targets panel is always visible in unified layout — no subtab switch needed.
         qt_app.processEvents()
 
-        dataset_list = window.findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
+        unified_list = window._data_targets_tab.unified_list
         weight_mode = window.findChild(QtWidgets.QComboBox, "global_fit_weight_mode_combo")
         weight_edit = window.findChild(QtWidgets.QLineEdit, "global_fit_dataset_weight_edit")
-        assert dataset_list is not None
         assert weight_mode is not None
         assert weight_edit is not None
 
-        dataset_list.setCurrentRow(0)
+        unified_list.select_dataset("ds1")
         qt_app.processEvents()
         weight_mode.setCurrentIndex(1)
         weight_edit.setText("0.75")
         qt_app.processEvents()
 
-        dataset_list.setCurrentRow(1)
+        unified_list.select_dataset("ds2")
         qt_app.processEvents()
 
         assert window._dataset_entries[0]["weight"] == pytest.approx(0.75)
 
-        dataset_list.setCurrentRow(0)
+        unified_list.select_dataset("ds1")
         qt_app.processEvents()
         assert weight_edit.text() == "0.75"
     finally:
@@ -240,20 +208,108 @@ def test_shell_uses_single_top_navigation_host_and_survives_narrow_resize(qt_app
         qt_app.processEvents()
 
         top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
-        shell_splitter = window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter")
         content_stack = window.findChild(QtWidgets.QStackedWidget, "global_fit_current_tab_stack")
 
         assert top_tabs is not None
-        assert shell_splitter is not None
         assert content_stack is not None
+        assert window.findChild(QtWidgets.QSplitter, "global_fit_shell_splitter") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_right_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_context_tabs") is None
         assert window.findChild(QtWidgets.QTabWidget, "global_fit_detail_tabs") is None
 
-        assert top_tabs.count() == 4
-        assert window._subset_widget.width() >= 300
+        assert top_tabs.count() == 3
         assert content_stack.width() >= 260
-        assert window._subset_widget.parentWidget() is shell_splitter
-        assert content_stack.parentWidget() is shell_splitter
+        assert content_stack.parentWidget() is window
+
+        # Switch to Results: stack still occupies the shell directly.
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
+        qt_app.processEvents()
+        assert content_stack.width() >= 260
+    finally:
+        window.close()
+
+
+def test_results_page_switches_without_subset_panel_logic(qt_app):
+    """Regression: Results page is stack-driven and no subset shell remains."""
+    window = _make_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        top_tabs = window._tabs
+
+        assert not hasattr(window, "_subset_widget")
+
+        # Switch to each page — the stack updates without any left-panel show/hide behavior.
+        for title in ("Data and Targets", "Parameters"):
+            top_tabs.setCurrentIndex(_tab_index(top_tabs, title))
+            qt_app.processEvents()
+            assert window._current_tab_stack.currentIndex() == _tab_index(top_tabs, title)
+
+        # Switch to Results — the Results page becomes current.
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
+        qt_app.processEvents()
+        assert window._current_tab_stack.currentWidget() is window._run_results_tab
+    finally:
+        window.close()
+
+
+def test_unified_layout_structure_and_subset_visibility(qt_app):
+    """Regression: 3 top-level tabs, DataTargetsTab has unified master/detail layout, subset visibility correct."""
+    from kindred.gui.fitting.data_tab import DataTab
+    from kindred.gui.fitting.data_targets_tab import DataTargetsTab
+    from kindred.gui.fitting.unified_dataset_list import UnifiedDatasetList
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
+
+    window = _make_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        top_tabs = window._tabs
+
+        # Exactly 3 top-level tabs with correct names
+        assert top_tabs.count() == 3
+        titles = [top_tabs.tabText(i) for i in range(top_tabs.count())]
+        assert titles == ["Data and Targets", "Parameters", "Results"]
+
+        # Page 0 is DataTargetsTab
+        dt_tab = window._data_targets_tab
+        assert isinstance(dt_tab, DataTargetsTab)
+
+        # DataTargetsTab contains a QSplitter, NOT a QTabWidget for subtabs.
+        assert dt_tab.findChild(QtWidgets.QTabWidget) is None
+        assert dt_tab.findChild(QtWidgets.QSplitter) is not None
+
+        # UnifiedDatasetList is present
+        assert isinstance(dt_tab.unified_list, UnifiedDatasetList)
+        assert dt_tab.isAncestorOf(dt_tab.unified_list)
+
+        # Species table and sampling panel are children of the DataTargetsTab.
+        # DataTab itself is hidden (signals/state owner only, not a layout child).
+        assert isinstance(dt_tab.data_tab, DataTab)
+        assert dt_tab.isAncestorOf(dt_tab.data_tab._sampling_panel_widget)
+        assert dt_tab.isAncestorOf(dt_tab.species_table)
+        assert isinstance(dt_tab.species_table, UnifiedSpeciesTable)
+
+        # Unified list is populated with 1 dataset
+        assert dt_tab.unified_list.selected_dataset_id() == "ds1"
+
+        # Results page is a normal stack page; no separate subset widget remains.
+        assert not hasattr(window, "_subset_widget")
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Parameters"))
+        qt_app.processEvents()
+        assert window._current_tab_stack.currentWidget() is window._params_ics_tab
+
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Results"))
+        qt_app.processEvents()
+        assert window._current_tab_stack.currentWidget() is window._run_results_tab
+
+        top_tabs.setCurrentIndex(_tab_index(top_tabs, "Data and Targets"))
+        qt_app.processEvents()
+        assert window._current_tab_stack.currentWidget() is window._data_targets_tab
+
+        # Species table is loaded for a dataset (proves on_tab_activated ran during construction)
+        assert window._species_table._current_dataset_id is not None
     finally:
         window.close()

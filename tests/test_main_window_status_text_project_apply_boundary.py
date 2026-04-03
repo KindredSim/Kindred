@@ -416,7 +416,7 @@ def test_apply_project_payload_clears_dirty_session_state(main_window, qt_app):
     assert data_panel._dataset_list.count() == 0
     assert data_panel.get_selected_dataset() == (None, None)
     assert not data_panel._preview_label.isVisible()
-    assert not data_panel._mapping_widget.isVisible()
+    assert not hasattr(data_panel, "_mapping_widget")
 
     assert main_window._dataset_manager._dataset_views == {}
     assert main_window._dataset_manager._fit_settings == {}

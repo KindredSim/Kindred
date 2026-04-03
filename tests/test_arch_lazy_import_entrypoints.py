@@ -33,5 +33,6 @@ def test_lazy_import_pressure_is_reduced_to_single_entrypoints() -> None:
         .joinpath("worker.py")
         .read_text(encoding="utf-8")
     )
-    assert "from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name" in worker_source
-    assert "        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name" not in worker_source
+    assert "from kindred.core.simulator.solvers import normalize_solver_name" in worker_source
+    assert "from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER" in worker_source
+    assert "        from kindred.core.simulator.solvers import normalize_solver_name" not in worker_source

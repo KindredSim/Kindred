@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+import csv
+from contextlib import closing, suppress
+import itertools
 import logging
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -13,8 +15,23 @@ from PySide6.QtCore import Qt
 
 from kindred.core.datasets.csv_import import (
     CsvImportInterrupted,
-    load_csv_dataset,
+    parse_csv_rows,
 )
+from kindred.core.datasets.excel_import import (
+    list_sheets,
+    read_excel_sheet_rows,
+)
+from kindred.gui.widgets.import_config import (
+    ImportConfig,
+    ResolvedSheetPlan,
+    SheetImportIntent,
+    UnitDetection,
+    UserImportIntent,
+    detect_units_from_row_mapping,
+    rebuild_intent_for_target,
+    resolve_import_plans,
+)
+from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 
 logger = logging.getLogger(__name__)
 
@@ -23,30 +40,48 @@ __all__ = ["DataManagerPanel"]
 class CSVLoaderWorker(QtCore.QThread):
     """Background worker for loading CSV files without blocking UI."""
 
-    # Signals
     finished = QtCore.Signal(str, dict)  # name, data
     cancelled = QtCore.Signal(str)  # dataset name
     error = QtCore.Signal(str)  # error message
     progress = QtCore.Signal(int)  # progress percentage
+    done = QtCore.Signal()
 
-    def __init__(
-        self,
-        filepath: str,
-        time_column: Optional[str] = None,
-        species_columns: Optional[Sequence[str]] = None,
-    ):
-        """
-        Initialize CSV loader worker.
-
-        Parameters
-        ----------
-        filepath : str
-            Path to CSV file to load
-        """
+    def __init__(self, plan: ResolvedSheetPlan):
         super().__init__()
-        self.filepath = filepath
-        self._time_column = (time_column or "").strip() or None
-        self._species_columns = [col.strip() for col in (species_columns or []) if col and col.strip()]
+        self.filepath = plan.filepath
+        self._time_column = plan.time_column or None
+        self._species_columns = list(plan.species_columns)
+        self._skip_unit_row = plan.skip_unit_row
+
+    def _load_csv_payload(self) -> dict:
+        with open(self.filepath, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if header is None:
+                raise ValueError("CSV file is empty")
+            normalized_header = [str(column).strip() for column in header]
+            row_iter = iter(reader)
+            first_row = next(row_iter, None)
+            if first_row is None:
+                raise ValueError("CSV file is empty")
+            if self._skip_unit_row:
+                rows = row_iter
+            else:
+                rows = itertools.chain((first_row,), row_iter)
+            normalized_rows = (
+                {
+                    normalized_header[index]: (row[index] if index < len(row) else "")
+                    for index in range(len(normalized_header))
+                }
+                for row in rows
+            )
+            _time_source, data = parse_csv_rows(
+                normalized_rows,
+                time_column=self._time_column,
+                species_columns=self._species_columns,
+                interruption_checker=self.isInterruptionRequested,
+            )
+        return data
 
     def run(self):
         """Load CSV file in background thread."""
@@ -74,12 +109,7 @@ class CSVLoaderWorker(QtCore.QThread):
 
             # Stream CSV rows through the shared core importer so interruption can
             # be observed during file iteration rather than only after full read.
-            _loaded_name, data = load_csv_dataset(
-                filename,
-                time_column=self._time_column,
-                species_columns=self._species_columns,
-                interruption_checker=self.isInterruptionRequested,
-            )
+            data = self._load_csv_payload()
             logger.debug(
                 "Parsed CSV dataset: time column '%s', species columns: %s",
                 data.get("metadata", {}).get("time_column"),
@@ -111,6 +141,83 @@ class CSVLoaderWorker(QtCore.QThread):
         except Exception as e:
             logger.error(f"CSV import failed: {dataset_name} - {type(e).__name__}: {e}", exc_info=True)
             self.error.emit(f"{type(e).__name__}: {str(e)}")
+        finally:
+            self.done.emit()
+
+
+class ExcelLoaderWorker(QtCore.QThread):
+    """Background worker for loading Excel sheets without blocking UI."""
+
+    finished = QtCore.Signal(str, dict)  # name, data
+    cancelled = QtCore.Signal(str)  # dataset name
+    error = QtCore.Signal(str)  # error message
+    progress = QtCore.Signal(int)  # progress percentage
+    done = QtCore.Signal()
+
+    def __init__(self, filepath: str, plans: Sequence[ResolvedSheetPlan]):
+        super().__init__()
+        self.filepath = str(filepath)
+        self._plans = list(plans)
+
+    def _load_sheet_payload(self, plan: ResolvedSheetPlan) -> Tuple[str, dict]:
+        with closing(read_excel_sheet_rows(self.filepath, plan.sheet_name)) as rows:
+            row_iter = iter(rows)
+            first_row = next(row_iter, None)
+            if first_row is None:
+                raise ValueError(f"Sheet '{plan.sheet_name}' is empty.")
+            first_row_mapping = dict(first_row)
+            if plan.skip_unit_row:
+                rows_to_parse = row_iter
+            else:
+                rows_to_parse = itertools.chain((first_row_mapping,), row_iter)
+            _time_source, data = parse_csv_rows(
+                rows_to_parse,
+                time_column=plan.time_column,
+                species_columns=list(plan.species_columns),
+                interruption_checker=self.isInterruptionRequested,
+            )
+        return f"{os.path.basename(self.filepath)}::{plan.sheet_name}", data
+
+    def run(self):
+        dataset_name = os.path.basename(self.filepath)
+        total = len(self._plans)
+
+        if total <= 0:
+            self.error.emit("No Excel sheets were selected for import.")
+            self.done.emit()
+            return
+
+        try:
+            self.progress.emit(0)
+            for index, plan in enumerate(self._plans, start=1):
+                if self.isInterruptionRequested():
+                    logger.info("Excel import interrupted before sheet %s: %s", plan.sheet_name, dataset_name)
+                    self.cancelled.emit(dataset_name)
+                    return
+                try:
+                    loaded_name, data = self._load_sheet_payload(plan)
+                except CsvImportInterrupted:
+                    logger.info("Excel import interrupted while parsing sheet %s: %s", plan.sheet_name, dataset_name)
+                    self.cancelled.emit(dataset_name)
+                    return
+                except Exception as exc:
+                    logger.error(
+                        "Excel import failed: %s sheet %s - %s: %s",
+                        dataset_name, plan.sheet_name, type(exc).__name__, exc, exc_info=True,
+                    )
+                    self.error.emit(f"Sheet '{plan.sheet_name}': {type(exc).__name__}: {exc}")
+                else:
+                    self.finished.emit(loaded_name, data)
+                self.progress.emit(int((index / total) * 100))
+                if self.isInterruptionRequested():
+                    logger.info("Excel import interrupted after sheet %s: %s", plan.sheet_name, dataset_name)
+                    self.cancelled.emit(dataset_name)
+                    return
+        except Exception as exc:
+            logger.error("Excel import failed: %s - %s: %s", dataset_name, type(exc).__name__, exc, exc_info=True)
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+        finally:
+            self.done.emit()
 
 
 class DataManagerPanel(QtWidgets.QWidget):
@@ -118,11 +225,11 @@ class DataManagerPanel(QtWidgets.QWidget):
     Data manager for loading/managing experimental datasets.
 
     Features:
-    - Load CSV files with experimental data
+    - Load CSV and Excel files with experimental data
     - Auto-detect time column (tries: time, time_s, t, Time, T, x)
     - Extract all numeric columns as species
     - Preview loaded datasets
-    - Column mapping configuration
+    - Import configuration dialog with unit selection
     - Multiple dataset support
 
     Signals:
@@ -161,7 +268,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
-        self._load_btn = QtWidgets.QPushButton("Load CSV")
+        self._load_btn = QtWidgets.QPushButton("Load Data")
         self._load_btn.setObjectName("loadDataButton")
         self._load_btn.clicked.connect(self._load_dataset)
         self._remove_btn = QtWidgets.QPushButton("Remove")
@@ -179,29 +286,19 @@ class DataManagerPanel(QtWidgets.QWidget):
         layout.addWidget(self._preview_label)
         self._preview_label.hide()
 
-        # Column mapping section
-        layout.addWidget(QtWidgets.QLabel("Column Mapping:"))
-        self._mapping_widget = QtWidgets.QWidget()
-        mapping_layout = QtWidgets.QFormLayout(self._mapping_widget)
-        self._time_col_edit = QtWidgets.QLineEdit()
-        self._time_col_edit.setPlaceholderText("auto-detect (time, t, ...)")
-        self._species_col_edit = QtWidgets.QLineEdit()
-        self._species_col_edit.setPlaceholderText("comma-separated, leave blank for auto")
-        mapping_layout.addRow("Time column:", self._time_col_edit)
-        mapping_layout.addRow("Species columns:", self._species_col_edit)
-        layout.addWidget(self._mapping_widget)
-        self._mapping_widget.hide()
-
         # Store loaded datasets {name: {t: array, species: {name: array}}}
         self._datasets: Dict[str, Dict] = {}
 
-        # Track multiple CSV workers for multi-file loading
-        self._csv_workers: List[CSVLoaderWorker] = []
+        # Track active import workers across CSV and Excel loads.
+        self._csv_workers: List[QtCore.QThread] = []
         self._pending_files_count = 0
         self._completed_files_count = 0
         self._progress_dialog: Optional[QtWidgets.QProgressDialog] = None
         self._cancel_requested = False
         self._load_finished_emitted = False
+        self._pending_import_configs: Dict[str, ImportConfig] = {}
+        self._pending_import_units_remaining: Dict[str, int] = {}
+        self._load_generation = 0
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -212,89 +309,246 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def clear_datasets(self) -> None:
         """Clear loaded datasets and reset dataset-panel UI state."""
+        self._load_generation += 1
+        workers = list(self._csv_workers)
+        for worker in workers:
+            with suppress(RuntimeError):
+                worker.requestInterruption()
+        for worker in workers:
+            self._cleanup_worker(worker)
+        self._pending_files_count = 0
+        self._completed_files_count = 0
+        self._pending_import_configs.clear()
+        self._pending_import_units_remaining.clear()
+        self._cancel_requested = False
+        self._load_finished_emitted = False
+        self._finalize_progress_dialog()
         self._datasets.clear()
         self._dataset_list.clear()
         self._preview_label.setText("No dataset selected")
         self._preview_label.hide()
-        self._mapping_widget.hide()
-        self._time_col_edit.clear()
-        self._species_col_edit.clear()
 
     def _load_dataset(self):
-        """Load CSV dataset(s) using background worker(s). Supports multi-select."""
+        """Load dataset(s) using per-file import configuration and background workers."""
         filenames, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
             "Load Dataset(s)",
             "",
-            "CSV Files (*.csv);;Text Files (*.txt);;All Files (*)"
+            "Data Files (*.csv *.xlsx);;CSV Files (*.csv);;Excel Files (*.xlsx);;Text Files (*.txt);;All Files (*)"
         )
 
         if not filenames:
             return
 
-        # Initialize counters for multi-file tracking
-        self._pending_files_count = len(filenames)
+        configs: List[ImportConfig] = []
+        index = 0
+        while index < len(filenames):
+            filepath = str(filenames[index])
+            remaining = len(filenames) - index - 1
+            result = self._collect_import_config(filepath, remaining)
+            if result.action == "cancel":
+                return
+            if result.action == "skip":
+                index += 1
+                continue
+            if result.config is None:
+                index += 1
+                continue
+            configs.append(result.config)
+            if result.config.file_intent.apply_to_remaining:
+                source_intent = result.config.remaining_file_template
+                if source_intent is None:
+                    raise RuntimeError(
+                        "apply_to_remaining is True but remaining_file_template is None"
+                    )
+                source_sheet_names = result.config.file_intent.sheet_names
+                for remaining_idx in range(index + 1, len(filenames)):
+                    remaining_path = str(filenames[remaining_idx])
+                    try:
+                        remaining_config = self._build_remaining_file_config(
+                            remaining_path, source_intent,
+                            source_sheet_names=source_sheet_names,
+                        )
+                    except (ValueError, OSError, UnicodeDecodeError) as exc:
+                        QtWidgets.QMessageBox.critical(
+                            self,
+                            "Import Error",
+                            f"Cannot apply settings to "
+                            f"'{os.path.basename(remaining_path)}':\n\n{exc}",
+                        )
+                        continue
+                    configs.append(remaining_config)
+                break
+            index += 1
+
+        if not configs:
+            return
+
+        expected_count = sum(self._expected_dataset_count_for_config(config) for config in configs)
+        if expected_count <= 0:
+            return
+
+        self._load_generation += 1
+        current_generation = self._load_generation
+        self._pending_files_count = expected_count
         self._completed_files_count = 0
         self._cancel_requested = False
         self._load_finished_emitted = False
+        self._pending_import_configs.clear()
+        self._pending_import_units_remaining.clear()
 
-        file_count = len(filenames)
-        file_list = ", ".join([os.path.basename(f) for f in filenames[:3]])
-        if file_count > 3:
-            file_list += f", ... ({file_count - 3} more)"
+        dataset_label = f"{expected_count} dataset{'s' if expected_count != 1 else ''}"
+        logger.info("User initiated dataset import: %s", dataset_label)
 
-        logger.info(f"User initiated CSV import: {file_count} file(s) - {file_list}")
-
-        # Create progress dialog
         self._progress_dialog = QtWidgets.QProgressDialog(
-            f"Loading {file_count} file(s)...", "Cancel", 0, 100, self
+            f"Loading {dataset_label}...", "Cancel", 0, 100, self
         )
         self._progress_dialog.setWindowTitle("Loading Datasets")
         self._progress_dialog.setWindowModality(Qt.WindowModal)
-        self._progress_dialog.setMinimumDuration(0)  # Show immediately
+        self._progress_dialog.setMinimumDuration(0)
         self._progress_dialog.canceled.connect(self._on_load_canceled)
         self._progress_dialog.show()
 
-        time_column = self._time_col_edit.text().strip() or None
-        species_text = self._species_col_edit.text().strip()
-        species_columns = [col.strip() for col in species_text.split(',') if col.strip()] if species_text else []
-
-        # Create and start worker for each file
-        for filename in filenames:
-            worker = CSVLoaderWorker(
-                filename,
-                time_column=time_column,
-                species_columns=species_columns or None,
-            )
+        for config in configs:
+            result_units = self._expected_dataset_count_for_config(config)
+            self._pending_import_configs[config.filepath] = config
+            self._pending_import_units_remaining[config.filepath] = result_units
+            if config.file_type == "excel":
+                worker: QtCore.QThread = ExcelLoaderWorker(config.filepath, list(config.plans))
+                worker.finished.connect(self._on_excel_loaded)
+            else:
+                worker = CSVLoaderWorker(config.plans[0])
+                worker.finished.connect(self._on_csv_loaded)
+            setattr(worker, "_expected_result_count", result_units)
+            setattr(worker, "_accounted_result_count", 0)
+            setattr(worker, "_load_generation", current_generation)
             worker.progress.connect(self._on_load_progress)
-            worker.finished.connect(self._on_csv_loaded)
             worker.cancelled.connect(self._on_csv_cancelled)
             worker.error.connect(self._on_csv_error)
-            worker.finished.connect(lambda *args, w=worker: self._cleanup_worker(w))
-            worker.cancelled.connect(lambda *args, w=worker: self._cleanup_worker(w))
-            worker.error.connect(lambda *args, w=worker: self._cleanup_worker(w))
-
+            worker.done.connect(self._on_worker_done)
             self._csv_workers.append(worker)
             worker.start()
 
+    def _expected_dataset_count_for_config(self, config: ImportConfig) -> int:
+        return len(config.plans)
+
+    def _collect_import_config(self, filepath: str, remaining_count: int) -> ImportDialogResult:
+        try:
+            dialog = ImportConfigDialog(filepath, remaining_count=remaining_count, parent=self)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to open import configuration for '{os.path.basename(filepath)}':\n\n{type(exc).__name__}: {exc}",
+            )
+            return ImportDialogResult(config=None, action="skip")
+        dialog.exec()
+        return dialog.get_result()
+
+    def _build_remaining_file_config(
+        self,
+        filepath: str,
+        source_intent: SheetImportIntent,
+        *,
+        source_sheet_names: Tuple[str, ...] = (),
+    ) -> ImportConfig:
+        """Build an ImportConfig for a remaining file using the source intent.
+
+        Raises ValueError if the source intent is incompatible with the file.
+        """
+        lower = filepath.lower()
+        file_type = "excel" if lower.endswith(".xlsx") else "csv"
+
+        per_sheet_intents: Dict[Optional[str], SheetImportIntent] = {}
+        per_sheet_detections: Dict[Optional[str], UnitDetection] = {}
+        per_sheet_columns: Dict[Optional[str], List[str]] = {}
+        target_sheet_names: Tuple[str, ...] = ()
+
+        # Scope detection to source-selected columns only
+        selected_keys = set(source_intent.species_columns)
+        if source_intent.time_column:
+            selected_keys.add(source_intent.time_column)
+
+        if file_type == "csv":
+            with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    raise ValueError("CSV file is empty")
+                columns = [h.strip() for h in header]
+                first_row_raw = next(reader, None)
+            if first_row_raw is not None:
+                row_values = [c.strip() if c else "" for c in first_row_raw]
+                row_mapping = dict(zip(columns, row_values))
+                det = detect_units_from_row_mapping(
+                    row_mapping, list(selected_keys)
+                )
+            else:
+                det = UnitDetection.empty()
+            per_sheet_intents[None] = rebuild_intent_for_target(
+                source_intent, det,
+            )
+            per_sheet_detections[None] = det
+            per_sheet_columns[None] = columns
+        else:
+            sheets = list_sheets(filepath)
+            if not sheets:
+                raise ValueError("Excel file has no sheets")
+            # Filter sheets by source's checked set
+            if source_sheet_names:
+                source_set = set(source_sheet_names)
+                sheets = [s for s in sheets if s in source_set]
+                if not sheets:
+                    raise ValueError("No matching sheets found")
+            for sheet_name in sheets:
+                with closing(read_excel_sheet_rows(filepath, sheet_name)) as rows:
+                    first_row = next(iter(rows), None)
+                if first_row is None:
+                    per_sheet_columns[sheet_name] = []
+                    per_sheet_detections[sheet_name] = UnitDetection.empty()
+                else:
+                    per_sheet_columns[sheet_name] = list(first_row.keys())
+                    per_sheet_detections[sheet_name] = detect_units_from_row_mapping(
+                        dict(first_row), list(selected_keys)
+                    )
+                per_sheet_intents[sheet_name] = rebuild_intent_for_target(
+                    source_intent, per_sheet_detections[sheet_name],
+                )
+            target_sheet_names = tuple(sheets)
+
+        plans = resolve_import_plans(
+            filepath, file_type,
+            per_sheet_intents, per_sheet_detections, per_sheet_columns,
+        )
+
+        file_intent = UserImportIntent(
+            sheet_names=target_sheet_names,
+            apply_to_remaining=False,
+        )
+        return ImportConfig(
+            filepath=filepath,
+            file_type=file_type,
+            file_intent=file_intent,
+            per_sheet_intents=tuple(per_sheet_intents.items()),
+            plans=tuple(plans),
+        )
+
     def _on_load_progress(self, percent: int):
-        """Handle progress updates from CSV worker(s)."""
+        """Handle progress updates from dataset import worker(s)."""
         if self._progress_dialog:
-            # Calculate overall progress across all files
             if self._pending_files_count > 0:
                 completed_fraction = self._completed_files_count / self._pending_files_count
                 current_file_fraction = (1.0 / self._pending_files_count) * (percent / 100.0)
                 overall_percent = int((completed_fraction + current_file_fraction) * 100)
-                self._progress_dialog.setValue(min(overall_percent, 99))  # Reserve 100 for completion
+                self._progress_dialog.setValue(min(overall_percent, 99))
 
     def _on_load_canceled(self):
-        """Handle cancel request during CSV loading."""
-        # Request interruption for all active workers
+        """Handle cancel request during dataset loading."""
         for worker in self._csv_workers:
             if worker:
                 worker.requestInterruption()
 
-        logger.info("CSV import cancellation requested by user")
+        logger.info("Dataset import cancellation requested by user")
         self._cancel_requested = True
 
         # Close progress dialog immediately
@@ -305,9 +559,12 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._maybe_finalize_load_cycle()
 
     def _on_csv_cancelled(self, name: str):
-        """Handle CSV cancellation without surfacing an error dialog."""
-        logger.info("CSV import canceled: %s", name)
-        self._completed_files_count += 1
+        """Handle dataset import cancellation without surfacing an error dialog."""
+        sender = self.sender()
+        if sender is not None and int(getattr(sender, "_load_generation", -1)) != int(self._load_generation):
+            return
+        logger.info("Dataset import canceled: %s", name)
+        self._note_worker_units_processed(sender, self._remaining_worker_result_count(sender))
         self._maybe_finalize_load_cycle()
 
     def _emit_load_finished(self, canceled: bool) -> None:
@@ -321,6 +578,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Close and clear the progress dialog if it exists."""
         if not self._progress_dialog:
             return
+        try:
+            self._progress_dialog.canceled.disconnect(self._on_load_canceled)
+        except (TypeError, RuntimeError):
+            pass
         with suppress(RuntimeError, TypeError):
             self._progress_dialog.setValue(100)
         self._progress_dialog.close()
@@ -336,13 +597,46 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._finalize_progress_dialog()
             self._pending_files_count = 0
             self._completed_files_count = 0
+            self._pending_import_configs.clear()
+            self._pending_import_units_remaining.clear()
             self._emit_load_finished(self._cancel_requested)
             self._cancel_requested = False
 
-    def _cleanup_worker(self, worker: CSVLoaderWorker):
+    def _remaining_worker_result_count(self, worker: Optional[QtCore.QThread]) -> int:
+        if worker is None:
+            return 0
+        expected = int(getattr(worker, "_expected_result_count", 0) or 0)
+        accounted = int(getattr(worker, "_accounted_result_count", 0) or 0)
+        return max(0, expected - accounted)
+
+    def _note_worker_units_processed(self, worker: Optional[QtCore.QThread], count: int) -> None:
+        if worker is None:
+            return
+        if int(getattr(worker, "_load_generation", -1)) != int(self._load_generation):
+            return
+        expected = int(getattr(worker, "_expected_result_count", 0) or 0)
+        accounted = int(getattr(worker, "_accounted_result_count", 0) or 0)
+        delta = max(0, min(int(count), max(0, expected - accounted)))
+        if delta <= 0:
+            return
+        setattr(worker, "_accounted_result_count", accounted + delta)
+        self._completed_files_count += delta
+        filepath = str(getattr(worker, "filepath", "") or "")
+        if not filepath:
+            return
+        remaining = max(0, int(self._pending_import_units_remaining.get(filepath, 0) or 0) - delta)
+        if remaining <= 0:
+            self._pending_import_units_remaining.pop(filepath, None)
+            self._pending_import_configs.pop(filepath, None)
+            return
+        self._pending_import_units_remaining[filepath] = remaining
+
+    def _cleanup_worker(self, worker: QtCore.QThread):
         """Clean up worker thread after completion or error."""
         if not worker:
             return
+
+        self._note_worker_units_processed(worker, self._remaining_worker_result_count(worker))
 
         try:
             worker.requestInterruption()
@@ -362,6 +656,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             getattr(worker, "finished", None),
             getattr(worker, "error", None),
             getattr(worker, "cancelled", None),
+            getattr(worker, "done", None),
         ):
             if signal is None:
                 continue
@@ -380,33 +675,67 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         self._maybe_finalize_load_cycle()
 
-    def _on_csv_loaded(self, name: str, data: dict):
-        """Handle successful CSV load with automatic unique naming."""
-        # Ensure unique dataset name
+    def _on_worker_done(self) -> None:
+        """Marshal worker cleanup back onto the GUI thread."""
+        self._cleanup_worker(self.sender())
+
+    def _apply_unit_conversion(self, data: dict, plan: ResolvedSheetPlan) -> None:
+        metadata = data.setdefault("metadata", {})
+        if plan.time_factor != 1.0:
+            data["t"] = data["t"] * plan.time_factor
+        for species_name in list(data["species"].keys()):
+            factor = plan.conc_factors[species_name]
+            if factor != 1.0:
+                data["species"][species_name] = data["species"][species_name] * factor
+        metadata["original_time_unit"] = plan.original_time_unit
+        metadata["original_concentration_units"] = dict(plan.original_conc_units)
+
+    def _finalize_loaded_dataset(self, worker: Optional[QtCore.QThread], name: str, data: dict) -> None:
+        if worker is not None and int(getattr(worker, "_load_generation", -1)) != int(self._load_generation):
+            return
+        config = self._pending_import_configs.get(str(getattr(worker, "filepath", "") or ""))
+        plan: Optional[ResolvedSheetPlan] = None
+        if config is not None:
+            if "::" in name:
+                sheet_name = name.split("::", 1)[1]
+                plan = next((p for p in config.plans if p.sheet_name == sheet_name), None)
+            elif config.plans:
+                plan = config.plans[0]
+        try:
+            if plan is not None:
+                self._apply_unit_conversion(data, plan)
+        except Exception as exc:
+            self._note_worker_units_processed(worker, 1)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to apply import settings:\n\n{type(exc).__name__}: {exc}",
+            )
+            self._maybe_finalize_load_cycle()
+            return
+
         unique_name = self._make_unique_dataset_name(name)
-
-        # Store dataset with unique name
         self._datasets[unique_name] = data
-
-        # Add to list
         self._dataset_list.addItem(unique_name)
-
-        # Emit signal with unique name
         self.datasetLoaded.emit(unique_name, data)
-
-        # Track completion for multi-file progress
-        self._completed_files_count += 1
-
+        self._note_worker_units_processed(worker, 1)
         self._maybe_finalize_load_cycle()
 
-        # Note: Worker already logged completion, no need to log again here
+    def _on_csv_loaded(self, name: str, data: dict):
+        """Handle successful CSV load with import settings applied."""
+        self._finalize_loaded_dataset(self.sender(), name, data)
+
+    def _on_excel_loaded(self, name: str, data: dict):
+        """Handle successful Excel sheet load with import settings applied."""
+        self._finalize_loaded_dataset(self.sender(), name, data)
 
     def _on_csv_error(self, error_msg: str):
-        """Handle CSV load error."""
-        # Track completion even for errors
-        self._completed_files_count += 1
+        """Handle dataset load error."""
+        sender = self.sender()
+        if sender is not None and int(getattr(sender, "_load_generation", -1)) != int(self._load_generation):
+            return
+        self._note_worker_units_processed(sender, 1)
 
-        # Show error message
         QtWidgets.QMessageBox.critical(
             self,
             "Load Error",
@@ -434,18 +763,15 @@ class DataManagerPanel(QtWidgets.QWidget):
         if not current:
             self._preview_label.setText("No dataset selected")
             self._preview_label.hide()
-            self._mapping_widget.hide()
             return
 
         name = current.text()
         if name not in self._datasets:
             self._preview_label.hide()
-            self._mapping_widget.hide()
             return
 
         data = self._datasets[name]
         self._preview_label.show()
-        self._mapping_widget.show()
         t = data['t']
         species = data['species']
 

@@ -15,19 +15,14 @@ def _make_tab():
 
 
 def test_construction(qt_app):
-    """RunResultsTab builds expected widget hierarchy."""
+    """RunResultsTab builds expected widget hierarchy (no Run Stamp GroupBox)."""
     tab = _make_tab()
     try:
-        stamp_label = tab.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
-        assert stamp_label is not None
+        groups = tab.findChildren(QtWidgets.QGroupBox)
+        stamp_groups = [g for g in groups if g.title() == "Run Stamp"]
+        assert len(stamp_groups) == 0
 
-        copy_btn = tab.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_button")
-        assert copy_btn is not None
-
-        copy_json_btn = tab.findChild(QtWidgets.QPushButton, "global_fit_copy_stamp_json_button")
-        assert copy_json_btn is not None
-
-        assert len(tab._stats_labels) == 8
+        assert hasattr(tab, "open_results_summary_dialog")
     finally:
         tab.close()
         qt_app.processEvents()
@@ -47,34 +42,66 @@ def test_signals_defined(qt_app):
 
 
 def test_set_run_stamp(qt_app):
-    """set_run_stamp populates label and enables copy buttons."""
+    """set_run_stamp stores stamp data internally."""
     tab = _make_tab()
     try:
-        assert not tab._copy_stamp_button.isEnabled()
-        assert not tab._copy_stamp_json_button.isEnabled()
-
         tab.set_run_stamp({"solver": "LSODA"}, "abc123hash", "abc123")
         qt_app.processEvents()
 
-        assert tab._run_stamp_label.text() == "Stamp: abc123"
-        assert tab._copy_stamp_button.isEnabled()
-        assert tab._copy_stamp_json_button.isEnabled()
+        assert tab._last_run_stamp == {"solver": "LSODA"}
+        assert tab._last_run_stamp_hash == "abc123hash"
+        assert tab._last_run_stamp_short == "abc123"
     finally:
         tab.close()
         qt_app.processEvents()
 
 
 def test_update_statistics(qt_app):
-    """update_statistics writes values into stat labels."""
+    """update_statistics stores values internally."""
     tab = _make_tab()
     try:
         tab.update_statistics({"Datasets": 3, "SSQ": 1.5, "Points": 100})
         qt_app.processEvents()
 
-        assert tab._stats_labels["Datasets"].text() == "3"
-        assert tab._stats_labels["SSQ"].text() == "1.5"
-        assert tab._stats_labels["Points"].text() == "100"
-        assert tab._stats_labels["DF"].text() == "\u2014"
+        assert tab._last_stats["Datasets"] == 3
+        assert tab._last_stats["SSQ"] == 1.5
+        assert tab._last_stats["Points"] == 100
     finally:
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_stamp_stats_sync_across_runs(qt_app):
+    """set_run_stamp clears stale stats; dialog reflects new state."""
+    tab = _make_tab()
+    try:
+        # Run A: stamp + stats
+        tab.set_run_stamp({"run": "A"}, "hashA", "shortA")
+        tab.update_statistics({"Datasets": 5, "SSQ": 2.0})
+        assert tab._last_stats == {"Datasets": 5, "SSQ": 2.0}
+
+        # Run B starts: stamp overwritten, stats must be cleared
+        tab.set_run_stamp({"run": "B"}, "hashB", "shortB")
+        assert tab._last_stats == {}  # old stats cleared
+
+        # Open dialog during run B (before stats arrive)
+        tab.open_results_summary_dialog()
+        qt_app.processEvents()
+        dialog = tab._stamp_dialog
+        assert dialog is not None
+        assert dialog._stamp_short == "shortB"
+        # All stats show dash
+        for label in dialog._stats_labels.values():
+            assert label.text() == "\u2014"
+
+        # Run B completes with new stats
+        tab.update_statistics({"Datasets": 10, "SSQ": 0.5})
+        qt_app.processEvents()
+        assert dialog._stamp_short == "shortB"
+        assert dialog._stats_labels["Datasets"].text() == "10"
+        assert dialog._stats_labels["SSQ"].text() == "0.5"
+    finally:
+        if tab._stamp_dialog is not None:
+            tab._stamp_dialog.close()
         tab.close()
         qt_app.processEvents()

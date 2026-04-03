@@ -208,6 +208,7 @@ class MainWindow(
         self._focused_batch_set_id = ""
         self._connected_batch_semantics_model = None
         self._connected_batch_selection_model = None
+        self._pending_import_batch_mapping_names: List[str] = []
         # (Batch run/caching/executor state lives in self._sim_controller.)
 
     def _init_settings_and_controllers(self) -> None:
@@ -1341,6 +1342,7 @@ class MainWindow(
         # Data manager signals
         self._right_panel._data_manager.datasetLoaded.connect(self._on_dataset_loaded)
         self._right_panel._data_manager.datasetRemoved.connect(self._on_dataset_removed)
+        self._right_panel._data_manager.loadFinished.connect(self._on_dataset_load_finished)
 
         # Temperature mode indicator updates
         self._temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
@@ -1689,6 +1691,182 @@ class MainWindow(
 
         self._status_label.setText(f"Dataset '{name}' loaded ({len(data['t'])} points)")
         self._sync_overlay_catalog()
+        self._pending_import_batch_mapping_names.append(str(name))
+
+    def _on_dataset_load_finished(self, canceled: bool) -> None:
+        """Resolve post-import batch mapping after a dataset load cycle completes."""
+        if not self._pending_import_batch_mapping_names:
+            return
+        batch_store = getattr(self, "_batch_store", None)
+        batch_model = getattr(self, "_batch_model", None)
+        batch_store_rows = int(batch_store.row_count()) if batch_store is not None else 0
+        batch_model_rows = int(batch_model.rowCount()) if batch_model is not None else 0
+        if not (batch_store_rows > 0 or batch_model_rows > 0):
+            self._pending_import_batch_mapping_names.clear()
+            return
+
+        mechanism_species: List[str] = []
+        try:
+            mechanism_species = list((self._extract_mechanism_initials(self._get_mechanism_text()) or {}).keys())
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.import_batch_mapping.extract_mechanism_initials",
+                message="Failed to extract mechanism initials while preparing import-time batch mapping",
+                exc=exc,
+            )
+        try:
+            self.sync_batch_species_columns(mechanism_species)
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.import_batch_mapping.sync_batch_species_columns",
+                message="Failed to sync batch species columns while preparing import-time batch mapping",
+                exc=exc,
+            )
+
+        data_panel = getattr(self._right_panel, "_data_manager", None)
+        pending_names = list(dict.fromkeys(self._pending_import_batch_mapping_names))
+        self._pending_import_batch_mapping_names.clear()
+        for dataset_name in pending_names:
+            if data_panel is None:
+                break
+            dataset_payload = data_panel.get_dataset(str(dataset_name))
+            if dataset_payload is None:
+                continue
+            self._maybe_prompt_for_import_batch_mapping(str(dataset_name), dataset_payload, mechanism_species)
+
+    def _maybe_prompt_for_import_batch_mapping(
+        self,
+        dataset_name: str,
+        dataset_payload: Dict[str, Any],
+        mechanism_species: Sequence[str],
+    ) -> None:
+        from kindred.gui.fitting.batch_mapping import (
+            T0_SEED_TOL_S,
+            apply_batch_mapping_to_settings,
+            create_and_seed_batch_set,
+            default_batch_set_name_for_dataset,
+            pick_existing_batch_set,
+            prompt_dataset_batch_mapping_choice,
+            resolve_saved_batch_mapping,
+            select_batch_set,
+            unique_batch_set_name,
+        )
+
+        batch_store = getattr(self, "_batch_store", None)
+        batch_model = getattr(self, "_batch_model", None)
+        if batch_store is None or batch_model is None:
+            return
+        try:
+            self.sync_batch_species_columns(list(mechanism_species))
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.import_batch_mapping.sync_batch_species_columns",
+                message="Failed to sync batch species columns while preparing import-time batch mapping",
+                exc=exc,
+            )
+
+        settings = self._dataset_manager.get_fit_settings(str(dataset_name))
+        resolved = resolve_saved_batch_mapping(settings, batch_store)
+        if resolved.status == "mapped":
+            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
+            return
+
+        batch_set_names = list(batch_store.set_names() or [])
+        if not batch_set_names:
+            return
+
+        create_set_name = unique_batch_set_name(
+            batch_set_names,
+            default_batch_set_name_for_dataset(str(dataset_name)) or str(dataset_name),
+        )
+        running_under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        action = prompt_dataset_batch_mapping_choice(
+            self,
+            str(dataset_name),
+            create_set_name,
+            title="Import Batch Mapping",
+            skip_label="Skip",
+            skip_description="Leave this dataset unmapped",
+            running_under_pytest=running_under_pytest,
+            pytest_default_action="skip",
+        )
+        if action == "skip":
+            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
+            return
+        if action == "map":
+            target_set = pick_existing_batch_set(
+                self,
+                str(dataset_name),
+                batch_set_names,
+                title="Map Dataset to Batch Set",
+                empty_message_title="Import Batch Mapping",
+                empty_message_text="No batch sets exist to map to. Create a batch set first.",
+            )
+            if not target_set:
+                self._dataset_manager.update_fit_settings(str(dataset_name), settings)
+                return
+            apply_batch_mapping_to_settings(settings, batch_store, target_set)
+            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
+            return
+
+        _row_idx, created, seeded = create_and_seed_batch_set(
+            dataset_name=str(dataset_name),
+            dataset_payload=dataset_payload,
+            mechanism_species=mechanism_species,
+            batch_store=batch_store,
+            batch_model=batch_model,
+            set_name=create_set_name,
+            record_failure=self._record_best_effort_failure,
+            failure_key_prefix="main_window.import_batch_mapping",
+        )
+        if created and not seeded and not mechanism_species:
+            self._dataset_manager.update_fit_settings(str(dataset_name), settings)
+            return
+        if created and batch_store is not None and not seeded:
+            try:
+                t_arr = np.asarray((dataset_payload or {}).get("t", []), dtype=float).reshape(-1)
+                t0 = float(t_arr[0]) if t_arr.size else float("nan")
+            except Exception:
+                t0 = float("nan")
+            if not (abs(t0) <= T0_SEED_TOL_S):
+                if running_under_pytest:
+                    response = QtWidgets.QMessageBox.StandardButton.Cancel
+                else:
+                    response = QtWidgets.QMessageBox.warning(
+                        self,
+                        "Import Batch Mapping",
+                        (
+                            f"Dataset '{dataset_name}' does not start at t\u22480 "
+                            f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
+                            "OK: Map this dataset to the new zeroed batch set\n"
+                            "Cancel: Leave this dataset unmapped and edit the new batch set manually"
+                        ),
+                        QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                        QtWidgets.QMessageBox.StandardButton.Cancel,
+                    )
+                if response == QtWidgets.QMessageBox.StandardButton.Cancel:
+                    select_batch_set(
+                        batch_store,
+                        batch_model,
+                        getattr(self, "_batch_table", None),
+                        create_set_name,
+                        record_failure=self._record_best_effort_failure,
+                        failure_key_prefix="main_window.import_batch_mapping",
+                    )
+                    if not running_under_pytest:
+                        QtWidgets.QMessageBox.information(
+                            self,
+                            "Import Batch Mapping",
+                            (
+                                f"Batch set '{create_set_name}' was created.\n\n"
+                                "Edit its initial concentrations in the Batch Initial Conditions table, "
+                                "then map the dataset when it is ready."
+                            ),
+                        )
+                    self._dataset_manager.update_fit_settings(str(dataset_name), settings)
+                    return
+        apply_batch_mapping_to_settings(settings, batch_store, create_set_name)
+        self._dataset_manager.update_fit_settings(str(dataset_name), settings)
 
     def _on_dataset_removed(self, name: str):
         """Handle dataset removal from the data manager."""
@@ -8413,8 +8591,13 @@ class MainWindow(
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         body_label = QtWidgets.QLabel(
-            "Desktop GUI for kinetic modeling and fitting.\n"
-            "MIT License.",
+            "Desktop GUI for reaction mechanism investigation, kinetic modeling, and data fitting.\n\n"
+            "The initial development of Kindred was led primarily by Pedro Helou de Oliveira.\n"
+            "Kindred is now developed and maintained jointly by Pedro Helou de Oliveira and Annabel Flook.\n\n"
+            "Certain GUI design elements were informed by ideas seen in Velocity, a kinetics software package developed and maintained by Chen Li.\n\n"
+            "Kindred source code is licensed under the MIT License.\n"
+            "Includes Qt for Python (PySide6/shiboken6) under LGPLv3/GPL terms.\n"
+            "See NOTICE.txt, COPYING, COPYING.LESSER, and THIRD_PARTY_LICENSES.txt.",
             dialog,
         )
         body_label.setObjectName("aboutBodyLabel")

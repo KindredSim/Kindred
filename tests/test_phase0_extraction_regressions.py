@@ -16,47 +16,6 @@ pytestmark = [pytest.mark.gui]
 
 
 # ---------------------------------------------------------------------------
-# Helpers — TargetsWeightsTab
-# ---------------------------------------------------------------------------
-
-def _make_tw_tab(*, entries=None, included_ids=None):
-    from kindred.gui.fitting.targets_weights_tab import TargetsWeightsTab
-
-    if entries is None:
-        t = np.linspace(0.0, 1.0, 6)
-        entries = [
-            {
-                "id": "ds1",
-                "label": "Dataset 1",
-                "t": t.copy(),
-                "species_data": {"A": np.linspace(0, 1, t.size)},
-                "selected_species": ["A"],
-                "weight": 1.0,
-                "include": True,
-            }
-        ]
-
-    _entries = list(entries)
-
-    if included_ids is None:
-        included_ids = [str(e["id"]) for e in _entries if e.get("include", True)]
-
-    tab = TargetsWeightsTab(
-        dataset_entries=list(_entries),
-        dataset_entries_getter=lambda: list(_entries),
-        included_dataset_ids_getter=lambda: list(included_ids),
-        dataset_label_getter=lambda ds_id: next(
-            (str(e.get("label") or ds_id) for e in _entries if str(e.get("id")) == ds_id),
-            str(ds_id),
-        ),
-        dataset_weight_getter=lambda ds_id: 1.0,
-        persist_dataset_weight_callback=lambda ds_id, w: None,
-        worker_running_getter=lambda: False,
-    )
-    return tab
-
-
-# ---------------------------------------------------------------------------
 # Helpers — DataTab
 # ---------------------------------------------------------------------------
 
@@ -87,12 +46,27 @@ def _make_data_tab(*, worker_running=False):
 def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
                      entries=None, species=None):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     if entries is None:
         entries = [{"id": "ds1", "label": "DS 1"}]
     if species is None:
         species = ["A", "B"]
 
+    ic_panel = UnifiedSpeciesTable(
+        dataset_entries=list(entries),
+        mechanism_species=list(species),
+        dataset_entries_getter=lambda: list(entries),
+        included_dataset_ids_getter=lambda: [str(e["id"]) for e in entries],
+        dataset_label_getter=lambda ds_id: next(
+            (str(e.get("label") or ds_id) for e in entries if str(e.get("id")) == ds_id),
+            str(ds_id),
+        ),
+        dataset_weight_getter=lambda _ds_id: 1.0,
+        persist_dataset_weight_callback=lambda _ds_id, _weight: None,
+        dataset_manager_getter=lambda: None,
+        worker_running_getter=lambda: False,
+    )
     tab = ParametersIcsTab(
         parameter_state=[],
         initial_parameter_snapshot=[],
@@ -110,6 +84,7 @@ def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
         reactions_text_getter=lambda: "",
         integration_defaults=integration_defaults,
         config_defaults={},
+        ic_panel=ic_panel,
     )
     return tab
 
@@ -147,85 +122,19 @@ def _make_fitting_window():
 
 
 # ===================================================================
-# ITEM 19 — Subset stale suffix on apply failure
+# ITEM 19 — Results tab rebuild on apply
 # ===================================================================
 
-def test_on_targets_applied_subset_failure(qt_app):
-    """When subset widget update fails, status shows '(subset view stale)' suffix.
-
-    Note: signal ordering (targetsApplied before statusMessage) is verified
-    structurally at targets_weights_tab.py:834,840 — line 834 emits
-    targetsApplied, line 840 emits statusMessage. This test exercises the
-    FittingWindow handler logic directly, not the signal dispatch order.
-    """
+def test_on_targets_applied_rebuilds_results_tab(qt_app):
+    """Applied targets rebuild the eager Results tab plot surface."""
     window = _make_fitting_window()
     try:
-        window._subset_widget.set_dataset_entries = lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("test subset failure")
-        )
         window._on_targets_applied()
-        assert window._subset_view_stale is True
-
-        window._on_targets_status_message("Fit targets applied")
-        assert window._status_label.text().endswith("(subset view stale)")
-        assert window._subset_view_stale is False
+        assert "ds1" in window._run_results_tab._dataset_plot_views
+        assert window._run_results_tab._dataset_plot_views["ds1"]._datasets
     finally:
         window.close()
         qt_app.processEvents()
-
-
-# ===================================================================
-# ITEM 20 — Footer cleared after last dataset removal
-# ===================================================================
-
-def test_refresh_dataset_list_clears_footer_on_empty(qt_app):
-    """refresh_dataset_list clears footer errors when dataset list becomes empty."""
-    entries = []
-
-    def entries_getter():
-        return list(entries)
-
-    t = np.linspace(0.0, 1.0, 6)
-    initial_entries = [
-        {
-            "id": "ds1",
-            "label": "Dataset 1",
-            "t": t.copy(),
-            "species_data": {"A": np.linspace(0, 1, t.size)},
-            "selected_species": ["A"],
-            "weight": 1.0,
-            "include": True,
-        }
-    ]
-    entries.extend(initial_entries)
-
-    from kindred.gui.fitting.targets_weights_tab import TargetsWeightsTab
-    tab = TargetsWeightsTab(
-        dataset_entries=list(entries),
-        dataset_entries_getter=entries_getter,
-        included_dataset_ids_getter=lambda: [e["id"] for e in entries if e.get("include", True)],
-        dataset_label_getter=lambda ds_id: next(
-            (str(e.get("label") or ds_id) for e in entries if str(e.get("id")) == ds_id),
-            str(ds_id),
-        ),
-        dataset_weight_getter=lambda ds_id: 1.0,
-        persist_dataset_weight_callback=lambda ds_id, w: None,
-        worker_running_getter=lambda: False,
-    )
-    try:
-        tab._fit_targets_footer.set_error("Stale error from previous dataset")
-        assert tab._fit_targets_footer._error_text == "Stale error from previous dataset"
-
-        entries.clear()
-        tab.remove_dataset_state({"ds1"})
-        tab.refresh_dataset_list()
-        qt_app.processEvents()
-
-        assert tab._fit_targets_footer._error_text == ""
-    finally:
-        tab.close()
-        qt_app.processEvents()
-
 
 # ===================================================================
 # ITEM 6 — Remove button disabled during active fit
@@ -322,7 +231,7 @@ def test_push_best_update_empty_dataset_params_clears_staged(qt_app):
 # ===================================================================
 
 def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
-    """rebuild_for_mechanism updates _dataset_entries before refreshing IC combo."""
+    """rebuild_for_mechanism updates _dataset_entries before refreshing IC panel."""
     initial_entries = [{"id": "ds1", "label": "DS 1"}]
     tab = _make_params_tab(entries=initial_entries, species=["A"])
     try:
@@ -332,28 +241,29 @@ def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
         ]
         tab.rebuild_for_mechanism("", new_entries)
 
-        combo = tab._ic_dataset_combo
-        combo_ids = [str(combo.itemData(i) or "") for i in range(combo.count())]
-        assert "ds1" in combo_ids
-        assert "ds2" in combo_ids
+        # IC panel receives updated dataset entries via refresh_dataset_combo
+        ic_entry_ids = [str(e.get("id") or "") for e in tab._ic_panel._dataset_entries]
+        assert "ds1" in ic_entry_ids
+        assert "ds2" in ic_entry_ids
     finally:
         tab.close()
         qt_app.processEvents()
 
 
 # ===================================================================
-# ITEM 21 — Subset stale suffix on sampling-applied failure
+# ITEM 21 — Results tab rebuild on sampling apply
 # ===================================================================
 
-def test_on_sampling_applied_subset_failure(qt_app):
-    """When subset widget update fails during sampling-applied, status shows stale suffix."""
+def test_on_sampling_applied_rebuilds_results_tab(qt_app):
+    """Sampling apply rebuilds Results tab data and keeps a clean status message."""
     window = _make_fitting_window()
     try:
-        window._subset_widget.set_dataset_entries = lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("test subset failure")
+        window._on_data_tab_sampling_applied(
+            "ds1",
+            {"t_min": 0.0, "t_max": 1.0, "n_points": 10, "x_name": "t", "x_mapping_mode": "auto"},
         )
-        window._on_data_tab_sampling_applied("ds1", {"n_points": 10})
-        assert window._status_label.text().endswith("(subset view stale)")
+        assert window._status_label.text() == "Sampling applied"
+        assert "ds1" in window._run_results_tab._dataset_plot_views
     finally:
         window.close()
         qt_app.processEvents()

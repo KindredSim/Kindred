@@ -1,4 +1,4 @@
-"""Parameters & ICs tab for the fitting window."""
+"""Parameters tab for the fitting window."""
 
 from __future__ import annotations
 
@@ -10,9 +10,8 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
-from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
-from kindred.gui.widgets.collapsible_section import CollapsibleSection
-from kindred.gui.fitting.constants import INITIAL_PREFIX, DEFAULT_PARALLEL_STARTS
+from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
+from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
 logger = logging.getLogger(__name__)
 
@@ -325,9 +324,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
         reactions_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
+        ic_panel: Optional[UnifiedSpeciesTable] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        # transitional — ic_panel is passed for forwarder reach-through
+        # only. FittingWindow owns all IC signal wiring. This parameter
+        # and the associated forwarders are removed in Session 3.
+        self._ic_panel = ic_panel
         # Deep-copy transferred state
         self._parameter_state = [dict(row) for row in parameter_state]
         self._initial_parameter_snapshot = [dict(row) for row in initial_parameter_snapshot]
@@ -349,10 +353,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._worker_running_getter = worker_running_getter
         self._dataset_manager_getter = dataset_manager_getter
         self._reactions_text_getter = reactions_text_getter
-        # IC editor state
-        self._ic_editor_dirty = False
-        self._ic_editor_current_dataset_id: Optional[str] = None
-        self._ic_editor_is_refreshing = False
         # Build UI
         self._build_ui(integration_defaults)
         self._apply_config_defaults(config_defaults)
@@ -365,20 +365,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _build_ui(self, integration_defaults: Tuple[str, float, float]) -> None:
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        splitter = QtWidgets.QSplitter(Qt.Vertical, self)
-        # --- Parameters panel ---
         params_widget = self._build_parameters_panel(integration_defaults)
-        # --- IC panel ---
-        ic_panel = self._build_initial_conditions_panel()
-        ic_panel.setMinimumHeight(220)
-        splitter.addWidget(params_widget)
-        splitter.addWidget(ic_panel)
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([460, 300])
-        outer.addWidget(splitter, stretch=1)
+        outer.addWidget(params_widget, stretch=1)
 
     def _build_parameters_panel(self, integration_defaults: Tuple[str, float, float]) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
@@ -400,7 +388,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table = QtWidgets.QTableWidget()
         self._param_table.setColumnCount(7)
         self._param_table.setHorizontalHeaderLabels(["Fit", "Log10", "Name", "Value", "Min", "Max", "Last Fit"])
-        self._param_table.horizontalHeader().setStretchLastSection(True)
+        _ph = self._param_table.horizontalHeader()
+        _ph.setStretchLastSection(False)
+        for col in range(self._param_table.columnCount()):
+            _ph.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+        _ph.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)  # Name
+        self._param_table.setColumnWidth(2, 140)
         self._param_table.itemChanged.connect(self._on_param_table_item_changed)
         self._param_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._param_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -458,13 +451,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         algo_form.addRow(self._seed_check, self._seed_spin)
         params_layout.addLayout(algo_form)
 
-        integration_section = CollapsibleSection("Advanced Integration Settings", parent=params_group)
-        integration_section.setObjectName("global_fit_advanced_integration_section")
-        integration_section.set_collapsed(True)
-        integration_widget = QtWidgets.QWidget(integration_section)
-        integration_form = QtWidgets.QFormLayout(integration_widget)
-
         default_solver, default_rtol, default_atol = integration_defaults
+        default_solver = str(default_solver or FITTING_DEFAULT_SOLVER)
 
         def _fmt(value: float) -> str:
             text = f"{float(value):g}"
@@ -479,15 +467,23 @@ class ParametersIcsTab(QtWidgets.QWidget):
             digits = digits.lstrip("0") or "0"
             return f"{base}e{sign}{digits}"
 
-        self._integration_solver_combo = QtWidgets.QComboBox(integration_widget)
+        integration_header = QtWidgets.QLabel("Integration Settings", params_group)
+        header_font = integration_header.font()
+        header_font.setBold(True)
+        integration_header.setFont(header_font)
+        params_layout.addWidget(integration_header)
+
+        integration_form = QtWidgets.QFormLayout()
+
+        self._integration_solver_combo = QtWidgets.QComboBox(params_group)
         self._integration_solver_combo.setObjectName("global_fit_integration_solver")
         self._integration_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._integration_solver_combo.setCurrentText(str(default_solver))
+        self._integration_solver_combo.setCurrentText(default_solver)
 
-        self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), integration_widget)
+        self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), params_group)
         self._integration_rtol_edit.setObjectName("global_fit_integration_rtol")
 
-        self._integration_atol_edit = QtWidgets.QLineEdit(_fmt(default_atol), integration_widget)
+        self._integration_atol_edit = QtWidgets.QLineEdit(_fmt(default_atol), params_group)
         self._integration_atol_edit.setObjectName("global_fit_integration_atol")
 
         setup_scientific_validator(self._integration_rtol_edit)
@@ -496,48 +492,26 @@ class ParametersIcsTab(QtWidgets.QWidget):
         integration_form.addRow("Solver:", self._integration_solver_combo)
         integration_form.addRow("rtol:", self._integration_rtol_edit)
         integration_form.addRow("atol:", self._integration_atol_edit)
-        integration_section.set_content_widget(integration_widget)
-        params_layout.addWidget(integration_section)
+        params_layout.addLayout(integration_form)
 
         layout.addWidget(params_group, stretch=1)
         return widget
 
-    def _build_initial_conditions_panel(self) -> QtWidgets.QGroupBox:
-        group = QtWidgets.QGroupBox("Initial Conditions")
-        group.setObjectName("global_fit_initial_conditions_panel")
-        layout = QtWidgets.QVBoxLayout(group)
+    # ------------------------------------------------------------------
+    # Transitional forwarders for IC panel widgets
+    # ------------------------------------------------------------------
 
-        self._ic_footer = ConfigPanelFooter(
-            group,
-            show_dirty=True,
-            show_divider=True,
-            apply_requires_no_error=False,
-            button_order=("apply", "revert"),
-            apply_object_name="global_fit_initial_conditions_apply",
-            revert_object_name="global_fit_initial_conditions_revert",
-        )
-        layout.addWidget(self._ic_footer, stretch=1)
-        self._ic_footer.applyRequested.connect(self._apply_initial_conditions_changes)
-        self._ic_footer.revertRequested.connect(self._revert_initial_conditions_changes)
+    @property
+    def _ic_dataset_combo(self):
+        return None
 
-        self._ic_dataset_combo = QtWidgets.QComboBox(group)
-        self._ic_dataset_combo.setObjectName("global_fit_initial_conditions_dataset_combo")
-        self._ic_footer.body_layout.addWidget(self._ic_dataset_combo)
+    # ------------------------------------------------------------------
+    # IC applied handler
+    # ------------------------------------------------------------------
 
-        self._ic_table = QtWidgets.QTableWidget(group)
-        self._ic_table.setObjectName("global_fit_initial_conditions_table")
-        self._ic_table.setColumnCount(6)
-        self._ic_table.setHorizontalHeaderLabels(["Species", "Initial", "Fit?", "Log10", "Min", "Max"])
-        self._ic_table.horizontalHeader().setStretchLastSection(True)
-        self._ic_table.verticalHeader().setVisible(False)
-        self._ic_table.setAlternatingRowColors(True)
-        self._ic_table.setMinimumHeight(200)
-        self._ic_table.itemChanged.connect(self._on_ic_table_item_changed)
-        self._ic_footer.body_layout.addWidget(self._ic_table, stretch=1)
-
-        self._ic_dataset_combo.currentIndexChanged.connect(self._load_initial_conditions_for_current_dataset)
-        self._refresh_initial_conditions_dataset_combo_items()
-        return group
+    def _on_ic_applied(self, dataset_id: str, updates: dict, fit_flags_updates: dict) -> None:
+        self._apply_ic_updates_to_window_state(dataset_id, updates, fit_flags_updates)
+        self._populate_parameter_table()
 
     # ------------------------------------------------------------------
     # Config defaults
@@ -603,200 +577,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 self._seed_spin.setValue(seed_val)
         self._seed_spin.setEnabled(self._seed_check.isChecked())
 
-    # ------------------------------------------------------------------
-    # IC editor
-    # ------------------------------------------------------------------
-
-    def _set_ic_editor_dirty_state(self, dirty: bool) -> None:
-        self._ic_editor_dirty = bool(dirty)
-        if hasattr(self, "_ic_footer"):
-            self._ic_footer.set_dirty(self._ic_editor_dirty)
-
-    def _on_ic_table_item_changed(self, _item: QtWidgets.QTableWidgetItem) -> None:
-        if self._ic_editor_is_refreshing:
-            return
-        self._set_ic_editor_dirty_state(True)
-
-    def _load_initial_conditions_for_current_dataset(self) -> None:
-        if not hasattr(self, "_ic_dataset_combo"):
-            return
-        if self._ic_editor_dirty:
-            # No modal prompts; discard pending edits when switching datasets.
-            self._set_ic_editor_dirty_state(False)
-        ds_id = str(self._ic_dataset_combo.currentData() or "").strip()
-        self._ic_editor_current_dataset_id = ds_id or None
-        self._populate_initial_conditions_table(ds_id)
-
-    def _populate_initial_conditions_table(self, dataset_id: str) -> None:
-        ds_id = str(dataset_id or "").strip()
-        self._ic_editor_is_refreshing = True
-        try:
-            if hasattr(self, "_ic_footer"):
-                self._ic_footer.set_error(None)
-
-            if not self._mechanism_species:
-                self._ic_table.setRowCount(0)
-                self._ic_table.setEnabled(False)
-                return
-
-            settings = None
-            dataset_manager = self._dataset_manager_getter()
-            if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings") and ds_id:
-                try:
-                    settings = dataset_manager.get_fit_settings(ds_id)
-                except Exception:
-                    settings = None
-
-            initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
-            fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
-            log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
-            bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
-
-            self._ic_table.setEnabled(True)
-            self._ic_table.setRowCount(len(self._mechanism_species))
-            for row, species in enumerate(self._mechanism_species):
-                init_val = float(initials.get(species, 0.0))
-                fit_flag = bool(fit_flags.get(species, False))
-                log10_flag = bool(log10_flags.get(species, False))
-                bounds = bounds_map.get(species)
-                if not bounds:
-                    bounds = (0.0, max(10.0, init_val * 10 or 10.0))
-                try:
-                    min_val = float(bounds[0])
-                    max_val = float(bounds[1])
-                except Exception:
-                    min_val, max_val = (0.0, max(10.0, init_val * 10 or 10.0))
-
-                species_item = QtWidgets.QTableWidgetItem(str(species))
-                species_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self._ic_table.setItem(row, 0, species_item)
-
-                init_item = QtWidgets.QTableWidgetItem(f"{init_val:.6g}")
-                self._ic_table.setItem(row, 1, init_item)
-
-                fit_item = QtWidgets.QTableWidgetItem()
-                fit_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                fit_item.setCheckState(Qt.Checked if fit_flag else Qt.Unchecked)
-                self._ic_table.setItem(row, 2, fit_item)
-
-                log_item = QtWidgets.QTableWidgetItem()
-                log_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                log_item.setCheckState(Qt.Checked if log10_flag else Qt.Unchecked)
-                self._ic_table.setItem(row, 3, log_item)
-
-                min_item = QtWidgets.QTableWidgetItem(f"{min_val:.6g}")
-                max_item = QtWidgets.QTableWidgetItem(f"{max_val:.6g}")
-                self._ic_table.setItem(row, 4, min_item)
-                self._ic_table.setItem(row, 5, max_item)
-        finally:
-            self._ic_editor_is_refreshing = False
-
-    def _collect_initial_conditions_from_table(
-        self,
-    ) -> Tuple[
-        Optional[Dict[str, Dict[str, object]]],
-        Optional[Dict[str, bool]],
-        Optional[str],
-    ]:
-        ds_id = str(self._ic_editor_current_dataset_id or "").strip()
-        if not ds_id:
-            return None, None, "No dataset selected."
-        if not self._mechanism_species:
-            return None, None, "No mechanism species available."
-        updates: Dict[str, Dict[str, object]] = {}
-        fit_flags_updates: Dict[str, bool] = {}
-        for row, species in enumerate(self._mechanism_species):
-            init_item = self._ic_table.item(row, 1)
-            fit_item = self._ic_table.item(row, 2)
-            log_item = self._ic_table.item(row, 3)
-            min_item = self._ic_table.item(row, 4)
-            max_item = self._ic_table.item(row, 5)
-            try:
-                init_val = float(init_item.text())
-            except Exception:
-                return (
-                    None,
-                    None,
-                    f"Species '{species}' requires a numeric initial concentration.",
-                )
-            fit_flag = bool(fit_item and fit_item.checkState() == Qt.Checked)
-            log10_flag = bool(log_item and log_item.checkState() == Qt.Checked)
-            try:
-                min_val = float(min_item.text())
-                max_val = float(max_item.text())
-            except Exception:
-                return None, None, f"Species '{species}' requires numeric bounds."
-            if fit_flag and not (min_val < max_val):
-                return None, None, f"Species '{species}' bounds must satisfy min < max."
-            if fit_flag and log10_flag:
-                if not (init_val > 0.0 and min_val > 0.0 and max_val > 0.0):
-                    return (
-                        None,
-                        None,
-                        f"Species '{species}' requires initial/min/max > 0 when Log10 is enabled.",
-                    )
-            updates[str(species)] = {
-                "initial": float(init_val),
-                "log10": bool(log10_flag),
-                "min": float(min_val),
-                "max": float(max_val),
-            }
-            fit_flags_updates[str(species)] = bool(fit_flag)
-        return updates, fit_flags_updates, None
-
-    def _apply_initial_conditions_changes(self) -> None:
-        updates, fit_flags_updates, error = self._collect_initial_conditions_from_table()
-        if error:
-            if hasattr(self, "_ic_footer"):
-                self._ic_footer.set_error(str(error))
-            return
-        assert updates is not None
-        assert fit_flags_updates is not None
-        ds_id = str(self._ic_editor_current_dataset_id or "").strip()
-        if not ds_id:
-            return
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is None or not hasattr(dataset_manager, "get_fit_settings") or not hasattr(dataset_manager, "update_fit_settings"):
-            message = "Dataset manager unavailable; cannot persist Initial Conditions."
-            if hasattr(self, "_ic_footer"):
-                self._ic_footer.set_error(message)
-            return
-        try:
-            settings = dataset_manager.get_fit_settings(ds_id)
-        except Exception:
-            message = f"Failed to load fit settings for dataset {ds_id}."
-            if hasattr(self, "_ic_footer"):
-                self._ic_footer.set_error(message)
-            return
-
-        initials = dict(getattr(settings, "initial_conditions", {}) or {})
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {})
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {})
-        bounds_map = dict(getattr(settings, "bounds", {}) or {})
-        for species, spec in updates.items():
-            species_key = str(species)
-            initials[str(species)] = float(spec["initial"])
-            fit_flags[species_key] = bool(fit_flags_updates.get(species_key, False))
-            log10_flags[str(species)] = bool(spec["log10"])
-            bounds_map[str(species)] = (float(spec["min"]), float(spec["max"]))
-
-        settings.initial_conditions = initials
-        settings.fit_flags = fit_flags
-        settings.log10_flags = log10_flags
-        settings.bounds = bounds_map
-        try:
-            dataset_manager.update_fit_settings(ds_id, settings)
-        except Exception:
-            message = f"Failed to persist fit settings for dataset {ds_id}."
-            if hasattr(self, "_ic_footer"):
-                self._ic_footer.set_error(message)
-            return
-
-        self._apply_ic_updates_to_window_state(ds_id, updates, fit_flags_updates)
-        self._populate_parameter_table()
-        self._set_ic_editor_dirty_state(False)
-        self.statusMessage.emit("Initial conditions applied")
-
     def _apply_ic_updates_to_window_state(
         self,
         dataset_id: str,
@@ -856,36 +636,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if not specs:
             self._global_dataset_variable_params.pop(ds_id, None)
 
-    def _revert_initial_conditions_changes(self) -> None:
-        ds_id = str(self._ic_editor_current_dataset_id or "").strip()
-        self._set_ic_editor_dirty_state(False)
-        self._populate_initial_conditions_table(ds_id)
-
-    def _refresh_initial_conditions_dataset_combo_items(self) -> None:
-        if not hasattr(self, "_ic_dataset_combo"):
-            return
-        combo = self._ic_dataset_combo
-        current = str(combo.currentData() or "").strip()
-        combo.blockSignals(True)
-        try:
-            combo.clear()
-            for entry in self._dataset_entries:
-                ds_id = str(entry.get("id") or "").strip()
-                if not ds_id:
-                    continue
-                label = str(entry.get("label") or ds_id)
-                combo.addItem(label, ds_id)
-        finally:
-            combo.blockSignals(False)
-        if current:
-            for i in range(combo.count()):
-                if str(combo.itemData(i) or "").strip() == current:
-                    combo.setCurrentIndex(i)
-                    break
-        if combo.count() and combo.currentIndex() < 0:
-            combo.setCurrentIndex(0)
-        self._load_initial_conditions_for_current_dataset()
-
     # ------------------------------------------------------------------
     # Parameter table
     # ------------------------------------------------------------------
@@ -904,16 +654,55 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._param_table.setItem(row, 1, log_item)
             name_item = QtWidgets.QTableWidgetItem(str(entry["name"]))
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            name_item.setTextAlignment(Qt.AlignCenter)
             self._param_table.setItem(row, 2, name_item)
-            self._param_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{entry['value']:.6g}"))
-            self._param_table.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{entry['min']:.6g}"))
-            self._param_table.setItem(row, 5, QtWidgets.QTableWidgetItem(f"{entry['max']:.6g}"))
+            value_item = QtWidgets.QTableWidgetItem(f"{entry['value']:.6g}")
+            value_item.setTextAlignment(Qt.AlignCenter)
+            self._param_table.setItem(row, 3, value_item)
+            min_item = QtWidgets.QTableWidgetItem(f"{entry['min']:.6g}")
+            min_item.setTextAlignment(Qt.AlignCenter)
+            self._param_table.setItem(row, 4, min_item)
+            max_item = QtWidgets.QTableWidgetItem(f"{entry['max']:.6g}")
+            max_item.setTextAlignment(Qt.AlignCenter)
+            self._param_table.setItem(row, 5, max_item)
             last = entry.get("last_fit")
             display = "—" if last is None else f"{last:.6g}"
             last_item = QtWidgets.QTableWidgetItem(display)
             last_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            last_item.setTextAlignment(Qt.AlignCenter)
             self._param_table.setItem(row, 6, last_item)
         self._param_table.blockSignals(False)
+        self._update_remove_button_state()
+
+    def _refresh_live_fit_value_cells(self) -> None:
+        if self._param_table.rowCount() != len(self._parameter_state):
+            self._populate_parameter_table()
+            return
+
+        needs_full_rebuild = False
+        self._param_table.blockSignals(True)
+        try:
+            for row, entry in enumerate(self._parameter_state):
+                value_item = self._param_table.item(row, 3)
+                last_fit_item = self._param_table.item(row, 6)
+                if value_item is None or last_fit_item is None:
+                    needs_full_rebuild = True
+                    break
+
+                value_text = f"{float(entry['value']):.6g}"
+                last_fit = entry.get("last_fit")
+                last_fit_text = "—" if last_fit is None else f"{float(last_fit):.6g}"
+
+                if value_item.text() != value_text:
+                    value_item.setText(value_text)
+                if last_fit_item.text() != last_fit_text:
+                    last_fit_item.setText(last_fit_text)
+        finally:
+            self._param_table.blockSignals(False)
+
+        if needs_full_rebuild:
+            self._populate_parameter_table()
+            return
         self._update_remove_button_state()
 
     def _on_param_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
@@ -1757,13 +1546,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return state
 
     def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+        from kindred.core.simulator.solvers import normalize_solver_name
 
         allowed = ("LSODA", "Radau", "BDF")
         combo = getattr(self, "_integration_solver_combo", None)
-        solver_label = str(combo.currentText()).strip() if combo is not None else str(DEFAULT_SOLVER_NAME)
+        solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
         if solver_label not in allowed:
-            solver_label = str(DEFAULT_SOLVER_NAME)
+            solver_label = FITTING_DEFAULT_SOLVER
         solver_method, solver_warning = normalize_solver_name(solver_label)
         if solver_warning:
             QtWidgets.QMessageBox.information(
@@ -1827,38 +1616,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         species_map = getattr(mechanism, "species", {}) or {}
         species_names = [str(name) for name in species_map.keys() if str(name).strip()]
         return list(dict.fromkeys(species_names))
-
-    def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str) -> tuple[bool, dict[str, float]]:
-        settings = None
-        dataset_manager = self._dataset_manager_getter()
-        if dataset_manager is not None and hasattr(dataset_manager, "get_fit_settings"):
-            try:
-                settings = dataset_manager.get_fit_settings(str(dataset_id))
-            except Exception:
-                settings = None
-        initials = dict(getattr(settings, "initial_conditions", {}) or {}) if settings is not None else {}
-        fit_flags = dict(getattr(settings, "fit_flags", {}) or {}) if settings is not None else {}
-        log10_flags = dict(getattr(settings, "log10_flags", {}) or {}) if settings is not None else {}
-        bounds_map = dict(getattr(settings, "bounds", {}) or {}) if settings is not None else {}
-
-        init_val = float(initials.get(species, 0.0))
-        fit_flag = bool(fit_flags.get(species, False))
-        log10_flag = bool(log10_flags.get(species, False))
-        bounds = bounds_map.get(species)
-        if not bounds:
-            bounds = (0.0, max(10.0, init_val * 10 or 10.0))
-        try:
-            min_val = float(bounds[0])
-            max_val = float(bounds[1])
-        except Exception:
-            min_val = 0.0
-            max_val = max(10.0, init_val * 10 or 10.0)
-        return fit_flag, {
-            "initial": float(init_val),
-            "min": float(min_val),
-            "max": float(max_val),
-            "log10": bool(log10_flag),
-        }
 
     @staticmethod
     def _coerce_variable_spec(spec: dict[str, Any]) -> Optional[dict[str, float]]:
@@ -1958,7 +1715,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 param_name = f"{INITIAL_PREFIX}{species}"
                 if param_name in fixed_map or param_name in variable_map:
                     continue
-                fit_flag, default_spec = self._initial_parameter_defaults_for_species(ds_id, species)
+                if self._ic_panel is not None:
+                    fit_flag, default_spec = self._ic_panel.initial_parameter_defaults_for_species(ds_id, species)
+                else:
+                    fit_flag, default_spec = False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
                 if fit_flag:
                     variable_map[param_name] = dict(default_spec)
                 else:
@@ -2067,7 +1827,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
         self._dataset_entries = list(dataset_entries)
         self._populate_parameter_table()
-        self._refresh_initial_conditions_dataset_combo_items()
+        if self._ic_panel is not None:
+            self._ic_panel.set_mechanism_species(list(self._mechanism_species))
+            self._ic_panel.refresh_dataset_combo(list(self._dataset_entries))
         return list(self._prepared_param_names)
 
     # ------------------------------------------------------------------
@@ -2188,7 +1950,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     if isinstance(ds_map, dict) and param_name in ds_map:
                         entry["value"] = float(ds_map[param_name])
                         entry["last_fit"] = float(ds_map[param_name])
-        self._populate_parameter_table()
+        self._refresh_live_fit_value_cells()
 
     # ------------------------------------------------------------------
     # Public API — running state
@@ -2201,6 +1963,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._remove_param_button.setEnabled(
                 (not running) and bool({item.row() for item in self._param_table.selectedItems()})
             )
+        if self._ic_panel is not None:
+            self._ic_panel.set_running_state(running)
 
     # ------------------------------------------------------------------
     # Public API — dataset lifecycle
@@ -2208,7 +1972,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def refresh_ic_dataset_combo(self, dataset_entries: List[Dict[str, Any]]) -> None:
         self._dataset_entries = list(dataset_entries)
-        self._refresh_initial_conditions_dataset_combo_items()
+        if self._ic_panel is not None:
+            self._ic_panel.refresh_dataset_combo(dataset_entries)
 
     def remove_dataset_parameter_rows(self, dataset_ids: Sequence[str]) -> None:
         remove_set = {str(x) for x in dataset_ids}

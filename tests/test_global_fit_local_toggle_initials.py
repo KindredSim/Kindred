@@ -61,14 +61,14 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
     try:
         ds_rows = [
             idx
-            for idx, entry in enumerate(window._parameter_state)
+            for idx, entry in enumerate(window._params_ics_tab.get_parameter_state())
             if entry.get("scope") == "dataset" and entry.get("dataset_id") == "ds1" and entry.get("param_name") == "init:A"
         ]
         assert len(ds_rows) == 1
         row = ds_rows[0]
 
         # Uncheck "Fit" for the local initial condition row.
-        window._param_table.item(row, 0).setCheckState(QtCore.Qt.Unchecked)
+        window._params_ics_tab._param_table.item(row, 0).setCheckState(QtCore.Qt.Unchecked)
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
