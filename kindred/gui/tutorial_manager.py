@@ -177,7 +177,7 @@ class TutorialManager:
                     TutorialStep(
                         title="Configure Bounds",
                         instruction=(
-                            "In the fitting window's <b>Parameters &amp; ICs</b> tab, set realistic bounds for each parameter:<br><br>"
+                            "In the fitting window's <b>Parameters and ICs</b> tab, set realistic bounds for each parameter:<br><br>"
                             "• <b>Value</b>: Starting guess<br>"
                             "• <b>Min/Max</b>: Search bounds<br><br>"
                             "Good bounds improve convergence and prevent unphysical values."
