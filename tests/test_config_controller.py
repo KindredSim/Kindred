@@ -112,7 +112,6 @@ def test_config_controller_port_exposes_bounded_surface_without_raw_main_window(
     assert port.parent is main_window
     assert port.settings() is main_window._settings
     assert port.dark_mode_action() is main_window._dark_mode_action
-    assert port.debug_sliders_action() is main_window._debug_sliders_action
 
 
 def test_save_then_load_settings_round_trip(main_window):

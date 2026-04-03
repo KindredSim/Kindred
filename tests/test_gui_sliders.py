@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import builtins
-from contextlib import suppress
 import functools
 import numpy as np
 import pytest
@@ -1318,34 +1317,6 @@ def test_slider_release_never_auto_commits_with_queued_changes(main_window, qtbo
     assert commits == []
 
 
-def test_log_slider_updates_writes_to_file_without_global_debug(main_window, qtbot, monkeypatch, tmp_path):
-    """
-    Regression: Tools → Debug → Log Slider Updates must write to a user-accessible file
-    without requiring a terminal or global DEBUG logging.
-    """
-    log_path = tmp_path / "kindred-slider-updates.log"
-    monkeypatch.setenv("KINDRED_SLIDER_DEBUG_LOG", str(log_path))
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "equilibrium: A <-> B ; kf=0.2, K=0.5\n"
-        "reaction: B -> C ; k=0.1\n"
-        "init: A=1, B=0, C=0\n"
-    )
-    main_window._extract_and_populate_variables()
-
-    # Prevent background simulation from running in this test.
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
-
-    main_window._set_slider_debug_logging(True)
-
-    sliders = main_window._mechanism_editor._variable_sliders
-    sliders.update_variable("K1", 0.6)
-    QtWidgets.QApplication.processEvents()
-    qtbot.wait(20)
-
-    assert log_path.exists()
-    assert "update_variable(K1" in log_path.read_text(encoding="utf-8")
-
 def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, monkeypatch):
     """If a slider target is missing from bindings, fall back to parsing updated DSL."""
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1944,58 +1915,6 @@ def test_K_drag_uses_preview_t_end_and_release_uses_full_t_end(main_window, monk
     (t_span_full, cfg_full) = captured[-1]
     assert t_span_full[1] == pytest.approx(1000.0)
     assert int(cfg_full["grid"]["N"]) > 120
-
-
-def test_slider_debug_logging_reenables_file_logger_when_already_enabled(monkeypatch, qtbot, tmp_path):
-    """
-    Regression: if slider debug logging is enabled at construction time (e.g. via
-    KINDRED_DEBUG_SLIDERS), enabling it again must still configure a file-only handler
-    and disable propagation so logs cannot recurse through stdout/stderr handlers.
-    """
-    import logging
-
-    from kindred.gui.widgets.variable_sliders import VariableSliders, slider_update_logger
-
-    prev_handlers = list(slider_update_logger.handlers)
-    prev_level = int(slider_update_logger.level)
-    prev_propagate = bool(slider_update_logger.propagate)
-
-    try:
-        for handler in list(slider_update_logger.handlers):
-            slider_update_logger.removeHandler(handler)
-        slider_update_logger.setLevel(logging.NOTSET)
-        slider_update_logger.propagate = True
-
-        monkeypatch.setenv("KINDRED_DEBUG_SLIDERS", "1")
-
-        sliders = VariableSliders()
-        qtbot.addWidget(sliders)
-
-        log_path = tmp_path / "kindred-slider-updates.log"
-        sliders.set_debug_slider_log_path(str(log_path))
-        sliders.set_debug_slider_updates(True)
-
-        assert slider_update_logger.propagate is False
-        assert slider_update_logger.handlers
-        assert all(isinstance(handler, logging.FileHandler) for handler in slider_update_logger.handlers)
-
-        slider_update_logger.debug("smoke-test")
-        QtWidgets.QApplication.processEvents()
-        qtbot.wait(20)
-
-        assert log_path.exists()
-        assert "smoke-test" in log_path.read_text(encoding="utf-8")
-    finally:
-        for handler in list(slider_update_logger.handlers):
-            slider_update_logger.removeHandler(handler)
-            if handler not in prev_handlers:
-                with suppress(Exception):
-                    handler.close()
-        slider_update_logger.setLevel(prev_level)
-        slider_update_logger.propagate = prev_propagate
-        for handler in prev_handlers:
-            if handler not in slider_update_logger.handlers:
-                slider_update_logger.addHandler(handler)
 
 
 def test_stale_slider_worker_completion_does_not_override_latest(main_window, monkeypatch, qtbot):

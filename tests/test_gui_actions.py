@@ -57,21 +57,6 @@ def test_run_simulation_uses_worker_stub(main_window: MainWindow, monkeypatch):
     assert "Simulation complete" in main_window._status_label.text()
 
 
-def test_debug_slider_logging_menu_toggle(main_window: MainWindow):
-    sliders = main_window._mechanism_editor._variable_sliders
-    assert hasattr(sliders, "debug_slider_updates_enabled")
-
-    action = getattr(main_window, "_debug_sliders_action", None)
-    if action is None:
-        pytest.skip("Debug slider logging menu action hidden — no UI entry point to test")
-
-    action.setChecked(True)
-    assert sliders.debug_slider_updates_enabled() is True
-
-    action.setChecked(False)
-    assert sliders.debug_slider_updates_enabled() is False
-
-
 def test_handle_export_config_writes_csv(main_window: MainWindow, tmp_path: Path):
     """Export handler should write CSV rows for the current simulation."""
     class _Plot:

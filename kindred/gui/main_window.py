@@ -225,7 +225,6 @@ class MainWindow(
 
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
-        self._debug_sliders_action = None
         self._mechanism_edit_locked = True
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
@@ -970,78 +969,6 @@ class MainWindow(
     def purge_simulation_all_caches(self) -> None:
         self._sim_controller.purge_simulation_all_caches()
 
-    def _set_slider_debug_logging(self, enabled: bool, *, persist: bool = True, announce: bool = True) -> None:
-        """
-        Toggle verbose logging for programmatic slider updates.
-
-        When enabled, logs are written to a deterministic, user-writable file location and
-        the path is surfaced in the UI (so this works in compiled desktop distributions
-        without a terminal/console).
-        """
-        sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-        log_path: Optional[str] = None
-        if bool(enabled):
-            override = os.environ.get("KINDRED_SLIDER_DEBUG_LOG")
-            if override:
-                log_path = str(override)
-            else:
-                base_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
-                if not base_dir:
-                    base_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.TempLocation)
-                if base_dir:
-                    try:
-                        os.makedirs(base_dir, exist_ok=True)
-                        log_path = os.path.join(base_dir, "kindred-slider-updates.log")
-                    except OSError as exc:
-                        logger.debug("Failed to create slider debug log dir %s: %s", base_dir, exc, exc_info=True)
-                        log_path = None
-
-        if sliders is not None and hasattr(sliders, "set_debug_slider_updates"):
-            applied = False
-            try:
-                if hasattr(sliders, "set_debug_slider_log_path"):
-                    sliders.set_debug_slider_log_path(log_path)
-                sliders.set_debug_slider_updates(bool(enabled))
-                applied = True
-            except RuntimeError as exc:
-                logger.debug("Failed to apply slider debug logging: %s", exc, exc_info=True)
-                enabled = False
-            except (AttributeError, TypeError, ValueError) as exc:
-                logger.warning("Slider debug logging failed: %s", exc, exc_info=True)
-                enabled = False
-            if bool(enabled) and not applied:
-                enabled = False
-
-        if persist:
-            try:
-                self.config_controller.persist_slider_debug_updates(bool(enabled))
-            except Exception as exc:
-                logger.warning("Failed to persist slider debug logging setting: %s", exc, exc_info=True)
-                bar = getattr(self, "_status_bar", None)
-                if bar is not None:
-                    try:
-                        bar.showMessage("Failed to persist slider debug logging setting (see logs)", 8000)
-                    except RuntimeError as exc:
-                        logger.debug("Failed to show slider debug persistence error in status bar: %s", exc, exc_info=True)
-                        self._status_bar = None
-
-        if announce:
-            try:
-                if bool(enabled) and log_path:
-                    self._status_bar.showMessage(f"Slider debug logs: {log_path}", 15000)
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "Slider Debug Logging Enabled",
-                        f"Writing slider debug logs to:\n{log_path}",
-                    )
-                elif not bool(enabled):
-                    self._status_bar.showMessage("Slider debug logging disabled", 5000)
-                else:
-                    self._status_bar.showMessage("Unable to enable slider debug logging (see logs)", 8000)
-            except RuntimeError as exc:
-                logger.debug("Failed to announce slider debug logging state: %s", exc, exc_info=True)
-                self._status_bar = None
-
     def _create_menus(self):
         """Create the menu bar and shortcut customization registry."""
         self._shortcut_actions = {}
@@ -1229,39 +1156,13 @@ class MainWindow(
             ],
         )
 
-        tools_menu = menubar.addMenu("&Tools")
-        add_items(
-            tools_menu,
-            [
-                # ──────────────────────────────────────────────────────────────
-                # HIDDEN FEATURE: Temperature Schedule
-                # Status: Hidden from users — NOT dead code
-                # Reason: Undertested and not integrated with current workflows
-                # Code: kindred/gui/widgets/temperature_schedule_editor.py, _open_temperature_schedule_editor() in this file
-                # Unhide: Uncomment the lines below after the feature passes a
-                #         dedicated integration audit and is approved for user access.
-                # Tracked: chore/post-merge-audit-cleanup branch
-                # ──────────────────────────────────────────────────────────────
-                # ("&Temperature Schedule...", self._open_temperature_schedule_editor, None, "temperatureScheduleAction", "Create piecewise temperature schedules with visual preview"),
-                # None,
-            ],
-        )
         # ──────────────────────────────────────────────────────────────
-        # HIDDEN FEATURE: Log Slider Updates (Debug menu)
-        # Status: Hidden from users — NOT dead code
-        # Reason: Undertested and not integrated with current workflows
-        # Code: _set_slider_debug_logging() in this file, kindred/gui/widgets/variable_sliders.py
-        # Unhide: Uncomment the lines below after the feature passes a
-        #         dedicated integration audit and is approved for user access.
-        # Tracked: chore/post-merge-audit-cleanup branch
+        # HIDDEN: Tools menu — all items currently removed or hidden
+        # Items:
+        #   - Temperature Schedule: hidden (see _open_temperature_schedule_editor in this file)
+        #   - Debug > Log Slider Updates: removed entirely
+        # Unhide: Recreate the menu when a Tools item is ready for user access.
         # ──────────────────────────────────────────────────────────────
-        # debug_menu = tools_menu.addMenu("Debug")
-        # add_items(
-        #     debug_menu,
-        #     [
-        #         ("Log Slider Updates", self._set_slider_debug_logging, None, "debugSlidersAction", "Log programmatic K-slider updates (for diagnosing slider snapping).", {"checkable": True, "signal": "toggled", "store_as": "_debug_sliders_action"}),
-        #     ],
-        # )
 
         help_menu = menubar.addMenu("&Help")
         add_items(

@@ -113,7 +113,6 @@ def test_main_window_load_settings_runs_after_bootstrap_prerequisites(qt_app, mo
                 "has_profile_indicator": hasattr(window, "_profile_indicator"),
                 "has_profiles_menu": hasattr(window, "_profiles_menu"),
                 "has_dark_mode_action": hasattr(window, "_dark_mode_action"),
-                "has_debug_sliders_action": hasattr(window, "_debug_sliders_action"),
                 "has_ribbon_toolbar": hasattr(window, "_ribbon_toolbar"),
                 "has_ribbon_host": hasattr(window, "_ribbon_host"),
                 "profile_ports_ready": getattr(window, "_profile_ports", None) is not None
@@ -139,7 +138,6 @@ def test_main_window_load_settings_runs_after_bootstrap_prerequisites(qt_app, mo
             "has_profile_indicator": True,
             "has_profiles_menu": False,  # Hidden: Profiles menu removed (entry point commented out in main_window.py)
             "has_dark_mode_action": True,
-            "has_debug_sliders_action": True,
             "has_ribbon_toolbar": False,  # Hidden: Ribbon removed (entry point commented out in main_window.py)
             "has_ribbon_host": False,  # Hidden: Ribbon removed (entry point commented out in main_window.py)
             "profile_ports_ready": True,

@@ -64,9 +64,7 @@ class ConfigControllerPort:
     set_dark_mode: Callable[[bool], None]
     dark_mode: Callable[[], bool]
     dark_mode_action: Callable[[], object | None]
-    debug_sliders_action: Callable[[], object | None]
     apply_theme: Callable[[bool], None]
-    set_slider_debug_logging: Callable[..., None]
     profile_manager: Callable[[], object]
     apply_profile: Callable[[object], None]
     set_profile_indicator_text: Callable[[str], None]
@@ -253,20 +251,6 @@ class ConfigController(QtCore.QObject):
         ribbon_collapsed = settings.value("ui/ribbon_collapsed", False, type=bool)
         self._ui.set_ribbon_collapsed(ribbon_collapsed)
 
-        debug_sliders_setting = settings.value("debug/slider_updates", None)
-        if debug_sliders_setting is None:
-            debug_sliders_enabled = bool(os.environ.get("KINDRED_DEBUG_SLIDERS"))
-        else:
-            debug_sliders_enabled = bool(debug_sliders_setting)
-        self._ui.set_slider_debug_logging(debug_sliders_enabled, persist=False, announce=False)
-        debug_action = self._ui.debug_sliders_action()
-        if debug_action is not None:
-            debug_action.blockSignals(True)
-            try:
-                debug_action.setChecked(bool(debug_sliders_enabled))
-            finally:
-                debug_action.blockSignals(False)
-
         profiles_available = self._ui.profiles_menu_available()
         if not profiles_available:
             # Profiles menu is hidden — clear any stranded key so the hidden
@@ -389,10 +373,6 @@ class ConfigController(QtCore.QObject):
 
         settings.setValue("ui/ribbon_collapsed", self._ui.ribbon_collapsed())
 
-        debug_action = self._ui.debug_sliders_action()
-        if debug_action is not None:
-            settings.setValue("debug/slider_updates", bool(debug_action.isChecked()))
-
         active_profile = self._ui.profile_manager().get_active_profile()
         if active_profile:
             settings.setValue("profiles/active", active_profile.name)
@@ -401,10 +381,6 @@ class ConfigController(QtCore.QObject):
 
         settings.sync()
         logger.debug("User settings saved to QSettings")
-
-    def persist_slider_debug_updates(self, enabled: bool) -> None:
-        with suppress(RuntimeError, TypeError):
-            self._settings().setValue("debug/slider_updates", bool(enabled))
 
     def persist_keyboard_shortcuts(self, shortcuts_dict: dict) -> None:
         self._settings().setValue("keyboard/shortcuts", shortcuts_dict)
