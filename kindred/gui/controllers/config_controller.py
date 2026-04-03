@@ -72,6 +72,7 @@ class ConfigControllerPort:
     set_profile_indicator_text: Callable[[str], None]
     set_status_text: Callable[[str], None]
     update_profiles_menu: Callable[[], None]
+    profiles_menu_available: Callable[[], bool]
     load_custom_shortcuts: Callable[[dict], None]
     recent_menu: Callable[[], object | None]
     set_recent_menu: Callable[[object | None], None]
@@ -266,17 +267,33 @@ class ConfigController(QtCore.QObject):
             finally:
                 debug_action.blockSignals(False)
 
-        profile_manager = self._ui.profile_manager()
-        stored_profile = ""
+        profiles_available = self._ui.profiles_menu_available()
+        if not profiles_available:
+            # Profiles menu is hidden — clear any stranded key so the hidden
+            # feature does not silently override user settings each launch.
+            stored = settings.value("profiles/active", "", type=str)
+            if stored:
+                logger.info(
+                    "Clearing stranded profiles/active='%s' — "
+                    "profiles menu is not available",
+                    stored,
+                )
+                settings.remove("profiles/active")
+                settings.sync()
+
         profile_to_apply = None
-        active_profile = profile_manager.get_active_profile()
-        if active_profile is None:
-            stored_profile = settings.value("profiles/active", "", type=str)
-            if stored_profile:
-                profile = profile_manager.get_profile(stored_profile)
-                if profile:
-                    profile_manager.set_active_profile(stored_profile)
-                    profile_to_apply = profile
+        active_profile = None
+        stored_profile = ""
+        if profiles_available:
+            profile_manager = self._ui.profile_manager()
+            active_profile = profile_manager.get_active_profile()
+            if active_profile is None:
+                stored_profile = settings.value("profiles/active", "", type=str)
+                if stored_profile:
+                    profile = profile_manager.get_profile(stored_profile)
+                    if profile:
+                        profile_manager.set_active_profile(stored_profile)
+                        profile_to_apply = profile
 
         dark_mode = settings.value("ui/dark_mode", True, type=bool)
         if active_profile is None and profile_to_apply is None:

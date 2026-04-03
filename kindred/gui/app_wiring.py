@@ -298,6 +298,7 @@ def build_settings_and_controllers(main_window: MainWindow) -> SettingsControlle
         set_profile_indicator_text=lambda text: main_window._profile_indicator.setText(str(text)),
         set_status_text=main_window.set_status_text,
         update_profiles_menu=main_window._update_profiles_menu,
+        profiles_menu_available=lambda: main_window._profile_ports.profiles_menu_getter() is not None,
         load_custom_shortcuts=main_window._load_custom_shortcuts,
         recent_menu=lambda: getattr(main_window, "_recent_menu", None),
         set_recent_menu=lambda menu: setattr(main_window, "_recent_menu", menu),

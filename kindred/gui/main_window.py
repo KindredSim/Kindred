@@ -8508,8 +8508,8 @@ class MainWindow(
                 fallback = (
                     f"Online documentation ({DOCUMENTATION_URL}) could not be opened.\n\n"
                     "Available local resources:\n"
-                    "- Help → Tutorials (guided workflows)\n"
-                    "- README.md (project overview and installation)"
+                    "- README.md (project overview and installation)\n"
+                    "- Check the project repository for documentation"
                 )
                 QtWidgets.QMessageBox.information(self, "Documentation", fallback)
                 self._status_label.setText("Documentation URL unavailable")
@@ -8518,8 +8518,8 @@ class MainWindow(
             message = (
                 f"Online documentation for Kindred v{KINDRED_VERSION} is not yet available.\n\n"
                 "Available local resources:\n"
-                "- Help → Tutorials for built-in walkthroughs\n"
-                "- README.md for project overview and installation"
+                "- README.md for project overview and installation\n"
+                "- Check the project repository for documentation"
             )
             QtWidgets.QMessageBox.information(self, "Documentation", message)
             self._status_label.setText("Online documentation not yet available")

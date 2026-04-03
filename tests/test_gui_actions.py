@@ -116,6 +116,18 @@ def test_open_docs_falls_back_without_url(main_window: MainWindow, monkeypatch):
     infos = _capture_messagebox(monkeypatch, "information")
     main_window._open_docs()
     assert infos and "online documentation" in infos[0].lower()
+    assert "tutorial" not in infos[0].lower()
+
+
+def test_open_docs_browser_failure_does_not_mention_tutorials(main_window: MainWindow, monkeypatch):
+    """When the browser fails to open, the fallback message must not reference hidden Tutorials."""
+    monkeypatch.setattr("kindred.gui.main_window.DOCUMENTATION_URL", "https://example.com")
+    monkeypatch.setattr("webbrowser.open", lambda url: (_ for _ in ()).throw(OSError("simulated")))
+    infos = _capture_messagebox(monkeypatch, "information")
+    main_window._open_docs()
+    assert infos
+    assert "could not be opened" in infos[0].lower()
+    assert "tutorial" not in infos[0].lower()
 
 
 @pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
