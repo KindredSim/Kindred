@@ -45,48 +45,50 @@ def _make_window(*, selected_species: list[str]):
     )
 
 
-def _set_fit_targets_dataset(panel, *, dataset_id: str) -> None:
-    from PySide6 import QtCore, QtWidgets
-
-    dataset_list = panel.window().findChild(QtWidgets.QListWidget, "global_fit_fit_targets_dataset_list")
-    assert dataset_list is not None
-    for i in range(dataset_list.count()):
-        item = dataset_list.item(i)
+def _set_fit_targets_dataset(widget, *, dataset_id: str) -> None:
+    from PySide6 import QtCore
+    window = widget if hasattr(widget, '_data_targets_tab') else widget.window()
+    ulist = window._data_targets_tab.unified_list._list
+    for i in range(ulist.count()):
+        item = ulist.item(i)
         if item is not None and str(item.data(QtCore.Qt.UserRole) or "") == str(dataset_id):
-            dataset_list.setCurrentRow(i)
+            ulist.setCurrentRow(i)
             return
     raise AssertionError(f"Dataset id not in list: {dataset_id!r}")
 
 
 def test_apply_fit_targets_refreshes_overlay_and_plot_without_manual_toggle(qt_app):
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
 
     window = _make_window(selected_species=["A"])
     try:
-        subset = window._subset_widget
-        selector = subset._selector
+        ds1_grid = window._run_results_tab._dataset_plot_views["ds1"]
+        assert {ds["name"] for ds in getattr(ds1_grid, "_datasets", [])} == {"ds1"}
+        assert set(getattr(ds1_grid, "_datasets", [])[0]["all_species"].keys()) == {"A"}
 
-        assert selector.selected_dataset_species() == {"ds1": {"A"}}
-        assert {ds["name"] for ds in getattr(subset._grid, "_datasets", [])} == {"ds1"}
-
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
-        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_fit_targets_apply")
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
 
         _set_fit_targets_dataset(panel, dataset_id="ds1")
 
-        checkbox_a = next(cb for cb in panel.findChildren(QtWidgets.QCheckBox) if cb.text().strip() == "A")
-        checkbox_b = next(cb for cb in panel.findChildren(QtWidgets.QCheckBox) if cb.text().strip() == "B")
-        checkbox_a.setChecked(False)
-        checkbox_b.setChecked(True)
+        from kindred.gui.fitting.unified_species_table import _Col
+        table = window._species_table._table
+        for row in range(table.rowCount()):
+            name = table.item(row, _Col.SPECIES).text()
+            if name == "A":
+                table.item(row, _Col.INCLUDE).setCheckState(QtCore.Qt.Unchecked)
+            elif name == "B":
+                table.item(row, _Col.INCLUDE).setCheckState(QtCore.Qt.Checked)
         qt_app.processEvents()
 
         apply_btn.click()
         qt_app.processEvents()
 
-        assert selector.selected_dataset_species() == {"ds1": {"B"}}
-        assert {ds["name"] for ds in getattr(subset._grid, "_datasets", [])} == {"ds1"}
+        ds1_payload = getattr(window._run_results_tab._dataset_plot_views["ds1"], "_datasets", [])[0]
+        assert set(ds1_payload["all_species"].keys()) == {"B"}
+        assert {ds["name"] for ds in getattr(window._run_results_tab._dataset_plot_views["ds1"], "_datasets", [])} == {"ds1"}
     finally:
         window.close()
         qt_app.processEvents()

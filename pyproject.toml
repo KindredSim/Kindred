@@ -34,6 +34,7 @@ dependencies = [
     "shiboken6==6.7.2",
     "pyqtdarktheme-fork==2.3.4",
     "pyqtgraph==0.13.7",
+    "openpyxl==3.1.5",
 ]
 
 [project.optional-dependencies]

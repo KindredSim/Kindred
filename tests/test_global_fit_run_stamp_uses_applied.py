@@ -79,22 +79,31 @@ def _make_window(*, selected_species: list[str]):
     )
 
 
-def _toggle_fit_targets_pending(panel) -> None:
-    from PySide6 import QtWidgets
+def _toggle_fit_targets_pending(window) -> None:
+    from PySide6.QtCore import Qt
+    from kindred.gui.fitting.unified_species_table import _Col
+    table = window._species_table._table
+    for row in range(table.rowCount()):
+        species_item = table.item(row, _Col.SPECIES)
+        include_item = table.item(row, _Col.INCLUDE)
+        if species_item is None or include_item is None:
+            continue
+        name = species_item.text()
+        if name == "A":
+            include_item.setCheckState(Qt.Unchecked)
+        elif name == "B":
+            include_item.setCheckState(Qt.Checked)
 
-    checkbox_a = next(cb for cb in panel.findChildren(QtWidgets.QCheckBox) if cb.text().strip() == "A")
-    checkbox_b = next(cb for cb in panel.findChildren(QtWidgets.QCheckBox) if cb.text().strip() == "B")
-    checkbox_a.setChecked(False)
-    checkbox_b.setChecked(True)
 
-
-def _target_weight_edit(panel, *, target_name: str):
-    from PySide6 import QtWidgets
-
-    for edit in reversed(panel.findChildren(QtWidgets.QLineEdit)):
-        if str(edit.property("fitTargetName") or "") == str(target_name):
-            return edit
-    raise AssertionError(f"Target weight edit not found: {target_name!r}")
+def _target_weight_edit(widget, *, target_name: str):
+    from kindred.gui.fitting.unified_species_table import _Col
+    window = widget if hasattr(widget, '_species_table') else widget.window()
+    table = window._species_table._table
+    for row in range(table.rowCount()):
+        species_item = table.item(row, _Col.SPECIES)
+        if species_item is not None and species_item.text() == target_name:
+            return table.item(row, _Col.WEIGHT)
+    raise AssertionError(f"Target weight item not found: {target_name!r}")
 
 
 def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
@@ -122,13 +131,13 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
 
     window = _make_window(selected_species=["A"])
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
 
-        _toggle_fit_targets_pending(panel)
+        _toggle_fit_targets_pending(window)
         qt_app.processEvents()
-        assert window._fit_targets_selection_applied["ds1"] == ["A"]
-        assert window._fit_targets_selection_pending["ds1"] == {"B"}
+        assert window._species_table.fit_targets_selection_applied["ds1"] == ["A"]
+        assert window._species_table._fit_targets_selection_pending["ds1"] == {"B"}
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
@@ -152,10 +161,8 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         json.dumps(rrt._last_run_stamp, sort_keys=True)
         assert rrt._last_run_stamp_hash
 
-        stamp_label = window.findChild(QtWidgets.QLabel, "global_fit_run_stamp_label")
-        assert stamp_label is not None
-        assert stamp_label.isHidden() is False
-        assert "stamp" in stamp_label.text().lower()
+        assert rrt._last_run_stamp_short
+        assert rrt._last_run_stamp_hash
     finally:
         window.close()
         qt_app.processEvents()
@@ -182,7 +189,7 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
 
     window = _make_window(selected_species=["A"])
     try:
-        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_fit_targets_panel")
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
         assert panel is not None
 
         edit_a = _target_weight_edit(panel, target_name="A")

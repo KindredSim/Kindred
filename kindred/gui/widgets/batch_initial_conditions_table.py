@@ -189,7 +189,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 return self._store.get_value(row, species[col - 1])
             return ""
 
-        if role == QtCore.Qt.TextAlignmentRole and self.is_control_column(col):
+        if role == QtCore.Qt.TextAlignmentRole:
             return int(QtCore.Qt.AlignCenter)
 
         if role == QtCore.Qt.ToolTipRole:

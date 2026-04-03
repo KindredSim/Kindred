@@ -52,7 +52,7 @@ def _make_window(*, t1: np.ndarray, t2: np.ndarray):
 
 
 def _select_dataset_row(window, *, row: int, qt_app) -> None:
-    table = getattr(window, "_dataset_table", None)
+    table = getattr(window._data_tab, "_dataset_table", None)
     assert table is not None
     table.selectRow(int(row))
     qt_app.processEvents()

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 __all__ = ["ParameterStatisticsTable"]
 
@@ -25,7 +25,11 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         self.setColumnCount(3)
         self.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
         header = self.horizontalHeader()
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
+        for col in range(self.columnCount()):
+            header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)  # Unit
+        self.setColumnWidth(2, 140)
         self.setAlternatingRowColors(True)
         self.setMaximumHeight(130)
 
@@ -42,11 +46,15 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         for row, name in enumerate(sorted(parameters.keys(), key=_param_sort_key)):
             value, unit = parameters[name]
             self.insertRow(row)
-            self.setItem(row, 0, QtWidgets.QTableWidgetItem(str(name)))
-            self.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{float(value):.6g}"))
-            self.setItem(row, 2, QtWidgets.QTableWidgetItem(str(unit)))
-
-        self.resizeColumnsToContents()
+            _name_item = QtWidgets.QTableWidgetItem(str(name))
+            _name_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(row, 0, _name_item)
+            _val_item = QtWidgets.QTableWidgetItem(f"{float(value):.6g}")
+            _val_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(row, 1, _val_item)
+            _unit_item = QtWidgets.QTableWidgetItem(str(unit))
+            _unit_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.setItem(row, 2, _unit_item)
         self.viewport().repaint()
 
 

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from kindred.core.analysis.x_mapping import parse_x_mapping_mode
-from kindred.gui.fitting.window import build_selected_fit_dataset_payload as _build_selected_fit_dataset_payload
+from kindred.core.analysis.fit_dataset_payload import build_fit_dataset_payload as _build_selected_fit_dataset_payload
 
 
 @pytest.mark.unit

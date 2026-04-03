@@ -73,7 +73,9 @@ class GridPlotView(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        controls_layout = QtWidgets.QHBoxLayout()
+        self._controls_widget = QtWidgets.QWidget(self)
+        self._controls_widget.setObjectName("grid_plot_view_controls")
+        controls_layout = QtWidgets.QHBoxLayout(self._controls_widget)
         controls_layout.setContentsMargins(2, 2, 2, 0)
         controls_layout.setSpacing(6)
 
@@ -95,7 +97,7 @@ class GridPlotView(QtWidgets.QWidget):
         controls_layout.addWidget(self._species_list)
 
         controls_layout.addStretch()
-        layout.addLayout(controls_layout)
+        layout.addWidget(self._controls_widget)
 
         ok, pg, _exc = try_import_pyqtgraph()
         self._pg = pg if ok else None
@@ -403,7 +405,7 @@ class GridPlotView(QtWidgets.QWidget):
                 [],
                 [],
                 pen=self._pg.mkPen(color=color, width=2),
-                name=f"{species_name} (model)",
+                name=species_name,
             )
         else:
             item = plot.plot(
@@ -414,7 +416,7 @@ class GridPlotView(QtWidgets.QWidget):
                 symbolSize=5,
                 symbolBrush=self._pg.mkBrush(*color, 150),
                 symbolPen=self._pg.mkPen(color=color, width=1),
-                name=f"{species_name} (data)",
+                name=None,
             )
         series_map[key] = item
         return item
@@ -809,6 +811,10 @@ class GridPlotView(QtWidgets.QWidget):
         self._species_list.blockSignals(False)
         self._schedule_redraw()
 
+    def set_controls_visible(self, visible: bool) -> None:
+        """Show or hide the built-in legend/species control row."""
+        self._controls_widget.setVisible(bool(visible))
+
     def set_autorange_locked(self, locked: bool) -> None:
         """
         When locked, disable PyQtGraph autorange on all subplots and preserve the current
@@ -1023,7 +1029,7 @@ class GridPlotView(QtWidgets.QWidget):
                 symbolSize=5,
                 symbolBrush=self._pg.mkBrush(*color, 150),
                 symbolPen=self._pg.mkPen(color=color, width=1),
-                name=f"{species_name} (data)",
+                name=None,
             )
 
             # Plot model overlay (multi-series preferred, fallback to single model_y)
@@ -1039,7 +1045,7 @@ class GridPlotView(QtWidgets.QWidget):
                     x_model,
                     y_model,
                     pen=self._pg.mkPen(color=color, width=2),
-                    name=f"{species_name} (model)",
+                    name=species_name,
                 )
 
         # Add legend if we have multiple species
