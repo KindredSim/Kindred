@@ -89,6 +89,20 @@ class ConfigController(QtCore.QObject):
     def __init__(self, ui: ConfigControllerPort):
         super().__init__(ui.parent)
         self._ui = ui
+        # User preference snapshot — not overwritten by document loads.
+        self._user_preferences: dict[str, object] = {}
+
+    def update_user_preference(self, key: str, value: object) -> None:
+        """Record a user-chosen value for a dual-persisted settings key."""
+        from kindred.gui.project_schema import QSETTINGS_KEY_MAP
+        if __debug__:
+            assert key in QSETTINGS_KEY_MAP, f"Unknown preference key: {key!r}"
+        self._user_preferences[key] = value
+
+    def get_user_preference(self, key: str) -> object:
+        """Return the stored user preference, falling back to factory default."""
+        from kindred.gui.project_schema import PROJECT_DEFAULTS
+        return self._user_preferences.get(key, PROJECT_DEFAULTS.get(key))
 
     @staticmethod
     def _read_int_setting(settings: QtCore.QSettings, key: str, default: int) -> int:
@@ -319,9 +333,23 @@ class ConfigController(QtCore.QObject):
         if saved_shortcuts:
             self._ui.load_custom_shortcuts(saved_shortcuts)
 
+        # Snapshot resolved startup values as the user preference baseline.
+        # Reads from QSettings, then patches in any CLI/profile overrides that
+        # were applied to live state above but not written to QSettings.
+        from kindred.gui.project_schema import get_user_preference_payload
+        self._user_preferences = get_user_preference_payload(settings)
+        if self._ui.has_explicit_startup_solver_override():
+            self._user_preferences["solver"] = str(solver_value or DEFAULT_SOLVER_NAME)
+        if self._ui.has_explicit_startup_rtol_override():
+            self._user_preferences["rtol"] = rtol_value
+        if self._ui.has_explicit_startup_atol_override():
+            self._user_preferences["atol"] = atol_value
+
         logger.debug("User settings loaded from QSettings (dark_mode=%s)", self._ui.dark_mode())
 
     def save_settings(self) -> None:
+        from kindred.gui.project_schema import PROJECT_DEFAULTS, QSETTINGS_KEY_MAP
+
         settings = self._settings()
 
         settings.setValue("window/is_maximized", self._ui.is_maximized())
@@ -332,36 +360,15 @@ class ConfigController(QtCore.QObject):
         if splitter:
             settings.setValue("window/splitter_state", splitter.saveState())
 
-        settings.setValue("simulation/temperature", self._ui.temperature())
-        settings.setValue("simulation/time", self._ui.simulation_time_text().strip())
-        settings.setValue("simulation/points", self._ui.num_points())
+        # Dual-persisted keys — write user preferences, not live document state.
+        for key, qs_key in QSETTINGS_KEY_MAP.items():
+            value = self._user_preferences.get(key, PROJECT_DEFAULTS.get(key))
+            if value is not None:
+                settings.setValue(qs_key, value)
+
+        # Application-level keys — always read from live UI state.
         settings.setValue("simulation/slider_preview_points", self._ui.slider_preview_points())
         settings.setValue("simulation/slider_preview_solver", self._ui.slider_preview_solver())
-        settings.setValue(
-            "simulation/solver",
-            self._ui.initial_solver_name(),
-        )
-        settings.setValue(
-            "simulation/rtol",
-            self._ui.initial_rtol(),
-        )
-        settings.setValue(
-            "simulation/atol",
-            self._ui.initial_atol(),
-        )
-        settings.setValue("simulation/use_sparse_jacobian", self._ui.use_sparse_jacobian())
-        settings.setValue(
-            "simulation/wegscheider_cyclicity_enabled",
-            self._ui.wegscheider_cyclicity_enabled(),
-        )
-        settings.setValue(
-            "simulation/max_parallel_batch_workers",
-            self._ui.max_parallel_batch_workers(),
-        )
-        settings.setValue(
-            "simulation/limit_blas_threads_per_worker",
-            self._ui.limit_blas_threads_per_worker(),
-        )
         settings.setValue(
             "simulation/result_cache_cap",
             self._ui.result_cache_cap(),

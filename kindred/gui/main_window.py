@@ -31,6 +31,7 @@ from kindred.core.simulator.dsl_text_update import (
 )
 from kindred.core.validation import try_parse_finite_float
 from kindred.gui.controllers.cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
+from kindred.gui.project_schema import PROJECT_DEFAULTS, PROJECT_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from kindred.core.mechanism import Mechanism
@@ -70,7 +71,6 @@ __all__ = ["MainWindow"]
 
 # Online documentation is not yet published.
 DOCUMENTATION_URL: Optional[str] = None
-PROJECT_SCHEMA_VERSION = 3
 _SOLVER_STATE_UNSET = object()
 _STARTUP_WIDTH_RATIO = 0.86
 _STARTUP_HEIGHT_RATIO = 0.88
@@ -193,6 +193,7 @@ class MainWindow(
         # Mechanism + simulation state.
         self._use_sparse_jacobian = False
         self._wegscheider_cyclicity_enabled = False
+        self._applying_document = False  # Guard: True while a project payload is being applied.
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
 
@@ -1007,8 +1008,10 @@ class MainWindow(
         add_items(
             file_menu,
             [
+                ("New Project", self.project_controller.new_project, QtGui.QKeySequence.New, "newProjectAction", "Start a new empty project"),
                 ("Load Project...", self.project_controller.load_project, QtGui.QKeySequence.Open, "loadProjectAction", "Load a Kindred project file (.kin)"),
-                ("Save Project...", self.project_controller.save_project, QtGui.QKeySequence.Save, "saveProjectAction", "Save current mechanism and settings to a project file"),
+                ("Save Project", self.project_controller.save_project, QtGui.QKeySequence.Save, "saveProjectAction", "Save current project to its file"),
+                ("Save Project As...", self.project_controller.save_project_as, QtGui.QKeySequence.SaveAs, "saveProjectAsAction", "Save current project to a new file"),
                 ("Load Data...", self._load_data_via_action, "Ctrl+Shift+L", "loadDataAction", "Load experimental CSV data (same as the Data panel 'Load' button)"),
                 ("submenu", "Recent Projects", "_recent_menu", self._update_recent_files_menu),
                 None,
@@ -1320,6 +1323,10 @@ class MainWindow(
 
         # Temperature mode indicator updates
         self._temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
+        # User preference tracking for spinbox-only dual-persisted keys.
+        self._temperature_spinbox.valueChanged.connect(self._on_temperature_user_edit)
+        self._num_points_spinbox.valueChanged.connect(self._on_num_points_user_edit)
+        self._sim_time_spinbox.textChanged.connect(self._on_sim_time_user_edit)
         self._mechanism_editor._reactions_text.textChanged.connect(self._update_temperature_mode_indicator)
         self._mechanism_editor._reactions_text.textChanged.connect(self._on_authoritative_mechanism_input_changed)
         self._mechanism_editor._reactions_text.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
@@ -1530,6 +1537,18 @@ class MainWindow(
         if self._use_sparse_jacobian and str(solver_method).upper() in {"RADAU", "BDF"}:
             summary += " • Sparse J"
         self._solver_summary_label.setText(summary)
+
+    def _on_temperature_user_edit(self, value: float) -> None:
+        if not self._applying_document:
+            self.config_controller.update_user_preference("temperature_K", value)
+
+    def _on_num_points_user_edit(self, value: int) -> None:
+        if not self._applying_document:
+            self.config_controller.update_user_preference("num_points", value)
+
+    def _on_sim_time_user_edit(self, text: str) -> None:
+        if not self._applying_document:
+            self.config_controller.update_user_preference("simulation_time", str(text).strip())
 
     def _update_temperature_mode_indicator(self) -> None:
         """
@@ -2045,6 +2064,9 @@ class MainWindow(
                 rtol=rtol_spin.value(),
                 atol=atol_spin.value(),
             )
+            self.config_controller.update_user_preference("solver", self._initial_solver)
+            self.config_controller.update_user_preference("rtol", self._initial_rtol)
+            self.config_controller.update_user_preference("atol", self._initial_atol)
             logger.info(f"Preferences updated: solver={self._initial_solver}, rtol={self._initial_rtol}, atol={self._initial_atol}")
             self._status_label.setText("Preferences updated")
 
@@ -3473,6 +3495,13 @@ class MainWindow(
 
     def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         """Populate the UI from serialized project data."""
+        self._applying_document = True
+        try:
+            self._apply_project_payload_inner(data, record_undo=record_undo)
+        finally:
+            self._applying_document = False
+
+    def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         from kindred.core.batch_initial_conditions import (
             BatchInitialConditionsStore,
             migrate_reaction_dsl_initial_concentration_sets,
@@ -3562,41 +3591,44 @@ class MainWindow(
             if current_state_network.strip():
                 state_editor.clear()
 
-        solver_contract = load_solver_contract()
-        solver_value = data.get('solver', self._initial_solver or solver_contract.default_solver_name)
-        rtol_value = data.get('rtol', self._initial_rtol or 1e-6)
-        atol_value = data.get('atol', self._initial_atol or 1e-12)
+        # Fall back to user preference when key absent from payload.
+        _pref = self.config_controller.get_user_preference
+        solver_value = data.get('solver', _pref('solver'))
+        rtol_value = data.get('rtol', _pref('rtol'))
+        atol_value = data.get('atol', _pref('atol'))
 
-        # Load solver/settings metadata (with safe defaults for older files)
-        if 'use_sparse_jacobian' in data:
-            self._use_sparse_jacobian = bool(data.get('use_sparse_jacobian'))
-        if 'wegscheider_cyclicity_enabled' in data:
-            self._wegscheider_cyclicity_enabled = bool(data.get('wegscheider_cyclicity_enabled'))
-        if 'max_parallel_batch_workers' in data:
-            try:
-                self._sim_controller.parallel_batch.max_parallel_workers = max(1, int(data.get('max_parallel_batch_workers')))
-            except Exception:
-                self._sim_controller.parallel_batch.max_parallel_workers = 12
-        if 'limit_blas_threads_per_worker' in data:
-            self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
-                data.get('limit_blas_threads_per_worker')
+        self._use_sparse_jacobian = bool(
+            data.get('use_sparse_jacobian', _pref('use_sparse_jacobian'))
+        )
+        self._wegscheider_cyclicity_enabled = bool(
+            data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
+        )
+        try:
+            self._sim_controller.parallel_batch.max_parallel_workers = max(
+                1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))
             )
+        except Exception:
+            self._sim_controller.parallel_batch.max_parallel_workers = int(PROJECT_DEFAULTS['max_parallel_batch_workers'])
+        self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
+            data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
+        )
         if 'use_advanced_dsl' in data:
             logger.info(
                 "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
                 data['use_advanced_dsl'],
             )
-        if 'temperature_K' in data:
-            self._temperature_spinbox.setValue(data['temperature_K'])
-        if 'simulation_time' in data:
-            sim_time = data.get('simulation_time')
-            if isinstance(sim_time, (int, float)):
-                sim_time_text = f"{float(sim_time):g}"
-            else:
-                sim_time_text = str(sim_time)
-            self._sim_time_spinbox.setText(sim_time_text)
-        if 'num_points' in data:
-            self._num_points_spinbox.setValue(int(data['num_points']))
+        self._temperature_spinbox.setValue(
+            data.get('temperature_K', _pref('temperature_K'))
+        )
+        sim_time = data.get('simulation_time', _pref('simulation_time'))
+        if isinstance(sim_time, (int, float)):
+            sim_time_text = f"{float(sim_time):g}"
+        else:
+            sim_time_text = str(sim_time)
+        self._sim_time_spinbox.setText(sim_time_text)
+        self._num_points_spinbox.setValue(
+            int(data.get('num_points', _pref('num_points')))
+        )
 
         self._apply_solver_runtime_state(
             solver=solver_value,
@@ -8600,8 +8632,10 @@ class MainWindow(
 
 <h4>File Operations</h4>
 <table>
+<tr><td><b>Ctrl+N</b></td><td>New Project</td></tr>
 <tr><td><b>Ctrl+O</b></td><td>Load Project</td></tr>
 <tr><td><b>Ctrl+S</b></td><td>Save Project</td></tr>
+<tr><td><b>Ctrl+Shift+S</b></td><td>Save Project As</td></tr>
 <tr><td><b>Ctrl+E</b></td><td>Export CSV Data</td></tr>
 <tr><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
 </table>
@@ -8780,6 +8814,22 @@ class MainWindow(
                 solver=settings.get('solver', self._initial_solver or solver_contract.default_solver_name),
                 rtol=settings.get('rtol', self._initial_rtol or 1e-6),
                 atol=settings.get('atol', self._initial_atol or 1e-12),
+            )
+            # Record dialog changes as user preferences.
+            self.config_controller.update_user_preference("solver", self._initial_solver)
+            self.config_controller.update_user_preference("rtol", self._initial_rtol)
+            self.config_controller.update_user_preference("atol", self._initial_atol)
+            self.config_controller.update_user_preference("use_sparse_jacobian", self._use_sparse_jacobian)
+            self.config_controller.update_user_preference(
+                "wegscheider_cyclicity_enabled", self._wegscheider_cyclicity_enabled,
+            )
+            self.config_controller.update_user_preference(
+                "max_parallel_batch_workers",
+                self._sim_controller.parallel_batch.max_parallel_workers,
+            )
+            self.config_controller.update_user_preference(
+                "limit_blas_threads_per_worker",
+                self._sim_controller.parallel_batch.limit_blas_threads_per_worker,
             )
             slider_schema_refresh_needed = bool(
                 current_runtime_settings["wegscheider_cyclicity_enabled"]
