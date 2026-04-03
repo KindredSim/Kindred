@@ -194,3 +194,31 @@ def test_reactions_text_has_param_decl_detects_existing_param():
     assert check("param otherName = 1.0", "myP") is False
     assert check("", "myP") is False
     assert check("something else", "myP") is False
+
+
+# ---- Stale-applied-targets bug: empty apply must disable Run Fit ----
+
+def test_apply_empty_targets_disables_run_fit(qt_app):
+    window = _make_window()
+    try:
+        st = window._species_table
+
+        # Initially ds1 has applied target ["A"], Run Fit should be enabled
+        window._refresh_run_button_enabled_state()
+        assert window._run_button.isEnabled(), "Run Fit should start enabled with applied targets"
+
+        # Uncheck all targets for ds1
+        st._fit_targets_selection_pending["ds1"] = set()
+        st._fit_targets_dirty = True
+
+        # Apply — this emits targetsApplied which triggers _on_targets_validity_changed
+        st._apply_changes()
+        qt_app.processEvents()
+
+        # Run Fit must now be disabled
+        assert not window._run_button.isEnabled(), (
+            "Run Fit must be disabled after applying empty targets"
+        )
+    finally:
+        window.close()
+        qt_app.processEvents()

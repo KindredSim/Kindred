@@ -1047,7 +1047,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         used_ids = set(self._included_dataset_ids_getter())
         new_applied = dict(self._fit_targets_selection_applied or {})
         new_applied_target_weights = dict(self._fit_target_weights_applied or {})
-        invalid_pending_used: set[str] = set()
         invalid_pending_weights: set[str] = set()
         deferred_excluded_pending_weights: set[str] = set()
 
@@ -1055,9 +1054,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             available = list(self._fit_targets_available_by_dataset.get(ds_id, []))
             pending_set = self._fit_targets_selection_pending.get(ds_id, set()) or set()
             pending_list = [name for name in available if name in pending_set]
-            if ds_id in used_ids and not pending_list:
-                invalid_pending_used.add(ds_id)
-                continue
             invalid_map = self._fit_target_weights_pending_invalid.get(ds_id, {})
             has_invalid_pending_weights = isinstance(invalid_map, dict) and any(name in invalid_map for name in pending_list)
             if ds_id in used_ids and has_invalid_pending_weights:
@@ -1077,8 +1073,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_target_weights_applied = {ds: dict(v) for ds, v in new_applied_target_weights.items()}
         for ds_id in list(self._fit_targets_selection_pending.keys()):
             if (
-                ds_id in invalid_pending_used
-                or ds_id in invalid_pending_weights
+                ds_id in invalid_pending_weights
                 or ds_id in deferred_excluded_pending_weights
             ):
                 continue

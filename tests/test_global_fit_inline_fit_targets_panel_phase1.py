@@ -309,7 +309,7 @@ def test_preloaded_target_weights_fall_back_to_seeded_payload_when_entry_omits_t
         qt_app.processEvents()
 
 
-def test_fit_targets_apply_keeps_invalid_used_dataset_pending_and_highlights_row(qt_app, monkeypatch):
+def test_fit_targets_apply_promotes_empty_selection_and_highlights_row(qt_app, monkeypatch):
     from PySide6 import QtCore, QtGui, QtWidgets
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
 
@@ -319,8 +319,6 @@ def test_fit_targets_apply_keeps_invalid_used_dataset_pending_and_highlights_row
         assert panel is not None
         apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
         assert apply_btn is not None
-
-        applied_before = list(window._species_table.fit_targets_selection_applied["ds1"])
 
         _set_fit_targets_dataset(window, dataset_id="ds1")
         from kindred.gui.fitting.unified_species_table import _Col
@@ -336,10 +334,11 @@ def test_fit_targets_apply_keeps_invalid_used_dataset_pending_and_highlights_row
         apply_btn.click()
         qt_app.processEvents()
 
-        # Used dataset with empty pending selection must not be applied.
-        assert window._species_table.fit_targets_selection_applied["ds1"] == applied_before
+        # Empty pending selection is promoted truthfully into applied state.
+        assert window._species_table.fit_targets_selection_applied["ds1"] == []
         assert window._species_table._fit_targets_selection_pending["ds1"] == set()
-        assert apply_btn.isEnabled(), "Apply should remain enabled while invalid pending changes exist."
+        # Pending now matches applied (both empty), so no unsaved changes remain.
+        assert not apply_btn.isEnabled(), "Apply should be disabled when pending matches applied."
 
         error_label = panel.findChild(QtWidgets.QLabel, "global_fit_species_table_error")
         assert error_label is not None

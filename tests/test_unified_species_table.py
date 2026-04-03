@@ -1358,3 +1358,87 @@ def test_species_table_delegate_reads_foreground_role(qt_app):
     finally:
         tbl.close()
         qt_app.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# Stale-applied-targets bug — empty pending must promote into applied
+# ---------------------------------------------------------------------------
+
+def test_apply_empty_targets_clears_applied_state(qt_app):
+    """Unchecking all targets and applying must clear applied state, not keep stale targets."""
+    entries = _make_entries(selected=["A", "B"])
+    mgr = _make_manager(species=["A", "B"])
+    tbl = _make_table(entries=entries, manager=mgr)
+    try:
+        # Initial applied has A, B
+        assert sorted(tbl._fit_targets_selection_applied.get("ds1", [])) == ["A", "B"]
+
+        # Uncheck all targets — set pending to empty
+        tbl._fit_targets_selection_pending["ds1"] = set()
+        tbl._fit_targets_dirty = True
+
+        result = tbl._apply_targets()
+        assert result is True
+
+        # Applied must now be empty — not stale ["A", "B"]
+        assert tbl._fit_targets_selection_applied.get("ds1", []) == []
+        assert tbl._fit_target_weights_applied.get("ds1", {}) == {}
+        assert "ds1" in tbl.invalid_applied_used_dataset_ids()
+
+        # Dirty state must be clean: pending=empty matches applied=empty
+        tbl._update_fit_targets_dirty_state()
+        assert tbl._fit_targets_dirty is False
+
+        # Round-trip recovery: re-select one target and apply again
+        tbl._fit_targets_selection_pending["ds1"] = {"A"}
+        tbl._fit_targets_dirty = True
+        tbl._apply_targets()
+        assert tbl._fit_targets_selection_applied.get("ds1", []) == ["A"]
+        assert "ds1" not in tbl.invalid_applied_used_dataset_ids()
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_apply_empty_targets_one_of_two_datasets(qt_app):
+    """Empty apply on one dataset must not affect the other dataset's applied state."""
+    t = np.linspace(0, 1, 5)
+    entries = [
+        {
+            "id": "ds1", "label": "DS 1", "t": t,
+            "species_data": {"A": np.linspace(1, 0.5, t.size), "B": np.linspace(0.2, 0.9, t.size)},
+            "selected_species": ["A", "B"], "weight": 1.0, "include": True,
+        },
+        {
+            "id": "ds2", "label": "DS 2", "t": t,
+            "species_data": {"A": np.linspace(0.8, 0.3, t.size), "B": np.linspace(0.1, 0.7, t.size)},
+            "selected_species": ["A", "B"], "weight": 1.0, "include": True,
+        },
+    ]
+    mgr = _make_manager(
+        by_dataset={
+            "ds1": {"initial_conditions": {"A": 1.0, "B": 0.2}, "fit_flags": {}, "log10_flags": {}, "bounds": {}},
+            "ds2": {"initial_conditions": {"A": 0.8, "B": 0.1}, "fit_flags": {}, "log10_flags": {}, "bounds": {}},
+        }
+    )
+    tbl = _make_table(entries=entries, manager=mgr, included_ids=["ds1", "ds2"])
+    try:
+        assert sorted(tbl._fit_targets_selection_applied.get("ds1", [])) == ["A", "B"]
+        assert sorted(tbl._fit_targets_selection_applied.get("ds2", [])) == ["A", "B"]
+
+        # Uncheck all for ds1 only
+        tbl._fit_targets_selection_pending["ds1"] = set()
+        tbl._fit_targets_dirty = True
+
+        tbl._apply_targets()
+
+        # ds1 applied must be empty; ds2 preserved
+        assert tbl._fit_targets_selection_applied.get("ds1", []) == []
+        assert sorted(tbl._fit_targets_selection_applied.get("ds2", [])) == ["A", "B"]
+
+        invalid = tbl.invalid_applied_used_dataset_ids()
+        assert "ds1" in invalid
+        assert "ds2" not in invalid
+    finally:
+        tbl.close()
+        qt_app.processEvents()
