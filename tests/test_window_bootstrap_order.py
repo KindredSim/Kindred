@@ -68,14 +68,14 @@ def test_main_window_initializes_mixin_ports_once_after_menu_prerequisites(qt_ap
     try:
         assert calls == [
             {
-                "has_profiles_menu": True,
+                "has_profiles_menu": False,  # Hidden: Profiles menu removed from menu bar (entry point commented out in main_window.py)
                 "has_dark_mode_action": True,
                 "has_status_label": True,
                 "has_profile_indicator": True,
             }
         ]
         assert window._profile_ports.dark_mode_action is window._dark_mode_action
-        assert window._profile_ports.profiles_menu_getter() is window._profiles_menu
+        assert window._profile_ports.profiles_menu_getter() is None  # Hidden: Profiles menu removed
     finally:
         window.close()
         _clear_gui_settings()
@@ -117,8 +117,7 @@ def test_main_window_load_settings_runs_after_bootstrap_prerequisites(qt_app, mo
                 "has_ribbon_toolbar": hasattr(window, "_ribbon_toolbar"),
                 "has_ribbon_host": hasattr(window, "_ribbon_host"),
                 "profile_ports_ready": getattr(window, "_profile_ports", None) is not None
-                and window._profile_ports.dark_mode_action is window._dark_mode_action
-                and window._profile_ports.profiles_menu_getter() is window._profiles_menu,
+                and window._profile_ports.dark_mode_action is window._dark_mode_action,
             }
         )
 
@@ -138,11 +137,11 @@ def test_main_window_load_settings_runs_after_bootstrap_prerequisites(qt_app, mo
             "has_analysis_dock": True,
             "has_status_label": True,
             "has_profile_indicator": True,
-            "has_profiles_menu": True,
+            "has_profiles_menu": False,  # Hidden: Profiles menu removed (entry point commented out in main_window.py)
             "has_dark_mode_action": True,
             "has_debug_sliders_action": True,
-            "has_ribbon_toolbar": True,
-            "has_ribbon_host": True,
+            "has_ribbon_toolbar": False,  # Hidden: Ribbon removed (entry point commented out in main_window.py)
+            "has_ribbon_host": False,  # Hidden: Ribbon removed (entry point commented out in main_window.py)
             "profile_ports_ready": True,
         }
     finally:

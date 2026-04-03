@@ -219,6 +219,7 @@ def test_slider_preview_preferences_persist_across_restart(main_window, qt_app):
         qt_app.processEvents()
 
 
+@pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_ribbon_collapsed_state_persists_across_restart(main_window, qt_app):
     settings = main_window._settings
     settings.clear()

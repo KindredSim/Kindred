@@ -765,7 +765,16 @@ class MainWindow(
     def _finish_window_composition(self) -> None:
         """Complete window composition before any persisted/bootstrap state is applied."""
         self._create_menus()
-        self._init_ribbon_host()
+        # ──────────────────────────────────────────────────────────────
+        # HIDDEN FEATURE: Ribbon
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: kindred/gui/widgets/ribbon.py, _init_ribbon_host() in this file
+        # Unhide: Uncomment the line below after the feature passes a
+        #         dedicated integration audit and is approved for user access.
+        # Tracked: chore/post-merge-audit-cleanup branch
+        # ──────────────────────────────────────────────────────────────
+        # self._init_ribbon_host()
         self._init_mixin_ports()
         self._connect_signals()
 
@@ -787,7 +796,7 @@ class MainWindow(
         )
         self._profile_ports = ProfileMixinPorts(
             profile_manager=self._profile_manager,
-            profiles_menu_getter=lambda: self._profiles_menu,
+            profiles_menu_getter=lambda: None,  # Hidden: Profiles menu removed from menu bar
             profile_indicator_setter=lambda text: self._profile_indicator.setText(str(text)),
             status_setter=lambda text: self._status_label.setText(str(text)),
             settings_set_value=self.settings_set_value,
@@ -1090,9 +1099,36 @@ class MainWindow(
                 ("&Redo", self._redo, QtGui.QKeySequence.Redo, "redoAction", "Redo previously undone edit"),
                 ("Allow Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
                 None,
-                ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
-                ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
-                ("&Computational Mode...", self._open_computational_mode, None, "computationalModeAction", "Convert absolute computed free energies into energy-mode DSL blocks"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: Species Registry
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: _open_species_registry() and _gather_species_registry_entries() in this file
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: State Network Editor
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: kindred/gui/widgets/state_network_editor.py, _open_state_network() in this file
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: Computational Mode
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: kindred/gui/widgets/computational_mode_dialog.py, _open_computational_mode() in this file
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("&Computational Mode...", self._open_computational_mode, None, "computationalModeAction", "Convert absolute computed free energies into energy-mode DSL blocks"),
                 None,
                 ("Preferences...", self._open_preferences, QtGui.QKeySequence.Preferences, "preferencesAction", "Configure application preferences and settings"),
                 ("Customize &Keyboard Shortcuts...", self._open_shortcuts_dialog, "Ctrl+K", "customizeShortcutsAction", "Customize keyboard shortcuts for actions"),
@@ -1149,9 +1185,19 @@ class MainWindow(
             ],
         )
 
-        self._profiles_menu = QtWidgets.QMenu("&Profiles", self)
-        menubar.addMenu(self._profiles_menu)
-        self._update_profiles_menu()
+        # ──────────────────────────────────────────────────────────────
+        # HIDDEN FEATURE: Profiles
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: kindred/config/profiles.py, kindred/gui/mixins/profile_mixin.py
+        # Unhide: Uncomment the lines below after the feature passes a
+        #         dedicated integration audit and is approved for user access.
+        #         Also restore profiles_menu_getter in _init_mixin_ports().
+        # Tracked: chore/post-merge-audit-cleanup branch
+        # ──────────────────────────────────────────────────────────────
+        # self._profiles_menu = QtWidgets.QMenu("&Profiles", self)
+        # menubar.addMenu(self._profiles_menu)
+        # self._update_profiles_menu()
 
         examples_menu = menubar.addMenu("E&xamples")
         presets_submenu = examples_menu.addMenu("Preset Mechanisms")
@@ -1187,8 +1233,17 @@ class MainWindow(
         add_items(
             tools_menu,
             [
-                ("&Temperature Schedule...", self._open_temperature_schedule_editor, None, "temperatureScheduleAction", "Create piecewise temperature schedules with visual preview"),
-                None,
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: Temperature Schedule
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: kindred/gui/widgets/temperature_schedule_editor.py, _open_temperature_schedule_editor() in this file
+                # Unhide: Uncomment the lines below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("&Temperature Schedule...", self._open_temperature_schedule_editor, None, "temperatureScheduleAction", "Create piecewise temperature schedules with visual preview"),
+                # None,
             ],
         )
         debug_menu = tools_menu.addMenu("Debug")
@@ -1204,7 +1259,16 @@ class MainWindow(
             help_menu,
             [
                 ("&Documentation", self._open_docs, QtGui.QKeySequence.HelpContents, "documentationAction", "Open Kindred documentation (shows offline guidance if online docs are unavailable)"),
-                ("&Interactive Tutorials...", self._show_tutorials, None, "tutorialsAction", "Launch step-by-step interactive tutorials"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: Tutorial
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: kindred/gui/tutorial_manager.py, kindred/gui/widgets/tutorial_overlay.py, kindred/gui/widgets/tutorial_selection_dialog.py
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("&Interactive Tutorials...", self._show_tutorials, None, "tutorialsAction", "Launch step-by-step interactive tutorials"),
                 ("&Keyboard Shortcuts", self._show_keyboard_shortcuts, "Ctrl+?", "keyboardShortcutsAction", "View list of keyboard shortcuts (Ctrl+?)"),
                 None,
                 ("&About", self._show_about, None, "aboutAction", "About Kindred - version and license information"),
