@@ -193,7 +193,7 @@ class MainWindow(
         # Mechanism + simulation state.
         self._use_sparse_jacobian = False
         self._wegscheider_cyclicity_enabled = False
-        self._applying_document = False  # Guard: True while a project payload is being applied.
+        self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
 
@@ -781,7 +781,11 @@ class MainWindow(
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
         self._apply_initial_profile_from_cli()
-        self._load_settings()
+        self._suppress_preference_updates = True
+        try:
+            self._load_settings()
+        finally:
+            self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
 
     def _init_mixin_ports(self) -> None:
@@ -1505,6 +1509,8 @@ class MainWindow(
 
     def _on_solver_method_changed(self, v: str) -> None:
         self._apply_solver_runtime_state(solver=str(v), sync_combo=False)
+        if not self._suppress_preference_updates:
+            self.config_controller.update_user_preference("solver", self._initial_solver)
 
     def _update_solver_summary_label(self) -> None:
         """Refresh the solver summary label shown in the Solver section."""
@@ -1539,16 +1545,19 @@ class MainWindow(
         self._solver_summary_label.setText(summary)
 
     def _on_temperature_user_edit(self, value: float) -> None:
-        if not self._applying_document:
+        if not self._suppress_preference_updates:
             self.config_controller.update_user_preference("temperature_K", value)
 
     def _on_num_points_user_edit(self, value: int) -> None:
-        if not self._applying_document:
+        if not self._suppress_preference_updates:
             self.config_controller.update_user_preference("num_points", value)
 
     def _on_sim_time_user_edit(self, text: str) -> None:
-        if not self._applying_document:
-            self.config_controller.update_user_preference("simulation_time", str(text).strip())
+        if not self._suppress_preference_updates:
+            # QLineEdit can emit empty strings during editing; skip to avoid persisting invalid state.
+            stripped = str(text).strip()
+            if stripped:
+                self.config_controller.update_user_preference("simulation_time", stripped)
 
     def _update_temperature_mode_indicator(self) -> None:
         """
@@ -3495,11 +3504,11 @@ class MainWindow(
 
     def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         """Populate the UI from serialized project data."""
-        self._applying_document = True
+        self._suppress_preference_updates = True
         try:
             self._apply_project_payload_inner(data, record_undo=record_undo)
         finally:
-            self._applying_document = False
+            self._suppress_preference_updates = False
 
     def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         from kindred.core.batch_initial_conditions import (

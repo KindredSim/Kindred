@@ -661,13 +661,13 @@ def test_dialog_update_user_preference_roundtrips(main_window):
 
 
 def test_spinbox_edit_updates_user_preference_when_not_applying_document(main_window):
-    """Direct spinbox edits update user preferences when _applying_document is False."""
+    """Direct spinbox edits update user preferences when _suppress_preference_updates is False."""
     settings = main_window._settings
     settings.clear()
     settings.sync()
 
     main_window.config_controller.load_settings()
-    assert main_window._applying_document is False
+    assert main_window._suppress_preference_updates is False
 
     main_window._temperature_spinbox.setValue(400.0)
     assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(400.0)
@@ -677,7 +677,7 @@ def test_spinbox_edit_updates_user_preference_when_not_applying_document(main_wi
 
 
 def test_spinbox_during_project_apply_does_not_update_user_preferences(main_window):
-    """_apply_project_payload sets _applying_document=True so spinbox signals skip preferences."""
+    """_apply_project_payload sets _suppress_preference_updates=True so spinbox signals skip preferences."""
     settings = main_window._settings
     settings.clear()
     settings.setValue("simulation/temperature", 298.15)
@@ -698,3 +698,80 @@ def test_spinbox_during_project_apply_does_not_update_user_preferences(main_wind
     # User preferences unchanged
     assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(original_temp)
     assert main_window.config_controller._user_preferences["num_points"] == original_points
+
+
+def test_solver_combo_change_persists_to_qsettings(main_window):
+    """Changing the solver combo updates user preferences so save_settings persists the value."""
+    settings = main_window._settings
+    settings.clear()
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    original_solver = main_window.config_controller._user_preferences.get("solver")
+
+    # Simulate user changing the solver combo.
+    combo = main_window._solver_method_combo
+    target_solver = "BDF" if original_solver != "BDF" else "Radau"
+    idx = combo.findText(target_solver)
+    assert idx >= 0, f"Solver {target_solver!r} not found in combo"
+    combo.setCurrentIndex(idx)
+
+    assert main_window.config_controller._user_preferences["solver"] == target_solver
+
+    main_window.config_controller.save_settings()
+    assert settings.value("simulation/solver") == target_solver
+
+
+def test_solver_unchanged_during_document_apply(main_window):
+    """Applying a project payload with a different solver must not modify user preferences."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/solver", "Radau")
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    assert main_window.config_controller._user_preferences["solver"] == "Radau"
+
+    payload = {"mechanism": "A -> B ; k1=1", "solver": "BDF"}
+    main_window._apply_project_payload(payload)
+
+    assert main_window._initial_solver == "BDF"
+    assert main_window.config_controller._user_preferences["solver"] == "Radau"
+
+
+def test_load_settings_suppresses_preference_updates(main_window):
+    """load_settings must not trigger update_user_preference via spinbox signals."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/temperature", 350.0)
+    settings.setValue("simulation/points", 200)
+    settings.sync()
+
+    calls = []
+    original_update = main_window.config_controller.update_user_preference
+
+    def spy(key, value):
+        calls.append((key, value))
+        original_update(key, value)
+
+    main_window.config_controller.update_user_preference = spy
+    main_window._suppress_preference_updates = True
+    try:
+        main_window.config_controller.load_settings()
+    finally:
+        main_window._suppress_preference_updates = False
+    main_window.config_controller.update_user_preference = original_update
+
+    assert len(calls) == 0, f"update_user_preference called {len(calls)} times during load_settings: {calls}"
+
+
+def test_bootstrap_window_state_suppresses_preference_updates(main_window):
+    """The production bootstrap path must suppress preference updates during load."""
+    calls = []
+    original = main_window.config_controller.update_user_preference
+    main_window.config_controller.update_user_preference = lambda k, v: calls.append((k, v))
+    try:
+        main_window._bootstrap_window_state()
+    finally:
+        main_window.config_controller.update_user_preference = original
+    assert len(calls) == 0, f"update_user_preference called during bootstrap: {calls}"

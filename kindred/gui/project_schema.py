@@ -7,6 +7,7 @@ factory defaults < user preferences (QSettings) < document overrides (.kin).
 """
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING
 
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
@@ -63,9 +64,7 @@ def get_default_project_payload() -> dict[str, object]:
     Callers must use this function instead of PROJECT_DEFAULTS directly
     to avoid mutating the shared module-level dict.
     """
-    result = dict(PROJECT_DEFAULTS)
-    result["batch_initial_conditions"] = dict(result["batch_initial_conditions"])
-    return result
+    return copy.deepcopy(PROJECT_DEFAULTS)
 
 
 def get_user_preference_payload(settings: QSettings) -> dict[str, object]:

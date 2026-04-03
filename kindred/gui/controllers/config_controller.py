@@ -95,8 +95,8 @@ class ConfigController(QtCore.QObject):
     def update_user_preference(self, key: str, value: object) -> None:
         """Record a user-chosen value for a dual-persisted settings key."""
         from kindred.gui.project_schema import QSETTINGS_KEY_MAP
-        if __debug__:
-            assert key in QSETTINGS_KEY_MAP, f"Unknown preference key: {key!r}"
+        if key not in QSETTINGS_KEY_MAP:
+            raise ValueError(f"Unknown user preference key: {key!r}")
         self._user_preferences[key] = value
 
     def get_user_preference(self, key: str) -> object:

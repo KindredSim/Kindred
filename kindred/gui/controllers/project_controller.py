@@ -111,14 +111,6 @@ class ProjectController(QtCore.QObject):
                 data = self._serialize_project_state()
                 with open(filepath, "w") as handle:
                     json.dump(data, handle, indent=2)
-
-            self._current_project_path = filepath
-            self._update_window_title()
-            self._set_status(f"Saved project: {filepath}")
-            logger.info("Saved project to %s", filepath)
-            self._add_to_recent_files(filepath)
-            return True
-
         except Exception as exc:
             logger.error("Failed to save project: %s", exc, exc_info=True)
             QtWidgets.QMessageBox.critical(
@@ -127,6 +119,17 @@ class ProjectController(QtCore.QObject):
                 f"Failed to save project:\n\n{exc}",
             )
             return False
+
+        # File write succeeded — title and recent-files are best-effort.
+        self._current_project_path = filepath
+        try:
+            self._update_window_title()
+            self._set_status(f"Saved project: {filepath}")
+            logger.info("Saved project to %s", filepath)
+            self._add_to_recent_files(filepath)
+        except Exception:
+            logger.warning("Post-save bookkeeping failed for %s", filepath, exc_info=True)
+        return True
 
     def new_project(self) -> None:
         """Reset the application to an empty project state.
