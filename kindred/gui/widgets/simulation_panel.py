@@ -44,6 +44,7 @@ class SimulationPanel(QtWidgets.QWidget):
         batch_layout.setSpacing(4)
 
         self.batch_table = BatchInitialConditionsTableView(batch_widget)
+        self.batch_table.setObjectName("batchTable")
         self.batch_table.setModel(batch_model)
         self.batch_table.pasteError.connect(
             lambda msg: QtWidgets.QMessageBox.warning(message_parent, "Paste Error", str(msg))

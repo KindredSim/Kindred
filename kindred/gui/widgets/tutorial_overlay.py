@@ -298,32 +298,36 @@ class TutorialOverlay(QtWidgets.QWidget):
         return None
 
     def paintEvent(self, event: QtGui.QPaintEvent):
-        """Paint semi-transparent overlay with spotlight."""
+        """Paint semi-transparent overlay with spotlight cutout."""
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
-        # Draw dark overlay
-        overlay_color = QtGui.QColor(0, 0, 0, 180)  # Semi-transparent black
-        painter.fillRect(self.rect(), overlay_color)
+        overlay_color = QtGui.QColor(0, 0, 0, 180)
 
-        # Cut out spotlight area
         highlight_rect = self._get_highlight_rect()
         if highlight_rect:
-            # Expand highlight rect for padding
             padding = 8
             spotlight_rect = highlight_rect.adjusted(-padding, -padding, padding, padding)
 
-            # Draw rounded spotlight
-            painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
-            painter.setBrush(Qt.transparent)
-            painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(spotlight_rect, 8, 8)
+            # Use a path with the spotlight subtracted so the cutout is
+            # truly transparent instead of black (CompositionMode_Clear
+            # requires a translucent backing store which is not guaranteed).
+            overlay_path = QtGui.QPainterPath()
+            overlay_path.addRect(QtCore.QRectF(self.rect()))
+            cutout = QtGui.QPainterPath()
+            cutout.addRoundedRect(QtCore.QRectF(spotlight_rect), 8, 8)
+            overlay_path -= cutout
 
-            # Draw highlight border
-            painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(overlay_color)
+            painter.drawPath(overlay_path)
+
+            # Highlight border around the spotlight
             painter.setPen(QtGui.QPen(QtGui.QColor("#4A90E2"), 3))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(spotlight_rect, 8, 8)
+        else:
+            painter.fillRect(self.rect(), overlay_color)
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
         """Handle parent resize."""
