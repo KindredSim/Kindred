@@ -683,8 +683,8 @@ class DataManagerPanel(QtWidgets.QWidget):
         metadata = data.setdefault("metadata", {})
         if plan.time_factor != 1.0:
             data["t"] = data["t"] * plan.time_factor
-        for species_name in list((data.get("species") or {}).keys()):
-            factor = plan.conc_factors.get(species_name, 1.0)
+        for species_name in list(data["species"].keys()):
+            factor = plan.conc_factors[species_name]
             if factor != 1.0:
                 data["species"][species_name] = data["species"][species_name] * factor
         metadata["original_time_unit"] = plan.original_time_unit

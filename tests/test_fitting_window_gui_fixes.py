@@ -149,3 +149,48 @@ def test_footer_has_results_summary_button(qt_app):
     finally:
         window.close()
         qt_app.processEvents()
+
+
+# ---- Regex: _validate_observable_name_rules rejects rate-constant patterns ----
+
+def test_validate_observable_name_rejects_rate_constant_patterns(qt_app, monkeypatch):
+    from kindred.core.algebra.symbols import SymbolTable
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **kw: None)
+
+    window = _make_window()
+    try:
+        st = SymbolTable()
+        must_reject = ["k1", "kf3", "kr10", "K5"]
+        for name in must_reject:
+            result = window._validate_observable_name_rules(
+                name, mechanism_species=set(), symbol_table=st,
+            )
+            assert result is False, f"Should reject rate-constant-like name: {name!r}"
+
+        must_accept = ["kcat", "myK1", "species_k1", "K"]
+        for name in must_accept:
+            result = window._validate_observable_name_rules(
+                name, mechanism_species=set(), symbol_table=st,
+            )
+            assert result is True, f"Should accept non-rate-constant name: {name!r}"
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+# ---- Regex: _reactions_text_has_param_decl detects existing param declarations ----
+
+def test_reactions_text_has_param_decl_detects_existing_param():
+    from kindred.gui.fitting.window import FittingWindow
+
+    check = FittingWindow._reactions_text_has_param_decl
+
+    assert check("param myP = 1.0", "myP") is True
+    assert check("  param myP = 1.0", "myP") is True
+    assert check("PARAM myP = 1.0", "myP") is True
+    assert check("line1\n  param myP = 1.0\nline3", "myP") is True
+
+    assert check("param otherName = 1.0", "myP") is False
+    assert check("", "myP") is False
+    assert check("something else", "myP") is False

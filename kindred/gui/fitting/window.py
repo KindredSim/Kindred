@@ -1078,8 +1078,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_sampling_validity_ui()
 
     def _on_data_tab_include_changed(self, row: int, dataset_id: str, included: bool) -> None:
-        if 0 <= row < len(self._dataset_entries):
-            self._dataset_entries[row]["include"] = included
+        entry = self._dataset_entry_for_id(dataset_id)
+        if entry is not None:
+            entry["include"] = included
         self._species_table.refresh_dataset_list()
         self._on_targets_validity_changed()
         self._refresh_sampling_validity_ui()
@@ -1404,7 +1405,7 @@ class FittingWindow(QtWidgets.QDialog):
                 f"Observable name '{obs_name}' conflicts with a mechanism species name.",
             )
             return False
-        if re.match(r"^(k|kf|kr|K)\\d+$", obs_name):
+        if re.match(r"^(k|kf|kr|K)\d+$", obs_name):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Add Observable",
@@ -1483,7 +1484,7 @@ class FittingWindow(QtWidgets.QDialog):
 
         if not name:
             return False
-        pat = rf"(?im)^\\s*param\\s+{re.escape(str(name))}\\s*="
+        pat = rf"(?im)^\s*param\s+{re.escape(str(name))}\s*="
         return bool(re.search(pat, reactions_text or ""))
 
     def _persist_observable_updates(
