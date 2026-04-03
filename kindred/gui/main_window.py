@@ -1246,13 +1246,22 @@ class MainWindow(
                 # None,
             ],
         )
-        debug_menu = tools_menu.addMenu("Debug")
-        add_items(
-            debug_menu,
-            [
-                ("Log Slider Updates", self._set_slider_debug_logging, None, "debugSlidersAction", "Log programmatic K-slider updates (for diagnosing slider snapping).", {"checkable": True, "signal": "toggled", "store_as": "_debug_sliders_action"}),
-            ],
-        )
+        # ──────────────────────────────────────────────────────────────
+        # HIDDEN FEATURE: Log Slider Updates (Debug menu)
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: _set_slider_debug_logging() in this file, kindred/gui/widgets/variable_sliders.py
+        # Unhide: Uncomment the lines below after the feature passes a
+        #         dedicated integration audit and is approved for user access.
+        # Tracked: chore/post-merge-audit-cleanup branch
+        # ──────────────────────────────────────────────────────────────
+        # debug_menu = tools_menu.addMenu("Debug")
+        # add_items(
+        #     debug_menu,
+        #     [
+        #         ("Log Slider Updates", self._set_slider_debug_logging, None, "debugSlidersAction", "Log programmatic K-slider updates (for diagnosing slider snapping).", {"checkable": True, "signal": "toggled", "store_as": "_debug_sliders_action"}),
+        #     ],
+        # )
 
         help_menu = menubar.addMenu("&Help")
         add_items(
