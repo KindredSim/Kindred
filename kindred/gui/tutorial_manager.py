@@ -273,12 +273,12 @@ class TutorialManager:
             "duration": "4 minutes",
             "steps": [
                 TutorialStep(
-                    title="Enter a mechanism with rate constants",
+                    title="Before you start",
                     instruction=(
-                        "Sliders need adjustable parameters. Enter a mechanism "
-                        "with rate constants, for example:<br><br>"
-                        "<code>A -&gt; B ; k=1.0</code><br>"
-                        "<code>B -&gt; C ; k=0.5</code>"
+                        "Sliders require a mechanism with adjustable rate "
+                        "constants (for example <code>k=1.0</code>). If the "
+                        "slider pane is not visible below the editor, close "
+                        "this tutorial, enter a mechanism, and relaunch."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
