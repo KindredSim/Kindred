@@ -1085,16 +1085,6 @@ class MainWindow(
             panels_menu.addAction(dock_action)
             self._dock_toggle_actions[spec.identity_key] = dock_action
 
-        self._build_action(
-            menu=view_menu,
-            text="Panel Layout Tips...",
-            callback=self._show_panel_layout_tips,
-            shortcut=None,
-            object_name="panelLayoutTipsAction",
-            tooltip="Explain how to arrange multiple panels together on the same side of the workspace",
-            store_as="_panel_layout_tips_action",
-        )
-
         analysis_surfaces_menu = view_menu.addMenu("Analysis Surfaces")
         self._analysis_surfaces_menu = analysis_surfaces_menu
         self._analysis_surface_actions: Dict[str, QtGui.QAction] = {}
@@ -1175,12 +1165,27 @@ class MainWindow(
         # ──────────────────────────────────────────────────────────────
 
         help_menu = menubar.addMenu("&Help")
+        self._help_menu = help_menu
         add_items(
             help_menu,
             [
                 ("&Documentation", self._open_docs, QtGui.QKeySequence.HelpContents, "documentationAction", "Open Kindred documentation (shows offline guidance if online docs are unavailable)"),
                 ("&Interactive Tutorials...", self._show_tutorials, None, "tutorialsAction", "Launch step-by-step interactive tutorials"),
                 None,
+            ],
+        )
+        self._build_action(
+            menu=help_menu,
+            text="Panel Layout Tips...",
+            callback=self._show_panel_layout_tips,
+            shortcut=None,
+            object_name="panelLayoutTipsAction",
+            tooltip="Explain how to arrange multiple panels together on the same side of the workspace",
+            store_as="_panel_layout_tips_action",
+        )
+        add_items(
+            help_menu,
+            [
                 ("&About", self._show_about, None, "aboutAction", "About Kindred - version and license information"),
             ],
         )
@@ -1779,7 +1784,7 @@ class MainWindow(
             self,
             str(dataset_name),
             create_set_name,
-            title="Import Batch Mapping",
+            title="Import Set Mapping",
             skip_label="Skip",
             skip_description="Leave this dataset unmapped",
             running_under_pytest=running_under_pytest,
@@ -1793,9 +1798,9 @@ class MainWindow(
                 self,
                 str(dataset_name),
                 batch_set_names,
-                title="Map Dataset to Batch Set",
-                empty_message_title="Import Batch Mapping",
-                empty_message_text="No batch sets exist to map to. Create a batch set first.",
+                title="Map Dataset to Set",
+                empty_message_title="Import Set Mapping",
+                empty_message_text="No sets exist to map to. Create a set first.",
             )
             if not target_set:
                 self._dataset_manager.update_fit_settings(str(dataset_name), settings)
@@ -1829,12 +1834,12 @@ class MainWindow(
                 else:
                     response = QtWidgets.QMessageBox.warning(
                         self,
-                        "Import Batch Mapping",
+                        "Import Set Mapping",
                         (
                             f"Dataset '{dataset_name}' does not start at t\u22480 "
                             f"(t0={t0:.6g} s; tol={T0_SEED_TOL_S:.1e} s).\n\n"
-                            "OK: Map this dataset to the new zeroed batch set\n"
-                            "Cancel: Leave this dataset unmapped and edit the new batch set manually"
+                            "OK: Map this dataset to the new zeroed set\n"
+                            "Cancel: Leave this dataset unmapped and edit the new set manually"
                         ),
                         QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
                         QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -1851,10 +1856,10 @@ class MainWindow(
                     if not running_under_pytest:
                         QtWidgets.QMessageBox.information(
                             self,
-                            "Import Batch Mapping",
+                            "Import Set Mapping",
                             (
-                                f"Batch set '{create_set_name}' was created.\n\n"
-                                "Edit its initial concentrations in the Batch Initial Conditions table, "
+                                f"Set '{create_set_name}' was created.\n\n"
+                                "Edit its initial concentrations in the Initial Conditions table, "
                                 "then map the dataset when it is ready."
                             ),
                         )
@@ -2475,7 +2480,7 @@ class MainWindow(
         QtWidgets.QMessageBox.information(
             self,
             "Panel Layout Tips",
-            "Use View > Panels to show or hide the Mechanism, Interactive Sliders, Batch Initial Conditions, Data, and Analysis panels.\n\n"
+            "Use View > Panels to show or hide the Mechanism, Interactive Sliders, Initial Conditions, Data, and Analysis panels.\n\n"
             "To place panels together on the same side, drag a panel by its title bar and pause over an occupied "
             "dock area until Qt shows an inner drop guide. Dropping there lets that side share space with the "
             "existing panel.\n\n"
@@ -3510,7 +3515,7 @@ class MainWindow(
                 self._set_text_with_optional_undo(
                     self._mechanism_editor._reactions_text,
                     rewritten,
-                    "Migrate initial concentrations to batch table",
+                    "Migrate initial concentrations to set table",
                     record_undo,
                 )
 
@@ -4413,7 +4418,7 @@ class MainWindow(
             try:
                 self.set_mechanism_reactions_text_with_optional_undo(
                     str(rewrite),
-                    "Migrate initial concentrations to batch table",
+                    "Migrate initial concentrations to set table",
                     record_undo=True,
                 )
                 self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
@@ -5228,9 +5233,9 @@ class MainWindow(
 
         lines: List[str] = []
         if multi:
-            lines.append(f"Delete {len(names)} selected batch sets?")
+            lines.append(f"Delete {len(names)} selected sets?")
         else:
-            lines.append(f"Delete batch set '{names[0]}'?")
+            lines.append(f"Delete set '{names[0]}'?")
 
         if mapped:
             lines.append("")
@@ -5251,7 +5256,7 @@ class MainWindow(
         message = "\n".join(lines)
         response = QtWidgets.QMessageBox.question(
             self,
-            "Delete Batch Set(s)",
+            "Delete Set(s)",
             message,
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
             QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -5359,7 +5364,7 @@ class MainWindow(
         ):
             return
 
-        if not self._guard_slider_transaction_invalidation(action_text="Deleting the selected batch set(s)"):
+        if not self._guard_slider_transaction_invalidation(action_text="Deleting the selected set(s)"):
             return
 
         self._batch_model.beginResetModel()

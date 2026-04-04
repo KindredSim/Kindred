@@ -87,7 +87,7 @@ def default_batch_set_name_for_dataset(dataset_name: str) -> str:
 
 def ensure_batch_set_row(batch_store: Any, batch_model: Any, set_name: str) -> tuple[int, bool]:
     if batch_store is None or batch_model is None:
-        raise RuntimeError("Batch initial conditions table is unavailable.")
+        raise RuntimeError("Initial conditions table is unavailable.")
     existing = batch_store.row_for_set(set_name)
     if existing is not None:
         return int(existing), False
@@ -227,12 +227,12 @@ def prompt_dataset_batch_mapping_choice(
     box = QtWidgets.QMessageBox(parent)
     box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
     box.setWindowTitle(str(title))
-    box.setText(f"Dataset '{dataset_name}' has no saved batch mapping.")
+    box.setText(f"Dataset '{dataset_name}' has no saved set mapping.")
     box.setInformativeText(
         "\n".join(
             [
-                f"Create new: Create batch set '{create_set_name}'",
-                "Map existing: Choose an existing batch set",
+                f"Create new: Create set '{create_set_name}'",
+                "Map existing: Choose an existing set",
                 f"{skip_label}: {skip_description}",
             ]
         )
@@ -267,7 +267,7 @@ def pick_existing_batch_set(
     choice, ok = QtWidgets.QInputDialog.getItem(
         parent,
         str(title),
-        f"Select a batch set for dataset '{dataset_name}':",
+        f"Select a set for dataset '{dataset_name}':",
         [str(name) for name in batch_set_names],
         0,
         False,

@@ -180,7 +180,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
         self._slider_edit_targets_label = QtWidgets.QLabel("Slider edit targets: none")
-        self._slider_edit_targets_label.setToolTip("The batch set whose initial conditions are controlled by concentration sliders")
+        self._slider_edit_targets_label.setToolTip("The set whose initial conditions are controlled by concentration sliders")
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
         self._slider_edit_targets_label.setFont(target_font)
@@ -487,7 +487,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._current_validation_state = state
         self._run_btn.setEnabled(state == "valid" and not self._run_gated)
         self._run_btn.setToolTip(
-            "Run simulation for all selected batch sets (same as Run Selected in Batch Initial Conditions)"
+            "Run simulation for all selected sets (same as Run Selected in Initial Conditions)"
             if state == "valid"
             else "No valid mechanism \u2014 enter a valid reaction mechanism to enable"
         )

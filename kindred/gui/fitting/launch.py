@@ -184,8 +184,8 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             QtWidgets.QMessageBox.warning(
                 context.parent,
                 "Global Fit",
-                f"Batch set '{set_name}' has invalid initial conditions:\n\n{exc}\n\n"
-                "Fix the Batch Initial Conditions table and retry Global Fit.",
+                f"Set '{set_name}' has invalid initial conditions:\n\n{exc}\n\n"
+                "Fix the Initial Conditions table and retry Global Fit.",
             )
             return None
 
@@ -205,7 +205,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                 context.parent,
                 dataset_name,
                 create_set_name,
-                title="Global Fit – Batch Mapping",
+                title="Global Fit – Set Mapping",
                 skip_label="Cancel",
                 skip_description="Cancel global fit",
                 running_under_pytest=running_under_pytest,
@@ -219,9 +219,9 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                     context.parent,
                     dataset_name,
                     batch_set_names,
-                    title="Map Dataset to Batch Set",
+                    title="Map Dataset to Set",
                     empty_message_title="Global Fit",
-                    empty_message_text="No batch sets exist to map to. Create a batch set first.",
+                    empty_message_text="No sets exist to map to. Create a set first.",
                 )
                 if not target_set:
                     context.set_status("Global fit cancelled")
@@ -280,8 +280,8 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
                                 context.parent,
                                 "Global Fit",
                                 (
-                                    f"Batch set '{target_set}' was created.\n\n"
-                                    "Edit its initial concentrations in the Batch Initial Conditions table, "
+                                    f"Set '{target_set}' was created.\n\n"
+                                    "Edit its initial concentrations in the Initial Conditions table, "
                                     "then start Global Fit again."
                                 ),
                             )

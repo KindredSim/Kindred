@@ -1789,7 +1789,7 @@ class SimulationController(QtCore.QObject):
 
         rows_to_run = self.ui.batch.batch_rows_for_scope("selected")
         if not rows_to_run:
-            self.ui.dialogs.message_box_warning("No Batch Sets", "Add at least one batch set before running.")
+            self.ui.dialogs.message_box_warning("No Sets", "Add at least one set before running.")
             return
 
         try:
@@ -1919,7 +1919,7 @@ class SimulationController(QtCore.QObject):
             except Exception as exc:
                 self.ui.dialogs.message_box_warning(
                     "Invalid Initial Conditions",
-                    f"Batch set '{set_name}' has invalid initial conditions:\n\n{exc}",
+                    f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
                 )
                 ctx["active"] = False
                 self._batch_run_context = dict(ctx)
@@ -1993,7 +1993,7 @@ class SimulationController(QtCore.QObject):
                 int(max_workers),
             )
         self.ui.run_ui.set_sim_progress_value(0)
-        self.ui.run_ui.set_status_text(f"Running {total} batch sets in parallel ({max_workers} workers)...")
+        self.ui.run_ui.set_status_text(f"Running {total} sets in parallel ({max_workers} workers)...")
         if hasattr(self, "_batch_future_poll_timer"):
             self._batch_future_poll_timer.start()
 
@@ -2035,7 +2035,7 @@ class SimulationController(QtCore.QObject):
                 )
             self.ui.dialogs.message_box_warning(
                 "Invalid Initial Conditions",
-                f"Batch set '{set_name}' has invalid initial conditions:\n\n{exc}",
+                f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
             )
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
@@ -2236,7 +2236,7 @@ class SimulationController(QtCore.QObject):
             if int(row_count) > 0:
                 batch_rows = [0]
             else:
-                self.ui.dialogs.message_box_warning("No Batch Sets", "Add at least one batch set before running.")
+                self.ui.dialogs.message_box_warning("No Sets", "Add at least one set before running.")
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)
                 self.ui.run_ui.set_stop_button_enabled(False)
@@ -2254,7 +2254,7 @@ class SimulationController(QtCore.QObject):
             )
             self.ui.dialogs.message_box_warning(
                 "Invalid Initial Conditions",
-                "Fix invalid numeric cells in the Batch Initial Conditions table before running:\n\n" + details + more,
+                "Fix invalid numeric cells in the Initial Conditions table before running:\n\n" + details + more,
             )
             self._simulation_running = False
             self.ui.run_ui.set_run_button_enabled(True)
@@ -2542,7 +2542,7 @@ class SimulationController(QtCore.QObject):
                     except Exception as exc:
                         self.ui.dialogs.message_box_warning(
                             "Invalid Initial Conditions",
-                            f"Batch set '{set_name}' has invalid initial conditions:\n\n{exc}",
+                            f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
                         )
                         self._simulation_running = False
                         self.ui.run_ui.set_run_button_enabled(True)
@@ -2586,7 +2586,7 @@ class SimulationController(QtCore.QObject):
                 )
                 self.ui.dialogs.message_box_warning(
                     "Invalid Initial Conditions",
-                    f"Batch set '{set_name}' has invalid initial conditions:\n\n{exc}",
+                    f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
                 )
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)
