@@ -67,6 +67,9 @@ class TutorialOverlay(QtWidgets.QWidget):
     - Automatically positions instruction box away from highlighted area
     """
 
+    _SPOTLIGHT_PADDING = 8
+    _HIGHLIGHT_BORDER_WIDTH = 3
+
     # Signals
     tutorialCompleted = QtCore.Signal()
     tutorialSkipped = QtCore.Signal()
@@ -175,8 +178,9 @@ class TutorialOverlay(QtWidgets.QWidget):
         else:
             self._next_btn.setText("Next →")
 
-        # Position instruction box
+        # Position instruction box and update input mask
         self._position_instruction_box()
+        self._update_mask()
 
         # Trigger repaint
         self.update()
@@ -306,8 +310,8 @@ class TutorialOverlay(QtWidgets.QWidget):
 
         highlight_rect = self._get_highlight_rect()
         if highlight_rect:
-            padding = 8
-            spotlight_rect = highlight_rect.adjusted(-padding, -padding, padding, padding)
+            pad = self._SPOTLIGHT_PADDING
+            spotlight_rect = highlight_rect.adjusted(-pad, -pad, pad, pad)
 
             # Use a path with the spotlight subtracted so the cutout is
             # truly transparent instead of black (CompositionMode_Clear
@@ -323,16 +327,41 @@ class TutorialOverlay(QtWidgets.QWidget):
             painter.drawPath(overlay_path)
 
             # Highlight border around the spotlight
-            painter.setPen(QtGui.QPen(QtGui.QColor("#4A90E2"), 3))
+            painter.setPen(QtGui.QPen(QtGui.QColor("#4A90E2"), self._HIGHLIGHT_BORDER_WIDTH))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(spotlight_rect, 8, 8)
         else:
             painter.fillRect(self.rect(), overlay_color)
 
+    def _update_mask(self) -> None:
+        """Exclude spotlight area from input region so clicks reach the target widget.
+
+        The exclusion is inset by the highlight border width so the painted border
+        remains fully visible.  The instruction box region is always re-added so
+        child widgets (title, buttons, progress) stay visible and clickable even
+        when the box overlaps the spotlight cutout.
+        """
+        highlight_rect = self._get_highlight_rect()
+        if highlight_rect:
+            pad = self._SPOTLIGHT_PADDING
+            bw = self._HIGHLIGHT_BORDER_WIDTH
+            spotlight_rect = highlight_rect.adjusted(-pad, -pad, pad, pad)
+            # Inset the exclusion so the border ring stays within the painted mask
+            exclusion_rect = spotlight_rect.adjusted(bw, bw, -bw, -bw)
+            full_region = QtGui.QRegion(self.rect())
+            mask = full_region - QtGui.QRegion(exclusion_rect)
+            # Re-add instruction box area so child widgets remain visible and clickable
+            mask |= QtGui.QRegion(self._instruction_box.geometry())
+            self.setMask(mask)
+        else:
+            # Clear mask for informational steps with no target
+            self.clearMask()
+
     def resizeEvent(self, event: QtGui.QResizeEvent):
         """Handle parent resize."""
         super().resizeEvent(event)
         self._position_instruction_box()
+        self._update_mask()
 
     def _on_next(self):
         """Handle Next button click."""
