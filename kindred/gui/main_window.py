@@ -31,7 +31,7 @@ from kindred.core.simulator.dsl_text_update import (
 )
 from kindred.core.validation import try_parse_finite_float
 from kindred.gui.controllers.cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
-from kindred.gui.project_schema import PROJECT_DEFAULTS, PROJECT_SCHEMA_VERSION
+from kindred.gui.project_schema import FITTING_DEFAULTS_KEYS, PROJECT_DEFAULTS, PROJECT_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from kindred.core.mechanism import Mechanism
@@ -194,6 +194,7 @@ class MainWindow(
         self._use_sparse_jacobian = False
         self._wegscheider_cyclicity_enabled = False
         self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
+        self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
 
@@ -954,6 +955,7 @@ class MainWindow(
     def _load_settings(self):
         """Load user preferences from QSettings."""
         self.config_controller.load_settings()
+        self._init_fitting_defaults()
 
     def _save_settings(self):
         """Save user preferences to QSettings."""
@@ -1064,7 +1066,6 @@ class MainWindow(
                 # ──────────────────────────────────────────────────────────────
                 # ("&Computational Mode...", self._open_computational_mode, None, "computationalModeAction", "Convert absolute computed free energies into energy-mode DSL blocks"),
                 None,
-                ("Preferences...", self._open_preferences, QtGui.QKeySequence.Preferences, "preferencesAction", "Configure application preferences and settings"),
                 ("Customize &Keyboard Shortcuts...", self._open_shortcuts_dialog, "Ctrl+K", "customizeShortcutsAction", "Customize keyboard shortcuts for actions"),
             ],
         )
@@ -1158,7 +1159,7 @@ class MainWindow(
         add_items(
             fit_menu,
             [
-                ("&Configure...", self._configure_fitting, None, "configureFitAction", "Configure fitting parameters and bounds"),
+                ("Fitting &Defaults...", self._configure_fitting, None, "fittingDefaultsAction", "Set default algorithm and integration settings for new fitting windows"),
                 ("Global Fit...", self._run_global_fit, "Ctrl+Shift+F", "globalFitAction", "Fit shared parameters across all loaded datasets (Ctrl+Shift+F)"),
             ],
         )
@@ -1179,7 +1180,6 @@ class MainWindow(
             [
                 ("&Documentation", self._open_docs, QtGui.QKeySequence.HelpContents, "documentationAction", "Open Kindred documentation (shows offline guidance if online docs are unavailable)"),
                 ("&Interactive Tutorials...", self._show_tutorials, None, "tutorialsAction", "Launch step-by-step interactive tutorials"),
-                ("&Keyboard Shortcuts", self._show_keyboard_shortcuts, "Ctrl+?", "keyboardShortcutsAction", "View list of keyboard shortcuts (Ctrl+?)"),
                 None,
                 ("&About", self._show_about, None, "aboutAction", "About Kindred - version and license information"),
             ],
@@ -2015,62 +2015,6 @@ class MainWindow(
 
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
-
-    def _open_preferences(self):
-        """Open preferences dialog."""
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
-
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Preferences")
-        dialog.setMinimumWidth(400)
-
-        layout = QtWidgets.QVBoxLayout(dialog)
-
-        # Default solver
-        solver_group = QtWidgets.QGroupBox("Default Solver Settings")
-        solver_layout = QtWidgets.QFormLayout()
-
-        solver_combo = QtWidgets.QComboBox()
-        solver_combo.addItems(['LSODA', 'Radau', 'BDF'])
-        solver_combo.setCurrentText(self._initial_solver or str(DEFAULT_SOLVER_NAME))
-        solver_layout.addRow("Solver:", solver_combo)
-
-        rtol_spin = QtWidgets.QDoubleSpinBox()
-        rtol_spin.setDecimals(12)
-        rtol_spin.setRange(1e-15, 1e-3)
-        rtol_spin.setValue(self._initial_rtol or 1e-6)
-        rtol_spin.setSingleStep(1e-7)
-        solver_layout.addRow("Relative Tolerance:", rtol_spin)
-
-        atol_spin = QtWidgets.QDoubleSpinBox()
-        atol_spin.setDecimals(15)
-        atol_spin.setRange(1e-18, 1e-6)
-        atol_spin.setValue(self._initial_atol or 1e-12)
-        atol_spin.setSingleStep(1e-13)
-        solver_layout.addRow("Absolute Tolerance:", atol_spin)
-
-        solver_group.setLayout(solver_layout)
-        layout.addWidget(solver_group)
-
-        # Buttons
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self._apply_solver_runtime_state(
-                solver=solver_combo.currentText(),
-                rtol=rtol_spin.value(),
-                atol=atol_spin.value(),
-            )
-            self.config_controller.update_user_preference("solver", self._initial_solver)
-            self.config_controller.update_user_preference("rtol", self._initial_rtol)
-            self.config_controller.update_user_preference("atol", self._initial_atol)
-            logger.info(f"Preferences updated: solver={self._initial_solver}, rtol={self._initial_rtol}, atol={self._initial_atol}")
-            self._status_label.setText("Preferences updated")
 
     def _load_custom_shortcuts(self, shortcuts_dict: dict):
         """
@@ -3461,6 +3405,8 @@ class MainWindow(
             'simulation_time': str(self._sim_time_spinbox.text()).strip(),
             'num_points': int(self._num_points_spinbox.value()),
             'batch_initial_conditions': self._batch_store.as_serializable(),
+            **{key: self._fitting_defaults.get(key, PROJECT_DEFAULTS.get(key))
+               for key in FITTING_DEFAULTS_KEYS},
         }
 
     def serialize_project_state(self) -> Dict[str, Any]:
@@ -3637,6 +3583,11 @@ class MainWindow(
             rtol=rtol_value,
             atol=atol_value,
         )
+
+        self._fitting_defaults = {
+            key: data.get(key, _pref(key))
+            for key in FITTING_DEFAULTS_KEYS
+        }
 
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
@@ -8626,51 +8577,6 @@ class MainWindow(
 
     def _show_about(self):
         self._build_about_dialog().exec()
-
-    def _show_keyboard_shortcuts(self):
-        """Show keyboard shortcuts reference dialog."""
-        shortcuts_text = """
-<h3>Keyboard Shortcuts</h3>
-
-<h4>File Operations</h4>
-<table>
-<tr><td><b>Ctrl+N</b></td><td>New Project</td></tr>
-<tr><td><b>Ctrl+O</b></td><td>Load Project</td></tr>
-<tr><td><b>Ctrl+S</b></td><td>Save Project</td></tr>
-<tr><td><b>Ctrl+Shift+S</b></td><td>Save Project As</td></tr>
-<tr><td><b>Ctrl+E</b></td><td>Export CSV Data</td></tr>
-<tr><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
-</table>
-
-<h4>Simulation</h4>
-<table>
-<tr><td><b>Ctrl+R</b> or <b>F5</b></td><td>Run Simulation</td></tr>
-<tr><td><b>Esc</b></td><td>Stop Simulation</td></tr>
-</table>
-
-<h4>Fitting</h4>
-<table>
-<tr><td><b>Ctrl+Shift+F</b></td><td>Run Parameter Fit</td></tr>
-</table>
-
-<h4>Tools</h4>
-<table>
-<tr><td><b>Ctrl+Shift+R</b></td><td>Reset Layout</td></tr>
-<tr><td><b>Ctrl+,</b></td><td>Preferences (Mac)</td></tr>
-</table>
-
-<h4>Help</h4>
-<table>
-<tr><td><b>F1</b></td><td>Documentation</td></tr>
-<tr><td><b>Ctrl+?</b></td><td>Keyboard Shortcuts</td></tr>
-</table>
-        """
-        msg_box = QtWidgets.QMessageBox(self)
-        msg_box.setWindowTitle("Keyboard Shortcuts")
-        msg_box.setTextFormat(Qt.TextFormat.RichText)
-        msg_box.setText(shortcuts_text)
-        msg_box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
-        msg_box.exec()
 
     def _open_solver_settings(self):
         """Open solver settings dialog."""
