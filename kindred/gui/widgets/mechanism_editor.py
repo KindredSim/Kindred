@@ -103,8 +103,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_text.setPlaceholderText(
             "Example:\n"
             "reaction: 2A + B => C ; kf=1e5\n"
-            "equilibrium: C <=> D ; K=2.5\n"
-            "reaction: C + E -> F ; kf=k_derived\n"
+            "equilibrium: C <=> D ; K=2.5 ; kf=10.0\n"
+            "reaction: C + E -> F ; k=0.5\n"
             "reaction: A -> A_Side ; kf=0.01\n"
             "\n"
             "# algebra\n"
@@ -256,12 +256,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         help_layout.setContentsMargins(0, 0, 0, 0)
         help_scroll = make_scroll_area(self._help_tab)
         help_label = QtWidgets.QLabel(
-            '<pre style="white-space: pre-wrap;"><b>Global DSL Directives &amp; Advanced Features</b>\n'
-            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol, J/mol)\n"
+            '<pre style="white-space: pre-wrap;"><b>Global DSL Directives and Advanced Features</b>\n'
+            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol)\n"
             "T=300          (Global isothermal temperature in K)\n"
             "[A]=1.0        (Hardcode initial conditions directly)\n"
             "\n"
-            "<b>Algebra &amp; Observables (# algebra)</b>\n"
+            "<b>Algebra and Observables (# algebra)</b>\n"
             "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
             "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
             "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
@@ -275,8 +275,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "\n"
             "<b>Example</b>\n"
             "reaction: 2A + B =&gt; C ; kf=1e5\n"
-            "equilibrium: C &lt;=&gt; D ; K=2.5\n"
-            "reaction: C + E -&gt; F ; kf=k_derived\n"
+            "equilibrium: C &lt;=&gt; D ; K=2.5 ; kf=10.0\n"
+            "reaction: C + E -&gt; F ; k=0.5\n"
             "reaction: A -&gt; A_Side ; kf=0.01\n"
             "\n"
             "# algebra\n"

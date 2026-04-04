@@ -148,7 +148,7 @@ def test_run_selected_sits_next_to_delete_in_batch_action_row(main_window, qtbot
     QtWidgets.QApplication.processEvents()
 
     delete_btn = main_window.findChild(QtWidgets.QPushButton, "deleteBatchSetButton")
-    run_btn = main_window.findChild(QtWidgets.QPushButton, "runSimulationAction")
+    run_btn = main_window.findChild(QtWidgets.QPushButton, "runSelectedButton")
 
     assert delete_btn is not None
     assert run_btn is not None

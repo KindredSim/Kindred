@@ -1327,15 +1327,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     ) -> None:
         self._fit_targets_full_series_by_dataset[dataset_id] = dict(full_series)
         self._fit_targets_full_t_by_dataset[dataset_id] = full_t
-        modeled = self._safe_modeled_series()
-        fit_universe = [s for s in available if s in modeled]
-        self._fit_targets_available_by_dataset[dataset_id] = fit_universe
         self._fit_targets_selection_applied[dataset_id] = []
         self._fit_targets_selection_pending[dataset_id] = set()
         self._fit_target_weights_applied[dataset_id] = {}
         self._fit_target_weights_pending[dataset_id] = {}
         self._fit_target_weights_pending_invalid.pop(dataset_id, None)
         self._seed_ic_state_for_dataset(dataset_id)
+        self._recompute_fit_universe()
 
     def remove_dataset_state(self, dataset_ids: set[str]) -> None:
         for ds_id in list(dataset_ids):

@@ -6,6 +6,7 @@ import shiboken6
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 pytestmark = pytest.mark.gui
 
@@ -515,3 +516,262 @@ def test_apply_project_payload_dirty_slider_commit_continues_after_transaction_c
     assert outcome is True
     assert commit_calls == ["commit"]
     assert apply_calls == [(payload, False)]
+
+
+def test_apply_project_payload_legacy_file_resets_leaky_keys(main_window):
+    """Loading a legacy .kin file missing solver/worker keys must reset to schema defaults."""
+    # Set non-default values to detect leaks
+    main_window._initial_solver = "BDF"
+    main_window._initial_rtol = 0.1
+    main_window._initial_atol = 0.1
+    main_window._use_sparse_jacobian = True
+    main_window._wegscheider_cyclicity_enabled = True
+    main_window._sim_controller.parallel_batch.max_parallel_workers = 99
+    main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker = False
+
+    # Minimal legacy payload — only mechanism and batch
+    legacy_payload = {
+        "mechanism": "A -> B; k=1",
+        "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
+    }
+    main_window._apply_project_payload(legacy_payload, record_undo=False)
+
+    # Solver state is applied via _apply_solver_runtime_state, which sets
+    # _initial_solver. The value sent was PROJECT_DEFAULTS['solver'].
+    assert main_window._initial_solver == PROJECT_DEFAULTS["solver"]
+    assert main_window._initial_rtol == PROJECT_DEFAULTS["rtol"]
+    assert main_window._initial_atol == PROJECT_DEFAULTS["atol"]
+    assert main_window._use_sparse_jacobian == PROJECT_DEFAULTS["use_sparse_jacobian"]
+    assert main_window._wegscheider_cyclicity_enabled == PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]
+    assert (
+        main_window._sim_controller.parallel_batch.max_parallel_workers
+        == PROJECT_DEFAULTS["max_parallel_batch_workers"]
+    )
+    assert (
+        main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker
+        == PROJECT_DEFAULTS["limit_blas_threads_per_worker"]
+    )
+
+
+# ── Three-tier precedence tests ──────────────────────────────────────
+
+
+def test_new_project_inherits_user_preferences_not_factory_defaults(main_window, monkeypatch):
+    """New Project uses the user's QSettings-based preferences for dual-persisted keys."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/solver", "BDF")
+    settings.setValue("simulation/rtol", 1e-5)
+    settings.setValue("simulation/temperature", 310.0)
+    settings.setValue("simulation/points", 200)
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+
+    # Verify user preferences captured
+    assert main_window.config_controller._user_preferences["solver"] == "BDF"
+    assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(310.0)
+
+    # Simulate New Project (mock QMessageBox to auto-discard)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *a, **kw: QtWidgets.QMessageBox.StandardButton.Discard,
+    )
+    main_window.project_controller.new_project()
+
+    # Dual-persisted keys should reflect user preferences, not factory defaults
+    assert main_window._initial_solver == "BDF"
+    assert main_window._initial_rtol == pytest.approx(1e-5)
+    assert main_window._temperature_spinbox.value() == pytest.approx(310.0)
+    assert main_window._num_points_spinbox.value() == 200
+
+
+def test_legacy_load_falls_back_to_user_preferences(main_window):
+    """A .kin file missing a key falls back to user preferences, not factory defaults."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/solver", "BDF")
+    settings.setValue("simulation/temperature", 350.0)
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+
+    minimal_payload = {"mechanism": "A -> B ; k1=1"}
+    main_window._apply_project_payload(minimal_payload)
+
+    assert main_window._initial_solver == "BDF"
+    assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+
+def test_document_load_does_not_contaminate_user_preferences(main_window):
+    """Loading a .kin file changes live state but must not modify _user_preferences."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/solver", "Radau")
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    assert main_window.config_controller._user_preferences["solver"] == "Radau"
+
+    payload = {"mechanism": "A -> B ; k1=1", "solver": "BDF", "temperature_K": 500.0}
+    main_window._apply_project_payload(payload)
+
+    # Live state reflects document
+    assert main_window._initial_solver == "BDF"
+    assert main_window._temperature_spinbox.value() == pytest.approx(500.0)
+
+    # User preferences are untouched
+    assert main_window.config_controller._user_preferences["solver"] == "Radau"
+    assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(298.15)
+
+
+def test_save_settings_writes_user_preferences_not_live_document_state(main_window):
+    """save_settings persists user preferences, so loading a .kin cannot leak into QSettings."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/solver", "Radau")
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+
+    payload = {"mechanism": "A -> B ; k1=1", "solver": "BDF"}
+    main_window._apply_project_payload(payload)
+    assert main_window._initial_solver == "BDF"
+
+    main_window.config_controller.save_settings()
+
+    assert settings.value("simulation/solver") == "Radau"
+
+
+def test_dialog_update_user_preference_roundtrips(main_window):
+    """update_user_preference stores values that save_settings persists."""
+    settings = main_window._settings
+    settings.clear()
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    main_window.config_controller.update_user_preference("solver", "LSODA")
+    main_window.config_controller.update_user_preference("rtol", 1e-8)
+
+    main_window.config_controller.save_settings()
+
+    assert settings.value("simulation/solver") == "LSODA"
+    assert settings.value("simulation/rtol", type=float) == pytest.approx(1e-8)
+
+
+def test_spinbox_edit_updates_user_preference_when_not_applying_document(main_window):
+    """Direct spinbox edits update user preferences when _suppress_preference_updates is False."""
+    settings = main_window._settings
+    settings.clear()
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    assert main_window._suppress_preference_updates is False
+
+    main_window._temperature_spinbox.setValue(400.0)
+    assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(400.0)
+
+    main_window._num_points_spinbox.setValue(500)
+    assert main_window.config_controller._user_preferences["num_points"] == 500
+
+
+def test_spinbox_during_project_apply_does_not_update_user_preferences(main_window):
+    """_apply_project_payload sets _suppress_preference_updates=True so spinbox signals skip preferences."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/temperature", 298.15)
+    settings.setValue("simulation/points", 100)
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    original_temp = main_window.config_controller._user_preferences["temperature_K"]
+    original_points = main_window.config_controller._user_preferences["num_points"]
+
+    payload = {"mechanism": "", "temperature_K": 500.0, "num_points": 999}
+    main_window._apply_project_payload(payload)
+
+    # Live state reflects document
+    assert main_window._temperature_spinbox.value() == pytest.approx(500.0)
+    assert main_window._num_points_spinbox.value() == 999
+
+    # User preferences unchanged
+    assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(original_temp)
+    assert main_window.config_controller._user_preferences["num_points"] == original_points
+
+
+def test_solver_combo_change_persists_to_qsettings(main_window):
+    """Changing the solver combo updates user preferences so save_settings persists the value."""
+    settings = main_window._settings
+    settings.clear()
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    original_solver = main_window.config_controller._user_preferences.get("solver")
+
+    # Simulate user changing the solver combo.
+    combo = main_window._solver_method_combo
+    target_solver = "BDF" if original_solver != "BDF" else "Radau"
+    idx = combo.findText(target_solver)
+    assert idx >= 0, f"Solver {target_solver!r} not found in combo"
+    combo.setCurrentIndex(idx)
+
+    assert main_window.config_controller._user_preferences["solver"] == target_solver
+
+    main_window.config_controller.save_settings()
+    assert settings.value("simulation/solver") == target_solver
+
+
+def test_solver_unchanged_during_document_apply(main_window):
+    """Applying a project payload with a different solver must not modify user preferences."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/solver", "Radau")
+    settings.sync()
+
+    main_window.config_controller.load_settings()
+    assert main_window.config_controller._user_preferences["solver"] == "Radau"
+
+    payload = {"mechanism": "A -> B ; k1=1", "solver": "BDF"}
+    main_window._apply_project_payload(payload)
+
+    assert main_window._initial_solver == "BDF"
+    assert main_window.config_controller._user_preferences["solver"] == "Radau"
+
+
+def test_load_settings_suppresses_preference_updates(main_window):
+    """load_settings must not trigger update_user_preference via spinbox signals."""
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/temperature", 350.0)
+    settings.setValue("simulation/points", 200)
+    settings.sync()
+
+    calls = []
+    original_update = main_window.config_controller.update_user_preference
+
+    def spy(key, value):
+        calls.append((key, value))
+        original_update(key, value)
+
+    main_window.config_controller.update_user_preference = spy
+    main_window._suppress_preference_updates = True
+    try:
+        main_window.config_controller.load_settings()
+    finally:
+        main_window._suppress_preference_updates = False
+    main_window.config_controller.update_user_preference = original_update
+
+    assert len(calls) == 0, f"update_user_preference called {len(calls)} times during load_settings: {calls}"
+
+
+def test_bootstrap_window_state_suppresses_preference_updates(main_window):
+    """The production bootstrap path must suppress preference updates during load."""
+    calls = []
+    original = main_window.config_controller.update_user_preference
+    main_window.config_controller.update_user_preference = lambda k, v: calls.append((k, v))
+    try:
+        main_window._bootstrap_window_state()
+    finally:
+        main_window.config_controller.update_user_preference = original
+    assert len(calls) == 0, f"update_user_preference called during bootstrap: {calls}"

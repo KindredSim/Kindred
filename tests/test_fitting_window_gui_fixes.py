@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 
 import numpy as np
 import pytest
@@ -10,6 +11,64 @@ from PySide6.QtCore import Qt
 
 
 pytestmark = [pytest.mark.gui]
+
+
+# ---- F3: add_dataset_state delegates to _recompute_fit_universe ----
+
+def test_add_dataset_state_delegates_to_recompute_fit_universe(qt_app, monkeypatch):
+    """add_dataset_state must delegate fit-universe computation to
+    _recompute_fit_universe (ARCH_RULES F3), not write
+    _fit_targets_available_by_dataset inline."""
+    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
+
+    t = np.linspace(0, 1, 5)
+    entries = [{
+        "id": "ds1", "label": "DS 1", "t": t,
+        "species_data": {"A": np.ones(5), "B": np.ones(5)},
+        "selected_species": ["A", "B"], "weight": 1.0, "include": True,
+    }]
+    species = ["A", "B", "C"]
+    modeled = {"A", "B", "C"}
+
+    kwargs = dict(
+        dataset_entries=entries,
+        mechanism_species=species,
+        dataset_entries_getter=lambda: entries,
+        included_dataset_ids_getter=lambda: ["ds1"],
+        dataset_label_getter=lambda ds_id: str(ds_id),
+        dataset_weight_getter=lambda ds_id: 1.0,
+        persist_dataset_weight_callback=lambda ds_id, w: None,
+        dataset_manager_getter=lambda: None,
+        worker_running_getter=lambda: False,
+    )
+    if "modeled_series_getter" in inspect.signature(UnifiedSpeciesTable).parameters:
+        kwargs["modeled_series_getter"] = lambda: modeled
+
+    tbl = UnifiedSpeciesTable(**kwargs)
+
+    calls: list[str] = []
+    original = tbl._recompute_fit_universe
+
+    def tracking_recompute():
+        calls.append("called")
+        original()
+
+    monkeypatch.setattr(tbl, "_recompute_fit_universe", tracking_recompute)
+
+    new_t = np.linspace(0, 2, 10)
+    tbl.add_dataset_state(
+        "ds2",
+        full_series={"A": np.ones(10), "C": np.ones(10)},
+        full_t=new_t,
+        available=["A", "C"],
+    )
+
+    assert len(calls) >= 1, (
+        "add_dataset_state must call _recompute_fit_universe (F3 rule)"
+    )
+    assert sorted(tbl._fit_targets_available_by_dataset["ds2"]) == ["A", "C"]
+    tbl.close()
+    qt_app.processEvents()
 
 
 def _make_window():

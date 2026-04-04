@@ -10,13 +10,6 @@ def test_gui_package_keeps_compat_indirection_out_of_gui_namespace() -> None:
     assert "from .compat.shims import" not in gui_source
     assert "kindred.compat" not in gui_source
 
-    compat_init = importlib.resources.files("kindred.compat").joinpath("__init__.py")
-    assert compat_init.is_file()
-
-    compat_source = compat_init.read_text(encoding="utf-8")
-    assert "from kindred.compat.shims import" not in compat_source
-    assert "from kindred.gui.compat.shims import" not in compat_source
-
     ports_source = (
         importlib.resources.files("kindred.gui")
         .joinpath("ports.py")

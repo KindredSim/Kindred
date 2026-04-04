@@ -33,6 +33,7 @@ def controller_and_mw(qt_app):
     mw.apply_project_payload = MagicMock(name="ApplyProjectPayloadMock")
     mw.add_to_recent_files = MagicMock(name="AddToRecentFilesMock")
     mw._undo_stack = MagicMock(name="UndoStackMock")
+    mw.setWindowTitle = MagicMock(name="SetWindowTitleMock")
     controller.mw = mw
 
     return controller, mw
@@ -69,16 +70,40 @@ def test_load_project_dialog_ok_calls_load_from_path(controller_and_mw):
     )
 
 
-def test_save_project_dialog_cancel_is_noop(controller_and_mw):
+def test_save_project_no_path_delegates_to_save_as(controller_and_mw):
+    """When no project path is set, save_project delegates to save_project_as."""
     controller, mw = controller_and_mw
+    assert controller._current_project_path is None
 
     with patch.object(QtWidgets.QFileDialog, "getSaveFileName", return_value=("", "")):
-        controller.save_project()
+        result = controller.save_project()
 
+    assert result is False
     mw.serialize_project_state.assert_not_called()
 
 
-def test_save_project_success_writes_json_and_updates_ui(controller_and_mw):
+def test_save_project_with_path_writes_directly(controller_and_mw):
+    """When a project path is already set, save_project writes without dialog."""
+    controller, mw = controller_and_mw
+    controller._current_project_path = "/existing/project.kin"
+    mw.serialize_project_state.return_value = {"ok": True}
+
+    with (
+        patch("kindred.gui.controllers.project_controller.BusyCursor", return_value=_null_cursor()),
+        patch("builtins.open", mock_open()),
+        patch("kindred.gui.controllers.project_controller.json.dump") as json_dump,
+    ):
+        result = controller.save_project()
+
+    assert result is True
+    json_dump.assert_called_once()
+    mw.set_status_text.assert_called_once_with("Saved project: /existing/project.kin")
+    mw.setWindowTitle.assert_called_once_with("Kindred \u2014 project.kin")
+    mw.add_to_recent_files.assert_called_once_with("/existing/project.kin")
+
+
+def test_save_project_as_success(controller_and_mw):
+    """save_project_as always shows dialog, writes, and sets path."""
     controller, mw = controller_and_mw
     mw.serialize_project_state.return_value = {"ok": True}
 
@@ -88,20 +113,35 @@ def test_save_project_success_writes_json_and_updates_ui(controller_and_mw):
         patch("builtins.open", mock_open()),
         patch("kindred.gui.controllers.project_controller.json.dump") as json_dump,
     ):
-        controller.save_project()
+        result = controller.save_project_as()
 
+    assert result is True
     get_save.assert_called_once_with(
         controller.mw,
-        "Save Project",
+        "Save Project As",
         "",
         PROJECT_DIALOG_FILTER,
     )
     json_dump.assert_called_once()
     mw.set_status_text.assert_called_once_with("Saved project: out.kin")
     mw.add_to_recent_files.assert_called_once_with("out.kin")
+    assert controller._current_project_path == "out.kin"
+    mw.setWindowTitle.assert_called_once_with("Kindred \u2014 out.kin")
 
 
-def test_save_project_failure_shows_critical_dialog(controller_and_mw):
+def test_save_project_as_cancel_returns_false(controller_and_mw):
+    """Cancelling the save-as dialog returns False without writing."""
+    controller, mw = controller_and_mw
+
+    with patch.object(QtWidgets.QFileDialog, "getSaveFileName", return_value=("", "")):
+        result = controller.save_project_as()
+
+    assert result is False
+    mw.serialize_project_state.assert_not_called()
+
+
+def test_save_project_as_failure_returns_false(controller_and_mw):
+    """Write failure shows critical dialog and returns False."""
     controller, mw = controller_and_mw
     mw.serialize_project_state.return_value = {"ok": True}
 
@@ -112,10 +152,12 @@ def test_save_project_failure_shows_critical_dialog(controller_and_mw):
         patch("kindred.gui.controllers.project_controller.json.dump", side_effect=ValueError("nope")),
         patch.object(QtWidgets.QMessageBox, "critical") as critical,
     ):
-        controller.save_project()
+        result = controller.save_project_as()
 
+    assert result is False
     critical.assert_called_once()
     mw.add_to_recent_files.assert_not_called()
+    assert controller._current_project_path is None
 
 
 def test_load_recent_project_missing_file_warns_and_prunes_recent(controller_and_mw, tmp_path):
@@ -170,6 +212,8 @@ def test__load_project_from_path_success_applies_payload_and_updates_status(cont
     mw.apply_project_payload.assert_called_once_with({"payload": 1}, record_undo=True)
     mw.set_status_text.assert_called_once_with("Loaded project: in.kin")
     mw.add_to_recent_files.assert_called_once_with(in_path)
+    assert controller._current_project_path == in_path
+    mw.setWindowTitle.assert_called_once_with("Kindred \u2014 in.kin")
 
 
 def test__load_project_from_path_non_undoable_load_clears_app_undo_history(controller_and_mw, tmp_path):
@@ -232,6 +276,8 @@ def test__load_project_from_path_canceled_apply_does_not_report_success(controll
     mw.apply_project_payload.assert_called_once_with({"payload": 1}, record_undo=True)
     mw.set_status_text.assert_not_called()
     mw.add_to_recent_files.assert_not_called()
+    assert controller._current_project_path is None
+    mw.setWindowTitle.assert_not_called()
 
 
 def test__load_project_from_path_failure_shows_critical(controller_and_mw, tmp_path):
@@ -598,3 +644,154 @@ def test__prepare_payload_export_rows_rejects_length_mismatch(controller_and_mw)
 
     with pytest.raises(ValueError, match="does not match time grid"):
         controller._prepare_payload_export_rows(payload, plot=plot, scope="all")
+
+
+# ------------------------------------------------------------------
+# current_project_path property
+# ------------------------------------------------------------------
+
+def test_current_project_path_initially_none(controller_and_mw):
+    controller, _mw = controller_and_mw
+    assert controller.current_project_path is None
+
+
+# ------------------------------------------------------------------
+# _update_window_title
+# ------------------------------------------------------------------
+
+def test_update_window_title_with_path(controller_and_mw):
+    controller, mw = controller_and_mw
+    controller._current_project_path = "/path/to/my_project.kin"
+    controller._update_window_title()
+    mw.setWindowTitle.assert_called_once_with("Kindred \u2014 my_project.kin")
+
+
+def test_update_window_title_without_path(controller_and_mw):
+    controller, mw = controller_and_mw
+    controller._current_project_path = None
+    controller._update_window_title()
+    mw.setWindowTitle.assert_called_once_with("Kindred")
+
+
+# ------------------------------------------------------------------
+# new_project
+# ------------------------------------------------------------------
+
+def test_new_project_cancel_is_noop(controller_and_mw):
+    """Cancelling the save prompt does nothing."""
+    controller, mw = controller_and_mw
+    controller._current_project_path = "/some/file.kin"
+
+    with patch.object(
+        QtWidgets.QMessageBox, "question",
+        return_value=QtWidgets.QMessageBox.StandardButton.Cancel,
+    ):
+        controller.new_project()
+
+    assert controller._current_project_path == "/some/file.kin"
+    mw.apply_project_payload.assert_not_called()
+
+
+def test_new_project_discard_clears_state(controller_and_mw):
+    """Choosing Discard clears state without saving."""
+    controller, mw = controller_and_mw
+    controller._current_project_path = "/some/file.kin"
+
+    with patch.object(
+        QtWidgets.QMessageBox, "question",
+        return_value=QtWidgets.QMessageBox.StandardButton.Discard,
+    ):
+        controller.new_project()
+
+    mw.apply_project_payload.assert_called_once()
+    payload = mw.apply_project_payload.call_args[0][0]
+    assert payload["mechanism"] == ""
+    assert payload["notes"] == ""
+    assert controller._current_project_path is None
+    mw.setWindowTitle.assert_called_with("Kindred")
+    mw._undo_stack.clear.assert_called_once()
+    mw.set_status_text.assert_called_once_with("New project")
+
+
+def test_new_project_payload_contains_project_only_keys_and_omits_dual_persisted(controller_and_mw):
+    """new_project() sends project-only keys and omits dual-persisted ones.
+
+    Dual-persisted keys are intentionally stripped so _apply_project_payload
+    falls through to user preferences instead of factory defaults.
+    """
+    from kindred.gui.project_schema import PROJECT_DEFAULTS, QSETTINGS_KEY_MAP
+
+    controller, mw = controller_and_mw
+    with patch.object(
+        QtWidgets.QMessageBox, "question",
+        return_value=QtWidgets.QMessageBox.StandardButton.Discard,
+    ):
+        controller.new_project()
+
+    mw.apply_project_payload.assert_called_once()
+    payload = mw.apply_project_payload.call_args[0][0]
+
+    # Project-only keys must be present with factory defaults
+    project_only_keys = set(PROJECT_DEFAULTS.keys()) - set(QSETTINGS_KEY_MAP.keys())
+    for key in project_only_keys:
+        assert key in payload, f"Project-only key {key!r} missing from new_project payload"
+        assert payload[key] == PROJECT_DEFAULTS[key]
+
+    # Dual-persisted keys must be absent (fall through to user preferences)
+    for key in QSETTINGS_KEY_MAP:
+        assert key not in payload, f"Dual-persisted key {key!r} should not be in new_project payload"
+
+
+def test_new_project_save_then_clear(controller_and_mw):
+    """Choosing Save triggers save_project, then clears on success."""
+    controller, mw = controller_and_mw
+    controller._current_project_path = "/existing/project.kin"
+    mw.serialize_project_state.return_value = {"ok": True}
+
+    with (
+        patch.object(
+            QtWidgets.QMessageBox, "question",
+            return_value=QtWidgets.QMessageBox.StandardButton.Save,
+        ),
+        patch("kindred.gui.controllers.project_controller.BusyCursor", return_value=_null_cursor()),
+        patch("builtins.open", mock_open()),
+        patch("kindred.gui.controllers.project_controller.json.dump"),
+    ):
+        controller.new_project()
+
+    mw.serialize_project_state.assert_called_once()
+    mw.apply_project_payload.assert_called_once()
+    assert controller._current_project_path is None
+
+
+def test_new_project_save_cancelled_aborts(controller_and_mw):
+    """If save_project returns False (user cancelled dialog), new project is aborted."""
+    controller, mw = controller_and_mw
+
+    with (
+        patch.object(
+            QtWidgets.QMessageBox, "question",
+            return_value=QtWidgets.QMessageBox.StandardButton.Save,
+        ),
+        patch.object(QtWidgets.QFileDialog, "getSaveFileName", return_value=("", "")),
+    ):
+        controller.new_project()
+
+    mw.apply_project_payload.assert_not_called()
+
+
+def test_new_project_apply_payload_guard_cancels(controller_and_mw):
+    """If the slider transaction guard cancels apply_project_payload, abort."""
+    controller, mw = controller_and_mw
+    controller._current_project_path = "/some/file.kin"
+    mw.apply_project_payload.return_value = False
+
+    with patch.object(
+        QtWidgets.QMessageBox, "question",
+        return_value=QtWidgets.QMessageBox.StandardButton.Discard,
+    ):
+        controller.new_project()
+
+    mw.apply_project_payload.assert_called_once()
+    assert controller._current_project_path == "/some/file.kin"
+    mw._undo_stack.clear.assert_not_called()

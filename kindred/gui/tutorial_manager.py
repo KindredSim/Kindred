@@ -3,10 +3,12 @@ Tutorial management system.
 
 Provides built-in tutorials covering key Kindred workflows:
 - Getting Started (basic simulation)
-- Parameter Fitting (experimental data fitting)
-- Temperature Schedules (time-varying kinetics)
-- State Networks (transition state theory)
-- Advanced Features (equilibria, algebra)
+- Mechanism Language (DSL syntax)
+- Batch Initial Conditions
+- Interactive Sliders
+- Data Import and Overlay
+- Parameter Fitting
+- Right-click Copy
 """
 
 from __future__ import annotations
@@ -39,406 +41,511 @@ class TutorialManager:
     TUTORIALS: Dict[str, Dict] = {
         "getting_started": {
             "title": "Getting Started with Kindred",
-            "description": "Learn how to create a simple reaction mechanism and run your first simulation.",
-            "duration": "5 minutes",
+            "description": "Create a simple mechanism and run your first simulation.",
+            "duration": "3 minutes",
             "steps": [
                 TutorialStep(
-                    title="Welcome to Kindred!",
+                    title="Welcome to Kindred",
                     instruction=(
-                        "Kindred is a chemical kinetics simulation and fitting tool. "
-                        "This tutorial will guide you through creating your first simulation.<br><br>"
-                        "<b>What you'll learn:</b><ul>"
-                        "<li>Writing reaction mechanisms in DSL</li>"
-                        "<li>Setting initial conditions</li>"
-                        "<li>Running simulations</li>"
-                        "<li>Viewing results</li></ul>"
+                        "Kindred is a chemical kinetics simulator and fitting tool. "
+                        "This tutorial walks you through your first simulation."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
                     title="The Mechanism Editor",
                     instruction=(
-                        "The <b>Reactions tab</b> is where you define your chemical mechanism using Kindred's DSL syntax.<br><br>"
-                        "DSL stands for Domain-Specific Language - it's a simple, readable format for writing reactions."
-                    ),
-                    target_widget="mechanismEditor",  # Will need to set this object name
-                    arrow_direction="left",
-                ),
-                TutorialStep(
-                    title="Write Your First Reaction",
-                    instruction=(
-                        "Let's write a simple reaction: <code>A → B</code><br><br>"
-                        "In the Reactions tab, type:<br>"
-                        "<code>reaction: A -> B; k=0.5</code><br><br>"
-                        "This defines a first-order reaction with rate constant k=0.5 s⁻¹."
+                        "The <b>Reactions</b> tab is where you write your chemical "
+                        "mechanism. Kindred uses a simple text-based syntax."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Set Initial Conditions",
+                    title="Enter a mechanism",
                     instruction=(
-                        "Now add initial concentrations below your reaction:<br>"
-                        "<code>initial: A=1.0</code><br>"
-                        "<code>initial: B=0.0</code><br><br>"
-                        "This sets [A]₀ = 1.0 M and [B]₀ = 0.0 M."
+                        "Type these two reactions into the editor:<br><br>"
+                        "<code>A -&gt; B ; k=1.0</code><br>"
+                        "<code>B -&gt; C ; k=0.5</code><br><br>"
+                        "Each line defines a reaction with its rate constant."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Run the Simulation",
+                    title="Check for the green tick",
                     instruction=(
-                        "Click the <b>Run</b> button (or press <b>Ctrl+R</b>) to simulate your mechanism.<br><br>"
-                        "Kindred will solve the differential equations and plot concentration vs time."
+                        "Below the editor you will see a validation indicator. "
+                        "A green tick means the mechanism parsed successfully."
                     ),
-                    target_widget="runSimulationAction",
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Set initial concentrations",
+                    instruction=(
+                        "The <b>Batch Initial Conditions</b> panel holds starting "
+                        "concentrations. The default set starts every species at zero. "
+                        "Set <b>A</b> to <code>1.0</code> by editing its cell."
+                    ),
+                    target_widget="batchDock",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Run the simulation",
+                    instruction=(
+                        "Click <b>Run Selected</b> to solve the ODEs and plot "
+                        "concentration vs. time."
+                    ),
+                    target_widget="runSelectedButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(
-                    title="View Results",
+                    title="Read the plot",
                     instruction=(
-                        "The <b>Plot</b> panel shows your simulation results.<br><br>"
-                        "You should see [A] decreasing exponentially while [B] increases to 1.0 M.<br><br>"
-                        "The table below shows time-series data that you can export."
+                        "The plot shows species concentrations over time. "
+                        "You should see A decaying, B rising then falling, and C "
+                        "accumulating. Congratulations on your first simulation!"
+                    ),
+                    target_widget="plotPanel",
+                    arrow_direction="right",
+                ),
+            ],
+        },
+        "mechanism_language": {
+            "title": "Mechanism Language",
+            "description": "Learn the reaction syntax, rate constants, equilibria, and algebra.",
+            "duration": "5 minutes",
+            "steps": [
+                TutorialStep(
+                    title="Reaction syntax basics",
+                    instruction=(
+                        "Reactions use arrows to show direction:<br>"
+                        "<code>A -&gt; B ; k=1.0</code> (irreversible)<br>"
+                        "<code>A &lt;-&gt; B ; kf=1.0 ; kr=0.5</code> (reversible)<br><br>"
+                        "You can also write <code>=&gt;</code> or <code>&lt;=&gt;</code>."
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Stoichiometric coefficients",
+                    instruction=(
+                        "Place coefficients before species names:<br>"
+                        "<code>2A + B -&gt; C ; k=0.01</code><br><br>"
+                        "An optional <code>*</code> is allowed: <code>2*A</code> "
+                        "is the same as <code>2A</code>."
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Numeric rate constants",
+                    instruction=(
+                        "Rate constants on reaction lines must be numeric values:<br>"
+                        "<code>k=1.5</code>, <code>kf=1e5</code>, <code>kr=0.002</code><br><br>"
+                        "Symbolic relationships between rates are handled separately "
+                        "in the <code># Algebra</code> block."
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Equilibrium lines",
+                    instruction=(
+                        "Use the <code>equilibrium:</code> keyword for fast equilibria:<br>"
+                        "<code>equilibrium: A &lt;-&gt; B ; K=2.5 ; kf=10.0</code><br><br>"
+                        "A reversible arrow is required. <code>K=</code> needs at least one "
+                        "of <code>kf=</code> or <code>kr=</code> as an anchor rate."
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Global directives",
+                    instruction=(
+                        "Set global conditions at the top of your mechanism:<br>"
+                        "<code>energy=kJ/mol</code> (or <code>kcal/mol</code>)<br>"
+                        "<code>T=310</code> (temperature in Kelvin)<br>"
+                        "<code>[A]=1.0</code> (initial concentration)"
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="The Algebra block",
+                    instruction=(
+                        "Add a <code># Algebra</code> section for derived parameters "
+                        "and observables:<br>"
+                        "<code>param scale = 2.0</code> (adjustable parameter)<br>"
+                        "<code>param k2 = k1 * scale</code> (derived constraint)<br>"
+                        "<code>let total = [A] + [B]</code> (observable)"
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="param vs let",
+                    instruction=(
+                        "<code>param</code> defines kinetic parameters evaluated "
+                        "<b>before</b> the solver runs. It cannot reference species "
+                        "concentrations.<br><br>"
+                        "<code>let</code> defines observables that can read species data "
+                        "like <code>[A]</code> and <code>[A]_0</code>."
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Language summary",
+                    instruction=(
+                        "You now know the core syntax. The <b>Help</b> tab in the "
+                        "mechanism editor has a quick-reference with examples."
+                    ),
+                    arrow_direction="none",
+                ),
+            ],
+        },
+        "batch_initial_conditions": {
+            "title": "Batch Initial Conditions",
+            "description": "Create batch sets and control starting concentrations.",
+            "duration": "3 minutes",
+            "steps": [
+                TutorialStep(
+                    title="What are batch sets?",
+                    instruction=(
+                        "Each <b>batch set</b> is a row of starting concentrations "
+                        "for your species. You can define multiple sets to compare "
+                        "different conditions in one run."
+                    ),
+                    target_widget="batchDock",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Add a batch set",
+                    instruction=(
+                        "Click <b>Add Set</b> to create a new row. "
+                        "Each row starts with all concentrations at zero."
+                    ),
+                    target_widget="addBatchSetButton",
+                    arrow_direction="top",
+                ),
+                TutorialStep(
+                    title="Edit concentrations",
+                    instruction=(
+                        "Click a cell in the table to type a concentration value. "
+                        "You can also paste a block of values from a spreadsheet."
+                    ),
+                    target_widget="batchTable",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Select sets to run",
+                    instruction=(
+                        "Click rows to select which batch sets to simulate. "
+                        "Hold <b>Ctrl</b> (or <b>Cmd</b>) to select multiple rows."
+                    ),
+                    target_widget="batchTable",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Run selected sets",
+                    instruction=(
+                        "Click <b>Run Selected</b> to simulate only the selected "
+                        "batch sets. Unselected sets are not affected."
+                    ),
+                    target_widget="runSelectedButton",
+                    arrow_direction="top",
+                ),
+                TutorialStep(
+                    title="Batch sets summary",
+                    instruction=(
+                        "Batch sets let you explore how different starting conditions "
+                        "affect your kinetics without changing the mechanism itself."
+                    ),
+                    arrow_direction="none",
+                ),
+            ],
+        },
+        "interactive_sliders": {
+            "title": "Interactive Sliders",
+            "description": "Adjust parameters with live preview and commit changes.",
+            "duration": "4 minutes",
+            "steps": [
+                TutorialStep(
+                    title="Before you start",
+                    instruction=(
+                        "Sliders require a mechanism with adjustable rate "
+                        "constants (for example <code>k=1.0</code>). If the "
+                        "slider pane is not visible below the editor, close "
+                        "this tutorial, enter a mechanism, and relaunch."
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Slider pane appears",
+                    instruction=(
+                        "After entering a valid mechanism with adjustable "
+                        "parameters, the <b>slider pane</b> appears below "
+                        "the Reactions editor."
+                    ),
+                    target_widget="mechanismSliderPane",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Choose visible sliders",
+                    instruction=(
+                        "Sliders start hidden. Click <b>Visible sliders</b> "
+                        "and check the parameters you want to adjust."
+                    ),
+                    target_widget="sliderVisibilityPickerButton",
+                    arrow_direction="top",
+                ),
+                TutorialStep(
+                    title="Drag for live preview",
+                    instruction=(
+                        "Drag any slider to see a <b>live preview</b> of how the "
+                        "simulation changes. The plot updates automatically."
+                    ),
+                    target_widget="unifiedSliderSurface",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Preview vs committed state",
+                    instruction=(
+                        "Slider adjustments are <b>preview only</b>. They do not "
+                        "change the canonical mechanism until you explicitly commit. "
+                        "The preview is shown as an overlay on the plot."
+                    ),
+                    target_widget="unifiedSliderSurface",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Commit slider values",
+                    instruction=(
+                        "After changing a slider value, <b>Commit</b> activates. "
+                        "Click it to promote the current slider values into the "
+                        "canonical mechanism and update the DSL text."
+                    ),
+                    target_widget="commitSliderOverridesButton",
+                    arrow_direction="top",
+                ),
+                TutorialStep(
+                    title="Reset sliders",
+                    instruction=(
+                        "Click <b>Reset</b> to discard your slider adjustments "
+                        "and return to the canonical mechanism values."
+                    ),
+                    target_widget="resetSliderOverridesButton",
+                    arrow_direction="top",
+                ),
+                TutorialStep(
+                    title="Fine adjustment mode",
+                    instruction=(
+                        "Toggle <b>Fine</b> mode for more precise slider control "
+                        "when you need small adjustments."
+                    ),
+                    target_widget="mechanismSliderPane",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Sliders summary",
+                    instruction=(
+                        "Sliders give you instant visual feedback on how parameters "
+                        "affect your kinetics. Commit when you find values you like."
+                    ),
+                    arrow_direction="none",
+                ),
+            ],
+        },
+        "data_import": {
+            "title": "Data Import and Overlay",
+            "description": "Load experimental data and overlay it on simulations.",
+            "duration": "3 minutes",
+            "steps": [
+                TutorialStep(
+                    title="Supported file formats",
+                    instruction=(
+                        "Kindred imports experimental data from <b>CSV</b> and "
+                        "<b>Excel (.xlsx)</b> files. Each file should have a time "
+                        "column and one or more concentration columns."
+                    ),
+                    arrow_direction="none",
+                ),
+                TutorialStep(
+                    title="Open the import dialog",
+                    instruction=(
+                        "Click the <b>Load</b> button in the Data panel (or use "
+                        "<b>File &gt; Load Data</b>) to open the import dialog."
+                    ),
+                    target_widget="loadDataButton",
+                    arrow_direction="top",
+                ),
+                TutorialStep(
+                    title="Configure the import",
+                    instruction=(
+                        "The import dialog lets you select columns, set units, and "
+                        "choose which sheets to import. Each Excel sheet is imported "
+                        "independently."
+                    ),
+                    arrow_direction="none",
+                ),
+                TutorialStep(
+                    title="View imported data",
+                    instruction=(
+                        "After import, your datasets appear in the <b>Data</b> panel. "
+                        "Each dataset is mapped to a batch set for simulation."
+                    ),
+                    target_widget="dataPanel",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Overlay on the plot",
+                    instruction=(
+                        "Imported data is automatically overlaid on the simulation "
+                        "plot, making it easy to compare model predictions with "
+                        "experimental measurements."
                     ),
                     target_widget="plotPanel",
                     arrow_direction="right",
                 ),
                 TutorialStep(
-                    title="Congratulations!",
+                    title="Data import summary",
                     instruction=(
-                        "You've completed your first Kindred simulation! 🎉<br><br>"
-                        "<b>Next steps:</b><ul>"
-                        "<li>Try more complex reactions (bimolecular, reversible)</li>"
-                        "<li>Explore equilibria and thermodynamics</li>"
-                        "<li>Learn about parameter fitting</li></ul><br>"
-                        "Check out other tutorials from <b>Help → Tutorials</b>."
+                        "With data loaded, you can visually compare your model "
+                        "to experiments. This is the foundation for parameter fitting."
                     ),
                     arrow_direction="none",
                 ),
             ],
         },
         "parameter_fitting": {
-            "title": "Parameter Fitting Workflow",
-            "description": "Learn how to fit rate constants to experimental data.",
-            "duration": "10 minutes",
+            "title": "Parameter Fitting",
+            "description": "Fit rate constants to experimental data using Global Fit.",
+            "duration": "5 minutes",
             "steps": [
                 TutorialStep(
-                    title="Parameter Fitting in Kindred",
+                    title="Parameter fitting overview",
                     instruction=(
-                        "Kindred can automatically fit rate constants and other parameters to experimental data.<br><br>"
-                        "<b>What you'll learn:</b><ul>"
-                        "<li>Loading experimental data</li>"
-                        "<li>Opening the fitting window</li>"
-                        "<li>Configuring bounds</li>"
-                        "<li>Running optimization</li>"
-                        "<li>Viewing diagnostics</li></ul>"
+                        "Kindred can automatically optimise rate constants and other "
+                        "parameters to match experimental data. This tutorial assumes "
+                        "you already have a mechanism and loaded data."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Load Experimental Data",
+                    title="Prepare your mechanism",
                     instruction=(
-                        "First, load your experimental data from a CSV file.<br><br>"
-                        "Go to <b>File → Load Data...</b> and select a CSV with time and concentration columns."
-                    ),
-                    target_widget="loadDataAction",
-                    arrow_direction="top",
-                ),
-                TutorialStep(
-                    title="The Data Panel",
-                    instruction=(
-                        "The <b>Data</b> tab shows your loaded datasets.<br><br>"
-                        "You can preview the data and confirm the dataset you want to fit."
-                    ),
-                    target_widget="dataPanel",
-                    arrow_direction="left",
-                ),
-                TutorialStep(
-                    title="Define Your Mechanism",
-                    instruction=(
-                        "Write the mechanism you want to fit in the <b>Reactions</b> tab.<br><br>"
-                        "Use parameter names (like <code>k1</code>, <code>k2</code>) instead of numeric values:<br>"
-                        "<code>reaction: A -> B; k=k1</code>"
+                        "Write your mechanism in the <b>Reactions</b> tab with numeric "
+                        "rate constants as starting guesses. The fitter will adjust "
+                        "these values."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Open the Fitting Window",
+                    title="Load experimental data",
                     instruction=(
-                        "Click <b>Fitting → Global Fit...</b> (or <b>Ctrl+Shift+F</b>) to open the fitting window.<br><br>"
-                        "Kindred will automatically detect parameter names from your mechanism."
+                        "Make sure your experimental data is loaded in the "
+                        "<b>Data</b> panel. Each dataset should be mapped to "
+                        "a batch set."
+                    ),
+                    target_widget="dataPanel",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Open Global Fit",
+                    instruction=(
+                        "Go to <b>Fitting &gt; Global Fit</b> (or press "
+                        "<b>Ctrl+Shift+F</b>) to open the fitting window."
                     ),
                     target_widget="globalFitAction",
                     arrow_direction="top",
                 ),
-                    TutorialStep(
-                        title="Configure Bounds",
-                        instruction=(
-                            "In the fitting window's <b>Parameters &amp; ICs</b> tab, set realistic bounds for each parameter:<br><br>"
-                            "• <b>Value</b>: Starting guess<br>"
-                            "• <b>Min/Max</b>: Search bounds<br><br>"
-                            "Good bounds improve convergence and prevent unphysical values."
-                        ),
-                    arrow_direction="none",
-                ),
                 TutorialStep(
-                    title="Run Fit",
+                    title="Select fit targets",
                     instruction=(
-                        "Click <b>Run Fit</b> inside the fitting window to start optimization.<br><br>"
-                        "Kindred uses scipy's least-squares optimizer to minimize residuals."
+                        "In the fitting window, choose which species to fit "
+                        "and set parameter bounds (min, max, initial guess). "
+                        "Realistic bounds improve convergence."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Review Results",
+                    title="Run the fit",
                     instruction=(
-                        "Review the fit inside the fitting window itself.<br>"
-                        "• Optimized parameter values<br>"
-                        "• Uncertainties (standard errors)<br>"
-                        "• Goodness-of-fit statistics (R², χ²)<br><br>"
-                        "Nothing updates the project until you use <b>Apply to Project</b>."
+                        "Click <b>Run Fit</b> to start the optimiser. "
+                        "Progress is shown live with parameter values and "
+                        "residual plots updating in real time."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Apply to Project",
+                    title="Review results",
                     instruction=(
-                        "Use the fitting window's <b>Apply to Project</b> control when you are ready to promote results.<br><br>"
-                        "Choose whether to apply:<br>"
-                        "• Parameters only<br>"
-                        "• Initial conditions only<br>"
-                        "• Parameters and initial conditions"
+                        "When the fit completes, review optimised parameter values, "
+                        "uncertainties, and goodness-of-fit statistics inside the "
+                        "fitting window."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Fitting Complete!",
+                    title="Apply to project",
                     instruction=(
-                        "You now know how to fit kinetic models to data! 🎉<br><br>"
-                        "<b>Tips:</b><ul>"
-                        "<li>Use physically reasonable bounds</li>"
-                        "<li>Check residual plots for systematic errors</li>"
-                        "<li>Try different initial guesses if fit fails</li>"
-                        "</ul>"
+                        "Use <b>Apply to Project</b> to promote fitted values back "
+                        "into your mechanism. You can apply parameters only, initial "
+                        "conditions only, or both."
+                    ),
+                    arrow_direction="none",
+                ),
+                TutorialStep(
+                    title="Fitting summary",
+                    instruction=(
+                        "Tips for good fits: use physically reasonable bounds, "
+                        "check residual plots for systematic errors, and try "
+                        "different initial guesses if the fit does not converge."
                     ),
                     arrow_direction="none",
                 ),
             ],
         },
-        "temperature_schedules": {
-            "title": "Temperature Schedules",
-            "description": "Create time-varying temperature profiles for non-isothermal kinetics.",
-            "duration": "7 minutes",
+        "right_click_copy": {
+            "title": "Right-click Copy",
+            "description": "Copy plot data to the clipboard for use in spreadsheets.",
+            "duration": "1 minute",
             "steps": [
                 TutorialStep(
-                    title="Time-Varying Temperature",
+                    title="Copy data from the plot",
                     instruction=(
-                        "Kindred supports piecewise constant temperature schedules for simulating:<br>"
-                        "• Temperature ramps<br>"
-                        "• Step changes<br>"
-                        "• Cyclic heating/cooling<br>"
-                        "• Arbitrary temperature profiles"
+                        "You can copy simulation results directly from the plot "
+                        "without exporting to a file."
+                    ),
+                    target_widget="plotPanel",
+                    arrow_direction="right",
+                ),
+                TutorialStep(
+                    title="Right-click the plot",
+                    instruction=(
+                        "Right-click anywhere on the <b>plot area</b> to open "
+                        "the context menu with copy options."
+                    ),
+                    target_widget="plotViewport",
+                    arrow_direction="right",
+                ),
+                TutorialStep(
+                    title="Paste into a spreadsheet",
+                    instruction=(
+                        "After copying, paste into Excel, Google Sheets, or any "
+                        "text editor. The data is tab-separated for easy import."
                     ),
                     arrow_direction="none",
                 ),
                 TutorialStep(
-                    title="Temperature Schedule Editor",
+                    title="Copy summary",
                     instruction=(
-                        "Open <b>Tools → Temperature Schedule...</b> to launch the visual editor.<br><br>"
-                        "The editor provides:<br>"
-                        "• Table-based interval editing<br>"
-                        "• Live preview plot<br>"
-                        "• Template presets<br>"
-                        "• DSL export"
-                    ),
-                    target_widget="temperatureScheduleAction",
-                    arrow_direction="top",
-                ),
-                TutorialStep(
-                    title="Create a Schedule",
-                    instruction=(
-                        "Try a template like <b>Linear Ramp (25°C → 100°C)</b>.<br><br>"
-                        "You can customize intervals by editing the table:<br>"
-                        "• Start/End Time (seconds)<br>"
-                        "• Temperature (Kelvin)"
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Preview and Export",
-                    instruction=(
-                        "The preview plot shows your temperature profile.<br><br>"
-                        "Click <b>OK</b> to export DSL syntax like:<br>"
-                        "<code>temp_step: t=[0,25,50,...], T=[298.15,316.9,...]</code><br><br>"
-                        "This gets inserted into your mechanism."
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Temperature-Dependent Rates",
-                    instruction=(
-                        "Reactions with Eyring or Arrhenius parameters automatically use the temperature schedule:<br><br>"
-                        "<code>reaction: A -> B; dG_act=75.0</code><br><br>"
-                        "Rate constants will vary with temperature during simulation."
-                    ),
-                    target_widget="mechanismEditor",
-                    arrow_direction="left",
-                ),
-                TutorialStep(
-                    title="Temperature Schedules Mastered!",
-                    instruction=(
-                        "You can now simulate non-isothermal kinetics! 🔥<br><br>"
-                        "<b>Applications:</b><ul>"
-                        "<li>Temperature-programmed reactions</li>"
-                        "<li>Thermal analysis (DSC, TGA)</li>"
-                        "<li>Reaction calorimetry</li>"
-                        "<li>Process optimization</li></ul>"
-                    ),
-                    arrow_direction="none",
-                ),
-            ],
-        },
-        "state_networks": {
-            "title": "State Networks (Transition State Theory)",
-            "description": "Model reactions using energy landscapes and transition states.",
-            "duration": "8 minutes",
-            "steps": [
-                TutorialStep(
-                    title="Transition State Theory in Kindred",
-                    instruction=(
-                        "State networks provide an alternative way to define mechanisms based on energy landscapes.<br><br>"
-                        "<b>Concepts:</b><ul>"
-                        "<li>States (energy minima)</li>"
-                        "<li>Transition states (energy barriers)</li>"
-                        "<li>Automatic rate calculation via Eyring equation</li></ul>"
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Access State Network Editor",
-                    instruction=(
-                        "Go to <b>Edit → State Network...</b> to open the visual editor.<br><br>"
-                        "State networks are stored separately from reaction DSL but can be converted."
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Define States",
-                    instruction=(
-                        "In the editor, define states with:<br>"
-                        "• Name (e.g., 'A', 'B')<br>"
-                        "• Energy (relative, in kJ/mol)<br>"
-                        "• Degeneracy (statistical weight)<br><br>"
-                        "Example:<br>"
-                        "<code>state: A; energy=0.0; degeneracy=1</code>"
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Add Transition States",
-                    instruction=(
-                        "Connect states via transition states:<br>"
-                        "<code>edge: A -> TS1 -> B; energy=75.0</code><br><br>"
-                        "Kindred automatically calculates forward and reverse rates using Eyring theory."
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Convert to Reactions",
-                    instruction=(
-                        "Click <b>Convert to Reactions</b> to generate standard DSL.<br><br>"
-                        "The state network is converted to reactions with Eyring parameters:<br>"
-                        "<code>reaction: A -> B; dG_act=75.0</code>"
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="State Networks Complete!",
-                    instruction=(
-                        "You can now use transition state theory in Kindred! ⚛️<br><br>"
-                        "<b>When to use state networks:</b><ul>"
-                        "<li>Reactions with known barriers</li>"
-                        "<li>Computational chemistry data</li>"
-                        "<li>Complex equilibrium networks</li></ul>"
-                    ),
-                    arrow_direction="none",
-                ),
-            ],
-        },
-        "advanced_features": {
-            "title": "Advanced Features",
-            "description": "Explore equilibria, algebraic expressions, and multiple datasets.",
-            "duration": "10 minutes",
-            "steps": [
-                TutorialStep(
-                    title="Beyond Basic Reactions",
-                    instruction=(
-                        "Kindred supports advanced modeling features:<br><br>"
-                        "• <b>Equilibria</b>: Fast reversible reactions<br>"
-                        "• <b>Algebra</b>: Custom expressions in <code># Algebra</code> blocks<br>"
-                        "• <b>Multiple datasets</b>: Comparison and fitting"
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Equilibria",
-                    instruction=(
-                        "Define fast equilibria using equilibrium constants:<br>"
-                        "<code>equilibrium: A <-> B; K=2.5</code> (or <code>A <=> B</code>)<br><br>"
-                        "Or thermodynamic parameters:<br>"
-                        "<code>equilibrium: A <=> B; dG0=-2.3; T=298.15</code><br><br>"
-                        "Kindred handles equilibria efficiently in the ODE system."
-                    ),
-                    target_widget="mechanismEditor",
-                    arrow_direction="left",
-                ),
-                TutorialStep(
-                    title="Algebraic Expressions",
-                    instruction=(
-                        "Define algebraic expressions inside the Reactions editor using a <code># Algebra</code> section:<br>"
-                        "• Derived series: <code>let Total = [A] + [B]</code><br>"
-                        "• Scalar parameters: <code>param scale = 1.0</code><br>"
-                        "• Fluxes: <code>let flux = k1 * [A]</code><br><br>"
-                        "These are evaluated dynamically during simulation."
-                    ),
-                    arrow_direction="none",
-                ),
-                TutorialStep(
-                    title="Multiple Datasets",
-                    instruction=(
-                        "Load multiple datasets to compare experiments:<br><br>"
-                        "• Different conditions<br>"
-                        "• Replicate measurements<br>"
-                        "• Different species<br><br>"
-                        "Use the grid view for side-by-side comparison."
-                    ),
-                    target_widget="dataPanel",
-                    arrow_direction="left",
-                ),
-                TutorialStep(
-                    title="Solver Settings",
-                    instruction=(
-                        "Fine-tune simulations in <b>Tools → Solver Settings...</b>:<br><br>"
-                        "• Solver method (LSODA, Radau, BDF)<br>"
-                        "• Tolerances (rtol, atol)<br>"
-                        "• Temperature<br>"
-                        "• Grid density"
-                    ),
-                    target_widget="solverSettingsAction",
-                    arrow_direction="top",
-                ),
-                TutorialStep(
-                    title="All Features Unlocked!",
-                    instruction=(
-                        "You're now a Kindred power user! 🚀<br><br>"
-                        "<b>Resources:</b><ul>"
-                        "<li><b>F1</b>: Documentation</li>"
-                        "<li><b>Ctrl+?</b>: Keyboard shortcuts</li>"
-                        "<li><b>Help → About</b>: Version and license</li></ul><br>"
-                        "Happy modeling!"
+                        "Right-click copy is the fastest way to get simulation "
+                        "data into a report or spreadsheet."
                     ),
                     arrow_direction="none",
                 ),

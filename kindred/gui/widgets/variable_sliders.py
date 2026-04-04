@@ -7,12 +7,8 @@ equilibrium constants, and scalar values) with automatic simulation updates.
 
 from __future__ import annotations
 
-from contextlib import suppress
 from functools import partial
-import os
 import logging
-import traceback
-from pathlib import Path
 from typing import Dict, Optional, Tuple
 import math
 
@@ -22,8 +18,6 @@ from PySide6.QtCore import Signal
 from ..ui_helpers import make_placeholder_label, make_scroll_area
 
 logger = logging.getLogger(__name__)
-slider_update_logger = logging.getLogger("kindred.slider_updates")
-slider_update_logger.propagate = False
 
 __all__ = ["VariableSliders"]
 
@@ -82,8 +76,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._last_valid_values: Dict[str, float] = {}
         self._freeze_ranges: bool = False
         self._fine_mode: bool = False
-        self._debug_slider_updates: bool = bool(os.environ.get("KINDRED_DEBUG_SLIDERS"))
-        self._slider_debug_log_path: Optional[str] = None
         self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
         self._visibility_scope_signature: object | None = None
@@ -137,108 +129,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         logger.debug("VariableSliders initialized")
 
-    def set_debug_slider_updates(self, enabled: bool) -> None:
-        """Enable or disable verbose slider update logging (for debugging)."""
-        enabled = bool(enabled)
-        if self._debug_slider_updates == enabled:
-            if enabled:
-                self._enable_slider_update_file_logger()
-            return
-        self._debug_slider_updates = enabled
-        if enabled:
-            self._enable_slider_update_file_logger()
-        else:
-            self._disable_slider_update_file_logger()
-        logger.info("Slider debug logging %s", "enabled" if enabled else "disabled")
-
-    def set_debug_slider_log_path(self, path: Optional[str]) -> None:
-        """
-        Set the log file path used when slider debug logging is enabled.
-
-        Test/automation override:
-        - `KINDRED_SLIDER_DEBUG_LOG` (if set) overrides this value when enabling.
-        """
-        self._slider_debug_log_path = str(path) if path else None
-
-    def _enable_slider_update_file_logger(self) -> Optional[str]:
-        slider_update_logger.propagate = False
-        log_path = os.environ.get("KINDRED_SLIDER_DEBUG_LOG") or self._slider_debug_log_path
-        if not log_path:
-            try:
-                base_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
-                if not base_dir:
-                    base_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.TempLocation)
-                if base_dir:
-                    os.makedirs(base_dir, exist_ok=True)
-                    log_path = os.path.join(base_dir, "kindred-slider-updates.log")
-            except Exception:
-                log_path = None
-        if not log_path:
-            slider_update_logger.setLevel(logging.DEBUG)
-            return None
-
-        import tempfile
-
-        initial_path = Path(str(log_path)).expanduser()
-        fallback_path = Path(tempfile.gettempdir()) / "kindred-slider-updates.log"
-
-        candidates = [initial_path]
-        if fallback_path != initial_path:
-            candidates.append(fallback_path)
-
-        handler = None
-        last_exc: Optional[BaseException] = None
-        path = initial_path
-        for candidate in candidates:
-            try:
-                if candidate.parent:
-                    candidate.parent.mkdir(parents=True, exist_ok=True)
-                handler = logging.FileHandler(str(candidate), mode="a", encoding="utf-8")
-            except OSError as exc:
-                last_exc = exc
-                continue
-            else:
-                path = candidate
-                break
-        if handler is None:
-            slider_update_logger.setLevel(logging.DEBUG)
-            logger.debug("Failed to open slider debug log file; disabling file logger: %s", last_exc, exc_info=True)
-            return None
-
-        for handler in list(slider_update_logger.handlers):
-            if getattr(handler, "_kindred_slider_updates", False):
-                with suppress(Exception):
-                    slider_update_logger.removeHandler(handler)
-                with suppress(Exception):
-                    handler.close()
-            elif not isinstance(handler, logging.FileHandler):
-                with suppress(Exception):
-                    slider_update_logger.removeHandler(handler)
-
-        handler._kindred_slider_updates = True  # type: ignore[attr-defined]
-        handler.setLevel(logging.DEBUG)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        slider_update_logger.setLevel(logging.DEBUG)
-        slider_update_logger.addHandler(handler)
-
-        slider_update_logger.debug("Slider debug logging enabled (path=%s)", str(path))
-        return str(path)
-
-    def _disable_slider_update_file_logger(self) -> None:
-        for handler in list(slider_update_logger.handlers):
-            if getattr(handler, "_kindred_slider_updates", False):
-                with suppress(Exception):
-                    slider_update_logger.debug("Slider debug logging disabled")
-                with suppress(Exception):
-                    slider_update_logger.removeHandler(handler)
-                with suppress(Exception):
-                    handler.close()
-
-    def debug_slider_updates_enabled(self) -> bool:
-        return bool(self._debug_slider_updates)
-
     def set_variables(
         self,
         variables: Dict[str, float],
@@ -286,14 +176,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         if self._placeholder is not None:
             self._placeholder.hide()
-
-        if self._debug_slider_updates:
-            try:
-                k_values = {k: float(v) for k, v in variables.items() if str(k).startswith("K")}
-            except Exception:
-                k_values = {}
-            if k_values:
-                logger.debug("set_variables K*: %s", k_values)
 
         for name, value in variables.items():
             self._create_slider(name, value)
@@ -547,13 +429,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         # Emit signal
         logger.debug("Variable changed: %s = %.12g", str(name), float(value))
-        if self._debug_slider_updates:
-            slider_update_logger.debug(
-                "slider_value_changed(%s pos=%d -> %.12g)",
-                str(name),
-                int(slider_pos),
-                float(value),
-            )
         self.variableChanged.emit(name, value)
 
     def _format_value(self, value: float) -> str:
@@ -612,10 +487,6 @@ class VariableSliders(QtWidgets.QWidget):
             logger.warning(f"Cannot update unknown variable: {name}")
             return
 
-        if self._debug_slider_updates:
-            stack = "".join(traceback.format_stack(limit=10)).strip()
-            slider_update_logger.debug("update_variable(%s=%s) stack:\n%s", name, value, stack)
-
         value_f = float(value)
         if self._slider_scales.get(name, "log") == "log":
             sign = 1.0 if value_f >= 0 else -1.0
@@ -652,10 +523,6 @@ class VariableSliders(QtWidgets.QWidget):
         if name not in self._variables:
             logger.warning(f"Cannot update unknown variable: {name}")
             return
-
-        if self._debug_slider_updates:
-            stack = "".join(traceback.format_stack(limit=10)).strip()
-            slider_update_logger.debug("update_variable_readout(%s=%s) stack:\n%s", name, value, stack)
 
         self._variables[name] = value
         try:
