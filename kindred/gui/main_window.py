@@ -780,7 +780,7 @@ class MainWindow(
 
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
-        self._apply_initial_profile_from_cli()
+        self._apply_initial_profile()
         self._suppress_preference_updates = True
         try:
             self._load_settings()
@@ -811,7 +811,7 @@ class MainWindow(
             update_solver_summary_label=self._update_solver_summary_label,
         )
 
-    def _apply_initial_profile_from_cli(self) -> None:
+    def _apply_initial_profile(self) -> None:
         if not self._initial_profile:
             return
         if self._profile_manager.get_profile(self._initial_profile):
@@ -1164,11 +1164,13 @@ class MainWindow(
         )
 
         # ──────────────────────────────────────────────────────────────
-        # HIDDEN: Tools menu — all items currently removed or hidden
-        # Items:
-        #   - Temperature Schedule: hidden (see _open_temperature_schedule_editor in this file)
-        #   - Debug > Log Slider Updates: removed entirely
-        # Unhide: Recreate the menu when a Tools item is ready for user access.
+        # HIDDEN FEATURE: Temperature Schedule
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: kindred/gui/widgets/temperature_schedule_editor.py, kindred/core/temperature_dsl.py
+        # Note: The Tools menu is hidden entirely because this is its only remaining item.
+        # Unhide: Recreate the Tools menu and uncomment the action below after the
+        #         feature passes a dedicated integration audit and is approved for user access.
         # ──────────────────────────────────────────────────────────────
 
         help_menu = menubar.addMenu("&Help")
