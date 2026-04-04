@@ -269,7 +269,7 @@ class TutorialManager:
         },
         "interactive_sliders": {
             "title": "Interactive Sliders",
-            "description": "Adjust parameters with live preview and commit changes.",
+            "description": "Adjust parameters with live preview and apply changes.",
             "duration": "4 minutes",
             "steps": [
                 TutorialStep(
@@ -312,19 +312,19 @@ class TutorialManager:
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Preview vs committed state",
+                    title="Preview vs applied state",
                     instruction=(
                         "Slider adjustments are <b>preview only</b>. They do not "
-                        "change the canonical mechanism until you explicitly commit. "
+                        "change the canonical mechanism until you explicitly apply them. "
                         "The preview is shown as an overlay on the plot."
                     ),
                     target_widget="unifiedSliderSurface",
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Commit slider values",
+                    title="Apply slider values",
                     instruction=(
-                        "After changing a slider value, <b>Commit</b> activates. "
+                        "After changing a slider value, <b>Apply</b> activates. "
                         "Click it to promote the current slider values into the "
                         "canonical mechanism and update the DSL text."
                     ),
@@ -353,7 +353,7 @@ class TutorialManager:
                     title="Sliders summary",
                     instruction=(
                         "Sliders give you instant visual feedback on how parameters "
-                        "affect your kinetics. Commit when you find values you like."
+                        "affect your kinetics. Apply when you find values you like."
                     ),
                     arrow_direction="none",
                 ),

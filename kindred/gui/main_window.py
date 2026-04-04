@@ -511,11 +511,11 @@ class MainWindow(
         box.setWindowTitle("Pending Slider Changes")
         box.setText(f"{str(action_text)} will discard pending slider changes.")
         box.setInformativeText(
-            "Commit applies the staged slider transaction before continuing.\n"
+            "Apply saves the staged slider values before continuing.\n"
             "Discard clears it.\n"
             "Cancel keeps the current pending edits."
         )
-        commit_btn = box.addButton("Commit", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        commit_btn = box.addButton("Apply", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         discard_btn = box.addButton("Discard", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
         cancel_btn = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(cancel_btn)
@@ -556,7 +556,7 @@ class MainWindow(
             if bool(preview.has_dirty_transaction()):
                 self.message_box_warning(
                     "Pending Slider Changes",
-                    f"{str(action_text)} was canceled because pending slider changes could not be committed.",
+                    f"{str(action_text)} was canceled because pending slider changes could not be applied.",
                 )
                 return False
             return True
@@ -7630,14 +7630,14 @@ class MainWindow(
                 normalized_values[str(name)] = float(parsed)
         self._apply_effective_slider_values_to_mechanism_editors(
             normalized_values,
-            description=f"Commit slider {name}",
+            description=f"Apply slider {name}",
         )
 
     def _apply_effective_slider_values_to_mechanism_editors(
         self,
         values: Dict[str, float],
         *,
-        description: str = "Commit slider overrides",
+        description: str = "Apply slider overrides",
     ) -> None:
         reactions_text, state_network_dsl = self._materialized_mechanism_editor_texts_for_effective_slider_values(
             values
@@ -7748,7 +7748,7 @@ class MainWindow(
         effective_values = self._preview_session.effective_slider_values(set_id=focused_set_id)
         self._finalize_authoritative_slider_materialization(
             effective_values,
-            description="Commit slider overrides",
+            description="Apply slider overrides",
             apply_species_overlays=True,
         )
 

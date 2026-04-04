@@ -159,7 +159,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.addWidget(self._fine_btn)
 
         # Override mode controls (Commit/Reset)
-        self._commit_slider_overrides_btn = QtWidgets.QPushButton("Commit")
+        self._commit_slider_overrides_btn = QtWidgets.QPushButton("Apply")
         self._commit_slider_overrides_btn.setObjectName("commitSliderOverridesButton")
         self._commit_slider_overrides_btn.setToolTip("Apply current slider values to the canonical mechanism")
         slider_actions_layout.addWidget(self._commit_slider_overrides_btn)
