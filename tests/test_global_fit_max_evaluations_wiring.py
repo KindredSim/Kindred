@@ -42,20 +42,23 @@ def test_configure_fitting_persists_default_max_nfev_1000(qt_app, monkeypatch):
     from PySide6 import QtWidgets
 
     from kindred.gui.mixins.fitting_mixin import FittingMixin
-    from kindred.gui.project_schema import FITTING_DEFAULTS_KEYS, PROJECT_DEFAULTS
+    from kindred.gui.project_schema import PROJECT_DEFAULTS
 
     class _MockConfigController:
+        def __init__(self):
+            self._persisted = {}
+
         def get_user_preference(self, key):
-            return PROJECT_DEFAULTS.get(key)
+            return self._persisted.get(key, PROJECT_DEFAULTS.get(key))
 
         def update_user_preference(self, key, value):
-            pass
+            self._persisted[key] = value
 
     class _Host(QtWidgets.QWidget, FittingMixin):
         def __init__(self):
             super().__init__()
             self.config_controller = _MockConfigController()
-            self._fitting_defaults = {k: PROJECT_DEFAULTS[k] for k in FITTING_DEFAULTS_KEYS}
+            self._fitting_defaults = {}
             self._status_label = QtWidgets.QLabel("")
 
     monkeypatch.setattr(QtWidgets.QDialog, "exec", lambda _self: QtWidgets.QDialog.DialogCode.Accepted)
@@ -63,7 +66,7 @@ def test_configure_fitting_persists_default_max_nfev_1000(qt_app, monkeypatch):
     host = _Host()
     try:
         host._configure_fitting()
-        assert host._fitting_defaults["fitting_max_nfev"] == 1000
+        assert host.config_controller.get_user_preference("fitting_max_nfev") == 1000
     finally:
         host.close()
 

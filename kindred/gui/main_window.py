@@ -3405,8 +3405,8 @@ class MainWindow(
             'simulation_time': str(self._sim_time_spinbox.text()).strip(),
             'num_points': int(self._num_points_spinbox.value()),
             'batch_initial_conditions': self._batch_store.as_serializable(),
-            **{key: self._fitting_defaults.get(key, PROJECT_DEFAULTS.get(key))
-               for key in FITTING_DEFAULTS_KEYS},
+            **{key: self._fitting_defaults[key] for key in self._fitting_defaults
+               if key in FITTING_DEFAULTS_KEYS},
         }
 
     def serialize_project_state(self) -> Dict[str, Any]:
@@ -3584,9 +3584,11 @@ class MainWindow(
             atol=atol_value,
         )
 
+        # Document-override-only dict -- non-overridden keys read live from tier 2
         self._fitting_defaults = {
-            key: data.get(key, _pref(key))
+            key: data[key]
             for key in FITTING_DEFAULTS_KEYS
+            if key in data and data[key] is not None
         }
 
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:

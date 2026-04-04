@@ -26,7 +26,6 @@ from kindred.core.simulator.dsl_text_update import (
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
 from kindred.gui.mixins.ports import FittingMixinPorts
-from kindred.gui.project_schema import FITTING_DEFAULTS_KEYS
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 
 logger = logging.getLogger(__name__)
@@ -467,11 +466,8 @@ class FittingMixin:
         )
 
     def _init_fitting_defaults(self) -> None:
-        """Populate live fitting defaults from user preferences (three-tier)."""
-        _pref = self.config_controller.get_user_preference
-        self._fitting_defaults: Dict[str, object] = {
-            key: _pref(key) for key in FITTING_DEFAULTS_KEYS
-        }
+        """Initialize document-override fitting defaults as empty (no document loaded yet)."""
+        self._fitting_defaults: Dict[str, object] = {}
 
     def _load_fitting_defaults(self) -> Dict[str, object]:
         """Return user-level fitting defaults (short keys) for the Fitting Defaults dialog.
@@ -488,11 +484,15 @@ class FittingMixin:
     def _get_fitting_session_defaults(self) -> Dict[str, object]:
         """Return project-effective fitting defaults (short keys) for the fitting window.
 
-        Reads from self._fitting_defaults (tier 3 — document overrides merged
-        with user-pref fallback), not from config_controller directly.
+        Document overrides (tier 3) take precedence.  Non-overridden keys
+        read live from the user preference (tier 2), which itself falls
+        back to factory defaults.
         """
+        _pref = self.config_controller.get_user_preference
         return {
-            short: self._fitting_defaults.get(full)
+            short: (self._fitting_defaults[full]
+                    if full in self._fitting_defaults
+                    else _pref(full))
             for full, short in _FITTING_KEY_TO_SHORT.items()
         }
 

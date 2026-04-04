@@ -159,7 +159,7 @@ def test_fitting_defaults_dialog_updates_all_keys(qt_app, monkeypatch):
         def __init__(self):
             super().__init__()
             self.config_controller = _MockConfigController()
-            self._fitting_defaults = {k: PROJECT_DEFAULTS[k] for k in FITTING_DEFAULTS_KEYS}
+            self._fitting_defaults = {}
             self._status_label = QtWidgets.QLabel("")
 
     monkeypatch.setattr(
@@ -174,9 +174,8 @@ def test_fitting_defaults_dialog_updates_all_keys(qt_app, monkeypatch):
         assert expected_keys <= set(persisted.keys()), (
             f"Missing persisted keys: {expected_keys - set(persisted.keys())}"
         )
-        # _fitting_defaults must NOT be updated by dialog — it is tier-3 project state
-        for key in FITTING_DEFAULTS_KEYS:
-            assert host._fitting_defaults[key] == PROJECT_DEFAULTS[key]
+        # Dialog must not write to document-level _fitting_defaults
+        assert host._fitting_defaults == {}
     finally:
         host.close()
 
@@ -211,7 +210,7 @@ def test_fitting_key_to_short_matches_fitting_defaults_keys():
 
 
 def test_session_defaults_reads_fitting_defaults_not_user_prefs(main_window):
-    """_get_fitting_session_defaults returns tier-3 project state, not tier-2 user prefs."""
+    """_get_fitting_session_defaults returns document overrides merged with live user prefs."""
     payload = main_window._serialize_project_state()
     payload["fitting_solver"] = "Radau"
     payload["fitting_rtol"] = 1e-4
@@ -273,3 +272,102 @@ def test_active_integration_defaults_none_check_not_falsy_or(qt_app):
         assert atol == 1e-11
     finally:
         window.close()
+
+
+def test_fitting_defaults_empty_at_startup(main_window):
+    """No document loaded at startup means no document overrides."""
+    assert main_window._fitting_defaults == {}, (
+        f"Expected empty dict at startup, got {main_window._fitting_defaults}"
+    )
+
+
+def test_dialog_change_takes_effect_on_session_defaults(main_window):
+    """Changing a fitting preference via config_controller must be reflected
+    in _get_fitting_session_defaults() without reload."""
+    session_before = main_window._get_fitting_session_defaults()
+    assert session_before["max_nfev"] == 1000
+
+    main_window.config_controller.update_user_preference("fitting_max_nfev", 5000)
+
+    session_after = main_window._get_fitting_session_defaults()
+    assert session_after["max_nfev"] == 5000, (
+        f"Expected 5000 after dialog change, got {session_after['max_nfev']}"
+    )
+
+
+def test_document_override_preserved_after_dialog_change(main_window):
+    """A document override must take precedence even after the user changes
+    the same key via the Fitting Defaults dialog."""
+    payload = main_window._serialize_project_state()
+    payload["fitting_max_nfev"] = 500
+    main_window._apply_project_payload(payload, record_undo=False)
+
+    session = main_window._get_fitting_session_defaults()
+    assert session["max_nfev"] == 500
+
+    main_window.config_controller.update_user_preference("fitting_max_nfev", 9999)
+
+    session_after = main_window._get_fitting_session_defaults()
+    assert session_after["max_nfev"] == 500, (
+        f"Document override should win, got {session_after['max_nfev']}"
+    )
+
+
+def test_partial_document_load_stores_only_present_keys(main_window):
+    """Loading a document with only some fitting keys must store only those
+    keys, while _get_fitting_session_defaults still returns all 10 short keys."""
+    # Build a payload that has only 3 of the 10 fitting keys
+    payload = main_window._serialize_project_state()
+    payload["fitting_method"] = "dogbox"
+    payload["fitting_max_nfev"] = 500
+    payload["fitting_solver"] = "Radau"
+    # Ensure the other 7 are absent
+    for key in ("fitting_ftol", "fitting_xtol", "fitting_use_parallel",
+                "fitting_use_seed", "fitting_seed", "fitting_rtol", "fitting_atol"):
+        payload.pop(key, None)
+
+    main_window._apply_project_payload(payload, record_undo=False)
+
+    assert "fitting_method" in main_window._fitting_defaults
+    assert "fitting_max_nfev" in main_window._fitting_defaults
+    assert "fitting_solver" in main_window._fitting_defaults
+    assert "fitting_ftol" not in main_window._fitting_defaults
+    assert "fitting_use_parallel" not in main_window._fitting_defaults
+
+    session = main_window._get_fitting_session_defaults()
+    from kindred.gui.mixins.fitting_mixin import _FITTING_KEY_TO_SHORT
+    assert set(session.keys()) == set(_FITTING_KEY_TO_SHORT.values())
+    assert session["ftol"] == PROJECT_DEFAULTS["fitting_ftol"]
+
+
+def test_save_load_round_trip_preserves_sparsity(main_window):
+    """Saving a project with 3 document overrides and reloading must not
+    inflate _fitting_defaults to all 10 keys."""
+    main_window._fitting_defaults = {
+        "fitting_method": "dogbox",
+        "fitting_solver": "Radau",
+        "fitting_seed": 99,
+    }
+
+    payload = main_window._serialize_project_state()
+
+    # Only the 3 override keys should appear in the payload
+    assert payload.get("fitting_method") == "dogbox"
+    assert payload.get("fitting_solver") == "Radau"
+    assert payload.get("fitting_seed") == 99
+    assert "fitting_ftol" not in payload
+    assert "fitting_max_nfev" not in payload
+
+    # Round-trip: reload and verify sparsity is preserved
+    main_window._apply_project_payload(payload, record_undo=False)
+    assert set(main_window._fitting_defaults.keys()) == {
+        "fitting_method", "fitting_solver", "fitting_seed",
+    }
+
+    # Session defaults must still return all 10 short keys
+    session = main_window._get_fitting_session_defaults()
+    assert session["method"] == "dogbox"
+    assert session["solver"] == "Radau"
+    assert session["seed"] == 99
+    # Non-overridden keys come from tier 2
+    assert session["max_nfev"] == PROJECT_DEFAULTS["fitting_max_nfev"]
