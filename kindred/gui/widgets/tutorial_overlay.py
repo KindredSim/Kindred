@@ -67,6 +67,9 @@ class TutorialOverlay(QtWidgets.QWidget):
     - Automatically positions instruction box away from highlighted area
     """
 
+    _SPOTLIGHT_PADDING = 8
+    _HIGHLIGHT_BORDER_WIDTH = 3
+
     # Signals
     tutorialCompleted = QtCore.Signal()
     tutorialSkipped = QtCore.Signal()
@@ -175,8 +178,9 @@ class TutorialOverlay(QtWidgets.QWidget):
         else:
             self._next_btn.setText("Next →")
 
-        # Position instruction box
+        # Position instruction box and update input mask
         self._position_instruction_box()
+        self._update_mask()
 
         # Trigger repaint
         self.update()
@@ -250,47 +254,114 @@ class TutorialOverlay(QtWidgets.QWidget):
                     local_pos = self.mapFromGlobal(global_pos)
                     return QtCore.QRect(local_pos, target.size())
                 elif isinstance(target, QtGui.QAction):
-                    # For QAction, try to find associated widget
-                    for widget in target.associatedWidgets():
-                        if isinstance(widget, QtWidgets.QToolButton) or isinstance(widget, QtWidgets.QPushButton):
+                    # Try to find an associated toolbar widget (PyQt5 compat;
+                    # PySide6 does not expose associatedWidgets on QAction).
+                    for widget in getattr(target, "associatedWidgets", list)():
+                        if isinstance(widget, (QtWidgets.QToolButton, QtWidgets.QPushButton)):
                             global_pos = widget.mapToGlobal(QtCore.QPoint(0, 0))
                             local_pos = self.mapFromGlobal(global_pos)
                             return QtCore.QRect(local_pos, widget.size())
 
+                    # Fallback: highlight the parent menu in the menu bar
+                    rect = self._get_menu_bar_rect_for_action(target)
+                    if rect is not None:
+                        return rect
+
+        return None
+
+    def _get_menu_bar_rect_for_action(
+        self, action: QtGui.QAction
+    ) -> Optional[QtCore.QRect]:
+        """Return the menu-bar geometry for the top-level menu that contains *action*.
+
+        Walks the QMenuBar's top-level menus (one level only — no submenu
+        recursion) and returns the menu-bar item rectangle mapped into
+        overlay coordinates.  Returns ``None`` if the action is not found
+        or the resulting rectangle is empty.
+        """
+        parent = self.parent()
+        menu_bar = getattr(parent, "menuBar", None)
+        if menu_bar is None:
+            return None
+        menu_bar = menu_bar()
+        if not isinstance(menu_bar, QtWidgets.QMenuBar):
+            return None
+
+        for top_action in menu_bar.actions():
+            menu = top_action.menu()
+            if menu is None:
+                continue
+            if action in menu.actions():
+                geom = menu_bar.actionGeometry(top_action)
+                if geom.isEmpty():
+                    return None
+                global_pos = menu_bar.mapToGlobal(geom.topLeft())
+                local_pos = self.mapFromGlobal(global_pos)
+                return QtCore.QRect(local_pos, geom.size())
+
         return None
 
     def paintEvent(self, event: QtGui.QPaintEvent):
-        """Paint semi-transparent overlay with spotlight."""
+        """Paint semi-transparent overlay with spotlight cutout."""
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
-        # Draw dark overlay
-        overlay_color = QtGui.QColor(0, 0, 0, 180)  # Semi-transparent black
-        painter.fillRect(self.rect(), overlay_color)
+        overlay_color = QtGui.QColor(0, 0, 0, 180)
 
-        # Cut out spotlight area
         highlight_rect = self._get_highlight_rect()
         if highlight_rect:
-            # Expand highlight rect for padding
-            padding = 8
-            spotlight_rect = highlight_rect.adjusted(-padding, -padding, padding, padding)
+            pad = self._SPOTLIGHT_PADDING
+            spotlight_rect = highlight_rect.adjusted(-pad, -pad, pad, pad)
 
-            # Draw rounded spotlight
-            painter.setCompositionMode(QtGui.QPainter.CompositionMode_Clear)
-            painter.setBrush(Qt.transparent)
+            # Use a path with the spotlight subtracted so the cutout is
+            # truly transparent instead of black (CompositionMode_Clear
+            # requires a translucent backing store which is not guaranteed).
+            overlay_path = QtGui.QPainterPath()
+            overlay_path.addRect(QtCore.QRectF(self.rect()))
+            cutout = QtGui.QPainterPath()
+            cutout.addRoundedRect(QtCore.QRectF(spotlight_rect), 8, 8)
+            overlay_path -= cutout
+
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(spotlight_rect, 8, 8)
+            painter.setBrush(overlay_color)
+            painter.drawPath(overlay_path)
 
-            # Draw highlight border
-            painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
-            painter.setPen(QtGui.QPen(QtGui.QColor("#4A90E2"), 3))
+            # Highlight border around the spotlight
+            painter.setPen(QtGui.QPen(QtGui.QColor("#4A90E2"), self._HIGHLIGHT_BORDER_WIDTH))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(spotlight_rect, 8, 8)
+        else:
+            painter.fillRect(self.rect(), overlay_color)
+
+    def _update_mask(self) -> None:
+        """Exclude spotlight area from input region so clicks reach the target widget.
+
+        The exclusion is inset by the highlight border width so the painted border
+        remains fully visible.  The instruction box region is always re-added so
+        child widgets (title, buttons, progress) stay visible and clickable even
+        when the box overlaps the spotlight cutout.
+        """
+        highlight_rect = self._get_highlight_rect()
+        if highlight_rect:
+            pad = self._SPOTLIGHT_PADDING
+            bw = self._HIGHLIGHT_BORDER_WIDTH
+            spotlight_rect = highlight_rect.adjusted(-pad, -pad, pad, pad)
+            # Inset the exclusion so the border ring stays within the painted mask
+            exclusion_rect = spotlight_rect.adjusted(bw, bw, -bw, -bw)
+            full_region = QtGui.QRegion(self.rect())
+            mask = full_region - QtGui.QRegion(exclusion_rect)
+            # Re-add instruction box area so child widgets remain visible and clickable
+            mask |= QtGui.QRegion(self._instruction_box.geometry())
+            self.setMask(mask)
+        else:
+            # Clear mask for informational steps with no target
+            self.clearMask()
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
         """Handle parent resize."""
         super().resizeEvent(event)
         self._position_instruction_box()
+        self._update_mask()
 
     def _on_next(self):
         """Handle Next button click."""

@@ -57,20 +57,6 @@ def test_run_simulation_uses_worker_stub(main_window: MainWindow, monkeypatch):
     assert "Simulation complete" in main_window._status_label.text()
 
 
-def test_debug_slider_logging_menu_toggle(main_window: MainWindow):
-    sliders = main_window._mechanism_editor._variable_sliders
-    assert hasattr(sliders, "debug_slider_updates_enabled")
-
-    action = getattr(main_window, "_debug_sliders_action", None)
-    assert action is not None
-
-    action.setChecked(True)
-    assert sliders.debug_slider_updates_enabled() is True
-
-    action.setChecked(False)
-    assert sliders.debug_slider_updates_enabled() is False
-
-
 def test_handle_export_config_writes_csv(main_window: MainWindow, tmp_path: Path):
     """Export handler should write CSV rows for the current simulation."""
     class _Plot:
@@ -116,6 +102,18 @@ def test_open_docs_falls_back_without_url(main_window: MainWindow, monkeypatch):
     infos = _capture_messagebox(monkeypatch, "information")
     main_window._open_docs()
     assert infos and "online documentation" in infos[0].lower()
+    assert "tutorial" not in infos[0].lower()
+
+
+def test_open_docs_browser_failure_does_not_mention_tutorials(main_window: MainWindow, monkeypatch):
+    """When the browser fails to open, the fallback message must not reference hidden Tutorials."""
+    monkeypatch.setattr("kindred.gui.main_window.DOCUMENTATION_URL", "https://example.com")
+    monkeypatch.setattr("webbrowser.open", lambda url: (_ for _ in ()).throw(OSError("simulated")))
+    infos = _capture_messagebox(monkeypatch, "information")
+    main_window._open_docs()
+    assert infos
+    assert "could not be opened" in infos[0].lower()
+    assert "tutorial" not in infos[0].lower()
 
 
 @pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")

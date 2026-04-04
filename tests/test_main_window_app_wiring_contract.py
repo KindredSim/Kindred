@@ -313,6 +313,7 @@ def test_shell_contract_exposes_all_five_docks_and_detached_slider_surface(main_
     ]
 
 
+@pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_minimal_view_ribbon_host_sits_beneath_menu_bar_and_reuses_shared_view_actions(main_window, qt_app) -> None:
     main_window.show()
     qt_app.processEvents()
@@ -351,6 +352,7 @@ def test_minimal_view_ribbon_host_sits_beneath_menu_bar_and_reuses_shared_view_a
     assert "Load Data..." not in action_texts
 
 
+@pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_view_ribbon_exposes_first_class_page_group_contract(main_window, qt_app) -> None:
     main_window.show()
     qt_app.processEvents()
@@ -403,6 +405,7 @@ def test_view_ribbon_exposes_first_class_page_group_contract(main_window, qt_app
     }
 
 
+@pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_ribbon_host_collapses_and_expands_without_changing_central_workspace_owner(main_window, qt_app) -> None:
     main_window.show()
     qt_app.processEvents()
@@ -433,6 +436,7 @@ def test_ribbon_host_collapses_and_expands_without_changing_central_workspace_ow
     assert body.isVisible() is True
 
 
+@pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_ribbon_expand_preserves_maximized_main_window_when_expand_drops_it(main_window, qt_app, monkeypatch) -> None:
     main_window.show()
     main_window.showMaximized()

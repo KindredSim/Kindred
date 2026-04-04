@@ -31,6 +31,7 @@ from kindred.core.simulator.dsl_text_update import (
 )
 from kindred.core.validation import try_parse_finite_float
 from kindred.gui.controllers.cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
+from kindred.gui.project_schema import PROJECT_DEFAULTS, PROJECT_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from kindred.core.mechanism import Mechanism
@@ -70,7 +71,6 @@ __all__ = ["MainWindow"]
 
 # Online documentation is not yet published.
 DOCUMENTATION_URL: Optional[str] = None
-PROJECT_SCHEMA_VERSION = 3
 _SOLVER_STATE_UNSET = object()
 _STARTUP_WIDTH_RATIO = 0.86
 _STARTUP_HEIGHT_RATIO = 0.88
@@ -193,6 +193,7 @@ class MainWindow(
         # Mechanism + simulation state.
         self._use_sparse_jacobian = False
         self._wegscheider_cyclicity_enabled = False
+        self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
 
@@ -225,7 +226,6 @@ class MainWindow(
 
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
-        self._debug_sliders_action = None
         self._mechanism_edit_locked = True
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
@@ -765,14 +765,27 @@ class MainWindow(
     def _finish_window_composition(self) -> None:
         """Complete window composition before any persisted/bootstrap state is applied."""
         self._create_menus()
-        self._init_ribbon_host()
+        # ──────────────────────────────────────────────────────────────
+        # HIDDEN FEATURE: Ribbon
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: kindred/gui/widgets/ribbon.py, _init_ribbon_host() in this file
+        # Unhide: Uncomment the line below after the feature passes a
+        #         dedicated integration audit and is approved for user access.
+        # Tracked: chore/post-merge-audit-cleanup branch
+        # ──────────────────────────────────────────────────────────────
+        # self._init_ribbon_host()
         self._init_mixin_ports()
         self._connect_signals()
 
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
-        self._apply_initial_profile_from_cli()
-        self._load_settings()
+        self._apply_initial_profile()
+        self._suppress_preference_updates = True
+        try:
+            self._load_settings()
+        finally:
+            self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
 
     def _init_mixin_ports(self) -> None:
@@ -787,7 +800,7 @@ class MainWindow(
         )
         self._profile_ports = ProfileMixinPorts(
             profile_manager=self._profile_manager,
-            profiles_menu_getter=lambda: self._profiles_menu,
+            profiles_menu_getter=lambda: None,  # Hidden: Profiles menu removed from menu bar
             profile_indicator_setter=lambda text: self._profile_indicator.setText(str(text)),
             status_setter=lambda text: self._status_label.setText(str(text)),
             settings_set_value=self.settings_set_value,
@@ -798,7 +811,7 @@ class MainWindow(
             update_solver_summary_label=self._update_solver_summary_label,
         )
 
-    def _apply_initial_profile_from_cli(self) -> None:
+    def _apply_initial_profile(self) -> None:
         if not self._initial_profile:
             return
         if self._profile_manager.get_profile(self._initial_profile):
@@ -961,78 +974,6 @@ class MainWindow(
     def purge_simulation_all_caches(self) -> None:
         self._sim_controller.purge_simulation_all_caches()
 
-    def _set_slider_debug_logging(self, enabled: bool, *, persist: bool = True, announce: bool = True) -> None:
-        """
-        Toggle verbose logging for programmatic slider updates.
-
-        When enabled, logs are written to a deterministic, user-writable file location and
-        the path is surfaced in the UI (so this works in compiled desktop distributions
-        without a terminal/console).
-        """
-        sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-        log_path: Optional[str] = None
-        if bool(enabled):
-            override = os.environ.get("KINDRED_SLIDER_DEBUG_LOG")
-            if override:
-                log_path = str(override)
-            else:
-                base_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
-                if not base_dir:
-                    base_dir = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.TempLocation)
-                if base_dir:
-                    try:
-                        os.makedirs(base_dir, exist_ok=True)
-                        log_path = os.path.join(base_dir, "kindred-slider-updates.log")
-                    except OSError as exc:
-                        logger.debug("Failed to create slider debug log dir %s: %s", base_dir, exc, exc_info=True)
-                        log_path = None
-
-        if sliders is not None and hasattr(sliders, "set_debug_slider_updates"):
-            applied = False
-            try:
-                if hasattr(sliders, "set_debug_slider_log_path"):
-                    sliders.set_debug_slider_log_path(log_path)
-                sliders.set_debug_slider_updates(bool(enabled))
-                applied = True
-            except RuntimeError as exc:
-                logger.debug("Failed to apply slider debug logging: %s", exc, exc_info=True)
-                enabled = False
-            except (AttributeError, TypeError, ValueError) as exc:
-                logger.warning("Slider debug logging failed: %s", exc, exc_info=True)
-                enabled = False
-            if bool(enabled) and not applied:
-                enabled = False
-
-        if persist:
-            try:
-                self.config_controller.persist_slider_debug_updates(bool(enabled))
-            except Exception as exc:
-                logger.warning("Failed to persist slider debug logging setting: %s", exc, exc_info=True)
-                bar = getattr(self, "_status_bar", None)
-                if bar is not None:
-                    try:
-                        bar.showMessage("Failed to persist slider debug logging setting (see logs)", 8000)
-                    except RuntimeError as exc:
-                        logger.debug("Failed to show slider debug persistence error in status bar: %s", exc, exc_info=True)
-                        self._status_bar = None
-
-        if announce:
-            try:
-                if bool(enabled) and log_path:
-                    self._status_bar.showMessage(f"Slider debug logs: {log_path}", 15000)
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "Slider Debug Logging Enabled",
-                        f"Writing slider debug logs to:\n{log_path}",
-                    )
-                elif not bool(enabled):
-                    self._status_bar.showMessage("Slider debug logging disabled", 5000)
-                else:
-                    self._status_bar.showMessage("Unable to enable slider debug logging (see logs)", 8000)
-            except RuntimeError as exc:
-                logger.debug("Failed to announce slider debug logging state: %s", exc, exc_info=True)
-                self._status_bar = None
-
     def _create_menus(self):
         """Create the menu bar and shortcut customization registry."""
         self._shortcut_actions = {}
@@ -1071,8 +1012,10 @@ class MainWindow(
         add_items(
             file_menu,
             [
+                ("New Project", self.project_controller.new_project, QtGui.QKeySequence.New, "newProjectAction", "Start a new empty project"),
                 ("Load Project...", self.project_controller.load_project, QtGui.QKeySequence.Open, "loadProjectAction", "Load a Kindred project file (.kin)"),
-                ("Save Project...", self.project_controller.save_project, QtGui.QKeySequence.Save, "saveProjectAction", "Save current mechanism and settings to a project file"),
+                ("Save Project", self.project_controller.save_project, QtGui.QKeySequence.Save, "saveProjectAction", "Save current project to its file"),
+                ("Save Project As...", self.project_controller.save_project_as, QtGui.QKeySequence.SaveAs, "saveProjectAsAction", "Save current project to a new file"),
                 ("Load Data...", self._load_data_via_action, "Ctrl+Shift+L", "loadDataAction", "Load experimental CSV data (same as the Data panel 'Load' button)"),
                 ("submenu", "Recent Projects", "_recent_menu", self._update_recent_files_menu),
                 None,
@@ -1090,9 +1033,36 @@ class MainWindow(
                 ("&Redo", self._redo, QtGui.QKeySequence.Redo, "redoAction", "Redo previously undone edit"),
                 ("Allow Editing", self._on_mechanism_edit_lock_action_triggered, None, "mechanismEditLockAction", "Temporarily enable deliberate edits in the Reactions editor", {"checkable": True, "checked": False, "store_as": "_mechanism_edit_lock_action"}),
                 None,
-                ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
-                ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
-                ("&Computational Mode...", self._open_computational_mode, None, "computationalModeAction", "Convert absolute computed free energies into energy-mode DSL blocks"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: Species Registry
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: _open_species_registry() and _gather_species_registry_entries() in this file
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("&Species Registry...", self._open_species_registry, None, "speciesRegistryAction", "View and manage species definitions and properties"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: State Network Editor
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: kindred/gui/widgets/state_network_editor.py, _open_state_network() in this file
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("State &Network Editor...", self._open_state_network, None, "stateNetworkAction", "Edit state transition networks for TST calculations"),
+                # ──────────────────────────────────────────────────────────────
+                # HIDDEN FEATURE: Computational Mode
+                # Status: Hidden from users — NOT dead code
+                # Reason: Undertested and not integrated with current workflows
+                # Code: kindred/gui/widgets/computational_mode_dialog.py, _open_computational_mode() in this file
+                # Unhide: Uncomment the line below after the feature passes a
+                #         dedicated integration audit and is approved for user access.
+                # Tracked: chore/post-merge-audit-cleanup branch
+                # ──────────────────────────────────────────────────────────────
+                # ("&Computational Mode...", self._open_computational_mode, None, "computationalModeAction", "Convert absolute computed free energies into energy-mode DSL blocks"),
                 None,
                 ("Preferences...", self._open_preferences, QtGui.QKeySequence.Preferences, "preferencesAction", "Configure application preferences and settings"),
                 ("Customize &Keyboard Shortcuts...", self._open_shortcuts_dialog, "Ctrl+K", "customizeShortcutsAction", "Customize keyboard shortcuts for actions"),
@@ -1149,9 +1119,19 @@ class MainWindow(
             ],
         )
 
-        self._profiles_menu = QtWidgets.QMenu("&Profiles", self)
-        menubar.addMenu(self._profiles_menu)
-        self._update_profiles_menu()
+        # ──────────────────────────────────────────────────────────────
+        # HIDDEN FEATURE: Profiles
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: kindred/config/profiles.py, kindred/gui/mixins/profile_mixin.py
+        # Unhide: Uncomment the lines below after the feature passes a
+        #         dedicated integration audit and is approved for user access.
+        #         Also restore profiles_menu_getter in _init_mixin_ports().
+        # Tracked: chore/post-merge-audit-cleanup branch
+        # ──────────────────────────────────────────────────────────────
+        # self._profiles_menu = QtWidgets.QMenu("&Profiles", self)
+        # menubar.addMenu(self._profiles_menu)
+        # self._update_profiles_menu()
 
         examples_menu = menubar.addMenu("E&xamples")
         presets_submenu = examples_menu.addMenu("Preset Mechanisms")
@@ -1183,21 +1163,15 @@ class MainWindow(
             ],
         )
 
-        tools_menu = menubar.addMenu("&Tools")
-        add_items(
-            tools_menu,
-            [
-                ("&Temperature Schedule...", self._open_temperature_schedule_editor, None, "temperatureScheduleAction", "Create piecewise temperature schedules with visual preview"),
-                None,
-            ],
-        )
-        debug_menu = tools_menu.addMenu("Debug")
-        add_items(
-            debug_menu,
-            [
-                ("Log Slider Updates", self._set_slider_debug_logging, None, "debugSlidersAction", "Log programmatic K-slider updates (for diagnosing slider snapping).", {"checkable": True, "signal": "toggled", "store_as": "_debug_sliders_action"}),
-            ],
-        )
+        # ──────────────────────────────────────────────────────────────
+        # HIDDEN FEATURE: Temperature Schedule
+        # Status: Hidden from users — NOT dead code
+        # Reason: Undertested and not integrated with current workflows
+        # Code: kindred/gui/widgets/temperature_schedule_editor.py, kindred/core/temperature_dsl.py
+        # Note: The Tools menu is hidden entirely because this is its only remaining item.
+        # Unhide: Recreate the Tools menu and uncomment the action below after the
+        #         feature passes a dedicated integration audit and is approved for user access.
+        # ──────────────────────────────────────────────────────────────
 
         help_menu = menubar.addMenu("&Help")
         add_items(
@@ -1346,6 +1320,10 @@ class MainWindow(
 
         # Temperature mode indicator updates
         self._temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
+        # User preference tracking for spinbox-only dual-persisted keys.
+        self._temperature_spinbox.valueChanged.connect(self._on_temperature_user_edit)
+        self._num_points_spinbox.valueChanged.connect(self._on_num_points_user_edit)
+        self._sim_time_spinbox.textChanged.connect(self._on_sim_time_user_edit)
         self._mechanism_editor._reactions_text.textChanged.connect(self._update_temperature_mode_indicator)
         self._mechanism_editor._reactions_text.textChanged.connect(self._on_authoritative_mechanism_input_changed)
         self._mechanism_editor._reactions_text.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
@@ -1524,6 +1502,8 @@ class MainWindow(
 
     def _on_solver_method_changed(self, v: str) -> None:
         self._apply_solver_runtime_state(solver=str(v), sync_combo=False)
+        if not self._suppress_preference_updates:
+            self.config_controller.update_user_preference("solver", self._initial_solver)
 
     def _update_solver_summary_label(self) -> None:
         """Refresh the solver summary label shown in the Solver section."""
@@ -1556,6 +1536,21 @@ class MainWindow(
         if self._use_sparse_jacobian and str(solver_method).upper() in {"RADAU", "BDF"}:
             summary += " • Sparse J"
         self._solver_summary_label.setText(summary)
+
+    def _on_temperature_user_edit(self, value: float) -> None:
+        if not self._suppress_preference_updates:
+            self.config_controller.update_user_preference("temperature_K", value)
+
+    def _on_num_points_user_edit(self, value: int) -> None:
+        if not self._suppress_preference_updates:
+            self.config_controller.update_user_preference("num_points", value)
+
+    def _on_sim_time_user_edit(self, text: str) -> None:
+        if not self._suppress_preference_updates:
+            # QLineEdit can emit empty strings during editing; skip to avoid persisting invalid state.
+            stripped = str(text).strip()
+            if stripped:
+                self.config_controller.update_user_preference("simulation_time", stripped)
 
     def _update_temperature_mode_indicator(self) -> None:
         """
@@ -2071,6 +2066,9 @@ class MainWindow(
                 rtol=rtol_spin.value(),
                 atol=atol_spin.value(),
             )
+            self.config_controller.update_user_preference("solver", self._initial_solver)
+            self.config_controller.update_user_preference("rtol", self._initial_rtol)
+            self.config_controller.update_user_preference("atol", self._initial_atol)
             logger.info(f"Preferences updated: solver={self._initial_solver}, rtol={self._initial_rtol}, atol={self._initial_atol}")
             self._status_label.setText("Preferences updated")
 
@@ -3499,6 +3497,13 @@ class MainWindow(
 
     def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         """Populate the UI from serialized project data."""
+        self._suppress_preference_updates = True
+        try:
+            self._apply_project_payload_inner(data, record_undo=record_undo)
+        finally:
+            self._suppress_preference_updates = False
+
+    def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         from kindred.core.batch_initial_conditions import (
             BatchInitialConditionsStore,
             migrate_reaction_dsl_initial_concentration_sets,
@@ -3588,41 +3593,44 @@ class MainWindow(
             if current_state_network.strip():
                 state_editor.clear()
 
-        solver_contract = load_solver_contract()
-        solver_value = data.get('solver', self._initial_solver or solver_contract.default_solver_name)
-        rtol_value = data.get('rtol', self._initial_rtol or 1e-6)
-        atol_value = data.get('atol', self._initial_atol or 1e-12)
+        # Fall back to user preference when key absent from payload.
+        _pref = self.config_controller.get_user_preference
+        solver_value = data.get('solver', _pref('solver'))
+        rtol_value = data.get('rtol', _pref('rtol'))
+        atol_value = data.get('atol', _pref('atol'))
 
-        # Load solver/settings metadata (with safe defaults for older files)
-        if 'use_sparse_jacobian' in data:
-            self._use_sparse_jacobian = bool(data.get('use_sparse_jacobian'))
-        if 'wegscheider_cyclicity_enabled' in data:
-            self._wegscheider_cyclicity_enabled = bool(data.get('wegscheider_cyclicity_enabled'))
-        if 'max_parallel_batch_workers' in data:
-            try:
-                self._sim_controller.parallel_batch.max_parallel_workers = max(1, int(data.get('max_parallel_batch_workers')))
-            except Exception:
-                self._sim_controller.parallel_batch.max_parallel_workers = 12
-        if 'limit_blas_threads_per_worker' in data:
-            self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
-                data.get('limit_blas_threads_per_worker')
+        self._use_sparse_jacobian = bool(
+            data.get('use_sparse_jacobian', _pref('use_sparse_jacobian'))
+        )
+        self._wegscheider_cyclicity_enabled = bool(
+            data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
+        )
+        try:
+            self._sim_controller.parallel_batch.max_parallel_workers = max(
+                1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))
             )
+        except Exception:
+            self._sim_controller.parallel_batch.max_parallel_workers = int(PROJECT_DEFAULTS['max_parallel_batch_workers'])
+        self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
+            data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
+        )
         if 'use_advanced_dsl' in data:
             logger.info(
                 "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
                 data['use_advanced_dsl'],
             )
-        if 'temperature_K' in data:
-            self._temperature_spinbox.setValue(data['temperature_K'])
-        if 'simulation_time' in data:
-            sim_time = data.get('simulation_time')
-            if isinstance(sim_time, (int, float)):
-                sim_time_text = f"{float(sim_time):g}"
-            else:
-                sim_time_text = str(sim_time)
-            self._sim_time_spinbox.setText(sim_time_text)
-        if 'num_points' in data:
-            self._num_points_spinbox.setValue(int(data['num_points']))
+        self._temperature_spinbox.setValue(
+            data.get('temperature_K', _pref('temperature_K'))
+        )
+        sim_time = data.get('simulation_time', _pref('simulation_time'))
+        if isinstance(sim_time, (int, float)):
+            sim_time_text = f"{float(sim_time):g}"
+        else:
+            sim_time_text = str(sim_time)
+        self._sim_time_spinbox.setText(sim_time_text)
+        self._num_points_spinbox.setValue(
+            int(data.get('num_points', _pref('num_points')))
+        )
 
         self._apply_solver_runtime_state(
             solver=solver_value,
@@ -8444,8 +8452,8 @@ class MainWindow(
                 fallback = (
                     f"Online documentation ({DOCUMENTATION_URL}) could not be opened.\n\n"
                     "Available local resources:\n"
-                    "- Help → Tutorials (guided workflows)\n"
-                    "- README.md (project overview and installation)"
+                    "- README.md (project overview and installation)\n"
+                    "- Check the project repository for documentation"
                 )
                 QtWidgets.QMessageBox.information(self, "Documentation", fallback)
                 self._status_label.setText("Documentation URL unavailable")
@@ -8454,8 +8462,8 @@ class MainWindow(
             message = (
                 f"Online documentation for Kindred v{KINDRED_VERSION} is not yet available.\n\n"
                 "Available local resources:\n"
-                "- Help → Tutorials for built-in walkthroughs\n"
-                "- README.md for project overview and installation"
+                "- README.md for project overview and installation\n"
+                "- Check the project repository for documentation"
             )
             QtWidgets.QMessageBox.information(self, "Documentation", message)
             self._status_label.setText("Online documentation not yet available")
@@ -8626,8 +8634,10 @@ class MainWindow(
 
 <h4>File Operations</h4>
 <table>
+<tr><td><b>Ctrl+N</b></td><td>New Project</td></tr>
 <tr><td><b>Ctrl+O</b></td><td>Load Project</td></tr>
 <tr><td><b>Ctrl+S</b></td><td>Save Project</td></tr>
+<tr><td><b>Ctrl+Shift+S</b></td><td>Save Project As</td></tr>
 <tr><td><b>Ctrl+E</b></td><td>Export CSV Data</td></tr>
 <tr><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
 </table>
@@ -8806,6 +8816,22 @@ class MainWindow(
                 solver=settings.get('solver', self._initial_solver or solver_contract.default_solver_name),
                 rtol=settings.get('rtol', self._initial_rtol or 1e-6),
                 atol=settings.get('atol', self._initial_atol or 1e-12),
+            )
+            # Record dialog changes as user preferences.
+            self.config_controller.update_user_preference("solver", self._initial_solver)
+            self.config_controller.update_user_preference("rtol", self._initial_rtol)
+            self.config_controller.update_user_preference("atol", self._initial_atol)
+            self.config_controller.update_user_preference("use_sparse_jacobian", self._use_sparse_jacobian)
+            self.config_controller.update_user_preference(
+                "wegscheider_cyclicity_enabled", self._wegscheider_cyclicity_enabled,
+            )
+            self.config_controller.update_user_preference(
+                "max_parallel_batch_workers",
+                self._sim_controller.parallel_batch.max_parallel_workers,
+            )
+            self.config_controller.update_user_preference(
+                "limit_blas_threads_per_worker",
+                self._sim_controller.parallel_batch.limit_blas_threads_per_worker,
             )
             slider_schema_refresh_needed = bool(
                 current_runtime_settings["wegscheider_cyclicity_enabled"]

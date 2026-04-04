@@ -112,7 +112,6 @@ def test_config_controller_port_exposes_bounded_surface_without_raw_main_window(
     assert port.parent is main_window
     assert port.settings() is main_window._settings
     assert port.dark_mode_action() is main_window._dark_mode_action
-    assert port.debug_sliders_action() is main_window._debug_sliders_action
 
 
 def test_save_then_load_settings_round_trip(main_window):
@@ -120,6 +119,7 @@ def test_save_then_load_settings_round_trip(main_window):
     settings.clear()
     settings.sync()
 
+    cc = main_window.config_controller
     main_window._temperature_spinbox.setValue(310.0)
     main_window._sim_time_spinbox.setText("12.5")
     main_window._num_points_spinbox.setValue(123)
@@ -129,8 +129,19 @@ def test_save_then_load_settings_round_trip(main_window):
     main_window._wegscheider_cyclicity_enabled = True
     main_window.simulation_controller.parallel_batch.max_parallel_workers = 4
     main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker = False
+    # save_settings writes from _user_preferences, so update them too.
+    cc.update_user_preference("temperature_K", 310.0)
+    cc.update_user_preference("simulation_time", "12.5")
+    cc.update_user_preference("num_points", 123)
+    cc.update_user_preference("solver", main_window._initial_solver)
+    cc.update_user_preference("rtol", main_window._initial_rtol)
+    cc.update_user_preference("atol", main_window._initial_atol)
+    cc.update_user_preference("use_sparse_jacobian", True)
+    cc.update_user_preference("wegscheider_cyclicity_enabled", True)
+    cc.update_user_preference("max_parallel_batch_workers", 4)
+    cc.update_user_preference("limit_blas_threads_per_worker", False)
 
-    main_window.config_controller.save_settings()
+    cc.save_settings()
 
     main_window._temperature_spinbox.setValue(298.15)
     main_window._sim_time_spinbox.setText("1.0")
@@ -142,7 +153,7 @@ def test_save_then_load_settings_round_trip(main_window):
     main_window.simulation_controller.parallel_batch.max_parallel_workers = 1
     main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker = True
 
-    main_window.config_controller.load_settings()
+    cc.load_settings()
 
     assert main_window._temperature_spinbox.value() == pytest.approx(310.0)
     assert main_window._sim_time_spinbox.text().strip() == "12.5"
@@ -182,6 +193,9 @@ def test_solver_settings_persist_across_restart_and_restore_visible_combo(main_w
     main_window._initial_solver = "BDF"
     main_window._initial_rtol = 1e-5
     main_window._initial_atol = 1e-9
+    main_window.config_controller.update_user_preference("solver", "BDF")
+    main_window.config_controller.update_user_preference("rtol", 1e-5)
+    main_window.config_controller.update_user_preference("atol", 1e-9)
 
     main_window.config_controller.save_settings()
     main_window.close()
@@ -219,6 +233,7 @@ def test_slider_preview_preferences_persist_across_restart(main_window, qt_app):
         qt_app.processEvents()
 
 
+@pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_ribbon_collapsed_state_persists_across_restart(main_window, qt_app):
     settings = main_window._settings
     settings.clear()

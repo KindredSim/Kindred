@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.project_schema import get_default_project_payload, QSETTINGS_KEY_MAP
 from kindred.gui.utils import BusyCursor
 from kindred.gui.widgets.export_dialog import ExportDialog
 
@@ -35,6 +36,11 @@ class ProjectController(QtCore.QObject):
         super().__init__(mw)
         self.mw = mw
         self._export_dialog = None
+        self._current_project_path: Optional[str] = None
+
+    @property
+    def current_project_path(self) -> Optional[str]:
+        return self._current_project_path
 
     def _set_status(self, text: str) -> None:
         self.mw.set_status_text(str(text))
@@ -52,6 +58,12 @@ class ProjectController(QtCore.QObject):
         stack = getattr(self.mw, "_undo_stack", None)
         if stack is not None and hasattr(stack, "clear"):
             stack.clear()
+
+    def _update_window_title(self) -> None:
+        if self._current_project_path is not None:
+            self.mw.setWindowTitle(f"Kindred \u2014 {os.path.basename(self._current_project_path)}")
+        else:
+            self.mw.setWindowTitle("Kindred")
 
     # ------------------------------------------------------------------
     # Project load/save
@@ -74,27 +86,31 @@ class ProjectController(QtCore.QObject):
             status_path=filename,
         )
 
-    def save_project(self) -> None:
-        """Save project to JSON file chosen via QFileDialog."""
+    def save_project(self) -> bool:
+        """Overwrite the current file, or prompt if no path is known."""
+        if self._current_project_path is not None:
+            return self._write_project_to_path(self._current_project_path)
+        return self.save_project_as()
+
+    def save_project_as(self) -> bool:
+        """Always prompt for a file path and save."""
         filename, _ = QtWidgets.QFileDialog.getSaveFileName(
             self.mw,
-            "Save Project",
-            "",
+            "Save Project As",
+            self._current_project_path or "",
             "Kindred Project (*.kin);;JSON Files (*.json);;All Files (*)",
         )
         if not filename:
-            return
+            return False
+        return self._write_project_to_path(filename)
 
+    def _write_project_to_path(self, filepath: str) -> bool:
+        """Serialize and write the project to the given file path."""
         try:
             with BusyCursor():
                 data = self._serialize_project_state()
-                with open(filename, "w") as handle:
+                with open(filepath, "w") as handle:
                     json.dump(data, handle, indent=2)
-
-                self._set_status(f"Saved project: {filename}")
-            logger.info("Saved project to %s", filename)
-            self._add_to_recent_files(filename)
-
         except Exception as exc:
             logger.error("Failed to save project: %s", exc, exc_info=True)
             QtWidgets.QMessageBox.critical(
@@ -102,6 +118,56 @@ class ProjectController(QtCore.QObject):
                 "Save Error",
                 f"Failed to save project:\n\n{exc}",
             )
+            return False
+
+        # File write succeeded — title and recent-files are best-effort.
+        self._current_project_path = filepath
+        try:
+            self._update_window_title()
+            self._set_status(f"Saved project: {filepath}")
+            logger.info("Saved project to %s", filepath)
+            self._add_to_recent_files(filepath)
+        except Exception:
+            logger.warning("Post-save bookkeeping failed for %s", filepath, exc_info=True)
+        return True
+
+    def new_project(self) -> None:
+        """Reset the application to an empty project state.
+
+        Prompts the user to save unsaved work before clearing.
+        """
+        # ── Single-document assumption ──────────────────────────────────
+        # Kindred is a single-document application.  This method clears
+        # all project state to start fresh.  If multi-document support is
+        # added, this flow must be scoped per-document instead.
+        # ────────────────────────────────────────────────────────────────
+        reply = QtWidgets.QMessageBox.question(
+            self.mw,
+            "New Project",
+            "Do you want to save the current project before starting a new one?",
+            QtWidgets.QMessageBox.StandardButton.Save
+            | QtWidgets.QMessageBox.StandardButton.Discard
+            | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Save,
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Cancel:
+            return
+        if reply == QtWidgets.QMessageBox.StandardButton.Save:
+            if not self.save_project():
+                return
+
+        empty_payload = get_default_project_payload()
+        # Strip dual-persisted keys so _apply_project_payload falls through
+        # to user preferences for them instead of using factory defaults.
+        for key in QSETTINGS_KEY_MAP:
+            empty_payload.pop(key, None)
+        applied = self._apply_project_payload(empty_payload, record_undo=False)
+        if not applied:
+            return
+        self._clear_app_undo_history()
+        self._current_project_path = None
+        self._update_window_title()
+        self._set_status("New project")
 
     def load_recent_project(self, filepath: str) -> None:
         """Load a project from the Recent Projects menu."""
@@ -143,6 +209,8 @@ class ProjectController(QtCore.QObject):
                     return
                 if not record_undo:
                     self._clear_app_undo_history()
+                self._current_project_path = filepath
+                self._update_window_title()
                 self._set_status(f"Loaded project: {status_path}")
             logger.info("Loaded project from %s", filepath)
 

@@ -44,6 +44,7 @@ class SimulationPanel(QtWidgets.QWidget):
         batch_layout.setSpacing(4)
 
         self.batch_table = BatchInitialConditionsTableView(batch_widget)
+        self.batch_table.setObjectName("batchTable")
         self.batch_table.setModel(batch_model)
         self.batch_table.pasteError.connect(
             lambda msg: QtWidgets.QMessageBox.warning(message_parent, "Paste Error", str(msg))
@@ -82,7 +83,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self.num_points_spinbox.valueChanged.connect(lambda _v: on_solver_summary_refresh())
 
         self.run_btn = QtWidgets.QPushButton("Run Selected")
-        self.run_btn.setObjectName("runSimulationAction")
+        self.run_btn.setObjectName("runSelectedButton")
         self.run_btn.setToolTip("Run kinetic simulation for selected batch sets (Ctrl+R or F5)")
         self.run_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self.run_btn.clicked.connect(on_run_selected)

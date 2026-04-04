@@ -780,7 +780,7 @@ def test_batch_run_controls_are_condensed_and_run_all_removed(main_window):
 
     assert main_window.findChild(QtWidgets.QPushButton, "runAllSimulationsButton") is None
 
-    run_btn = main_window.findChild(QtWidgets.QPushButton, "runSimulationAction")
+    run_btn = main_window.findChild(QtWidgets.QPushButton, "runSelectedButton")
     assert run_btn is not None
 
     controls_row = main_window.findChild(QtWidgets.QWidget, "batchSolverControlsRow")

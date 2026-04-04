@@ -44,11 +44,11 @@ def test_main_window_title_and_menu_entries(main_window):
         "&File",
         "&Edit",
         "&View",
-        "&Profiles",
+        # "&Profiles",  # Hidden: undertested, not exposed to users
         "E&xamples",
         "&Simulation",
         "&Fitting",
-        "&Tools",
+        # "&Tools",  # Hidden: all items removed or hidden
         "&Help",
     }
     assert expected.issubset(set(menu_titles))
