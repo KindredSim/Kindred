@@ -587,6 +587,7 @@ class MainWindow(
         self._stop_btn = sim_panel.stop_btn
         self._sim_progress = sim_panel.sim_progress
         self._temperature_spinbox = sim_panel.temperature_spinbox
+        self._temperature_label = sim_panel.temperature_label
 
         self._rebind_batch_semantics_signal_bindings()
 
@@ -1562,20 +1563,20 @@ class MainWindow(
         Update temperature mode indicator in status bar.
 
         Shows one of:
-        - "Temperature: XXX K (isothermal)" - when no schedule in DSL
+        - "Temperature: XXX K (from DSL)" - when T= directive found in reactions
+        - "Temperature: XXX K (isothermal)" - when no schedule and no T= in DSL
         - "Temperature: Schedule (N intervals)" - when piecewise schedule detected
         - "Temperature: Schedule (constant)" - when temp_const detected
         - "Temperature: Schedule (response, N intervals)" - when temp_response detected
 
         Priority rule:
-        - If temperature schedule is defined in DSL (temp_step, temp_response, or temp_const),
-          it takes precedence during ODE integration.
-        - Otherwise, the temperature spinbox value is used (isothermal).
+        1. T= directive in reactions text (any mode) overrides spinbox.
+        2. Temperature schedule in DSL takes precedence during ODE integration.
+        3. Otherwise, the temperature spinbox value is used (isothermal).
         """
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 
-        # Get current mechanism text
         mechanism_text = self._mechanism_editor._reactions_text.toPlainText()
         state_network_text = ""
         try:
@@ -1583,6 +1584,28 @@ class MainWindow(
         except Exception:
             state_network_text = ""
         energy_mode_active = bool(str(state_network_text or "").strip())
+
+        # Extract T= unconditionally — not gated on state network presence
+        T_override = self._dsl_global_temperature_K(mechanism_text)
+        if T_override is not None:
+            # Sync spinbox to DSL-derived temperature without firing preference persistence
+            self._temperature_spinbox.blockSignals(True)
+            try:
+                self._temperature_spinbox.setValue(T_override)
+            finally:
+                self._temperature_spinbox.blockSignals(False)
+            indicator_text = f"Temperature: {T_override:.2f} K (from DSL)"
+            self._temperature_mode_indicator.setText(indicator_text)
+            self._set_temperature_override_state(
+                enabled=False,
+                tooltip="Overridden by DSL (T=...).",
+            )
+            self._set_temperature_spinbox_visible(True)
+            logger.debug(f"Temperature mode indicator updated: {indicator_text}")
+            return
+
+        # No T= found — hide spinbox and restore editable state
+        self._set_temperature_spinbox_visible(False)
         if energy_mode_active:
             self._set_temperature_override_state(
                 enabled=True,
@@ -1594,18 +1617,6 @@ class MainWindow(
                 tooltip="Temperature for thermodynamic calculations",
             )
 
-        if energy_mode_active:
-            T_override = self._dsl_global_temperature_K(mechanism_text)
-            if T_override is not None:
-                indicator_text = f"Temperature: {T_override:.2f} K (from DSL)"
-                self._temperature_mode_indicator.setText(indicator_text)
-                self._set_temperature_override_state(
-                    enabled=False,
-                    tooltip="Overridden by energy-mode DSL (T=...).",
-                )
-                logger.debug(f"Temperature mode indicator updated: {indicator_text}")
-                return
-
         # Try to detect temperature schedule in DSL
         schedule_defined = False
         try:
@@ -1615,13 +1626,10 @@ class MainWindow(
             schedule_defined = temp_schedule is not None
 
             if temp_schedule is not None:
-                # Temperature schedule detected
                 if temp_schedule.schedule_type == "constant":
-                    # Constant temperature from DSL
                     T = temp_schedule(0.0)
                     indicator_text = f"Temperature: {T:.2f} K (constant from DSL)"
                 elif temp_schedule.schedule_type == "piecewise":
-                    # Piecewise schedule
                     intervals = temp_schedule.get_intervals()
                     n_intervals = len(intervals)
                     indicator_text = f"Temperature: Schedule ({n_intervals} interval{'s' if n_intervals != 1 else ''})"
@@ -1635,7 +1643,6 @@ class MainWindow(
                 else:
                     indicator_text = "Temperature: Schedule (unknown type)"
             else:
-                # No temperature schedule - use spinbox value
                 T = self._temperature_spinbox.value()
                 if energy_mode_active:
                     indicator_text = f"Temperature: {T:.2f} K (energy mode: set T=... in DSL)"
@@ -1643,7 +1650,6 @@ class MainWindow(
                     indicator_text = f"Temperature: {T:.2f} K (isothermal)"
 
         except Exception as e:
-            # Fallback if parsing fails
             logger.debug(f"Temperature schedule parsing failed: {e}")
             T = self._temperature_spinbox.value()
             if energy_mode_active:
@@ -6043,10 +6049,9 @@ class MainWindow(
             last_slider_change_name=str(self._preview_session.last_slider_change_name() or ""),
         )
         temperature_k = float(self.temperature_spinbox_value())
-        if "\n\n# State Network\n" in str(mechanism_text):
-            t_override = self.dsl_global_temperature_K(str(mechanism_text))
-            if t_override is not None:
-                temperature_k = float(t_override)
+        t_override = self.dsl_global_temperature_K(str(mechanism_text))
+        if t_override is not None:
+            temperature_k = float(t_override)
         solver_config = {
             "solver": str(solver_grid_context.get("solver") or ""),
             "solver_label": str(solver_grid_context.get("solver_label") or ""),
@@ -8374,6 +8379,15 @@ class MainWindow(
             except RuntimeError as exc:
                 logger.debug("Failed to set temperature tooltip: %s", exc, exc_info=True)
                 self._temperature_tooltip_failed = True
+
+    def _set_temperature_spinbox_visible(self, visible: bool) -> None:
+        spin = getattr(self, "_temperature_spinbox", None)
+        if spin is None:
+            return
+        spin.setVisible(bool(visible))
+        label = getattr(self, "_temperature_label", None)
+        if label is not None:
+            label.setVisible(bool(visible))
 
     def _sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None:
         return self._variable_runtime.sync_energy_mode_temperature_from_mechanism(mechanism)

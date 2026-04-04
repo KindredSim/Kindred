@@ -2379,10 +2379,9 @@ class SimulationController(QtCore.QObject):
         rtol = self.ui.solver.initial_rtol() or 1e-6
         atol = self.ui.solver.initial_atol() or 1e-12
         temperature_K = float(self.ui.solver.temperature_spinbox_value())
-        if state_network_dsl.strip():
-            T_override = self.ui.solver.dsl_global_temperature_K(full_dsl)
-            if T_override is not None:
-                temperature_K = float(T_override)
+        T_override = self.ui.solver.dsl_global_temperature_K(full_dsl)
+        if T_override is not None:
+            temperature_K = float(T_override)
 
         prepared_payload: Optional[Dict[str, Any]] = None
         prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
@@ -3463,7 +3462,7 @@ class SimulationController(QtCore.QObject):
                     "temperature_K": float(temperature_used),
                     "temperature_source": (
                         "dsl"
-                        if energy_mode and self.ui.solver.dsl_global_temperature_K(mechanism_text) is not None
+                        if self.ui.solver.dsl_global_temperature_K(mechanism_text) is not None
                         else "ui"
                     ),
                     "energy_unit": energy_unit_used,

@@ -97,6 +97,19 @@ class SimulationPanel(QtWidgets.QWidget):
         controls_inputs_row.addSpacing(6)
         controls_inputs_row.addWidget(points_label)
         controls_inputs_row.addWidget(self.num_points_spinbox)
+        controls_inputs_row.addSpacing(6)
+        self.temperature_label = QtWidgets.QLabel("T:", controls_row_widget)
+        self.temperature_label.setVisible(False)
+        self.temperature_spinbox = QtWidgets.QDoubleSpinBox(controls_row_widget)
+        self.temperature_spinbox.setRange(0.1, 10000.0)
+        self.temperature_spinbox.setValue(298.15)
+        self.temperature_spinbox.setDecimals(2)
+        self.temperature_spinbox.setSuffix(" K")
+        self.temperature_spinbox.setMaximumWidth(140)
+        self.temperature_spinbox.setEnabled(False)
+        self.temperature_spinbox.setVisible(False)
+        controls_inputs_row.addWidget(self.temperature_label)
+        controls_inputs_row.addWidget(self.temperature_spinbox)
         controls_inputs_row.addStretch(1)
         controls_row.addLayout(controls_inputs_row)
 
@@ -145,13 +158,5 @@ class SimulationPanel(QtWidgets.QWidget):
 
         self.sim_progress = QtWidgets.QProgressBar(batch_widget)
         batch_layout.addWidget(self.sim_progress)
-
-        self.temperature_spinbox = QtWidgets.QDoubleSpinBox(batch_widget)
-        self.temperature_spinbox.setRange(0.1, 10000.0)
-        self.temperature_spinbox.setValue(298.15)
-        self.temperature_spinbox.setDecimals(2)
-        self.temperature_spinbox.setSuffix(" K")
-        self.temperature_spinbox.setEnabled(False)
-        self.temperature_spinbox.setVisible(False)
 
         layout.addWidget(batch_widget, stretch=1)
