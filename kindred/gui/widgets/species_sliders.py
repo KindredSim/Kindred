@@ -105,7 +105,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             header.setFont(header_font)
             layout.addWidget(header)
 
-            desc = QtWidgets.QLabel("Adjust initial concentrations for the selected batch set")
+            desc = QtWidgets.QLabel("Adjust initial concentrations for the selected set")
             desc.setWordWrap(True)
             desc_font = desc.font()
             desc_font.setPointSize(desc_font.pointSize() - 1)
@@ -123,7 +123,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         else:
             self._scroll.setWidget(self._sliders_widget)
 
-            self._placeholder = make_placeholder_label("Select a batch set row to edit initial concentrations.")
+            self._placeholder = make_placeholder_label("Select a set row to edit initial concentrations.")
             self._sliders_layout.addWidget(self._placeholder)
             self._hidden_placeholder = make_placeholder_label("All concentration sliders hidden by picker.")
             self._hidden_placeholder.hide()

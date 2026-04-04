@@ -84,7 +84,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Set initial concentrations",
                     instruction=(
-                        "The <b>Batch Initial Conditions</b> panel holds starting "
+                        "The <b>Initial Conditions</b> panel holds starting "
                         "concentrations. The default set starts every species at zero. "
                         "Set <b>A</b> to <code>1.0</code> by editing its cell."
                     ),
@@ -207,14 +207,14 @@ class TutorialManager:
             ],
         },
         "batch_initial_conditions": {
-            "title": "Batch Initial Conditions",
-            "description": "Create batch sets and control starting concentrations.",
+            "title": "Initial Conditions",
+            "description": "Create sets and control starting concentrations.",
             "duration": "3 minutes",
             "steps": [
                 TutorialStep(
-                    title="What are batch sets?",
+                    title="What are sets?",
                     instruction=(
-                        "Each <b>batch set</b> is a row of starting concentrations "
+                        "Each <b>set</b> is a row of starting concentrations "
                         "for your species. You can define multiple sets to compare "
                         "different conditions in one run."
                     ),
@@ -222,7 +222,7 @@ class TutorialManager:
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Add a batch set",
+                    title="Add a set",
                     instruction=(
                         "Click <b>Add Set</b> to create a new row. "
                         "Each row starts with all concentrations at zero."
@@ -242,7 +242,7 @@ class TutorialManager:
                 TutorialStep(
                     title="Select sets to run",
                     instruction=(
-                        "Click rows to select which batch sets to simulate. "
+                        "Click rows to select which sets to simulate. "
                         "Hold <b>Ctrl</b> (or <b>Cmd</b>) to select multiple rows."
                     ),
                     target_widget="batchTable",
@@ -252,15 +252,15 @@ class TutorialManager:
                     title="Run selected sets",
                     instruction=(
                         "Click <b>Run Selected</b> to simulate only the selected "
-                        "batch sets. Unselected sets are not affected."
+                        "sets. Unselected sets are not affected."
                     ),
                     target_widget="runSelectedButton",
                     arrow_direction="top",
                 ),
                 TutorialStep(
-                    title="Batch sets summary",
+                    title="Sets summary",
                     instruction=(
-                        "Batch sets let you explore how different starting conditions "
+                        "Sets let you explore how different starting conditions "
                         "affect your kinetics without changing the mechanism itself."
                     ),
                     arrow_direction="none",
@@ -269,7 +269,7 @@ class TutorialManager:
         },
         "interactive_sliders": {
             "title": "Interactive Sliders",
-            "description": "Adjust parameters with live preview and commit changes.",
+            "description": "Adjust parameters with live preview and apply changes.",
             "duration": "4 minutes",
             "steps": [
                 TutorialStep(
@@ -312,19 +312,19 @@ class TutorialManager:
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Preview vs committed state",
+                    title="Preview vs applied state",
                     instruction=(
                         "Slider adjustments are <b>preview only</b>. They do not "
-                        "change the canonical mechanism until you explicitly commit. "
+                        "change the canonical mechanism until you explicitly apply them. "
                         "The preview is shown as an overlay on the plot."
                     ),
                     target_widget="unifiedSliderSurface",
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="Commit slider values",
+                    title="Apply slider values",
                     instruction=(
-                        "After changing a slider value, <b>Commit</b> activates. "
+                        "After changing a slider value, <b>Apply</b> activates. "
                         "Click it to promote the current slider values into the "
                         "canonical mechanism and update the DSL text."
                     ),
@@ -353,7 +353,7 @@ class TutorialManager:
                     title="Sliders summary",
                     instruction=(
                         "Sliders give you instant visual feedback on how parameters "
-                        "affect your kinetics. Commit when you find values you like."
+                        "affect your kinetics. Apply when you find values you like."
                     ),
                     arrow_direction="none",
                 ),
@@ -395,7 +395,7 @@ class TutorialManager:
                     title="View imported data",
                     instruction=(
                         "After import, your datasets appear in the <b>Data</b> panel. "
-                        "Each dataset is mapped to a batch set for simulation."
+                        "Each dataset is mapped to a set for simulation."
                     ),
                     target_widget="dataPanel",
                     arrow_direction="left",
@@ -449,7 +449,7 @@ class TutorialManager:
                     instruction=(
                         "Make sure your experimental data is loaded in the "
                         "<b>Data</b> panel. Each dataset should be mapped to "
-                        "a batch set."
+                        "a set."
                     ),
                     target_widget="dataPanel",
                     arrow_direction="left",

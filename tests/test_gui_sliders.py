@@ -654,6 +654,13 @@ def test_authoritative_mechanism_editor_write_undo_reverts_state_network_only_ch
     assert main_window.mechanism_state_network_dsl_raw() == state_before
 
 
+def test_slider_apply_button_shows_apply_text(main_window):
+    """The slider confirmation button must display 'Apply' (not the former 'Commit')."""
+    btn = main_window.findChild(QtWidgets.QPushButton, "commitSliderOverridesButton")
+    assert btn is not None, "commitSliderOverridesButton not found"
+    assert btn.text() == "Apply"
+
+
 def test_commit_and_reset_buttons_control_dsl_overrides(main_window, qtbot, monkeypatch):
     """
     Override mode UX: sliders change overrides for preview runs; Commit writes to DSL; Reset snaps back.

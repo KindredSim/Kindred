@@ -21,7 +21,7 @@ _RIGHT_STACK_ATTRS = ("_right_dock", "_analysis_dock")
 _EXPECTED_DOCK_METADATA = {
     "_mechanism_dock": ("Mechanism", "mechanismDock"),
     "_sliders_dock": ("Interactive Sliders", "slidersDock"),
-    "_batch_dock": ("Batch Initial Conditions", "batchDock"),
+    "_batch_dock": ("Initial Conditions", "batchDock"),
     "_right_dock": ("Data", "rightDock"),
     "_analysis_dock": ("Analysis", "analysisDock"),
 }
@@ -31,6 +31,12 @@ def _view_menu(main_window) -> QtWidgets.QMenu:
     view_menu = getattr(main_window, "_view_menu", None)
     assert view_menu is not None
     return view_menu
+
+
+def _help_menu(main_window) -> QtWidgets.QMenu:
+    help_menu = getattr(main_window, "_help_menu", None)
+    assert help_menu is not None
+    return help_menu
 
 
 def _analysis_surface_actions(main_window) -> dict[str, QtGui.QAction]:
@@ -288,10 +294,13 @@ def test_shell_contract_exposes_all_five_docks_and_detached_slider_surface(main_
     assert panels_menu is not None
     panel_actions = {action.text() for action in panels_menu.actions()}
     surface_actions = _analysis_surface_actions(main_window)
-    panel_layout_tips_action = _view_action(main_window, "Panel Layout Tips...")
+    help_menu = _help_menu(main_window)
+    panel_layout_tips_action = next(
+        action for action in help_menu.actions() if action.menu() is None and action.text() == "Panel Layout Tips..."
+    )
 
     assert main_window.centralWidget() is main_window._plot_tabs
-    assert panel_actions == {"Mechanism", "Interactive Sliders", "Batch Initial Conditions", "Data", "Analysis"}
+    assert panel_actions == {"Mechanism", "Interactive Sliders", "Initial Conditions", "Data", "Analysis"}
     assert set(surface_actions) == {"Statistics", "Parameters"}
     assert panel_layout_tips_action.objectName() == "panelLayoutTipsAction"
     for dock in _all_shell_docks(main_window):
@@ -339,7 +348,7 @@ def test_minimal_view_ribbon_host_sits_beneath_menu_bar_and_reuses_shared_view_a
     assert action_texts >= {
         "Mechanism",
         "Interactive Sliders",
-        "Batch Initial Conditions",
+        "Initial Conditions",
         "Data",
         "Analysis",
         "Statistics",
@@ -393,7 +402,7 @@ def test_view_ribbon_exposes_first_class_page_group_contract(main_window, qt_app
     assert set(panels_group.compact_action_texts()) == {
         "Mechanism",
         "Interactive Sliders",
-        "Batch Initial Conditions",
+        "Initial Conditions",
         "Data",
         "Analysis",
     }
@@ -477,7 +486,8 @@ def test_panel_layout_tips_action_explains_same_side_docking(main_window, monkey
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "information", _record_information)
 
-    action = _view_action(main_window, "Panel Layout Tips...")
+    help_menu = _help_menu(main_window)
+    action = next(action for action in help_menu.actions() if action.menu() is None and action.text() == "Panel Layout Tips...")
     action.trigger()
 
     assert captured["parent"] is main_window
@@ -645,3 +655,16 @@ def test_restored_floating_dock_safety_uses_dock_minimums_and_screen_intersectio
     assert main_window._is_restored_floating_dock_unsafe(compact_on_screen) is False
     assert main_window._is_restored_floating_dock_unsafe(off_screen) is True
     assert main_window._is_restored_floating_dock_unsafe(too_small) is True
+
+
+def test_batch_dock_title_is_initial_conditions_and_tips_in_help_menu(main_window) -> None:
+    """Dock title must be 'Initial Conditions' and Panel Layout Tips must be in Help menu."""
+    assert main_window._batch_dock.windowTitle() == "Initial Conditions"
+
+    help_menu = _help_menu(main_window)
+    help_action_texts = [a.text() for a in help_menu.actions() if not a.isSeparator()]
+    assert "Panel Layout Tips..." in help_action_texts
+
+    view_menu = _view_menu(main_window)
+    view_action_texts = [a.text() for a in view_menu.actions() if a.menu() is None and not a.isSeparator()]
+    assert "Panel Layout Tips..." not in view_action_texts
