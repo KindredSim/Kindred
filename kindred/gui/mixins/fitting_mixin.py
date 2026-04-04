@@ -30,6 +30,19 @@ from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 
 logger = logging.getLogger(__name__)
 
+_FITTING_KEY_TO_SHORT: dict[str, str] = {
+    "fitting_method": "method",
+    "fitting_max_nfev": "max_nfev",
+    "fitting_ftol": "ftol",
+    "fitting_xtol": "xtol",
+    "fitting_use_parallel": "use_parallel",
+    "fitting_use_seed": "use_seed",
+    "fitting_seed": "seed",
+    "fitting_solver": "solver",
+    "fitting_rtol": "rtol",
+    "fitting_atol": "atol",
+}
+
 _FIT_PARAMETER_APPLY_STATUS_REWRITTEN = "rewritten"
 _FIT_PARAMETER_APPLY_STATUS_ALREADY_CURRENT = "already_current"
 _FIT_PARAMETER_APPLY_STATUS_FAILED = "failed"
@@ -452,82 +465,48 @@ class FittingMixin:
             needs_dsl_rewrite=(updated_text != current_text),
         )
 
-    def _get_fitting_settings(self) -> QtCore.QSettings:
-        settings = getattr(self, "_settings", None)
-        if settings is None:
-            settings = QtCore.QSettings("Kindred", "KindredGUI")
-        return settings
+    def _init_fitting_defaults(self) -> None:
+        """Initialize document-override fitting defaults as empty (no document loaded yet)."""
+        self._fitting_defaults: Dict[str, object] = {}
 
     def _load_fitting_defaults(self) -> Dict[str, object]:
-        settings = self._get_fitting_settings()
-        defaults: Dict[str, object] = {}
+        """Return user-level fitting defaults (short keys) for the Fitting Defaults dialog.
 
-        def _coerce_bool(value: object) -> bool:
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return bool(value)
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-            return False
+        Reads from config_controller (tier 2 — global user preferences), NOT from
+        self._fitting_defaults which may contain document overrides (tier 3).
+        """
+        _pref = self.config_controller.get_user_preference
+        return {
+            short: _pref(full)
+            for full, short in _FITTING_KEY_TO_SHORT.items()
+        }
 
-        if settings.contains("fitting/method"):
-            method = settings.value("fitting/method", type=str)
-            if method:
-                defaults["method"] = str(method).strip().lower()
-        if settings.contains("fitting/max_nfev"):
-            try:
-                defaults["max_nfev"] = int(settings.value("fitting/max_nfev"))
-            except (TypeError, ValueError) as exc:
-                self._record_fitting_best_effort_failure(
-                    "fitting_defaults.max_nfev",
-                    message="Invalid fitting/max_nfev setting; ignoring",
-                    exc=exc,
-                )
-        if settings.contains("fitting/ftol"):
-            try:
-                defaults["ftol"] = float(settings.value("fitting/ftol"))
-            except (TypeError, ValueError) as exc:
-                self._record_fitting_best_effort_failure(
-                    "fitting_defaults.ftol",
-                    message="Invalid fitting/ftol setting; ignoring",
-                    exc=exc,
-                )
-        if settings.contains("fitting/xtol"):
-            try:
-                defaults["xtol"] = float(settings.value("fitting/xtol"))
-            except (TypeError, ValueError) as exc:
-                self._record_fitting_best_effort_failure(
-                    "fitting_defaults.xtol",
-                    message="Invalid fitting/xtol setting; ignoring",
-                    exc=exc,
-                )
-        if settings.contains("fitting/use_parallel"):
-            defaults["use_parallel"] = _coerce_bool(settings.value("fitting/use_parallel"))
-        if settings.contains("fitting/use_seed"):
-            defaults["use_seed"] = _coerce_bool(settings.value("fitting/use_seed"))
-        if settings.contains("fitting/seed"):
-            try:
-                defaults["seed"] = int(settings.value("fitting/seed"))
-            except (TypeError, ValueError) as exc:
-                self._record_fitting_best_effort_failure(
-                    "fitting_defaults.seed",
-                    message="Invalid fitting/seed setting; ignoring",
-                    exc=exc,
-                )
-        return defaults
+    def _get_fitting_session_defaults(self) -> Dict[str, object]:
+        """Return project-effective fitting defaults (short keys) for the fitting window.
+
+        Document overrides (tier 3) take precedence.  Non-overridden keys
+        read live from the user preference (tier 2), which itself falls
+        back to factory defaults.
+        """
+        _pref = self.config_controller.get_user_preference
+        return {
+            short: (self._fitting_defaults[full]
+                    if full in self._fitting_defaults
+                    else _pref(full))
+            for full, short in _FITTING_KEY_TO_SHORT.items()
+        }
 
     def _configure_fitting(self):
         """Configure default fitting settings for new fitting windows."""
         defaults = self._load_fitting_defaults()
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Configure Fitting")
+        dialog.setWindowTitle("Fitting Defaults")
         dialog.setMinimumWidth(420)
 
         layout = QtWidgets.QVBoxLayout(dialog)
 
         info = QtWidgets.QLabel(
-            "Set default algorithm settings for new fitting windows."
+            "Set default settings for new fitting windows."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -537,7 +516,7 @@ class FittingMixin:
 
         method_combo = QtWidgets.QComboBox()
         method_combo.addItems(["lm", "trf", "dogbox", "differential_evolution"])
-        method_default = defaults.get("method", "lm")
+        method_default = defaults.get("method", "trf")
         if method_default in {"lm", "trf", "dogbox", "differential_evolution"}:
             method_combo.setCurrentText(method_default)
         algo_layout.addRow("Method:", method_combo)
@@ -570,6 +549,24 @@ class FittingMixin:
 
         layout.addWidget(algo_group)
 
+        integration_group = QtWidgets.QGroupBox("Integration")
+        integration_layout = QtWidgets.QFormLayout(integration_group)
+
+        solver_combo = QtWidgets.QComboBox()
+        solver_combo.addItems(["LSODA", "Radau", "BDF"])
+        solver_combo.setCurrentText(str(defaults.get("solver", "LSODA")))
+        integration_layout.addRow("Solver:", solver_combo)
+
+        rtol_edit = QtWidgets.QLineEdit(str(defaults.get("rtol", "1e-6")))
+        _rtol_val = setup_scientific_validator(rtol_edit)
+        integration_layout.addRow("rtol:", rtol_edit)
+
+        atol_edit = QtWidgets.QLineEdit(str(defaults.get("atol", "1e-12")))
+        _atol_val = setup_scientific_validator(atol_edit)
+        integration_layout.addRow("atol:", atol_edit)
+
+        layout.addWidget(integration_group)
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
@@ -578,15 +575,20 @@ class FittingMixin:
         layout.addWidget(buttons)
 
         if dialog.exec() == QtWidgets.QDialog.Accepted:
-            settings = self._get_fitting_settings()
-            settings.setValue("fitting/method", method_combo.currentText().strip().lower())
-            settings.setValue("fitting/max_nfev", int(max_nfev_spin.value()))
-            settings.setValue("fitting/ftol", max(safe_float_parse(ftol_edit.text(), 1e-10), 1e-15))
-            settings.setValue("fitting/xtol", max(safe_float_parse(xtol_edit.text(), 1e-10), 1e-15))
-            settings.setValue("fitting/use_parallel", bool(use_parallel_check.isChecked()))
-            settings.setValue("fitting/use_seed", bool(use_seed_check.isChecked()))
-            settings.setValue("fitting/seed", int(seed_spin.value()))
-            settings.sync()
+            updates = {
+                "fitting_method": method_combo.currentText().strip().lower(),
+                "fitting_max_nfev": int(max_nfev_spin.value()),
+                "fitting_ftol": max(safe_float_parse(ftol_edit.text(), 1e-10), 1e-15),
+                "fitting_xtol": max(safe_float_parse(xtol_edit.text(), 1e-10), 1e-15),
+                "fitting_use_parallel": bool(use_parallel_check.isChecked()),
+                "fitting_use_seed": bool(use_seed_check.isChecked()),
+                "fitting_seed": int(seed_spin.value()),
+                "fitting_solver": solver_combo.currentText(),
+                "fitting_rtol": max(safe_float_parse(rtol_edit.text(), 1e-6), 1e-15),
+                "fitting_atol": max(safe_float_parse(atol_edit.text(), 1e-12), 1e-18),
+            }
+            for key, value in updates.items():
+                self.config_controller.update_user_preference(key, value)
             logger.info("Fitting defaults updated")
             self._set_fitting_status("Fitting defaults updated")
 
@@ -708,7 +710,7 @@ class FittingMixin:
             write_fit_results_to_mechanism=self._write_fit_results_to_mechanism,
             apply_fit_results_to_project=self._apply_fit_results_to_project,
             apply_dataset_initial_updates=self._apply_dataset_initial_updates,
-            load_fitting_defaults=self._load_fitting_defaults,
+            load_fitting_defaults=self._get_fitting_session_defaults,
             batch_store=getattr(self, "_batch_store", None),
             batch_model=getattr(self, "_batch_model", None),
             batch_table=getattr(self, "_batch_table", None),

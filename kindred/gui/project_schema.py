@@ -11,6 +11,7 @@ import copy
 from typing import TYPE_CHECKING
 
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
 if TYPE_CHECKING:
     from PySide6.QtCore import QSettings
@@ -19,11 +20,12 @@ __all__ = [
     "PROJECT_SCHEMA_VERSION",
     "PROJECT_DEFAULTS",
     "QSETTINGS_KEY_MAP",
+    "FITTING_DEFAULTS_KEYS",
     "get_default_project_payload",
     "get_user_preference_payload",
 ]
 
-PROJECT_SCHEMA_VERSION: int = 3
+PROJECT_SCHEMA_VERSION: int = 4
 
 PROJECT_DEFAULTS: dict[str, object] = {
     "mechanism": "",
@@ -40,6 +42,16 @@ PROJECT_DEFAULTS: dict[str, object] = {
     "temperature_K": 298.15,
     "simulation_time": "10.0",
     "num_points": 100,
+    "fitting_method": "trf",
+    "fitting_max_nfev": 1000,
+    "fitting_ftol": 1e-10,
+    "fitting_xtol": 1e-10,
+    "fitting_use_parallel": False,
+    "fitting_use_seed": True,
+    "fitting_seed": 42,
+    "fitting_solver": FITTING_DEFAULT_SOLVER,
+    "fitting_rtol": 1e-6,
+    "fitting_atol": 1e-12,
 }
 
 
@@ -54,8 +66,22 @@ QSETTINGS_KEY_MAP: dict[str, str] = {
     "temperature_K": "simulation/temperature",
     "simulation_time": "simulation/time",
     "num_points": "simulation/points",
+    "fitting_method": "fitting/method",
+    "fitting_max_nfev": "fitting/max_nfev",
+    "fitting_ftol": "fitting/ftol",
+    "fitting_xtol": "fitting/xtol",
+    "fitting_use_parallel": "fitting/use_parallel",
+    "fitting_use_seed": "fitting/use_seed",
+    "fitting_seed": "fitting/seed",
+    "fitting_solver": "fitting/solver",
+    "fitting_rtol": "fitting/rtol",
+    "fitting_atol": "fitting/atol",
 }
 """Maps each dual-persisted PROJECT_DEFAULTS key to its QSettings path."""
+
+FITTING_DEFAULTS_KEYS: tuple[str, ...] = tuple(
+    k for k in QSETTINGS_KEY_MAP if k.startswith("fitting_")
+)
 
 
 def get_default_project_payload() -> dict[str, object]:
