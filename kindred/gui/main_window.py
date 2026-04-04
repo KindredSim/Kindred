@@ -1176,16 +1176,7 @@ class MainWindow(
             help_menu,
             [
                 ("&Documentation", self._open_docs, QtGui.QKeySequence.HelpContents, "documentationAction", "Open Kindred documentation (shows offline guidance if online docs are unavailable)"),
-                # ──────────────────────────────────────────────────────────────
-                # HIDDEN FEATURE: Tutorial
-                # Status: Hidden from users — NOT dead code
-                # Reason: Undertested and not integrated with current workflows
-                # Code: kindred/gui/tutorial_manager.py, kindred/gui/widgets/tutorial_overlay.py, kindred/gui/widgets/tutorial_selection_dialog.py
-                # Unhide: Uncomment the line below after the feature passes a
-                #         dedicated integration audit and is approved for user access.
-                # Tracked: chore/post-merge-audit-cleanup branch
-                # ──────────────────────────────────────────────────────────────
-                # ("&Interactive Tutorials...", self._show_tutorials, None, "tutorialsAction", "Launch step-by-step interactive tutorials"),
+                ("&Interactive Tutorials...", self._show_tutorials, None, "tutorialsAction", "Launch step-by-step interactive tutorials"),
                 ("&Keyboard Shortcuts", self._show_keyboard_shortcuts, "Ctrl+?", "keyboardShortcutsAction", "View list of keyboard shortcuts (Ctrl+?)"),
                 None,
                 ("&About", self._show_about, None, "aboutAction", "About Kindred - version and license information"),
