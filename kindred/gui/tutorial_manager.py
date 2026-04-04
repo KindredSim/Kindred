@@ -273,13 +273,34 @@ class TutorialManager:
             "duration": "4 minutes",
             "steps": [
                 TutorialStep(
-                    title="Where sliders appear",
+                    title="Enter a mechanism with rate constants",
                     instruction=(
-                        "When your mechanism has adjustable rate constants, sliders "
-                        "appear in the <b>slider pane</b> below the Reactions editor."
+                        "Sliders need adjustable parameters. Enter a mechanism "
+                        "with rate constants, for example:<br><br>"
+                        "<code>A -&gt; B ; k=1.0</code><br>"
+                        "<code>B -&gt; C ; k=0.5</code>"
+                    ),
+                    target_widget="mechanismEditor",
+                    arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Slider pane appears",
+                    instruction=(
+                        "After entering a valid mechanism with adjustable "
+                        "parameters, the <b>slider pane</b> appears below "
+                        "the Reactions editor."
                     ),
                     target_widget="mechanismSliderPane",
                     arrow_direction="left",
+                ),
+                TutorialStep(
+                    title="Choose visible sliders",
+                    instruction=(
+                        "Sliders start hidden. Click <b>Visible sliders</b> "
+                        "and check the parameters you want to adjust."
+                    ),
+                    target_widget="sliderVisibilityPickerButton",
+                    arrow_direction="top",
                 ),
                 TutorialStep(
                     title="Drag for live preview",
@@ -303,8 +324,9 @@ class TutorialManager:
                 TutorialStep(
                     title="Commit slider values",
                     instruction=(
-                        "Click <b>Commit</b> to promote the current slider values "
-                        "into the canonical mechanism. This updates the DSL text."
+                        "After changing a slider value, <b>Commit</b> activates. "
+                        "Click it to promote the current slider values into the "
+                        "canonical mechanism and update the DSL text."
                     ),
                     target_widget="commitSliderOverridesButton",
                     arrow_direction="top",
@@ -505,10 +527,10 @@ class TutorialManager:
                 TutorialStep(
                     title="Right-click the plot",
                     instruction=(
-                        "Right-click anywhere on the <b>plot surface</b> to open "
+                        "Right-click anywhere on the <b>plot area</b> to open "
                         "the context menu with copy options."
                     ),
-                    target_widget="mainPlotSurface",
+                    target_widget="plotViewport",
                     arrow_direction="right",
                 ),
                 TutorialStep(

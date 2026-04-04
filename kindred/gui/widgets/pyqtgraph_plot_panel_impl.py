@@ -258,6 +258,7 @@ if PYQTGRAPH_AVAILABLE:
 
             # Create PyQtGraph PlotWidget
             self._plot_widget = pg.PlotWidget()
+            self._plot_widget.setObjectName("plotViewport")
             self._plot_item = self._plot_widget.getPlotItem()
             self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
 
