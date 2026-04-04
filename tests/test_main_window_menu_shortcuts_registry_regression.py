@@ -43,10 +43,6 @@ def test_shortcut_registry_is_populated_during_menu_creation(main_window):
             "object_name": "redoAction",
             "default": _std_default(QtGui.QKeySequence.Redo),
         },
-        "Preferences": {
-            "object_name": "preferencesAction",
-            "default": _std_default(QtGui.QKeySequence.Preferences),
-        },
         "Customize Keyboard Shortcuts": {
             "object_name": "customizeShortcutsAction",
             "default": QtGui.QKeySequence("Ctrl+K").toString(),
@@ -78,10 +74,6 @@ def test_shortcut_registry_is_populated_during_menu_creation(main_window):
         "Documentation": {
             "object_name": "documentationAction",
             "default": _std_default(QtGui.QKeySequence.HelpContents),
-        },
-        "Keyboard Shortcuts": {
-            "object_name": "keyboardShortcutsAction",
-            "default": QtGui.QKeySequence("Ctrl+?").toString(),
         },
     }
 

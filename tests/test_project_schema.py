@@ -17,6 +17,16 @@ EXPECTED_KEYS = {
     "temperature_K",
     "simulation_time",
     "num_points",
+    "fitting_method",
+    "fitting_max_nfev",
+    "fitting_ftol",
+    "fitting_xtol",
+    "fitting_use_parallel",
+    "fitting_use_seed",
+    "fitting_seed",
+    "fitting_solver",
+    "fitting_rtol",
+    "fitting_atol",
 }
 
 
@@ -61,7 +71,7 @@ class TestProjectDefaults:
     def test_schema_version_matches(self):
         from kindred.gui.project_schema import PROJECT_SCHEMA_VERSION
 
-        assert PROJECT_SCHEMA_VERSION == 3
+        assert PROJECT_SCHEMA_VERSION == 4
 
     def test_solver_default_matches_core(self):
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
@@ -81,6 +91,16 @@ EXPECTED_DUAL_PERSISTED_KEYS = {
     "temperature_K",
     "simulation_time",
     "num_points",
+    "fitting_method",
+    "fitting_max_nfev",
+    "fitting_ftol",
+    "fitting_xtol",
+    "fitting_use_parallel",
+    "fitting_use_seed",
+    "fitting_seed",
+    "fitting_solver",
+    "fitting_rtol",
+    "fitting_atol",
 }
 
 

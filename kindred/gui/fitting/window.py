@@ -448,35 +448,21 @@ class FittingWindow(QtWidgets.QDialog):
             self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
 
     def _active_integration_defaults_for_ui(self) -> Tuple[str, float, float]:
-        """
-        Read the currently active solver profile from the prepared simulation metadata.
-
-        This prevents the Advanced Integration Settings UI from silently overriding the
-        application's active solver settings at window launch.
-        """
+        """Read fitting integration defaults from the persisted fitting preferences."""
         allowed = ("LSODA", "Radau", "BDF")
-        solver_default = FITTING_DEFAULT_SOLVER
-        rtol_default = 1e-6
-        atol_default = 1e-12
 
-        base_simulation = getattr(self, "_simulation_func", None)
-        prepared: Optional[PreparedSimulationMetadata] = None
-        if base_simulation is not None:
-            try:
-                prepared = coerce_prepared_simulation_metadata(
-                    getattr(base_simulation, "_kindred_prepared_simulation_meta", None)
-                )
-            except Exception:
-                prepared = None
-        if prepared is not None:
-            try:
-                rtol_default = float(prepared.rtol)
-            except Exception:
-                rtol_default = 1e-6
-            try:
-                atol_default = float(prepared.atol)
-            except Exception:
-                atol_default = 1e-12
+        _solver_raw = self._config_defaults.get("solver")
+        solver_default = str(_solver_raw) if _solver_raw is not None else FITTING_DEFAULT_SOLVER
+        try:
+            _rtol_raw = self._config_defaults.get("rtol")
+            rtol_default = float(_rtol_raw) if _rtol_raw is not None else 1e-6
+        except (TypeError, ValueError):
+            rtol_default = 1e-6
+        try:
+            _atol_raw = self._config_defaults.get("atol")
+            atol_default = float(_atol_raw) if _atol_raw is not None else 1e-12
+        except (TypeError, ValueError):
+            atol_default = 1e-12
 
         if solver_default not in allowed:
             solver_default = FITTING_DEFAULT_SOLVER
