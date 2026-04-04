@@ -111,7 +111,7 @@ SLIDERS_DOCK_SPEC = DockShellSpec(
 BATCH_DOCK_SPEC = DockShellSpec(
     identity_key="batch_initial_conditions",
     attr_name="_batch_dock",
-    title="Batch Initial Conditions",
+    title="Initial Conditions",
     object_name="batchDock",
     default_area=QtCore.Qt.LeftDockWidgetArea,
 )

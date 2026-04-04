@@ -4537,7 +4537,7 @@ def test_start_next_batch_simulation_invalid_initials_after_pending_init_migrati
 
     controller._start_next_batch_simulation()
 
-    assert warned == [("Invalid Initial Conditions", "Batch set 'set1' has invalid initial conditions:\n\nbad initials")]
+    assert warned == [("Invalid Initial Conditions", "Set 'set1' has invalid initial conditions:\n\nbad initials")]
     mw._batch_model.validate_rows.assert_called_once_with([0])
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     assert controller._batch_run_context["pending_init_applied"] is False
@@ -4586,7 +4586,7 @@ def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_mi
 
     controller._start_parallel_batch_simulations()
 
-    assert warned == [("Invalid Initial Conditions", "Batch set 'set1' has invalid initial conditions:\n\nbad initials")]
+    assert warned == [("Invalid Initial Conditions", "Set 'set1' has invalid initial conditions:\n\nbad initials")]
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
     assert controller._batch_run_context["pending_init_applied"] is False

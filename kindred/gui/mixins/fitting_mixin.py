@@ -761,7 +761,7 @@ class FittingMixin:
 
         batch_store = getattr(self, "_batch_store", None)
         if batch_store is None:
-            raise RuntimeError("Batch initial conditions store is unavailable.")
+            raise RuntimeError("Initial conditions store is unavailable.")
 
         dataset_manager = self._require_fitting_ports().dataset_manager
         if dataset_manager is None:
@@ -781,7 +781,7 @@ class FittingMixin:
                 row = batch_store.row_for_set(mapped_set_name)
             if row is None:
                 raise RuntimeError(
-                    f"Dataset '{dataset_id}' is no longer mapped to a Batch Initial Conditions set."
+                    f"Dataset '{dataset_id}' is no longer mapped to an Initial Conditions set."
                 )
             row_i = int(row)
             resolved_set_id = str(batch_store.set_id_for_row(row_i))
