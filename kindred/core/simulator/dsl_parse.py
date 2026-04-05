@@ -337,10 +337,13 @@ def _float_or_none(s: Optional[str]) -> Optional[float]:
     if s is None:
         return None
     try:
-        return float(s)
+        v = float(s)
     except Exception:
         logger.debug(f"Failed to convert '{s}' to float", exc_info=True)
         raise invalid_number_error(str(s), "value")
+    if not math.isfinite(v):
+        raise invalid_number_error(str(s), "value")
+    return v
 
 
 def _validate_rate_or_K(
@@ -382,7 +385,7 @@ def _derive_equilibrium_rates_with_context(
         from .common import derive_equilibrium_rates
 
         return derive_equilibrium_rates(**kwargs)
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
@@ -842,7 +845,16 @@ def _parse_reaction_like_step(
     model = "Eyring"
     if "A" in params or "Ea" in params:
         model = "Arrhenius"
-    kappa = _float_or_none(params.get("κ")) or kappa_global
+    kappa_raw = _float_or_none(params.get("κ"))
+    if kappa_raw is not None:
+        if kappa_raw <= 0:
+            raise DSLError(
+                f"Per-step kappa must be positive, got {kappa_raw}",
+                line_number=line_number, line_content=line_content,
+            )
+        kappa = kappa_raw
+    else:
+        kappa = kappa_global
     n = molecularity(react)
 
     kf = _float_or_none(params.get("kf") or params.get("k"))
@@ -864,24 +876,46 @@ def _parse_reaction_like_step(
         Ea = params.get("Ea")
         if A is None or Ea is None:
             raise DSLError("Arrhenius requires A and Ea")
+        if A <= 0:
+            raise DSLError(
+                f"Arrhenius pre-exponential factor A must be positive, got {A}",
+                line_number=line_number, line_content=line_content,
+            )
         Ea_val = _float_or_none(Ea)
         if Ea_val is None:
             raise DSLError("Ea must be numeric", line_number=line_number, line_content=line_content)
         EaJ = normalize_energy_to_J_per_mol(Ea_val, energy_unit)
         arrhenius_A = A
         arrhenius_EaJ = EaJ
-        kf = arrhenius_rate(A, EaJ, T)
+        try:
+            kf = arrhenius_rate(A, EaJ, T)
+        except OverflowError as exc:
+            raise DSLError(
+                "Arrhenius rate computation overflowed (A and Ea produce an unrepresentable rate)",
+                line_number=line_number, line_content=line_content,
+            ) from exc
         explicit_rates.append(kf)
         if reversible and kr is None:
             if "K" in params or "dG_eq" in params:
                 K = _float_or_none(params.get("K"))
+                if K is not None and K <= 0:
+                    raise DSLError(
+                        f"K must be positive for reversible reaction, got {K}",
+                        line_number=line_number, line_content=line_content,
+                    )
                 if K is None:
                     dG_eq_val = _float_or_none(params["dG_eq"])
                     if dG_eq_val is None:
                         raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
                     dG = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
                     dG_eqJ_for_step = dG
-                    K = K_from_deltaG_eq(dG, T)
+                    try:
+                        K = K_from_deltaG_eq(dG, T)
+                    except OverflowError as exc:
+                        raise DSLError(
+                            "Equilibrium constant overflow (dG_eq too large for given T)",
+                            line_number=line_number, line_content=line_content,
+                        ) from exc
                 kr = kf / K
                 K_input = K if "K" in params else None
             else:
@@ -896,18 +930,35 @@ def _parse_reaction_like_step(
                 raise DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
             dGJ = normalize_energy_to_J_per_mol(dG_act_val, energy_unit)
             eyring_dGJ = dGJ
-            kf = eyring_rate(dGJ, T, kappa=kappa, molecularity=n, standard_conc_M=C0)
+            try:
+                kf = eyring_rate(dGJ, T, kappa=kappa, molecularity=n, standard_conc_M=C0)
+            except OverflowError as exc:
+                raise DSLError(
+                    "Eyring rate computation overflowed (dG_act too large for given T)",
+                    line_number=line_number, line_content=line_content,
+                ) from exc
             explicit_rates.append(kf)
         if reversible and kr is None:
             if "K" in params or "dG_eq" in params:
                 K = _float_or_none(params.get("K"))
+                if K is not None and K <= 0:
+                    raise DSLError(
+                        f"K must be positive for reversible reaction, got {K}",
+                        line_number=line_number, line_content=line_content,
+                    )
                 if K is None:
                     dG_eq_val = _float_or_none(params["dG_eq"])
                     if dG_eq_val is None:
                         raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
                     dG = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
                     dG_eqJ_for_step = dG
-                    K = K_from_deltaG_eq(dG, T)
+                    try:
+                        K = K_from_deltaG_eq(dG, T)
+                    except OverflowError as exc:
+                        raise DSLError(
+                            "Equilibrium constant overflow (dG_eq too large for given T)",
+                            line_number=line_number, line_content=line_content,
+                        ) from exc
                 kr = kf / K
                 K_input = K if "K" in params else None
             else:
