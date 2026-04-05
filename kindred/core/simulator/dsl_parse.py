@@ -385,7 +385,7 @@ def _derive_equilibrium_rates_with_context(
         from .common import derive_equilibrium_rates
 
         return derive_equilibrium_rates(**kwargs)
-    except (ValueError, OverflowError) as exc:
+    except (ValueError, OverflowError, ZeroDivisionError) as exc:
         raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
@@ -847,11 +847,6 @@ def _parse_reaction_like_step(
         model = "Arrhenius"
     kappa_raw = _float_or_none(params.get("κ"))
     if kappa_raw is not None:
-        if kappa_raw <= 0:
-            raise DSLError(
-                f"Per-step kappa must be positive, got {kappa_raw}",
-                line_number=line_number, line_content=line_content,
-            )
         kappa = kappa_raw
     else:
         kappa = kappa_global
@@ -864,6 +859,13 @@ def _parse_reaction_like_step(
                             line_number=line_number, line_content=line_content)
     if params.get("kr"):
         _validate_rate_or_K(kr, "kr", line_number=line_number, line_content=line_content)
+    if "K" in params:
+        _K_early = _float_or_none(params["K"])
+        if _K_early is not None and _K_early <= 0:
+            raise DSLError(
+                f"K must be positive, got {_K_early}",
+                line_number=line_number, line_content=line_content,
+            )
     arrhenius_A = None
     arrhenius_EaJ = None
     eyring_dGJ = None
@@ -898,11 +900,6 @@ def _parse_reaction_like_step(
         if reversible and kr is None:
             if "K" in params or "dG_eq" in params:
                 K = _float_or_none(params.get("K"))
-                if K is not None and K <= 0:
-                    raise DSLError(
-                        f"K must be positive for reversible reaction, got {K}",
-                        line_number=line_number, line_content=line_content,
-                    )
                 if K is None:
                     dG_eq_val = _float_or_none(params["dG_eq"])
                     if dG_eq_val is None:
@@ -916,6 +913,11 @@ def _parse_reaction_like_step(
                             "Equilibrium constant overflow (dG_eq too large for given T)",
                             line_number=line_number, line_content=line_content,
                         ) from exc
+                    if K <= 0:
+                        raise DSLError(
+                            "Equilibrium constant underflowed to zero (dG_eq too large for given T)",
+                            line_number=line_number, line_content=line_content,
+                        )
                 kr = kf / K
                 K_input = K if "K" in params else None
             else:
@@ -930,6 +932,11 @@ def _parse_reaction_like_step(
                 raise DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
             dGJ = normalize_energy_to_J_per_mol(dG_act_val, energy_unit)
             eyring_dGJ = dGJ
+            if kappa <= 0:
+                raise DSLError(
+                    f"Per-step kappa must be positive for Eyring rate computation, got {kappa}",
+                    line_number=line_number, line_content=line_content,
+                )
             try:
                 kf = eyring_rate(dGJ, T, kappa=kappa, molecularity=n, standard_conc_M=C0)
             except OverflowError as exc:
@@ -941,11 +948,6 @@ def _parse_reaction_like_step(
         if reversible and kr is None:
             if "K" in params or "dG_eq" in params:
                 K = _float_or_none(params.get("K"))
-                if K is not None and K <= 0:
-                    raise DSLError(
-                        f"K must be positive for reversible reaction, got {K}",
-                        line_number=line_number, line_content=line_content,
-                    )
                 if K is None:
                     dG_eq_val = _float_or_none(params["dG_eq"])
                     if dG_eq_val is None:
@@ -959,6 +961,11 @@ def _parse_reaction_like_step(
                             "Equilibrium constant overflow (dG_eq too large for given T)",
                             line_number=line_number, line_content=line_content,
                         ) from exc
+                    if K <= 0:
+                        raise DSLError(
+                            "Equilibrium constant underflowed to zero (dG_eq too large for given T)",
+                            line_number=line_number, line_content=line_content,
+                        )
                 kr = kf / K
                 K_input = K if "K" in params else None
             else:

@@ -397,3 +397,56 @@ class TestOverflowGuard:
     def test_overflow_Ea_rejected(self):
         with pytest.raises(DSLError):
             parse_dsl("energy=kJ/mol\nreaction: A -> B; A=1e10; Ea=-1000000")
+
+
+# ---------------------------------------------------------------------------
+# Per-step kappa: only validated when used in Eyring rate computation
+# ---------------------------------------------------------------------------
+
+
+class TestPerStepKappaPlacement:
+    def test_explicit_rate_with_kappa_zero_accepted(self):
+        result = parse_dsl("reaction: A -> B; k=1; κ=0")
+        assert result.ir is not None
+
+    def test_arrhenius_with_kappa_zero_accepted(self):
+        result = parse_dsl("reaction: A -> B; A=1e10; Ea=50; κ=0")
+        assert result.ir is not None
+
+    def test_eyring_kappa_zero_still_rejected(self):
+        with pytest.raises(DSLError):
+            parse_dsl("reaction: A -> B; dG_act=50; κ=0")
+
+    def test_eyring_kappa_negative_still_rejected(self):
+        with pytest.raises(DSLError):
+            parse_dsl("reaction: A -> B; dG_act=50; κ=-1")
+
+
+# ---------------------------------------------------------------------------
+# K underflow to zero from large positive dG_eq
+# ---------------------------------------------------------------------------
+
+
+class TestKUnderflow:
+    def test_K_underflow_from_large_positive_dG_eq_rejected(self):
+        with pytest.raises(DSLError):
+            parse_dsl("energy=kJ/mol\nreaction: A <-> B; dG_act=50; dG_eq=1000000")
+
+    def test_K_underflow_equilibrium_path_rejected(self):
+        with pytest.raises(DSLError):
+            parse_dsl("energy=kJ/mol\nequilibrium: A <=> B; dG_eq=1000000")
+
+
+# ---------------------------------------------------------------------------
+# K validated whenever present, not just when used as divisor
+# ---------------------------------------------------------------------------
+
+
+class TestKAlwaysValidated:
+    def test_K_zero_with_explicit_kr_rejected(self):
+        with pytest.raises(DSLError):
+            parse_dsl("energy=kJ/mol\nreaction: A <-> B; dG_act=10; kr=1; K=0")
+
+    def test_K_negative_with_explicit_kr_rejected(self):
+        with pytest.raises(DSLError):
+            parse_dsl("energy=kJ/mol\nreaction: A <-> B; dG_act=10; kr=1; K=-1")
