@@ -78,10 +78,11 @@ def test_loading_preset_populates_editor(main_window):
 def test_arrhenius_mechanism_runs_by_default(main_window):
     """Arrhenius-style DSL parses and simulates without any toggle."""
     dsl_text = "\n".join([
-        "reaction: A -> B; Ea=55, A=1e12, energy=kJ/mol",
+        "energy=kJ/mol",
+        "T=320",
+        "reaction: A -> B; Ea=55, A=1e12",
         "initial: A=1.0",
         "initial: B=0.0",
-        "T=320",
     ])
     result = main_window._run_dataset_simulation(dsl_text)
     assert result["t"].size > 0

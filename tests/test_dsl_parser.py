@@ -185,8 +185,8 @@ class TestThermodynamicParameters:
 
         assert len(mechanism.reactions) == 1
 
-    def test_per_reaction_temperature(self):
-        """Test per-reaction temperature override."""
+    def test_per_reaction_temperature_rejected(self):
+        """Per-reaction T= override is rejected (use global T= instead)."""
         dsl = """
         T=298.15
         energy=kJ/mol
@@ -194,9 +194,8 @@ class TestThermodynamicParameters:
         [A] = 1.0
         [B] = 0.0
         """
-        mechanism = parse_dsl_to_mechanism(dsl, initials={})
-
-        assert len(mechanism.reactions) == 1
+        with pytest.raises(DSLError, match="Per-reaction T="):
+            parse_dsl_to_mechanism(dsl, initials={})
 
 
 class TestGlobalSettings:
@@ -491,10 +490,14 @@ class TestExtractedHelperFunctions:
         with pytest.raises(DSLError, match=r"C0 must be positive"):
             _parse_standard_conc_directive(line)
 
-    @pytest.mark.parametrize("line", ["C0=", "c0=  ", "c°=nope"])
-    def test_parse_standard_conc_directive_invalid_number_raises(self, line):
-        with pytest.raises(DSLError, match=r"Invalid number"):
+    @pytest.mark.parametrize("line", ["C0=", "c0=  "])
+    def test_parse_standard_conc_directive_empty_raises(self, line):
+        with pytest.raises(DSLError, match=r"requires a numeric value"):
             _parse_standard_conc_directive(line)
+
+    def test_parse_standard_conc_directive_invalid_number_raises(self):
+        with pytest.raises(DSLError, match=r"Invalid number"):
+            _parse_standard_conc_directive("c°=nope")
 
     @pytest.mark.parametrize(("line", "expected"), [("kappa=0.8", 0.8), ("κ=1.25", 1.25)])
     def test_parse_kappa_directive_valid(self, line, expected):
@@ -505,13 +508,17 @@ class TestExtractedHelperFunctions:
         with pytest.raises(DSLError, match=r"κ must be positive"):
             _parse_kappa_directive(line)
 
-    @pytest.mark.parametrize("line", ["kappa=", "κ=  ", "kappa=nope"])
-    def test_parse_kappa_directive_invalid_number_raises(self, line):
-        with pytest.raises(DSLError, match=r"Invalid number"):
+    @pytest.mark.parametrize("line", ["kappa=", "κ=  "])
+    def test_parse_kappa_directive_empty_raises(self, line):
+        with pytest.raises(DSLError, match=r"requires a numeric value"):
             _parse_kappa_directive(line)
 
+    def test_parse_kappa_directive_invalid_number_raises(self):
+        with pytest.raises(DSLError, match=r"Invalid number"):
+            _parse_kappa_directive("kappa=nope")
+
     def test_parse_kappa_directive_k_is_not_a_kappa_alias(self):
-        with pytest.raises(KeyError):
+        with pytest.raises(DSLError):
             _parse_kappa_directive("k=0.8")
 
 

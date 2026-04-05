@@ -5,8 +5,8 @@ Current contract
 ----------------
 - Entries: `reaction:`, `equilibrium:` and a `States/TS` block.
 - Accepted keys with normalization:
-  T, degeneracy, κ, C°|C0, p°|p0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
-  energy=kcal/mol|kJ/mol, state, edge
+  T, degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
+  energy=kcal/mol|kJ/mol|J/mol, state, edge
 - If dG_eq/ΔG° is provided and K is omitted, compute K = exp(-ΔG°/(R*T)).
 - Default per step is Eyring; Arrhenius override via A/Ea.
 - Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C°.
@@ -29,6 +29,7 @@ Non-goals
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, cast, TYPE_CHECKING
 
@@ -78,8 +79,6 @@ _KEY_ALIASES: Dict[str, str] = {
     "κ": "κ",
     "c°": "C0",
     "c0": "C0",
-    "p°": "p0",
-    "p0": "p0",
     # energies / model params
     "dg_act": "dG_act",
     "Δg‡": "dG_act",
@@ -111,6 +110,15 @@ _SPECIES_TERM_RE = re.compile(r"^\s*(?:(\d+(?:\.\d+)?)\s*\*?\s*)?([A-Za-z_][A-Za
 _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _STATE_REST_SPLIT_RE = re.compile(r"[;,]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
+
+_ENERGY_UNIT_MAP: Dict[str, str] = {
+    "kj/mol": "kJ/mol",
+    "kcal/mol": "kcal/mol",
+    "j/mol": "J/mol",
+}
+
+_REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "K", "dG_eq", "dG_act"})
+_EQUILIBRIUM_KNOWN_KEYS = frozenset({"K", "kf", "kr", "dG_eq", "dg_eq", "cm_id"})
 
 
 # ------------------------------ data models ----------------------------------
@@ -292,7 +300,7 @@ def _parse_species_side(text: str) -> Dict[str, float]:
     for term in text.split("+"):
         term = term.strip()
         if not term:
-            continue
+            raise DSLError("Malformed stoichiometry: empty term (e.g., consecutive '+' signs)")
         m = _SPECIES_TERM_RE.match(term)
         if not m and "*" in term:
             # Allow patterns like "2 * B" while rejecting "A B"
@@ -333,6 +341,23 @@ def _float_or_none(s: Optional[str]) -> Optional[float]:
     except Exception:
         logger.debug(f"Failed to convert '{s}' to float", exc_info=True)
         raise invalid_number_error(str(s), "value")
+
+
+def _validate_rate_or_K(
+    value: Optional[float],
+    name: str,
+    *,
+    line_number: int | None = None,
+    line_content: str | None = None,
+) -> None:
+    if value is None:
+        return
+    if math.isnan(value) or math.isinf(value) or value < 0:
+        raise DSLError(
+            f"'{name}' must be a non-negative finite number, got {value}",
+            line_number=line_number,
+            line_content=line_content,
+        )
 
 
 def _bool_from_str(s: str) -> bool:
@@ -470,7 +495,10 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 line_number=line_no,
                 line_content=raw,
             )
-            state_network.add_state(name, **state_kwargs)
+            try:
+                state_network.add_state(name, **state_kwargs)
+            except ValueError as exc:
+                raise DSLError(str(exc), line_number=line_no, line_content=raw) from exc
             continue
 
         if lower.startswith("edge:"):
@@ -617,15 +645,24 @@ class ParsedStep:
 
 def _parse_energy_unit_directive(line: str) -> str:
     kv = _parse_keyvals(line)
-    energy_unit = kv["energy"]
-    if energy_unit not in ("kJ/mol", "kcal/mol"):
-        raise DSLError(f"energy must be 'kJ/mol' or 'kcal/mol', got {energy_unit!r}")
-    return energy_unit
+    raw = kv.get("energy")
+    if not raw:
+        raise DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
+    canonical = _ENERGY_UNIT_MAP.get(raw.strip().lower())
+    if canonical is None:
+        raise DSLError(
+            f"energy must be 'kJ/mol', 'kcal/mol', or 'J/mol', got {raw!r}",
+            examples=["energy=kJ/mol", "energy=kcal/mol", "energy=J/mol"],
+        )
+    return canonical
 
 
 def _parse_temperature_directive(line: str) -> float:
     kv = _parse_keyvals(line)
-    T = _float_or_none(kv["T"])
+    raw = kv.get("T")
+    if not raw:
+        raise DSLError("T= directive requires a numeric value")
+    T = _float_or_none(raw)
     if T is None or T <= 0:
         raise DSLError("T must be positive")
     return float(T)
@@ -633,7 +670,10 @@ def _parse_temperature_directive(line: str) -> float:
 
 def _parse_standard_conc_directive(line: str) -> float:
     kv = _parse_keyvals(line)
-    C0 = _float_or_none(kv["C0"])
+    raw = kv.get("C0")
+    if not raw:
+        raise DSLError("C0= directive requires a numeric value")
+    C0 = _float_or_none(raw)
     if C0 is None or C0 <= 0:
         raise DSLError("C0 must be positive")
     return float(C0)
@@ -641,7 +681,10 @@ def _parse_standard_conc_directive(line: str) -> float:
 
 def _parse_kappa_directive(line: str) -> float:
     kv = _parse_keyvals(line)
-    kappa = _float_or_none(kv["κ"])
+    raw = kv.get("κ")
+    if not raw:
+        raise DSLError("κ= directive requires a numeric value")
+    kappa = _float_or_none(raw)
     if kappa is None or kappa <= 0:
         raise DSLError("κ must be positive")
     return float(kappa)
@@ -779,6 +822,23 @@ def _parse_reaction_like_step(
     react, prod, arrow = _parse_stoich(stoich_part)
     reversible = arrow in ("<->", "<=>")
 
+    if "T" in params:
+        raise DSLError(
+            "Per-reaction T= is not supported; use a global T= directive",
+            line_number=line_number, line_content=line_content,
+        )
+    if "energy" in params:
+        raise DSLError(
+            "Per-reaction energy= is not supported; use a global energy= directive",
+            line_number=line_number, line_content=line_content,
+        )
+    unknown = set(params) - _REACTION_KNOWN_KEYS
+    if unknown:
+        raise DSLError(
+            f"Unknown reaction parameter(s): {', '.join(sorted(unknown))}",
+            line_number=line_number, line_content=line_content,
+        )
+
     model = "Eyring"
     if "A" in params or "Ea" in params:
         model = "Arrhenius"
@@ -787,6 +847,11 @@ def _parse_reaction_like_step(
 
     kf = _float_or_none(params.get("kf") or params.get("k"))
     kr = _float_or_none(params.get("kr"))
+    if params.get("kf") or params.get("k"):
+        _validate_rate_or_K(kf, "kf" if "kf" in params else "k",
+                            line_number=line_number, line_content=line_content)
+    if params.get("kr"):
+        _validate_rate_or_K(kr, "kr", line_number=line_number, line_content=line_content)
     arrhenius_A = None
     arrhenius_EaJ = None
     eyring_dGJ = None
@@ -956,6 +1021,23 @@ def _parse_equilibrium_step(
         raise DSLError("equilibrium must use '<->' or '<=>'")
     _ = molecularity(react)
 
+    if "T" in params:
+        raise DSLError(
+            "Per-reaction T= is not supported; use a global T= directive",
+            line_number=line_number, line_content=line_content,
+        )
+    if "energy" in params:
+        raise DSLError(
+            "Per-reaction energy= is not supported; use a global energy= directive",
+            line_number=line_number, line_content=line_content,
+        )
+    unknown = set(params) - _EQUILIBRIUM_KNOWN_KEYS
+    if unknown:
+        raise DSLError(
+            f"Unknown equilibrium parameter(s): {', '.join(sorted(unknown))}",
+            line_number=line_number, line_content=line_content,
+        )
+
     has_explicit_K = "K" in params
     K = _float_or_none(params.get("K"))
     if has_explicit_K and K is None:
@@ -964,6 +1046,8 @@ def _parse_equilibrium_step(
             line_number=line_number,
             line_content=line_content,
         )
+    if has_explicit_K and K is not None:
+        _validate_rate_or_K(K, "K", line_number=line_number, line_content=line_content)
     dG_eqJ = None
 
     exp_rates: List[float] = []
@@ -973,12 +1057,14 @@ def _parse_equilibrium_step(
         kfv = _float_or_none(params["kf"])
         if kfv is None:
             raise DSLError("kf must be numeric", line_number=line_number, line_content=line_content)
+        _validate_rate_or_K(kfv, "kf", line_number=line_number, line_content=line_content)
         kf_explicit = kfv
         exp_rates.append(kfv)
     if "kr" in params:
         krv = _float_or_none(params["kr"])
         if krv is None:
             raise DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
+        _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
         kr_explicit = krv
         exp_rates.append(krv)
 
