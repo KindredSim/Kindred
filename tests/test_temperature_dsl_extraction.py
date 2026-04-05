@@ -160,3 +160,98 @@ class TestScheduleOverridesT:
         assert "Schedule" in indicator_text
         # T= still seeds the spinbox value
         assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+
+class TestProjectLoadTemperatureStash:
+    """Removing T= after project load must restore to the project temperature, not startup default."""
+
+    def test_removing_T_after_project_load_restores_project_temperature(self, main_window):
+        _clear_state_network(main_window)
+
+        payload = main_window._serialize_project_state()
+        payload["mechanism"] = "T=350\nA -> B ; k=1"
+        payload["temperature_K"] = 500.0
+        main_window._apply_project_payload(payload, record_undo=False)
+
+        # T= overrides the spinbox to 350
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+        # Remove T= — spinbox must revert to the project temperature (500), not 298.15
+        _set_reactions(main_window, "A -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(500.0)
+
+    def test_T_active_then_project_load_then_remove_restores_latest_project(self, main_window):
+        _clear_state_network(main_window)
+
+        # Establish T= override from manual editing
+        main_window._temperature_spinbox.setValue(300.0)
+        _set_reactions(main_window, "T=350\nA -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+        # Load a different project while T= is already active
+        payload = main_window._serialize_project_state()
+        payload["mechanism"] = "T=400\nC -> D ; k=2"
+        payload["temperature_K"] = 600.0
+        main_window._apply_project_payload(payload, record_undo=False)
+        assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
+
+        # Remove T= — must restore to latest project's temperature (600), not 300
+        _set_reactions(main_window, "C -> D ; k=2")
+        assert main_window._temperature_spinbox.value() == pytest.approx(600.0)
+
+
+class TestStashStabilityDuringTValueChanges:
+    """Changing the T= value in DSL must not corrupt the pre-override stash."""
+
+    def test_changing_T_value_preserves_original_stash(self, main_window):
+        _clear_state_network(main_window)
+
+        # Set a known spinbox value
+        main_window._temperature_spinbox.setValue(400.0)
+
+        # Add T=350 — stash captures 400
+        _set_reactions(main_window, "T=350\nA -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+        # Change to T=500 — stash must NOT update (still 400)
+        _set_reactions(main_window, "T=500\nA -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(500.0)
+
+        # Remove T= — must restore to original 400, not 350 or 500
+        _set_reactions(main_window, "A -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
+
+
+class TestSerializationWhileTOverrideActive:
+    """Saving a project while T= is active must serialize the base temperature, not the T= value."""
+
+    def test_serialize_preserves_base_temperature_not_T_override(self, main_window):
+        _clear_state_network(main_window)
+
+        # Set a known base temperature
+        main_window._temperature_spinbox.setValue(500.0)
+
+        # Add T= override — spinbox now shows T= value, not the base
+        _set_reactions(main_window, "T=350\nA -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+        # Serialize while T= is active
+        payload = main_window._serialize_project_state()
+        assert payload["temperature_K"] == pytest.approx(500.0)
+
+    def test_save_reload_remove_T_round_trip(self, main_window):
+        _clear_state_network(main_window)
+
+        main_window._temperature_spinbox.setValue(500.0)
+        _set_reactions(main_window, "T=350\nA -> B ; k=1")
+
+        # Save and reload
+        payload = main_window._serialize_project_state()
+        main_window._apply_project_payload(payload, record_undo=False)
+
+        # T= still overrides
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+        # Remove T= — must restore to 500, not 350
+        _set_reactions(main_window, "A -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(500.0)

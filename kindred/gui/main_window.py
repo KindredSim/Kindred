@@ -194,6 +194,8 @@ class MainWindow(
         self._use_sparse_jacobian = False
         self._wegscheider_cyclicity_enabled = False
         self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
+        self._pre_dsl_temperature: float | None = None  # Spinbox value before T= override.
+        self._temperature_dsl_override_active = False
         self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
@@ -1603,6 +1605,9 @@ class MainWindow(
         was_override_active = getattr(self, "_temperature_dsl_override_active", False)
 
         if T_override is not None:
+            if not was_override_active:
+                # Capture pre-override spinbox value before DSL write-back.
+                self._pre_dsl_temperature = self._temperature_spinbox.value()
             self._temperature_dsl_override_active = True
             # Sync spinbox to DSL-derived temperature without firing preference persistence
             self._temperature_spinbox.blockSignals(True)
@@ -1626,14 +1631,18 @@ class MainWindow(
             # the T= value seeds the spinbox but the schedule dictates the indicator.
 
         if T_override is None:
-            # Restore user preference when DSL temperature override is removed
             if was_override_active:
-                pref = self.config_controller.get_user_preference("temperature_K")
+                restore = self._pre_dsl_temperature
+                if restore is None:
+                    restore = float(
+                        self.config_controller.get_user_preference("temperature_K")
+                    )
                 self._temperature_spinbox.blockSignals(True)
                 try:
-                    self._temperature_spinbox.setValue(float(pref))
+                    self._temperature_spinbox.setValue(float(restore))
                 finally:
                     self._temperature_spinbox.blockSignals(False)
+                self._pre_dsl_temperature = None
             self._temperature_dsl_override_active = False
 
         # Hide spinbox and restore editable state
@@ -3349,6 +3358,9 @@ class MainWindow(
         if data_manager is not None and hasattr(data_manager, "clear_datasets"):
             data_manager.clear_datasets()
 
+        self._pre_dsl_temperature = None
+        self._temperature_dsl_override_active = False
+
         self._clear_main_plot_project_apply_state()
         self._sync_overlay_catalog()
 
@@ -3429,7 +3441,11 @@ class MainWindow(
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
-            'temperature_K': self._temperature_spinbox.value(),
+            'temperature_K': (
+                self._pre_dsl_temperature
+                if self._pre_dsl_temperature is not None
+                else self._temperature_spinbox.value()
+            ),
             'simulation_time': str(self._sim_time_spinbox.text()).strip(),
             'num_points': int(self._num_points_spinbox.value()),
             'batch_initial_conditions': self._batch_store.as_serializable(),
@@ -3596,6 +3612,11 @@ class MainWindow(
         self._temperature_spinbox.setValue(
             data.get('temperature_K', _pref('temperature_K'))
         )
+        # Update stash when project loads while T= override is active.
+        if getattr(self, "_temperature_dsl_override_active", False):
+            self._pre_dsl_temperature = data.get(
+                'temperature_K', _pref('temperature_K')
+            )
         sim_time = data.get('simulation_time', _pref('simulation_time'))
         if isinstance(sim_time, (int, float)):
             sim_time_text = f"{float(sim_time):g}"
