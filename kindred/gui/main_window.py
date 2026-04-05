@@ -1570,8 +1570,8 @@ class MainWindow(
         - "Temperature: Schedule (response, N intervals)" - when temp_response detected
 
         Priority rule:
-        1. T= directive in reactions text (any mode) overrides spinbox.
-        2. Temperature schedule in DSL takes precedence during ODE integration.
+        1. Temperature schedule in DSL takes highest priority for indicator and solver.
+        2. T= directive seeds the spinbox value but does not override a schedule.
         3. Otherwise, the temperature spinbox value is used (isothermal).
         """
         if not hasattr(self, "_temperature_mode_indicator"):
@@ -1587,24 +1587,56 @@ class MainWindow(
 
         # Extract T= unconditionally — not gated on state network presence
         T_override = self._dsl_global_temperature_K(mechanism_text)
+
+        # Parse temperature schedule before branching on T= so the schedule
+        # can take precedence over a bare T= directive for the indicator.
+        schedule_defined = False
+        temp_schedule = None
+        try:
+            from kindred.core.temperature_dsl import parse_temperature_schedule
+
+            temp_schedule = parse_temperature_schedule(mechanism_text)
+            schedule_defined = temp_schedule is not None
+        except Exception as e:
+            logger.debug(f"Temperature schedule parsing failed: {e}")
+
+        was_override_active = getattr(self, "_temperature_dsl_override_active", False)
+
         if T_override is not None:
+            self._temperature_dsl_override_active = True
             # Sync spinbox to DSL-derived temperature without firing preference persistence
             self._temperature_spinbox.blockSignals(True)
             try:
                 self._temperature_spinbox.setValue(T_override)
             finally:
                 self._temperature_spinbox.blockSignals(False)
-            indicator_text = f"Temperature: {T_override:.2f} K (from DSL)"
-            self._temperature_mode_indicator.setText(indicator_text)
-            self._set_temperature_override_state(
-                enabled=False,
-                tooltip="Overridden by DSL (T=...).",
-            )
-            self._set_temperature_spinbox_visible(True)
-            logger.debug(f"Temperature mode indicator updated: {indicator_text}")
-            return
 
-        # No T= found — hide spinbox and restore editable state
+            if not schedule_defined:
+                # Bare T= without schedule: spinbox visible, disabled, "from DSL"
+                indicator_text = f"Temperature: {T_override:.2f} K (from DSL)"
+                self._temperature_mode_indicator.setText(indicator_text)
+                self._set_temperature_override_state(
+                    enabled=False,
+                    tooltip="Overridden by DSL (T=...).",
+                )
+                self._set_temperature_spinbox_visible(True)
+                logger.debug(f"Temperature mode indicator updated: {indicator_text}")
+                return
+            # Temperature schedule takes precedence over bare T= directive —
+            # the T= value seeds the spinbox but the schedule dictates the indicator.
+
+        if T_override is None:
+            # Restore user preference when DSL temperature override is removed
+            if was_override_active:
+                pref = self.config_controller.get_user_preference("temperature_K")
+                self._temperature_spinbox.blockSignals(True)
+                try:
+                    self._temperature_spinbox.setValue(float(pref))
+                finally:
+                    self._temperature_spinbox.blockSignals(False)
+            self._temperature_dsl_override_active = False
+
+        # Hide spinbox and restore editable state
         self._set_temperature_spinbox_visible(False)
         if energy_mode_active:
             self._set_temperature_override_state(
@@ -1617,40 +1649,25 @@ class MainWindow(
                 tooltip="Temperature for thermodynamic calculations",
             )
 
-        # Try to detect temperature schedule in DSL
-        schedule_defined = False
-        try:
-            from kindred.core.temperature_dsl import parse_temperature_schedule
-
-            temp_schedule = parse_temperature_schedule(mechanism_text)
-            schedule_defined = temp_schedule is not None
-
-            if temp_schedule is not None:
-                if temp_schedule.schedule_type == "constant":
-                    T = temp_schedule(0.0)
-                    indicator_text = f"Temperature: {T:.2f} K (constant from DSL)"
-                elif temp_schedule.schedule_type == "piecewise":
-                    intervals = temp_schedule.get_intervals()
-                    n_intervals = len(intervals)
-                    indicator_text = f"Temperature: Schedule ({n_intervals} interval{'s' if n_intervals != 1 else ''})"
-                elif temp_schedule.schedule_type == "response":
-                    intervals = temp_schedule.get_intervals()
-                    n_intervals = len(intervals)
-                    indicator_text = (
-                        f"Temperature: Schedule (response, {n_intervals} interval"
-                        f"{'s' if n_intervals != 1 else ''})"
-                    )
-                else:
-                    indicator_text = "Temperature: Schedule (unknown type)"
+        # Build indicator text from schedule or isothermal fallback
+        if temp_schedule is not None:
+            if temp_schedule.schedule_type == "constant":
+                T = temp_schedule(0.0)
+                indicator_text = f"Temperature: {T:.2f} K (constant from DSL)"
+            elif temp_schedule.schedule_type == "piecewise":
+                intervals = temp_schedule.get_intervals()
+                n_intervals = len(intervals)
+                indicator_text = f"Temperature: Schedule ({n_intervals} interval{'s' if n_intervals != 1 else ''})"
+            elif temp_schedule.schedule_type == "response":
+                intervals = temp_schedule.get_intervals()
+                n_intervals = len(intervals)
+                indicator_text = (
+                    f"Temperature: Schedule (response, {n_intervals} interval"
+                    f"{'s' if n_intervals != 1 else ''})"
+                )
             else:
-                T = self._temperature_spinbox.value()
-                if energy_mode_active:
-                    indicator_text = f"Temperature: {T:.2f} K (energy mode: set T=... in DSL)"
-                else:
-                    indicator_text = f"Temperature: {T:.2f} K (isothermal)"
-
-        except Exception as e:
-            logger.debug(f"Temperature schedule parsing failed: {e}")
+                indicator_text = "Temperature: Schedule (unknown type)"
+        else:
             T = self._temperature_spinbox.value()
             if energy_mode_active:
                 indicator_text = f"Temperature: {T:.2f} K (energy mode: set T=... in DSL)"

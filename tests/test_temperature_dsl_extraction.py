@@ -89,17 +89,21 @@ class TestWriteBackGuard:
 class TestSpinboxVisibilityToggle:
     """Spinbox visibility must track T= presence in DSL."""
 
-    def test_removing_T_hides_spinbox_and_keeps_value(self, main_window):
+    def test_removing_T_hides_spinbox_and_restores_preference(self, main_window):
         _clear_state_network(main_window)
 
-        # Add T= — spinbox should become visible (not hidden)
+        # Establish a known user preference via manual spinbox edit
+        main_window._temperature_spinbox.setValue(300.0)
+
+        # Add T= — spinbox should become visible with DSL value
         _set_reactions(main_window, "T=350\nA -> B ; k=1")
         assert not main_window._temperature_spinbox.isHidden()
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
 
-        # Remove T= — spinbox should hide but keep value
+        # Remove T= — spinbox should hide and revert to user preference
         _set_reactions(main_window, "A -> B ; k=1")
         assert main_window._temperature_spinbox.isHidden()
-        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+        assert main_window._temperature_spinbox.value() == pytest.approx(300.0)
 
 
 class TestNormalIsothermalPath:
@@ -115,3 +119,44 @@ class TestNormalIsothermalPath:
         assert main_window._temperature_spinbox.isEnabled()
         indicator_text = main_window._temperature_mode_indicator.text()
         assert "310.00" in indicator_text
+
+
+class TestPreferenceRestorationOnTRemoval:
+    """Removing T= from DSL must restore the spinbox to the user's preference."""
+
+    def test_removing_T_restores_user_preference_value(self, main_window):
+        _clear_state_network(main_window)
+        cc = main_window.config_controller
+        cc.update_user_preference("temperature_K", 300.0)
+        main_window._temperature_spinbox.blockSignals(True)
+        try:
+            main_window._temperature_spinbox.setValue(300.0)
+        finally:
+            main_window._temperature_spinbox.blockSignals(False)
+
+        # T= overrides the spinbox to 350
+        _set_reactions(main_window, "T=350\nA -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+
+        # Remove T= — spinbox must revert to the user preference, not stay at 350
+        _set_reactions(main_window, "A -> B ; k=1")
+        assert main_window._temperature_spinbox.value() == pytest.approx(300.0)
+
+
+class TestScheduleOverridesT:
+    """Temperature schedule takes precedence over bare T= for the indicator."""
+
+    def test_schedule_indicator_wins_over_bare_T(self, main_window):
+        _clear_state_network(main_window)
+        main_window._temperature_spinbox.setValue(298.15)
+
+        _set_reactions(
+            main_window,
+            "T=350\nA -> B ; k=1\ntemp_step: t=[0,50,100], T=[298,350]",
+        )
+
+        indicator_text = main_window._temperature_mode_indicator.text()
+        assert "from DSL" not in indicator_text
+        assert "Schedule" in indicator_text
+        # T= still seeds the spinbox value
+        assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
