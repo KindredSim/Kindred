@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 from typing import Any, Mapping, MutableMapping, Optional
 
+from kindred.core.simulator.common import normalize_energy_unit
 from kindred.core.temperature import TemperatureScheduleProtocol, coerce_temperature_schedule
 
 __all__ = [
@@ -73,21 +74,6 @@ def _optional_finite_float(value: object) -> Optional[float]:
     return float(out)
 
 
-def _normalize_energy_unit(value: object, *, default: str = "kJ/mol") -> str:
-    if isinstance(value, str):
-        normalized = value.strip()
-        aliases = {
-            "J/mol": "J/mol",
-            "j/mol": "J/mol",
-            "kJ/mol": "kJ/mol",
-            "kj/mol": "kJ/mol",
-            "kcal/mol": "kcal/mol",
-        }
-        if normalized in aliases:
-            return aliases[normalized]
-    return str(default)
-
-
 @dataclass(frozen=True)
 class MechanismMetadataView:
     temperature_K: float = 298.15
@@ -115,7 +101,7 @@ class MechanismMetadataView:
                 meta.get(MechanismMetadataKeys.KAPPA_GLOBAL, 1.0),
                 default=1.0,
             ),
-            energy_unit=_normalize_energy_unit(
+            energy_unit=normalize_energy_unit(
                 meta.get(MechanismMetadataKeys.ENERGY_UNIT, "kJ/mol"),
                 default="kJ/mol",
             ),

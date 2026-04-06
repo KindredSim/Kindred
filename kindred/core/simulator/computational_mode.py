@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import scipy.constants
 
 from kindred.core.constants import R
+from kindred.core.simulator.common import normalize_energy_unit
 
 __all__ = [
     "COMP_BLOCK_START",
@@ -53,21 +54,8 @@ def hartree_to_jmol(x_hartree: float) -> float:
     return float(x_hartree) * float(scipy.constants.value("Hartree energy")) * float(scipy.constants.N_A)
 
 
-def _normalize_energy_unit(value: str) -> str:
-    s = str(value or "").strip().lower()
-    if s in {"hartree", "eh"}:
-        return "hartree"
-    if s in {"j/mol", "j"}:
-        return "J/mol"
-    if s in {"kj/mol", "kj"}:
-        return "kJ/mol"
-    if s in {"kcal/mol", "kcal"}:
-        return "kcal/mol"
-    raise ValueError(f"unsupported energy_unit {value!r}")
-
-
 def _energy_to_jmol(value: float, unit: str) -> float:
-    unit_n = _normalize_energy_unit(unit)
+    unit_n = normalize_energy_unit(unit, allow_hartree=True)
     if unit_n == "hartree":
         return hartree_to_jmol(float(value))
     if unit_n == "J/mol":
@@ -418,7 +406,7 @@ def parse_comp_block(comp_block_body: str) -> CompSpec:
                 pressure_Pa = _parse_pressure_Pa(val)
                 continue
             if key == "energy_unit":
-                energy_unit = _normalize_energy_unit(val)
+                energy_unit = normalize_energy_unit(val, allow_hartree=True)
                 continue
             if key == "std_default":
                 std_default_M = _parse_conc_M(val)
@@ -556,7 +544,7 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
     energy_unit = str(spec.energy_unit)
     std_default = float(spec.std_default_M)
 
-    out_energy_unit = _normalize_energy_unit(output_energy_unit)
+    out_energy_unit = normalize_energy_unit(output_energy_unit, allow_hartree=True)
     if out_energy_unit not in {"kJ/mol", "kcal/mol"}:
         raise ValueError("output_energy_unit must be 'kJ/mol' or 'kcal/mol'")
     from kindred.core.units import UnitsModel

@@ -93,20 +93,6 @@ def invalid_temperature_error(value: str) -> DSLError:
             "T=373.15  (boiling point of water)"
         ]
     )
-
-
-def invalid_energy_unit_error(value: str) -> DSLError:
-    """Error for invalid energy unit."""
-    return DSLError(
-        f"Invalid energy unit: energy={value}",
-        suggestion="Energy unit must be 'kJ/mol' or 'kcal/mol'",
-        examples=[
-            "energy=kJ/mol",
-            "energy=kcal/mol"
-        ]
-    )
-
-
 def invalid_number_error(value: str, field: str) -> DSLError:
     """Error for non-numeric value where number expected."""
     return DSLError(

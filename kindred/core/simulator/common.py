@@ -16,11 +16,43 @@ from .kinetics import K_from_deltaG_eq
 
 __all__ = [
     "DSLError",
+    "STANDARD_ENERGY_UNIT_MAP",
     "choose_k_fast",
     "derive_equilibrium_rates",
     "FastEqResult",
     "molecularity",
+    "normalize_energy_unit",
 ]
+
+
+STANDARD_ENERGY_UNIT_MAP: Dict[str, str] = {
+    "j/mol": "J/mol",
+    "j": "J/mol",
+    "kj/mol": "kJ/mol",
+    "kj": "kJ/mol",
+    "kcal/mol": "kcal/mol",
+    "kcal": "kcal/mol",
+    "hartree": "hartree",
+    "eh": "hartree",
+}
+
+
+def normalize_energy_unit(
+    value: object,
+    *,
+    default: str | None = None,
+    allow_hartree: bool = False,
+) -> str:
+    canonical = None
+    if isinstance(value, str):
+        canonical = STANDARD_ENERGY_UNIT_MAP.get(value.strip().lower())
+        if canonical == "hartree" and not allow_hartree:
+            canonical = None
+    if canonical is not None:
+        return canonical
+    if default is not None:
+        return default
+    raise ValueError(f"unsupported energy_unit {value!r}")
 
 
 def _pos_finite(x: float | None, label: str = "value") -> float:

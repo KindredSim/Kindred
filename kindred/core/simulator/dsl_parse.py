@@ -111,12 +111,6 @@ _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _STATE_REST_SPLIT_RE = re.compile(r"[;,]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
-_ENERGY_UNIT_MAP: Dict[str, str] = {
-    "kj/mol": "kJ/mol",
-    "kcal/mol": "kcal/mol",
-    "j/mol": "J/mol",
-}
-
 _REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "K", "dG_eq", "dG_act"})
 _EQUILIBRIUM_KNOWN_KEYS = frozenset({"K", "kf", "kr", "dG_eq", "dg_eq", "cm_id"})
 
@@ -647,17 +641,19 @@ class ParsedStep:
 
 
 def _parse_energy_unit_directive(line: str) -> str:
+    from .common import normalize_energy_unit
+
     kv = _parse_keyvals(line)
     raw = kv.get("energy")
     if not raw:
         raise DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
-    canonical = _ENERGY_UNIT_MAP.get(raw.strip().lower())
-    if canonical is None:
+    try:
+        return normalize_energy_unit(raw, allow_hartree=False)
+    except ValueError:
         raise DSLError(
             f"energy must be 'kJ/mol', 'kcal/mol', or 'J/mol', got {raw!r}",
             examples=["energy=kJ/mol", "energy=kcal/mol", "energy=J/mol"],
         )
-    return canonical
 
 
 def _parse_temperature_directive(line: str) -> float:
