@@ -269,6 +269,11 @@ class TestCaseInsensitiveEnergyUnit:
         with pytest.raises(DSLError):
             parse_dsl("energy=eV\nA -> B; k=1")
 
+    @pytest.mark.parametrize("value", ["kj", "kcal", "J", "j", " KJ ", "Kcal"])
+    def test_short_form_unit_still_rejected(self, value: str):
+        with pytest.raises(DSLError):
+            parse_dsl(f"energy={value}\nA -> B; k=1")
+
 
 # ---------------------------------------------------------------------------
 # Non-finite directives rejected (NaN/inf in T, C0, κ, initials)

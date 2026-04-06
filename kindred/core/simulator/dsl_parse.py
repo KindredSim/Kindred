@@ -641,14 +641,14 @@ class ParsedStep:
 
 
 def _parse_energy_unit_directive(line: str) -> str:
-    from .common import normalize_energy_unit
+    from .common import _normalize_directive_energy_unit
 
     kv = _parse_keyvals(line)
     raw = kv.get("energy")
     if not raw:
         raise DSLError("energy= directive requires a value (kJ/mol, kcal/mol, or J/mol)")
     try:
-        return normalize_energy_unit(raw, allow_hartree=False)
+        return _normalize_directive_energy_unit(raw)
     except ValueError:
         raise DSLError(
             f"energy must be 'kJ/mol', 'kcal/mol', or 'J/mol', got {raw!r}",
