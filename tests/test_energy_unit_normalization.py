@@ -35,21 +35,21 @@ def test_normalize_energy_unit_accepts_case_variations(value: str, expected: str
     assert normalize_energy_unit(value) == expected
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("j", "J/mol"),
-        ("kj", "kJ/mol"),
-        ("kcal", "kcal/mol"),
-    ],
-)
-def test_normalize_energy_unit_accepts_short_forms(value: str, expected: str) -> None:
-    assert normalize_energy_unit(value) == expected
+@pytest.mark.parametrize("value", ["j", "kj", "kcal"])
+def test_normalize_energy_unit_rejects_short_forms(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_energy_unit(value)
 
 
-@pytest.mark.parametrize("value", ["hartree", "eh", "Hartree", "EH"])
+@pytest.mark.parametrize("value", ["hartree", "Hartree"])
 def test_normalize_energy_unit_accepts_hartree_when_allowed(value: str) -> None:
     assert normalize_energy_unit(value, allow_hartree=True) == "hartree"
+
+
+@pytest.mark.parametrize("value", ["eh", "EH"])
+def test_normalize_energy_unit_rejects_eh_short_form_even_when_hartree_allowed(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_energy_unit(value, allow_hartree=True)
 
 
 def test_normalize_energy_unit_rejects_hartree_without_default_when_disallowed() -> None:

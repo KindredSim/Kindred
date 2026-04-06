@@ -37,24 +37,23 @@ def test_hartree_to_jmol_matches_scipy_constants():
 
 
 @pytest.mark.unit
-def test_parse_comp_block_accepts_short_form_energy_unit_aliases():
+def test_parse_comp_block_rejects_short_form_energy_unit_aliases():
     from kindred.core.simulator.computational_mode import parse_comp_block
 
-    spec = parse_comp_block(
-        "\n".join(
-            [
-                "comp: T = 298.15 K",
-                "comp: pressure = 1 atm",
-                "comp: energy_unit = kj",
-                "comp: std_default = 1 M",
-                "comp: species A type=GS G=0.0 degeneracy=1",
-                "comp: species B type=GS G=1.0 degeneracy=1",
-                "comp: rxn A <-> B",
-            ]
+    with pytest.raises(ValueError, match="unsupported energy_unit"):
+        parse_comp_block(
+            "\n".join(
+                [
+                    "comp: T = 298.15 K",
+                    "comp: pressure = 1 atm",
+                    "comp: energy_unit = kj",
+                    "comp: std_default = 1 M",
+                    "comp: species A type=GS G=0.0 degeneracy=1",
+                    "comp: species B type=GS G=1.0 degeneracy=1",
+                    "comp: rxn A <-> B",
+                ]
+            )
         )
-    )
-
-    assert spec.energy_unit == "kJ/mol"
 
 
 @pytest.mark.unit

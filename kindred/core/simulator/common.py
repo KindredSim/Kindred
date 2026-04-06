@@ -27,20 +27,9 @@ __all__ = [
 
 STANDARD_ENERGY_UNIT_MAP: Dict[str, str] = {
     "j/mol": "J/mol",
-    "j": "J/mol",
     "kj/mol": "kJ/mol",
-    "kj": "kJ/mol",
     "kcal/mol": "kcal/mol",
-    "kcal": "kcal/mol",
     "hartree": "hartree",
-    "eh": "hartree",
-}
-
-
-_DIRECTIVE_ENERGY_UNIT_MAP: Dict[str, str] = {
-    key: value
-    for key, value in STANDARD_ENERGY_UNIT_MAP.items()
-    if "/" in key and value != "hartree"
 }
 
 
@@ -59,14 +48,6 @@ def normalize_energy_unit(
         return canonical
     if default is not None:
         return default
-    raise ValueError(f"unsupported energy_unit {value!r}")
-
-
-def _normalize_directive_energy_unit(value: object) -> str:
-    if isinstance(value, str):
-        canonical = _DIRECTIVE_ENERGY_UNIT_MAP.get(value.strip().lower())
-        if canonical is not None:
-            return canonical
     raise ValueError(f"unsupported energy_unit {value!r}")
 
 
