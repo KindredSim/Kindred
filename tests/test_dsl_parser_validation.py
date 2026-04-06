@@ -455,3 +455,103 @@ class TestKAlwaysValidated:
     def test_K_negative_with_explicit_kr_rejected(self):
         with pytest.raises(DSLError):
             parse_dsl("energy=kJ/mol\nreaction: A <-> B; dG_act=10; kr=1; K=-1")
+
+
+# ---------------------------------------------------------------------------
+# Edge KeyError / ValueError must be wrapped as DSLError
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeErrorWrapping:
+    def test_edge_unknown_state_raises_dsl_error(self):
+        """edge: A,B with only state A defined must raise DSLError, not KeyError."""
+        dsl = "state: A, kind=GS, energy=0\nedge: A,B"
+        with pytest.raises(DSLError):
+            parse_dsl(dsl)
+
+    def test_edge_self_loop_raises_dsl_error(self):
+        """edge: A,A (self-loop) must raise DSLError, not ValueError."""
+        dsl = "state: A, kind=GS, energy=0\nedge: A,A"
+        with pytest.raises(DSLError):
+            parse_dsl(dsl)
+
+
+# ---------------------------------------------------------------------------
+# Stoichiometry coefficient overflow must raise DSLError
+# ---------------------------------------------------------------------------
+
+
+class TestStoichiometryCoefficientOverflow:
+    def test_huge_coefficient_raises_dsl_error(self):
+        """Extremely long digit string as coefficient must raise DSLError, not produce inf."""
+        huge = "9" * 400
+        with pytest.raises(DSLError):
+            parse_dsl(f"{huge}A -> B ; k=1")
+
+
+# ---------------------------------------------------------------------------
+# Directive errors must include line_number
+# ---------------------------------------------------------------------------
+
+
+class TestDirectiveErrorLineContext:
+    def test_unrecognized_line_has_line_number(self):
+        dsl = "A -> B; k=1\ngarbage_line_here"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 2
+
+    def test_temperature_directive_error_has_line_number(self):
+        dsl = "A -> B; k=1\nT=abc"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 2
+
+    def test_energy_directive_error_has_line_number(self):
+        dsl = "A -> B; k=1\nenergy=xyz"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 2
+
+    def test_c0_directive_error_has_line_number(self):
+        dsl = "A -> B; k=1\nC0=abc"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 2
+
+    def test_kappa_directive_error_has_line_number(self):
+        dsl = "A -> B; k=1\nκ=abc"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 2
+
+
+# ---------------------------------------------------------------------------
+# Keq / K_eq aliases for equilibrium constant K
+# ---------------------------------------------------------------------------
+
+
+class TestKeqAliases:
+    def test_keq_alias_on_reaction(self):
+        ref = parse_dsl("A <-> B ; kf=10 ; K=2.0")
+        result = parse_dsl("A <-> B ; kf=10 ; Keq=2.0")
+        assert result.ir is not None
+        assert abs(result.ir.steps[0].kr - ref.ir.steps[0].kr) < 1e-12
+
+    def test_k_eq_alias_on_reaction(self):
+        ref = parse_dsl("A <-> B ; kf=10 ; K=2.0")
+        result = parse_dsl("A <-> B ; kf=10 ; K_eq=2.0")
+        assert result.ir is not None
+        assert abs(result.ir.steps[0].kr - ref.ir.steps[0].kr) < 1e-12
+
+    def test_keq_alias_on_equilibrium(self):
+        ref = parse_dsl("equilibrium: A <-> B ; K=2.0 ; kf=10")
+        result = parse_dsl("equilibrium: A <-> B ; Keq=2.0 ; kf=10")
+        assert result.ir is not None
+        assert abs(result.ir.steps[0].kr - ref.ir.steps[0].kr) < 1e-12
+
+    def test_k_eq_alias_on_equilibrium(self):
+        ref = parse_dsl("equilibrium: A <-> B ; K=2.0 ; kf=10")
+        result = parse_dsl("equilibrium: A <-> B ; K_eq=2.0 ; kf=10")
+        assert result.ir is not None
+        assert abs(result.ir.steps[0].kr - ref.ir.steps[0].kr) < 1e-12
