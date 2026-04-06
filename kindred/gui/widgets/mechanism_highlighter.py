@@ -16,10 +16,10 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Syntax highlighter for Kindred mechanism DSL.
 
     Highlights:
-    - Keywords (reaction, equilibrium, reversible, etc.) - bold purple
+    - Keywords (reaction, equilibrium, time, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
-    - Operators (->, <->, <=>, <-, =) - red bold
-    - Rate constants (k=, kf=, kr=, K=) - green
+    - Operators (->, =>, <->, <=>, <-, +) - red bold
+    - Rate constants (k=, kf=, kr=, K=, kappa=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
     - Comments (#...) - gray italic
     - Energy terms (Ea=, dG_act=, etc.) - cyan
@@ -89,46 +89,52 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         initial_format.setFontWeight(QtGui.QFont.Bold)
         self.formats['initial'] = initial_format
 
-        # Define highlighting rules (order matters!)
+        # Define highlighting rules (order matters — setFormat is last-wins,
+        # so broad catch-alls go first and specific patterns override them).
         self.rules = []
 
-        # 1. Comments (highest priority - once in comment, nothing else matters)
-        self.rules.append((re.compile(r'#[^\n]*'), 'comment'))
+        # 1. Species names (broad catch-all, lowest effective priority)
+        species_pattern = r'\b[A-Z][A-Za-z0-9_]*\b'
+        self.rules.append((re.compile(species_pattern), 'species'))
 
-        # 2. Initial conditions ([Species] = value)
-        self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial'))
+        # 2. Numbers (1.0, 1e-5, .5, etc.)
+        number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
+        self.rules.append((re.compile(number_pattern), 'number'))
 
-        # 3. Keywords (reaction, equilibrium, reversible, init, etc.)
-        keywords = [
-            'reaction', 'equilibrium', 'reversible', 'irreversible',
-            'init', 'initial', 'conditions', 'units', 'temperature',
-            'temp_const', 'temp_step', 'temp_response', 'state', 'edge'
-        ]
-        keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
-        self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword'))
-
-        # 4. Energy/thermodynamic terms (Ea=, dG_act=, dG_eq=, A=, T=)
-        energy_terms = [
-            r'\bEa\s*=', r'\bdG_act\s*=', r'\bdG_eq\s*=', r'\bA\s*=',
-            r'\bactivation_energy\s*=', r'\benthalpy\s*=', r'\bentropy\s*=',
-            r'\bT\s*=', r'\benergy\s*=', r'\bΔG‡\s*=', r'\bΔG°\s*='
-        ]
-        for term in energy_terms:
-            self.rules.append((re.compile(term, re.IGNORECASE), 'energy'))
-
-        # 5. Rate constants (k=, kf=, kr=, K=, k1=, etc.)
+        # 3. Rate constants (k=, kf=, kr=, K=, kappa=, κ=)
         rate_patterns = [
-            r'\bk[fr]?\d*\s*=',  # k=, kf=, kr=, k1=, kf2=, etc.
-            r'\bK\d*\s*=',        # K=, K1=, K2=, etc.
-            r'\brate\s*=',
+            r'\bk[fr]?\s*=',   # k=, kf=, kr=
+            r'\bK\s*=',         # K=
+            r'\bkappa\s*=',     # kappa=
+            r'\bκ\s*=',         # κ= (Unicode kappa)
         ]
         for pattern in rate_patterns:
             self.rules.append((re.compile(pattern), 'rate'))
 
-        # 6. Operators (->, <->, <=>, <-, =, +)
+        # 4. Energy/thermodynamic terms (Ea=, dG_act=, dG_eq=, A=, T=, etc.)
+        energy_terms = [
+            r'\bEa\s*=', r'\bdG_act\s*=', r'\bdG_eq\s*=', r'\bA\s*=',
+            r'\bT\s*=', r'\benergy\s*=', r'\bΔG‡\s*=', r'\bΔG°\s*=',
+            r'\bC0\s*=', r'\bC°\s*=', r'\bdegeneracy\s*=',
+        ]
+        for term in energy_terms:
+            self.rules.append((re.compile(term, re.IGNORECASE), 'energy'))
+
+        # 5. Keywords (reaction, equilibrium, init, etc.)
+        keywords = [
+            'reaction', 'equilibrium',
+            'init', 'initial', 'time',
+            'temp_const', 'temp_step', 'temp_response', 'state', 'edge',
+        ]
+        keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
+        self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword'))
+
+        # 6. Operators (->, =>, <->, <=>, <-, +)
+        # Applied after rate/energy so arrow `=` is not consumed by `A=` patterns.
         operators = [
             r'<=>',  # Reversible (alternate)
             r'<->',  # Reversible
+            r'=>',   # Forward (alternate)
             r'->',   # Forward
             r'<-',   # Backward (rare)
             r'\+',   # Addition (in reactions)
@@ -136,15 +142,11 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         for op in operators:
             self.rules.append((re.compile(op), 'operator'))
 
-        # 7. Numbers (1.0, 1e-5, .5, etc.)
-        # Match scientific notation and decimals
-        number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
-        self.rules.append((re.compile(number_pattern), 'number'))
+        # 7. Initial conditions ([Species] = value)
+        self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial'))
 
-        # 8. Species names (A, B, ATP, H2O, etc.)
-        # Match capitalized words and chemical formulas
-        species_pattern = r'\b[A-Z][A-Za-z0-9_]*\b'
-        self.rules.append((re.compile(species_pattern), 'species'))
+        # 8. Comments (applied last — highest effective priority)
+        self.rules.append((re.compile(r'#[^\n]*'), 'comment'))
 
     def highlightBlock(self, text: str):
         """
