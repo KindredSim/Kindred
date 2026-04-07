@@ -24,6 +24,7 @@ from .step_constraint_authority import (
 AUTHORITATIVE_PARAMETER_SIG_DIGITS = 15
 _STEP_PARAMETER_RE = re.compile(r"^(kf|kr|K|k)\d+$")
 _STEP_PARAMETER_FLOOR = 1e-12
+_EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq", "k_eq"})
 
 
 __all__ = [
@@ -203,18 +204,23 @@ def _dedupe_tokens_case_insensitive(tokens: list[list[str]]) -> list[list[str]]:
     return result
 
 
+def _is_equilibrium_k_token(key: object) -> bool:
+    key_str = str(key).strip()
+    return key_str == "K" or key_str.lower() in _EQUILIBRIUM_K_ALIAS_LOWER
+
+
+def _token_matches_alias(key: object, alias: str) -> bool:
+    if str(alias) == "K":
+        return _is_equilibrium_k_token(key)
+    alias_str = str(alias)
+    if _is_equilibrium_k_token(key):
+        return False
+    return str(key).strip().lower() == alias_str.lower()
+
+
 def _get_token_float(tokens: list[list[str]], aliases: tuple[str, ...], default: float | None = None) -> float | None:
-    exact_aliases = set(aliases)
-    alias_set = {alias.lower() for alias in aliases if alias != "K"}
     for key, val in tokens:
-        if key == "K":
-            if "K" not in exact_aliases:
-                continue
-            try:
-                return float(val)
-            except (TypeError, ValueError):
-                return default
-        if str(key).lower() in alias_set:
+        if any(_token_matches_alias(key, alias) for alias in aliases):
             try:
                 return float(val)
             except (TypeError, ValueError):
@@ -223,14 +229,8 @@ def _get_token_float(tokens: list[list[str]], aliases: tuple[str, ...], default:
 
 
 def _has_token_alias(tokens: list[list[str]], aliases: tuple[str, ...]) -> bool:
-    exact_aliases = set(aliases)
-    alias_set = {alias.lower() for alias in aliases if alias != "K"}
     for key, _ in tokens:
-        if key == "K":
-            if "K" in exact_aliases:
-                return True
-            continue
-        if str(key).lower() in alias_set:
+        if any(_token_matches_alias(key, alias) for alias in aliases):
             return True
     return False
 
@@ -247,12 +247,11 @@ def _set_token_float(
         sanitized = format_authoritative_parameter_value(float_value)
     else:
         sanitized = f"{float(float_value):.{int(sig)}g}"
-    exact_aliases = set(aliases)
 
     if canonical_key == "K":
         target_index = None
         for idx, (key, _) in enumerate(tokens):
-            if key == "K":
+            if _is_equilibrium_k_token(key):
                 target_index = idx
                 break
         if target_index is not None:
@@ -260,20 +259,25 @@ def _set_token_float(
             tokens[target_index][1] = sanitized
         else:
             tokens.append([canonical_key, sanitized])
+            target_index = len(tokens) - 1
+        for idx in range(len(tokens) - 1, -1, -1):
+            if idx == target_index:
+                continue
+            if _is_equilibrium_k_token(tokens[idx][0]):
+                tokens.pop(idx)
         return
 
-    alias_set = {canonical_key.lower()}
-    alias_set.update(alias.lower() for alias in aliases if alias != "K")
-
-    target_index = None
+    exact_index = None
+    alias_index = None
     for idx, (key, _) in enumerate(tokens):
-        if key == "K" and "K" not in exact_aliases:
-            continue
-        if str(key).lower() in alias_set:
-            target_index = idx
+        if _token_matches_alias(key, canonical_key):
+            exact_index = idx
             break
+        if alias_index is None and any(_token_matches_alias(key, alias) for alias in aliases):
+            alias_index = idx
 
-    if target_index is not None:
+    if exact_index is not None:
+        target_index = exact_index
         tokens[target_index][0] = canonical_key
         tokens[target_index][1] = sanitized
     else:
@@ -283,25 +287,15 @@ def _set_token_float(
     for idx in range(len(tokens) - 1, -1, -1):
         if idx == target_index:
             continue
-        token_key = tokens[idx][0]
-        if token_key == "K" and canonical_key != "K" and "K" not in aliases:
-            continue
-        if str(token_key).lower() in alias_set:
+        if any(_token_matches_alias(tokens[idx][0], alias) for alias in (canonical_key, *aliases)):
             tokens.pop(idx)
 
 
 def _remove_token_aliases(tokens: list[list[str]], aliases: tuple[str, ...]) -> None:
-    alias_set = {alias.lower() for alias in aliases}
-    exact_aliases = set(aliases)
     filtered: list[list[str]] = []
     for key, val in tokens:
-        lower = str(key).lower()
-        if lower not in alias_set:
+        if not any(_token_matches_alias(key, alias) for alias in aliases):
             filtered.append([key, val])
-            continue
-        if key == "K" and "K" not in exact_aliases:
-            filtered.append([key, val])
-            continue
     tokens[:] = filtered
 
 

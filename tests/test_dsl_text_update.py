@@ -752,6 +752,61 @@ def test_analyze_step_parameter_update_distinguishes_canonicalization_only_step_
     assert outcome.warning_reason is None
 
 
+def test_analyze_step_parameter_update_rewrites_keq_target_to_canonical_k_token():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; kf=6 ; Keq=3",
+        "K1",
+        5.0,
+        authoritative_current_value=3.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, K=5"
+    assert outcome.semantic_value_change is True
+    assert outcome.canonicalization_only_change is False
+
+
+def test_analyze_step_parameter_update_canonicalizes_keq_spelling_when_kf_is_rewritten():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; kf=6 ; Keq=3",
+        "kf1",
+        10.0,
+        authoritative_current_value=6.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=10, K=3"
+    assert "Keq" not in outcome.updated_text
+    assert outcome.semantic_value_change is True
+    assert outcome.canonicalization_only_change is False
+
+
+def test_analyze_step_parameter_update_marks_keq_spelling_only_rewrite_as_canonicalization_only():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; kf=1 ; Keq=3",
+        "K1",
+        3.0,
+        authoritative_current_value=3.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=1, K=3"
+    assert outcome.semantic_value_change is False
+    assert outcome.would_change_text is True
+    assert outcome.canonicalization_only_change is True
+
+
+def test_analyze_step_parameter_update_marks_k_eq_spelling_only_rewrite_as_canonicalization_only():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; K_eq=3 ; kf=1",
+        "K1",
+        3.0,
+        authoritative_current_value=3.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; K=3, kf=1"
+    assert outcome.semantic_value_change is False
+    assert outcome.would_change_text is True
+    assert outcome.canonicalization_only_change is True
+
+
 def test_analyze_parameter_updates_to_dsl_text_reports_step_floor_as_real_semantic_change():
     analysis = analyze_parameter_updates_to_dsl_text(
         "equilibrium: A <-> B ; kf=1, K=0",

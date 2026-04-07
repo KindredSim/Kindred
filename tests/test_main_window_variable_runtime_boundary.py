@@ -8,20 +8,12 @@ import pytest
 
 from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.gui.main_window import MainWindow
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FakeRuntimeHost:
-    _parse_mechanism_semicolon_kv = staticmethod(MainWindow._parse_mechanism_semicolon_kv)
-    _serialize_mechanism_semicolon_kv = staticmethod(MainWindow._serialize_mechanism_semicolon_kv)
-    _dedupe_tokens_case_insensitive = staticmethod(MainWindow._dedupe_tokens_case_insensitive)
-    _get_token_float = staticmethod(MainWindow._get_token_float)
-    _set_token_float = staticmethod(MainWindow._set_token_float)
-    _remove_token_aliases = staticmethod(MainWindow._remove_token_aliases)
-
     def __init__(
         self,
         *,
@@ -220,6 +212,35 @@ def test_runtime_extract_keeps_unsupported_let_named_set_blocks_invalid() -> Non
 
     assert host._slider_set_calls == []
     assert host.variable_slider_values() == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_mechanism_parameter_conflicts_canonicalizes_keq_to_k() -> None:
+    host = _FakeRuntimeHost(reactions_text="equilibrium: A <-> B ; kf=6 ; Keq=3")
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(
+        host.mechanism_reactions_text_raw()
+    )
+
+    assert sanitized_text == "equilibrium: A <-> B ; kf=6, K=3"
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_extract_keq_alias_writeback_preserves_equilibrium_value() -> None:
+    original_text = "equilibrium: A <-> B ; kf=6 ; Keq=3"
+    host = _FakeRuntimeHost(reactions_text=original_text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, _, _ = runtime.sanitize_mechanism_parameter_conflicts(original_text)
+    original = parse_dsl_to_mechanism(original_text, initials={})
+    sanitized = parse_dsl_to_mechanism(sanitized_text, initials={})
+
+    assert sanitized_text == "equilibrium: A <-> B ; kf=6, K=3"
+    assert float(original.equilibria[0].kf) == pytest.approx(float(sanitized.equilibria[0].kf))
+    assert float(original.equilibria[0].kr) == pytest.approx(float(sanitized.equilibria[0].kr))
 
 
 @pytest.mark.unit

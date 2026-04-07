@@ -175,7 +175,13 @@ def _norm_key(k: str) -> str:
     return _KEY_ALIASES.get(key.lower(), key)
 
 
-def _parse_keyvals(rest: str) -> Dict[str, str]:
+def _parse_keyvals(
+    rest: str,
+    *,
+    reject_duplicate_canonical_keys: bool = False,
+    line_number: int | None = None,
+    line_content: str | None = None,
+) -> Dict[str, str]:
     """
     Parse comma or semicolon-separated key=value pairs with lenient spacing.
 
@@ -183,6 +189,7 @@ def _parse_keyvals(rest: str) -> Dict[str, str]:
     Example: "kf=1.5; kr=0.25" -> {"kf":"1.5","kr":"0.25"}
     """
     out: Dict[str, str] = {}
+    original_spellings: Dict[str, str] = {}
     if not rest.strip():
         return out
     # Split on both commas and semicolons to support both formats
@@ -193,7 +200,21 @@ def _parse_keyvals(rest: str) -> Dict[str, str]:
             # tolerate stray tokens like "state=..." lines; raise for truly malformed
             raise invalid_keyvalue_pair_error(chunk)
         k, v = chunk.split("=", 1)
-        out[_norm_key(k)] = v.strip()
+        raw_key = k.strip()
+        canonical_key = _norm_key(raw_key)
+        previous_spelling = original_spellings.get(canonical_key)
+        if (
+            reject_duplicate_canonical_keys
+            and previous_spelling is not None
+            and previous_spelling != raw_key
+        ):
+            raise DSLError(
+                f"Duplicate parameter: '{previous_spelling}' and '{raw_key}' both resolve to {canonical_key}",
+                line_number=line_number,
+                line_content=line_content,
+            )
+        original_spellings[canonical_key] = raw_key
+        out[canonical_key] = v.strip()
     return out
 
 
@@ -857,9 +878,24 @@ def _parse_edge_step(
     return a, b
 
 
-def _split_stoich_and_params(text: str) -> Tuple[str, Dict[str, str]]:
+def _split_stoich_and_params(
+    text: str,
+    *,
+    reject_duplicate_canonical_keys: bool = False,
+    line_number: int | None = None,
+    line_content: str | None = None,
+) -> Tuple[str, Dict[str, str]]:
     stoich_part, *tail = _SEMI_SPLIT_RE.split(text, maxsplit=1)
-    params = _parse_keyvals(tail[0]) if tail else {}
+    params = (
+        _parse_keyvals(
+            tail[0],
+            reject_duplicate_canonical_keys=reject_duplicate_canonical_keys,
+            line_number=line_number,
+            line_content=line_content,
+        )
+        if tail
+        else {}
+    )
     return stoich_part, params
 
 
@@ -1129,7 +1165,12 @@ def _parse_reaction_step(
     line_number: int,
     line_content: str,
 ) -> ParsedStep:
-    stoich_part, params = _split_stoich_and_params(rest)
+    stoich_part, params = _split_stoich_and_params(
+        rest,
+        reject_duplicate_canonical_keys=True,
+        line_number=line_number,
+        line_content=line_content,
+    )
     return _parse_reaction_like_step(
         stoich_part=stoich_part,
         params=params,
@@ -1153,7 +1194,12 @@ def _parse_bare_arrow_step(
     line_number: int,
     line_content: str,
 ) -> ParsedStep:
-    stoich_part, params = _split_stoich_and_params(line)
+    stoich_part, params = _split_stoich_and_params(
+        line,
+        reject_duplicate_canonical_keys=True,
+        line_number=line_number,
+        line_content=line_content,
+    )
     return _parse_reaction_like_step(
         stoich_part=stoich_part,
         params=params,
@@ -1180,7 +1226,12 @@ def _parse_equilibrium_step(
     from .common import molecularity
     from .kinetics import normalize_energy_to_J_per_mol
 
-    stoich_part, params = _split_stoich_and_params(rest)
+    stoich_part, params = _split_stoich_and_params(
+        rest,
+        reject_duplicate_canonical_keys=True,
+        line_number=line_number,
+        line_content=line_content,
+    )
     try:
         react, prod, arrow = _parse_stoich(stoich_part)
     except DSLError as exc:

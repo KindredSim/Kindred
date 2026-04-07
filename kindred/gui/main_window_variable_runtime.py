@@ -7,6 +7,15 @@ import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from kindred.core.api.simulation import prepare_bound_mechanism
+from kindred.core.simulator.dsl_text_update import (
+    _dedupe_tokens_case_insensitive,
+    _get_token_float,
+    _is_equilibrium_k_token,
+    _parse_mechanism_semicolon_kv,
+    _remove_token_aliases,
+    _serialize_mechanism_semicolon_kv,
+    _set_token_float,
+)
 
 if TYPE_CHECKING:
     from kindred.core.simulation_preparation import BoundMechanism
@@ -114,14 +123,6 @@ class MainWindowVariableRuntime:
         self,
         text: str,
     ) -> tuple[str, "OrderedDict[str, float]", "OrderedDict[str, Dict[str, object]]"]:
-        mw = self._mw
-        parse_components = mw._parse_mechanism_semicolon_kv
-        serialize_line = mw._serialize_mechanism_semicolon_kv
-        dedupe_tokens = mw._dedupe_tokens_case_insensitive
-        get_value = mw._get_token_float
-        set_value = mw._set_token_float
-        remove_keys = mw._remove_token_aliases
-
         lines = text.split("\n")
         changed = False
         variables: OrderedDict[str, float] = OrderedDict()
@@ -133,16 +134,18 @@ class MainWindowVariableRuntime:
                 continue
 
             lower = stripped.lower()
-            prefix, tokens, comment = parse_components(line)
-            tokens = dedupe_tokens(tokens)
+            prefix, tokens, comment = _parse_mechanism_semicolon_kv(line)
+            tokens = _dedupe_tokens_case_insensitive(tokens)
 
             original_line = line
 
             if "<->" in lower or "<=>" in lower:
-                k_explicit = any(k == "K" for k, _ in tokens)
-                kf_val = get_value(tokens, ("kf", "k"))
-                kr_val = get_value(tokens, ("kr",))
-                k_val = get_value(tokens, ("K",)) if k_explicit else None
+                if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
+                    continue
+                k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
+                kf_val = _get_token_float(tokens, ("kf", "k"))
+                kr_val = _get_token_float(tokens, ("kr",))
+                k_val = _get_token_float(tokens, ("K",)) if k_explicit else None
 
                 if kf_val is not None and (not math.isfinite(kf_val) or kf_val <= 0):
                     kf_val = None
@@ -152,20 +155,20 @@ class MainWindowVariableRuntime:
                     k_val = None
 
                 if kf_val is not None:
-                    set_value(tokens, "kf", kf_val, aliases=("k",))
+                    _set_token_float(tokens, "kf", kf_val, aliases=("k",))
                 if kr_val is not None:
-                    set_value(tokens, "kr", kr_val)
+                    _set_token_float(tokens, "kr", kr_val)
                 if k_explicit and k_val is not None:
-                    set_value(tokens, "K", k_val)
+                    _set_token_float(tokens, "K", k_val)
 
-                remove_keys(tokens, ("k",))
-                new_line = serialize_line(prefix, tokens, comment)
+                _remove_token_aliases(tokens, ("k",))
+                new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
             elif "->" in lower:
-                rate_val = get_value(tokens, ("k", "kf"))
+                rate_val = _get_token_float(tokens, ("k", "kf"))
                 if rate_val is not None:
-                    set_value(tokens, "k", rate_val)
-                remove_keys(tokens, ("kf", "kr"))
-                new_line = serialize_line(prefix, tokens, comment)
+                    _set_token_float(tokens, "k", rate_val)
+                _remove_token_aliases(tokens, ("kf", "kr"))
+                new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
             else:
                 continue
 

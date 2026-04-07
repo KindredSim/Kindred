@@ -532,6 +532,30 @@ class TestDirectiveErrorLineContext:
 
 
 class TestKeqAliases:
+    def test_duplicate_keq_and_k_on_equilibrium_rejected_with_line_context(self):
+        dsl = "equilibrium: A <-> B ; kf=6 ; Keq=3 ; K=5"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "Keq" in str(exc_info.value)
+        assert "K" in str(exc_info.value)
+
+    def test_duplicate_keq_and_k_eq_on_reaction_rejected_with_line_context(self):
+        dsl = "reaction: A <-> B ; Keq=3 ; K_eq=5 ; kf=1"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "Keq" in str(exc_info.value)
+        assert "K_eq" in str(exc_info.value)
+
+    def test_duplicate_k_and_keq_on_bare_equilibrium_rejected_with_line_context(self):
+        dsl = "A <-> B ; K=3 ; keq=5 ; kf=1"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "K" in str(exc_info.value)
+        assert "keq" in str(exc_info.value)
+
     def test_keq_alias_on_reaction(self):
         ref = parse_dsl("A <-> B ; kf=10 ; K=2.0")
         result = parse_dsl("A <-> B ; kf=10 ; Keq=2.0")
