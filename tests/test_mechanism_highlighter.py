@@ -239,3 +239,44 @@ def test_multi_token_priority(doc_and_hl):
     # "50" → NUMBER
     num_pos = text.index("50")
     assert _color_at(doc, hl, num_pos) == NUMBER
+
+
+def test_algebra_section_does_not_apply_mechanism_rate_highlighting(doc_and_hl):
+    doc, hl = doc_and_hl
+    text = "\n".join(
+        [
+            "equilibrium: A <-> B ; K=1 ; Keq=2 ; K_eq=3 ; KF=4 ; Kr=5 ; kappa=6",
+            "# Algebra",
+            "param K = 1",
+            "param KF = 2",
+            "param Kr = 3",
+        ]
+    )
+    doc.setPlainText(text)
+
+    for token in ["K=", "Keq=", "K_eq=", "KF=", "Kr=", "kappa="]:
+        assert _color_at(doc, hl, text.index(token)) == RATE
+
+    for token in ["K", "KF", "Kr"]:
+        pos = text.rindex(f"param {token}") + len("param ")
+        assert _color_at(doc, hl, pos) != RATE
+
+
+def test_mechanism_rate_highlighting_resumes_after_algebra_section_boundary(doc_and_hl):
+    doc, hl = doc_and_hl
+    text = "\n".join(
+        [
+            "equilibrium: A <-> B ; K=1",
+            "# Algebra",
+            "param K = 1",
+            "# Notes",
+            "equilibrium: B <-> C ; Keq=2",
+        ]
+    )
+    doc.setPlainText(text)
+
+    algebra_pos = text.index("param K") + len("param ")
+    assert _color_at(doc, hl, algebra_pos) != RATE
+
+    resumed_pos = text.rindex("Keq=")
+    assert _color_at(doc, hl, resumed_pos) == RATE

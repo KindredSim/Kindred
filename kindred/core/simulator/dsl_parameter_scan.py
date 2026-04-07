@@ -67,7 +67,7 @@ def _parameter_family(key: str) -> str | None:
 
     if normalized == "Keq":
         return "Keq"
-    if normalized.startswith("Keq") and normalized[4:].isdigit():
+    if normalized.startswith("Keq") and normalized[3:].isdigit():
         return "Keq"
 
     return None

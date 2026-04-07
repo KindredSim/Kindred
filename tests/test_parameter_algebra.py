@@ -265,6 +265,53 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
     assert exc.value.line_content == "param Keq2 = a"
 
 
+def test_param_k_alias_canonicalizes_to_equilibrium_parameter_namespace():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=6.0; K=3.0",
+            "# Algebra",
+            "param K1 = 5",
+        ]
+    )
+    mech = _base_mech(dsl)
+
+    apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
+    assert float(mech.equilibria[0].Keq) == pytest.approx(5.0)
+
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param K1 = 5",
+            ]
+        ),
+        mechanism_param_names={"kf1", "kr1", "Keq1"},
+    )
+
+    assert [assignment.name for assignment in spec.param_statements] == ["Keq1"]
+
+    derived = evaluate_parameter_algebra(
+        spec,
+        base_values={"kf1": 6.0, "Keq1": 3.0},
+    )
+
+    assert derived["Keq1"] == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("line", ["let K1 = 5", "K1 = 5"])
+def test_k_alias_non_param_assignments_fail_clearly_for_mechanism_namespace(line):
+    with pytest.raises(DSLError, match="rate/equilibrium parameter"):
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(
+                [
+                    "# Algebra",
+                    line,
+                ]
+            ),
+            mechanism_param_names={"kf1", "kr1", "Keq1"},
+        )
+
+
 def test_rate_constant_unit_formatting():
     assert rate_constant_unit(1) == "1/s"
     assert rate_constant_unit(2) == "1/(M s)"

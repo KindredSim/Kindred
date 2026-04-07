@@ -11,6 +11,14 @@ _PARAM_STMT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s
 _LET_STMT_RE = re.compile(r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
+_LEGACY_KEQ_PARAM_RE = re.compile(r"^K(\d+)$")
+
+
+def _normalize_mechanism_param_target(name: str) -> str:
+    alias_match = _LEGACY_KEQ_PARAM_RE.match(name)
+    if alias_match is None:
+        return name
+    return f"Keq{alias_match.group(1)}"
 
 
 @dataclass(frozen=True)
@@ -136,7 +144,8 @@ def extract_parameter_assignments_from_algebra_lines(
 
         m_param = _PARAM_STMT_RE.match(code)
         if m_param:
-            name = m_param.group(1)
+            raw_name = m_param.group(1)
+            name = _normalize_mechanism_param_target(raw_name)
             expr = m_param.group(2).strip()
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
@@ -148,7 +157,7 @@ def extract_parameter_assignments_from_algebra_lines(
             m_mech = _MECH_PARAM_RE.match(name)
             if m_mech and name not in mechanism_param_names:
                 raise DSLError(
-                    f"Unknown mechanism parameter {name!r} in Algebra param statement",
+                    f"Unknown mechanism parameter {raw_name!r} in Algebra param statement",
                     suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, Keq1) or define the parameter on a reaction line.",
                     examples=["reaction: A -> B; k=1.0", "param k1 = 4*k2"],
                     line_number=line_no,
@@ -174,12 +183,13 @@ def extract_parameter_assignments_from_algebra_lines(
 
         m_let = _LET_STMT_RE.match(code)
         if m_let:
-            target = m_let.group(1)
+            target_raw = m_let.group(1)
+            target = _normalize_mechanism_param_target(target_raw)
             if target in mechanism_param_names:
                 raise DSLError(
-                    f"{target!r} is a rate/equilibrium parameter; use 'param {target} = ...' for parameter algebra",
-                    suggestion=f"Replace this with: param {target} = ...",
-                    examples=[f"param {target} = 4*k2"],
+                    f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
+                    suggestion=f"Replace this with: param {target_raw} = ...",
+                    examples=[f"param {target_raw} = 4*k2"],
                     line_number=line_no,
                     line_content=original,
                 )
@@ -187,12 +197,13 @@ def extract_parameter_assignments_from_algebra_lines(
 
         m_assign = _ASSIGN_RE.match(code)
         if m_assign:
-            target = m_assign.group(1)
+            target_raw = m_assign.group(1)
+            target = _normalize_mechanism_param_target(target_raw)
             if target in mechanism_param_names:
                 raise DSLError(
-                    f"{target!r} is a rate/equilibrium parameter; use 'param {target} = ...' for parameter algebra",
-                    suggestion=f"Replace this with: param {target} = ...",
-                    examples=[f"param {target} = 4*k2"],
+                    f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
+                    suggestion=f"Replace this with: param {target_raw} = ...",
+                    examples=[f"param {target_raw} = 4*k2"],
                     line_number=line_no,
                     line_content=original,
                 )

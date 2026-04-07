@@ -29,6 +29,8 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         highlighter = MechanismHighlighter(text_edit.document())
     """
 
+    _ALGEBRA_BLOCK_STATE = 1
+
     def __init__(self, parent: Optional[QtCore.QObject] = None):
         """
         Initialize syntax highlighter.
@@ -95,11 +97,11 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
 
         # 1. Species names (broad catch-all, lowest effective priority)
         species_pattern = r'\b[A-Z][A-Za-z0-9_]*\b'
-        self.rules.append((re.compile(species_pattern), 'species'))
+        self.rules.append((re.compile(species_pattern), 'species', True))
 
         # 2. Numbers (1.0, 1e-5, .5, etc.)
         number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
-        self.rules.append((re.compile(number_pattern), 'number'))
+        self.rules.append((re.compile(number_pattern), 'number', True))
 
         # 3. Rate constants (k=, kf=, kr=, K=, kappa=, κ=)
         rate_patterns = [
@@ -109,7 +111,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
             (r'\bκ\s*=', 0),                           # κ= (Unicode kappa)
         ]
         for pattern, flags in rate_patterns:
-            self.rules.append((re.compile(pattern, flags), 'rate'))
+            self.rules.append((re.compile(pattern, flags), 'rate', False))
 
         # 4. Energy/thermodynamic terms (Ea=, dG_act=, dG_eq=, A=, T=, etc.)
         energy_terms = [
@@ -118,7 +120,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
             r'\bC0\s*=', r'\bC°\s*=', r'\bdegeneracy\s*=',
         ]
         for term in energy_terms:
-            self.rules.append((re.compile(term, re.IGNORECASE), 'energy'))
+            self.rules.append((re.compile(term, re.IGNORECASE), 'energy', True))
 
         # 5. Keywords (reaction, equilibrium, init, etc.)
         keywords = [
@@ -127,7 +129,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
             'temp_const', 'temp_step', 'temp_response', 'state', 'edge',
         ]
         keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
-        self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword'))
+        self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword', False))
 
         # 6. Operators (->, =>, <->, <=>, <-, +)
         # Applied after rate/energy so arrow `=` is not consumed by `A=` patterns.
@@ -140,13 +142,21 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
             r'\+',   # Addition (in reactions)
         ]
         for op in operators:
-            self.rules.append((re.compile(op), 'operator'))
+            self.rules.append((re.compile(op), 'operator', True))
 
         # 7. Initial conditions ([Species] = value)
-        self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial'))
+        self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial', True))
 
         # 8. Comments (applied last — highest effective priority)
-        self.rules.append((re.compile(r'#[^\n]*'), 'comment'))
+        self.rules.append((re.compile(r'#[^\n]*'), 'comment', True))
+
+    @staticmethod
+    def _is_algebra_header(stripped: str) -> bool:
+        return stripped.lower().startswith("# algebra")
+
+    @classmethod
+    def _is_section_boundary(cls, stripped: str) -> bool:
+        return stripped.lower().startswith("# ") and not cls._is_algebra_header(stripped)
 
     def highlightBlock(self, text: str):
         """
@@ -159,8 +169,18 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         text : str
             Text to highlight
         """
+        stripped = text.strip()
+        previous_state = self.previousBlockState()
+        starts_algebra = self._is_algebra_header(stripped)
+        ends_algebra = previous_state == self._ALGEBRA_BLOCK_STATE and self._is_section_boundary(stripped)
+        in_algebra_body = previous_state == self._ALGEBRA_BLOCK_STATE and not starts_algebra and not ends_algebra
+        next_state = self._ALGEBRA_BLOCK_STATE if (starts_algebra or in_algebra_body) else 0
+        self.setCurrentBlockState(next_state)
+
         # Apply all rules in order
-        for pattern, format_name in self.rules:
+        for pattern, format_name, applies_in_algebra in self.rules:
+            if in_algebra_body and not applies_in_algebra:
+                continue
             format_obj = self.formats[format_name]
 
             # Find all matches

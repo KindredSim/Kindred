@@ -1391,7 +1391,7 @@ class FittingWindow(QtWidgets.QDialog):
                 f"Observable name '{obs_name}' conflicts with a mechanism species name.",
             )
             return False
-        if re.match(r"^(k|kf|kr|K)\d+$", obs_name):
+        if re.match(r"^(?:k|kf|kr|Keq|K)\d+$", obs_name):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Add Observable",

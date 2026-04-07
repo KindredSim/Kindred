@@ -220,7 +220,7 @@ def test_validate_observable_name_rejects_rate_constant_patterns(qt_app, monkeyp
     window = _make_window()
     try:
         st = SymbolTable()
-        must_reject = ["k1", "kf3", "kr10", "K5"]
+        must_reject = ["k1", "kf3", "kr10", "K5", "Keq5"]
         for name in must_reject:
             result = window._validate_observable_name_rules(
                 name, mechanism_species=set(), symbol_table=st,
