@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_parallel import run_batch_simulation_task
+
 pytestmark = [pytest.mark.gui]
 
 
@@ -76,6 +78,10 @@ def _queue_slider_run(main_window) -> None:
     main_window.simulation_controller.run_simulation_from_slider()
 
 
+def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:
+    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+
+
 def _result_payload(task: Dict[str, Any], marker: float) -> Dict[str, Any]:
     sid = str(task.get("set_id") or "")
     return {
@@ -109,7 +115,8 @@ def test_parallel_completion_consumes_done_futures_in_completion_order(main_wind
     )
 
     _queue_slider_run(main_window)
-    assert len(fake.submissions) >= 3
+    simulation_submissions = _simulation_submissions(fake)
+    assert len(simulation_submissions) >= 3
 
     processed: list[str] = []
     monkeypatch.setattr(
@@ -119,14 +126,14 @@ def test_parallel_completion_consumes_done_futures_in_completion_order(main_wind
         raising=True,
     )
 
-    first = dict(fake.submissions[0].args[0])
-    last = dict(fake.submissions[-1].args[0])
+    first = dict(simulation_submissions[0].args[0])
+    last = dict(simulation_submissions[-1].args[0])
     sid_first = str(first.get("set_id") or "")
     sid_last = str(last.get("set_id") or "")
     assert sid_first and sid_last and sid_first != sid_last
 
-    fake.submissions[-1].future.set_result(_result_payload(last, marker=3.0))
-    fake.submissions[0].future.set_result(_result_payload(first, marker=1.0))
+    simulation_submissions[-1].future.set_result(_result_payload(last, marker=3.0))
+    simulation_submissions[0].future.set_result(_result_payload(first, marker=1.0))
 
     main_window.simulation_controller.poll_parallel_batch_futures()
 

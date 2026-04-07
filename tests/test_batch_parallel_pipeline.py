@@ -3,11 +3,13 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_parallel import run_batch_simulation_task
 
 pytestmark = [pytest.mark.gui]
 
@@ -32,24 +34,27 @@ class _FakeExecutor:
         sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs), future=fut)
         self.submissions.append(sub)
         if self.done_immediately:
-            task = dict(args[0] if args else {})
-            sid = str(task.get("set_id") or task.get("batch_set_id") or "")
-            fut.set_result(
-                {
-                    "run_id": int(task.get("run_id") or 0),
-                    "set_id": sid,
-                    "set_name": str(task.get("set_name") or sid or "set"),
-                    "t": np.array([0.0, 1.0]),
-                    "Y": np.array([[self.value_marker, self.value_marker]]),
-                    "species_names": ["A"],
-                    "algebra_scalars": {},
-                    "mechanism": None,
-                    "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
-                    "solver_config": dict(task.get("solver_config") or {}),
-                    "fallback_occurred": False,
-                    "fallback_message": None,
-                }
-            )
+            if fn is run_batch_simulation_task:
+                task = dict(args[0] if args else {})
+                sid = str(task.get("set_id") or task.get("batch_set_id") or "")
+                fut.set_result(
+                    {
+                        "run_id": int(task.get("run_id") or 0),
+                        "set_id": sid,
+                        "set_name": str(task.get("set_name") or sid or "set"),
+                        "t": np.array([0.0, 1.0]),
+                        "Y": np.array([[self.value_marker, self.value_marker]]),
+                        "species_names": ["A"],
+                        "algebra_scalars": {},
+                        "mechanism": None,
+                        "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
+                        "solver_config": dict(task.get("solver_config") or {}),
+                        "fallback_occurred": False,
+                        "fallback_message": None,
+                    }
+                )
+            else:
+                fut.set_result(True)
         return fut
 
     def shutdown(self, wait=True, cancel_futures=False):
@@ -92,6 +97,10 @@ def _prime_three_batch_sets(main_window) -> list[str]:
     return names[:3]
 
 
+def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:
+    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+
+
 
 def test_worker_policy_uses_num_sets_cpu_minus_one_and_cap(monkeypatch):
     from kindred.core.batch_parallel import compute_effective_batch_workers
@@ -125,7 +134,7 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
     main_window.simulation_controller.run_simulation()
     qtbot.wait(40)
 
-    assert len(fake.submissions) == len(names)
+    assert len(_simulation_submissions(fake)) == len(names)
 
 
 
@@ -162,7 +171,7 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
     cache_key = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     assert cache_key
 
-    for sub in old_exec.submissions:
+    for sub in _simulation_submissions(old_exec):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
         sub.future.set_result(
@@ -182,7 +191,7 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
             }
         )
 
-    for sub in new_exec.submissions:
+    for sub in _simulation_submissions(new_exec):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
         sub.future.set_result(
@@ -205,7 +214,7 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
     qtbot.wait(80)
 
     cached_payloads = []
-    for sub in new_exec.submissions:
+    for sub in _simulation_submissions(new_exec):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
         payload = main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{sid}")
@@ -367,9 +376,11 @@ def test_open_solver_settings_wires_parallel_batch_controls(main_window, monkeyp
         "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
         _FakeDialog,
     )
+    main_window.simulation_controller.parallel_batch_pool_settings_changed = MagicMock()
     main_window._open_solver_settings()
     assert int(main_window.simulation_controller.parallel_batch.max_parallel_workers) == 7
     assert bool(main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker) is False
+    main_window.simulation_controller.parallel_batch_pool_settings_changed.assert_called_once_with()
 
 
 def test_open_solver_settings_persists_preview_debounce_controls(main_window, monkeypatch):

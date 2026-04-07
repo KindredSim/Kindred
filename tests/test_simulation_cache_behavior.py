@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
+from kindred.core.batch_parallel import run_batch_simulation_task
+
 
 def _fake_sim_result(*, marker: float = 1.0) -> dict:
     t = np.asarray([0.0, 1.0], dtype=float)
@@ -142,6 +144,10 @@ class _FakeExecutor:
 
     def shutdown(self, wait=True, cancel_futures=False):
         return None
+
+
+def _simulation_submissions(executor: _FakeExecutor) -> list[_FakeExecutorSubmission]:
+    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
 
 
 def _current_preview_identity_payload(
@@ -1872,11 +1878,12 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
     main_window.simulation_controller.run_simulation_from_slider()
     qt_app.processEvents()
 
-    assert len(fake.submissions) >= 2
+    simulation_submissions = _simulation_submissions(fake)
+    assert len(simulation_submissions) >= 2
 
-    first_task = dict(fake.submissions[0].args[0])
+    first_task = dict(simulation_submissions[0].args[0])
     assert str(first_task.get("set_id") or "") == primary_id
-    fake.submissions[0].future.set_result(
+    simulation_submissions[0].future.set_result(
         {
             "run_id": int(first_task.get("run_id") or 0),
             "set_id": str(first_task.get("set_id") or ""),
@@ -1959,20 +1966,22 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     main_window.simulation_controller.run_simulation_from_slider()
     qt_app.processEvents()
 
-    assert len(fake.submissions) == 2
+    simulation_submissions = _simulation_submissions(fake)
+    assert len(simulation_submissions) == 2
 
     main_window._on_variable_changed("k1", 3.0)
     main_window._preview_session.stop_variable_update_timer()
     main_window.simulation_controller.run_simulation_from_slider()
     qt_app.processEvents()
 
-    assert len(fake.submissions) == 4
-    assert fake.submissions[0].future.cancelled() is True
-    assert fake.submissions[1].future.cancelled() is True
+    simulation_submissions = _simulation_submissions(fake)
+    assert len(simulation_submissions) == 4
+    assert simulation_submissions[0].future.cancelled() is True
+    assert simulation_submissions[1].future.cancelled() is True
 
-    first_generation_task = dict(fake.submissions[0].args[0])
+    first_generation_task = dict(simulation_submissions[0].args[0])
     replay_submission = next(
-        sub for sub in fake.submissions[2:] if str(sub.args[0].get("set_id") or "") == str(primary_id)
+        sub for sub in simulation_submissions[2:] if str(sub.args[0].get("set_id") or "") == str(primary_id)
     )
     replay_task = dict(replay_submission.args[0])
     replay_submission.future.set_result(
@@ -2001,7 +2010,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
         coalescer_timer.timeout.emit()
         qt_app.processEvents()
 
-    assert len(fake.submissions) == 4
+    assert len(_simulation_submissions(fake)) == 4
     assert int(replay_task.get("request_id") or 0) > int(first_generation_task.get("request_id") or 0)
     plot = main_window._plot_tabs._main_plot
     assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)

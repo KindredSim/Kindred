@@ -4506,6 +4506,150 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
 
 
 @pytest.mark.unit
+def test_parallel_batch_pool_settings_changed_shuts_down_idle_pool_immediately(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    class _FakeExecutor:
+        def __init__(self) -> None:
+            self._max_workers = 2
+            self.shutdown_calls: list[dict[str, object]] = []
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_calls.append(
+                {
+                    "wait": bool(wait),
+                    "cancel_futures": bool(cancel_futures),
+                }
+            )
+
+    fake = _FakeExecutor()
+    controller.parallel_batch.executor = fake
+    controller.batch_run_context = {}
+    controller.parallel_batch.future_map = {}
+    controller.parallel_batch.superseded_future_map = {}
+
+    controller.parallel_batch_pool_settings_changed()
+
+    assert fake.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert controller.parallel_batch.executor is None
+
+
+@pytest.mark.unit
+def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_completion(
+    mw: _FakeMainWindow, controller: SimulationController, monkeypatch
+):
+    class _FakeExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self._max_workers = int(max_workers)
+            self.shutdown_calls: list[dict[str, object]] = []
+
+        def submit(self, _fn, *_args, **_kwargs):
+            return object()
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_calls.append(
+                {
+                    "wait": bool(wait),
+                    "cancel_futures": bool(cancel_futures),
+                }
+            )
+
+    current = _FakeExecutor(2)
+    created: list[tuple[int, bool, _FakeExecutor]] = []
+
+    def _factory(max_workers: int, limit_blas_threads: bool) -> _FakeExecutor:
+        executor = _FakeExecutor(max_workers)
+        created.append((int(max_workers), bool(limit_blas_threads), executor))
+        return executor
+
+    controller.parallel_batch.executor = current
+    controller.parallel_batch.executor_factory = _factory
+    controller.parallel_batch.max_parallel_workers = 6
+    controller.batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "keep_executor_alive": True,
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "completed_set_ids": [],
+        "total": 1,
+        "fast_mode": False,
+        "primary_set_id": "other-id",
+    }
+    controller._active_run_id = 3
+    controller.run_state.latest_sim_request_id = 11
+    mw._batch_current_row.return_value = None
+    monkeypatch.setattr(controller, "_resolve_completion_mechanism", MagicMock(return_value=None))
+    monkeypatch.setattr(controller, "_update_primary_result_materialization_contract", MagicMock(return_value=False))
+
+    controller.parallel_batch_pool_settings_changed()
+
+    assert controller.parallel_batch.executor is current
+    assert controller.parallel_batch._pool_stale is True
+    assert current.shutdown_calls == []
+
+    controller.on_simulation_complete(
+        {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "Y": np.asarray([[1.0, 1.0]], dtype=float),
+            "species_names": ["A"],
+            "algebra_scalars": {},
+            "mechanism": None,
+            "mechanism_text": "",
+            "solver_config": {},
+            "fallback_occurred": False,
+            "fallback_message": None,
+        },
+        run_id=3,
+        fast_mode=False,
+        request_id=11,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="cache-key",
+    )
+
+    assert current.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert controller.parallel_batch.executor is None
+
+    recreated = controller.parallel_batch.ensure_executor(max_workers=6)
+
+    assert created == [(6, True, recreated)]
+    assert controller.parallel_batch.executor is recreated
+
+
+@pytest.mark.unit
+def test_ensure_parallel_batch_pool_eagerly_created_only_once(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    created: list[tuple[int, bool]] = []
+
+    class _FakeExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self._max_workers = int(max_workers)
+
+        def submit(self, _fn, *_args, **_kwargs):
+            return object()
+
+        def shutdown(self, *args, **kwargs):
+            _ = args, kwargs
+            return None
+
+    def _factory(max_workers: int, limit_blas_threads: bool) -> _FakeExecutor:
+        created.append((int(max_workers), bool(limit_blas_threads)))
+        return _FakeExecutor(max_workers)
+
+    controller.parallel_batch.max_parallel_workers = 5
+    controller.parallel_batch.executor_factory = _factory
+
+    controller.ensure_parallel_batch_pool_eagerly_created()
+    first = controller.parallel_batch.executor
+    controller.ensure_parallel_batch_pool_eagerly_created()
+
+    assert created == [(5, True)]
+    assert controller.parallel_batch.executor is first
+
+
+@pytest.mark.unit
 def test_start_next_batch_simulation_invalid_initials_after_pending_init_migration_reinvalidates_preserved_results(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):

@@ -8600,6 +8600,8 @@ class MainWindow(
                 self._use_sparse_jacobian = bool(settings['use_sparse_jacobian'])
             if 'wegscheider_cyclicity_enabled' in settings:
                 self._wegscheider_cyclicity_enabled = bool(settings['wegscheider_cyclicity_enabled'])
+            previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
+            previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             if 'max_parallel_batch_workers' in settings:
                 try:
                     self._sim_controller.parallel_batch.max_parallel_workers = max(
@@ -8612,6 +8614,12 @@ class MainWindow(
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
                     settings['limit_blas_threads_per_worker']
                 )
+            if (
+                previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
+                or previous_limit_blas_threads
+                != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
+            ):
+                self._sim_controller.parallel_batch_pool_settings_changed()
             if 'result_cache_cap' in settings or 'preview_cache_cap' in settings:
                 self.set_simulation_cache_caps(
                     result_cap=int(

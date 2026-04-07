@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_parallel import run_batch_simulation_task
+
 pytestmark = [pytest.mark.gui]
 
 
@@ -75,6 +77,10 @@ def _queue_slider_run(main_window) -> None:
     main_window.simulation_controller.run_simulation_from_slider()
 
 
+def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:
+    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+
+
 def test_slider_updates_coalesce_to_one_timer_fire(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B ; k=0.25\ninitial: A=1.0\ninitial: B=0.0"
@@ -111,7 +117,7 @@ def test_slider_parallel_path_submits_all_selected_sets(main_window, monkeypatch
 
     _queue_slider_run(main_window)
 
-    assert len(fake.submissions) == len(names)
+    assert len(_simulation_submissions(fake)) == len(names)
     assert bool(main_window.simulation_controller.batch_run_context.get("parallel")) is True
     assert int(main_window.simulation_controller.batch_run_context.get("effective_workers") or 0) > 1
     main_window.simulation_controller.shutdown_batch_executor(force_terminate=True)
@@ -141,7 +147,7 @@ def test_slider_parallel_path_uses_per_set_local_mechanism_workspaces(main_windo
 
     _queue_slider_run(main_window)
 
-    submitted_by_set_id = {str(sub.args[0]["set_id"]): dict(sub.args[0]) for sub in fake.submissions}
+    submitted_by_set_id = {str(sub.args[0]["set_id"]): dict(sub.args[0]) for sub in _simulation_submissions(fake)}
     assert len(submitted_by_set_id) == 3
     assert "k=0.5" in str(submitted_by_set_id[set0_id]["mechanism_text"])
     assert "k=0.75" in str(submitted_by_set_id[set1_id]["mechanism_text"])

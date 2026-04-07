@@ -193,6 +193,7 @@ class SimulationController(QtCore.QObject):
             executor_factory=_default_batch_executor_factory,
             max_parallel_workers=12,
             limit_blas_threads_per_worker=True,
+            record_nonfatal_exception=self._record_nonfatal_exception,
         )
 
         self._batch_future_poll_timer = QtCore.QTimer(self)
@@ -214,6 +215,7 @@ class SimulationController(QtCore.QObject):
         self._retained_simulation_workers: List[object] = []
         self._shutdown_requested_for_close: bool = False
         self._discarded_slider_preview_generation_id: Optional[int] = None
+        self._pool_eagerly_created: bool = False
 
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
@@ -548,6 +550,12 @@ class SimulationController(QtCore.QObject):
 
     def shutdown_batch_executor(self, *, force_terminate: bool) -> None:
         self._shutdown_batch_executor(force_terminate=force_terminate)
+
+    def parallel_batch_pool_settings_changed(self) -> None:
+        self._parallel_batch_pool_settings_changed()
+
+    def ensure_parallel_batch_pool_eagerly_created(self) -> None:
+        self._ensure_parallel_batch_pool_eagerly_created()
 
     def release_current_simulation_worker(self) -> None:
         self._release_current_simulation_worker()
@@ -954,6 +962,61 @@ class SimulationController(QtCore.QObject):
                 bool(force_terminate),
                 int(prior_futures),
             )
+
+    def _has_active_parallel_batch_work(self) -> bool:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"):
+            return True
+        return bool(self._batch_parallel.future_map) or bool(self._batch_parallel.superseded_future_map)
+
+    def _parallel_batch_pool_settings_changed(self) -> None:
+        if self._has_active_parallel_batch_work():
+            self._batch_parallel._pool_stale = True
+            return
+        self._shutdown_batch_executor(force_terminate=False)
+
+    def _ensure_parallel_batch_pool_eagerly_created(self) -> None:
+        if self._pool_eagerly_created:
+            return
+        self._pool_eagerly_created = True
+        try:
+            self._batch_parallel.ensure_executor(
+                max_workers=max(1, int(self._batch_parallel.max_parallel_workers))
+            )
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to eagerly create parallel batch pool after mechanism parse",
+                exc,
+            )
+
+    def _cleanup_parallel_batch_executor_after_run(
+        self,
+        *,
+        keep_executor_alive: bool,
+        clear_pending_plot_updates: bool = False,
+        stale_fast_handoff_after_display: bool = False,
+    ) -> None:
+        if bool(keep_executor_alive) and (not bool(self._batch_parallel._pool_stale)):
+            if stale_fast_handoff_after_display:
+                cancelled, running = self._batch_parallel.soft_supersede()
+                timer = getattr(self, "_batch_future_poll_timer", None)
+                if running > 0 and timer is not None:
+                    timer.start()
+                if bool(getattr(self, "_debug_batch_parallel", False)):
+                    logger.info(
+                        "BATCH_PAR soft handoff after stale preview display cancelled=%s running=%s",
+                        int(cancelled),
+                        int(running),
+                    )
+            else:
+                self._batch_parallel.reset_active_run_state()
+            self._stop_batch_future_poll_timer_if_idle()
+            if bool(clear_pending_plot_updates):
+                self._clear_pending_slider_plot_updates()
+            if bool(getattr(self, "_debug_batch_parallel", False)):
+                logger.info("BATCH_PAR keeping executor alive after slider batch completion")
+            return
+        self._shutdown_batch_executor(force_terminate=False)
 
     def _supersede_parallel_batch_run_soft(self) -> None:
         """
@@ -3006,12 +3069,10 @@ class SimulationController(QtCore.QObject):
                     self._release_current_simulation_worker()
 
                     keep_executor_alive = bool(isinstance(ctx, dict) and ctx.get("parallel") and ctx.get("keep_executor_alive"))
-                    if keep_executor_alive:
-                        self._batch_parallel.reset_active_run_state()
-                        self._stop_batch_future_poll_timer_if_idle()
-                        self._clear_pending_slider_plot_updates()
-                    else:
-                        self._shutdown_batch_executor(force_terminate=False)
+                    self._cleanup_parallel_batch_executor_after_run(
+                        keep_executor_alive=keep_executor_alive,
+                        clear_pending_plot_updates=True,
+                    )
 
                     self.ui.slider.set_slider_triggered_simulation(False)
                     self._simulation_running = False
@@ -3704,25 +3765,10 @@ class SimulationController(QtCore.QObject):
                     and ctx_for_cleanup.get("parallel")
                     and ctx_for_cleanup.get("keep_executor_alive")
                 )
-                if keep_executor_alive:
-                    if stale_fast_handoff_after_display:
-                        cancelled, running = self._batch_parallel.soft_supersede()
-                        timer = getattr(self, "_batch_future_poll_timer", None)
-                        if running > 0 and timer is not None:
-                            timer.start()
-                        if bool(getattr(self, "_debug_batch_parallel", False)):
-                            logger.info(
-                                "BATCH_PAR soft handoff after stale preview display cancelled=%s running=%s",
-                                int(cancelled),
-                                int(running),
-                            )
-                    else:
-                        self._batch_parallel.reset_active_run_state()
-                    self._stop_batch_future_poll_timer_if_idle()
-                    if bool(getattr(self, "_debug_batch_parallel", False)):
-                        logger.info("BATCH_PAR keeping executor alive after slider batch completion")
-                else:
-                    self._shutdown_batch_executor(force_terminate=False)
+                self._cleanup_parallel_batch_executor_after_run(
+                    keep_executor_alive=keep_executor_alive,
+                    stale_fast_handoff_after_display=stale_fast_handoff_after_display,
+                )
                 self.ui.slider.set_slider_triggered_simulation(False)
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)

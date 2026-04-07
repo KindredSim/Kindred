@@ -28,6 +28,7 @@ __all__ = [
     "batch_mechanism_signature",
     "compute_effective_batch_workers",
     "initialize_batch_worker",
+    "prewarm_worker_imports",
     "run_batch_simulation_task",
 ]
 
@@ -69,6 +70,12 @@ def apply_worker_blas_limits(*, enabled: bool, environ: MutableMapping[str, str]
 def initialize_batch_worker(limit_blas_threads: bool) -> None:
     """Process-pool initializer for batch simulation workers."""
     apply_worker_blas_limits(enabled=bool(limit_blas_threads))
+
+
+def prewarm_worker_imports() -> bool:
+    from scipy.integrate import solve_ivp  # noqa: F401
+
+    return True
 
 
 def batch_mechanism_signature(
