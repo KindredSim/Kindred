@@ -979,7 +979,6 @@ class SimulationController(QtCore.QObject):
     def _ensure_parallel_batch_pool_eagerly_created(self) -> None:
         if self._pool_eagerly_created:
             return
-        self._pool_eagerly_created = True
         try:
             effective_workers = compute_effective_batch_workers(
                 num_sets=max(1, int(self._batch_parallel.max_parallel_workers)),
@@ -988,11 +987,10 @@ class SimulationController(QtCore.QObject):
             self._batch_parallel.ensure_executor(
                 max_workers=max(1, int(effective_workers))
             )
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                "Failed to eagerly create parallel batch pool after mechanism parse",
-                exc,
-            )
+        except Exception:
+            self._pool_eagerly_created = False
+            return
+        self._pool_eagerly_created = True
 
     def _cleanup_parallel_batch_executor_after_run(
         self,

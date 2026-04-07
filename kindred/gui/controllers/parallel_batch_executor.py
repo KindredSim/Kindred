@@ -83,11 +83,12 @@ class ParallelBatchExecutor:
         return self._create_and_prewarm_executor(max_workers=requested_workers)
 
     def _create_and_prewarm_executor(self, *, max_workers: int) -> Any:
-        self.executor = self.executor_factory(int(max_workers), bool(self.limit_blas_threads_per_worker))
-        self._current_max_workers = int(max_workers)
-        self._pool_stale = False
         try:
-            self._submit_prewarm_tasks(self.executor, max_workers=int(max_workers))
+            executor = self.executor_factory(int(max_workers), bool(self.limit_blas_threads_per_worker))
+            self.executor = executor
+            self._current_max_workers = int(max_workers)
+            self._pool_stale = False
+            self._submit_prewarm_tasks(executor, max_workers=int(max_workers))
         except Exception as exc:
             self.shutdown(
                 force_terminate=True,
