@@ -1,9 +1,10 @@
 import pytest
 
+from kindred.core.simulator.dsl import _parse_dsl_ir, extract_parameter_names_from_dsl, parse_dsl_to_mechanism
 from kindred.core.simulator.dsl_parameter_scan import _parameter_family, _scan_mechanism_param_names
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_algebra import mechanism_parameter_names
 from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
-from kindred.core.simulator.dsl import _parse_dsl_ir, extract_parameter_names_from_dsl
 
 
 @pytest.mark.parametrize(
@@ -58,6 +59,35 @@ def test_scan_namespace_matches_global_step_indexing():
     ir = _parse_dsl_ir(dsl)
 
     assert _scan_mechanism_param_names(ir) == {"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"}
+
+
+def test_scan_namespace_omits_keq_without_explicit_keq_input():
+    ir = _parse_dsl_ir("equilibrium: A <-> B; kf=6; kr=2\n")
+
+    assert _scan_mechanism_param_names(ir) == {"kf1", "kr1"}
+
+
+def test_scan_namespace_includes_keq_for_reversible_reaction_with_explicit_keq():
+    ir = _parse_dsl_ir("reaction: A <-> B; kf=6; Keq=3\n")
+
+    assert _scan_mechanism_param_names(ir) == {"kf1", "kr1", "Keq1"}
+
+
+@pytest.mark.parametrize(
+    ("dsl", "expected"),
+    [
+        ("reaction: A -> B; k=1\n", {"k1"}),
+        ("reaction: A <-> B; kf=6; kr=2\n", {"kf1", "kr1"}),
+        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1"}),
+        ("equilibrium: A <-> B; kf=6; K=3\n", {"kf1", "kr1", "Keq1"}),
+    ],
+)
+def test_scan_namespace_matches_executable_namespace_for_audit_cases(dsl, expected):
+    ir = _parse_dsl_ir(dsl)
+    mech = parse_dsl_to_mechanism(dsl, initials={})
+
+    assert _scan_mechanism_param_names(ir) == expected
+    assert mechanism_parameter_names(mech) == expected
 
 
 def test_scan_private_validation_reversible_step_uses_kf_namespace():

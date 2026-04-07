@@ -161,12 +161,17 @@ def _scan_mechanism_param_names(ir) -> set[str]:
     mechanism_param_names: set[str] = set()
 
     for step_index, step in enumerate(ir.steps, start=1):
-        if step.is_equilibrium:
+        is_equilibrium_step = bool(
+            getattr(step, "is_equilibrium", False)
+            or (getattr(step, "reversible", False) and getattr(step, "kr", None) is not None)
+        )
+        if is_equilibrium_step:
             mechanism_param_names.add(f"kf{step_index}")
             mechanism_param_names.add(f"kr{step_index}")
-            mechanism_param_names.add(f"Keq{step_index}")
+            if getattr(step, "Keq_input", None) is not None:
+                mechanism_param_names.add(f"Keq{step_index}")
             continue
-        if step.reversible:
+        if getattr(step, "reversible", False):
             mechanism_param_names.add(f"kf{step_index}")
             mechanism_param_names.add(f"kr{step_index}")
             continue

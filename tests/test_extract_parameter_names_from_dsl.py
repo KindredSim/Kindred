@@ -70,3 +70,31 @@ def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_step():
 
     with pytest.raises(DSLError, match="Keq1"):
         extract_parameter_names_from_dsl(dsl)
+
+
+def test_extract_parameter_names_from_dsl_accepts_k_alias_on_equilibrium_without_explicit_keq():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=6.0; kr=2.0",
+            "# Algebra",
+            "param K1 = 5",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(dsl)
+
+    assert "kf1" in names
+
+
+def test_extract_parameter_names_from_dsl_accepts_keq_name_for_reversible_reaction_with_explicit_keq():
+    dsl = "\n".join(
+        [
+            "reaction: A <-> B; kf=6.0; Keq=3.0",
+            "# Algebra",
+            "param Keq1 = 5",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(dsl)
+
+    assert "Keq1" in names

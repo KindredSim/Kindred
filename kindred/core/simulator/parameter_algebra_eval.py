@@ -138,6 +138,7 @@ def _canonicalize_mechanism_param_identifiers(
     expr: ExprNode,
     *,
     canonical_by_lower: Mapping[str, str],
+    scalar_input_names: Set[str],
     assignment: ParameterAssignment,
 ) -> _CanonicalizedExpr:
     if isinstance(expr, NumberNode):
@@ -145,6 +146,9 @@ def _canonicalize_mechanism_param_identifiers(
     if isinstance(expr, SpeciesRefNode):
         return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
     if isinstance(expr, IdentNode):
+        # Exact-case scalar names keep their original binding.
+        if expr.name in scalar_input_names:
+            return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
         resolution = _resolve_mechanism_param_name(expr.name, canonical_by_lower=canonical_by_lower)
         if resolution.equilibrium_conflict_name is not None:
             _raise_equilibrium_constant_alias_error(
@@ -163,6 +167,7 @@ def _canonicalize_mechanism_param_identifiers(
         rhs = _canonicalize_mechanism_param_identifiers(
             expr.rhs,
             canonical_by_lower=canonical_by_lower,
+            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         return _CanonicalizedExpr(
@@ -173,11 +178,13 @@ def _canonicalize_mechanism_param_identifiers(
         lhs = _canonicalize_mechanism_param_identifiers(
             expr.lhs,
             canonical_by_lower=canonical_by_lower,
+            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         rhs = _canonicalize_mechanism_param_identifiers(
             expr.rhs,
             canonical_by_lower=canonical_by_lower,
+            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         return _CanonicalizedExpr(
@@ -194,6 +201,7 @@ def _canonicalize_mechanism_param_identifiers(
             canonical_arg = _canonicalize_mechanism_param_identifiers(
                 arg,
                 canonical_by_lower=canonical_by_lower,
+                scalar_input_names=scalar_input_names,
                 assignment=assignment,
             )
             canonical_args.append(canonical_arg.expr)
@@ -211,6 +219,7 @@ def _parse_canonicalized_param_block(
 ) -> _CanonicalizedParameterBlock:
     parsed_block = _parse_param_block(assignments)
     canonical_by_lower = _build_mechanism_param_lookup(spec.mechanism_param_names)
+    scalar_input_names = set(spec.scalar_input_names)
     lines: List[LetStatement] = []
     raw_to_canonical_identifiers_by_assignment: Dict[str, Mapping[str, str]] = {}
 
@@ -218,6 +227,7 @@ def _parse_canonicalized_param_block(
         canonicalized_expr = _canonicalize_mechanism_param_identifiers(
             stmt.expr,
             canonical_by_lower=canonical_by_lower,
+            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         lines.append(

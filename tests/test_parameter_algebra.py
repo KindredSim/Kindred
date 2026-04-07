@@ -376,6 +376,45 @@ def test_rhs_mechanism_identifiers_resolve_case_insensitively(
     assert derived["a"] == pytest.approx(expected)
 
 
+def test_rhs_exact_case_scalar_input_takes_priority_over_mechanism_canonicalization():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param k2 = K1",
+            ]
+        ),
+        mechanism_param_names={"k1", "k2"},
+        scalar_input_names={"K1"},
+    )
+
+    derived = evaluate_parameter_algebra(
+        spec,
+        base_values={"k1": 1.0, "k2": 0.0, "K1": 99.0},
+    )
+
+    assert derived["k2"] == pytest.approx(99.0)
+
+
+def test_rhs_mechanism_canonicalization_applies_when_exact_case_scalar_input_is_absent():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param k2 = K1",
+            ]
+        ),
+        mechanism_param_names={"k1", "k2"},
+    )
+
+    derived = evaluate_parameter_algebra(
+        spec,
+        base_values={"k1": 1.0, "k2": 0.0},
+    )
+
+    assert derived["k2"] == pytest.approx(1.0)
+
+
 def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_guidance():
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(
