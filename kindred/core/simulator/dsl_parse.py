@@ -203,11 +203,7 @@ def _parse_keyvals(
         raw_key = k.strip()
         canonical_key = _norm_key(raw_key)
         previous_spelling = original_spellings.get(canonical_key)
-        if (
-            reject_duplicate_canonical_keys
-            and previous_spelling is not None
-            and previous_spelling != raw_key
-        ):
+        if reject_duplicate_canonical_keys and previous_spelling is not None:
             raise DSLError(
                 f"Duplicate parameter: '{previous_spelling}' and '{raw_key}' both resolve to {canonical_key}",
                 line_number=line_number,

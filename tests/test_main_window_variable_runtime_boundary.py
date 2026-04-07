@@ -244,6 +244,58 @@ def test_runtime_extract_keq_alias_writeback_preserves_equilibrium_value() -> No
 
 
 @pytest.mark.unit
+def test_runtime_sanitize_duplicate_keq_aliases_leaves_text_unchanged() -> None:
+    text = "equilibrium: A <-> B ; kf=1 ; Keq=3 ; Keq=5"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_case_only_duplicate_keq_aliases_leaves_text_unchanged() -> None:
+    text = "equilibrium: A <-> B ; kf=1 ; Keq=3 ; keq=5"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_duplicate_reaction_k_tokens_leaves_text_unchanged() -> None:
+    text = "reaction: A -> B ; k=3 ; k=5"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_duplicate_reversible_kf_tokens_leaves_text_unchanged() -> None:
+    text = "reaction: A <-> B ; kf=3 ; kf=5 ; K=2"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
 def test_runtime_energy_mode_sync_uses_public_main_window_boundary() -> None:
     host = _FakeRuntimeHost(reactions_text="")
     mechanism = SimpleNamespace(metadata={"temperature_K": 200.0})

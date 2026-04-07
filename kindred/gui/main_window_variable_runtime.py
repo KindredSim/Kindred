@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from kindred.core.api.simulation import prepare_bound_mechanism
 from kindred.core.simulator.dsl_text_update import (
     _dedupe_tokens_case_insensitive,
+    _duplicate_canonical_step_token,
     _get_token_float,
     _is_equilibrium_k_token,
     _parse_mechanism_semicolon_kv,
@@ -135,6 +136,8 @@ class MainWindowVariableRuntime:
 
             lower = stripped.lower()
             prefix, tokens, comment = _parse_mechanism_semicolon_kv(line)
+            if _duplicate_canonical_step_token(tokens) is not None:
+                continue
             tokens = _dedupe_tokens_case_insensitive(tokens)
 
             original_line = line

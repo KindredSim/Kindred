@@ -532,6 +532,41 @@ class TestDirectiveErrorLineContext:
 
 
 class TestKeqAliases:
+    def test_duplicate_identical_keq_alias_on_equilibrium_rejected_with_line_context(self):
+        dsl = "equilibrium: A <-> B ; kf=1 ; Keq=3 ; Keq=5"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "Keq" in str(exc_info.value)
+
+    def test_duplicate_identical_k_on_equilibrium_rejected_with_line_context(self):
+        dsl = "equilibrium: A <-> B ; kf=1 ; K=3 ; K=5"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "K" in str(exc_info.value)
+
+    def test_duplicate_identical_k_eq_alias_on_equilibrium_rejected_with_line_context(self):
+        dsl = "equilibrium: A <-> B ; kf=1 ; K_eq=3 ; K_eq=5"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "K_eq" in str(exc_info.value)
+
+    def test_duplicate_identical_k_on_reaction_rejected_with_line_context(self):
+        dsl = "reaction: A -> B ; k=3 ; k=5"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "k" in str(exc_info.value)
+
+    def test_duplicate_identical_kf_on_reversible_reaction_rejected_with_line_context(self):
+        dsl = "reaction: A <-> B ; kf=3 ; kf=5 ; K=2"
+        with pytest.raises(DSLError) as exc_info:
+            parse_dsl(dsl)
+        assert exc_info.value.line_number == 1
+        assert "kf" in str(exc_info.value)
+
     def test_duplicate_keq_and_k_on_equilibrium_rejected_with_line_context(self):
         dsl = "equilibrium: A <-> B ; kf=6 ; Keq=3 ; K=5"
         with pytest.raises(DSLError) as exc_info:
@@ -579,3 +614,16 @@ class TestKeqAliases:
         result = parse_dsl("equilibrium: A <-> B ; K_eq=2.0 ; kf=10")
         assert result.ir is not None
         assert abs(result.ir.steps[0].kr - ref.ir.steps[0].kr) < 1e-12
+
+    def test_single_occurrence_duplicate_guard_sanity_cases_still_parse(self):
+        cases = (
+            "equilibrium: A <-> B ; kf=10 ; Keq=2.0",
+            "equilibrium: A <-> B ; kf=10 ; K=2.0",
+            "equilibrium: A <-> B ; kf=10 ; K_eq=2.0",
+            "reaction: A -> B ; k=3",
+            "reaction: A <-> B ; kf=3 ; K=2",
+        )
+        for dsl in cases:
+            result = parse_dsl(dsl)
+            assert result.ir is not None
+            assert result.ir.steps

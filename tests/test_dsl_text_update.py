@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import kindred.core.simulator.dsl_text_update as dsl_text_update
+import pytest
 
 from kindred.core.simulator.dsl_text_update import (
     analyze_parameter_updates_to_dsl_text,
@@ -805,6 +806,46 @@ def test_analyze_step_parameter_update_marks_k_eq_spelling_only_rewrite_as_canon
     assert outcome.semantic_value_change is False
     assert outcome.would_change_text is True
     assert outcome.canonicalization_only_change is True
+
+
+def test_analyze_step_parameter_update_rejects_identical_duplicate_keq_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "equilibrium: A <-> B ; kf=1 ; Keq=3 ; Keq=5",
+            "kf1",
+            2.0,
+            authoritative_current_value=1.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_case_only_duplicate_keq_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "equilibrium: A <-> B ; kf=1 ; Keq=3 ; keq=5",
+            "K1",
+            4.0,
+            authoritative_current_value=3.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_reaction_k_tokens():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "reaction: A -> B ; k=3 ; k=5",
+            "k1",
+            4.0,
+            authoritative_current_value=5.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_reversible_kf_tokens():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "reaction: A <-> B ; kf=3 ; kf=5 ; K=2",
+            "kf1",
+            6.0,
+            authoritative_current_value=5.0,
+        )
 
 
 def test_analyze_parameter_updates_to_dsl_text_reports_step_floor_as_real_semantic_change():

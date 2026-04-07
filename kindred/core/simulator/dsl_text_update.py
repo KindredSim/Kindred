@@ -218,6 +218,42 @@ def _token_matches_alias(key: object, alias: str) -> bool:
     return str(key).strip().lower() == alias_str.lower()
 
 
+def _canonical_step_token_key_for_duplicate_check(key: object) -> str | None:
+    key_str = str(key).strip()
+    if not key_str:
+        return None
+    if _is_equilibrium_k_token(key_str):
+        return "K"
+    lowered = key_str.lower()
+    if lowered in {"k", "kf", "kr"}:
+        return lowered
+    return None
+
+
+def _duplicate_canonical_step_token(tokens: list[list[str]]) -> tuple[str, str, str] | None:
+    seen: dict[str, str] = {}
+    for key, _ in tokens:
+        raw_key = str(key).strip()
+        canonical_key = _canonical_step_token_key_for_duplicate_check(raw_key)
+        if canonical_key is None:
+            continue
+        previous_spelling = seen.get(canonical_key)
+        if previous_spelling is not None:
+            return previous_spelling, raw_key, canonical_key
+        seen[canonical_key] = raw_key
+    return None
+
+
+def _raise_on_duplicate_canonical_step_tokens(tokens: list[list[str]]) -> None:
+    duplicate = _duplicate_canonical_step_token(tokens)
+    if duplicate is None:
+        return
+    previous_spelling, raw_key, canonical_key = duplicate
+    raise ValueError(
+        f"Duplicate parameter: '{previous_spelling}' and '{raw_key}' both resolve to {canonical_key}"
+    )
+
+
 def _get_token_float(tokens: list[list[str]], aliases: tuple[str, ...], default: float | None = None) -> float | None:
     for key, val in tokens:
         if any(_token_matches_alias(key, alias) for alias in aliases):
@@ -268,13 +304,10 @@ def _set_token_float(
         return
 
     exact_index = None
-    alias_index = None
     for idx, (key, _) in enumerate(tokens):
         if _token_matches_alias(key, canonical_key):
             exact_index = idx
             break
-        if alias_index is None and any(_token_matches_alias(key, alias) for alias in aliases):
-            alias_index = idx
 
     if exact_index is not None:
         target_index = exact_index
@@ -585,6 +618,7 @@ def analyze_step_parameter_update(
                 resolved_values=(),
             )
         prefix, tokens, comment = _parse_mechanism_semicolon_kv(lines[line_index])
+        _raise_on_duplicate_canonical_step_tokens(tokens)
         tokens = _dedupe_tokens_case_insensitive(tokens)
         current_step_constraints = current_text_context.step_constraint_reasons
         current_effective = _current_effective_step_value(family, tokens, has_explicit_k=False)
@@ -665,6 +699,7 @@ def analyze_step_parameter_update(
         )
 
     prefix, tokens, comment = _parse_mechanism_semicolon_kv(lines[line_index])
+    _raise_on_duplicate_canonical_step_tokens(tokens)
     tokens = _dedupe_tokens_case_insensitive(tokens)
     has_explicit_k = _has_token_alias(tokens, ("K",))
     derive_rate = _derive_equilibrium_role(tokens, step_index=step_index, step_metadata=step_metadata)
