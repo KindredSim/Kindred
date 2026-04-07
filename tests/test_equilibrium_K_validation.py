@@ -32,8 +32,8 @@ def test_equilibrium_kf_kr_K_consistent_is_accepted_without_overriding():
     mech = parse_dsl_to_mechanism(dsl, initials={})
     assert float(mech.equilibria[0].kf) == pytest.approx(4.0)
     assert float(mech.equilibria[0].kr) == pytest.approx(2.0)
-    assert mech.equilibria[0].metadata.get("K_input") == pytest.approx(2.0)
-    assert canonical_parameter_names(mech) == {"kf1", "kr1", "K1"}
+    assert mech.equilibria[0].metadata.get("Keq_input") == pytest.approx(2.0)
+    assert canonical_parameter_names(mech) == {"kf1", "kr1", "Keq1"}
 
 
 def test_equilibrium_K_only_requires_anchor_rate():
@@ -62,7 +62,7 @@ def test_equilibrium_kf_and_K_derives_kr_deterministically():
     mech = parse_dsl_to_mechanism(dsl, initials={})
     assert float(mech.equilibria[0].kf) == pytest.approx(10.0)
     assert float(mech.equilibria[0].kr) == pytest.approx(2.0)
-    assert canonical_parameter_names(mech) == {"kf1", "kr1", "K1"}
+    assert canonical_parameter_names(mech) == {"kf1", "kr1", "Keq1"}
 
 
 def test_equilibrium_kr_and_K_derives_kf_deterministically():
@@ -76,7 +76,7 @@ def test_equilibrium_kr_and_K_derives_kf_deterministically():
     mech = parse_dsl_to_mechanism(dsl, initials={})
     assert float(mech.equilibria[0].kr) == pytest.approx(2.0)
     assert float(mech.equilibria[0].kf) == pytest.approx(10.0)
-    assert canonical_parameter_names(mech) == {"kf1", "kr1", "K1"}
+    assert canonical_parameter_names(mech) == {"kf1", "kr1", "Keq1"}
 
 
 def test_equilibrium_kf_kr_without_K_does_not_expose_K_param():

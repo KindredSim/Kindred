@@ -9,8 +9,8 @@ _DEFAULT_TEMPERATURE_K = 298.15
 _VALID_CONSTRAINT_REASONS = frozenset({"algebra", "wegscheider"})
 _TOP_LEVEL_SCALAR_ASSIGNMENT_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*=\s*[^#;\n]+\s*(?:#.*)?$")
 _TOP_LEVEL_SCALAR_DIRECTIVES = frozenset({"energy", "t", "c0", "c°", "kappa", "κ"})
-_ALGEBRA_STEP_PARAM_ASSIGNMENT_RE = re.compile(r"^\s*param\s+(?:k|kf|kr|K)\d+\s*=", re.IGNORECASE)
-_MECHANISM_STEP_PARAM_RE = re.compile(r"^(k|kf|kr|K)(\d+)$")
+_ALGEBRA_STEP_PARAM_ASSIGNMENT_RE = re.compile(r"^\s*param\s+(?:k|kf|kr|Keq)\d+\s*=", re.IGNORECASE)
+_MECHANISM_STEP_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -633,7 +633,7 @@ def read_step_equilibrium_authoritative_values_from_text(
         )
     return read_mechanism_parameter_values(
         state.mechanism,
-        names={f"kf{int(step_index)}", f"kr{int(step_index)}", f"K{int(step_index)}"},
+        names={f"kf{int(step_index)}", f"kr{int(step_index)}", f"Keq{int(step_index)}"},
     )
 
 

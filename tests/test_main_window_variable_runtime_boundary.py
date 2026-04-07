@@ -275,7 +275,7 @@ def test_runtime_sanitize_mechanism_parameter_conflicts_canonicalizes_keq_to_k()
         host.mechanism_reactions_text_raw()
     )
 
-    assert sanitized_text == "equilibrium: A <-> B ; kf=6, K=3"
+    assert sanitized_text == "equilibrium: A <-> B ; kf=6, Keq=3"
     assert baseline_variables == {}
     assert baseline_metadata == {}
 
@@ -290,7 +290,7 @@ def test_runtime_extract_keq_alias_writeback_preserves_equilibrium_value() -> No
     original = parse_dsl_to_mechanism(original_text, initials={})
     sanitized = parse_dsl_to_mechanism(sanitized_text, initials={})
 
-    assert sanitized_text == "equilibrium: A <-> B ; kf=6, K=3"
+    assert sanitized_text == "equilibrium: A <-> B ; kf=6, Keq=3"
     assert float(original.equilibria[0].kf) == pytest.approx(float(sanitized.equilibria[0].kf))
     assert float(original.equilibria[0].kr) == pytest.approx(float(sanitized.equilibria[0].kr))
 
@@ -381,7 +381,7 @@ def test_runtime_energy_mode_population_uses_public_slider_and_plot_seams() -> N
     assert any(name.startswith("dGact_fwd__") for name in slider_values)
     assert any(name.startswith("dG_eq__") for name in slider_values)
     assert host._parameter_summary_updates
-    assert "K (A→B via TS1)" in host._parameter_summary_updates[-1]
+    assert "Keq (A→B via TS1)" in host._parameter_summary_updates[-1]
 
 
 @pytest.mark.unit
@@ -420,7 +420,7 @@ def test_runtime_energy_mode_population_accepts_structured_energy_result_mechani
     )
 
     assert host._parameter_summary_updates
-    assert host._parameter_summary_updates[-1]["K (A→B via TS1)"][0] == pytest.approx(
+    assert host._parameter_summary_updates[-1]["Keq (A→B via TS1)"][0] == pytest.approx(
         K_from_deltaG_eq(5000.0, 298.15)
     )
     assert host._best_effort_failures == []

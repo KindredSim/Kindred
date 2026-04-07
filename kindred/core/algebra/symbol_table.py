@@ -77,16 +77,16 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                         symtab.define_user(f"kr{n}", kr_val)
                     except Exception as exc:
                         _log_skip(f"Failed to evaluate equilibrium reverse rate for kr{n}", exc)
-                if bool(entry.get("has_K_param")):
+                if bool(entry.get("has_Keq_param")):
                     meta = getattr(eq, "metadata", {}) or {}
-                    K_obj = meta.get("K_input")
-                    if K_obj is not None:
+                    Keq_obj = meta.get("Keq_input")
+                    if Keq_obj is not None:
                         try:
-                            raw = K_obj() if callable(K_obj) else K_obj
-                            K_val = float(raw)
-                            symtab.define_user(f"K{n}", K_val)
+                            raw = Keq_obj() if callable(Keq_obj) else Keq_obj
+                            Keq_val = float(raw)
+                            symtab.define_user(f"Keq{n}", Keq_val)
                         except Exception as exc:
-                            _log_skip(f"Failed to evaluate equilibrium constant for K{n}", exc)
+                            _log_skip(f"Failed to evaluate equilibrium constant for Keq{n}", exc)
     else:
         # Legacy fallback: per-type ordinals.
         for i, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
@@ -99,13 +99,13 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                 _log_skip(f"Failed to evaluate reaction rate for k{i}", exc)
                 continue
         for i, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-            if getattr(eq, "K", None) is not None:
+            if getattr(eq, "Keq", None) is not None:
                 try:
-                    raw = eq.K() if callable(eq.K) else eq.K
-                    K_val = float(raw)
-                    symtab.define_user(f"K{i}", K_val)
+                    raw = eq.Keq() if callable(eq.Keq) else eq.Keq
+                    Keq_val = float(raw)
+                    symtab.define_user(f"Keq{i}", Keq_val)
                 except Exception as exc:
-                    _log_skip(f"Failed to evaluate equilibrium constant for K{i}", exc)
+                    _log_skip(f"Failed to evaluate equilibrium constant for Keq{i}", exc)
             if getattr(eq, "kf", None) is not None:
                 try:
                     raw = eq.kf() if callable(eq.kf) else eq.kf

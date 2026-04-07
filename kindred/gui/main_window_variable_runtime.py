@@ -148,7 +148,7 @@ class MainWindowVariableRuntime:
                 k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
                 kf_val = _get_token_float(tokens, ("kf", "k"))
                 kr_val = _get_token_float(tokens, ("kr",))
-                k_val = _get_token_float(tokens, ("K",)) if k_explicit else None
+                k_val = _get_token_float(tokens, ("Keq",)) if k_explicit else None
 
                 if kf_val is not None and (not math.isfinite(kf_val) or kf_val <= 0):
                     kf_val = None
@@ -162,7 +162,7 @@ class MainWindowVariableRuntime:
                 if kr_val is not None:
                     _set_token_float(tokens, "kr", kr_val)
                 if k_explicit and k_val is not None:
-                    _set_token_float(tokens, "K", k_val)
+                    _set_token_float(tokens, "Keq", k_val)
 
                 _remove_token_aliases(tokens, ("k",))
                 new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
@@ -387,10 +387,10 @@ class MainWindowVariableRuntime:
 
         # Ensure constrained mechanism parameters are bound even if the user isn't directly editing them.
         try:
-            mechanism_param_names = {k for k in meta_map.keys() if re.match(r"^(k|kf|kr|K)\d+$", str(k))}
+            mechanism_param_names = {k for k in meta_map.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
             spec = mw._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
             if spec is not None and getattr(spec, "param_statements", None):
-                constrained = {p.name for p in spec.param_statements if re.match(r"^(k|kf|kr|K)\d+$", str(p.name))}
+                constrained = {p.name for p in spec.param_statements if re.match(r"^(k|kf|kr|Keq)\d+$", str(p.name))}
                 if constrained:
                     param_names = sorted(set(param_names) | constrained)
         except Exception as exc:
@@ -529,8 +529,8 @@ class MainWindowVariableRuntime:
             try:
                 return float(raw_value() if callable(raw_value) else raw_value)
             except Exception:
-                if role == "K":
-                    meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("K_input")
+                if role == "Keq":
+                    meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("Keq_input")
                     try:
                         return float(meta_value() if callable(meta_value) else meta_value)
                     except Exception:
@@ -661,7 +661,7 @@ class MainWindowVariableRuntime:
                     "std_conc_product_product": std_prod,
                     "kf": _equilibrium_value(eq, "kf"),
                     "kr": _equilibrium_value(eq, "kr"),
-                    "K": _equilibrium_value(eq, "K"),
+                    "Keq": _equilibrium_value(eq, "Keq"),
                     "unit_kf": unit_kf,
                     "unit_kr": unit_kr,
                 }
@@ -918,7 +918,7 @@ class MainWindowVariableRuntime:
             params[f"ΔG° ({label})"] = (dg_eq, energy_unit)
             params[f"k_f ({label})"] = (float(ch["kf"]), str(ch.get("unit_kf") or "1/s"))
             params[f"k_r ({label})"] = (float(ch["kr"]), str(ch.get("unit_kr") or "1/s"))
-            params[f"K ({label})"] = (float(ch["K"]), "1")
+            params[f"Keq ({label})"] = (float(ch["Keq"]), "1")
 
         def _slug(text: str) -> str:
             return re.sub(r"[^A-Za-z0-9_]+", "_", str(text or "").strip()).strip("_") or "fast_eq"
@@ -964,7 +964,7 @@ class MainWindowVariableRuntime:
             params[f"ΔG° ({label})"] = (dg_eq, energy_unit)
             params[f"k_f ({label})"] = (kf_fixed, str(ch.get("unit_kf") or "1/s"))
             params[f"k_r ({label})"] = (kr_val, str(ch.get("unit_kr") or "1/s"))
-            params[f"K ({label})"] = (k_thermo, "1")
+            params[f"Keq ({label})"] = (k_thermo, "1")
 
         self.set_variable_metadata(dict(vmeta))
         visibility_scope_signature = self._slider_visibility_scope_signature(dict(variables), dict(vmeta))

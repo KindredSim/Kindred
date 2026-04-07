@@ -125,7 +125,7 @@ class TestEquilibria:
 
         assert len(mechanism.equilibria) == 1
         eq = mechanism.equilibria[0]
-        assert eq.K is not None
+        assert eq.Keq is not None
 
     def test_equilibrium_with_rates(self):
         """Test equilibrium with explicit rate constants."""
@@ -443,13 +443,13 @@ class TestExtractedHelperFunctions:
 
     def test_parse_keyvals_preserves_equilibrium_K_case(self):
         kv = _parse_keyvals("K=2.0, k=1.0")
-        assert kv["K"] == "2.0"
+        assert kv["Keq"] == "2.0"
         assert kv["k"] == "1.0"
 
     def test_parse_keyvals_preserves_irreversible_k_distinct_from_mixed_case_keq_alias(self):
         kv = _parse_keyvals("k=1.0, kEq=2.0")
         assert kv["k"] == "1.0"
-        assert kv["K"] == "2.0"
+        assert kv["Keq"] == "2.0"
 
     def test_parse_keyvals_normalizes_mixed_case_rate_aliases(self):
         kv = _parse_keyvals("Kf=1.5, kR=0.25")

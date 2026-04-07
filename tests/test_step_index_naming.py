@@ -59,7 +59,7 @@ def test_post_solve_symbol_table_exposes_canonical_names_only():
     assert symtab.get("k1") == pytest.approx(float(mech.reactions[0].rate))
     assert symtab.get("kf2") == pytest.approx(float(mech.equilibria[0].kf))
     assert symtab.get("kr2") == pytest.approx(float(mech.equilibria[0].kr))
-    assert "K2" not in symtab.user_names()
+    assert "Keq2" not in symtab.user_names()
 
 
 def test_gui_parameter_enumeration_returns_canonical_names_and_derived_flags():
@@ -76,10 +76,10 @@ def test_gui_parameter_enumeration_returns_canonical_names_and_derived_flags():
     apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
 
     variables, metadata = enumerate_step_parameters_for_gui(mech)
-    assert list(variables.keys()) == ["k1", "kf2", "kr2", "K2", "k3"]
+    assert list(variables.keys()) == ["k1", "kf2", "kr2", "Keq2", "k3"]
 
     # For "kr=...; K=..." (kf not explicit), policy derives kf from kr*K and disables kf slider.
-    assert float(mech.equilibria[0].kf) == pytest.approx(float(mech.equilibria[0].kr) * float(mech.equilibria[0].metadata["K_input"]))
+    assert float(mech.equilibria[0].kf) == pytest.approx(float(mech.equilibria[0].kr) * float(mech.equilibria[0].metadata["Keq_input"]))
     assert metadata["kf2"].get("derived") is True
     assert metadata["kf2"].get("editable") is False
     assert metadata["kr2"].get("derived") is not True

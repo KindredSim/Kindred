@@ -262,7 +262,7 @@ class _PlanStepHost(_PlanHost):
         mechanism_text = str(source_text or self._fitting_ports.mechanism_editor.reactions_text())
         family = "".join(ch for ch in str(name) if not ch.isdigit())
         effective = abs(float(value))
-        if family in {"K", "kf", "kr"} and abs(effective) < 1e-12:
+        if family in {"Keq", "kf", "kr"} and abs(effective) < 1e-12:
             effective = 1e-12
         elif effective == 0.0:
             effective = 0.0
@@ -366,18 +366,18 @@ def test_build_fit_project_apply_plan_uses_current_text_owner_when_fit_metadata_
     _ = qt_app
     host = _PlanHost(
         mechanism_text="equilibrium: A <-> B ; kr=2, K=3",
-        authoritative_params={"K1": 3.0},
+        authoritative_params={"Keq1": 3.0},
         batch_rows=[],
         settings_by_dataset={},
     )
     host.variable_metadata = lambda: {
-        "K1": {"type": "equilibrium", "index": 1, "role": "K", "editable": True},
+        "Keq1": {"type": "equilibrium", "index": 1, "role": "Keq", "editable": True},
         "kf1": {"type": "equilibrium", "index": 1, "role": "kf", "editable": True},
         "kr1": {"type": "equilibrium", "index": 1, "role": "kr", "editable": False, "derived": True},
     }
 
     try:
-        plan = host._build_fit_project_apply_plan("parameters", {"K1": 6.0}, {})
+        plan = host._build_fit_project_apply_plan("parameters", {"Keq1": 6.0}, {})
     finally:
         host.close()
 
@@ -385,10 +385,10 @@ def test_build_fit_project_apply_plan_uses_current_text_owner_when_fit_metadata_
     assert plan.parameter_delta.has_real_change is True
     assert plan.parameter_delta.needs_dsl_rewrite is True
     assert plan.parameter_delta.warning_messages == ()
-    assert plan.parameter_delta.updated_text == "equilibrium: A <-> B ; kr=2, K=6"
+    assert plan.parameter_delta.updated_text == "equilibrium: A <-> B ; kr=2, Keq=6"
     assert len(plan.parameter_delta.step_outcomes) == 1
     outcome = plan.parameter_delta.step_outcomes[0]
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.writable is True
     assert outcome.warning_reason is None
 
@@ -397,15 +397,15 @@ def test_build_fit_project_apply_plan_ignores_stale_fit_constraint_metadata_when
     _ = qt_app
     host = _PlanHost(
         mechanism_text="equilibrium: A <-> B ; kf=6, K=3",
-        authoritative_params={"K1": 3.0},
+        authoritative_params={"Keq1": 3.0},
         batch_rows=[],
         settings_by_dataset={},
     )
     host.variable_metadata = lambda: {
-        "K1": {
+        "Keq1": {
             "type": "equilibrium",
             "index": 1,
-            "role": "K",
+            "role": "Keq",
             "editable": False,
             "derived": True,
             "constraint_reason": "algebra",
@@ -413,7 +413,7 @@ def test_build_fit_project_apply_plan_ignores_stale_fit_constraint_metadata_when
     }
 
     try:
-        plan = host._build_fit_project_apply_plan("parameters", {"K1": 8.0}, {})
+        plan = host._build_fit_project_apply_plan("parameters", {"Keq1": 8.0}, {})
     finally:
         host.close()
 
@@ -421,10 +421,10 @@ def test_build_fit_project_apply_plan_ignores_stale_fit_constraint_metadata_when
     assert plan.parameter_delta.has_real_change is True
     assert plan.parameter_delta.needs_dsl_rewrite is True
     assert plan.parameter_delta.warning_messages == ()
-    assert plan.parameter_delta.updated_text == "equilibrium: A <-> B ; kf=6, K=8"
+    assert plan.parameter_delta.updated_text == "equilibrium: A <-> B ; kf=6, Keq=8"
     assert len(plan.parameter_delta.step_outcomes) == 1
     outcome = plan.parameter_delta.step_outcomes[0]
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.writable is True
     assert outcome.warning_reason is None
 
@@ -432,14 +432,14 @@ def test_build_fit_project_apply_plan_ignores_stale_fit_constraint_metadata_when
 def test_build_fit_project_apply_plan_preserves_scalar_backed_current_text_step_constraint(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = alpha",
-        authoritative_params={"alpha": 2.0, "K1": 2.0},
+        mechanism_text="alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha",
+        authoritative_params={"alpha": 2.0, "Keq1": 2.0},
         batch_rows=[],
         settings_by_dataset={},
     )
 
     try:
-        plan = host._build_fit_project_apply_plan("parameters", {"K1": 8.0}, {})
+        plan = host._build_fit_project_apply_plan("parameters", {"Keq1": 8.0}, {})
     finally:
         host.close()
 
@@ -447,11 +447,11 @@ def test_build_fit_project_apply_plan_preserves_scalar_backed_current_text_step_
     assert plan.parameter_delta.has_real_change is False
     assert plan.parameter_delta.needs_dsl_rewrite is False
     assert plan.parameter_delta.warning_messages == (
-        "Step parameter 'K1' is no longer writable in the current mechanism text.",
+        "Step parameter 'Keq1' is no longer writable in the current mechanism text.",
     )
     assert len(plan.parameter_delta.step_outcomes) == 1
     outcome = plan.parameter_delta.step_outcomes[0]
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == pytest.approx(2.0)
@@ -488,8 +488,8 @@ def test_build_fit_project_apply_plan_preserves_plain_k_current_text_step_constr
 def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_current_text_step_block_present(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = 4",
-        authoritative_params={"alpha": 1.0, "K1": 4.0},
+        mechanism_text="alpha = 1.0\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4",
+        authoritative_params={"alpha": 1.0, "Keq1": 4.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
             {"set_id": "set-ds2", "set_name": "Set ds2", "values": {"A": "1.0"}},
@@ -503,17 +503,17 @@ def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_current_
     try:
         result = host._apply_fit_results_to_project(
             "both",
-            {"alpha": 2.0, "K1": 8.0},
+            {"alpha": 2.0, "Keq1": 8.0},
             {"ds1": {"init:A": 2.5}, "ds2": {"init:A": 1.7}},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K1" in result
+    assert "Keq1" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == (
-        "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = 4"
+        "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4"
     )
     assert host._batch_store.get_value(0, "A") == "2.5"
     assert host._batch_store.get_value(1, "A") == "1.7"
@@ -560,10 +560,10 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
                 "# Algebra",
-                "param K2 = sin",
+                "param Keq2 = sin",
             ]
         ),
-        authoritative_params={"alpha": 1.0, "K1": 3.0, "K2": 5.0},
+        authoritative_params={"alpha": 1.0, "Keq1": 3.0, "Keq2": 5.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
         ],
@@ -575,24 +575,24 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     try:
         result = host._apply_fit_results_to_project(
             "both",
-            {"alpha": 2.0, "K1": 8.0, "K2": 9.0},
+            {"alpha": 2.0, "Keq1": 8.0, "Keq2": 9.0},
             {"ds1": {"init:A": 2.5}},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K2" in result
+    assert "Keq2" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
             "alpha = 2",
             "sin = 2",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
     assert host._batch_store.get_value(0, "A") == "2.5"
@@ -611,10 +611,10 @@ def test_apply_fit_results_to_project_allows_same_step_constrained_K_when_other_
                 "",
                 "# Algebra",
                 "param kf1 = 6",
-                "param K2 = sin",
+                "param Keq2 = sin",
             ]
         ),
-        authoritative_params={"alpha": 1.0, "K1": 3.0, "K2": 5.0},
+        authoritative_params={"alpha": 1.0, "Keq1": 3.0, "Keq2": 5.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
         ],
@@ -626,25 +626,25 @@ def test_apply_fit_results_to_project_allows_same_step_constrained_K_when_other_
     try:
         result = host._apply_fit_results_to_project(
             "both",
-            {"alpha": 2.0, "K1": 8.0, "K2": 9.0},
+            {"alpha": 2.0, "Keq1": 8.0, "Keq2": 9.0},
             {"ds1": {"init:A": 2.5}},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K2" in result
+    assert "Keq2" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
             "alpha = 2",
             "sin = 2",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
             "param kf1 = 6",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
     assert host._batch_store.get_value(0, "A") == "2.5"
@@ -661,10 +661,10 @@ def test_apply_fit_results_to_project_keeps_target_step_analysis_failure_block(q
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = sin",
+                "param Keq1 = sin",
             ]
         ),
-        authoritative_params={"alpha": 1.0, "K1": 3.0},
+        authoritative_params={"alpha": 1.0, "Keq1": 3.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
         ],
@@ -676,14 +676,14 @@ def test_apply_fit_results_to_project_keeps_target_step_analysis_failure_block(q
     try:
         result = host._apply_fit_results_to_project(
             "both",
-            {"alpha": 2.0, "K1": 8.0},
+            {"alpha": 2.0, "Keq1": 8.0},
             {"ds1": {"init:A": 2.5}},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K1" in result
+    assert "Keq1" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
@@ -692,7 +692,7 @@ def test_apply_fit_results_to_project_keeps_target_step_analysis_failure_block(q
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
-            "param K1 = sin",
+            "param Keq1 = sin",
         ]
     )
     assert host._batch_store.get_value(0, "A") == "2.5"
@@ -911,10 +911,10 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
                 "# Algebra",
-                "param K2 = a",
+                "param Keq2 = a",
             ]
         ),
-        authoritative_params={"alpha": 1.0, "K1": 3.0, "K2": 5.0},
+        authoritative_params={"alpha": 1.0, "Keq1": 3.0, "Keq2": 5.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
         ],
@@ -926,24 +926,24 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     try:
         result = host._apply_fit_results_to_project(
             "both",
-            {"alpha": 2.0, "K1": 8.0, "K2": 9.0},
+            {"alpha": 2.0, "Keq1": 8.0, "Keq2": 9.0},
             {"ds1": {"init:A": 2.5}},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K2" in result
+    assert "Keq2" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
             "alpha = 2",
             "a = nan",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
     assert host._batch_store.get_value(0, "A") == "2.5"
@@ -959,12 +959,12 @@ def test_apply_fit_results_to_project_keeps_step_block_when_scalar_name_matches_
             "",
             "# Algebra",
             "let alpha = [A]",
-            "param K1 = 4",
+            "param Keq1 = 4",
         ]
     )
     host = _PlanHost(
         mechanism_text=mechanism_text,
-        authoritative_params={"alpha": 1.0, "K1": 4.0},
+        authoritative_params={"alpha": 1.0, "Keq1": 4.0},
         batch_rows=[],
         settings_by_dataset={},
     )
@@ -972,14 +972,14 @@ def test_apply_fit_results_to_project_keeps_step_block_when_scalar_name_matches_
     try:
         result = host._apply_fit_results_to_project(
             "parameters",
-            {"alpha": 2.0, "K1": 8.0},
+            {"alpha": 2.0, "Keq1": 8.0},
             {},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K1" in result
+    assert "Keq1" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
@@ -988,7 +988,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_scalar_name_matches_
             "",
             "# Algebra",
             "let alpha = [A]",
-            "param K1 = 4",
+            "param Keq1 = 4",
         ]
     )
 
@@ -1001,12 +1001,12 @@ def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shado
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
-            "param K1 = 4",
+            "param Keq1 = 4",
         ]
     )
     host = _PlanHost(
         mechanism_text=mechanism_text,
-        authoritative_params={"sin": 1.0, "K1": 4.0},
+        authoritative_params={"sin": 1.0, "Keq1": 4.0},
         batch_rows=[],
         settings_by_dataset={},
     )
@@ -1014,14 +1014,14 @@ def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shado
     try:
         result = host._apply_fit_results_to_project(
             "parameters",
-            {"sin": 2.0, "K1": 8.0},
+            {"sin": 2.0, "Keq1": 8.0},
             {},
         )
     finally:
         host.close()
 
     assert isinstance(result, str)
-    assert "K1" in result
+    assert "Keq1" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
@@ -1029,7 +1029,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shado
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
-            "param K1 = 4",
+            "param Keq1 = 4",
         ]
     )
 
@@ -1135,18 +1135,18 @@ def test_build_fit_project_apply_plan_treats_step_parameter_signed_zero_floor_as
     _ = qt_app
     host = _PlanHost(
         mechanism_text="equilibrium: A <-> B ; kf=1, K=0",
-        authoritative_params={"K1": 0.0},
+        authoritative_params={"Keq1": 0.0},
         batch_rows=[],
         settings_by_dataset={},
     )
 
     try:
-        plan = host._build_fit_project_apply_plan("parameters", {"K1": -0.0}, {})
+        plan = host._build_fit_project_apply_plan("parameters", {"Keq1": -0.0}, {})
     finally:
         host.close()
 
     assert plan.parameter_delta is not None
-    assert plan.parameter_delta.updated_text == "equilibrium: A <-> B ; kf=1, K=1e-12"
+    assert plan.parameter_delta.updated_text == "equilibrium: A <-> B ; kf=1, Keq=1e-12"
     assert plan.parameter_delta.has_real_change is True
     assert plan.parameter_delta.needs_dsl_rewrite is True
     assert plan.parameter_delta.warning_messages == ()

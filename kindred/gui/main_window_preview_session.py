@@ -587,7 +587,7 @@ class MainWindowPreviewSession:
 
     def variable_preview_debounce_ms(self, name: str) -> int:
         name_s = str(name or "")
-        if name_s.startswith("K") and name_s[1:].isdigit():
+        if name_s.startswith("Keq") and name_s[3:].isdigit():
             return self._read_preview_delay_setting(
                 "simulation/equilibrium_preview_debounce_ms",
                 default=150,

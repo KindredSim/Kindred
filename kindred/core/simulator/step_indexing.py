@@ -5,8 +5,8 @@ Canonical rule:
 - Every kinetic step in DSL order gets a 1-based index N.
 - Reaction step -> parameter kN
 - Equilibrium step -> parameters kfN and krN
-- Equilibrium constant parameter KN exists only when explicitly represented/used
-  (currently: when the DSL provided K=... on that step; stored as metadata K_input).
+- Equilibrium constant parameter KeqN exists only when explicitly represented/used
+  (currently: when the DSL provided K=... on that step; stored as metadata Keq_input).
 
 Policy:
 - State-network generated steps are excluded from the step-index map to avoid
@@ -27,7 +27,7 @@ __all__ = [
     "lookup_step_param_target",
 ]
 
-_CANON_PARAM_RE = re.compile(r"^(k|kf|kr|K)(\d+)$")
+_CANON_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 
 
 def get_step_index_map(mechanism: object) -> List[Dict[str, object]]:
@@ -49,7 +49,7 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
     """
     Yield (param_name, step_entry, role).
 
-    role is one of: "k", "kf", "kr", "K".
+    role is one of: "k", "kf", "kr", "Keq".
     """
     for entry in get_step_index_map(mechanism):
         n, ok = try_parse_int(entry.get("step_index"))
@@ -61,8 +61,8 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
         elif kind == "equilibrium":
             yield (f"kf{n}", entry, "kf")
             yield (f"kr{n}", entry, "kr")
-            if bool(entry.get("has_K_param")):
-                yield (f"K{n}", entry, "K")
+            if bool(entry.get("has_Keq_param")):
+                yield (f"Keq{n}", entry, "Keq")
 
 
 def canonical_parameter_names(mechanism: object) -> Set[str]:
@@ -78,7 +78,7 @@ def lookup_step_param_target(
     Returns (kind, index, role, entry) where:
     - kind: "reaction" or "equilibrium"
     - index: 0-based index into mechanism.reactions or mechanism.equilibria
-    - role: "k" / "kf" / "kr" / "K"
+    - role: "k" / "kf" / "kr" / "Keq"
     """
     m = _CANON_PARAM_RE.match(str(name))
     if not m:
@@ -102,10 +102,10 @@ def lookup_step_param_target(
             if not ok:
                 return None
             return ("reaction", idx, "k", entry)
-        if role in {"kf", "kr", "K"}:
+        if role in {"kf", "kr", "Keq"}:
             if kind != "equilibrium":
                 return None
-            if role == "K" and not bool(entry.get("has_K_param")):
+            if role == "Keq" and not bool(entry.get("has_Keq_param")):
                 return None
             idx_raw = entry.get("equilibrium_index")
             idx, ok = try_parse_int(idx_raw)

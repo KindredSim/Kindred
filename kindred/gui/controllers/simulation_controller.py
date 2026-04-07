@@ -129,8 +129,8 @@ def build_fast_preview_solver_grid_context(
         fast_mode
         and slider_drag_active
         and isinstance(last_slider_change_name, str)
-        and last_slider_change_name.startswith("K")
-        and last_slider_change_name[1:].isdigit()
+        and last_slider_change_name.startswith("Keq")
+        and last_slider_change_name[3:].isdigit()
     )
     if preview_mode:
         n_points = min(int(n_points), 120)

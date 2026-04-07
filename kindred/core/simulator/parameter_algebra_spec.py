@@ -10,7 +10,7 @@ from kindred.core.simulator.errors import DSLError
 _PARAM_STMT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
 _LET_STMT_RE = re.compile(r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
-_MECH_PARAM_RE = re.compile(r"^(k|kf|kr|K)(\d+)$")
+_MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -149,7 +149,7 @@ def extract_parameter_assignments_from_algebra_lines(
             if m_mech and name not in mechanism_param_names:
                 raise DSLError(
                     f"Unknown mechanism parameter {name!r} in Algebra param statement",
-                    suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, K1) or define the parameter on a reaction line.",
+                    suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, Keq1) or define the parameter on a reaction line.",
                     examples=["reaction: A -> B; k=1.0", "param k1 = 4*k2"],
                     line_number=line_no,
                     line_content=original,

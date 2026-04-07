@@ -31,7 +31,7 @@ class EquilibriumMetadataKeys:
     USER_PROVIDED_KF = "user_provided_kf"
     USER_PROVIDED_KR = "user_provided_kr"
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
-    K_INPUT = "K_input"
+    KEQ_INPUT = "Keq_input"
     EXPLICIT_RATES = "explicit_rates"
     FORWARD_MODEL = "forward_model"
     STANDARD_CONC_M = "standard_conc_M"
@@ -136,7 +136,7 @@ class EquilibriumMetadataView:
     user_provided_kf: bool
     user_provided_kr: bool
     dG_eq_J_per_mol: Optional[float] = None
-    K_input: Optional[object] = None
+    Keq_input: Optional[object] = None
     explicit_rates: tuple[float, ...] = ()
     forward_model: Optional[dict[str, object]] = None
     standard_conc_M: Optional[float] = None
@@ -175,7 +175,7 @@ class EquilibriumMetadataView:
             user_provided_kf=_as_bool(meta.get(EquilibriumMetadataKeys.USER_PROVIDED_KF)),
             user_provided_kr=_as_bool(meta.get(EquilibriumMetadataKeys.USER_PROVIDED_KR)),
             dG_eq_J_per_mol=dG_f,
-            K_input=meta.get(EquilibriumMetadataKeys.K_INPUT),
+            Keq_input=meta.get(EquilibriumMetadataKeys.KEQ_INPUT),
             explicit_rates=tuple(explicit_rates_f),
             forward_model=forward_model,
             standard_conc_M=std_f,
@@ -189,8 +189,8 @@ class EquilibriumMetadataView:
         }
         if self.dG_eq_J_per_mol is not None:
             out[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
-        if self.K_input is not None:
-            out[EquilibriumMetadataKeys.K_INPUT] = self.K_input
+        if self.Keq_input is not None:
+            out[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq_input
         if self.explicit_rates:
             out[EquilibriumMetadataKeys.EXPLICIT_RATES] = list(self.explicit_rates)
         if self.forward_model is not None:

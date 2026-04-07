@@ -51,7 +51,7 @@ def _parameter_family(key: str) -> str | None:
     """
     Determine the canonical parameter family for a DSL key.
 
-    Recognizes keys like k, k1, kf2, kr, A, Ea, dG_act, dG_eq, and K variants.
+    Recognizes keys like k, k1, kf2, kr, A, Ea, dG_act, dG_eq, and Keq variants.
     """
     normalized = key.strip()
     lower = normalized.lower()
@@ -65,10 +65,10 @@ def _parameter_family(key: str) -> str | None:
         if lower.startswith(fam_lower) and suffix.isdigit():
             return fam
 
-    if normalized == "K":
-        return "K"
-    if normalized.startswith("K") and normalized[1:].isdigit():
-        return "K"
+    if normalized == "Keq":
+        return "Keq"
+    if normalized.startswith("Keq") and normalized[4:].isdigit():
+        return "Keq"
 
     return None
 
@@ -135,7 +135,7 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
                 source = "Arrhenius"
             elif family == "dg_act":
                 source = "Eyring"
-            elif family in ("dg_eq", "K"):
+            elif family in ("dg_eq", "Keq"):
                 source = "Equilibrium constant"
             elif family == "kf":
                 source = "Forward rate"
@@ -181,7 +181,7 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
     for i in range(1, n_eq + 1):
         mechanism_param_names.add(f"kf{i}")
         mechanism_param_names.add(f"kr{i}")
-        mechanism_param_names.add(f"K{i}")
+        mechanism_param_names.add(f"Keq{i}")
 
     spec = parameter_algebra.parse_parameter_algebra_spec_from_dsl_text(
         text,

@@ -102,8 +102,8 @@ def _current_preview_solver_config(main_window) -> dict:
     preview_mode = bool(
         main_window._preview_session.slider_drag_active()
         and isinstance(last_change_name, str)
-        and last_change_name.startswith("K")
-        and last_change_name[1:].isdigit()
+        and last_change_name.startswith("Keq")
+        and last_change_name[4:].isdigit()
     )
     if preview_mode:
         n_points = min(int(n_points), 120)

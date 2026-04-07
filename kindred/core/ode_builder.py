@@ -89,19 +89,19 @@ def build_ode_rhs_from_mechanism(
     def _compute_equilibrium_constant(meta: Dict[str, object], eq_obj: Equilibrium, T: float) -> Optional[float]:
         if meta.get("dG_eq_J_per_mol") is not None:
             return K_from_deltaG_eq(float(meta["dG_eq_J_per_mol"]), T)
-        if meta.get("K_input") is not None:
-            val = _evaluate_scalar(meta["K_input"])
+        if meta.get("Keq_input") is not None:
+            val = _evaluate_scalar(meta["Keq_input"])
             return float(val) if val is not None else None
-        if eq_obj.K is not None:
-            val = _evaluate_scalar(eq_obj.K)
+        if eq_obj.Keq is not None:
+            val = _evaluate_scalar(eq_obj.Keq)
             return float(val) if val is not None else None
         return None
 
-    def _require_positive_finite_runtime_K(K_value: float) -> float:
-        K_float = float(K_value)
-        if not (K_float > 0.0) or not math.isfinite(K_float):
-            raise ValueError("Equilibrium K must be positive and finite for runtime anchoring")
-        return K_float
+    def _require_positive_finite_runtime_Keq(Keq_value: float) -> float:
+        Keq_float = float(Keq_value)
+        if not (Keq_float > 0.0) or not math.isfinite(Keq_float):
+            raise ValueError("Equilibrium Keq must be positive and finite for runtime anchoring")
+        return Keq_float
 
     class EquilibriumRateEvaluator:
         """
@@ -126,10 +126,10 @@ def build_ode_rhs_from_mechanism(
             rev_mol: float,
             kf_binding: Optional[RateBinding],
             kr_binding: Optional[RateBinding],
-            K_binding: Optional[RateBinding],
+            Keq_binding: Optional[RateBinding],
             kf_const: Optional[float],
             kr_const: Optional[float],
-            K_const: Optional[float],
+            Keq_const: Optional[float],
         ) -> None:
             self._eq = eq_obj
             self._meta = meta
@@ -143,13 +143,13 @@ def build_ode_rhs_from_mechanism(
             self._rev_mol = float(rev_mol)
             self._kf_binding = kf_binding
             self._kr_binding = kr_binding
-            self._K_binding = K_binding
+            self._Keq_binding = Keq_binding
             self._kf_const = kf_const
             self._kr_const = kr_const
-            self._K_const = K_const
+            self._Keq_const = Keq_const
 
         def __call__(self, T: float) -> Tuple[float, float]:
-            K_T = _compute_equilibrium_constant(self._meta, self._eq, T)
+            Keq_T = _compute_equilibrium_constant(self._meta, self._eq, T)
             kf_val = _eval_model(self._forward_model, T, self._fwd_mol)
             if kf_val is None and self._kf_binding is not None:
                 kf_val = float(self._kf_binding())
@@ -182,15 +182,15 @@ def build_ode_rhs_from_mechanism(
             if kr_val is not None:
                 explicit.append(float(kr_val))
 
-            thermo_K = K_T if K_T is not None else self._K_const
-            if thermo_K is None and self._K_binding is not None:
-                thermo_K = float(self._K_binding())
+            thermo_Keq = Keq_T if Keq_T is not None else self._Keq_const
+            if thermo_Keq is None and self._Keq_binding is not None:
+                thermo_Keq = float(self._Keq_binding())
 
             if self._fast_flag and (kf_val is None or kr_val is None) and (
-                self._meta.get("dG_eq_J_per_mol") is not None or thermo_K is not None
+                self._meta.get("dG_eq_J_per_mol") is not None or thermo_Keq is not None
             ):
                 fe = derive_equilibrium_rates(
-                    K=thermo_K,
+                    Keq=thermo_Keq,
                     dG_eq_J_per_mol=self._meta.get("dG_eq_J_per_mol"),
                     T=T,
                     explicit_rates=explicit or None,
@@ -199,41 +199,41 @@ def build_ode_rhs_from_mechanism(
                     kf_val = fe.kf
                 if kr_val is None:
                     kr_val = fe.kr
-                if K_T is None:
-                    K_T = fe.K
+                if Keq_T is None:
+                    Keq_T = fe.Keq
 
-            if kr_val is None and kf_val is not None and K_T is not None and not self._user_kr:
-                K_T = _require_positive_finite_runtime_K(K_T)
-                kr_val = float(kf_val) / float(K_T)
-            if kf_val is None and kr_val is not None and K_T is not None and not self._user_kf:
-                K_T = _require_positive_finite_runtime_K(K_T)
-                kf_val = float(kr_val) * float(K_T)
+            if kr_val is None and kf_val is not None and Keq_T is not None and not self._user_kr:
+                Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
+                kr_val = float(kf_val) / float(Keq_T)
+            if kf_val is None and kr_val is not None and Keq_T is not None and not self._user_kf:
+                Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
+                kf_val = float(kr_val) * float(Keq_T)
 
-            if kf_val is None and kr_val is None and K_T is None:
+            if kf_val is None and kr_val is None and Keq_T is None:
                 raise ValueError(
                     "Equilibrium missing usable kinetic and thermodynamic data "
-                    "(need K/dG_eq or rates)"
+                    "(need Keq/dG_eq or rates)"
                 )
             if kf_val is None:
                 if self._kf_const is not None:
                     kf_val = self._kf_const
-                elif K_T is not None and kr_val is not None:
-                    K_T = _require_positive_finite_runtime_K(K_T)
-                    kf_val = float(kr_val) * float(K_T)
-                elif K_T is not None and kr_val is None and not self._fast_flag:
-                    # Preserve the long-standing programmatic K-only contract for
+                elif Keq_T is not None and kr_val is not None:
+                    Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
+                    kf_val = float(kr_val) * float(Keq_T)
+                elif Keq_T is not None and kr_val is None and not self._fast_flag:
+                    # Preserve the long-standing programmatic Keq-only contract for
                     # non-fast equilibria by using the same deterministic anchor
                     # as the sparse Jacobian path.
-                    K_T = _require_positive_finite_runtime_K(K_T)
+                    Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
                     kf_val = 1.0
                 else:
                     raise ValueError("Equilibrium missing usable kf and thermodynamic data to derive it")
             if kr_val is None:
                 if self._kr_const is not None:
                     kr_val = self._kr_const
-                elif K_T is not None:
-                    K_T = _require_positive_finite_runtime_K(K_T)
-                    kr_val = float(kf_val) / float(K_T)
+                elif Keq_T is not None:
+                    Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
+                    kr_val = float(kf_val) / float(Keq_T)
                 else:
                     raise ValueError("Equilibrium missing usable kr and thermodynamic data to derive it")
             return float(kf_val), float(kr_val)
@@ -354,14 +354,14 @@ def build_ode_rhs_from_mechanism(
 
             kf_binding = eq.kf if isinstance(eq.kf, RateBinding) else None
             kr_binding = eq.kr if isinstance(eq.kr, RateBinding) else None
-            K_binding = eq.K if isinstance(eq.K, RateBinding) else None
+            Keq_binding = eq.Keq if isinstance(eq.Keq, RateBinding) else None
 
-            # IMPORTANT: if we are in prepared/bound mode, eq.kf/eq.kr/eq.K can be
+            # IMPORTANT: if we are in prepared/bound mode, eq.kf/eq.kr/eq.Keq can be
             # RateBinding objects that must be queried dynamically. Do not capture
             # their values at RHS-build time.
             kf_const = _evaluate_scalar(eq.kf) if kf_binding is None else None
             kr_const = _evaluate_scalar(eq.kr) if kr_binding is None else None
-            K_const = _evaluate_scalar(eq.K) if K_binding is None else None
+            Keq_const = _evaluate_scalar(eq.Keq) if Keq_binding is None else None
 
             evaluator = EquilibriumRateEvaluator(
                 eq_obj=eq,
@@ -376,10 +376,10 @@ def build_ode_rhs_from_mechanism(
                 rev_mol=rev_mol,
                 kf_binding=kf_binding,
                 kr_binding=kr_binding,
-                K_binding=K_binding,
+                Keq_binding=Keq_binding,
                 kf_const=kf_const,
                 kr_const=kr_const,
-                K_const=K_const,
+                Keq_const=Keq_const,
             )
             equilibrium_evaluators.append((i_step, evaluator))
 

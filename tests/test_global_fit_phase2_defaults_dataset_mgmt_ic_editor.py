@@ -1042,7 +1042,7 @@ def test_global_fit_apply_to_project_unwritable_derived_step_parameter_warns_ins
         "scan_mechanism_parameters",
         lambda _dsl: [
             {"name": "kr1", "value": 2.0, "min": 0.01, "max": 10.0},
-            {"name": "K1", "value": 3.0, "min": 0.01, "max": 10.0},
+            {"name": "Keq1", "value": 3.0, "min": 0.01, "max": 10.0},
         ],
     )
 

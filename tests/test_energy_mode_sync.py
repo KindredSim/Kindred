@@ -46,7 +46,7 @@ def test_energy_mode_parsing_exposes_temperature_and_default_energy_unit_and_K_r
 
     dG_eq_J_per_mol = -10.0 * 1000.0  # -10 kJ/mol
     expected_K = math.exp(-dG_eq_J_per_mol / (R * 200.0))
-    assert float(eq.K) == pytest.approx(expected_K, rel=1e-12)
+    assert float(eq.Keq) == pytest.approx(expected_K, rel=1e-12)
 
 
 def test_energy_mode_kcal_matches_kj_after_conversion():
@@ -76,7 +76,7 @@ def test_energy_mode_kcal_matches_kj_after_conversion():
     eq_kj = mech_kj.equilibria[0]
     eq_kcal = mech_kcal.equilibria[0]
 
-    assert float(eq_kcal.K) == pytest.approx(float(eq_kj.K), rel=1e-9)
+    assert float(eq_kcal.Keq) == pytest.approx(float(eq_kj.Keq), rel=1e-9)
     assert float(eq_kcal.kf) == pytest.approx(float(eq_kj.kf), rel=1e-9)
     assert float(eq_kcal.kr) == pytest.approx(float(eq_kj.kr), rel=1e-9)
 
@@ -283,7 +283,7 @@ def test_gui_energy_slider_refreshes_derived_K_immediately(main_window, monkeypa
 
     assert "params" in captured
     params = captured["params"]
-    K_key = "K (A→B via TS1)"
+    K_key = "Keq (A→B via TS1)"
     assert K_key in params
     dG_eq_J_per_mol = -5.0 * 1000.0
     expected_K = math.exp(-dG_eq_J_per_mol / (R * 200.0))

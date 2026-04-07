@@ -57,7 +57,7 @@ _PUBLIC_REEXPORTS = (
 
 
 def mechanism_parameter_names(mechanism: object) -> Set[str]:
-    # Canonical global step-index naming (kN / kfN / krN / KN).
+    # Canonical global step-index naming (kN / kfN / krN / KeqN).
     out = canonical_parameter_names(mechanism)
     if out:
         return out
@@ -70,7 +70,7 @@ def mechanism_parameter_names(mechanism: object) -> Set[str]:
     for i in range(1, n_eq + 1):
         legacy.add(f"kf{i}")
         legacy.add(f"kr{i}")
-        legacy.add(f"K{i}")
+        legacy.add(f"Keq{i}")
     return legacy
 
 
@@ -110,9 +110,9 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
                     v = _as_float(getattr(eq, role, None))
                     if v is not None:
                         out[name] = v
-                elif role == "K":
+                elif role == "Keq":
                     meta = getattr(eq, "metadata", {}) or {}
-                    v = _as_float(meta.get("K_input"))
+                    v = _as_float(meta.get("Keq_input"))
                     if v is not None:
                         out[name] = v
         return out
@@ -125,7 +125,7 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
             if v is not None:
                 out[key] = v
     for i, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-        for base, attr in (("kf", "kf"), ("kr", "kr"), ("K", "K")):
+        for base, attr in (("kf", "kf"), ("kr", "kr"), ("Keq", "Keq")):
             key = f"{base}{i}"
             if key in wanted:
                 v = _as_float(getattr(eq, attr, None))
@@ -210,28 +210,28 @@ def _set_mechanism_param(
                 raise DSLError(f"Parameter {name!r} is not mutable in this run (missing binding)")
             eqs[idx] = replace(eq, **{role: float(value)})
             return
-        if role == "K":
+        if role == "Keq":
             meta = dict(getattr(eq, "metadata", {}) or {})
-            current = meta.get("K_input")
+            current = meta.get("Keq_input")
             if require_mutable:
                 if hasattr(current, "set"):
                     current.set(float(value))  # type: ignore[call-arg]
                     return
-                # Allow creating a binding for K_input if not already mutable.
+                # Allow creating a binding for Keq_input if not already mutable.
                 b = RateBinding(name=str(name), value=float(value))
-                meta["K_input"] = b
+                meta["Keq_input"] = b
                 eqs[idx] = replace(eq, metadata=meta)
                 return
-            meta["K_input"] = float(value)
+            meta["Keq_input"] = float(value)
             eqs[idx] = replace(eq, metadata=meta)
             return
 
     raise DSLError(f"Unsupported parameter target for {name!r}")
 
 
-def _apply_equilibrium_K_constraints_to_values(mechanism: object, base_values: Dict[str, float]) -> None:
+def _apply_equilibrium_Keq_constraints_to_values(mechanism: object, base_values: Dict[str, float]) -> None:
     """
-    Populate derived equilibrium rate values implied by explicit K parameters.
+    Populate derived equilibrium rate values implied by explicit Keq parameters.
 
     This ensures parameter-algebra expressions that reference the derived rate
     see a consistent value.
@@ -239,48 +239,48 @@ def _apply_equilibrium_K_constraints_to_values(mechanism: object, base_values: D
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
-        if not bool(entry.get("has_K_param")):
+        if not bool(entry.get("has_Keq_param")):
             continue
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium K-constraint entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
+            logger.debug("Skipping equilibrium Keq-constraint entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
             continue
         derive_rate = str(entry.get("derive_rate") or "kr")
         kf_key = f"kf{n}"
         kr_key = f"kr{n}"
-        K_key = f"K{n}"
-        if K_key not in base_values:
+        keq_key = f"Keq{n}"
+        if keq_key not in base_values:
             continue
-        K = float(base_values[K_key])
-        if not math.isfinite(K) or abs(K) < 1e-30:
+        keq = float(base_values[keq_key])
+        if not math.isfinite(keq) or abs(keq) < 1e-30:
             continue
         if derive_rate == "kf":
             if kr_key in base_values:
-                base_values[kf_key] = float(base_values[kr_key]) * K
+                base_values[kf_key] = float(base_values[kr_key]) * keq
         else:
             if kf_key in base_values:
-                base_values[kr_key] = float(base_values[kf_key]) / K
+                base_values[kr_key] = float(base_values[kf_key]) / keq
 
 
-def _apply_equilibrium_K_constraints_to_mechanism(mechanism: object, *, require_mutable: bool) -> Dict[str, float]:
+def _apply_equilibrium_Keq_constraints_to_mechanism(mechanism: object, *, require_mutable: bool) -> Dict[str, float]:
     """
-    Apply equilibrium constraints implied by explicit K parameters to the mechanism in-place.
+    Apply equilibrium constraints implied by explicit Keq parameters to the mechanism in-place.
 
     Returns a map of derived rate updates (e.g., {'kr2': 1.23}).
     """
     updates: Dict[str, float] = {}
     values = read_mechanism_parameter_values(mechanism)
-    _apply_equilibrium_K_constraints_to_values(mechanism, values)
+    _apply_equilibrium_Keq_constraints_to_values(mechanism, values)
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
-        if not bool(entry.get("has_K_param")):
+        if not bool(entry.get("has_Keq_param")):
             continue
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium K-constraint (mechanism) entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
+            logger.debug("Skipping equilibrium Keq-constraint (mechanism) entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
             continue
         derive_rate = str(entry.get("derive_rate") or "kr")
         if derive_rate == "kf":
@@ -307,7 +307,7 @@ def _apply_wegscheider_cyclicity_constraints_to_mechanism(
     Policy (hard constraints):
     - Operates on ln(kf/kr) edge potentials over the complex graph.
     - Builds a deterministic spanning forest; non-tree, non-fixed edges are derived.
-    - Explicit-K equilibria (step_index_map has_K_param) are treated as fixed ratios.
+    - Explicit-Keq equilibria (step_index_map has_Keq_param) are treated as fixed ratios.
     - Derived targets are recorded into constrained_params for GUI + fit-scan exclusion.
     """
     meta = getattr(mechanism, "metadata", {}) or {}
@@ -463,7 +463,7 @@ def apply_parameter_algebra_spec_to_mechanism(
     base_values: Dict[str, float] = {}
     base_values.update(read_mechanism_parameter_values(mechanism, names=spec.mechanism_param_names))
     base_values.update(_read_scalar_param_values(mechanism, require_mutable=require_mutable))
-    _apply_equilibrium_K_constraints_to_values(mechanism, base_values)
+    _apply_equilibrium_Keq_constraints_to_values(mechanism, base_values)
 
     derived: Dict[str, float] = {}
     if spec.param_statements:
@@ -556,13 +556,13 @@ def apply_parameter_algebra_spec_to_mechanism(
         if _MECH_PARAM_RE.match(nm):
             _set_mechanism_param(mechanism, nm, val, require_mutable=require_mutable)
 
-    # Apply K-implied equilibrium constraints after any parameter algebra updates.
-    eq_updates = _apply_equilibrium_K_constraints_to_mechanism(mechanism, require_mutable=require_mutable)
+    # Apply Keq-implied equilibrium constraints after any parameter algebra updates.
+    eq_updates = _apply_equilibrium_Keq_constraints_to_mechanism(mechanism, require_mutable=require_mutable)
     if eq_updates:
         derived = dict(derived)
         derived.update(eq_updates)
 
-    # Apply Wegscheider cyclicity constraints last (after explicit-K implied rates).
+    # Apply Wegscheider cyclicity constraints last (after explicit-Keq implied rates).
     cy_updates = _apply_wegscheider_cyclicity_constraints_to_mechanism(
         mechanism,
         require_mutable=require_mutable,
@@ -603,7 +603,7 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
 
     - k{i}: based on Reaction.order (mass-action), units M^(1-order)/s
     - kf{i}, kr{i}: based on equilibrium forward/back molecularity
-    - K{i}: dimensionless ("1")
+    - Keq{i}: dimensionless ("1")
     - scalar params: dimensionless ("1") (if present in metadata)
     """
     from kindred.core.simulator.parameter_units import rate_constant_unit
@@ -640,7 +640,7 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 if not (0 <= idx < len(eqs)):
                     continue
                 eq = eqs[idx]
-                if role == "K":
+                if role == "Keq":
                     units[name] = "1"
                     continue
                 try:
@@ -674,7 +674,7 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 back_order = 1
             units[f"kf{i}"] = rate_constant_unit(fwd_order)
             units[f"kr{i}"] = rate_constant_unit(back_order)
-            units[f"K{i}"] = "1"
+            units[f"Keq{i}"] = "1"
 
     meta = getattr(mechanism, "metadata", {}) or {}
     scalar_info = meta.get("scalar_param_info") or {}

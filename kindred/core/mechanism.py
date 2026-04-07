@@ -22,7 +22,7 @@ Current contract
 - Equilibrium:
   - stoich_forward: dict[str, float]
   - stoich_back: dict[str, float]
-  - K: float | Expr | None
+  - Keq: float | Expr | None
   - kf: float | Expr | None
   - kr: float | Expr | None
   - fast: bool  (true if originated from `equilibrium:`)
@@ -188,7 +188,7 @@ class Equilibrium:
     """
     Reversible equilibrium description.
 
-    Either K or kf/kr may be provided (or both). If only K is provided,
+    Either Keq or kf/kr may be provided (or both). If only Keq is provided,
     kf/kr may be derived later based on a fast-equilibrium policy.
     Equilibria stay reversible single steps; the ODE builder consumes them as
     one column with forward/reverse power-law terms rather than duplicating
@@ -198,7 +198,7 @@ class Equilibrium:
     """
     stoich_forward: Dict[str, float]
     stoich_back: Dict[str, float]
-    K: Union[float, Expr, None] = None
+    Keq: Union[float, Expr, None] = None
     kf: Union[float, Expr, None] = None
     kr: Union[float, Expr, None] = None
     fast: bool = False
@@ -336,7 +336,7 @@ class Mechanism:
         stoich_forward: Mapping[str, float],
         stoich_back: Mapping[str, float],
         *,
-        K: Any | None = None,
+        Keq: Any | None = None,
         kf: Any | None = None,
         kr: Any | None = None,
         fast: bool = False,
@@ -345,7 +345,7 @@ class Mechanism:
         """
         Add an equilibrium pair.
 
-        At least one of {K, (kf and kr)} must be provided. Validation is structural;
+        At least one of {Keq, (kf and kr)} must be provided. Validation is structural;
         numeric sanity (positivity, units) is the responsibility of the simulator layer.
         """
         sf = _validate_stoich(stoich_forward)
@@ -353,15 +353,15 @@ class Mechanism:
         _ensure_species_exist(sf, self.species)
         _ensure_species_exist(sb, self.species)
 
-        if K is None and (kf is None or kr is None):
-            raise ValueError("equilibrium requires K or both kf and kr")
+        if Keq is None and (kf is None or kr is None):
+            raise ValueError("equilibrium requires Keq or both kf and kr")
 
         meta = dict(metadata) if metadata else {}
 
         eq = Equilibrium(
             stoich_forward=sf,
             stoich_back=sb,
-            K=K,
+            Keq=Keq,
             kf=kf,
             kr=kr,
             fast=bool(fast),
@@ -419,7 +419,7 @@ class Mechanism:
             {
                 "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
                 "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
-                "K": e.K, "kf": e.kf, "kr": e.kr, "fast": e.fast,
+                "Keq": e.Keq, "kf": e.kf, "kr": e.kr, "fast": e.fast,
             }
             for e in self.equilibria
         ]

@@ -23,7 +23,7 @@ def test_prepared_mode_binds_equilibrium_derived_kr_when_K_is_explicit():
     # so parameter algebra can enforce the equilibrium constraint each run.
     bound = prepare_bound_mechanism(
         mechanism_text=dsl,
-        param_names=["kf1", "K1", "k2", "a"],
+        param_names=["kf1", "Keq1", "k2", "a"],
         temperature_K=300.0,
         initials={},
         use_advanced_dsl=True,
@@ -31,10 +31,10 @@ def test_prepared_mode_binds_equilibrium_derived_kr_when_K_is_explicit():
 
     assert "kr1" in bound.bindings
     apply_parameter_algebra_to_mechanism(dsl, mechanism=bound.mechanism, require_mutable=True)
-    assert bound.bindings["kr1"]() == pytest.approx(bound.bindings["kf1"]() / bound.bindings["K1"]())
+    assert bound.bindings["kr1"]() == pytest.approx(bound.bindings["kf1"]() / bound.bindings["Keq1"]())
 
     bound.bindings["kf1"].set(8.0)
-    bound.bindings["K1"].set(4.0)
+    bound.bindings["Keq1"].set(4.0)
     apply_parameter_algebra_to_mechanism(dsl, mechanism=bound.mechanism, require_mutable=True)
     assert bound.bindings["kr1"]() == pytest.approx(2.0)
 
@@ -50,7 +50,7 @@ def test_prepared_mode_binds_equilibrium_derived_kf_when_K_is_explicit():
 
     bound = prepare_bound_mechanism(
         mechanism_text=dsl,
-        param_names=["kr1", "K1"],
+        param_names=["kr1", "Keq1"],
         temperature_K=300.0,
         initials={},
         use_advanced_dsl=True,
@@ -58,7 +58,7 @@ def test_prepared_mode_binds_equilibrium_derived_kf_when_K_is_explicit():
 
     assert "kf1" in bound.bindings
     apply_parameter_algebra_to_mechanism(dsl, mechanism=bound.mechanism, require_mutable=True)
-    assert bound.bindings["kf1"]() == pytest.approx(bound.bindings["kr1"]() * bound.bindings["K1"]())
+    assert bound.bindings["kf1"]() == pytest.approx(bound.bindings["kr1"]() * bound.bindings["Keq1"]())
 
 
 def test_prepared_rhs_uses_updated_equilibrium_binding_values():
@@ -78,7 +78,7 @@ def test_prepared_rhs_uses_updated_equilibrium_binding_values():
 
     bound = prepare_bound_mechanism(
         mechanism_text=dsl,
-        param_names=["kf1", "K1"],
+        param_names=["kf1", "Keq1"],
         temperature_K=300.0,
         initials={},
         use_advanced_dsl=True,
@@ -88,7 +88,7 @@ def test_prepared_rhs_uses_updated_equilibrium_binding_values():
     dy0 = bound.rhs(0.0, bound.y0)
 
     # Change K -> derived kr1 must update, and RHS must reflect it.
-    bound.bindings["K1"].set(2.0)
+    bound.bindings["Keq1"].set(2.0)
     apply_parameter_algebra_to_mechanism(dsl, mechanism=bound.mechanism, require_mutable=True)
     dy1 = bound.rhs(0.0, bound.y0)
 
@@ -103,7 +103,7 @@ def test_prepared_energy_fast_equilibrium_keeps_explicit_K_mutable():
             "init: A=1, B=0",
             "",
             "# Algebra",
-            "param K1 = 4",
+            "param Keq1 = 4",
         ]
     )
 
@@ -122,7 +122,7 @@ def test_prepared_energy_fast_equilibrium_keeps_explicit_K_mutable():
 
     assert float(eq.kf) == pytest.approx(10.0)
     assert float(eq.kr()) == pytest.approx(2.5)
-    assert float(meta["K_input"]()) == pytest.approx(4.0)
+    assert float(meta["Keq_input"]()) == pytest.approx(4.0)
 
 
 def test_prepared_energy_fast_equilibrium_preserves_explicit_K_when_kf_changes():
@@ -146,18 +146,18 @@ def test_prepared_energy_fast_equilibrium_preserves_explicit_K_when_kf_changes()
 
     assert float(eq.kf()) == pytest.approx(10.0)
     assert float(eq.kr()) == pytest.approx(2.0)
-    assert float(meta["K_input"]()) == pytest.approx(5.0)
+    assert float(meta["Keq_input"]()) == pytest.approx(5.0)
 
     bound.bindings["kf1"].set(20.0)
     apply_parameter_algebra_to_mechanism(dsl, mechanism=bound.mechanism, require_mutable=True)
 
     assert float(eq.kf()) == pytest.approx(20.0)
     assert float(eq.kr()) == pytest.approx(4.0)
-    assert float(meta["K_input"]()) == pytest.approx(5.0)
+    assert float(meta["Keq_input"]()) == pytest.approx(5.0)
 
     bound.bindings["kf1"].set(30.0)
     apply_parameter_algebra_to_mechanism(dsl, mechanism=bound.mechanism, require_mutable=True)
 
     assert float(eq.kf()) == pytest.approx(30.0)
     assert float(eq.kr()) == pytest.approx(6.0)
-    assert float(meta["K_input"]()) == pytest.approx(5.0)
+    assert float(meta["Keq_input"]()) == pytest.approx(5.0)

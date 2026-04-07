@@ -279,7 +279,7 @@ def test_gui_computational_mode_dialog_writes_blocks_and_populates_energy_slider
     assert any(name.startswith("dG_eq__") for name in variables), "Expected ΔG° slider variable"
 
     # Derived kf/kr/K are display-only (not present as sliders in energy mode).
-    assert not any(name.startswith(("k", "kf", "kr", "K")) for name in variables)
+    assert not any(name.startswith(("k", "kf", "kr", "Keq")) for name in variables)
 
     # Close dialog.
     _wait_for_dialog_deletion(dialog, qtbot)

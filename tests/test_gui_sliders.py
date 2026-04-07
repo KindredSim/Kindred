@@ -410,7 +410,7 @@ def test_slider_release_does_not_commit_dsl_in_override_mode(main_window, qtbot,
     main_window._extract_and_populate_variables()
 
     sliders = main_window._mechanism_editor._variable_sliders
-    assert sliders.has_variable("K1")
+    assert sliders.has_variable("Keq1")
 
     # Prevent background simulation from running in this test.
     monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
@@ -425,12 +425,12 @@ def test_slider_release_does_not_commit_dsl_in_override_mode(main_window, qtbot,
 
     # Simulate a drag gesture and release.
     preview = main_window._preview_session
-    main_window._on_slider_drag_started("K1")
-    slider_widget = sliders._sliders["K1"]
+    main_window._on_slider_drag_started("Keq1")
+    slider_widget = sliders._sliders["Keq1"]
     slider_widget.setValue(min(slider_widget.maximum(), slider_widget.value() + 50))
 
-    qtbot.waitUntil(lambda: "K1" in preview._pending_slider_values, timeout=1000)
-    main_window._on_slider_drag_finished("K1")
+    qtbot.waitUntil(lambda: "Keq1" in preview._pending_slider_values, timeout=1000)
+    main_window._on_slider_drag_finished("Keq1")
     qtbot.waitUntil(lambda: not bool(getattr(preview, "_slider_release_in_progress", False)), timeout=1500)
 
     assert commits == []
@@ -1210,14 +1210,14 @@ def test_release_does_not_recompute_K_when_editing_kr_with_explicit_K(main_windo
     main_window._extract_and_populate_variables()
 
     sliders = main_window._mechanism_editor._variable_sliders
-    assert sliders.has_variable("K1")
+    assert sliders.has_variable("Keq1")
     assert sliders.has_variable("kr1")
 
     # Prevent background simulation from running in this test.
     monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
 
     # Capture the initial K value (should remain stable through a kr edit).
-    initial_K = float(sliders.get_variables().get("K1"))
+    initial_K = float(sliders.get_variables().get("Keq1"))
 
     # Simulate a drag gesture for kr1 and release so the release-commit pipeline runs.
     preview = main_window._preview_session
@@ -1236,7 +1236,7 @@ def test_release_does_not_recompute_K_when_editing_kr_with_explicit_K(main_windo
     qtbot.waitUntil(lambda: not bool(getattr(preview, "_slider_release_in_progress", False)), timeout=1500)
 
     # K must not change just because kr changed (kf is the derived rate in this case).
-    assert float(sliders.get_variables().get("K1")) == pytest.approx(initial_K)
+    assert float(sliders.get_variables().get("Keq1")) == pytest.approx(initial_K)
 
 
 def test_fast_worker_completion_never_reextracts_sliders(main_window, qtbot, monkeypatch):
@@ -1421,7 +1421,7 @@ def test_equilibrium_slider_does_not_synthesize_K_when_not_explicit(main_window)
     sliders = main_window._mechanism_editor._variable_sliders
     assert sliders.has_variable("kf1")
     assert sliders.has_variable("kr1")
-    assert not sliders.has_variable("K1")
+    assert not sliders.has_variable("Keq1")
 
     # Changing kf1 should not introduce a K=... token into the DSL.
     main_window._update_variable_in_mechanism("kf1", 1.2)
@@ -1602,11 +1602,11 @@ def test_K_slider_update_writes_consistent_equilibrium_parameters(main_window):
     main_window._extract_and_populate_variables()
 
     sliders = main_window._mechanism_editor._variable_sliders
-    assert sliders.has_variable("K1")
+    assert sliders.has_variable("Keq1")
 
     # Historically, moving K would write a derived kr with too few significant digits
     # and then re-parse would fail the strict K ≈ kf/kr validation.
-    main_window._update_variable_in_mechanism("K1", 251.189)
+    main_window._update_variable_in_mechanism("Keq1", 251.189)
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
 
     # Must be parseable after the GUI rewrites equilibrium tokens.
@@ -1649,7 +1649,7 @@ def test_K_slider_does_not_store_derived_rate_as_override(main_window):
     )
     main_window._extract_and_populate_variables()
 
-    main_window._update_variable_in_mechanism("K1", 2.29087e6)
+    main_window._update_variable_in_mechanism("Keq1", 2.29087e6)
 
     # kr1 is derived/read-only for explicit-K equilibria (default policy), so it must
     # never be persisted into slider overrides (which later rewrite the DSL).
@@ -1681,10 +1681,10 @@ def test_K_update_uses_current_text_owner_when_cached_metadata_is_stale(main_win
         )
     )
 
-    main_window._update_variable_in_mechanism("K1", 6.0)
+    main_window._update_variable_in_mechanism("Keq1", 6.0)
 
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
-    assert "K=6" in updated
+    assert "Keq=6" in updated
     assert "kr=2" in updated
     assert "kf=" not in updated
 
@@ -1696,7 +1696,7 @@ def test_K_update_ignores_stale_cached_constraint_metadata_after_manual_text_edi
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = 4",
+                "param Keq1 = 4",
                 "reaction: B -> C ; k=0.1",
                 "initial: A=1.0",
                 "initial: B=0.0",
@@ -1717,11 +1717,11 @@ def test_K_update_ignores_stale_cached_constraint_metadata_after_manual_text_edi
         )
     )
 
-    main_window._update_variable_in_mechanism("K1", 8.0)
+    main_window._update_variable_in_mechanism("Keq1", 8.0)
 
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
-    assert "K=8" in updated
-    assert "param K1 = 4" not in updated
+    assert "Keq=8" in updated
+    assert "param Keq1 = 4" not in updated
 
 
 def test_K_update_keeps_current_text_constraint_when_unused_builtin_shadow_scalar_input_present(main_window):
@@ -1732,18 +1732,18 @@ def test_K_update_keeps_current_text_constraint_when_unused_builtin_shadow_scala
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = 4",
+                "param Keq1 = 4",
                 "initial: A=1.0",
                 "initial: B=0.0",
             ]
         )
     )
 
-    main_window._update_variable_in_mechanism("K1", 8.0)
+    main_window._update_variable_in_mechanism("Keq1", 8.0)
 
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
     assert "K=8" not in updated
-    assert "param K1 = 4" in updated
+    assert "param Keq1 = 4" in updated
 
 
 def test_slider_label_stays_canonical_step_label_after_updates(main_window):
@@ -1761,14 +1761,14 @@ def test_slider_label_stays_canonical_step_label_after_updates(main_window):
     main_window._extract_and_populate_variables()
     before = dict(main_window.variable_metadata())
     assert before["kf1"]["label"].startswith("Step ")
-    assert before["K1"]["label"].startswith("Step ")
+    assert before["Keq1"]["label"].startswith("Step ")
 
-    main_window._update_variable_in_mechanism("K1", 12.0)
+    main_window._update_variable_in_mechanism("Keq1", 12.0)
     after = dict(main_window.variable_metadata())
     assert after["kf1"]["label"].startswith("Step ")
-    assert after["K1"]["label"].startswith("Step ")
+    assert after["Keq1"]["label"].startswith("Step ")
     assert after["kf1"]["label"] == before["kf1"]["label"]
-    assert after["K1"]["label"] == before["K1"]["label"]
+    assert after["Keq1"]["label"] == before["Keq1"]["label"]
 
 
 def test_K_slider_uses_longer_debounce_than_other_params(main_window, qtbot, monkeypatch):
@@ -1795,8 +1795,8 @@ def test_K_slider_uses_longer_debounce_than_other_params(main_window, qtbot, mon
     qtbot.waitUntil(lambda: hasattr(preview, "_variable_update_timer"), timeout=1000)
     short_ms = preview._variable_update_timer.interval()
 
-    main_window._on_slider_drag_started("K1")
-    sliders._on_slider_changed("K1", sliders._value_to_slider_pos("K1", 20.0))
+    main_window._on_slider_drag_started("Keq1")
+    sliders._on_slider_changed("Keq1", sliders._value_to_slider_pos("Keq1", 20.0))
     long_ms = preview._variable_update_timer.interval()
 
     assert long_ms > short_ms
@@ -1827,8 +1827,8 @@ def test_slider_preview_debounce_settings_drive_parameter_and_K_timers(main_wind
     qtbot.waitUntil(lambda: hasattr(preview, "_variable_update_timer"), timeout=1000)
     short_ms = preview._variable_update_timer.interval()
 
-    main_window._on_slider_drag_started("K1")
-    sliders._on_slider_changed("K1", sliders._value_to_slider_pos("K1", 20.0))
+    main_window._on_slider_drag_started("Keq1")
+    sliders._on_slider_changed("Keq1", sliders._value_to_slider_pos("Keq1", 20.0))
     long_ms = preview._variable_update_timer.interval()
 
     assert short_ms == 25
@@ -1854,7 +1854,7 @@ def test_K_implied_derived_rate_updates_without_param_block(main_window):
 
     sliders = main_window._mechanism_editor._variable_sliders
     kf = sliders.get_variables()["kf1"]
-    sliders.update_variable("K1", 20.0)
+    sliders.update_variable("Keq1", 20.0)
     main_window._refresh_derived_parameters_display()
     after = sliders.get_variables()
     assert after["kr1"] == pytest.approx(kf / 20.0)
@@ -1906,8 +1906,8 @@ def test_K_drag_uses_preview_t_end_and_release_uses_full_t_end(main_window, monk
 
     # Drag preview
     preview = main_window._preview_session
-    main_window._on_slider_drag_started("K1")
-    preview._last_slider_change_name = "K1"
+    main_window._on_slider_drag_started("Keq1")
+    preview._last_slider_change_name = "Keq1"
     main_window.simulation_controller.run_simulation_internal(fast_mode=True)
     qtbot.waitUntil(lambda: len(captured) >= 1, timeout=1000)
     (t_span_preview, cfg_preview) = captured[-1]
@@ -1915,8 +1915,8 @@ def test_K_drag_uses_preview_t_end_and_release_uses_full_t_end(main_window, monk
     assert int(cfg_preview["grid"]["N"]) <= 120
 
     # Release full fast run
-    main_window._on_slider_drag_finished("K1")
-    preview._last_slider_change_name = "K1"
+    main_window._on_slider_drag_finished("Keq1")
+    preview._last_slider_change_name = "Keq1"
     main_window.simulation_controller.run_simulation_internal(fast_mode=True)
     qtbot.waitUntil(lambda: len(captured) >= 2, timeout=1000)
     (t_span_full, cfg_full) = captured[-1]

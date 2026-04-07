@@ -209,19 +209,19 @@ def test_unused_builtin_shadow_scalar_input_does_not_poison_parameter_algebra_ev
         "\n".join(
             [
                 "# Algebra",
-                "param K1 = 5",
+                "param Keq1 = 5",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "K1"},
+        mechanism_param_names={"kf1", "kr1", "Keq1"},
         scalar_input_names={"sin"},
     )
 
     derived = evaluate_parameter_algebra(
         spec,
-        base_values={"kf1": 6.0, "K1": 3.0, "sin": 2.0},
+        base_values={"kf1": 6.0, "Keq1": 3.0, "sin": 2.0},
     )
 
-    assert derived["K1"] == pytest.approx(5.0)
+    assert derived["Keq1"] == pytest.approx(5.0)
 
 
 def test_referenced_builtin_shadow_scalar_input_is_rejected():
@@ -229,17 +229,17 @@ def test_referenced_builtin_shadow_scalar_input_is_rejected():
         "\n".join(
             [
                 "# Algebra",
-                "param K1 = sin",
+                "param Keq1 = sin",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "K1"},
+        mechanism_param_names={"kf1", "kr1", "Keq1"},
         scalar_input_names={"sin"},
     )
 
     with pytest.raises(DSLError, match="sin"):
         evaluate_parameter_algebra(
             spec,
-            base_values={"kf1": 6.0, "K1": 3.0, "sin": 2.0},
+            base_values={"kf1": 6.0, "Keq1": 3.0, "sin": 2.0},
         )
 
 
@@ -248,21 +248,21 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
         "\n".join(
             [
                 "# Algebra",
-                "param K2 = a",
+                "param Keq2 = a",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "K1", "kf2", "kr2", "K2"},
+        mechanism_param_names={"kf1", "kr1", "Keq1", "kf2", "kr2", "Keq2"},
         scalar_input_names={"a"},
     )
 
     with pytest.raises(DSLError, match="Non-finite") as exc:
         evaluate_parameter_algebra(
             spec,
-            base_values={"kf1": 6.0, "K1": 3.0, "kf2": 4.0, "K2": 5.0, "a": float("nan")},
+            base_values={"kf1": 6.0, "Keq1": 3.0, "kf2": 4.0, "Keq2": 5.0, "a": float("nan")},
         )
 
     assert exc.value.line_number == 2
-    assert exc.value.line_content == "param K2 = a"
+    assert exc.value.line_content == "param Keq2 = a"
 
 
 def test_rate_constant_unit_formatting():

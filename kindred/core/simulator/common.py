@@ -113,14 +113,14 @@ def choose_k_fast(
 class FastEqResult:
     kf: float
     kr: float
-    K: float
+    Keq: float
     k_fast: float
     source: str
 
 
 def derive_equilibrium_rates(
     *,
-    K: float | None = None,
+    Keq: float | None = None,
     dG_eq_J_per_mol: float | None = None,
     T: float = 298.15,
     explicit_rates: Optional[Iterable[float]] = None,
@@ -128,23 +128,23 @@ def derive_equilibrium_rates(
     """
     Derive (kf, kr) for an equilibrium step using the fast-equilibrium policy.
 
-    You must provide either K or ΔG° (in J/mol). If both are provided, K takes precedence.
+    You must provide either Keq or ΔG° (in J/mol). If both are provided, Keq takes precedence.
     """
-    if K is None and dG_eq_J_per_mol is None:
-        raise DSLError("derive_equilibrium_rates requires K or dG_eq_J_per_mol")
+    if Keq is None and dG_eq_J_per_mol is None:
+        raise DSLError("derive_equilibrium_rates requires Keq or dG_eq_J_per_mol")
 
-    if K is None:
+    if Keq is None:
         if dG_eq_J_per_mol is None:
             raise DSLError("missing value for dG_eq_J_per_mol")
         dG_eq_val = float(dG_eq_J_per_mol)
         if not math.isfinite(dG_eq_val):
             raise DSLError("dG_eq_J_per_mol must be finite")
-        K_val = K_from_deltaG_eq(dG_eq_val, _pos_finite(T, "T"))
+        Keq_val = K_from_deltaG_eq(dG_eq_val, _pos_finite(T, "T"))
         source = "derived(ΔG°)"
     else:
-        K_val = _pos_finite(K, "K")
-        source = "derived(K)"
+        Keq_val = _pos_finite(Keq, "Keq")
+        source = "derived(Keq)"
 
     kf_fast = choose_k_fast(explicit_rates)
-    kr_fast = kf_fast / K_val
-    return FastEqResult(kf=kf_fast, kr=kr_fast, K=K_val, k_fast=kf_fast, source=source)
+    kr_fast = kf_fast / Keq_val
+    return FastEqResult(kf=kf_fast, kr=kr_fast, Keq=Keq_val, k_fast=kf_fast, source=source)

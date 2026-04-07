@@ -94,9 +94,9 @@ _KEY_ALIASES: Dict[str, str] = {
     "a": "A",
     "A": "A",
     "k": "k",
-    "K": "K",  # Equilibrium constant (case-sensitive)
-    "keq": "K",
-    "k_eq": "K",
+    "K": "Keq",  # Equilibrium constant (surface alias; distinct from lowercase k)
+    "keq": "Keq",
+    "k_eq": "Keq",
     "kf": "kf",
     "kr": "kr",
     "k_fast": "k_fast",
@@ -113,8 +113,8 @@ _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _STATE_REST_SPLIT_RE = re.compile(r"[;,]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
-_REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "K", "dG_eq", "dG_act"})
-_EQUILIBRIUM_KNOWN_KEYS = frozenset({"K", "kf", "kr", "dG_eq", "dg_eq", "cm_id"})
+_REACTION_KNOWN_KEYS = frozenset({"κ", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"})
+_EQUILIBRIUM_KNOWN_KEYS = frozenset({"Keq", "kf", "kr", "dG_eq", "dg_eq", "cm_id"})
 
 
 # ------------------------------ data models ----------------------------------
@@ -168,9 +168,9 @@ class DSLIR:
 
 def _norm_key(k: str) -> str:
     key = k.strip()
-    # Special case: preserve 'K' for equilibrium constant
-    if key == 'K':
-        return 'K'
+    # Preserve uppercase K as the equilibrium alias distinct from lowercase k.
+    if key == "K":
+        return "Keq"
     # Otherwise normalize to lowercase and look up
     return _KEY_ALIASES.get(key.lower(), key)
 
@@ -692,7 +692,7 @@ class ParsedStep:
     kappa: Optional[float] = None
     standard_conc_M: Optional[float] = None
     dG_eq_J_per_mol: Optional[float] = None
-    K_input: Optional[float] = None
+    Keq_input: Optional[float] = None
     explicit_rates: List[float] = field(default_factory=list)
     user_kf_explicit: bool = False
     user_kr_explicit: bool = False
@@ -933,7 +933,7 @@ def _reject_unknown_params(
         )
 
 
-def _resolve_K_from_params(
+def _resolve_Keq_from_params(
     params: Dict[str, str],
     *,
     energy_unit: str,
@@ -941,34 +941,34 @@ def _resolve_K_from_params(
     line_number: Optional[int],
     line_content: Optional[str],
 ) -> Tuple[float, Optional[float]]:
-    """Resolve equilibrium constant K from explicit K= or dG_eq=.
+    """Resolve equilibrium constant Keq from explicit K/Keq input or dG_eq=.
 
-    Precondition: at least one of "K" or "dG_eq" must be present in params.
-    Returns (K, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
+    Precondition: at least one of "Keq" or "dG_eq" must be present in params.
+    Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
     """
     from .kinetics import K_from_deltaG_eq, normalize_energy_to_J_per_mol
 
-    K = _float_or_none(params.get("K"))
+    Keq = _float_or_none(params.get("Keq"))
     dG_eqJ: Optional[float] = None
-    if K is None:
+    if Keq is None:
         dG_eq_val = _float_or_none(params["dG_eq"])
         if dG_eq_val is None:
             raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
         dG = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
         dG_eqJ = dG
         try:
-            K = K_from_deltaG_eq(dG, T)
+            Keq = K_from_deltaG_eq(dG, T)
         except OverflowError as exc:
             raise DSLError(
                 "Equilibrium constant overflow (dG_eq too large for given T)",
                 line_number=line_number, line_content=line_content,
             ) from exc
-        if K <= 0:
+        if Keq <= 0:
             raise DSLError(
                 "Equilibrium constant underflowed to zero (dG_eq too large for given T)",
                 line_number=line_number, line_content=line_content,
             )
-    return K, dG_eqJ
+    return Keq, dG_eqJ
 
 
 def _parse_reaction_like_step(
@@ -1016,18 +1016,18 @@ def _parse_reaction_like_step(
                             line_number=line_number, line_content=line_content)
     if params.get("kr"):
         _validate_rate_or_K(kr, "kr", line_number=line_number, line_content=line_content)
-    if "K" in params:
-        _K_early = _float_or_none(params["K"])
-        if _K_early is not None and _K_early <= 0:
+    if "Keq" in params:
+        _Keq_early = _float_or_none(params["Keq"])
+        if _Keq_early is not None and _Keq_early <= 0:
             raise DSLError(
-                f"K must be positive, got {_K_early}",
+                f"Keq must be positive, got {_Keq_early}",
                 line_number=line_number, line_content=line_content,
             )
     arrhenius_A = None
     arrhenius_EaJ = None
     eyring_dGJ = None
     dG_eqJ_for_step = None
-    K_input = None
+    Keq_input = None
     explicit_rates: List[float] = []
 
     if model == "Arrhenius":
@@ -1059,16 +1059,16 @@ def _parse_reaction_like_step(
             ) from exc
         explicit_rates.append(kf)
         if reversible and kr is None:
-            if "K" in params or "dG_eq" in params:
-                K, dG_eqJ_for_step = _resolve_K_from_params(
+            if "Keq" in params or "dG_eq" in params:
+                Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
                     params, energy_unit=energy_unit, T=T,
                     line_number=line_number, line_content=line_content,
                 )
-                kr = kf / K
-                K_input = K if "K" in params else None
+                kr = kf / Keq
+                Keq_input = Keq if "Keq" in params else None
             else:
                 raise DSLError(
-                    "reversible Arrhenius step needs kr or K/dG_eq",
+                    "reversible Arrhenius step needs kr or Keq/dG_eq",
                     examples=["A <-> B ; A=1e10 ; Ea=50 ; K=2.0"],
                     line_number=line_number, line_content=line_content,
                 )
@@ -1100,13 +1100,13 @@ def _parse_reaction_like_step(
                 ) from exc
             explicit_rates.append(kf)
         if reversible and kr is None:
-            if "K" in params or "dG_eq" in params:
-                K, dG_eqJ_for_step = _resolve_K_from_params(
+            if "Keq" in params or "dG_eq" in params:
+                Keq, dG_eqJ_for_step = _resolve_Keq_from_params(
                     params, energy_unit=energy_unit, T=T,
                     line_number=line_number, line_content=line_content,
                 )
-                kr = kf / K
-                K_input = K if "K" in params else None
+                kr = kf / Keq
+                Keq_input = Keq if "Keq" in params else None
             else:
                 dG_eq_fallback_J_per_mol = None
                 dG_eq_raw = params.get("dG_eq")
@@ -1116,7 +1116,7 @@ def _parse_reaction_like_step(
                         raise DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
                     dG_eq_fallback_J_per_mol = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
                 fe = _derive_equilibrium_rates_with_context(
-                    K=_float_or_none(params.get("K")),
+                    Keq=_float_or_none(params.get("Keq")),
                     dG_eq_J_per_mol=dG_eq_fallback_J_per_mol,
                     T=T,
                     explicit_rates=[kf] if kf is not None else None,
@@ -1142,7 +1142,7 @@ def _parse_reaction_like_step(
         kappa=kappa,
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ_for_step,
-        K_input=K_input,
+        Keq_input=Keq_input,
         explicit_rates=explicit_rates,
         user_kf_explicit=bool(
             params.get("kf") or params.get("k") or params.get("A") or params.get("Ea") or params.get("dG_act")
@@ -1238,7 +1238,7 @@ def _parse_equilibrium_step(
     if arrow not in ("<->", "<=>"):
         raise DSLError(
             "equilibrium must use '<->' or '<=>'",
-            examples=["equilibrium: A <-> B ; K=2.0 ; kf=10"],
+            examples=["equilibrium: A <-> B ; Keq=2.0 ; kf=10"],
             line_number=line_number, line_content=line_content,
         )
     _ = molecularity(react)
@@ -1247,16 +1247,16 @@ def _parse_equilibrium_step(
     _reject_unknown_params(params, _EQUILIBRIUM_KNOWN_KEYS, "equilibrium",
                            line_number=line_number, line_content=line_content)
 
-    has_explicit_K = "K" in params
-    K = _float_or_none(params.get("K"))
-    if has_explicit_K and K is None:
+    has_explicit_Keq = "Keq" in params
+    Keq = _float_or_none(params.get("Keq"))
+    if has_explicit_Keq and Keq is None:
         raise DSLError(
-            "K must be numeric",
+            "Keq must be numeric",
             line_number=line_number,
             line_content=line_content,
         )
-    if has_explicit_K and K is not None:
-        _validate_rate_or_K(K, "K", line_number=line_number, line_content=line_content)
+    if has_explicit_Keq and Keq is not None:
+        _validate_rate_or_K(Keq, "Keq", line_number=line_number, line_content=line_content)
     dG_eqJ = None
 
     exp_rates: List[float] = []
@@ -1277,48 +1277,48 @@ def _parse_equilibrium_step(
         kr_explicit = krv
         exp_rates.append(krv)
 
-    if has_explicit_K and kf_explicit is None and kr_explicit is None:
+    if has_explicit_Keq and kf_explicit is None and kr_explicit is None:
         raise DSLError(
-            "equilibrium with K=... requires at least one of kf or kr to anchor the rates",
-            suggestion="Provide either kf=...; K=... or kr=...; K=... (or specify both kf and kr without K).",
+            "equilibrium with Keq=... requires at least one of kf or kr to anchor the rates",
+            suggestion="Provide either kf=...; Keq=... or kr=...; Keq=... (or specify both kf and kr without Keq).",
             examples=[
-                "equilibrium: A <-> B; kf=10.0; K=5.0",
-                "equilibrium: A <-> B; kr=2.0; K=5.0",
+                "equilibrium: A <-> B; kf=10.0; Keq=5.0",
+                "equilibrium: A <-> B; kr=2.0; Keq=5.0",
                 "equilibrium: A <-> B; kf=4.0; kr=2.0",
             ],
             line_number=line_number,
             line_content=line_content,
         )
 
-    if has_explicit_K and kf_explicit is not None and kr_explicit is not None:
+    if has_explicit_Keq and kf_explicit is not None and kr_explicit is not None:
         if abs(kr_explicit) < 1e-30:
             raise DSLError(
-                "kr must be non-zero when validating K against kf/kr",
+                "kr must be non-zero when validating Keq against kf/kr",
                 line_number=line_number,
                 line_content=line_content,
             )
         implied_K = float(kf_explicit) / float(kr_explicit)
         tol_rel = 1e-6
         tol_abs = 1e-12
-        diff = abs(implied_K - float(K))
-        scale = max(abs(implied_K), abs(float(K)), 1.0)
+        diff = abs(implied_K - float(Keq))
+        scale = max(abs(implied_K), abs(float(Keq)), 1.0)
         if diff > (tol_abs + tol_rel * scale):
             raise DSLError(
-                f"Inconsistent equilibrium parameters: K={float(K):.6g} but kf/kr={implied_K:.6g}",
-                suggestion="Adjust K or kf/kr so that K ≈ kf/kr (within tolerance).",
+                f"Inconsistent equilibrium parameters: Keq={float(Keq):.6g} but kf/kr={implied_K:.6g}",
+                suggestion="Adjust Keq or kf/kr so that Keq ≈ kf/kr (within tolerance).",
                 line_number=line_number,
                 line_content=line_content,
             )
 
-    if K is None and kf_explicit is not None and kr_explicit is not None and kr_explicit != 0:
-        K = kf_explicit / kr_explicit
+    if Keq is None and kf_explicit is not None and kr_explicit is not None and kr_explicit != 0:
+        Keq = kf_explicit / kr_explicit
 
-    if K is None:
+    if Keq is None:
         dG_eq = params.get("dG_eq") or params.get("dg_eq")
         if dG_eq is None:
             raise DSLError(
-                "equilibrium requires K, dG_eq, or both kf and kr. "
-                "Examples: 'K=2.0' or 'kf=1.5; kr=0.25' or 'dG_eq=-10 kJ/mol'",
+                "equilibrium requires Keq, dG_eq, or both kf and kr. "
+                "Examples: 'Keq=2.0' or 'kf=1.5; kr=0.25' or 'dG_eq=-10 kJ/mol'",
                 line_number=line_number,
                 line_content=line_content,
             )
@@ -1328,7 +1328,7 @@ def _parse_equilibrium_step(
         dG_eqJ = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
 
     fe = _derive_equilibrium_rates_with_context(
-        K=K,
+        Keq=Keq,
         dG_eq_J_per_mol=dG_eqJ,
         T=T,
         explicit_rates=exp_rates or None,
@@ -1350,7 +1350,7 @@ def _parse_equilibrium_step(
         kappa=kappa_global,
         standard_conc_M=C0,
         dG_eq_J_per_mol=dG_eqJ,
-        K_input=(K if has_explicit_K else None),
+        Keq_input=(Keq if has_explicit_Keq else None),
         explicit_rates=exp_rates,
         user_kf_explicit=("kf" in params),
         user_kr_explicit=("kr" in params),

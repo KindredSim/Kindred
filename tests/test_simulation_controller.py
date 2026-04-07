@@ -4999,7 +4999,7 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
     mw._initial_atol = 1e-12
     mw._parse_sim_time_seconds.return_value = 10.0
     mw._slider_drag_active = True
-    mw._last_slider_change_name = "K12"
+    mw._last_slider_change_name = "Keq12"
     mw._batch_store.visible_species.return_value = ["A"]
 
     monkeypatch.setattr(

@@ -52,7 +52,7 @@ def _build_reference_rhs(mechanism):
 
             kf = _evaluate_scalar(step_obj.kf)
             kr = _evaluate_scalar(step_obj.kr)
-            K = _evaluate_scalar(step_obj.K)
+            K = _evaluate_scalar(step_obj.Keq)
 
             if kf is None and kr is None:
                 if K is None:

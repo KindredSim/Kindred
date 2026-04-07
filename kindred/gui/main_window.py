@@ -4542,8 +4542,8 @@ class MainWindow(
         }
         for name, value in parameters.items():
             name_str = str(name)
-            if re.match(r"^(kf|kr|K|k)\d+$", name_str) and hasattr(self, "_update_variable_in_mechanism"):
-                if re.match(r"^(kf|kr|K)\d+$", name_str) and (
+            if re.match(r"^(kf|kr|Keq|k)\d+$", name_str) and hasattr(self, "_update_variable_in_mechanism"):
+                if re.match(r"^(kf|kr|Keq)\d+$", name_str) and (
                     step_analysis_context is None or step_analysis_context.source_text != updated_text
                 ):
                     step_analysis_context = build_current_text_step_analysis_context(
@@ -6397,7 +6397,7 @@ class MainWindow(
             if isinstance(meta, dict) and meta.get("type") == "energy":
                 has_energy_overrides = True
                 continue
-            if re.match(r"^(kf|kr|K)\d+$", str(var_name)):
+            if re.match(r"^(kf|kr|Keq)\d+$", str(var_name)):
                 if step_analysis_context is None or step_analysis_context.source_text != text:
                     step_analysis_context = build_current_text_step_analysis_context(
                         text,
@@ -7121,7 +7121,7 @@ class MainWindow(
         current = sliders.get_variables()
         if not current:
             return
-        mechanism_param_names = {k for k in current.keys() if re.match(r"^(k|kf|kr|K)\d+$", str(k))}
+        mechanism_param_names = {k for k in current.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
         spec = None
         try:
             spec = self._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
@@ -7152,8 +7152,8 @@ class MainWindow(
         # Refresh snapshot after any derived updates.
         current = sliders.get_variables()
 
-        # Apply K-implied equilibrium constraints (canonical step indexing) so derived
-        # rates update immediately when K changes.
+        # Apply Keq-implied equilibrium constraints (canonical step indexing) so derived
+        # rates update immediately when Keq changes.
         step_map = getattr(self, "_step_index_map", None) or []
         if isinstance(step_map, list) and step_map:
             for entry in step_map:
@@ -7161,18 +7161,18 @@ class MainWindow(
                     continue
                 if str(entry.get("kind") or "") != "equilibrium":
                     continue
-                if not bool(entry.get("has_K_param")):
+                if not bool(entry.get("has_Keq_param")):
                     continue
                 try:
                     n = int(entry.get("step_index"))  # type: ignore[arg-type]
                 except Exception as exc:
                     self._record_best_effort_failure(
-                        "main_window.derived_K_constraints.step_index",
-                        message="Invalid step_index while applying K-implied constraints",
+                        "main_window.derived_Keq_constraints.step_index",
+                        message="Invalid step_index while applying Keq-implied constraints",
                         exc=exc,
                     )
                     continue
-                K_key = f"K{n}"
+                K_key = f"Keq{n}"
                 kf_key = f"kf{n}"
                 kr_key = f"kr{n}"
                 if K_key not in current:
@@ -7181,8 +7181,8 @@ class MainWindow(
                     K_val = float(current[K_key])
                 except Exception as exc:
                     self._record_best_effort_failure(
-                        "main_window.derived_K_constraints.K_val",
-                        message=f"Invalid K value for {K_key} while applying K-implied constraints",
+                        "main_window.derived_Keq_constraints.K_val",
+                        message=f"Invalid Keq value for {K_key} while applying Keq-implied constraints",
                         exc=exc,
                     )
                     continue
@@ -7196,7 +7196,7 @@ class MainWindow(
                         kr_val = float(current[kr_key])
                     except Exception as exc:
                         self._record_best_effort_failure(
-                            "main_window.derived_K_constraints.kr_val",
+                            "main_window.derived_Keq_constraints.kr_val",
                             message=f"Invalid kr value for {kr_key} while deriving kf",
                             exc=exc,
                         )
@@ -7216,7 +7216,7 @@ class MainWindow(
                         kf_val = float(current[kf_key])
                     except Exception as exc:
                         self._record_best_effort_failure(
-                            "main_window.derived_K_constraints.kf_val",
+                            "main_window.derived_Keq_constraints.kf_val",
                             message=f"Invalid kf value for {kf_key} while deriving kr",
                             exc=exc,
                         )
@@ -7336,7 +7336,7 @@ class MainWindow(
             f"ΔG° ({label})": (dG_eq, energy_unit),
             f"k_f ({label})": (kf_fixed, unit_kf),
             f"k_r ({label})": (kr, unit_kr),
-            f"K ({label})": (K, "1"),
+            f"Keq ({label})": (K, "1"),
         }
 
     def _energy_mode_params_for_ts_channel(
@@ -7436,14 +7436,14 @@ class MainWindow(
             f"ΔG° ({label})": (dG_eq, energy_unit),
             f"k_f ({label})": (kf, unit_kf),
             f"k_r ({label})": (kr, unit_kr),
-            f"K ({label})": (K, "1"),
+            f"Keq ({label})": (K, "1"),
         }
 
     def _refresh_energy_mode_derived_parameter_table(self) -> None:
         """
         Update the parameter table for energy-mode channels from current slider values.
 
-        This is cheap (no ODE solve) and keeps the read-only k_f/k_r/K display in sync
+        This is cheap (no ODE solve) and keeps the read-only k_f/k_r/Keq display in sync
         while the user drags energy sliders.
         """
         plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
@@ -8007,7 +8007,7 @@ class MainWindow(
     @staticmethod
     def _label_for_step_from_metadata(metadata: dict[str, object], step_index: int, fallback_prefix: str) -> str:
         # Preserve canonical labels generated from step_index_map ("Step N: ...").
-        for key in (f"kf{step_index}", f"kr{step_index}", f"K{step_index}", f"k{step_index}"):
+        for key in (f"kf{step_index}", f"kr{step_index}", f"Keq{step_index}", f"k{step_index}"):
             meta0 = metadata.get(key)
             if isinstance(meta0, dict) and isinstance(meta0.get("label"), str) and meta0.get("label"):
                 return str(meta0["label"])
@@ -8048,7 +8048,7 @@ class MainWindow(
         Parameters
         ----------
         name : str
-            Variable name (e.g., 'k1', 'K1', 'kf1')
+            Variable name (e.g., 'k1', 'Keq1', 'kf1')
         value : float
             New value
         source_text : str | None
@@ -8099,22 +8099,22 @@ class MainWindow(
         }
         new_text = str(outcome.updated_text)
 
-        if family == "K":
-            K_val = float(resolved_values[f"K{step_index}"])
+        if family == "Keq":
+            K_val = float(resolved_values[f"Keq{step_index}"])
             kf_val = float(resolved_values[f"kf{step_index}"])
             kr_val = float(resolved_values[f"kr{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
-            K_meta = dict(metadata.get(f"K{step_index}") or {})
+            K_meta = dict(metadata.get(f"Keq{step_index}") or {})
             K_meta.update(
                 {
                     "type": "equilibrium",
                     "index": step_index,
                     "label": K_meta.get("label") or label_text,
                     "line": line_index,
-                    "role": "K",
+                    "role": "Keq",
                 }
             )
-            metadata[f"K{step_index}"] = K_meta
+            metadata[f"Keq{step_index}"] = K_meta
             kf_meta = dict(metadata.get(f"kf{step_index}") or {})
             kf_meta.update(
                 {
@@ -8138,7 +8138,7 @@ class MainWindow(
             )
             metadata[f"kr{step_index}"] = kr_meta
             if commit:
-                slider_updates.append((f"K{step_index}", float(f"{K_val:.6g}"), metadata[f"K{step_index}"]))
+                slider_updates.append((f"Keq{step_index}", float(f"{K_val:.6g}"), metadata[f"Keq{step_index}"]))
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
         elif family == "kf":
@@ -8167,24 +8167,24 @@ class MainWindow(
                 }
             )
             metadata[f"kr{step_index}"] = kr_meta
-            if f"K{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"K{step_index}"])
-                K_meta = dict(metadata.get(f"K{step_index}") or {})
+            if f"Keq{step_index}" in resolved_values:
+                K_val = float(resolved_values[f"Keq{step_index}"])
+                K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
                         "type": "equilibrium",
                         "index": step_index,
                         "label": K_meta.get("label") or label_text,
                         "line": line_index,
-                        "role": "K",
+                        "role": "Keq",
                     }
                 )
-                metadata[f"K{step_index}"] = K_meta
+                metadata[f"Keq{step_index}"] = K_meta
             if commit:
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
-                if f"K{step_index}" in resolved_values:
-                    slider_updates.append((f"K{step_index}", float(f"{resolved_values[f'K{step_index}']:.6g}"), metadata[f"K{step_index}"]))
+                if f"Keq{step_index}" in resolved_values:
+                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "kr":
             kr_val = float(resolved_values[f"kr{step_index}"])
             kf_val = float(resolved_values[f"kf{step_index}"])
@@ -8211,24 +8211,24 @@ class MainWindow(
                 }
             )
             metadata[f"kf{step_index}"] = kf_meta
-            if f"K{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"K{step_index}"])
-                K_meta = dict(metadata.get(f"K{step_index}") or {})
+            if f"Keq{step_index}" in resolved_values:
+                K_val = float(resolved_values[f"Keq{step_index}"])
+                K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
                         "type": "equilibrium",
                         "index": step_index,
                         "label": K_meta.get("label") or label_text,
                         "line": line_index,
-                        "role": "K",
+                        "role": "Keq",
                     }
                 )
-                metadata[f"K{step_index}"] = K_meta
+                metadata[f"Keq{step_index}"] = K_meta
             if commit:
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                if f"K{step_index}" in resolved_values:
-                    slider_updates.append((f"K{step_index}", float(f"{resolved_values[f'K{step_index}']:.6g}"), metadata[f"K{step_index}"]))
+                if f"Keq{step_index}" in resolved_values:
+                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "k":
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             metadata[name] = {
@@ -8253,7 +8253,7 @@ class MainWindow(
                 sliders.update_variable(slider_name, slider_value)
                 sliders.update_metadata(slider_name, meta)
                 # Only persist user-editable slider values as overrides; derived/read-only
-                # sliders (e.g., kf/kr implied by explicit K, or param-algebra constraints)
+                # sliders (e.g., kf/kr implied by explicit Keq, or param-algebra constraints)
                 # must never be rewritten back into the DSL.
                 if not (isinstance(meta, dict) and meta.get("editable") is False):
                     self._preview_session.stage_slider_value(slider_name, slider_value)
@@ -8525,7 +8525,7 @@ class MainWindow(
             self._preview_session.variable_preview_debounce_ms("k1")
         )
         current_equilibrium_preview_debounce_ms = int(
-            self._preview_session.variable_preview_debounce_ms("K1")
+            self._preview_session.variable_preview_debounce_ms("Keq1")
         )
         current_slider_preview_points = int(self._mechanism_editor.slider_points_value())
         current_slider_preview_solver = str(self._mechanism_editor.slider_solver_value() or "LSODA")

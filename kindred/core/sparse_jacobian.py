@@ -276,11 +276,11 @@ def build_sparse_jacobian(
             return None
         return float(value()) if callable(value) else float(value)
 
-    def _require_positive_finite_runtime_K(K_value: float) -> float:
-        K_float = float(K_value)
-        if not (K_float > 0.0) or not math.isfinite(K_float):
-            raise ValueError("Equilibrium K must be positive and finite for runtime anchoring")
-        return K_float
+    def _require_positive_finite_runtime_Keq(Keq_value: float) -> float:
+        Keq_float = float(Keq_value)
+        if not (Keq_float > 0.0) or not math.isfinite(Keq_float):
+            raise ValueError("Equilibrium Keq must be positive and finite for runtime anchoring")
+        return Keq_float
 
     SMALL = 1e-30
 
@@ -371,24 +371,24 @@ def build_sparse_jacobian(
 
         kf = _evaluate_scalar(eq.kf)
         kr = _evaluate_scalar(eq.kr)
-        K = _evaluate_scalar(eq.K)
+        Keq = _evaluate_scalar(eq.Keq)
 
         if kf is None and kr is None:
-            if K is None:
-                raise ValueError("Equilibrium missing kinetic parameters (need K or rates)")
-            K = _require_positive_finite_runtime_K(K)
+            if Keq is None:
+                raise ValueError("Equilibrium missing kinetic parameters (need Keq or rates)")
+            Keq = _require_positive_finite_runtime_Keq(Keq)
             kf = 1.0
-            kr = kf / K
+            kr = kf / Keq
         elif kf is None:
-            if K is None:
+            if Keq is None:
                 raise ValueError("Equilibrium missing kf and equilibrium information to derive it")
-            K = _require_positive_finite_runtime_K(K)
-            kf = kr * K
+            Keq = _require_positive_finite_runtime_Keq(Keq)
+            kf = kr * Keq
         elif kr is None:
-            if K is None:
+            if Keq is None:
                 raise ValueError("Equilibrium missing kr and equilibrium information to derive it")
-            K = _require_positive_finite_runtime_K(K)
-            kr = kf / K
+            Keq = _require_positive_finite_runtime_Keq(Keq)
+            kr = kf / Keq
 
         fwd_pairs = [(species_index[n], v) for n, v in eq.stoich_forward.items()]
         rev_pairs = [(species_index[n], v) for n, v in eq.stoich_back.items()]

@@ -426,7 +426,7 @@ def test_open_solver_settings_persists_preview_debounce_controls(main_window, mo
     assert main_window._settings.value("simulation/parameter_preview_debounce_ms", type=int) == 35
     assert main_window._settings.value("simulation/equilibrium_preview_debounce_ms", type=int) == 90
     assert main_window._preview_session.variable_preview_debounce_ms("k1") == 35
-    assert main_window._preview_session.variable_preview_debounce_ms("K1") == 90
+    assert main_window._preview_session.variable_preview_debounce_ms("Keq1") == 90
 
 
 def test_slider_release_timer_uses_persisted_preview_debounce_controls(main_window, monkeypatch, qtbot):
@@ -464,12 +464,12 @@ def test_slider_release_timer_uses_persisted_preview_debounce_controls(main_wind
     preview = main_window._preview_session
     sliders = main_window._mechanism_editor._variable_sliders
 
-    main_window._on_slider_drag_started("K1")
-    slider_widget = sliders._sliders["K1"]
+    main_window._on_slider_drag_started("Keq1")
+    slider_widget = sliders._sliders["Keq1"]
     slider_widget.setValue(min(slider_widget.maximum(), slider_widget.value() + 50))
 
-    qtbot.waitUntil(lambda: "K1" in preview._pending_slider_values, timeout=1000)
-    main_window._on_slider_drag_finished("K1")
+    qtbot.waitUntil(lambda: "Keq1" in preview._pending_slider_values, timeout=1000)
+    main_window._on_slider_drag_finished("Keq1")
 
     release_timer = getattr(preview, "_slider_release_commit_timer", None)
     assert release_timer is not None

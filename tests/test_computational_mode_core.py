@@ -145,7 +145,7 @@ def test_ts_channel_uses_per_species_std_factors_and_degeneracy_and_stoichiometr
     assert float(eq.kr) == pytest.approx(kr_expected, rel=1e-12)
 
     K_expected = math.exp(-dG_eq_J / (R * float(T)))
-    assert float(eq.K) == pytest.approx(K_expected, rel=1e-12)
+    assert float(eq.Keq) == pytest.approx(K_expected, rel=1e-12)
 
     # Detailed balance in activity convention: kf/kr = K * (std_prod/std_react)
     std_react = 2.0 * 2.0

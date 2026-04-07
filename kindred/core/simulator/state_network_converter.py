@@ -293,14 +293,14 @@ class StateNetworkConverter:
             "degeneracy_ratio_rev": float(deg_ratio_reverse),
             "kf": float(k_forward),
             "kr": float(k_reverse),
-            "K": float(K),
+            "Keq": float(K),
         }
 
         # Add as equilibrium to mechanism
         mechanism.add_equilibrium(
             stoich_forward=stoich_forward,
             stoich_back=stoich_back,
-            K=K,
+            Keq=K,
             kf=k_forward,
             kr=k_reverse,
             fast=False,  # Not instantaneous equilibrium
@@ -359,13 +359,13 @@ class StateNetworkConverter:
             "dG_eq_J_per_mol": float(dG),
             "kf": float(k_forward),
             "kr": float(k_reverse),
-            "K": float(K),
+            "Keq": float(K),
         }
 
         mechanism.add_equilibrium(
             stoich_forward=stoich_forward,
             stoich_back=stoich_back,
-            K=K,
+            Keq=K,
             kf=k_forward,
             kr=k_reverse,
             fast=True,
