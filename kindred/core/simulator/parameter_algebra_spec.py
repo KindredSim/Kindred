@@ -2,73 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Dict, List, Mapping, Sequence, Set, Tuple
+from typing import List, Sequence, Set, Tuple
 
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
 _PARAM_STMT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
 _LET_STMT_RE = re.compile(r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 _MECH_PARAM_CI_RE = re.compile(r"^(?:k|kf|kr|keq)(\d+)$", re.IGNORECASE)
-_K_ALIAS_RE = re.compile(r"^k(\d+)$", re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class _MechanismParamResolution:
-    raw_name: str
-    canonical_name: str | None = None
-    equilibrium_conflict_name: str | None = None
-
-    @property
-    def is_resolved(self) -> bool:
-        return self.canonical_name is not None
-
-
-def _build_mechanism_param_lookup(mechanism_param_names: Set[str]) -> Dict[str, str]:
-    canonical_by_lower: Dict[str, str] = {}
-    for name in mechanism_param_names:
-        lowered = name.lower()
-        existing = canonical_by_lower.get(lowered)
-        if existing is not None and existing != name:
-            raise ValueError(
-                f"Conflicting mechanism parameter names for case-insensitive lookup: {existing!r} and {name!r}"
-            )
-        canonical_by_lower[lowered] = name
-    return canonical_by_lower
-
-
-def _resolve_mechanism_param_name(
-    raw_name: str,
-    *,
-    canonical_by_lower: Mapping[str, str],
-) -> _MechanismParamResolution:
-    direct_match = canonical_by_lower.get(raw_name.lower())
-    if direct_match is not None:
-        return _MechanismParamResolution(raw_name=raw_name, canonical_name=direct_match)
-
-    alias_match = _K_ALIAS_RE.match(raw_name)
-    if alias_match is None:
-        return _MechanismParamResolution(raw_name=raw_name)
-
-    index = alias_match.group(1)
-    equilibrium_name = canonical_by_lower.get(f"keq{index}")
-    if equilibrium_name is not None:
-        return _MechanismParamResolution(
-            raw_name=raw_name,
-            equilibrium_conflict_name=equilibrium_name,
-        )
-
-    reversible_forward_name = canonical_by_lower.get(f"kf{index}")
-    if reversible_forward_name is not None:
-        return _MechanismParamResolution(raw_name=raw_name, canonical_name=reversible_forward_name)
-
-    irreversible_name = canonical_by_lower.get(f"k{index}")
-    if irreversible_name is not None:
-        return _MechanismParamResolution(raw_name=raw_name, canonical_name=irreversible_name)
-
-    return _MechanismParamResolution(raw_name=raw_name)
 
 
 def _raise_equilibrium_constant_alias_error(
@@ -126,8 +70,12 @@ class ParameterAlgebraSpec:
 
     param_statements: List[ParameterAssignment]
     observable_names: Set[str]
-    mechanism_param_names: Set[str]
+    mechanism_namespace: MechanismParameterNamespace
     scalar_input_names: Set[str] = field(default_factory=set)
+
+    @property
+    def mechanism_param_names(self) -> Set[str]:
+        return self.mechanism_namespace.flat_names()
 
     def param_assignment_names(self) -> Set[str]:
         return {p.name for p in self.param_statements}
@@ -138,7 +86,7 @@ class ParameterAlgebraSpec:
     def namespace_model(self) -> ParameterAlgebraNamespace:
         symtab = SymbolTable()
         return ParameterAlgebraNamespace(
-            mechanism_param_names=set(self.mechanism_param_names),
+            mechanism_param_names=self.mechanism_namespace.flat_names(),
             param_assignment_names=self.param_assignment_names(),
             scalar_input_names=set(self.scalar_input_names),
             observable_names=set(self.observable_names),
@@ -192,11 +140,11 @@ def collect_algebra_section_lines(dsl_text: str) -> List[Tuple[int, str]]:
 def extract_parameter_assignments_from_algebra_lines(
     algebra_lines: Sequence[Tuple[int, str]],
     *,
-    mechanism_param_names: Set[str],
+    mechanism_namespace: MechanismParameterNamespace,
 ) -> List[ParameterAssignment]:
     assignments: List[ParameterAssignment] = []
     seen: Set[str] = set()
-    canonical_by_lower = _build_mechanism_param_lookup(mechanism_param_names)
+    mechanism_param_names = mechanism_namespace.flat_names()
 
     for line_no, raw in algebra_lines:
         original = raw.rstrip("\n")
@@ -211,7 +159,7 @@ def extract_parameter_assignments_from_algebra_lines(
         m_param = _PARAM_STMT_RE.match(code)
         if m_param:
             raw_name = m_param.group(1)
-            resolution = _resolve_mechanism_param_name(raw_name, canonical_by_lower=canonical_by_lower)
+            resolution = mechanism_namespace.resolve(raw_name)
             if resolution.equilibrium_conflict_name is not None:
                 _raise_equilibrium_constant_alias_error(
                     raw_name,
@@ -258,7 +206,7 @@ def extract_parameter_assignments_from_algebra_lines(
         m_let = _LET_STMT_RE.match(code)
         if m_let:
             target_raw = m_let.group(1)
-            resolution = _resolve_mechanism_param_name(target_raw, canonical_by_lower=canonical_by_lower)
+            resolution = mechanism_namespace.resolve(target_raw)
             if resolution.equilibrium_conflict_name is not None:
                 _raise_equilibrium_constant_alias_error(
                     target_raw,
@@ -280,7 +228,7 @@ def extract_parameter_assignments_from_algebra_lines(
         m_assign = _ASSIGN_RE.match(code)
         if m_assign:
             target_raw = m_assign.group(1)
-            resolution = _resolve_mechanism_param_name(target_raw, canonical_by_lower=canonical_by_lower)
+            resolution = mechanism_namespace.resolve(target_raw)
             if resolution.equilibrium_conflict_name is not None:
                 _raise_equilibrium_constant_alias_error(
                     target_raw,
@@ -304,11 +252,11 @@ def extract_parameter_assignments_from_algebra_lines(
 def extract_parameter_assignments_from_dsl_text(
     dsl_text: str,
     *,
-    mechanism_param_names: Set[str],
+    mechanism_namespace: MechanismParameterNamespace,
 ) -> List[ParameterAssignment]:
     return extract_parameter_assignments_from_algebra_lines(
         collect_algebra_section_lines(dsl_text),
-        mechanism_param_names=mechanism_param_names,
+        mechanism_namespace=mechanism_namespace,
     )
 
 
@@ -336,11 +284,11 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
 def parse_parameter_algebra_spec_from_dsl_text(
     dsl_text: str,
     *,
-    mechanism_param_names: Set[str],
+    mechanism_namespace: MechanismParameterNamespace,
     scalar_input_names: Set[str] | None = None,
 ) -> ParameterAlgebraSpec:
     lines = collect_algebra_section_lines(dsl_text)
-    assignments = extract_parameter_assignments_from_algebra_lines(lines, mechanism_param_names=mechanism_param_names)
+    assignments = extract_parameter_assignments_from_algebra_lines(lines, mechanism_namespace=mechanism_namespace)
     observables = extract_observable_names_from_algebra_lines(lines)
     for assignment in assignments:
         if assignment.name in observables:
@@ -356,6 +304,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
     return ParameterAlgebraSpec(
         param_statements=list(assignments),
         observable_names=set(observables),
-        mechanism_param_names=set(mechanism_param_names),
+        mechanism_namespace=mechanism_namespace,
         scalar_input_names=set(scalar_input_names or ()),
     )

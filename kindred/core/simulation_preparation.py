@@ -1156,13 +1156,16 @@ def prepare_bound_mechanism(
 
     try:
         from kindred.core.simulator.parameter_algebra import (
-            mechanism_parameter_names,
+            mechanism_parameter_namespace,
             parse_parameter_algebra_spec_from_dsl_text,
         )
         from kindred.core.simulator.step_indexing import get_step_index_map
 
-        mech_param_names = mechanism_parameter_names(mechanism)
-        spec = parse_parameter_algebra_spec_from_dsl_text(mechanism_text, mechanism_param_names=mech_param_names)
+        mechanism_namespace = mechanism_parameter_namespace(mechanism)
+        spec = parse_parameter_algebra_spec_from_dsl_text(
+            mechanism_text,
+            mechanism_namespace=mechanism_namespace,
+        )
         constrained = {
             stmt.name
             for stmt in (spec.param_statements or [])

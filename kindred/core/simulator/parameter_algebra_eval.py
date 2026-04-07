@@ -22,13 +22,12 @@ from kindred.core.algebra.parser import (
 )
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraNamespace,
     ParameterAlgebraSpec,
     ParameterAssignment,
-    _build_mechanism_param_lookup,
     _raise_equilibrium_constant_alias_error,
-    _resolve_mechanism_param_name,
     mechanism_parameter_name_pattern,
 )
 
@@ -137,7 +136,7 @@ def _merge_raw_identifier_maps(*maps: Mapping[str, str]) -> Dict[str, str]:
 def _canonicalize_mechanism_param_identifiers(
     expr: ExprNode,
     *,
-    canonical_by_lower: Mapping[str, str],
+    mechanism_namespace: MechanismParameterNamespace,
     scalar_input_names: Set[str],
     assignment: ParameterAssignment,
 ) -> _CanonicalizedExpr:
@@ -149,7 +148,7 @@ def _canonicalize_mechanism_param_identifiers(
         # Exact-case scalar names keep their original binding.
         if expr.name in scalar_input_names:
             return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
-        resolution = _resolve_mechanism_param_name(expr.name, canonical_by_lower=canonical_by_lower)
+        resolution = mechanism_namespace.resolve(expr.name)
         if resolution.equilibrium_conflict_name is not None:
             _raise_equilibrium_constant_alias_error(
                 expr.name,
@@ -166,7 +165,7 @@ def _canonicalize_mechanism_param_identifiers(
     if isinstance(expr, UnaryNode):
         rhs = _canonicalize_mechanism_param_identifiers(
             expr.rhs,
-            canonical_by_lower=canonical_by_lower,
+            mechanism_namespace=mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
@@ -177,13 +176,13 @@ def _canonicalize_mechanism_param_identifiers(
     if isinstance(expr, BinaryNode):
         lhs = _canonicalize_mechanism_param_identifiers(
             expr.lhs,
-            canonical_by_lower=canonical_by_lower,
+            mechanism_namespace=mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         rhs = _canonicalize_mechanism_param_identifiers(
             expr.rhs,
-            canonical_by_lower=canonical_by_lower,
+            mechanism_namespace=mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
@@ -200,7 +199,7 @@ def _canonicalize_mechanism_param_identifiers(
         for arg in expr.args:
             canonical_arg = _canonicalize_mechanism_param_identifiers(
                 arg,
-                canonical_by_lower=canonical_by_lower,
+                mechanism_namespace=mechanism_namespace,
                 scalar_input_names=scalar_input_names,
                 assignment=assignment,
             )
@@ -218,7 +217,6 @@ def _parse_canonicalized_param_block(
     assignments: Sequence[ParameterAssignment],
 ) -> _CanonicalizedParameterBlock:
     parsed_block = _parse_param_block(assignments)
-    canonical_by_lower = _build_mechanism_param_lookup(spec.mechanism_param_names)
     scalar_input_names = set(spec.scalar_input_names)
     lines: List[LetStatement] = []
     raw_to_canonical_identifiers_by_assignment: Dict[str, Mapping[str, str]] = {}
@@ -226,7 +224,7 @@ def _parse_canonicalized_param_block(
     for assignment, stmt in zip(assignments, parsed_block.lines):
         canonicalized_expr = _canonicalize_mechanism_param_identifiers(
             stmt.expr,
-            canonical_by_lower=canonical_by_lower,
+            mechanism_namespace=spec.mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
@@ -603,7 +601,7 @@ def evaluate_parameter_algebra(
                 tmp_spec = ParameterAlgebraSpec(
                     param_statements=[assignment],
                     observable_names=set(spec.observable_names),
-                    mechanism_param_names=set(spec.mechanism_param_names),
+                    mechanism_namespace=spec.mechanism_namespace,
                     scalar_input_names=set(spec.scalar_input_names),
                 )
                 val_map = evaluate_parameter_algebra_in_context(

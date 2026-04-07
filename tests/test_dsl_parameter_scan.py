@@ -3,6 +3,7 @@ import pytest
 from kindred.core.simulator.dsl import _parse_dsl_ir, extract_parameter_names_from_dsl, parse_dsl_to_mechanism
 from kindred.core.simulator.dsl_parameter_scan import _parameter_family, _scan_mechanism_param_names
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 from kindred.core.simulator.parameter_algebra import mechanism_parameter_names
 from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
 
@@ -98,7 +99,7 @@ def test_scan_private_validation_reversible_step_uses_kf_namespace():
                 "param K2 = 5",
             ]
         ),
-        mechanism_param_names={"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"},
+        mechanism_namespace=build_flat_compat_namespace({"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"}),
     )
 
     assert [assignment.name for assignment in spec.param_statements] == ["kf2"]

@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.validation import try_parse_int
 
 __all__ = [
@@ -51,22 +52,22 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
 
     role is one of: "k", "kf", "kr", "Keq".
     """
-    for entry in get_step_index_map(mechanism):
-        n, ok = try_parse_int(entry.get("step_index"))
-        if not ok:
+    step_map = get_step_index_map(mechanism)
+    namespace = build_namespace_from_mechanism(mechanism)
+    for item in namespace.ordered_items:
+        if item.source_index is None:
             continue
-        kind = str(entry.get("kind") or "")
-        if kind == "reaction":
-            yield (f"k{n}", entry, "k")
-        elif kind == "equilibrium":
-            yield (f"kf{n}", entry, "kf")
-            yield (f"kr{n}", entry, "kr")
-            if bool(entry.get("has_Keq_param")):
-                yield (f"Keq{n}", entry, "Keq")
+        if not (0 <= int(item.source_index) < len(step_map)):
+            continue
+        entry = step_map[int(item.source_index)]
+        role = item.info.role
+        if role is None:
+            continue
+        yield (item.canonical_name, entry, role)
 
 
 def canonical_parameter_names(mechanism: object) -> Set[str]:
-    return {name for name, _entry, _role in iter_canonical_parameters(mechanism)}
+    return build_namespace_from_mechanism(mechanism).flat_names()
 
 
 def lookup_step_param_target(

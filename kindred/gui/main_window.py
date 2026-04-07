@@ -7105,15 +7105,17 @@ class MainWindow(
 
     def _parameter_algebra_spec_for_ui(self, *, mechanism_param_names: set[str]):
         from kindred.core.simulator.algebra_section import extract_algebra_section_text
+        from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 
         reactions_text = self._mechanism_editor._reactions_text.toPlainText()
         if not extract_algebra_section_text(reactions_text).strip():
             return None
         from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
 
+        mechanism_namespace = build_flat_compat_namespace(mechanism_param_names)
         return parse_parameter_algebra_spec_from_dsl_text(
             str(reactions_text or ""),
-            mechanism_param_names=mechanism_param_names,
+            mechanism_namespace=mechanism_namespace,
         )
 
     def _refresh_derived_parameters_display(self) -> None:

@@ -19,6 +19,7 @@ from .dsl import (
 )
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
+from .parameter_namespace import build_namespace_from_ir_steps
 
 
 @dataclass(frozen=True)
@@ -158,26 +159,7 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
 
 
 def _scan_mechanism_param_names(ir) -> set[str]:
-    mechanism_param_names: set[str] = set()
-
-    for step_index, step in enumerate(ir.steps, start=1):
-        is_equilibrium_step = bool(
-            getattr(step, "is_equilibrium", False)
-            or (getattr(step, "reversible", False) and getattr(step, "kr", None) is not None)
-        )
-        if is_equilibrium_step:
-            mechanism_param_names.add(f"kf{step_index}")
-            mechanism_param_names.add(f"kr{step_index}")
-            if getattr(step, "Keq_input", None) is not None:
-                mechanism_param_names.add(f"Keq{step_index}")
-            continue
-        if getattr(step, "reversible", False):
-            mechanism_param_names.add(f"kf{step_index}")
-            mechanism_param_names.add(f"kr{step_index}")
-            continue
-        mechanism_param_names.add(f"k{step_index}")
-
-    return mechanism_param_names
+    return build_namespace_from_ir_steps(ir.steps).flat_names()
 
 
 def extract_parameter_names_from_dsl(text: str) -> set[str]:
@@ -197,11 +179,11 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
         param_names.add(param.name)
 
     ir = _parse_dsl_ir(text)
-    mechanism_param_names = _scan_mechanism_param_names(ir)
+    mechanism_namespace = build_namespace_from_ir_steps(ir.steps)
 
     spec = parameter_algebra.parse_parameter_algebra_spec_from_dsl_text(
         text,
-        mechanism_param_names=mechanism_param_names,
+        mechanism_namespace=mechanism_namespace,
     )
     param_names.update(spec.observable_names)
     param_names.update({assignment.name for assignment in spec.param_statements})

@@ -17,6 +17,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_namespace import (
+    MechanismParameterNamespace,
+    build_namespace_from_mechanism,
+)
 from kindred.core.simulator.parameter_algebra_eval import (
     evaluate_parameter_algebra,
     evaluate_parameter_algebra_in_context as _evaluate_param_block_in_context,
@@ -31,7 +35,6 @@ from kindred.core.simulator.parameter_algebra_spec import (
     parse_parameter_algebra_spec_from_dsl_text,
 )
 from kindred.core.simulator.step_indexing import (
-    canonical_parameter_names,
     get_step_index_map,
     iter_canonical_parameters,
     lookup_step_param_target,
@@ -56,22 +59,12 @@ _PUBLIC_REEXPORTS = (
 )
 
 
+def mechanism_parameter_namespace(mechanism: object) -> MechanismParameterNamespace:
+    return build_namespace_from_mechanism(mechanism)
+
+
 def mechanism_parameter_names(mechanism: object) -> Set[str]:
-    # Canonical global step-index naming (kN / kfN / krN / KeqN).
-    out = canonical_parameter_names(mechanism)
-    if out:
-        return out
-    # Fallback for legacy/hand-constructed Mechanism instances without a step_index_map.
-    n_rxn = len(getattr(mechanism, "reactions", []) or [])
-    n_eq = len(getattr(mechanism, "equilibria", []) or [])
-    legacy: Set[str] = set()
-    for i in range(1, n_rxn + 1):
-        legacy.add(f"k{i}")
-    for i in range(1, n_eq + 1):
-        legacy.add(f"kf{i}")
-        legacy.add(f"kr{i}")
-        legacy.add(f"Keq{i}")
-    return legacy
+    return mechanism_parameter_namespace(mechanism).flat_names()
 
 
 def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[str]] = None) -> Dict[str, float]:
@@ -86,51 +79,32 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
         except Exception:
             return None
 
-    # Prefer canonical step map if present.
-    step_map = get_step_index_map(mechanism)
-    if step_map:
-        rxns = getattr(mechanism, "reactions", []) or []
-        eqs = getattr(mechanism, "equilibria", []) or []
-        for name, entry, role in iter_canonical_parameters(mechanism):
-            if name not in wanted:
-                continue
-            kind = str(entry.get("kind") or "")
-            if kind == "reaction" and role == "k":
-                idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
-                if 0 <= idx < len(rxns):
-                    v = _as_float(getattr(rxns[idx], "rate", None))
-                    if v is not None:
-                        out[name] = v
-            elif kind == "equilibrium":
-                idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
-                if not (0 <= idx < len(eqs)):
-                    continue
-                eq = eqs[idx]
-                if role in {"kf", "kr"}:
-                    v = _as_float(getattr(eq, role, None))
-                    if v is not None:
-                        out[name] = v
-                elif role == "Keq":
-                    meta = getattr(eq, "metadata", {}) or {}
-                    v = _as_float(meta.get("Keq_input"))
-                    if v is not None:
-                        out[name] = v
-        return out
-
-    # Legacy fallback: per-type ordinals.
-    for i, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
-        key = f"k{i}"
-        if key in wanted:
-            v = _as_float(getattr(rxn, "rate", None))
-            if v is not None:
-                out[key] = v
-    for i, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-        for base, attr in (("kf", "kf"), ("kr", "kr"), ("Keq", "Keq")):
-            key = f"{base}{i}"
-            if key in wanted:
-                v = _as_float(getattr(eq, attr, None))
+    rxns = getattr(mechanism, "reactions", []) or []
+    eqs = getattr(mechanism, "equilibria", []) or []
+    for name, entry, role in iter_canonical_parameters(mechanism):
+        if name not in wanted:
+            continue
+        kind = str(entry.get("kind") or "")
+        if kind == "reaction" and role == "k":
+            idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
+            if 0 <= idx < len(rxns):
+                v = _as_float(getattr(rxns[idx], "rate", None))
                 if v is not None:
-                    out[key] = v
+                    out[name] = v
+        elif kind == "equilibrium":
+            idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
+            if not (0 <= idx < len(eqs)):
+                continue
+            eq = eqs[idx]
+            if role in {"kf", "kr"}:
+                v = _as_float(getattr(eq, role, None))
+                if v is not None:
+                    out[name] = v
+            elif role == "Keq":
+                meta = getattr(eq, "metadata", {}) or {}
+                v = _as_float(meta.get("Keq_input"))
+                if v is not None:
+                    out[name] = v
     return out
 
 
@@ -498,7 +472,7 @@ def apply_parameter_algebra_spec_to_mechanism(
             tmp_spec = ParameterAlgebraSpec(
                 param_statements=[stmt],
                 observable_names=set(spec.observable_names),
-                mechanism_param_names=set(spec.mechanism_param_names),
+                mechanism_namespace=spec.mechanism_namespace,
                 scalar_input_names=set(spec.scalar_input_names),
             )
             tmp_vals = _evaluate_param_block_in_context(tmp_spec, base_values=dict(base_values), enforce_defaults=False)
@@ -588,8 +562,11 @@ def apply_parameter_algebra_to_mechanism(
     - In prepared/bound mode (`require_mutable=True`), updates must target mutable
       bindings (RateBinding-like objects with `.set()`).
     """
-    mech_names = mechanism_parameter_names(mechanism)
-    spec = parse_parameter_algebra_spec_from_dsl_text(dsl_text, mechanism_param_names=mech_names)
+    mechanism_namespace = mechanism_parameter_namespace(mechanism)
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        dsl_text,
+        mechanism_namespace=mechanism_namespace,
+    )
     return apply_parameter_algebra_spec_to_mechanism(
         spec,
         mechanism=mechanism,

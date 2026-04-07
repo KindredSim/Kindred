@@ -7,13 +7,19 @@ from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_to_mechanism,
     evaluate_parameter_algebra,
+    mechanism_parameter_namespace,
     parse_parameter_algebra_spec_from_dsl_text,
 )
+from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 from kindred.core.simulator.parameter_units import rate_constant_unit
 
 
 def _base_mech(dsl_text: str):
     return parse_dsl_to_mechanism(dsl_text, initials={})
+
+
+def _compat_namespace(names: set[str]):
+    return build_flat_compat_namespace(names)
 
 
 def test_parameter_algebra_recomputes_on_base_change():
@@ -212,7 +218,7 @@ def test_unused_builtin_shadow_scalar_input_does_not_poison_parameter_algebra_ev
                 "param Keq1 = 5",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "Keq1"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
         scalar_input_names={"sin"},
     )
 
@@ -232,7 +238,7 @@ def test_referenced_builtin_shadow_scalar_input_is_rejected():
                 "param Keq1 = sin",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "Keq1"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
         scalar_input_names={"sin"},
     )
 
@@ -251,7 +257,7 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
                 "param Keq2 = a",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "Keq1", "kf2", "kr2", "Keq2"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1", "kf2", "kr2", "Keq2"}),
         scalar_input_names={"a"},
     )
 
@@ -286,7 +292,7 @@ def test_param_targets_resolve_case_insensitively_against_mechanism_namespace(
 ):
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(["# Algebra", line]),
-        mechanism_param_names=mechanism_param_names,
+        mechanism_namespace=_compat_namespace(mechanism_param_names),
     )
 
     assert [assignment.name for assignment in spec.param_statements] == [expected_name]
@@ -305,7 +311,7 @@ def test_param_k_target_rejects_equilibrium_constant_shorthand_with_keq_guidance
                     "param K1 = 5",
                 ]
             ),
-            mechanism_param_names={"kf1", "kr1", "Keq1"},
+            mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
         )
 
     assert exc.value.line_number == 2
@@ -329,7 +335,7 @@ def test_k_like_non_param_assignments_reject_resolved_mechanism_targets(line, me
                     line,
                 ]
             ),
-            mechanism_param_names=mechanism_param_names,
+            mechanism_namespace=_compat_namespace(mechanism_param_names),
         )
 
 
@@ -341,7 +347,7 @@ def test_let_k_like_name_without_mechanism_match_remains_observable():
                 "let K1 = 5",
             ]
         ),
-        mechanism_param_names={"k2"},
+        mechanism_namespace=_compat_namespace({"k2"}),
     )
 
     assert spec.param_statements == []
@@ -368,7 +374,7 @@ def test_rhs_mechanism_identifiers_resolve_case_insensitively(
                 line,
             ]
         ),
-        mechanism_param_names=mechanism_param_names,
+        mechanism_namespace=_compat_namespace(mechanism_param_names),
     )
 
     derived = evaluate_parameter_algebra(spec, base_values=dict(base_values))
@@ -384,7 +390,7 @@ def test_rhs_exact_case_scalar_input_takes_priority_over_mechanism_canonicalizat
                 "param k2 = K1",
             ]
         ),
-        mechanism_param_names={"k1", "k2"},
+        mechanism_namespace=_compat_namespace({"k1", "k2"}),
         scalar_input_names={"K1"},
     )
 
@@ -404,7 +410,7 @@ def test_rhs_mechanism_canonicalization_applies_when_exact_case_scalar_input_is_
                 "param k2 = K1",
             ]
         ),
-        mechanism_param_names={"k1", "k2"},
+        mechanism_namespace=_compat_namespace({"k1", "k2"}),
     )
 
     derived = evaluate_parameter_algebra(
@@ -423,7 +429,7 @@ def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_
                 "param a = K1",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "Keq1"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
     )
 
     with pytest.raises(DSLError, match="Keq1") as exc:
@@ -435,6 +441,14 @@ def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_
     assert exc.value.line_number == 2
     assert exc.value.line_content == "param a = K1"
     assert "K1" in str(exc.value)
+
+
+def test_mechanism_parameter_namespace_requires_authoritative_step_index_map():
+    class _MechanismWithoutStepMap:
+        metadata = {}
+
+    with pytest.raises(ValueError, match="step_index_map"):
+        mechanism_parameter_namespace(_MechanismWithoutStepMap())
 
 
 def test_rate_constant_unit_formatting():

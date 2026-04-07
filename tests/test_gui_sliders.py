@@ -371,7 +371,12 @@ def test_scalar_param_slider_updates_existing_param_in_reactions_algebra(main_wi
 
     # The effective DSL (built the same way as production) must contain exactly one `param a = ...`.
     full_dsl = main_window._get_mechanism_text()
-    spec = parse_parameter_algebra_spec_from_dsl_text(full_dsl, mechanism_param_names={"k2", "kf1"})
+    from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
+
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        full_dsl,
+        mechanism_namespace=build_flat_compat_namespace({"k2", "kf1"}),
+    )
     a_statements = [stmt for stmt in spec.param_statements if stmt.name == "a"]
     assert len(a_statements) == 1
     assert float(a_statements[0].expr_src) == pytest.approx(0.331131)
