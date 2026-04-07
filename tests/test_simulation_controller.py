@@ -3887,8 +3887,9 @@ def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentrat
             return False
 
     class _FakeExecutor:
-        def submit(self, _fn, task):
-            submitted.append(dict(task))
+        def submit(self, _fn, *args, **_kwargs):
+            if args:
+                submitted.append(dict(args[0]))
             return _FakeParallelFuture()
 
         def shutdown(self, *args, **kwargs) -> None:
@@ -3939,8 +3940,9 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
             return False
 
     class _FakeExecutor:
-        def submit(self, _fn, task):
-            submitted.append(dict(task))
+        def submit(self, _fn, *args, **_kwargs):
+            if args:
+                submitted.append(dict(args[0]))
             return _FakeParallelFuture()
 
         def shutdown(self, *args, **kwargs) -> None:
@@ -4467,8 +4469,9 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
             return False
 
     class _FakeExecutor:
-        def submit(self, _fn, task):
-            submitted.append(dict(task))
+        def submit(self, _fn, *args, **_kwargs):
+            if args:
+                submitted.append(dict(args[0]))
             return _FakeParallelFuture()
 
         def shutdown(self, *args, **kwargs) -> None:
@@ -4532,6 +4535,7 @@ def test_parallel_batch_pool_settings_changed_shuts_down_idle_pool_immediately(
 
     assert fake.shutdown_calls == [{"wait": False, "cancel_futures": True}]
     assert controller.parallel_batch.executor is None
+    assert controller._pool_eagerly_created is False
 
 
 @pytest.mark.unit
@@ -4585,7 +4589,7 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_com
     controller.parallel_batch_pool_settings_changed()
 
     assert controller.parallel_batch.executor is current
-    assert controller.parallel_batch._pool_stale is True
+    assert controller.parallel_batch.is_pool_stale is True
     assert current.shutdown_calls == []
 
     controller.on_simulation_complete(
@@ -4619,7 +4623,7 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_com
 
 @pytest.mark.unit
 def test_ensure_parallel_batch_pool_eagerly_created_only_once(
-    mw: _FakeMainWindow, controller: SimulationController
+    mw: _FakeMainWindow, controller: SimulationController, monkeypatch
 ):
     created: list[tuple[int, bool]] = []
 
@@ -4640,13 +4644,61 @@ def test_ensure_parallel_batch_pool_eagerly_created_only_once(
 
     controller.parallel_batch.max_parallel_workers = 5
     controller.parallel_batch.executor_factory = _factory
+    controller._pool_eagerly_created = False
+    monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 4)
 
     controller.ensure_parallel_batch_pool_eagerly_created()
     first = controller.parallel_batch.executor
     controller.ensure_parallel_batch_pool_eagerly_created()
+    controller.parallel_batch_pool_settings_changed()
+    controller.ensure_parallel_batch_pool_eagerly_created()
 
-    assert created == [(5, True)]
-    assert controller.parallel_batch.executor is first
+    assert created == [(3, True), (3, True)]
+    assert controller.parallel_batch.executor is not None
+    assert controller.parallel_batch.executor is not first
+
+
+@pytest.mark.unit
+def test_poll_parallel_batch_futures_shuts_down_stale_pool_after_superseded_futures_drain(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    class _SupersededFuture:
+        def done(self) -> bool:
+            return True
+
+        def result(self):
+            return {"ok": True}
+
+    class _FakeExecutor:
+        def __init__(self) -> None:
+            self.shutdown_calls: list[dict[str, object]] = []
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_calls.append(
+                {
+                    "wait": bool(wait),
+                    "cancel_futures": bool(cancel_futures),
+                }
+            )
+
+    timer = MagicMock()
+    timer.isActive.return_value = True
+    controller._batch_future_poll_timer = timer
+    executor = _FakeExecutor()
+    controller.parallel_batch.executor = executor
+    controller.parallel_batch.mark_pool_stale()
+    controller._batch_run_context = {"active": False, "parallel": False}
+    controller._batch_parallel.future_map = {}
+    controller._batch_parallel.superseded_future_map = {"sid": _SupersededFuture()}
+    controller._batch_parallel.superseded_future_meta = {"sid": {"set_id": "sid", "set_name": "set1", "superseded": "1"}}
+
+    controller._poll_parallel_batch_futures()
+
+    assert controller.parallel_batch.superseded_future_map == {}
+    assert controller.parallel_batch.superseded_future_meta == {}
+    assert executor.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert controller.parallel_batch.executor is None
+    assert timer.stop.called
 
 
 @pytest.mark.unit

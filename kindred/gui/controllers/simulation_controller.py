@@ -956,6 +956,7 @@ class SimulationController(QtCore.QObject):
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
+        self._pool_eagerly_created = False
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
                 "BATCH_PAR shutdown executor force=%s pending_futures=%s",
@@ -971,7 +972,7 @@ class SimulationController(QtCore.QObject):
 
     def _parallel_batch_pool_settings_changed(self) -> None:
         if self._has_active_parallel_batch_work():
-            self._batch_parallel._pool_stale = True
+            self._batch_parallel.mark_pool_stale()
             return
         self._shutdown_batch_executor(force_terminate=False)
 
@@ -980,8 +981,12 @@ class SimulationController(QtCore.QObject):
             return
         self._pool_eagerly_created = True
         try:
+            effective_workers = compute_effective_batch_workers(
+                num_sets=max(1, int(self._batch_parallel.max_parallel_workers)),
+                max_parallel_workers=max(1, int(self._batch_parallel.max_parallel_workers)),
+            )
             self._batch_parallel.ensure_executor(
-                max_workers=max(1, int(self._batch_parallel.max_parallel_workers))
+                max_workers=max(1, int(effective_workers))
             )
         except Exception as exc:
             self._record_nonfatal_exception(
@@ -996,7 +1001,7 @@ class SimulationController(QtCore.QObject):
         clear_pending_plot_updates: bool = False,
         stale_fast_handoff_after_display: bool = False,
     ) -> None:
-        if bool(keep_executor_alive) and (not bool(self._batch_parallel._pool_stale)):
+        if bool(keep_executor_alive) and (not self._batch_parallel.is_pool_stale):
             if stale_fast_handoff_after_display:
                 cancelled, running = self._batch_parallel.soft_supersede()
                 timer = getattr(self, "_batch_future_poll_timer", None)
@@ -1442,6 +1447,12 @@ class SimulationController(QtCore.QObject):
                 if not fut.done():
                     continue
                 self._consume_superseded_parallel_batch_future(owner_key=str(owner_key), fut=fut)
+            if (
+                self._batch_parallel.is_pool_stale
+                and (not self._batch_parallel.future_map)
+                and (not self._batch_parallel.superseded_future_map)
+            ):
+                self._shutdown_batch_executor(force_terminate=False)
         except Exception as exc:
             # Architecture note (polling safety net):
             # This broad catch is a last-resort guard for the QTimer-driven poll

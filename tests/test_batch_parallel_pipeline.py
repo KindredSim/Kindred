@@ -33,28 +33,27 @@ class _FakeExecutor:
         fut: Future = Future()
         sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs), future=fut)
         self.submissions.append(sub)
-        if self.done_immediately:
-            if fn is run_batch_simulation_task:
-                task = dict(args[0] if args else {})
-                sid = str(task.get("set_id") or task.get("batch_set_id") or "")
-                fut.set_result(
-                    {
-                        "run_id": int(task.get("run_id") or 0),
-                        "set_id": sid,
-                        "set_name": str(task.get("set_name") or sid or "set"),
-                        "t": np.array([0.0, 1.0]),
-                        "Y": np.array([[self.value_marker, self.value_marker]]),
-                        "species_names": ["A"],
-                        "algebra_scalars": {},
-                        "mechanism": None,
-                        "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
-                        "solver_config": dict(task.get("solver_config") or {}),
-                        "fallback_occurred": False,
-                        "fallback_message": None,
-                    }
-                )
-            else:
-                fut.set_result(True)
+        if fn is not run_batch_simulation_task:
+            fut.set_result(True)
+        elif self.done_immediately:
+            task = dict(args[0] if args else {})
+            sid = str(task.get("set_id") or task.get("batch_set_id") or "")
+            fut.set_result(
+                {
+                    "run_id": int(task.get("run_id") or 0),
+                    "set_id": sid,
+                    "set_name": str(task.get("set_name") or sid or "set"),
+                    "t": np.array([0.0, 1.0]),
+                    "Y": np.array([[self.value_marker, self.value_marker]]),
+                    "species_names": ["A"],
+                    "algebra_scalars": {},
+                    "mechanism": None,
+                    "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
+                    "solver_config": dict(task.get("solver_config") or {}),
+                    "fallback_occurred": False,
+                    "fallback_message": None,
+                }
+            )
         return fut
 
     def shutdown(self, wait=True, cancel_futures=False):
@@ -138,7 +137,7 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
 
 
 
-def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, monkeypatch, qtbot):
+def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, monkeypatch):
     if hasattr(main_window, "set_simulation_cache_caps"):
         main_window.set_simulation_cache_caps(result_cap=20, preview_cap=20)
     _prime_three_batch_sets(main_window)
@@ -154,7 +153,6 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
 
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "executor_factory", _factory, raising=True)
-
     req1 = main_window.simulation_controller.next_sim_request_id()
     main_window.simulation_controller.run_simulation_internal(fast_mode=False, request_id=int(req1), batch_rows=[0, 1, 2])
     assert len(executors) == 1
@@ -171,30 +169,37 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
     cache_key = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     assert cache_key
 
-    for sub in _simulation_submissions(old_exec):
-        task = dict(sub.args[0] if sub.args else {})
-        sid = str(task.get("set_id") or "")
-        sub.future.set_result(
-            {
-                "run_id": int(task.get("run_id") or 0),
-                "set_id": sid,
-                "set_name": str(task.get("set_name") or sid),
-                "t": np.array([0.0, 1.0]),
-                "Y": np.array([[111.0, 111.0]]),
-                "species_names": ["A"],
-                "algebra_scalars": {},
-                "mechanism": None,
-                "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
-                "solver_config": dict(task.get("solver_config") or {}),
-                "fallback_occurred": False,
-                "fallback_message": None,
-            }
-        )
+    stale_task = dict(_simulation_submissions(old_exec)[0].args[0] if _simulation_submissions(old_exec)[0].args else {})
+    stale_sid = str(stale_task.get("set_id") or "")
+    main_window.simulation_controller.on_simulation_complete(
+        {
+            "run_id": int(stale_task.get("run_id") or 0),
+            "set_id": stale_sid,
+            "set_name": str(stale_task.get("set_name") or stale_sid),
+            "t": np.array([0.0, 1.0]),
+            "Y": np.array([[111.0, 111.0]]),
+            "species_names": ["A"],
+            "algebra_scalars": {},
+            "mechanism": None,
+            "mechanism_text": str(stale_task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
+            "solver_config": dict(stale_task.get("solver_config") or {}),
+            "fallback_occurred": False,
+            "fallback_message": None,
+        },
+        run_id=int(stale_task.get("run_id") or 0),
+        fast_mode=False,
+        request_id=int(stale_task.get("request_id") or 0),
+        batch_set=str(stale_task.get("set_name") or stale_sid),
+        batch_set_id=stale_sid,
+        cache_key=cache_key,
+    )
+
+    assert main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{stale_sid}") is None
 
     for sub in _simulation_submissions(new_exec):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
-        sub.future.set_result(
+        main_window.simulation_controller.on_simulation_complete(
             {
                 "run_id": int(task.get("run_id") or 0),
                 "set_id": sid,
@@ -208,10 +213,14 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
                 "solver_config": dict(task.get("solver_config") or {}),
                 "fallback_occurred": False,
                 "fallback_message": None,
-            }
+            },
+            run_id=int(task.get("run_id") or 0),
+            fast_mode=False,
+            request_id=int(task.get("request_id") or 0),
+            batch_set=str(task.get("set_name") or sid),
+            batch_set_id=sid,
+            cache_key=cache_key,
         )
-
-    qtbot.wait(80)
 
     cached_payloads = []
     for sub in _simulation_submissions(new_exec):

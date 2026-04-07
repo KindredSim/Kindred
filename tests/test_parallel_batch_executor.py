@@ -91,7 +91,7 @@ def test_ensure_executor_does_not_resize_when_worker_count_matches() -> None:
 
 
 @pytest.mark.unit
-def test_ensure_executor_reuses_existing_pool_when_size_metadata_is_missing() -> None:
+def test_ensure_executor_tracks_current_max_workers_without_executor_introspection() -> None:
     created: list[tuple[int, bool]] = []
 
     def _factory(max_workers: int, limit_blas_threads: bool) -> _FakeExecutor:
@@ -103,8 +103,9 @@ def test_ensure_executor_reuses_existing_pool_when_size_metadata_is_missing() ->
     first = batch.ensure_executor(max_workers=2)
     second = batch.ensure_executor(max_workers=6)
 
-    assert created == [(2, True)]
-    assert second is first
+    assert created == [(2, True), (6, True)]
+    assert batch._current_max_workers == 6
+    assert second is not first
 
 
 @pytest.mark.unit
@@ -139,3 +140,35 @@ def test_ensure_executor_resize_factory_failure_leaves_wrapper_consistent() -> N
     assert batch.executor is None
     assert created == [first]
     assert first.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+
+
+@pytest.mark.unit
+def test_create_and_prewarm_executor_submit_failure_clears_executor_and_records_failure() -> None:
+    created: list[_FakeExecutor] = []
+    recorded: list[tuple[str, str]] = []
+
+    class _SubmitFailExecutor(_FakeExecutor):
+        def submit(self, fn, *args, **kwargs):
+            raise RuntimeError("submit boom")
+
+    def _factory(max_workers: int, _limit_blas_threads: bool) -> _SubmitFailExecutor:
+        executor = _SubmitFailExecutor(max_workers=max_workers)
+        created.append(executor)
+        return executor
+
+    def _record(message: str, exc: BaseException) -> None:
+        recorded.append((str(message), str(exc)))
+
+    batch = ParallelBatchExecutor(
+        executor_factory=_factory,
+        record_nonfatal_exception=_record,
+    )
+
+    with pytest.raises(RuntimeError, match="submit boom"):
+        batch.ensure_executor(max_workers=3)
+
+    assert len(created) == 1
+    assert created[0].shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert batch.executor is None
+    assert batch._current_max_workers is None
+    assert recorded == [("Failed to create and prewarm batch executor", "submit boom")]

@@ -3595,6 +3595,8 @@ class MainWindow(
         self._wegscheider_cyclicity_enabled = bool(
             data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
         )
+        previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
+        previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
             self._sim_controller.parallel_batch.max_parallel_workers = max(
                 1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))
@@ -3604,6 +3606,12 @@ class MainWindow(
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
             data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
+        if (
+            previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
+            or previous_limit_blas_threads
+            != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
+        ):
+            self._sim_controller.parallel_batch_pool_settings_changed()
         if 'use_advanced_dsl' in data:
             logger.info(
                 "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
