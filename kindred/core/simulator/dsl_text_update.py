@@ -25,6 +25,17 @@ AUTHORITATIVE_PARAMETER_SIG_DIGITS = 15
 _STEP_PARAMETER_RE = re.compile(r"^(kf|kr|K|k)\d+$")
 _STEP_PARAMETER_FLOOR = 1e-12
 _EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq", "k_eq"})
+_STEP_TOKEN_CANONICAL_ALIASES = {
+    "a": "A",
+    "ea": "Ea",
+    "dg_act": "dG_act",
+    "dg_eq": "dG_eq",
+    "k": "k",
+    "kf": "kf",
+    "kr": "kr",
+    "kappa": "κ",
+    "κ": "κ",
+}
 
 
 __all__ = [
@@ -224,10 +235,7 @@ def _canonical_step_token_key_for_duplicate_check(key: object) -> str | None:
         return None
     if _is_equilibrium_k_token(key_str):
         return "K"
-    lowered = key_str.lower()
-    if lowered in {"k", "kf", "kr"}:
-        return lowered
-    return None
+    return _STEP_TOKEN_CANONICAL_ALIASES.get(key_str.lower())
 
 
 def _duplicate_canonical_step_token(tokens: list[list[str]]) -> tuple[str, str, str] | None:

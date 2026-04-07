@@ -125,6 +125,13 @@ def test_valid_rate_pattern_highlighted(doc_and_hl, term):
     assert _color_at(doc, hl, 0) == RATE
 
 
+@pytest.mark.parametrize("term", ["Keq=", "K_eq=", "kEQ=", "KF=", "Kr="])
+def test_equilibrium_alias_and_case_insensitive_rate_patterns_highlighted(doc_and_hl, term):
+    doc, hl = doc_and_hl
+    doc.setPlainText(term)
+    assert _color_at(doc, hl, 0) == RATE
+
+
 @pytest.mark.parametrize("term", ["kappa=", "\u03ba="])
 def test_new_rate_pattern_highlighted(doc_and_hl, term):
     doc, hl = doc_and_hl

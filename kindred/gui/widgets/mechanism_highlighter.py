@@ -103,13 +103,13 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
 
         # 3. Rate constants (k=, kf=, kr=, K=, kappa=, κ=)
         rate_patterns = [
-            r'\bk[fr]?\s*=',   # k=, kf=, kr=
-            r'\bK\s*=',         # K=
-            r'\bkappa\s*=',     # kappa=
-            r'\bκ\s*=',         # κ= (Unicode kappa)
+            (r'\bk[fr]?\s*=', re.IGNORECASE),          # k=, kf=, kr=
+            (r'\bK(?:eq|_eq)?\s*=', re.IGNORECASE),    # K=, Keq=, K_eq=
+            (r'\bkappa\s*=', re.IGNORECASE),           # kappa=
+            (r'\bκ\s*=', 0),                           # κ= (Unicode kappa)
         ]
-        for pattern in rate_patterns:
-            self.rules.append((re.compile(pattern), 'rate'))
+        for pattern, flags in rate_patterns:
+            self.rules.append((re.compile(pattern, flags), 'rate'))
 
         # 4. Energy/thermodynamic terms (Ea=, dG_act=, dG_eq=, A=, T=, etc.)
         energy_terms = [

@@ -848,6 +848,26 @@ def test_analyze_step_parameter_update_rejects_duplicate_reversible_kf_tokens():
         )
 
 
+def test_analyze_step_parameter_update_rejects_duplicate_equilibrium_dg_eq_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "equilibrium: A <-> B ; kf=1 ; dG_eq=-1 ; DG_EQ=-2",
+            "kf1",
+            2.0,
+            authoritative_current_value=1.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_reaction_ea_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "reaction: A -> B ; k=1 ; Ea=5 ; ea=6",
+            "k1",
+            2.0,
+            authoritative_current_value=1.0,
+        )
+
+
 def test_analyze_parameter_updates_to_dsl_text_reports_step_floor_as_real_semantic_change():
     analysis = analyze_parameter_updates_to_dsl_text(
         "equilibrium: A <-> B ; kf=1, K=0",

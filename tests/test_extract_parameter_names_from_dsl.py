@@ -33,3 +33,13 @@ def test_extract_parameter_names_from_dsl_extracts_algebra_param_and_observable_
     assert "obs" in names
     assert "x" in names
 
+
+def test_extract_parameter_names_from_dsl_rejects_duplicate_equilibrium_aliases():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=1.0; Keq=2.0; K_eq=3.0",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="Duplicate parameter"):
+        extract_parameter_names_from_dsl(dsl)

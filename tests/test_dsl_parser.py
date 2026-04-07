@@ -344,6 +344,14 @@ class TestParameterExtraction:
         # Should extract dG_act parameter
         assert len(params) > 0
 
+    def test_extract_parameters_from_dsl_rejects_duplicate_equilibrium_aliases(self):
+        dsl = """
+        equilibrium: A <-> B; kf=1.0; Keq=2.0; K_eq=3.0
+        """
+
+        with pytest.raises(DSLError, match="Duplicate parameter"):
+            extract_parameters_from_dsl(dsl)
+
 
 class TestComplexMechanisms:
     """Test complex multi-step mechanisms."""
@@ -437,6 +445,16 @@ class TestExtractedHelperFunctions:
         kv = _parse_keyvals("K=2.0, k=1.0")
         assert kv["K"] == "2.0"
         assert kv["k"] == "1.0"
+
+    def test_parse_keyvals_preserves_irreversible_k_distinct_from_mixed_case_keq_alias(self):
+        kv = _parse_keyvals("k=1.0, kEq=2.0")
+        assert kv["k"] == "1.0"
+        assert kv["K"] == "2.0"
+
+    def test_parse_keyvals_normalizes_mixed_case_rate_aliases(self):
+        kv = _parse_keyvals("Kf=1.5, kR=0.25")
+        assert kv["kf"] == "1.5"
+        assert kv["kr"] == "0.25"
 
     def test_parse_keyvals_normalizes_common_aliases(self):
         kv = _parse_keyvals("t=298.15, c0=1.0, kappa=0.8, dg_act=75.5")

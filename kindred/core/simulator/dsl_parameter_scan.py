@@ -103,9 +103,14 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
             continue
 
         try:
-            stoich_part, kv = _split_stoich_and_params(rest)
+            stoich_part, kv = _split_stoich_and_params(
+                rest,
+                reject_duplicate_canonical_keys=True,
+            )
             react, prod, arrow = _parse_stoich(stoich_part)
-        except DSLError:
+        except DSLError as exc:
+            if str(exc.message).startswith("Duplicate parameter:"):
+                raise
             # Best-effort extraction utility: ignore malformed lines rather than failing the caller.
             continue
 
