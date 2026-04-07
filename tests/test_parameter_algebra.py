@@ -265,42 +265,63 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
     assert exc.value.line_content == "param Keq2 = a"
 
 
-def test_param_k_alias_canonicalizes_to_equilibrium_parameter_namespace():
-    dsl = "\n".join(
-        [
-            "equilibrium: A <-> B; kf=6.0; K=3.0",
-            "# Algebra",
-            "param K1 = 5",
-        ]
-    )
-    mech = _base_mech(dsl)
-
-    apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
-    assert float(mech.equilibria[0].Keq) == pytest.approx(5.0)
-
+@pytest.mark.parametrize(
+    ("line", "mechanism_param_names", "expected_name", "base_values", "expected_value"),
+    [
+        ("param K1 = 5", {"k1"}, "k1", {"k1": 1.0}, 5.0),
+        ("param K1 = 5", {"kf1", "kr1"}, "kf1", {"kf1": 2.0, "kr1": 0.5}, 5.0),
+        ("param k1 = 5", {"kf1", "kr1"}, "kf1", {"kf1": 2.0, "kr1": 0.5}, 5.0),
+        ("param KF2 = 5", {"kf2", "kr2"}, "kf2", {"kf2": 2.0, "kr2": 0.5}, 5.0),
+        ("param KR2 = 5", {"kf2", "kr2"}, "kr2", {"kf2": 2.0, "kr2": 0.5}, 5.0),
+        ("param KEQ3 = 5", {"kf3", "kr3", "Keq3"}, "Keq3", {"kf3": 8.0, "Keq3": 4.0}, 5.0),
+        ("param keq3 = 5", {"kf3", "kr3", "Keq3"}, "Keq3", {"kf3": 8.0, "Keq3": 4.0}, 5.0),
+    ],
+)
+def test_param_targets_resolve_case_insensitively_against_mechanism_namespace(
+    line,
+    mechanism_param_names,
+    expected_name,
+    base_values,
+    expected_value,
+):
     spec = parse_parameter_algebra_spec_from_dsl_text(
-        "\n".join(
-            [
-                "# Algebra",
-                "param K1 = 5",
-            ]
-        ),
-        mechanism_param_names={"kf1", "kr1", "Keq1"},
+        "\n".join(["# Algebra", line]),
+        mechanism_param_names=mechanism_param_names,
     )
 
-    assert [assignment.name for assignment in spec.param_statements] == ["Keq1"]
+    assert [assignment.name for assignment in spec.param_statements] == [expected_name]
 
-    derived = evaluate_parameter_algebra(
-        spec,
-        base_values={"kf1": 6.0, "Keq1": 3.0},
-    )
+    derived = evaluate_parameter_algebra(spec, base_values=dict(base_values))
 
-    assert derived["Keq1"] == pytest.approx(5.0)
+    assert derived[expected_name] == pytest.approx(expected_value)
 
 
-@pytest.mark.parametrize("line", ["let K1 = 5", "K1 = 5"])
-def test_k_alias_non_param_assignments_fail_clearly_for_mechanism_namespace(line):
-    with pytest.raises(DSLError, match="rate/equilibrium parameter"):
+def test_param_k_target_rejects_equilibrium_constant_shorthand_with_keq_guidance():
+    with pytest.raises(DSLError, match="Keq1") as exc:
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(
+                [
+                    "# Algebra",
+                    "param K1 = 5",
+                ]
+            ),
+            mechanism_param_names={"kf1", "kr1", "Keq1"},
+        )
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == "param K1 = 5"
+    assert "K1" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("line", "mechanism_param_names"),
+    [
+        ("let K1 = 5", {"k1"}),
+        ("K1 = 5", {"k1"}),
+    ],
+)
+def test_k_like_non_param_assignments_reject_resolved_mechanism_targets(line, mechanism_param_names):
+    with pytest.raises(DSLError, match="use 'param K1 ="):
         parse_parameter_algebra_spec_from_dsl_text(
             "\n".join(
                 [
@@ -308,8 +329,73 @@ def test_k_alias_non_param_assignments_fail_clearly_for_mechanism_namespace(line
                     line,
                 ]
             ),
-            mechanism_param_names={"kf1", "kr1", "Keq1"},
+            mechanism_param_names=mechanism_param_names,
         )
+
+
+def test_let_k_like_name_without_mechanism_match_remains_observable():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "let K1 = 5",
+            ]
+        ),
+        mechanism_param_names={"k2"},
+    )
+
+    assert spec.param_statements == []
+    assert spec.observable_names == {"K1"}
+
+
+@pytest.mark.parametrize(
+    ("line", "mechanism_param_names", "base_values", "expected"),
+    [
+        ("param a = 2*K1", {"k1"}, {"k1": 3.0}, 6.0),
+        ("param a = K1 + K2", {"k1", "kf2", "kr2"}, {"k1": 3.0, "kf2": 4.0}, 7.0),
+    ],
+)
+def test_rhs_mechanism_identifiers_resolve_case_insensitively(
+    line,
+    mechanism_param_names,
+    base_values,
+    expected,
+):
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                line,
+            ]
+        ),
+        mechanism_param_names=mechanism_param_names,
+    )
+
+    derived = evaluate_parameter_algebra(spec, base_values=dict(base_values))
+
+    assert derived["a"] == pytest.approx(expected)
+
+
+def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_guidance():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param a = K1",
+            ]
+        ),
+        mechanism_param_names={"kf1", "kr1", "Keq1"},
+    )
+
+    with pytest.raises(DSLError, match="Keq1") as exc:
+        evaluate_parameter_algebra(
+            spec,
+            base_values={"kf1": 6.0, "kr1": 2.0, "Keq1": 3.0},
+        )
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == "param a = K1"
+    assert "K1" in str(exc.value)
 
 
 def test_rate_constant_unit_formatting():

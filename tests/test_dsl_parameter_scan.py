@@ -1,6 +1,9 @@
 import pytest
 
-from kindred.core.simulator.dsl_parameter_scan import _parameter_family
+from kindred.core.simulator.dsl_parameter_scan import _parameter_family, _scan_mechanism_param_names
+from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
+from kindred.core.simulator.dsl import _parse_dsl_ir, extract_parameter_names_from_dsl
 
 
 @pytest.mark.parametrize(
@@ -14,3 +17,58 @@ from kindred.core.simulator.dsl_parameter_scan import _parameter_family
 )
 def test_parameter_family_recognizes_keq_suffixes(name, family):
     assert _parameter_family(name) == family
+
+
+def test_scan_public_path_accepts_k_alias_for_irreversible_step():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "# Algebra",
+            "param K1 = 5",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(dsl)
+
+    assert "k1" in names
+
+
+def test_scan_public_path_rejects_k_alias_for_equilibrium_step():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; Keq=3.0; kf=6.0",
+            "# Algebra",
+            "param K1 = 5",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="Keq1"):
+        extract_parameter_names_from_dsl(dsl)
+
+
+def test_scan_namespace_matches_global_step_indexing():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "reaction: C <-> D; kf=2.0; kr=0.5",
+            "equilibrium: E <-> F; Keq=4.0; kf=8.0",
+        ]
+    )
+
+    ir = _parse_dsl_ir(dsl)
+
+    assert _scan_mechanism_param_names(ir) == {"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"}
+
+
+def test_scan_private_validation_reversible_step_uses_kf_namespace():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param K2 = 5",
+            ]
+        ),
+        mechanism_param_names={"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"},
+    )
+
+    assert [assignment.name for assignment in spec.param_statements] == ["kf2"]

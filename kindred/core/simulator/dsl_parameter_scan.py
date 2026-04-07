@@ -157,6 +157,24 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
     return parameters
 
 
+def _scan_mechanism_param_names(ir) -> set[str]:
+    mechanism_param_names: set[str] = set()
+
+    for step_index, step in enumerate(ir.steps, start=1):
+        if step.is_equilibrium:
+            mechanism_param_names.add(f"kf{step_index}")
+            mechanism_param_names.add(f"kr{step_index}")
+            mechanism_param_names.add(f"Keq{step_index}")
+            continue
+        if step.reversible:
+            mechanism_param_names.add(f"kf{step_index}")
+            mechanism_param_names.add(f"kr{step_index}")
+            continue
+        mechanism_param_names.add(f"k{step_index}")
+
+    return mechanism_param_names
+
+
 def extract_parameter_names_from_dsl(text: str) -> set[str]:
     """
     Extract all parameter names from DSL content.
@@ -174,14 +192,7 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
         param_names.add(param.name)
 
     ir = _parse_dsl_ir(text)
-    n_rxn = sum(1 for step in ir.steps if not step.is_equilibrium)
-    n_eq = sum(1 for step in ir.steps if step.is_equilibrium)
-
-    mechanism_param_names: set[str] = {f"k{i}" for i in range(1, n_rxn + 1)}
-    for i in range(1, n_eq + 1):
-        mechanism_param_names.add(f"kf{i}")
-        mechanism_param_names.add(f"kr{i}")
-        mechanism_param_names.add(f"Keq{i}")
+    mechanism_param_names = _scan_mechanism_param_names(ir)
 
     spec = parameter_algebra.parse_parameter_algebra_spec_from_dsl_text(
         text,

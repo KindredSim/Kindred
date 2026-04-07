@@ -43,3 +43,30 @@ def test_extract_parameter_names_from_dsl_rejects_duplicate_equilibrium_aliases(
 
     with pytest.raises(DSLError, match="Duplicate parameter"):
         extract_parameter_names_from_dsl(dsl)
+
+
+def test_extract_parameter_names_from_dsl_accepts_k_alias_on_irreversible_step():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "# Algebra",
+            "param K1 = 5",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(dsl)
+
+    assert "k1" in names
+
+
+def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_step():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; Keq=3.0; kf=6.0",
+            "# Algebra",
+            "param K1 = 5",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="Keq1"):
+        extract_parameter_names_from_dsl(dsl)

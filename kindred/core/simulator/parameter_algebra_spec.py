@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import List, Sequence, Set, Tuple
+from typing import Dict, List, Mapping, Sequence, Set, Tuple
 
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
@@ -11,14 +11,79 @@ _PARAM_STMT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s
 _LET_STMT_RE = re.compile(r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
-_LEGACY_KEQ_PARAM_RE = re.compile(r"^K(\d+)$")
+_MECH_PARAM_CI_RE = re.compile(r"^(?:k|kf|kr|keq)(\d+)$", re.IGNORECASE)
+_K_ALIAS_RE = re.compile(r"^k(\d+)$", re.IGNORECASE)
 
 
-def _normalize_mechanism_param_target(name: str) -> str:
-    alias_match = _LEGACY_KEQ_PARAM_RE.match(name)
+@dataclass(frozen=True)
+class _MechanismParamResolution:
+    raw_name: str
+    canonical_name: str | None = None
+    equilibrium_conflict_name: str | None = None
+
+    @property
+    def is_resolved(self) -> bool:
+        return self.canonical_name is not None
+
+
+def _build_mechanism_param_lookup(mechanism_param_names: Set[str]) -> Dict[str, str]:
+    canonical_by_lower: Dict[str, str] = {}
+    for name in mechanism_param_names:
+        lowered = name.lower()
+        existing = canonical_by_lower.get(lowered)
+        if existing is not None and existing != name:
+            raise ValueError(
+                f"Conflicting mechanism parameter names for case-insensitive lookup: {existing!r} and {name!r}"
+            )
+        canonical_by_lower[lowered] = name
+    return canonical_by_lower
+
+
+def _resolve_mechanism_param_name(
+    raw_name: str,
+    *,
+    canonical_by_lower: Mapping[str, str],
+) -> _MechanismParamResolution:
+    direct_match = canonical_by_lower.get(raw_name.lower())
+    if direct_match is not None:
+        return _MechanismParamResolution(raw_name=raw_name, canonical_name=direct_match)
+
+    alias_match = _K_ALIAS_RE.match(raw_name)
     if alias_match is None:
-        return name
-    return f"Keq{alias_match.group(1)}"
+        return _MechanismParamResolution(raw_name=raw_name)
+
+    index = alias_match.group(1)
+    equilibrium_name = canonical_by_lower.get(f"keq{index}")
+    if equilibrium_name is not None:
+        return _MechanismParamResolution(
+            raw_name=raw_name,
+            equilibrium_conflict_name=equilibrium_name,
+        )
+
+    reversible_forward_name = canonical_by_lower.get(f"kf{index}")
+    if reversible_forward_name is not None:
+        return _MechanismParamResolution(raw_name=raw_name, canonical_name=reversible_forward_name)
+
+    irreversible_name = canonical_by_lower.get(f"k{index}")
+    if irreversible_name is not None:
+        return _MechanismParamResolution(raw_name=raw_name, canonical_name=irreversible_name)
+
+    return _MechanismParamResolution(raw_name=raw_name)
+
+
+def _raise_equilibrium_constant_alias_error(
+    raw_name: str,
+    *,
+    equilibrium_name: str,
+    line_number: int,
+    line_content: str,
+) -> None:
+    raise DSLError(
+        f"{raw_name!r} refers to an equilibrium constant; use {equilibrium_name} for equilibrium constants",
+        suggestion=f"Replace {raw_name} with {equilibrium_name}.",
+        line_number=line_number,
+        line_content=line_content,
+    )
 
 
 @dataclass(frozen=True)
@@ -131,6 +196,7 @@ def extract_parameter_assignments_from_algebra_lines(
 ) -> List[ParameterAssignment]:
     assignments: List[ParameterAssignment] = []
     seen: Set[str] = set()
+    canonical_by_lower = _build_mechanism_param_lookup(mechanism_param_names)
 
     for line_no, raw in algebra_lines:
         original = raw.rstrip("\n")
@@ -145,7 +211,15 @@ def extract_parameter_assignments_from_algebra_lines(
         m_param = _PARAM_STMT_RE.match(code)
         if m_param:
             raw_name = m_param.group(1)
-            name = _normalize_mechanism_param_target(raw_name)
+            resolution = _resolve_mechanism_param_name(raw_name, canonical_by_lower=canonical_by_lower)
+            if resolution.equilibrium_conflict_name is not None:
+                _raise_equilibrium_constant_alias_error(
+                    raw_name,
+                    equilibrium_name=resolution.equilibrium_conflict_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
+            name = resolution.canonical_name or raw_name
             expr = m_param.group(2).strip()
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
@@ -154,8 +228,8 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            m_mech = _MECH_PARAM_RE.match(name)
-            if m_mech and name not in mechanism_param_names:
+            m_mech = _MECH_PARAM_CI_RE.match(raw_name)
+            if m_mech and resolution.canonical_name is None and name not in mechanism_param_names:
                 raise DSLError(
                     f"Unknown mechanism parameter {raw_name!r} in Algebra param statement",
                     suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, Keq1) or define the parameter on a reaction line.",
@@ -184,8 +258,16 @@ def extract_parameter_assignments_from_algebra_lines(
         m_let = _LET_STMT_RE.match(code)
         if m_let:
             target_raw = m_let.group(1)
-            target = _normalize_mechanism_param_target(target_raw)
-            if target in mechanism_param_names:
+            resolution = _resolve_mechanism_param_name(target_raw, canonical_by_lower=canonical_by_lower)
+            if resolution.equilibrium_conflict_name is not None:
+                _raise_equilibrium_constant_alias_error(
+                    target_raw,
+                    equilibrium_name=resolution.equilibrium_conflict_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
+            target = resolution.canonical_name or target_raw
+            if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
                     f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
                     suggestion=f"Replace this with: param {target_raw} = ...",
@@ -198,8 +280,16 @@ def extract_parameter_assignments_from_algebra_lines(
         m_assign = _ASSIGN_RE.match(code)
         if m_assign:
             target_raw = m_assign.group(1)
-            target = _normalize_mechanism_param_target(target_raw)
-            if target in mechanism_param_names:
+            resolution = _resolve_mechanism_param_name(target_raw, canonical_by_lower=canonical_by_lower)
+            if resolution.equilibrium_conflict_name is not None:
+                _raise_equilibrium_constant_alias_error(
+                    target_raw,
+                    equilibrium_name=resolution.equilibrium_conflict_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
+            target = resolution.canonical_name or target_raw
+            if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
                     f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
                     suggestion=f"Replace this with: param {target_raw} = ...",
