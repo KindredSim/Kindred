@@ -150,6 +150,13 @@ def _simulation_submissions(executor: _FakeExecutor) -> list[_FakeExecutorSubmis
     return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
 
 
+def _clear_eager_parallel_executor(main_window) -> None:
+    controller = main_window.simulation_controller
+    if controller.parallel_batch.executor is not None:
+        controller.shutdown_batch_executor(force_terminate=True)
+    assert controller.parallel_batch.executor is None
+
+
 def _current_preview_identity_payload(
     main_window,
     *,
@@ -1842,6 +1849,7 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
+    _clear_eager_parallel_executor(main_window)
     main_window._batch_model.set_species(["A"])
 
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1878,6 +1886,7 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
     main_window.simulation_controller.run_simulation_from_slider()
     qt_app.processEvents()
 
+    assert main_window.simulation_controller.parallel_batch.executor is fake
     simulation_submissions = _simulation_submissions(fake)
     assert len(simulation_submissions) >= 2
 
@@ -1932,6 +1941,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
+    _clear_eager_parallel_executor(main_window)
     main_window._batch_model.set_species(["A"])
 
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1966,6 +1976,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     main_window.simulation_controller.run_simulation_from_slider()
     qt_app.processEvents()
 
+    assert main_window.simulation_controller.parallel_batch.executor is fake
     simulation_submissions = _simulation_submissions(fake)
     assert len(simulation_submissions) == 2
 
