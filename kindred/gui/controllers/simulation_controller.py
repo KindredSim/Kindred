@@ -1234,6 +1234,31 @@ class SimulationController(QtCore.QObject):
         self._batch_parallel.superseded_future_map.clear()
         self._batch_parallel.superseded_future_meta.clear()
 
+    def _reset_parallel_batch_run_and_shutdown_executor(self) -> None:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"):
+            ctx["active"] = False
+            self._batch_run_context = dict(ctx)
+        self.shutdown_batch_executor(force_terminate=True)
+        self._pop_all_stale_parallel_batch_futures()
+        self._drain_batch_completion_queue()
+
+    def _surface_current_parallel_batch_pool_failure_to_ui(self, error_msg: object) -> None:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if not (isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel")):
+            return
+        if self._batch_parallel.executor is None:
+            return
+        self.on_simulation_error(
+            error_msg,
+            run_id=int(ctx.get("run_id") or 0),
+            fast_mode=bool(ctx.get("fast_mode")),
+            request_id=int(ctx.get("request_id") or 0),
+            batch_set="",
+            batch_set_id="",
+            cache_key=str(ctx.get("cache_key") or ""),
+        )
+
     def _consume_parallel_batch_future(
         self,
         *,
@@ -1256,6 +1281,10 @@ class SimulationController(QtCore.QObject):
         try:
             payload = fut.result()
         except Exception as exc:
+            self._record_nonfatal_exception(
+                f"Parallel batch future failed while retrieving result (set_id={sid}, source={str(source)})",
+                exc,
+            )
             self.on_simulation_error(
                 f"Simulation failed:\n\n{exc}",
                 run_id=run_id,
@@ -1265,8 +1294,7 @@ class SimulationController(QtCore.QObject):
                 batch_set_id=sid,
                 cache_key=cache_key,
             )
-            self.shutdown_batch_executor(force_terminate=True)
-            self._pop_all_stale_parallel_batch_futures()
+            self._reset_parallel_batch_run_and_shutdown_executor()
             return False
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
@@ -1279,8 +1307,7 @@ class SimulationController(QtCore.QObject):
                 batch_set_id=sid,
                 cache_key=cache_key,
             )
-            self.shutdown_batch_executor(force_terminate=True)
-            self._pop_all_stale_parallel_batch_futures()
+            self._reset_parallel_batch_run_and_shutdown_executor()
             return False
 
         if bool(getattr(self, "_debug_batch_parallel", False)):
@@ -1323,8 +1350,7 @@ class SimulationController(QtCore.QObject):
                     "Failed to surface simulation-complete handling failure to UI",
                     ui_exc,
                 )
-            self.shutdown_batch_executor(force_terminate=True)
-            self._pop_all_stale_parallel_batch_futures()
+            self._reset_parallel_batch_run_and_shutdown_executor()
             return False
         return True
 
@@ -1333,7 +1359,7 @@ class SimulationController(QtCore.QObject):
         *,
         owner_key: str,
         fut: Any,
-    ) -> None:
+    ) -> bool:
         owner = str(owner_key or "")
         meta = dict((self._batch_parallel.superseded_future_meta or {}).get(owner) or {})
         self._batch_parallel.superseded_future_map.pop(owner, None)
@@ -1348,7 +1374,15 @@ class SimulationController(QtCore.QObject):
                 f"Superseded parallel batch future failed after soft supersede (set_id={set_id}, set_name={set_name})",
                 exc,
             )
-            return
+            try:
+                self._surface_current_parallel_batch_pool_failure_to_ui(f"Simulation failed:\n\n{exc}")
+            except Exception as ui_exc:
+                self._record_nonfatal_exception(
+                    "Failed to surface superseded parallel batch future failure to current run",
+                    ui_exc,
+                )
+            self._reset_parallel_batch_run_and_shutdown_executor()
+            return False
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
             error_payload = coerce_simulation_failure(payload["error"])
@@ -1357,6 +1391,7 @@ class SimulationController(QtCore.QObject):
                 f"Superseded parallel batch future returned error payload after soft supersede (set_id={set_id}, set_name={set_name})",
                 RuntimeError(error_text),
             )
+        return True
 
     def _stop_batch_future_poll_timer_if_idle(self) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
@@ -1444,7 +1479,8 @@ class SimulationController(QtCore.QObject):
             for owner_key, fut in list((self._batch_parallel.superseded_future_map or {}).items()):
                 if not fut.done():
                     continue
-                self._consume_superseded_parallel_batch_future(owner_key=str(owner_key), fut=fut)
+                if not self._consume_superseded_parallel_batch_future(owner_key=str(owner_key), fut=fut):
+                    return
             if (
                 self._batch_parallel.is_pool_stale
                 and (not self._batch_parallel.future_map)

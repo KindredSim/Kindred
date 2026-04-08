@@ -2164,6 +2164,133 @@ def test_superseded_parallel_batch_future_error_is_drained_deterministically(con
 
 
 @pytest.mark.unit
+def test_superseded_parallel_batch_future_exception_tears_down_pool_without_stale_ui_context(
+    controller: SimulationController,
+):
+    submitted: list[tuple[str, dict[str, object]]] = []
+
+    class _PendingFuture:
+        def __init__(self) -> None:
+            self._done = False
+            self._result = None
+
+        def add_done_callback(self, _callback) -> None:
+            return
+
+        def done(self) -> bool:
+            return bool(self._done)
+
+        def set_result(self, result) -> None:
+            self._done = True
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    class _SupersededFuture:
+        def done(self) -> bool:
+            return True
+
+        def result(self):
+            raise RuntimeError("superseded boom")
+
+    class _FakeExecutor:
+        def __init__(self, label: str) -> None:
+            self.label = str(label)
+            self.shutdown_calls: list[dict[str, object]] = []
+
+        def submit(self, _fn, *args, **_kwargs):
+            if args:
+                submitted.append((self.label, dict(args[0])))
+            return _PendingFuture()
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_calls.append(
+                {
+                    "wait": bool(wait),
+                    "cancel_futures": bool(cancel_futures),
+                }
+            )
+
+    created: list[_FakeExecutor] = []
+
+    def _factory(max_workers: int, _limit_blas_threads: bool) -> _FakeExecutor:
+        executor = _FakeExecutor(label=f"executor-{len(created) + 1}-w{int(max_workers)}")
+        created.append(executor)
+        return executor
+
+    current = _PendingFuture()
+    first = _FakeExecutor("initial")
+    controller.parallel_batch.executor_factory = _factory
+    controller.parallel_batch.executor = first
+    controller.parallel_batch._current_max_workers = 2
+    controller._pool_eagerly_created = True
+    controller._batch_parallel.future_map = {"current": current}
+    controller._batch_parallel.future_meta = {"current": {"set_name": "current-set"}}
+    controller._batch_parallel.superseded_future_map = {"stale": _SupersededFuture()}
+    controller._batch_parallel.superseded_future_meta = {
+        "stale": {"set_id": "stale", "set_name": "stale-set", "superseded": "1"}
+    }
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 11,
+        "request_id": 22,
+        "fast_mode": False,
+        "cache_key": "current-cache",
+    }
+    controller._on_simulation_error = MagicMock()
+    controller._on_simulation_complete = MagicMock()
+
+    controller._poll_parallel_batch_futures()
+
+    controller._on_simulation_error.assert_called_once()
+    _args, kwargs = controller._on_simulation_error.call_args
+    assert kwargs["run_id"] == 11
+    assert kwargs["request_id"] == 22
+    assert kwargs["cache_key"] == "current-cache"
+    assert kwargs["batch_set"] == ""
+    assert kwargs["batch_set_id"] == ""
+    assert controller._batch_run_context["active"] is False
+    assert first.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert controller.parallel_batch.executor is None
+    assert controller.parallel_batch.future_map == {}
+    assert controller.parallel_batch.superseded_future_map == {}
+    assert controller._pool_eagerly_created is False
+
+    current.set_result({"payload": "stale"})
+    controller._batch_parallel.completed_queue.put(("current", 1.0))
+    controller._poll_parallel_batch_futures()
+    controller._on_simulation_complete.assert_not_called()
+
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "rows": [0],
+        "queue_ids": ["fresh"],
+        "queue_names": ["fresh-set"],
+        "run_id": 12,
+        "request_id": 23,
+        "full_dsl": "reaction: A -> B; k=1",
+        "mechanism_signature": "sig",
+        "solver_config": {"solver": "LSODA"},
+        "t_end": 10.0,
+        "effective_workers": 2,
+        "fast_mode": False,
+        "pending_init_seed": {},
+        "pending_init_applied": True,
+    }
+    controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
+
+    controller._start_parallel_batch_simulations()
+
+    assert len(created) == 1
+    assert controller.parallel_batch.executor is created[0]
+    assert created[0] is not first
+    assert [label for label, task in submitted if task.get("set_id") == "fresh"] == [created[0].label]
+
+
+@pytest.mark.unit
 def test_parallel_keep_executor_alive_completion_keeps_polling_until_superseded_future_drains(
     mw: _FakeMainWindow, controller: SimulationController
 ):
@@ -2225,6 +2352,51 @@ def test_parallel_keep_executor_alive_completion_keeps_polling_until_superseded_
     assert controller._batch_parallel.superseded_future_meta == {}
     controller._record_nonfatal_exception.assert_not_called()
     timer.stop.assert_called_once()
+
+
+@pytest.mark.unit
+def test_superseded_parallel_batch_future_error_payload_keeps_healthy_pool_alive(controller: SimulationController):
+    class _SupersededFuture:
+        def done(self) -> bool:
+            return True
+
+        def result(self):
+            return {
+                "success": False,
+                "error": {"kind": "simulation_error", "message": "solver blew up", "code": "E301"},
+            }
+
+    class _FakeExecutor:
+        def __init__(self) -> None:
+            self.shutdown_calls: list[dict[str, object]] = []
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_calls.append(
+                {
+                    "wait": bool(wait),
+                    "cancel_futures": bool(cancel_futures),
+                }
+            )
+
+    executor = _FakeExecutor()
+    controller.parallel_batch.executor = executor
+    controller.parallel_batch._current_max_workers = 2
+    controller._pool_eagerly_created = True
+    controller._batch_run_context = {"active": False, "parallel": False}
+    controller._batch_parallel.superseded_future_map = {"sid": _SupersededFuture()}
+    controller._batch_parallel.superseded_future_meta = {
+        "sid": {"set_id": "sid", "set_name": "set1", "superseded": "1"}
+    }
+    controller._record_nonfatal_exception = MagicMock()
+
+    controller._poll_parallel_batch_futures()
+
+    assert controller.parallel_batch.executor is executor
+    assert executor.shutdown_calls == []
+    assert controller.parallel_batch.superseded_future_map == {}
+    assert controller.parallel_batch.superseded_future_meta == {}
+    assert controller._pool_eagerly_created is True
+    controller._record_nonfatal_exception.assert_called_once()
 
 
 @pytest.mark.unit
@@ -2635,6 +2807,113 @@ def test_consume_parallel_batch_future_error_calls_on_error_and_shutdown(mw: _Fa
     assert ok is False
     controller._on_simulation_error.assert_called_once()
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
+
+
+@pytest.mark.unit
+def test_consume_parallel_batch_future_exception_tears_down_pool_and_next_parallel_run_recreates_executor(
+    controller: SimulationController,
+):
+    submitted: list[tuple[str, dict[str, object]]] = []
+
+    class _PendingFuture:
+        def __init__(self) -> None:
+            self._done = False
+
+        def add_done_callback(self, _callback) -> None:
+            return
+
+        def done(self) -> bool:
+            return bool(self._done)
+
+    class _BoomFuture:
+        def result(self):
+            raise RuntimeError("boom")
+
+    class _FakeExecutor:
+        def __init__(self, label: str) -> None:
+            self.label = str(label)
+            self.shutdown_calls: list[dict[str, object]] = []
+
+        def submit(self, _fn, *args, **_kwargs):
+            if args:
+                submitted.append((self.label, dict(args[0])))
+            return _PendingFuture()
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_calls.append(
+                {
+                    "wait": bool(wait),
+                    "cancel_futures": bool(cancel_futures),
+                }
+            )
+
+    created: list[_FakeExecutor] = []
+
+    def _factory(max_workers: int, _limit_blas_threads: bool) -> _FakeExecutor:
+        executor = _FakeExecutor(label=f"executor-{len(created) + 1}-w{int(max_workers)}")
+        created.append(executor)
+        return executor
+
+    first = _FakeExecutor("initial")
+    controller.parallel_batch.executor_factory = _factory
+    controller.parallel_batch.executor = first
+    controller.parallel_batch._current_max_workers = 2
+    controller._pool_eagerly_created = True
+    controller._batch_parallel.future_map = {"sid": _BoomFuture()}
+    controller._batch_parallel.future_meta = {"sid": {"set_name": "set1"}}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+    }
+    controller.on_simulation_error = MagicMock()
+
+    ok = controller._consume_parallel_batch_future(
+        set_id="sid",
+        fut=controller._batch_parallel.future_map["sid"],
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="scan",
+    )
+
+    assert ok is False
+    controller.on_simulation_error.assert_called_once()
+    assert controller._batch_run_context["active"] is False
+    assert first.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert controller.parallel_batch.executor is None
+    assert controller.parallel_batch.future_map == {}
+    assert controller._pool_eagerly_created is False
+
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "rows": [0],
+        "queue_ids": ["fresh"],
+        "queue_names": ["fresh-set"],
+        "run_id": 3,
+        "request_id": 11,
+        "full_dsl": "reaction: A -> B; k=1",
+        "mechanism_signature": "sig",
+        "solver_config": {"solver": "LSODA"},
+        "t_end": 10.0,
+        "effective_workers": 2,
+        "fast_mode": False,
+        "pending_init_seed": {},
+        "pending_init_applied": True,
+    }
+    controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
+
+    controller._start_parallel_batch_simulations()
+
+    assert len(created) == 1
+    assert controller.parallel_batch.executor is created[0]
+    assert created[0] is not first
+    assert [label for label, task in submitted if task.get("set_id") == "fresh"] == [created[0].label]
 
 
 @pytest.mark.unit
