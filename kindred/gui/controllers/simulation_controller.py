@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from PySide6 import QtCore
+import shiboken6
 
 from kindred import __version__ as KINDRED_VERSION
 from kindred.core.batch_parallel import (
@@ -671,8 +672,19 @@ class SimulationController(QtCore.QObject):
     # Worker / executor lifecycle
     # ------------------------------------------------------------------
     @staticmethod
+    def _worker_is_valid(worker) -> bool:
+        if worker is None:
+            return False
+        if isinstance(worker, QtCore.QObject):
+            try:
+                return bool(shiboken6.isValid(worker))
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
     def _worker_is_running(worker) -> bool:
-        if worker is None or not hasattr(worker, "isRunning"):
+        if worker is None or (not SimulationController._worker_is_valid(worker)) or not hasattr(worker, "isRunning"):
             return False
         try:
             return bool(worker.isRunning())
@@ -690,8 +702,19 @@ class SimulationController(QtCore.QObject):
         if worker is None or self._worker_is_running(worker):
             return
         self._forget_retained_simulation_worker(worker)
+        if getattr(self, "_simulation_worker", None) is worker:
+            self._simulation_worker = None
+        if not self._worker_is_valid(worker):
+            return
         if hasattr(worker, "deleteLater"):
-            worker.deleteLater()
+            try:
+                worker.deleteLater()
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    f"Failed to schedule deleteLater() for {str(worker_name)}",
+                    exc,
+                )
+                return
         try:
             QtCore.QCoreApplication.sendPostedEvents(worker, QtCore.QEvent.DeferredDelete)
         except Exception as exc:
@@ -699,6 +722,22 @@ class SimulationController(QtCore.QObject):
                 f"Failed to send deferred delete events for {str(worker_name)}",
                 exc,
             )
+
+    def _prune_stopped_owned_simulation_workers(self) -> None:
+        seen_ids: set[int] = set()
+        owned_workers = []
+        current_worker = getattr(self, "_simulation_worker", None)
+        if current_worker is not None:
+            owned_workers.append(current_worker)
+            seen_ids.add(id(current_worker))
+        for worker in list(self._retained_simulation_workers):
+            if id(worker) in seen_ids:
+                continue
+            owned_workers.append(worker)
+            seen_ids.add(id(worker))
+        for worker in owned_workers:
+            if not self._worker_is_running(worker):
+                self._delete_worker_if_stopped(worker, "simulation worker")
 
     def _on_retained_simulation_worker_finished(self, worker, worker_name: str = "simulation worker") -> None:
         self._forget_retained_simulation_worker(worker)
@@ -726,6 +765,9 @@ class SimulationController(QtCore.QObject):
     def _retain_simulation_worker(self, worker, worker_name: str = "simulation worker") -> None:
         if worker is None:
             return
+        if not self._worker_is_valid(worker):
+            self._delete_worker_if_stopped(worker, worker_name)
+            return
         if any(item is worker for item in self._retained_simulation_workers):
             return
         self._retained_simulation_workers.append(worker)
@@ -751,6 +793,7 @@ class SimulationController(QtCore.QObject):
             self._on_retained_simulation_worker_finished(worker, worker_name)
 
     def _has_running_owned_simulation_workers(self) -> bool:
+        self._prune_stopped_owned_simulation_workers()
         seen_ids: set[int] = set()
         owned_workers = []
         current_worker = getattr(self, "_simulation_worker", None)
@@ -838,6 +881,7 @@ class SimulationController(QtCore.QObject):
             if (not still_running) and getattr(self, "_simulation_worker", None) is worker:
                 self._simulation_worker = None
         self._shutdown_batch_executor(force_terminate=True)
+        self._prune_stopped_owned_simulation_workers()
         has_running_workers = self._has_running_owned_simulation_workers()
         self._shutdown_requested_for_close = bool(has_running_workers)
         return not has_running_workers
@@ -856,8 +900,9 @@ class SimulationController(QtCore.QObject):
     ) -> bool:
         if worker is None:
             return False
-
-        # Wait for thread to finish (with timeout)
+        if not self._worker_is_valid(worker):
+            self._delete_worker_if_stopped(worker, worker_name)
+            return False
         is_running = self._worker_is_running(worker)
 
         if is_running:
@@ -870,19 +915,6 @@ class SimulationController(QtCore.QObject):
                         f"Failed to request cancellation for {str(worker_name)}",
                         exc,
                     )
-
-            # Wait up to 2 seconds for graceful shutdown
-            waited_ok = True
-            if hasattr(worker, "wait"):
-                try:
-                    waited_ok = bool(worker.wait(2000))
-                except Exception:
-                    waited_ok = True
-            if not waited_ok:
-                logger.error(
-                    "%s did not stop within timeout; continuing without forceful termination",
-                    str(worker_name),
-                )
 
         still_running = self._worker_is_running(worker)
         should_disconnect_application_signals = not (
@@ -909,7 +941,7 @@ class SimulationController(QtCore.QObject):
                 try:
                     finished_signal.connect(worker.deleteLater)
                     try:
-                        if hasattr(worker, "isRunning") and not bool(worker.isRunning()):
+                        if not self._worker_is_running(worker):
                             worker.deleteLater()
                     except Exception as exc:
                         self._record_nonfatal_exception(
@@ -1834,7 +1866,7 @@ class SimulationController(QtCore.QObject):
                 self._pending_slider_simulation = True
                 return
 
-        if worker is not None and worker.isRunning():
+        if self._worker_is_running(worker):
             logger.debug("Simulation currently running; deferring slider update")
             self._pending_slider_simulation = True
             return
@@ -2317,7 +2349,7 @@ class SimulationController(QtCore.QObject):
             worker = getattr(self, "_simulation_worker", None)
             if worker is not None and hasattr(worker, "isRunning"):
                 try:
-                    active_fast_worker = bool(worker.isRunning()) and bool(getattr(worker, "_fast_mode", False))
+                    active_fast_worker = self._worker_is_running(worker) and bool(getattr(worker, "_fast_mode", False))
                 except Exception:
                     active_fast_worker = False
 
@@ -3997,7 +4029,7 @@ class SimulationController(QtCore.QObject):
             self._batch_run_context = dict(ctx)
         self._shutdown_batch_executor(force_terminate=True)
 
-        if self._simulation_worker is not None and self._simulation_worker.isRunning():
+        if self._worker_is_running(self._simulation_worker):
             self._simulation_worker.cancel()
             logger.info("Cancellation requested from simulation worker")
             self.ui.run_ui.set_status_text("Cancelling simulation...")

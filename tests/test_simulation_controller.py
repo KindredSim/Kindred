@@ -870,6 +870,56 @@ def test_prepare_simulation_shutdown_for_close_keeps_window_recoverable_when_wor
 
 
 @pytest.mark.unit
+def test_prepare_simulation_shutdown_for_close_ignores_deleted_retained_worker(controller: SimulationController):
+    worker = QtCore.QThread(parent=controller)
+    controller._retained_simulation_workers.append(worker)
+    worker.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(worker, QtCore.QEvent.DeferredDelete)
+
+    close_ready = controller.prepare_simulation_shutdown_for_close()
+
+    assert close_ready is True
+    assert controller._shutdown_requested_for_close is False
+    assert controller._retained_simulation_workers == []
+
+
+@pytest.mark.unit
+def test_release_current_simulation_worker_ignores_deleted_worker(controller: SimulationController):
+    worker = QtCore.QThread(parent=controller)
+    controller._simulation_worker = worker
+    worker.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(worker, QtCore.QEvent.DeferredDelete)
+
+    controller.release_current_simulation_worker()
+
+    assert controller._simulation_worker is None
+    assert controller._retained_simulation_workers == []
+
+
+@pytest.mark.unit
+def test_run_simulation_from_slider_ignores_deleted_current_worker(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    calls: list[dict[str, Any]] = []
+
+    def _record_run(**kwargs) -> None:
+        calls.append(dict(kwargs))
+
+    controller.run_simulation_internal = _record_run
+    worker = QtCore.QThread(parent=controller)
+    controller._simulation_worker = worker
+    worker.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(worker, QtCore.QEvent.DeferredDelete)
+    controller._latest_sim_request_id = 1
+    controller._pending_slider_sim_request_id = 1
+
+    controller._run_simulation_from_slider()
+
+    assert controller._simulation_worker is None
+    assert calls and calls[0]["fast_mode"] is True
+
+
+@pytest.mark.unit
 def test_deferred_close_successful_completion_does_not_schedule_next_serial_batch_run(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
