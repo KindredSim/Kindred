@@ -576,7 +576,7 @@ def apply_parameter_algebra_to_mechanism(
 
 def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
     """
-    Best-effort unit map for solver parameters.
+    Unit map for solver parameters backed by authoritative step metadata.
 
     - k{i}: based on Reaction.order (mass-action), units M^(1-order)/s
     - kf{i}, kr{i}: based on equilibrium forward/back molecularity
@@ -586,61 +586,41 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
     from kindred.core.simulator.parameter_units import rate_constant_unit
 
     units: Dict[str, str] = {}
-    step_map = get_step_index_map(mechanism)
     rxns = getattr(mechanism, "reactions", []) or []
     eqs = getattr(mechanism, "equilibria", []) or []
-    if step_map:
-        for name, entry, role in iter_canonical_parameters(mechanism):
-            kind = str(entry.get("kind") or "")
-            if kind == "reaction" and role == "k":
-                try:
-                    idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
-                except (TypeError, ValueError) as exc:
-                    logger.debug("Skipping reaction index with invalid reaction_index=%r: %s", entry.get("reaction_index"), exc)
-                    continue
-                if 0 <= idx < len(rxns):
-                    try:
-                        order = int(getattr(rxns[idx], "order", 1))
-                    except Exception:
-                        order = 1
-                    units[name] = rate_constant_unit(order)
-            elif kind == "equilibrium":
-                try:
-                    idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
-                except (TypeError, ValueError) as exc:
-                    logger.debug(
-                        "Skipping equilibrium index with invalid equilibrium_index=%r: %s",
-                        entry.get("equilibrium_index"),
-                        exc,
-                    )
-                    continue
-                if not (0 <= idx < len(eqs)):
-                    continue
-                eq = eqs[idx]
-                if role == "Keq":
-                    units[name] = "1"
-                    continue
-                try:
-                    fwd_order = int(round(sum(getattr(eq, "stoich_forward", {}).values())))
-                except Exception:
-                    fwd_order = 1
-                try:
-                    back_order = int(round(sum(getattr(eq, "stoich_back", {}).values())))
-                except Exception:
-                    back_order = 1
-                if role == "kf":
-                    units[name] = rate_constant_unit(fwd_order)
-                elif role == "kr":
-                    units[name] = rate_constant_unit(back_order)
-    else:
-        # Legacy fallback: per-type ordinals.
-        for i, rxn in enumerate(rxns, start=1):
+    for name, entry, role in iter_canonical_parameters(mechanism):
+        kind = str(entry.get("kind") or "")
+        if kind == "reaction" and role == "k":
             try:
-                order = int(getattr(rxn, "order", 1))
+                idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has an invalid reaction_index."
+                ) from exc
+            if not (0 <= idx < len(rxns)):
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has reaction_index {idx} out of range."
+                )
+            try:
+                order = int(getattr(rxns[idx], "order", 1))
             except Exception:
                 order = 1
-            units[f"k{i}"] = rate_constant_unit(order)
-        for i, eq in enumerate(eqs, start=1):
+            units[name] = rate_constant_unit(order)
+        elif kind == "equilibrium":
+            try:
+                idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has an invalid equilibrium_index."
+                ) from exc
+            if not (0 <= idx < len(eqs)):
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has equilibrium_index {idx} out of range."
+                )
+            eq = eqs[idx]
+            if role == "Keq":
+                units[name] = "1"
+                continue
             try:
                 fwd_order = int(round(sum(getattr(eq, "stoich_forward", {}).values())))
             except Exception:
@@ -649,9 +629,10 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 back_order = int(round(sum(getattr(eq, "stoich_back", {}).values())))
             except Exception:
                 back_order = 1
-            units[f"kf{i}"] = rate_constant_unit(fwd_order)
-            units[f"kr{i}"] = rate_constant_unit(back_order)
-            units[f"Keq{i}"] = "1"
+            if role == "kf":
+                units[name] = rate_constant_unit(fwd_order)
+            elif role == "kr":
+                units[name] = rate_constant_unit(back_order)
 
     meta = getattr(mechanism, "metadata", {}) or {}
     scalar_info = meta.get("scalar_param_info") or {}

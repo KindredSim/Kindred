@@ -17,6 +17,7 @@ from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
+from .parameter_namespace import _namespace_policy_from_step
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +119,10 @@ def build_mechanism_from_ir(
             if sc is not None:
                 rxn_overrides["standard_conc_M"] = float(sc)
 
-        reversible = bool(getattr(step, "reversible", False))
         is_equilibrium = bool(getattr(step, "is_equilibrium", False))
+        namespace_policy = _namespace_policy_from_step(step)
         kr_attr = getattr(step, "kr", None)
-        is_equilibrium_step = bool(is_equilibrium or (reversible and kr_attr is not None))
+        is_equilibrium_step = namespace_policy.step_kind == "equilibrium"
 
         if is_equilibrium_step:
             kf_val = float(getattr(step, "kf"))
@@ -195,7 +196,7 @@ def build_mechanism_from_ir(
         # Record canonical step-index mapping for downstream layers (GUI/algebra/fitting).
         arrow = "<->" if is_equilibrium_step else "->"
         context = f"{_fmt_side(reactants)} {arrow} {_fmt_side(products)}"
-        has_Keq_param = bool(getattr(step, "Keq_input", None) is not None)
+        has_Keq_param = namespace_policy.has_explicit_keq
         derive_rate = None
         if is_equilibrium_step and has_Keq_param:
             user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
@@ -207,7 +208,7 @@ def build_mechanism_from_ir(
 
         entry: Dict[str, object] = {
             "step_index": int(step_no),
-            "kind": "equilibrium" if is_equilibrium_step else "reaction",
+            "kind": namespace_policy.step_kind,
             "context": context,
         }
         if is_equilibrium_step:

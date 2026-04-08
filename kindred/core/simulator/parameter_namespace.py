@@ -89,6 +89,12 @@ class _NamespaceStepDescriptor:
     source_index: int | None = None
 
 
+@dataclass(frozen=True)
+class _StepNamespacePolicy:
+    step_kind: str
+    has_explicit_keq: bool
+
+
 def _canonical_lookup(names: Iterable[str]) -> dict[str, str]:
     canonical_by_lower: dict[str, str] = {}
     for name in names:
@@ -174,19 +180,22 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
     )
 
 
-def _step_kind_from_ir_step(step: object) -> str:
+def _namespace_policy_from_step(step: object) -> _StepNamespacePolicy:
     missing_attrs = [
         attr for attr in ("is_equilibrium", "reversible", "kr", "Keq_input") if not hasattr(step, attr)
     ]
     if missing_attrs:
         raise ValueError(
-            "IR step is missing required namespace metadata: " + ", ".join(sorted(missing_attrs))
+            "Step is missing required namespace metadata: " + ", ".join(sorted(missing_attrs))
         )
     is_equilibrium_step = bool(
         getattr(step, "is_equilibrium")
         or (getattr(step, "reversible") and getattr(step, "kr") is not None)
     )
-    return "equilibrium" if is_equilibrium_step else "reaction"
+    return _StepNamespacePolicy(
+        step_kind="equilibrium" if is_equilibrium_step else "reaction",
+        has_explicit_keq=bool(getattr(step, "Keq_input", None) is not None),
+    )
 
 
 def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescriptor]:
@@ -228,14 +237,16 @@ def build_namespace_from_mechanism(mechanism: object) -> MechanismParameterNames
 
 
 def build_namespace_from_ir_steps(steps: Sequence[object]) -> MechanismParameterNamespace:
-    descriptors = [
-        _NamespaceStepDescriptor(
-            step_index=step_index,
-            step_kind=_step_kind_from_ir_step(step),
-            has_explicit_keq=bool(getattr(step, "Keq_input", None) is not None),
+    descriptors: list[_NamespaceStepDescriptor] = []
+    for step_index, step in enumerate(steps, start=1):
+        policy = _namespace_policy_from_step(step)
+        descriptors.append(
+            _NamespaceStepDescriptor(
+                step_index=step_index,
+                step_kind=policy.step_kind,
+                has_explicit_keq=policy.has_explicit_keq,
+            )
         )
-        for step_index, step in enumerate(steps, start=1)
-    ]
     return _build_namespace(descriptors)
 
 

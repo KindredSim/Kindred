@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from kindred.core.simulator.parameter_algebra import (
     evaluate_parameter_algebra,
     mechanism_parameter_namespace,
     parse_parameter_algebra_spec_from_dsl_text,
+    solver_parameter_units_from_mechanism,
 )
 from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 from kindred.core.simulator.parameter_units import rate_constant_unit
@@ -449,6 +451,59 @@ def test_mechanism_parameter_namespace_requires_authoritative_step_index_map():
 
     with pytest.raises(ValueError, match="step_index_map"):
         mechanism_parameter_namespace(_MechanismWithoutStepMap())
+
+
+def test_solver_parameter_units_requires_authoritative_step_index_map():
+    mechanism = SimpleNamespace(
+        metadata={},
+        reactions=[SimpleNamespace(order=1)],
+        equilibria=[SimpleNamespace(stoich_forward={"A": 1.0}, stoich_back={"B": 1.0})],
+    )
+
+    with pytest.raises(ValueError, match="step_index_map"):
+        solver_parameter_units_from_mechanism(mechanism)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "reactions", "equilibria", "expected_error"),
+    [
+        (
+            {"step_index_map": [{"step_index": 1, "kind": "reaction", "reaction_index": "bad"}]},
+            [SimpleNamespace(order=1)],
+            [],
+            "invalid reaction_index",
+        ),
+        (
+            {
+                "step_index_map": [
+                    {
+                        "step_index": 1,
+                        "kind": "equilibrium",
+                        "equilibrium_index": "bad",
+                        "has_Keq_param": False,
+                    }
+                ]
+            },
+            [],
+            [SimpleNamespace(stoich_forward={"A": 1.0}, stoich_back={"B": 1.0})],
+            "invalid equilibrium_index",
+        ),
+    ],
+)
+def test_solver_parameter_units_rejects_malformed_authoritative_indices(
+    metadata,
+    reactions,
+    equilibria,
+    expected_error,
+):
+    mechanism = SimpleNamespace(
+        metadata=metadata,
+        reactions=reactions,
+        equilibria=equilibria,
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        solver_parameter_units_from_mechanism(mechanism)
 
 
 def test_rate_constant_unit_formatting():

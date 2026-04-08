@@ -1191,16 +1191,12 @@ def prepare_bound_mechanism(
 
         wegscheider_derived = set()
         if bool(wegscheider_cyclicity_enabled):
-            try:
-                from kindred.core.simulator.wegscheider import derived_parameter_names_for_cyclicity
+            from kindred.core.simulator.wegscheider import derived_parameter_names_for_cyclicity
 
-                wegscheider_derived = derived_parameter_names_for_cyclicity(
-                    mechanism,
-                    constrained_param_names={str(x) for x in constrained},
-                )
-            except Exception as exc:
-                logger.debug("Wegscheider derived-parameter discovery failed: %s", exc)
-                wegscheider_derived = set()
+            wegscheider_derived = derived_parameter_names_for_cyclicity(
+                mechanism,
+                constrained_param_names={str(x) for x in constrained},
+            )
         requested = set(param_names or [])
         mech_bind_names = sorted(
             {
@@ -1210,8 +1206,9 @@ def prepare_bound_mechanism(
             }
         )
     except Exception as exc:
-        logger.debug("Prepared parameter-algebra binding prepass failed: %s", exc)
-        mech_bind_names = list(param_names)
+        raise _fit_simulation_error_from_preparation_error(
+            _prepare_preparation_failure("parameter_algebra", exc)
+        ) from exc
 
     bindings = _bind_parameters_to_mechanism(mechanism, mech_bind_names)
 
