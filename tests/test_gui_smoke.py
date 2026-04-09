@@ -234,3 +234,15 @@ def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window
 
     assert main_window._run_btn.isEnabled() is True
     assert editor.run_btn.isEnabled() is True
+
+
+def test_mechanism_editor_locked_programmatic_text_change_validates_immediately(main_window, qt_app):
+    editor = main_window._mechanism_editor
+
+    assert editor._reactions_text.isReadOnly() is True
+
+    editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    qt_app.processEvents()
+
+    assert editor.is_mechanism_valid() is True
+    assert editor._current_validation_state == "valid"

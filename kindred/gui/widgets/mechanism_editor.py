@@ -468,6 +468,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def _on_text_changed(self):
         """Handle text change event - trigger debounced validation."""
+        if bool(getattr(self, "_reactions_read_only", self._reactions_text.isReadOnly())):
+            self._validation_timer.stop()
+            self._validate_dsl()
+            return
         self._validation_timer.start()
         self._set_validation_state("validating")
 
@@ -619,7 +623,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_edit_status_label.setVisible(bool(text_s.strip()))
 
     def set_reactions_read_only(self, read_only: bool) -> None:
-        self._reactions_text.setReadOnly(bool(read_only))
+        self._reactions_read_only = bool(read_only)
+        self._reactions_text.setReadOnly(self._reactions_read_only)
 
     def reactions_text(self) -> str:
         """Return the current Reaction DSL text."""

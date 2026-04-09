@@ -95,6 +95,18 @@ def _invalid_state_network_dsl() -> str:
     )
 
 
+def _valid_state_network_dsl() -> str:
+    return "\n".join(
+        [
+            "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
+            "state: B, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "edge: A,TS1",
+            "edge: TS1,B",
+        ]
+    )
+
+
 def _wait_for_mechanism_validity(main_window, qt_app, expected_valid: bool, timeout_ms: int = 1500) -> None:
     deadline = time.monotonic() + (float(timeout_ms) / 1000.0)
     while time.monotonic() < deadline:
@@ -218,6 +230,81 @@ def test_consumers_disconnected_while_unlocked(main_window, monkeypatch, qt_app)
 
     assert calls == []
     assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
+
+
+def test_spinbox_change_while_unlocked_does_not_read_staged_text(main_window, monkeypatch, qt_app):
+    _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
+    main_window._mechanism_editor._state_network_editor.clear()
+    main_window._temperature_spinbox.setValue(305.0)
+    qt_app.processEvents()
+    baseline_indicator = main_window._temperature_mode_indicator.text()
+    assert "from DSL" not in baseline_indicator
+
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText("T=400\nreaction: A -> B; k=1.0")
+    qt_app.processEvents()
+
+    main_window._temperature_spinbox.setValue(315.0)
+    qt_app.processEvents()
+
+    assert main_window._temperature_mode_indicator.text() == baseline_indicator
+    assert "400" not in main_window._temperature_mode_indicator.text()
+    assert "from DSL" not in main_window._temperature_mode_indicator.text()
+
+
+def test_spinbox_change_while_locked_fires_temperature_indicator(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    calls: list[str] = []
+
+    def _record_temperature() -> None:
+        calls.append("temperature")
+
+    monkeypatch.setattr(main_window, "_update_temperature_mode_indicator", _record_temperature)
+
+    main_window._force_lock_editor()
+    assert main_window.mechanism_editing_locked() is True
+
+    main_window._temperature_spinbox.setValue(float(main_window._temperature_spinbox.value()) + 10.0)
+    qt_app.processEvents()
+
+    assert calls == ["temperature"]
+
+
+def test_state_network_change_fires_temperature_indicator_when_locked(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    calls: list[str] = []
+
+    def _record_temperature() -> None:
+        calls.append("temperature")
+
+    monkeypatch.setattr(main_window, "_update_temperature_mode_indicator", _record_temperature)
+
+    main_window._force_lock_editor()
+    assert main_window.mechanism_editing_locked() is True
+
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
+    qt_app.processEvents()
+
+    assert calls == ["temperature"]
+
+
+def test_state_network_change_suppressed_while_unlocked(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    calls: list[str] = []
+
+    def _record_temperature() -> None:
+        calls.append("temperature")
+
+    monkeypatch.setattr(main_window, "_update_temperature_mode_indicator", _record_temperature)
+
+    main_window._force_lock_editor()
+    main_window._set_mechanism_edit_locked(False)
+    assert main_window.mechanism_editing_locked() is False
+
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
+    qt_app.processEvents()
+
+    assert calls == []
 
 
 def test_consumers_reconnected_on_successful_lock(main_window, monkeypatch, qt_app):
@@ -433,6 +520,56 @@ def test_is_mechanism_ready_for_run_independent_of_lock(main_window, monkeypatch
     assert main_window.is_mechanism_ready_for_run() is False
 
 
+def test_empty_reactions_valid_state_network_is_ready_for_run(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("")
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
+    qt_app.processEvents()
+
+    assert main_window._mechanism_editor._state_network_editor.is_valid() is True
+    assert main_window.is_mechanism_ready_for_run() is True
+
+
+def test_empty_reactions_no_state_network_not_ready_for_run(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("")
+    main_window._mechanism_editor._state_network_editor.clear()
+    qt_app.processEvents()
+
+    assert main_window.is_mechanism_ready_for_run() is False
+
+
+def test_invalid_reactions_valid_state_network_not_ready_for_run(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("this line does not parse")
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
+    qt_app.processEvents()
+
+    assert main_window._mechanism_editor._state_network_editor.is_valid() is True
+    assert main_window.is_mechanism_ready_for_run() is False
+
+
+def test_valid_reactions_invalid_state_network_not_ready_for_run(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_invalid_state_network_dsl())
+    qt_app.processEvents()
+
+    assert main_window._mechanism_editor._state_network_editor.is_valid() is False
+    assert main_window.is_mechanism_ready_for_run() is False
+
+
+def test_named_inline_initial_set_blocks_are_ready_for_run(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\n"
+        "\n"
+        "Set B = {\n"
+        "[A] = 1.0\n"
+        "}\n"
+    )
+    main_window._mechanism_editor._state_network_editor.clear()
+    qt_app.processEvents()
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
+
+    assert main_window.is_mechanism_ready_for_run() is True
+
+
 def test_state_network_validation_blocks_lock(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
 
@@ -516,6 +653,36 @@ def test_run_auto_locks_editor_from_main_window(main_window, monkeypatch, qt_app
     main_window.simulation_controller.run_simulation_internal = MagicMock()
 
     main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    main_window.simulation_controller.run_simulation_internal.assert_called_once()
+
+
+def test_run_auto_locks_and_proceeds_for_state_network_only_mechanism(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText("")
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
+    qt_app.processEvents()
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    main_window.simulation_controller.run_simulation_internal.assert_called_once()
+
+
+def test_mechanism_editor_run_button_accepts_state_network_only_mechanism(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText("")
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
+    _process_events_bounded(qt_app)
+
+    assert main_window._mechanism_editor.run_btn.isEnabled() is True
+
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+    main_window._mechanism_editor.run_btn.click()
     qt_app.processEvents()
 
     assert main_window.mechanism_editing_locked() is True

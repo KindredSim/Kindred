@@ -324,6 +324,12 @@ class MainWindow(
         sliders.variableChanged.connect(self._on_variable_changed)
         sliders.sliderDragStarted.connect(self._on_slider_drag_started)
         sliders.sliderDragFinished.connect(self._on_slider_drag_finished)
+        self._mechanism_editor._reactions_text.textChanged.connect(
+            self._refresh_mechanism_editor_run_button_ready_state
+        )
+        self._mechanism_editor._state_network_editor.stateNetworkChanged.connect(
+            self._refresh_mechanism_editor_run_button_ready_state
+        )
 
         try:
             self._mechanism_editor._commit_slider_overrides_btn.clicked.connect(self._on_commit_slider_overrides_clicked)
@@ -336,6 +342,7 @@ class MainWindow(
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
         self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
         self._refresh_slider_transaction_button_state()
+        self._refresh_mechanism_editor_run_button_ready_state()
 
     def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
         for attr in ("_commit_slider_overrides_btn", "_reset_slider_overrides_btn"):
@@ -422,6 +429,7 @@ class MainWindow(
         editor = getattr(self, "_mechanism_editor", None)
         reactions_widget = getattr(editor, "_reactions_text", None)
         state_editor = getattr(editor, "_state_network_editor", None)
+        temperature_spinbox = getattr(self, "_temperature_spinbox", None)
         if not bool(getattr(self, "_mechanism_edit_consumers_connected", False)):
             return
         reactions_consumers = (
@@ -430,6 +438,7 @@ class MainWindow(
             self._refresh_overlay_swatches_for_current_mechanism,
         )
         state_network_consumers = (
+            self._update_temperature_mode_indicator,
             self._on_authoritative_mechanism_input_changed,
             self._refresh_overlay_swatches_for_current_mechanism,
         )
@@ -445,21 +454,38 @@ class MainWindow(
                     state_editor.stateNetworkChanged.disconnect(consumer)
                 except (RuntimeError, TypeError, AttributeError):
                     continue
+        if temperature_spinbox is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                try:
+                    temperature_spinbox.valueChanged.disconnect(self._update_temperature_mode_indicator)
+                except RuntimeError:
+                    pass
         self._mechanism_edit_consumers_connected = False
 
     def _reconnect_mechanism_edit_consumers(self) -> None:
         editor = getattr(self, "_mechanism_editor", None)
         reactions_widget = getattr(editor, "_reactions_text", None)
         state_editor = getattr(editor, "_state_network_editor", None)
+        temperature_spinbox = getattr(self, "_temperature_spinbox", None)
         if reactions_widget is None:
             return
         if bool(getattr(self, "_mechanism_edit_consumers_connected", False)):
             return
+        if temperature_spinbox is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                try:
+                    temperature_spinbox.valueChanged.disconnect(self._update_temperature_mode_indicator)
+                except RuntimeError:
+                    pass
+            temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
         reactions_widget.textChanged.connect(self._update_temperature_mode_indicator)
         reactions_widget.textChanged.connect(self._on_authoritative_mechanism_input_changed)
         reactions_widget.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
         if state_editor is not None:
             try:
+                state_editor.stateNetworkChanged.connect(self._update_temperature_mode_indicator)
                 state_editor.stateNetworkChanged.connect(self._on_authoritative_mechanism_input_changed)
                 state_editor.stateNetworkChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
             except Exception as exc:
@@ -478,20 +504,14 @@ class MainWindow(
 
     def _try_lock_mechanism_editor(self) -> bool:
         editor = getattr(self, "_mechanism_editor", None)
-        if editor is not None and hasattr(editor, "_validate_dsl"):
-            editor._validate_dsl()
-        reactions_valid = bool(
-            editor is not None
-            and hasattr(editor, "is_mechanism_valid")
-            and editor.is_mechanism_valid()
-        )
-        state_editor = getattr(editor, "_state_network_editor", None) if editor is not None else None
-        state_network_valid = bool(
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if (
             state_editor is not None
             and hasattr(state_editor, "is_valid")
-            and state_editor.is_valid()
-        )
-        if not reactions_valid or not state_network_valid:
+            and not state_editor.is_valid()
+        ):
+            return False
+        if not self.is_mechanism_ready_for_run():
             return False
         self._reconnect_mechanism_edit_consumers()
         self._update_temperature_mode_indicator()
@@ -525,17 +545,58 @@ class MainWindow(
         validate = getattr(editor, "_validate_dsl", None)
         if callable(validate):
             validate()
-        reactions_valid = bool(
-            hasattr(editor, "is_mechanism_valid")
-            and editor.is_mechanism_valid()
-        )
+        return self._combined_mechanism_dsl_is_runnable_for_run()
+
+    def _combined_mechanism_dsl_is_runnable_for_run(self) -> bool:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            return False
+        from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
+        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
         state_editor = getattr(editor, "_state_network_editor", None)
-        state_network_valid = bool(
-            state_editor is not None
-            and hasattr(state_editor, "is_valid")
-            and state_editor.is_valid()
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        reactions_text = str(reactions_widget.toPlainText() if reactions_widget is not None else "")
+        state_network_dsl = str(state_editor.get_state_network_dsl() if state_editor is not None else "")
+        if not state_network_dsl.strip():
+            if not reactions_text.strip():
+                return False
+            return bool(hasattr(editor, "is_mechanism_valid") and editor.is_mechanism_valid())
+        try:
+            reactions_text = strip_named_reaction_dsl_initial_concentration_sets(reactions_text)
+            full_dsl = reactions_text
+            if state_network_dsl.strip():
+                full_dsl += "\n\n# State Network\n" + state_network_dsl
+            if not full_dsl.strip():
+                return False
+            parse_dsl_to_mechanism(full_dsl, initials={})
+        except Exception:
+            return False
+        return True
+
+    def _refresh_mechanism_editor_run_button_ready_state(self, *, recompute: bool = True) -> None:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            return
+        run_button = getattr(editor, "run_btn", None)
+        if run_button is None:
+            return
+        ready = bool(getattr(self, "_mechanism_editor_run_ready", False))
+        if recompute or not hasattr(self, "_mechanism_editor_run_ready"):
+            ready = self._combined_mechanism_dsl_is_runnable_for_run()
+            self._mechanism_editor_run_ready = bool(ready)
+        elif not ready and hasattr(editor, "is_mechanism_valid") and editor.is_mechanism_valid():
+            ready = True
+            self._mechanism_editor_run_ready = True
+        if bool(getattr(editor, "_run_gated", False)):
+            run_button.setEnabled(False)
+            return
+        run_button.setEnabled(bool(ready))
+        run_button.setToolTip(
+            "Run simulation for all selected sets (same as Run Selected in Initial Conditions)"
+            if ready
+            else "No valid mechanism or state network. Enter a valid mechanism or state network to enable run."
         )
-        return bool(reactions_valid and state_network_valid)
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -909,6 +970,7 @@ class MainWindow(
         finally:
             self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
+        self._refresh_mechanism_editor_run_button_ready_state()
 
     def _init_mixin_ports(self) -> None:
         data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
@@ -961,6 +1023,7 @@ class MainWindow(
         self._update_temperature_mode_indicator()
         self._on_authoritative_mechanism_input_changed()
         self._refresh_slider_transaction_button_state()
+        self._refresh_mechanism_editor_run_button_ready_state()
 
         try:
             self._update_parameter_table_from_sliders()
@@ -3803,6 +3866,13 @@ class MainWindow(
         if editor is not None:
             if hasattr(editor, "set_run_gated"):
                 editor.set_run_gated(not bool(enabled))
+                if bool(enabled):
+                    state_editor = getattr(editor, "_state_network_editor", None)
+                    state_network_dsl = str(
+                        state_editor.get_state_network_dsl() if state_editor is not None else ""
+                    )
+                    if state_network_dsl.strip() or not editor.is_mechanism_valid():
+                        self._refresh_mechanism_editor_run_button_ready_state(recompute=False)
             elif enabled:
                 editor.run_btn.setEnabled(editor.is_mechanism_valid())
             else:
