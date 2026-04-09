@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from kindred.core.batch_initial_conditions import (
-    strip_named_reaction_dsl_initial_concentration_sets,
+    strip_reaction_dsl_initial_concentrations,
 )
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
@@ -152,14 +152,23 @@ class MechanismSessionOwner:
     def explicit_run_source(self) -> str:
         if not self.is_ready_for_explicit_run():
             raise RuntimeError("Canonical mechanism is not ready for an explicit run.")
-        return self.canonical_full_dsl
+        return self._build_simulation_source(
+            reactions_text=self._canonical_reactions_text,
+            state_network_dsl=self._canonical_state_network_dsl,
+        )
 
     def preview_source(self) -> str:
         if not self.is_ready_for_preview():
             raise RuntimeError("Mechanism source is not ready for preview.")
         if self._edit_session_active:
-            return self.draft_full_dsl
-        return self.canonical_full_dsl
+            return self._build_simulation_source(
+                reactions_text=self._draft_reactions_text,
+                state_network_dsl=self._draft_state_network_dsl,
+            )
+        return self._build_simulation_source(
+            reactions_text=self._canonical_reactions_text,
+            state_network_dsl=self._canonical_state_network_dsl,
+        )
 
     @staticmethod
     def _build_full_dsl(*, reactions_text: str, state_network_dsl: str) -> str:
@@ -189,9 +198,7 @@ class MechanismSessionOwner:
         )
 
     def _build_simulation_source(self, *, reactions_text: str, state_network_dsl: str) -> str:
-        normalized_reactions = strip_named_reaction_dsl_initial_concentration_sets(
-            reactions_text
-        )
+        normalized_reactions = strip_reaction_dsl_initial_concentrations(reactions_text)
         return self._build_full_dsl(
             reactions_text=normalized_reactions,
             state_network_dsl=state_network_dsl,

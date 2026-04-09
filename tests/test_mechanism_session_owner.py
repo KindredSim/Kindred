@@ -1,5 +1,9 @@
 import pytest
 
+from kindred.core.batch_initial_conditions import (
+    strip_reaction_dsl_initial_concentrations,
+)
+from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner, ValidationResult
 
 
@@ -10,6 +14,7 @@ VALID_REACTIONS = "A -> B ; k=1"
 UPDATED_REACTIONS = "A -> B ; k=2"
 INVALID_REACTIONS = "invalid garbage"
 REACTIONS_WITH_NAMED_INITIAL_SET = "reaction: A -> B; k=1.0\n\nSet B = {\n[A] = 1.0\n}"
+REACTIONS_WITH_INLINE_INITIALS = "A -> B ; k=1\n[A] = 1\n[B] = 0"
 VALID_STATE_NETWORK = "\n".join(
     [
         "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
@@ -253,24 +258,28 @@ def test_named_initial_set_normalization_keeps_validation_ready() -> None:
     assert result.species_count == 2
     assert result.reaction_count == 1
     assert owner.is_ready_for_explicit_run() is True
-    assert owner.explicit_run_source() == REACTIONS_WITH_NAMED_INITIAL_SET
+    assert owner.explicit_run_source() == strip_reaction_dsl_initial_concentrations(
+        REACTIONS_WITH_NAMED_INITIAL_SET
+    )
 
 
-def test_preview_source_preserves_named_initial_set_blocks() -> None:
+def test_preview_source_returns_normalized_draft_source() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(VALID_REACTIONS, "")
     owner.begin_edit_session()
     owner.update_draft_reactions(REACTIONS_WITH_NAMED_INITIAL_SET)
 
-    assert owner.preview_source() == REACTIONS_WITH_NAMED_INITIAL_SET
+    assert owner.preview_source() == strip_reaction_dsl_initial_concentrations(
+        REACTIONS_WITH_NAMED_INITIAL_SET
+    )
 
 
-def test_sources_return_owned_text_with_state_network_dsl() -> None:
+def test_sources_return_normalized_text_with_state_network_dsl() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(REACTIONS_WITH_NAMED_INITIAL_SET, VALID_STATE_NETWORK)
 
     expected_source = (
-        REACTIONS_WITH_NAMED_INITIAL_SET
+        strip_reaction_dsl_initial_concentrations(REACTIONS_WITH_NAMED_INITIAL_SET)
         + "\n\n# State Network\n"
         + VALID_STATE_NETWORK
     )
@@ -280,6 +289,34 @@ def test_sources_return_owned_text_with_state_network_dsl() -> None:
     owner.begin_edit_session()
 
     assert owner.preview_source() == expected_source
+
+
+def test_explicit_run_source_removes_inline_initial_concentrations() -> None:
+    owner = MechanismSessionOwner()
+    owner.apply_authoritative_update(REACTIONS_WITH_INLINE_INITIALS, "")
+
+    expected_source = strip_reaction_dsl_initial_concentrations(
+        REACTIONS_WITH_INLINE_INITIALS
+    )
+
+    assert owner.is_ready_for_explicit_run() is True
+    assert owner.explicit_run_source() == expected_source
+    parse_dsl_to_mechanism(owner.explicit_run_source(), initials={})
+
+
+def test_preview_source_removes_inline_initial_concentrations_from_draft() -> None:
+    owner = MechanismSessionOwner()
+    owner.apply_authoritative_update(VALID_REACTIONS, "")
+    owner.begin_edit_session()
+    owner.update_draft_reactions(REACTIONS_WITH_INLINE_INITIALS)
+
+    expected_source = strip_reaction_dsl_initial_concentrations(
+        REACTIONS_WITH_INLINE_INITIALS
+    )
+
+    assert owner.is_ready_for_preview() is True
+    assert owner.preview_source() == expected_source
+    parse_dsl_to_mechanism(owner.preview_source(), initials={})
 
 
 def test_commit_requires_topology_validator_for_state_network_canonicalization() -> None:
