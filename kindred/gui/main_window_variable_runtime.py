@@ -222,6 +222,14 @@ class MainWindowVariableRuntime:
                         "Normalize mechanism parameter tokens for sliders",
                         record_undo=False,
                     )
+                    sync_authoritative_write = getattr(
+                        mw,
+                        "finalize_authoritative_mechanism_widget_write",
+                        None,
+                    )
+                    if not callable(sync_authoritative_write):
+                        raise RuntimeError("MainWindow authoritative write finalizer is unavailable.")
+                    sync_authoritative_write(dispatch_consumers=False)
                 finally:
                     setattr(mw, "_suppress_authoritative_mechanism_input_change", previous_authoritative_suppress)
                 mechanism_text = sanitized_text

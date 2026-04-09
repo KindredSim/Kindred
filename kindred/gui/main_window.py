@@ -232,7 +232,6 @@ class MainWindow(
         self._recent_menu = None
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
-        self._mechanism_edit_consumers_connected = False
 
         # Undo/Redo stack for high-level operations.
         self._undo_stack = controllers.undo_stack
@@ -404,6 +403,86 @@ class MainWindow(
         owner.update_draft_reactions(reactions_text)
         owner.update_draft_state_network(state_network_dsl)
 
+    def _sync_mechanism_session_owner_from_widget_signal(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        self._sync_mechanism_session_owner_from_widgets(authoritative=not bool(owner.edit_session_active))
+
+    def _dispatch_authoritative_mechanism_consumers(self) -> None:
+        self._update_temperature_mode_indicator()
+        self._on_authoritative_mechanism_input_changed()
+        self._refresh_overlay_swatches_for_current_mechanism()
+
+    def _sync_mechanism_session_owner_after_authoritative_widget_write(
+        self,
+        *,
+        dispatch_consumers: bool,
+    ) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        session_was_active = bool(owner.edit_session_active)
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        if not session_was_active:
+            return
+        self._set_mechanism_edit_locked(True)
+        if bool(dispatch_consumers):
+            self._dispatch_authoritative_mechanism_consumers()
+
+    def _restore_mechanism_widgets_from_owner_canonical(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        editor = getattr(self, "_mechanism_editor", None)
+        if owner is None or editor is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None or state_editor is None:
+            raise RuntimeError("Mechanism editor widgets are unavailable.")
+
+        canonical_reactions = str(owner.canonical_reactions_text)
+        if str(reactions_widget.toPlainText()) != canonical_reactions:
+            reactions_widget.blockSignals(True)
+            try:
+                reactions_widget.setPlainText(canonical_reactions)
+            finally:
+                reactions_widget.blockSignals(False)
+
+        canonical_state_network = str(owner.canonical_state_network_dsl or "")
+        if str(state_editor.get_state_network_dsl() or "") != canonical_state_network:
+            state_editor.blockSignals(True)
+            try:
+                if canonical_state_network.strip():
+                    state_editor.set_state_network_dsl(canonical_state_network)
+                else:
+                    state_editor.clear()
+            finally:
+                state_editor.blockSignals(False)
+
+        validate = getattr(editor, "_validate_dsl", None)
+        if callable(validate):
+            validate()
+
+    def _on_reactions_text_changed_for_main_window(self) -> None:
+        self._sync_mechanism_session_owner_from_widget_signal()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None or bool(owner.edit_session_active):
+            return
+        self._dispatch_authoritative_mechanism_consumers()
+
+    def _on_state_network_changed_for_main_window(self) -> None:
+        self._sync_mechanism_session_owner_from_widget_signal()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None or bool(owner.edit_session_active):
+            return
+        self._dispatch_authoritative_mechanism_consumers()
+
+    def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
+        self._update_temperature_mode_indicator()
+
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
         if bool(locked):
@@ -457,80 +536,13 @@ class MainWindow(
                 if info_label is not None:
                     info_label.setText(self._state_network_dialog_info_text(locked=locked))
 
-    def _disconnect_mechanism_edit_consumers(self) -> None:
-        editor = getattr(self, "_mechanism_editor", None)
-        reactions_widget = getattr(editor, "_reactions_text", None)
-        state_editor = getattr(editor, "_state_network_editor", None)
-        temperature_spinbox = getattr(self, "_temperature_spinbox", None)
-        if not bool(getattr(self, "_mechanism_edit_consumers_connected", False)):
-            return
-        reactions_consumers = (
-            self._update_temperature_mode_indicator,
-            self._on_authoritative_mechanism_input_changed,
-            self._refresh_overlay_swatches_for_current_mechanism,
-        )
-        state_network_consumers = (
-            self._update_temperature_mode_indicator,
-            self._on_authoritative_mechanism_input_changed,
-            self._refresh_overlay_swatches_for_current_mechanism,
-        )
-        if reactions_widget is not None:
-            for consumer in reactions_consumers:
-                try:
-                    reactions_widget.textChanged.disconnect(consumer)
-                except (RuntimeError, TypeError):
-                    continue
-        if state_editor is not None:
-            for consumer in state_network_consumers:
-                try:
-                    state_editor.stateNetworkChanged.disconnect(consumer)
-                except (RuntimeError, TypeError, AttributeError):
-                    continue
-        if temperature_spinbox is not None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                try:
-                    temperature_spinbox.valueChanged.disconnect(self._update_temperature_mode_indicator)
-                except RuntimeError:
-                    pass
-        self._mechanism_edit_consumers_connected = False
-
-    def _reconnect_mechanism_edit_consumers(self) -> None:
-        editor = getattr(self, "_mechanism_editor", None)
-        reactions_widget = getattr(editor, "_reactions_text", None)
-        state_editor = getattr(editor, "_state_network_editor", None)
-        temperature_spinbox = getattr(self, "_temperature_spinbox", None)
-        if reactions_widget is None:
-            return
-        if bool(getattr(self, "_mechanism_edit_consumers_connected", False)):
-            return
-        if temperature_spinbox is not None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                try:
-                    temperature_spinbox.valueChanged.disconnect(self._update_temperature_mode_indicator)
-                except RuntimeError:
-                    pass
-            temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
-        reactions_widget.textChanged.connect(self._update_temperature_mode_indicator)
-        reactions_widget.textChanged.connect(self._on_authoritative_mechanism_input_changed)
-        reactions_widget.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
-        if state_editor is not None:
-            try:
-                state_editor.stateNetworkChanged.connect(self._update_temperature_mode_indicator)
-                state_editor.stateNetworkChanged.connect(self._on_authoritative_mechanism_input_changed)
-                state_editor.stateNetworkChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.state_network_editor.stateNetworkChanged.connect",
-                    message="State network editor did not expose stateNetworkChanged signal",
-                    exc=exc,
-                )
-        self._mechanism_edit_consumers_connected = True
-
     def _force_lock_editor(self) -> bool:
-        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
-        self._reconnect_mechanism_edit_consumers()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        if owner.edit_session_active:
+            owner.cancel_edit_session()
+            self._restore_mechanism_widgets_from_owner_canonical()
         self._refresh_mechanism_edit_lock_ui()
         return True
 
@@ -544,10 +556,7 @@ class MainWindow(
                 return False
         elif not self.is_mechanism_ready_for_run():
             return False
-        self._reconnect_mechanism_edit_consumers()
-        self._update_temperature_mode_indicator()
-        self._on_authoritative_mechanism_input_changed()
-        self._refresh_overlay_swatches_for_current_mechanism()
+        self._dispatch_authoritative_mechanism_consumers()
         self._refresh_mechanism_edit_lock_ui()
         return True
 
@@ -558,11 +567,9 @@ class MainWindow(
                 raise RuntimeError("Mechanism session owner is unavailable.")
             if not owner.edit_session_active:
                 owner.begin_edit_session()
-            self._disconnect_mechanism_edit_consumers()
             self._refresh_mechanism_edit_lock_ui()
             return True
         if self.mechanism_editing_locked():
-            self._reconnect_mechanism_edit_consumers()
             self._refresh_mechanism_edit_lock_ui()
             return True
         return self._force_lock_editor()
@@ -992,9 +999,8 @@ class MainWindow(
         Programmatic loads often set editor text with signals blocked (undo commands and some load
         paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
         """
-        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
-        self._set_mechanism_edit_locked(True)
         try:
             self._mechanism_editor._variable_sliders.clear()
         except Exception:
@@ -1002,8 +1008,7 @@ class MainWindow(
             self._preview_session.clear_pending_slider_values()
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
-        self._update_temperature_mode_indicator()
-        self._on_authoritative_mechanism_input_changed()
+        self._dispatch_authoritative_mechanism_consumers()
         self._refresh_slider_transaction_button_state()
 
         try:
@@ -1011,8 +1016,6 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to update parameter table after programmatic mechanism load", exc_info=True)
             QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
-
-        self._refresh_overlay_swatches_for_current_mechanism()
 
     def _bootstrap_existing_datasets(self):
         """Populate dataset visualizations for any datasets already loaded."""
@@ -1078,8 +1081,9 @@ class MainWindow(
         ColorManager.instance().set_current_species_roster(roster)
 
     def _refresh_overlay_swatches_for_current_mechanism(self) -> None:
-        if self.mechanism_editing_locked():
-            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
         self._sync_color_manager_authoritative_roster()
         plot = getattr(self._plot_tabs, "_main_plot", None)
         refresh_overlay_presentation = getattr(plot, "refresh_overlay_presentation_for_current_roster", None)
@@ -1491,13 +1495,18 @@ class MainWindow(
         self._right_panel._data_manager.datasetRemoved.connect(self._on_dataset_removed)
         self._right_panel._data_manager.loadFinished.connect(self._on_dataset_load_finished)
 
-        # Temperature mode indicator updates
-        self._temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
+        # Temperature mode indicator and authoritative mechanism consumers.
+        reactions_widget = getattr(self._mechanism_editor, "_reactions_text", None)
+        state_editor = getattr(self._mechanism_editor, "_state_network_editor", None)
+        if reactions_widget is not None:
+            reactions_widget.textChanged.connect(self._on_reactions_text_changed_for_main_window)
+        if state_editor is not None:
+            state_editor.stateNetworkChanged.connect(self._on_state_network_changed_for_main_window)
+        self._temperature_spinbox.valueChanged.connect(self._on_temperature_spinbox_value_changed_for_main_window)
         # User preference tracking for spinbox-only dual-persisted keys.
         self._temperature_spinbox.valueChanged.connect(self._on_temperature_user_edit)
         self._num_points_spinbox.valueChanged.connect(self._on_num_points_user_edit)
         self._sim_time_spinbox.textChanged.connect(self._on_sim_time_user_edit)
-        self._reconnect_mechanism_edit_consumers()
 
     def _record_best_effort_failure(
         self,
@@ -1526,8 +1535,9 @@ class MainWindow(
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Invalidate stale displayed results when the authoritative mechanism changes."""
-        if self.mechanism_editing_locked():
-            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
         if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
             return
         # Pending-init rewrite normalizes the DSL after a successful explicit run;
@@ -1729,8 +1739,9 @@ class MainWindow(
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 
-        if self.mechanism_editing_locked():
-            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
 
         mechanism_text = self.mechanism_reactions_text_raw()
         state_network_text = self.mechanism_state_network_dsl_raw()
@@ -4078,6 +4089,11 @@ class MainWindow(
             bool(record_undo),
         )
 
+    def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
+        self._sync_mechanism_session_owner_after_authoritative_widget_write(
+            dispatch_consumers=bool(dispatch_consumers)
+        )
+
     def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None:
         self._set_temperature_override_state(enabled=bool(enabled), tooltip=str(tooltip))
 
@@ -4628,6 +4644,7 @@ class MainWindow(
                     "Migrate initial concentrations to set table",
                     record_undo=True,
                 )
+                self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
                 self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
                 self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
                 self._set_mechanism_edit_locked(True)
@@ -7823,6 +7840,7 @@ class MainWindow(
                 description=str(description),
             )
             self._undo_stack.push(command)
+            self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         finally:
             self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress

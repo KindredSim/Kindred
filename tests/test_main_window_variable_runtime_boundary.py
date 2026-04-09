@@ -81,6 +81,9 @@ class _FakeRuntimeHost:
         _ = (description, record_undo)
         self._reactions_text = str(new_text)
 
+    def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
+        _ = dispatch_consumers
+
     def temperature_spinbox_value(self) -> float:
         return float(self._temperature_k)
 

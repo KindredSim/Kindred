@@ -199,6 +199,44 @@ def test_owner_canonical_text_remains_stable_while_unlocked_edits_are_staged(mai
     assert main_window.mechanism_state_network_dsl_raw() == baseline_state
 
 
+def test_owner_draft_tracks_unlocked_widget_edits_and_commits_on_lock(main_window, monkeypatch, qt_app):
+    baseline_reactions = "reaction: A -> B; k=1.0"
+    baseline_state = _valid_state_network_dsl()
+    staged_reactions = "T=410\nreaction: A -> B; k=2.0"
+    staged_state = "\n".join(
+        [
+            "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS1, kind=TS, energy=12, energy_unit=kJ/mol, degeneracy=1",
+            "state: B, kind=GS, energy=-1, energy_unit=kJ/mol, degeneracy=1",
+            "edge: A,TS1",
+            "edge: TS1,B",
+        ]
+    )
+
+    main_window._mechanism_editor._reactions_text.setPlainText(baseline_reactions)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(baseline_state)
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
+
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText(staged_reactions)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(staged_state)
+    qt_app.processEvents()
+
+    owner = main_window._mechanism_session_owner
+    assert owner.edit_session_active is True
+    assert owner.draft_reactions_text == staged_reactions
+    assert owner.draft_state_network_dsl == staged_state
+
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert owner.edit_session_active is False
+    assert owner.canonical_reactions_text == staged_reactions
+    assert owner.canonical_state_network_dsl == staged_state
+    assert main_window.mechanism_reactions_text_raw() == staged_reactions
+    assert main_window.mechanism_state_network_dsl_raw() == staged_state
+
+
 def test_unlock_reactions_editing_cancel_keeps_editor_locked(main_window, monkeypatch):
     reactions_widget = main_window._mechanism_editor._reactions_text
     action = main_window._mechanism_edit_lock_action
@@ -251,7 +289,7 @@ def test_unlock_reactions_editing_warns_once_per_window(main_window, monkeypatch
     assert action.isChecked() is True
 
 
-def test_consumers_disconnected_while_unlocked(main_window, monkeypatch, qt_app):
+def test_consumer_guards_suppress_main_window_work_while_unlocked(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
     calls = _consumer_call_recorder(main_window, monkeypatch)
     main_window._temperature_spinbox.setValue(298.15)
@@ -337,7 +375,7 @@ def test_state_network_change_suppressed_while_unlocked(main_window, monkeypatch
     assert calls == []
 
 
-def test_consumers_reconnected_on_successful_lock(main_window, monkeypatch, qt_app):
+def test_consumer_guards_resume_main_window_work_after_successful_lock(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
     calls = _consumer_call_recorder(main_window, monkeypatch)
     original_validate = main_window._mechanism_editor._validate_dsl
@@ -1060,7 +1098,7 @@ def test_programmatic_load_while_unlocked_does_not_hit_validation_gate(main_wind
     assert main_window._mechanism_editor.is_mechanism_valid() is False
 
 
-def test_programmatic_load_while_unlocked_reconnects_consumers(main_window, monkeypatch, qt_app):
+def test_programmatic_load_while_unlocked_restores_guarded_main_window_work(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
     calls = _consumer_call_recorder(main_window, monkeypatch)
 
