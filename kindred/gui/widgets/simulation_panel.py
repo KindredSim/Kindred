@@ -1,5 +1,5 @@
 # kindred/gui/widgets/simulation_panel.py
-"""Batch initial-conditions table + core simulation controls (collapsible)."""
+"""Batch initial-conditions table + core simulation controls."""
 
 from __future__ import annotations
 

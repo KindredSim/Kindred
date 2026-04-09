@@ -274,7 +274,6 @@ class MainWindow(
         self._mechanism_dock = mechanism_dock_components.dock
         self._mechanism_panel = mechanism_dock_components.panel
 
-        self._mechanism_section = self._mechanism_panel.section
         self._mechanism_editor = self._mechanism_panel.editor
         self._refresh_mechanism_edit_lock_ui()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
@@ -2563,12 +2562,13 @@ class MainWindow(
         if not all(dock is not None for dock in (mechanism_dock, sliders_dock, batch_dock, data_dock, analysis_dock)):
             return
 
-        # Left stack order: Mechanism, Interactive Sliders, Batch Initial Conditions.
-        self.splitDockWidget(mechanism_dock, batch_dock, Qt.Vertical)
+        # Left column: Mechanism (top), Interactive Sliders (bottom).
         self.splitDockWidget(mechanism_dock, sliders_dock, Qt.Vertical)
 
-        # Right stack order: Data above Analysis.
-        self.splitDockWidget(data_dock, analysis_dock, Qt.Vertical)
+        # Right column: Initial Conditions (top), Data and Analysis tabified (bottom).
+        self.splitDockWidget(batch_dock, data_dock, Qt.Vertical)
+        self.tabifyDockWidget(data_dock, analysis_dock)
+        data_dock.raise_()
 
     def schedule_restored_floating_dock_recovery(self) -> None:
         if bool(getattr(self, "_restored_floating_dock_recovery_pending", False)):
@@ -2638,6 +2638,9 @@ class MainWindow(
             dock_defaults = self._default_dock_layout()
 
             for dock, _area in dock_defaults:
+                tb = dock.titleBarWidget()
+                if tb is not None and hasattr(tb, "restore"):
+                    tb.restore()
                 dock.setVisible(True)
                 dock.setFloating(False)
 
