@@ -596,6 +596,12 @@ class MainWindow(
             self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         return bool(owner.is_ready_for_explicit_run())
 
+    def is_mechanism_valid_for_preview(self) -> bool:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            return False
+        return bool(owner.validate_canonical().valid)
+
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
         widget = getattr(editor, "_reactions_text", None)

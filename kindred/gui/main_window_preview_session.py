@@ -70,6 +70,9 @@ class MainWindowPreviewSession:
         except Exception:
             logger.debug("Failed to refresh slider transaction button state", exc_info=True)
 
+    def is_mechanism_valid_for_preview(self) -> bool:
+        return bool(self._mw.is_mechanism_valid_for_preview())
+
     def _clear_active_preview_cache_state(self) -> None:
         mw = self._mw
         try:
@@ -85,6 +88,12 @@ class MainWindowPreviewSession:
                         batch_cache.active_preview_scope_set_ids = None
         except Exception:
             logger.debug("Failed to clear active preview cache state", exc_info=True)
+
+    def _show_invalid_preview_state(self) -> None:
+        mw = self._mw
+        self._clear_active_preview_cache_state()
+        mw._refresh_batch_display_from_focus_and_shown()
+        mw._status_label.setText("Mechanism invalid — no preview available.")
 
     def _focused_mechanism_workspace_set_id(self) -> str:
         mw = self._mw
@@ -600,6 +609,9 @@ class MainWindowPreviewSession:
     def on_variable_changed(self, name: str, value: float) -> None:
         """Handle variable slider change and queue a fast preview simulation."""
         mw = self._mw
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
         logger.debug("Variable %s changed to %s", name, value)
         self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
@@ -657,6 +669,9 @@ class MainWindowPreviewSession:
     def commit_slider_value(self, name: str, value: float) -> None:
         """Stage a programmatic slider change for preview runs without mutating editor text."""
         mw = self._mw
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
         self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
         self._queue_pending_slider_preview_replay(
@@ -720,6 +735,9 @@ class MainWindowPreviewSession:
     def queue_species_slider_simulation(self, *, label: str, delay_ms: int) -> None:
         """Queue a fast preview run for species-mode slider edits."""
         mw = self._mw
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
         try:
             delay_ms_i = int(delay_ms)
         except Exception:

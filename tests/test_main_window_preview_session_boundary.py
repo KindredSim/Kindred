@@ -53,6 +53,13 @@ def _ensure_batch_rows(main_window, count: int) -> None:
         main_window._add_batch_set()
 
 
+def _set_valid_preview_mechanism(main_window) -> None:
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+
+
 def test_main_window_preview_session_owns_preview_state(main_window) -> None:
     owner = getattr(main_window, "_preview_session", None)
 
@@ -228,6 +235,7 @@ def test_main_window_preview_session_snapshots_slider_gesture_targets(main_windo
 
 def test_main_window_preview_session_non_drag_changes_seed_target_snapshot(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 2)
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
@@ -241,8 +249,82 @@ def test_main_window_preview_session_non_drag_changes_seed_target_snapshot(main_
     owner.stop_variable_update_timer()
 
 
+def test_main_window_preview_session_invalid_mechanism_skips_variable_preview_dispatch(
+    main_window,
+    monkeypatch,
+) -> None:
+    owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
+    owner.sync_committed_slider_values({"k1": 1.0})
+    _ensure_batch_rows(main_window, 1)
+    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    assert set0_id
+
+    calls = {"validity": 0, "refresh": 0, "dispatch": 0}
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_preview_cache_key = "stale-preview"
+    cache.active_preview_scope_set_ids = (set0_id,)
+
+    def _invalid_preview() -> bool:
+        calls["validity"] += 1
+        return False
+
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", _invalid_preview)
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_batch_display_from_focus_and_shown",
+        lambda: calls.__setitem__("refresh", calls["refresh"] + 1),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_from_slider",
+        lambda: calls.__setitem__("dispatch", calls["dispatch"] + 1),
+    )
+
+    owner.on_variable_changed("k1", 2.0)
+
+    assert calls == {"validity": 1, "refresh": 1, "dispatch": 0}
+    assert owner.local_mechanism_workspace(set0_id) == {}
+    assert owner.slider_gesture_target_set_ids_snapshot() == []
+    assert owner._variable_update_timer is None
+    assert owner._pending_slider_values == {}
+    assert main_window._status_label.text() == "Mechanism invalid — no preview available."
+    assert cache.active_preview_cache_key is None
+    assert cache.active_preview_scope_set_ids is None
+    assert main_window.simulation_controller.run_state.pending_slider_simulation is False
+    assert tuple(main_window.simulation_controller.run_state.pending_slider_target_set_ids) == ()
+
+
+def test_main_window_preview_session_valid_mechanism_allows_variable_preview_dispatch(
+    main_window,
+    monkeypatch,
+) -> None:
+    owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
+    owner.sync_committed_slider_values({"k1": 1.0})
+    _ensure_batch_rows(main_window, 1)
+    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
+
+    calls = {"validity": 0}
+
+    def _valid_preview() -> bool:
+        calls["validity"] += 1
+        return True
+
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", _valid_preview)
+
+    owner.on_variable_changed("k1", 2.0)
+
+    assert calls["validity"] == 1
+    assert owner._variable_update_timer is not None
+    assert owner._variable_update_timer.isActive() is True
+    owner.stop_variable_update_timer()
+
+
 def test_main_window_preview_session_non_drag_changes_stage_focused_target_set_by_default(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 3)
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
@@ -262,8 +344,52 @@ def test_main_window_preview_session_non_drag_changes_stage_focused_target_set_b
     owner.stop_variable_update_timer()
 
 
+def test_main_window_preview_session_invalid_mechanism_skips_species_preview_dispatch(
+    main_window,
+    monkeypatch,
+) -> None:
+    owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
+    _ensure_batch_rows(main_window, 1)
+    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    assert set0_id
+
+    calls = {"validity": 0, "refresh": 0, "dispatch": 0}
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_preview_cache_key = "stale-species-preview"
+    cache.active_preview_scope_set_ids = (set0_id,)
+
+    def _invalid_preview() -> bool:
+        calls["validity"] += 1
+        return False
+
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", _invalid_preview)
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_batch_display_from_focus_and_shown",
+        lambda: calls.__setitem__("refresh", calls["refresh"] + 1),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_from_slider",
+        lambda: calls.__setitem__("dispatch", calls["dispatch"] + 1),
+    )
+
+    owner.queue_species_slider_simulation(label="init:A", delay_ms=80)
+
+    assert calls == {"validity": 1, "refresh": 1, "dispatch": 0}
+    assert owner._species_slider_update_timer is None
+    assert main_window._status_label.text() == "Mechanism invalid — no preview available."
+    assert cache.active_preview_cache_key is None
+    assert cache.active_preview_scope_set_ids is None
+    assert main_window.simulation_controller.run_state.pending_slider_simulation is False
+    assert tuple(main_window.simulation_controller.run_state.pending_slider_target_set_ids) == ()
+
+
 def test_main_window_preview_session_focus_navigation_does_not_accumulate_hidden_targets(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 3)
 
@@ -291,6 +417,7 @@ def test_main_window_preview_session_focus_navigation_does_not_accumulate_hidden
 
 def test_main_window_preview_session_non_drag_changes_stage_explicit_edit_targets_not_selected_rows(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 3)
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
@@ -312,6 +439,7 @@ def test_main_window_preview_session_non_drag_changes_stage_focused_plus_explici
     main_window,
 ) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 4)
 
@@ -346,6 +474,7 @@ def test_main_window_preview_session_non_drag_changes_stage_focused_plus_explici
 
 def test_main_window_preview_session_drag_staging_uses_snapshotted_edit_targets_after_selection_change(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 3)
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
@@ -366,6 +495,7 @@ def test_main_window_preview_session_drag_staging_uses_snapshotted_edit_targets_
 
 def test_main_window_preview_session_drag_snapshot_uses_explicit_edit_targets_after_selection_change(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 3)
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
@@ -386,6 +516,7 @@ def test_main_window_preview_session_drag_snapshot_uses_explicit_edit_targets_af
 
 def test_main_window_preview_session_finalize_drag_release_preserves_original_target_sets(main_window) -> None:
     owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
     owner.sync_committed_slider_values({"k1": 1.0})
     _ensure_batch_rows(main_window, 3)
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
@@ -427,11 +558,18 @@ def test_main_window_preview_session_commit_slider_value_uses_focused_target_set
     set1_id = str(main_window.batch_set_id_for_row(1) or "")
     set2_id = str(main_window.batch_set_id_for_row(2) or "")
     main_window.set_slider_edit_target_set_ids([set0_id])
+    preview_validity_calls = {"count": 0}
 
+    def _valid_preview() -> bool:
+        preview_validity_calls["count"] += 1
+        return True
+
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", _valid_preview)
     monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
     owner.commit_slider_value("k1", 2.0)
     owner.stop_variable_update_timer()
 
+    assert preview_validity_calls["count"] == 1
     assert owner.local_mechanism_workspace(set0_id) == {"k1": pytest.approx(2.0)}
     assert owner.local_mechanism_workspace(set1_id) == {}
     assert owner.local_mechanism_workspace(set2_id) == {}

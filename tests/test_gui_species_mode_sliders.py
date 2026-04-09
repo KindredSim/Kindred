@@ -64,6 +64,13 @@ def _species_slider_row(main_window, species: str):
     return row
 
 
+def _set_valid_preview_mechanism(main_window) -> None:
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+
+
 def _column_for_header(model: QtCore.QAbstractItemModel, header: str) -> int:
     for column in range(model.columnCount()):
         if model.headerData(column, QtCore.Qt.Horizontal, QtCore.Qt.DisplayRole) == str(header):
@@ -118,6 +125,7 @@ def _set_slider_visibility(main_window, entry_kind: str, name: str, *, visible: 
 
 
 def test_unified_surface_builds_species_sliders_and_syncs_with_batch_table(main_window, qtbot, monkeypatch):
+    _set_valid_preview_mechanism(main_window)
     # Ensure species columns exist and seed numeric values via model edits.
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
@@ -628,6 +636,7 @@ def test_hidden_species_state_does_not_leak_into_new_species_set(main_window, qt
 
 
 def test_species_set_change_cancels_queued_species_preview_after_pruning(main_window, qtbot, monkeypatch):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
     assert model.setData(model.index(0, 1), "1.0")
@@ -663,6 +672,7 @@ def test_species_set_change_cancels_queued_species_preview_after_pruning(main_wi
 
 
 def test_species_mode_slider_fans_out_to_all_selected_rows(main_window, qtbot, monkeypatch):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
 
@@ -720,6 +730,7 @@ def test_species_mode_slider_fans_out_to_all_selected_rows(main_window, qtbot, m
 
 
 def test_concentration_surface_shows_mixed_value_before_edit_for_multi_selection(main_window, qtbot, monkeypatch):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
 
@@ -1013,6 +1024,7 @@ def test_focus_change_preserves_explicit_target_membership_without_accumulating_
 
 
 def test_focused_unchecked_target_row_shows_row_level_focus_marker_and_stages_only_effective_targets(main_window):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
     assert add_btn is not None
@@ -1116,6 +1128,7 @@ def test_batch_selection_and_current_handlers_are_single_wired_on_startup(main_w
 
 
 def test_species_mode_slider_targets_explicit_edit_rows_not_selected_rows(main_window, qtbot, monkeypatch):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
 
@@ -1283,6 +1296,7 @@ def test_concentration_surface_uses_focused_row_as_display_source_when_selection
     qtbot,
     monkeypatch,
 ):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
 
@@ -1332,6 +1346,7 @@ def test_species_mode_reset_restores_all_explicit_edit_targets_even_if_only_one_
     qtbot,
     monkeypatch,
 ):
+    _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
 
@@ -1441,6 +1456,7 @@ def test_species_mode_commit_rebases_reset_baseline_for_selected_rows(main_windo
 
 
 def test_species_slider_queue_marks_pending_slider_simulation(main_window, qtbot):
+    _set_valid_preview_mechanism(main_window)
     qtbot.addWidget(main_window)
     assert main_window.simulation_controller.run_state.pending_slider_simulation is False
     assert main_window.simulation_controller.run_state.pending_slider_sim_request_id is None

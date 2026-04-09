@@ -47,6 +47,17 @@ def test_simulation_mechanism_port_exposes_explicit_run_readiness_query() -> Non
     assert "def is_mechanism_ready_for_run(" in mechanism_block
 
 
+def test_simulation_slider_port_exposes_preview_validity_query() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "ports.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    slider_block = _protocol_block(source, "SimulationSliderPort")
+
+    assert "def is_mechanism_valid_for_preview(" in slider_block
+
+
 def test_build_simulation_plumbing_wires_truthful_explicit_owners() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "app_wiring.py"
