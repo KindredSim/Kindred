@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass
 import json
 import hashlib
 import logging
@@ -78,6 +79,17 @@ _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
 _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
+
+
+@dataclass(frozen=True)
+class TemperatureIndicatorState:
+    energy_mode_active: bool
+    t_override_k: Optional[float]
+    schedule_defined: bool
+    schedule_kind: Optional[str]
+    schedule_interval_count: Optional[int]
+    constant_schedule_k: Optional[float]
+    indicator_text: Optional[str]
 _ANALYSIS_SURFACE_NAMES: tuple[str, ...] = ("Statistics", "Parameters")
 _ABOUT_DIALOG_MIN_WIDTH = 420
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
@@ -478,9 +490,6 @@ class MainWindow(
         self._dispatch_authoritative_mechanism_consumers()
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is not None and bool(owner.edit_session_active):
-            return
         self._update_temperature_mode_indicator()
 
     @staticmethod
@@ -1720,6 +1729,67 @@ class MainWindow(
             if stripped:
                 self.config_controller.update_user_preference("simulation_time", stripped)
 
+    def _compute_temperature_indicator_state(
+        self,
+        reactions_text: str,
+        state_network_text: str,
+    ) -> TemperatureIndicatorState:
+        mechanism_text = str(reactions_text)
+        normalized_state_network_text = str(state_network_text or "")
+        energy_mode_active = bool(normalized_state_network_text.strip())
+
+        t_override_k = self._dsl_global_temperature_K(mechanism_text)
+
+        temp_schedule = None
+        schedule_defined = False
+        try:
+            from kindred.core.temperature_dsl import parse_temperature_schedule
+
+            temp_schedule = parse_temperature_schedule(mechanism_text)
+            schedule_defined = temp_schedule is not None
+        except Exception:
+            temp_schedule = None
+            schedule_defined = False
+
+        schedule_kind: Optional[str] = None
+        schedule_interval_count: Optional[int] = None
+        constant_schedule_k: Optional[float] = None
+        indicator_text: Optional[str] = None
+
+        if t_override_k is not None and not schedule_defined:
+            indicator_text = f"Temperature: {t_override_k:.2f} K (from DSL)"
+        elif temp_schedule is not None:
+            if temp_schedule.schedule_type == "constant":
+                schedule_kind = "constant"
+                constant_schedule_k = float(temp_schedule(0.0))
+                indicator_text = f"Temperature: {constant_schedule_k:.2f} K (constant from DSL)"
+            elif temp_schedule.schedule_type == "piecewise":
+                schedule_kind = "piecewise"
+                schedule_interval_count = len(temp_schedule.get_intervals())
+                indicator_text = (
+                    f"Temperature: Schedule ({schedule_interval_count} interval"
+                    f"{'s' if schedule_interval_count != 1 else ''})"
+                )
+            elif temp_schedule.schedule_type == "response":
+                schedule_kind = "response"
+                schedule_interval_count = len(temp_schedule.get_intervals())
+                indicator_text = (
+                    f"Temperature: Schedule (response, {schedule_interval_count} interval"
+                    f"{'s' if schedule_interval_count != 1 else ''})"
+                )
+            else:
+                indicator_text = "Temperature: Schedule (unknown type)"
+
+        return TemperatureIndicatorState(
+            energy_mode_active=energy_mode_active,
+            t_override_k=t_override_k,
+            schedule_defined=schedule_defined,
+            schedule_kind=schedule_kind,
+            schedule_interval_count=schedule_interval_count,
+            constant_schedule_k=constant_schedule_k,
+            indicator_text=indicator_text,
+        )
+
     def _update_temperature_mode_indicator(self) -> None:
         """
         Update temperature mode indicator in status bar.
@@ -1728,7 +1798,7 @@ class MainWindow(
         - "Temperature: XXX K (from DSL)" - when T= directive found in reactions
         - "Temperature: XXX K (isothermal)" - when no schedule and no T= in DSL
         - "Temperature: Schedule (N intervals)" - when piecewise schedule detected
-        - "Temperature: Schedule (constant)" - when temp_const detected
+        - "Temperature: XXX K (constant from DSL)" - when temp_const detected
         - "Temperature: Schedule (response, N intervals)" - when temp_response detected
 
         Priority rule:
@@ -1739,32 +1809,20 @@ class MainWindow(
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 
+        mechanism_text = self.mechanism_reactions_text_raw()
+        state_network_text = self.mechanism_state_network_dsl_raw()
+        state = self._compute_temperature_indicator_state(
+            reactions_text=mechanism_text,
+            state_network_text=state_network_text,
+        )
+
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is not None and bool(owner.edit_session_active):
             return
 
-        mechanism_text = self.mechanism_reactions_text_raw()
-        state_network_text = self.mechanism_state_network_dsl_raw()
-        energy_mode_active = bool(str(state_network_text or "").strip())
-
-        # Extract T= unconditionally — not gated on state network presence
-        T_override = self._dsl_global_temperature_K(mechanism_text)
-
-        # Parse temperature schedule before branching on T= so the schedule
-        # can take precedence over a bare T= directive for the indicator.
-        schedule_defined = False
-        temp_schedule = None
-        try:
-            from kindred.core.temperature_dsl import parse_temperature_schedule
-
-            temp_schedule = parse_temperature_schedule(mechanism_text)
-            schedule_defined = temp_schedule is not None
-        except Exception as e:
-            logger.debug(f"Temperature schedule parsing failed: {e}")
-
         was_override_active = getattr(self, "_temperature_dsl_override_active", False)
 
-        if T_override is not None:
+        if state.t_override_k is not None:
             if not was_override_active:
                 # Capture pre-override spinbox value before DSL write-back.
                 self._pre_dsl_temperature = self._temperature_spinbox.value()
@@ -1772,13 +1830,13 @@ class MainWindow(
             # Sync spinbox to DSL-derived temperature without firing preference persistence
             self._temperature_spinbox.blockSignals(True)
             try:
-                self._temperature_spinbox.setValue(T_override)
+                self._temperature_spinbox.setValue(state.t_override_k)
             finally:
                 self._temperature_spinbox.blockSignals(False)
 
-            if not schedule_defined:
+            if not state.schedule_defined:
                 # Bare T= without schedule: spinbox visible, disabled, "from DSL"
-                indicator_text = f"Temperature: {T_override:.2f} K (from DSL)"
+                indicator_text = str(state.indicator_text)
                 self._temperature_mode_indicator.setText(indicator_text)
                 self._set_temperature_override_state(
                     enabled=False,
@@ -1790,7 +1848,7 @@ class MainWindow(
             # Temperature schedule takes precedence over bare T= directive —
             # the T= value seeds the spinbox but the schedule dictates the indicator.
 
-        if T_override is None:
+        if state.t_override_k is None:
             if was_override_active:
                 restore = self._pre_dsl_temperature
                 if restore is None:
@@ -1807,7 +1865,7 @@ class MainWindow(
 
         # Hide spinbox and restore editable state
         self._set_temperature_spinbox_visible(False)
-        if energy_mode_active:
+        if state.energy_mode_active:
             self._set_temperature_override_state(
                 enabled=True,
                 tooltip="Temperature for thermodynamic calculations (energy mode: add T=... to override).",
@@ -1818,33 +1876,16 @@ class MainWindow(
                 tooltip="Temperature for thermodynamic calculations",
             )
 
-        # Build indicator text from schedule or isothermal fallback
-        if temp_schedule is not None:
-            if temp_schedule.schedule_type == "constant":
-                T = temp_schedule(0.0)
-                indicator_text = f"Temperature: {T:.2f} K (constant from DSL)"
-            elif temp_schedule.schedule_type == "piecewise":
-                intervals = temp_schedule.get_intervals()
-                n_intervals = len(intervals)
-                indicator_text = f"Temperature: Schedule ({n_intervals} interval{'s' if n_intervals != 1 else ''})"
-            elif temp_schedule.schedule_type == "response":
-                intervals = temp_schedule.get_intervals()
-                n_intervals = len(intervals)
-                indicator_text = (
-                    f"Temperature: Schedule (response, {n_intervals} interval"
-                    f"{'s' if n_intervals != 1 else ''})"
-                )
-            else:
-                indicator_text = "Temperature: Schedule (unknown type)"
-        else:
+        indicator_text = state.indicator_text
+        if indicator_text is None:
             T = self._temperature_spinbox.value()
-            if energy_mode_active:
+            if state.energy_mode_active:
                 indicator_text = f"Temperature: {T:.2f} K (energy mode: set T=... in DSL)"
             else:
                 indicator_text = f"Temperature: {T:.2f} K (isothermal)"
 
         self._temperature_mode_indicator.setText(indicator_text)
-        if energy_mode_active and schedule_defined:
+        if state.energy_mode_active and state.schedule_defined:
             self._set_temperature_override_state(
                 enabled=False,
                 tooltip="Overridden by DSL temperature schedule.",

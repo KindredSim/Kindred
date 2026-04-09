@@ -308,6 +308,18 @@ def test_spinbox_change_while_unlocked_does_not_read_staged_text(main_window, mo
     baseline_indicator = main_window._temperature_mode_indicator.text()
     assert "from DSL" not in baseline_indicator
 
+    compute_calls: list[tuple[str, str]] = []
+    original_compute = main_window._compute_temperature_indicator_state
+
+    def _record_compute(*, reactions_text: str, state_network_text: str):
+        compute_calls.append((str(reactions_text), str(state_network_text)))
+        return original_compute(
+            reactions_text=str(reactions_text),
+            state_network_text=str(state_network_text),
+        )
+
+    monkeypatch.setattr(main_window, "_compute_temperature_indicator_state", _record_compute)
+
     _unlock_reactions_editing(main_window, monkeypatch)
     main_window._mechanism_editor._reactions_text.setPlainText("T=400\nreaction: A -> B; k=1.0")
     qt_app.processEvents()
@@ -318,6 +330,7 @@ def test_spinbox_change_while_unlocked_does_not_read_staged_text(main_window, mo
     assert main_window._temperature_mode_indicator.text() == baseline_indicator
     assert "400" not in main_window._temperature_mode_indicator.text()
     assert "from DSL" not in main_window._temperature_mode_indicator.text()
+    assert compute_calls[-1] == ("reaction: A -> B; k=1.0", "")
 
 
 def test_spinbox_change_while_locked_fires_temperature_indicator(main_window, monkeypatch, qt_app):

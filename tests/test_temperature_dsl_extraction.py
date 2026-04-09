@@ -41,6 +41,38 @@ def _clear_state_network(main_window) -> None:
 class TestReactionsOnlyTemperatureExtraction:
     """T= in reactions-only DSL (no state network) must sync the spinbox."""
 
+    def test_compute_state_reports_bare_T_override(self, main_window):
+        state = main_window._compute_temperature_indicator_state(
+            reactions_text="A -> B ; k=1\nT=350",
+            state_network_text="",
+        )
+
+        assert state.t_override_k == pytest.approx(350.0)
+        assert state.schedule_defined is False
+        assert state.energy_mode_active is False
+        assert state.indicator_text is not None
+        assert "350.00 K (from DSL)" in state.indicator_text
+
+    def test_compute_state_reports_isothermal_without_indicator_text(self, main_window):
+        state = main_window._compute_temperature_indicator_state(
+            reactions_text="A -> B ; k=1",
+            state_network_text="",
+        )
+
+        assert state.t_override_k is None
+        assert state.schedule_defined is False
+        assert state.indicator_text is None
+
+    def test_compute_state_reports_energy_mode_from_state_network_text(self, main_window):
+        state = main_window._compute_temperature_indicator_state(
+            reactions_text="A -> B ; k=1",
+            state_network_text="A <-> B",
+        )
+
+        assert state.energy_mode_active is True
+        assert state.t_override_k is None
+        assert state.indicator_text is None
+
     def test_reactions_only_T_syncs_spinbox_value(self, main_window):
         _clear_state_network(main_window)
         main_window._temperature_spinbox.setValue(298.15)
