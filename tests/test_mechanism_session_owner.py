@@ -1,8 +1,5 @@
 import pytest
 
-from kindred.core.batch_initial_conditions import (
-    strip_reaction_dsl_initial_concentrations,
-)
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner, ValidationResult
 
@@ -258,31 +255,23 @@ def test_named_initial_set_normalization_keeps_validation_ready() -> None:
     assert result.species_count == 2
     assert result.reaction_count == 1
     assert owner.is_ready_for_explicit_run() is True
-    assert owner.explicit_run_source() == strip_reaction_dsl_initial_concentrations(
-        REACTIONS_WITH_NAMED_INITIAL_SET
-    )
+    assert owner.explicit_run_source() == REACTIONS_WITH_NAMED_INITIAL_SET
 
 
-def test_preview_source_returns_normalized_draft_source() -> None:
+def test_preview_source_returns_raw_draft_source() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(VALID_REACTIONS, "")
     owner.begin_edit_session()
     owner.update_draft_reactions(REACTIONS_WITH_NAMED_INITIAL_SET)
 
-    assert owner.preview_source() == strip_reaction_dsl_initial_concentrations(
-        REACTIONS_WITH_NAMED_INITIAL_SET
-    )
+    assert owner.preview_source() == REACTIONS_WITH_NAMED_INITIAL_SET
 
 
-def test_sources_return_normalized_text_with_state_network_dsl() -> None:
+def test_sources_return_raw_text_with_state_network_dsl() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(REACTIONS_WITH_NAMED_INITIAL_SET, VALID_STATE_NETWORK)
 
-    expected_source = (
-        strip_reaction_dsl_initial_concentrations(REACTIONS_WITH_NAMED_INITIAL_SET)
-        + "\n\n# State Network\n"
-        + VALID_STATE_NETWORK
-    )
+    expected_source = REACTIONS_WITH_NAMED_INITIAL_SET + "\n\n# State Network\n" + VALID_STATE_NETWORK
 
     assert owner.explicit_run_source() == expected_source
 
@@ -291,32 +280,52 @@ def test_sources_return_normalized_text_with_state_network_dsl() -> None:
     assert owner.preview_source() == expected_source
 
 
-def test_explicit_run_source_removes_inline_initial_concentrations() -> None:
+def test_explicit_run_source_preserves_inline_initial_concentrations() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(REACTIONS_WITH_INLINE_INITIALS, "")
 
-    expected_source = strip_reaction_dsl_initial_concentrations(
-        REACTIONS_WITH_INLINE_INITIALS
-    )
-
     assert owner.is_ready_for_explicit_run() is True
-    assert owner.explicit_run_source() == expected_source
+    assert owner.explicit_run_source() == REACTIONS_WITH_INLINE_INITIALS
     parse_dsl_to_mechanism(owner.explicit_run_source(), initials={})
 
 
-def test_preview_source_removes_inline_initial_concentrations_from_draft() -> None:
+def test_preview_source_preserves_inline_initial_concentrations_from_draft() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(VALID_REACTIONS, "")
     owner.begin_edit_session()
     owner.update_draft_reactions(REACTIONS_WITH_INLINE_INITIALS)
 
-    expected_source = strip_reaction_dsl_initial_concentrations(
-        REACTIONS_WITH_INLINE_INITIALS
-    )
-
     assert owner.is_ready_for_preview() is True
-    assert owner.preview_source() == expected_source
+    assert owner.preview_source() == REACTIONS_WITH_INLINE_INITIALS
     parse_dsl_to_mechanism(owner.preview_source(), initials={})
+
+
+def test_malformed_inline_initial_fails_validation() -> None:
+    owner = MechanismSessionOwner()
+    owner.apply_authoritative_update("A -> B ; k=1\ninitial: A 1.0", "")
+
+    validation = owner.validate_canonical()
+
+    assert validation.valid is False
+    assert validation.error_message
+
+
+def test_explicit_run_source_preserves_inline_initials_for_controller_dispatch() -> None:
+    owner = MechanismSessionOwner()
+    owner.apply_authoritative_update("A -> B ; k=1\ninit: A=1.0", "")
+
+    source = owner.explicit_run_source()
+
+    assert "init: A=1.0" in source
+
+
+def test_explicit_run_source_preserves_named_set_blocks_for_controller_dispatch() -> None:
+    owner = MechanismSessionOwner()
+    owner.apply_authoritative_update("A -> B ; k=1\nset1 = {\n[A]=1\n}", "")
+
+    source = owner.explicit_run_source()
+
+    assert "set1 = {\n[A]=1\n}" in source
 
 
 def test_commit_requires_topology_validator_for_state_network_canonicalization() -> None:

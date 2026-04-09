@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from kindred.core.batch_initial_conditions import (
-    strip_reaction_dsl_initial_concentrations,
+    _strip_named_initial_concentration_sets,
 )
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
@@ -179,12 +179,13 @@ class MechanismSessionOwner:
         return full_dsl
 
     def _validate_source(self, *, reactions_text: str, state_network_dsl: str) -> ValidationResult:
-        normalized_dsl = self._build_simulation_source(
-            reactions_text=reactions_text,
+        validation_reactions = _strip_named_initial_concentration_sets(reactions_text)
+        validation_dsl = self._build_full_dsl(
+            reactions_text=validation_reactions,
             state_network_dsl=state_network_dsl,
         )
         try:
-            mechanism = parse_dsl_to_mechanism(normalized_dsl, initials={})
+            mechanism = parse_dsl_to_mechanism(validation_dsl, initials={})
         except DSLError as exc:
             return ValidationResult(False, str(exc), 0, 0, 0)
         except Exception as exc:
@@ -198,9 +199,8 @@ class MechanismSessionOwner:
         )
 
     def _build_simulation_source(self, *, reactions_text: str, state_network_dsl: str) -> str:
-        normalized_reactions = strip_reaction_dsl_initial_concentrations(reactions_text)
         return self._build_full_dsl(
-            reactions_text=normalized_reactions,
+            reactions_text=reactions_text,
             state_network_dsl=state_network_dsl,
         )
 

@@ -169,6 +169,36 @@ def test_locked_state_network_programmatic_setters_still_work(main_window):
     assert main_window.mechanism_state_network_dsl_raw() == ""
 
 
+def test_owner_canonical_text_remains_stable_while_unlocked_edits_are_staged(main_window, monkeypatch, qt_app):
+    baseline_reactions = "reaction: A -> B; k=1.0"
+    baseline_state = _valid_state_network_dsl()
+    staged_reactions = "T=410\nreaction: A -> B; k=2.0"
+    staged_state = "\n".join(
+        [
+            "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS1, kind=TS, energy=12, energy_unit=kJ/mol, degeneracy=1",
+            "state: B, kind=GS, energy=-1, energy_unit=kJ/mol, degeneracy=1",
+            "edge: A,TS1",
+            "edge: TS1,B",
+        ]
+    )
+
+    main_window._mechanism_editor._reactions_text.setPlainText(baseline_reactions)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(baseline_state)
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
+
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText(staged_reactions)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(staged_state)
+    qt_app.processEvents()
+
+    owner = main_window._mechanism_session_owner
+    assert owner.canonical_reactions_text == baseline_reactions
+    assert owner.canonical_state_network_dsl == baseline_state
+    assert main_window.mechanism_reactions_text_raw() == baseline_reactions
+    assert main_window.mechanism_state_network_dsl_raw() == baseline_state
+
+
 def test_unlock_reactions_editing_cancel_keeps_editor_locked(main_window, monkeypatch):
     reactions_widget = main_window._mechanism_editor._reactions_text
     action = main_window._mechanism_edit_lock_action
@@ -498,7 +528,7 @@ def test_auto_lock_for_run_refuses_unchanged_invalid_mechanism(main_window, monk
     assert main_window._mechanism_editor.is_mechanism_valid() is False
 
 
-def test_is_mechanism_ready_for_run_independent_of_lock(main_window, monkeypatch, qt_app):
+def test_is_mechanism_ready_for_run_uses_canonical_state_while_unlocked(main_window, monkeypatch, qt_app):
     _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
     main_window._mechanism_editor._state_network_editor.clear()
     qt_app.processEvents()
@@ -513,7 +543,7 @@ def test_is_mechanism_ready_for_run_independent_of_lock(main_window, monkeypatch
     _unlock_reactions_editing(main_window, monkeypatch)
     _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
     assert main_window.mechanism_editing_locked() is False
-    assert main_window.is_mechanism_ready_for_run() is True
+    assert main_window.is_mechanism_ready_for_run() is False
 
     _set_invalid_reactions_text(main_window, qt_app)
     assert main_window.mechanism_editing_locked() is False
@@ -673,20 +703,17 @@ def test_run_auto_locks_and_proceeds_for_state_network_only_mechanism(main_windo
     main_window.simulation_controller.run_simulation_internal.assert_called_once()
 
 
-def test_mechanism_editor_run_button_accepts_state_network_only_mechanism(main_window, monkeypatch, qt_app):
+def test_mechanism_editor_run_button_stays_reactions_gated_for_state_network_only_mechanism(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
     _unlock_reactions_editing(main_window, monkeypatch)
     main_window._mechanism_editor._reactions_text.setPlainText("")
     main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
     _process_events_bounded(qt_app)
 
-    assert main_window._mechanism_editor.run_btn.isEnabled() is True
-
-    main_window.simulation_controller.run_simulation_internal = MagicMock()
-    main_window._mechanism_editor.run_btn.click()
-    qt_app.processEvents()
-
-    assert main_window.mechanism_editing_locked() is True
-    main_window.simulation_controller.run_simulation_internal.assert_called_once()
+    assert main_window._mechanism_editor.run_btn.isEnabled() is False
 
 
 def test_run_aborts_if_unchanged_invalid_editor_is_unlocked(main_window, monkeypatch, qt_app):
@@ -985,6 +1012,26 @@ def test_programmatic_load_refreshes_temperature(main_window, monkeypatch, qt_ap
 
     assert main_window.mechanism_editing_locked() is True
     assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
+
+
+def test_programmatic_project_load_syncs_owner_canonical_texts(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    state_text = _valid_state_network_dsl()
+    payload = {
+        "mechanism": "reaction: A -> B; k=3.0",
+        "notes": "",
+        "state_network": state_text,
+    }
+
+    assert main_window.apply_project_payload(payload, record_undo=False) is True
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
+
+    owner = main_window._mechanism_session_owner
+    assert main_window.mechanism_editing_locked() is True
+    assert owner.canonical_reactions_text == payload["mechanism"]
+    assert owner.canonical_state_network_dsl == state_text
+    assert main_window.mechanism_reactions_text_raw() == payload["mechanism"]
+    assert main_window.mechanism_state_network_dsl_raw() == state_text
 
 
 def test_programmatic_load_while_unlocked_does_not_hit_validation_gate(main_window, monkeypatch, qt_app):

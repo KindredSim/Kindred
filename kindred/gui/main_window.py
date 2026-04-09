@@ -58,6 +58,7 @@ from kindred.gui.app_wiring import (
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
+from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.mixins.ports import FittingMixinPorts, ProfileMixinPorts
@@ -229,7 +230,6 @@ class MainWindow(
 
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
-        self._mechanism_edit_locked = True
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
         self._mechanism_edit_consumers_connected = False
@@ -276,6 +276,10 @@ class MainWindow(
         self._mechanism_panel = mechanism_dock_components.panel
 
         self._mechanism_editor = self._mechanism_panel.editor
+        self._mechanism_session_owner = MechanismSessionOwner(
+            topology_validator=self._mechanism_session_topology_is_valid,
+        )
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         self._force_lock_editor()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
@@ -324,12 +328,6 @@ class MainWindow(
         sliders.variableChanged.connect(self._on_variable_changed)
         sliders.sliderDragStarted.connect(self._on_slider_drag_started)
         sliders.sliderDragFinished.connect(self._on_slider_drag_finished)
-        self._mechanism_editor._reactions_text.textChanged.connect(
-            self._refresh_mechanism_editor_run_button_ready_state
-        )
-        self._mechanism_editor._state_network_editor.stateNetworkChanged.connect(
-            self._refresh_mechanism_editor_run_button_ready_state
-        )
 
         try:
             self._mechanism_editor._commit_slider_overrides_btn.clicked.connect(self._on_commit_slider_overrides_clicked)
@@ -342,7 +340,6 @@ class MainWindow(
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
         self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
         self._refresh_slider_transaction_button_state()
-        self._refresh_mechanism_editor_run_button_ready_state()
 
     def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
         for attr in ("_commit_slider_overrides_btn", "_reset_slider_overrides_btn"):
@@ -370,7 +367,42 @@ class MainWindow(
         self._set_slider_override_mode_buttons_enabled(bool(dirty))
 
     def mechanism_editing_locked(self) -> bool:
-        return bool(getattr(self, "_mechanism_edit_locked", True))
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            return True
+        return not bool(owner.edit_session_active)
+
+    def _mechanism_session_texts_from_widgets(self) -> tuple[str, str]:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            raise RuntimeError("Mechanism editor is unavailable.")
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None or state_editor is None:
+            raise RuntimeError("Mechanism editor widgets are unavailable.")
+        reactions_text = str(reactions_widget.toPlainText())
+        state_network_dsl = str(state_editor.get_state_network_dsl() or "")
+        return reactions_text, state_network_dsl
+
+    def _mechanism_session_topology_is_valid(self) -> bool:
+        editor = getattr(self, "_mechanism_editor", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if state_editor is None or not hasattr(state_editor, "is_valid"):
+            raise RuntimeError("State network editor is unavailable.")
+        return bool(state_editor.is_valid())
+
+    def _sync_mechanism_session_owner_from_widgets(self, *, authoritative: bool) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
+        if authoritative:
+            owner.apply_authoritative_update(reactions_text, state_network_dsl)
+            return
+        if not owner.edit_session_active:
+            raise RuntimeError("Mechanism edit session is not active.")
+        owner.update_draft_reactions(reactions_text)
+        owner.update_draft_state_network(state_network_dsl)
 
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
@@ -497,33 +529,35 @@ class MainWindow(
         self._mechanism_edit_consumers_connected = True
 
     def _force_lock_editor(self) -> bool:
-        self._mechanism_edit_locked = True
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         self._reconnect_mechanism_edit_consumers()
         self._refresh_mechanism_edit_lock_ui()
         return True
 
     def _try_lock_mechanism_editor(self) -> bool:
-        editor = getattr(self, "_mechanism_editor", None)
-        state_editor = getattr(editor, "_state_network_editor", None)
-        if (
-            state_editor is not None
-            and hasattr(state_editor, "is_valid")
-            and not state_editor.is_valid()
-        ):
-            return False
-        if not self.is_mechanism_ready_for_run():
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        if owner.edit_session_active:
+            self._sync_mechanism_session_owner_from_widgets(authoritative=False)
+            if not owner.commit_edit_session():
+                return False
+        elif not self.is_mechanism_ready_for_run():
             return False
         self._reconnect_mechanism_edit_consumers()
         self._update_temperature_mode_indicator()
         self._on_authoritative_mechanism_input_changed()
         self._refresh_overlay_swatches_for_current_mechanism()
-        self._mechanism_edit_locked = True
         self._refresh_mechanism_edit_lock_ui()
         return True
 
     def _set_mechanism_edit_locked(self, locked: bool) -> bool:
         if not bool(locked):
-            self._mechanism_edit_locked = False
+            owner = getattr(self, "_mechanism_session_owner", None)
+            if owner is None:
+                raise RuntimeError("Mechanism session owner is unavailable.")
+            if not owner.edit_session_active:
+                owner.begin_edit_session()
             self._disconnect_mechanism_edit_consumers()
             self._refresh_mechanism_edit_lock_ui()
             return True
@@ -539,64 +573,12 @@ class MainWindow(
         return True
 
     def is_mechanism_ready_for_run(self) -> bool:
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
             return False
-        validate = getattr(editor, "_validate_dsl", None)
-        if callable(validate):
-            validate()
-        return self._combined_mechanism_dsl_is_runnable_for_run()
-
-    def _combined_mechanism_dsl_is_runnable_for_run(self) -> bool:
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is None:
-            return False
-        from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
-        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-
-        state_editor = getattr(editor, "_state_network_editor", None)
-        reactions_widget = getattr(editor, "_reactions_text", None)
-        reactions_text = str(reactions_widget.toPlainText() if reactions_widget is not None else "")
-        state_network_dsl = str(state_editor.get_state_network_dsl() if state_editor is not None else "")
-        if not state_network_dsl.strip():
-            if not reactions_text.strip():
-                return False
-            return bool(hasattr(editor, "is_mechanism_valid") and editor.is_mechanism_valid())
-        try:
-            reactions_text = strip_named_reaction_dsl_initial_concentration_sets(reactions_text)
-            full_dsl = reactions_text
-            if state_network_dsl.strip():
-                full_dsl += "\n\n# State Network\n" + state_network_dsl
-            if not full_dsl.strip():
-                return False
-            parse_dsl_to_mechanism(full_dsl, initials={})
-        except Exception:
-            return False
-        return True
-
-    def _refresh_mechanism_editor_run_button_ready_state(self, *, recompute: bool = True) -> None:
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is None:
-            return
-        run_button = getattr(editor, "run_btn", None)
-        if run_button is None:
-            return
-        ready = bool(getattr(self, "_mechanism_editor_run_ready", False))
-        if recompute or not hasattr(self, "_mechanism_editor_run_ready"):
-            ready = self._combined_mechanism_dsl_is_runnable_for_run()
-            self._mechanism_editor_run_ready = bool(ready)
-        elif not ready and hasattr(editor, "is_mechanism_valid") and editor.is_mechanism_valid():
-            ready = True
-            self._mechanism_editor_run_ready = True
-        if bool(getattr(editor, "_run_gated", False)):
-            run_button.setEnabled(False)
-            return
-        run_button.setEnabled(bool(ready))
-        run_button.setToolTip(
-            "Run simulation for all selected sets (same as Run Selected in Initial Conditions)"
-            if ready
-            else "No valid mechanism or state network. Enter a valid mechanism or state network to enable run."
-        )
+        if not owner.edit_session_active:
+            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        return bool(owner.is_ready_for_explicit_run())
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -970,7 +952,6 @@ class MainWindow(
         finally:
             self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
-        self._refresh_mechanism_editor_run_button_ready_state()
 
     def _init_mixin_ports(self) -> None:
         data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
@@ -1011,6 +992,7 @@ class MainWindow(
         Programmatic loads often set editor text with signals blocked (undo commands and some load
         paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
         """
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         self._set_mechanism_edit_locked(True)
         try:
@@ -1023,7 +1005,6 @@ class MainWindow(
         self._update_temperature_mode_indicator()
         self._on_authoritative_mechanism_input_changed()
         self._refresh_slider_transaction_button_state()
-        self._refresh_mechanism_editor_run_button_ready_state()
 
         try:
             self._update_parameter_table_from_sliders()
@@ -1097,6 +1078,8 @@ class MainWindow(
         ColorManager.instance().set_current_species_roster(roster)
 
     def _refresh_overlay_swatches_for_current_mechanism(self) -> None:
+        if self.mechanism_editing_locked():
+            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         self._sync_color_manager_authoritative_roster()
         plot = getattr(self._plot_tabs, "_main_plot", None)
         refresh_overlay_presentation = getattr(plot, "refresh_overlay_presentation_for_current_roster", None)
@@ -1543,6 +1526,8 @@ class MainWindow(
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Invalidate stale displayed results when the authoritative mechanism changes."""
+        if self.mechanism_editing_locked():
+            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
             return
         # Pending-init rewrite normalizes the DSL after a successful explicit run;
@@ -1744,12 +1729,11 @@ class MainWindow(
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 
-        mechanism_text = self._mechanism_editor._reactions_text.toPlainText()
-        state_network_text = ""
-        try:
-            state_network_text = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        except Exception:
-            state_network_text = ""
+        if self.mechanism_editing_locked():
+            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+
+        mechanism_text = self.mechanism_reactions_text_raw()
+        state_network_text = self.mechanism_state_network_dsl_raw()
         energy_mode_active = bool(str(state_network_text or "").strip())
 
         # Extract T= unconditionally — not gated on state network presence
@@ -2886,13 +2870,9 @@ class MainWindow(
         self.config_controller.toggle_theme()
 
     def _get_mechanism_text(self) -> str:
-        """Get the current mechanism DSL text from editor."""
-        reactions_text = self._mechanism_editor._reactions_text.toPlainText()
-        state_network_dsl = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        if self.has_slider_overrides():
-            state_network_dsl = self._apply_overrides_to_state_network_dsl(state_network_dsl)
-
-        # Combine DSL texts
+        """Get the canonical mechanism DSL text."""
+        reactions_text = self.mechanism_reactions_text_raw()
+        state_network_dsl = self.mechanism_state_network_dsl_raw()
         full_dsl = reactions_text
         if state_network_dsl.strip():
             full_dsl += "\n\n# State Network\n" + state_network_dsl
@@ -3707,7 +3687,6 @@ class MainWindow(
             "Load project (reactions)",
             record_undo,
         )
-        self._on_programmatic_mechanism_load()
 
         # Batch initial conditions (schema v3+). For older projects, migrate any
         # inline initial concentrations into set1 and rewrite the block stub.
@@ -3751,6 +3730,7 @@ class MainWindow(
         else:
             if current_state_network.strip():
                 state_editor.clear()
+        self._on_programmatic_mechanism_load()
 
         # Fall back to user preference when key absent from payload.
         _pref = self.config_controller.get_user_preference
@@ -3866,13 +3846,6 @@ class MainWindow(
         if editor is not None:
             if hasattr(editor, "set_run_gated"):
                 editor.set_run_gated(not bool(enabled))
-                if bool(enabled):
-                    state_editor = getattr(editor, "_state_network_editor", None)
-                    state_network_dsl = str(
-                        state_editor.get_state_network_dsl() if state_editor is not None else ""
-                    )
-                    if state_network_dsl.strip() or not editor.is_mechanism_valid():
-                        self._refresh_mechanism_editor_run_button_ready_state(recompute=False)
             elif enabled:
                 editor.run_btn.setEnabled(editor.is_mechanism_valid())
             else:
@@ -4022,10 +3995,16 @@ class MainWindow(
         self._results_table = table
 
     def mechanism_reactions_text_raw(self) -> str:
-        return str(self._mechanism_editor.reactions_text())
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_reactions_text)
 
     def mechanism_state_network_dsl_raw(self) -> str:
-        return str(self._mechanism_editor.state_network_dsl_raw() or "")
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_state_network_dsl or "")
 
     def mechanism_slider_points_value(self) -> Optional[int]:
         try:
