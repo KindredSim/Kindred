@@ -175,6 +175,8 @@ class Reaction:
 
     def __post_init__(self) -> None:
         # dataclass with frozen=True; use object.__setattr__
+        object.__setattr__(self, "stoich", dict(self.stoich))
+        object.__setattr__(self, "overrides", dict(self.overrides))
         object.__setattr__(self, "order", derive_molecularity(self.stoich))
 
     def stoich_vector(self, species_order: Iterable[str]) -> List[float]:
@@ -203,6 +205,11 @@ class Equilibrium:
     kr: Union[float, Expr, None] = None
     fast: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stoich_forward", dict(self.stoich_forward))
+        object.__setattr__(self, "stoich_back", dict(self.stoich_back))
+        object.__setattr__(self, "metadata", dict(self.metadata))
 
     def forward_vector(self, species_order: Iterable[str]) -> List[float]:
         return [float(self.stoich_forward.get(n, 0.0)) for n in species_order]

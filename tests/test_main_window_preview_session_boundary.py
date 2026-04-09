@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from PySide6 import QtCore
 
@@ -58,6 +60,16 @@ def _set_valid_preview_mechanism(main_window) -> None:
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
+
+
+def _wait_for_timer_to_settle(timer: QtCore.QTimer, *, timeout_ms: int = 500) -> None:
+    deadline = time.monotonic() + (float(timeout_ms) / 1000.0)
+    while time.monotonic() < deadline:
+        QtCore.QCoreApplication.processEvents()
+        if not timer.isActive():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"Timer did not settle within {int(timeout_ms)} ms")
 
 
 def test_main_window_preview_session_owns_preview_state(main_window) -> None:
@@ -322,6 +334,54 @@ def test_main_window_preview_session_valid_mechanism_allows_variable_preview_dis
     owner.stop_variable_update_timer()
 
 
+def test_main_window_preview_session_timer_rechecks_variable_preview_validity_before_dispatch(
+    main_window,
+    monkeypatch,
+) -> None:
+    owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
+    owner.sync_committed_slider_values({"k1": 1.0})
+    _ensure_batch_rows(main_window, 1)
+    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    assert set0_id
+
+    calls = {"validity": 0, "refresh": 0, "dispatch": 0}
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_preview_cache_key = "stale-preview"
+    cache.active_preview_scope_set_ids = (set0_id,)
+    preview_is_valid = {"value": True}
+
+    def _preview_validity() -> bool:
+        calls["validity"] += 1
+        return bool(preview_is_valid["value"])
+
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", _preview_validity)
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_batch_display_from_focus_and_shown",
+        lambda: calls.__setitem__("refresh", calls["refresh"] + 1),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_from_slider",
+        lambda: calls.__setitem__("dispatch", calls["dispatch"] + 1),
+    )
+
+    owner.on_variable_changed("k1", 2.0)
+    timer = owner._variable_update_timer
+    assert timer is not None
+    assert timer.isActive() is True
+
+    preview_is_valid["value"] = False
+    _wait_for_timer_to_settle(timer)
+
+    assert calls == {"validity": 2, "refresh": 1, "dispatch": 0}
+    assert main_window._status_label.text() == "Mechanism invalid — no preview available."
+    assert cache.active_preview_cache_key is None
+    assert cache.active_preview_scope_set_ids is None
+
+
 def test_main_window_preview_session_non_drag_changes_stage_focused_target_set_by_default(main_window) -> None:
     owner = main_window._preview_session
     _set_valid_preview_mechanism(main_window)
@@ -538,6 +598,46 @@ def test_main_window_preview_session_finalize_drag_release_preserves_original_ta
     assert tuple(main_window._sim_controller.run_state.pending_slider_target_set_ids) == (set0_id,)
     assert tuple(main_window._sim_controller.run_state.pending_slider_target_set_ids) != (set2_id,)
     owner.stop_variable_update_timer()
+
+
+def test_main_window_preview_session_finalize_drag_release_invalid_preview_does_not_start_timer(
+    main_window,
+    monkeypatch,
+) -> None:
+    owner = main_window._preview_session
+    _set_valid_preview_mechanism(main_window)
+    owner._pending_slider_values["k1"] = 2.0
+    owner._slider_release_in_progress = True
+    owner._slider_release_primary_name = "k1"
+    owner._capture_slider_gesture_target_snapshot()
+
+    calls = {"validity": 0, "refresh": 0, "dispatch": 0}
+
+    def _invalid_preview() -> bool:
+        calls["validity"] += 1
+        return False
+
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", _invalid_preview)
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_batch_display_from_focus_and_shown",
+        lambda: calls.__setitem__("refresh", calls["refresh"] + 1),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_from_slider",
+        lambda: calls.__setitem__("dispatch", calls["dispatch"] + 1),
+    )
+
+    timer = owner._ensure_variable_update_timer()
+    owner.finalize_slider_release_commit()
+
+    assert calls == {"validity": 1, "refresh": 1, "dispatch": 0}
+    assert timer.isActive() is False
+    assert owner._pending_slider_values == {"k1": 2.0}
+    assert owner._slider_release_in_progress is True
+    assert owner._slider_release_primary_name == "k1"
+    assert main_window._status_label.text() == "Mechanism invalid — no preview available."
 
 
 def test_main_window_preview_session_commit_slider_value_uses_focused_target_set_without_drag(

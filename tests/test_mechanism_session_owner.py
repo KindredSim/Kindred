@@ -177,6 +177,39 @@ def test_empty_reactions_and_valid_state_network_are_ready_for_explicit_run() ->
     assert owner.canonical_full_dsl == "\n\n# State Network\n" + VALID_STATE_NETWORK
 
 
+def test_whitespace_only_reactions_are_invalid_and_not_ready_for_explicit_run() -> None:
+    owner = MechanismSessionOwner()
+
+    owner.apply_authoritative_update("   ", "")
+
+    result = owner.validate_canonical()
+
+    assert result.valid is False
+    assert owner.is_ready_for_explicit_run() is False
+
+
+def test_comment_only_reactions_are_invalid_and_not_ready_for_explicit_run() -> None:
+    owner = MechanismSessionOwner()
+
+    owner.apply_authoritative_update("# just a comment", "")
+
+    result = owner.validate_canonical()
+
+    assert result.valid is False
+    assert owner.is_ready_for_explicit_run() is False
+
+
+def test_empty_reactions_with_state_network_remain_valid_for_explicit_run() -> None:
+    owner = MechanismSessionOwner()
+
+    owner.apply_authoritative_update("", VALID_STATE_NETWORK)
+
+    result = owner.validate_canonical()
+
+    assert result.valid is True
+    assert owner.is_ready_for_explicit_run() is True
+
+
 def test_preview_readiness_uses_draft_while_session_active() -> None:
     owner = MechanismSessionOwner()
     owner.apply_authoritative_update(VALID_REACTIONS, "")
@@ -400,10 +433,23 @@ def test_validate_draft_returns_empty_invalid_result_when_no_session_is_active()
     result = owner.validate_draft()
 
     assert result.valid is False
-    assert result.error_message
+    assert result.error_message == "No active edit session"
     assert result.species_count == 0
     assert result.reaction_count == 0
     assert result.equilibria_count == 0
+
+
+def test_validate_canonical_propagates_unexpected_parser_errors(monkeypatch) -> None:
+    owner = MechanismSessionOwner()
+    owner.apply_authoritative_update(VALID_REACTIONS, "")
+
+    def _raise_value_error(*args, **kwargs):
+        raise ValueError("unexpected parse failure")
+
+    monkeypatch.setattr("kindred.gui.mechanism_session_owner.parse_dsl_to_mechanism", _raise_value_error)
+
+    with pytest.raises(ValueError, match="unexpected parse failure"):
+        owner.validate_canonical()
 
 
 def test_text_mutators_reject_non_string_inputs() -> None:

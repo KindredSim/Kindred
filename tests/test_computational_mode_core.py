@@ -345,3 +345,74 @@ def test_compiled_fast_equilibrium_includes_cm_id_and_dG_eq_tokens_for_energy_mo
         tokens[k.strip()] = v.strip()
     assert "dG_eq" in tokens
     assert float(tokens["dG_eq"]) == pytest.approx(float(expected_dG_eq_kj), rel=0, abs=1e-6)
+
+
+@pytest.mark.unit
+def test_comp_reaction_defensively_copies_mutable_inputs():
+    from kindred.core.simulator.computational_mode import CompReaction
+
+    reactants = {"A": 1.0}
+    products = {"B": 1.0}
+    reaction = CompReaction(reactants=reactants, products=products, via_ts="TS1")
+
+    reactants["A"] = 9.0
+    products["B"] = 7.0
+
+    assert reaction.reactants == {"A": 1.0}
+    assert reaction.products == {"B": 1.0}
+
+    reaction.reactants["A"] = 3.0
+    reaction.products["B"] = 4.0
+
+    assert reactants == {"A": 9.0}
+    assert products == {"B": 7.0}
+
+
+@pytest.mark.unit
+def test_comp_spec_defensively_copies_mutable_inputs():
+    from kindred.core.simulator.computational_mode import CompReaction, CompSpec, CompSpecies
+
+    kfast_by_order = {2: 1.0e10}
+    species = {"A": CompSpecies(name="A", kind="GS", G_value=0.0)}
+    reactions = [CompReaction(reactants={"A": 1.0}, products={"B": 1.0})]
+    spec = CompSpec(
+        kfast_by_order=kfast_by_order,
+        species=species,
+        reactions=reactions,
+    )
+
+    kfast_by_order[2] = 2.0e10
+    species["A"] = CompSpecies(name="A", kind="TS", G_value=1.0)
+    reactions.append(CompReaction(reactants={"B": 1.0}, products={"C": 1.0}))
+
+    assert spec.kfast_by_order == {2: 1.0e10}
+    assert spec.species["A"].kind == "GS"
+    assert len(spec.reactions) == 1
+
+    spec.kfast_by_order[2] = 3.0e10
+    spec.species["A"] = CompSpecies(name="A", kind="GS", G_value=2.0)
+    spec.reactions.append(CompReaction(reactants={"C": 1.0}, products={"D": 1.0}))
+
+    assert kfast_by_order == {2: 2.0e10}
+    assert species["A"].kind == "TS"
+    assert len(reactions) == 2
+
+
+@pytest.mark.unit
+def test_compiled_comp_defensively_copies_mutable_inputs():
+    from kindred.core.simulator.computational_mode import CompSpec, CompiledComp
+
+    species_G_std = {"A": 1.0}
+    compiled = CompiledComp(
+        spec=CompSpec(),
+        species_G_std_J_per_mol=species_G_std,
+        generated_reaction_dsl="reaction: A -> B ; k=1.0",
+    )
+
+    species_G_std["A"] = 9.0
+
+    assert compiled.species_G_std_J_per_mol == {"A": 1.0}
+
+    compiled.species_G_std_J_per_mol["A"] = 3.0
+
+    assert species_G_std == {"A": 9.0}

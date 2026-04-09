@@ -601,6 +601,22 @@ def test_is_mechanism_ready_for_run_uses_canonical_state_while_unlocked(main_win
     assert main_window.is_mechanism_ready_for_run() is False
 
 
+def test_is_mechanism_ready_for_run_does_not_apply_authoritative_updates(main_window, monkeypatch, qt_app):
+    _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
+    owner = main_window._mechanism_session_owner
+    calls: list[tuple[str, str]] = []
+    original_apply = owner.apply_authoritative_update
+
+    def _record_apply(reactions_text: str, state_network_dsl: str) -> None:
+        calls.append((str(reactions_text), str(state_network_dsl)))
+        original_apply(reactions_text, state_network_dsl)
+
+    monkeypatch.setattr(owner, "apply_authoritative_update", _record_apply)
+
+    assert main_window.is_mechanism_ready_for_run() is True
+    assert calls == []
+
+
 def test_empty_reactions_valid_state_network_is_ready_for_run(main_window, qt_app):
     main_window._mechanism_editor._reactions_text.setPlainText("")
     main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_valid_state_network_dsl())
@@ -1219,7 +1235,11 @@ def test_pending_init_migration_while_unlocked_force_locks_without_validation_ga
     assert main_window._mechanism_editor.is_mechanism_valid() is False
 
 
-def test_pending_init_migration_while_unlocked_keeps_authoritative_invalidation_guard(main_window, monkeypatch, qt_app):
+def test_pending_init_migration_while_unlocked_dispatches_consumers_and_refreshes_temperature_control(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
     _unlock_reactions_editing(main_window, monkeypatch)
     calls = _consumer_call_recorder(main_window, monkeypatch)
     main_window._temperature_spinbox.setValue(298.15)
@@ -1231,8 +1251,66 @@ def test_pending_init_migration_while_unlocked_keeps_authoritative_invalidation_
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
 
     assert applied is True
-    assert calls == []
-    assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
+    assert calls == ["temperature", "authoritative", "overlay"]
+    assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
+
+
+def test_pending_init_migration_dispatches_consumers_after_force_lock(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    events: list[str] = []
+    original_set_locked = main_window._set_mechanism_edit_locked
+
+    def _record_set_locked(locked: bool) -> bool:
+        events.append(f"lock:{bool(locked)}")
+        return original_set_locked(bool(locked))
+
+    monkeypatch.setattr(main_window, "_set_mechanism_edit_locked", _record_set_locked)
+    monkeypatch.setattr(
+        main_window,
+        "_dispatch_authoritative_mechanism_consumers",
+        lambda: events.append("dispatch"),
+    )
+
+    applied = main_window.apply_pending_init_migration(
+        seed={"A": 1.0},
+        rewrite="reaction: A -> B; k=2.0",
+    )
+    qt_app.processEvents()
+
+    assert applied is True
+    assert "lock:True" in events
+    assert "dispatch" in events
+    assert events.index("lock:True") < events.index("dispatch")
+
+
+def test_unlock_warning_and_state_network_banner_describe_draft_semantics(main_window, monkeypatch):
+    captured: dict[str, str] = {}
+    original_set_text = QtWidgets.QMessageBox.setText
+    original_set_informative_text = QtWidgets.QMessageBox.setInformativeText
+
+    def _record_text(box, text: str) -> None:
+        captured["text"] = str(text)
+        original_set_text(box, text)
+
+    def _record_informative_text(box, text: str) -> None:
+        captured["informative"] = str(text)
+        original_set_informative_text(box, text)
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "setText", _record_text)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "setInformativeText", _record_informative_text)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "exec", lambda self: None)
+
+    warning_result = main_window._prompt_mechanism_edit_unlock_warning()
+    banner = main_window._state_network_dialog_info_text(locked=False)
+
+    assert warning_result is False
+    assert "draft" in captured["text"].lower()
+    assert "lock" in captured["informative"].lower()
+    assert "&" not in captured["text"]
+    assert "&" not in captured["informative"]
+    assert "draft" in banner.lower()
+    assert "lock" in banner.lower()
+    assert "&" not in banner
 
 
 def test_authoritative_editor_rewrite_updates_reactions_while_locked(main_window):

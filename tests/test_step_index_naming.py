@@ -62,6 +62,29 @@ def test_post_solve_symbol_table_exposes_canonical_names_only():
     assert "Keq2" not in symtab.user_names()
 
 
+def test_fully_explicit_equilibrium_does_not_mark_a_derived_rate():
+    mech = parse_dsl_to_mechanism(
+        "equilibrium: A <-> B ; kf=10 ; kr=5 ; Keq=2\ninitial: A=1.0\ninitial: B=0.0",
+        initials={},
+    )
+
+    step_map = get_step_index_map(mech)
+
+    assert step_map[0]["derive_rate"] is None
+
+
+def test_symbol_table_exposes_both_K_and_Keq_aliases_for_explicit_equilibrium_constants():
+    mech = parse_dsl_to_mechanism(
+        "equilibrium: A <-> B ; kf=10 ; K=2\ninitial: A=1.0\ninitial: B=0.0",
+        initials={},
+    )
+
+    symtab = build_algebra_symbol_table(mech)
+
+    assert symtab.get("K1") == pytest.approx(2.0)
+    assert symtab.get("Keq1") == pytest.approx(2.0)
+
+
 def test_gui_parameter_enumeration_returns_canonical_names_and_derived_flags():
     dsl = "\n".join(
         [

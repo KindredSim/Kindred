@@ -247,6 +247,10 @@ class CompReaction:
     via_ts: Optional[str] = None
     fast_k: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reactants", dict(self.reactants))
+        object.__setattr__(self, "products", dict(self.products))
+
 
 @dataclass(frozen=True)
 class CompSpec:
@@ -259,12 +263,20 @@ class CompSpec:
     species: Dict[str, CompSpecies] = field(default_factory=dict)
     reactions: List[CompReaction] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kfast_by_order", dict(self.kfast_by_order))
+        object.__setattr__(self, "species", dict(self.species))
+        object.__setattr__(self, "reactions", list(self.reactions))
+
 
 @dataclass(frozen=True)
 class CompiledComp:
     spec: CompSpec
     species_G_std_J_per_mol: Dict[str, float]
     generated_reaction_dsl: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "species_G_std_J_per_mol", dict(self.species_G_std_J_per_mol))
 
 
 def extract_marked_block(text: str, *, start_marker: str, end_marker: str) -> Optional[str]:

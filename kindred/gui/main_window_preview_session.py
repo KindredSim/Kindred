@@ -763,6 +763,10 @@ class MainWindowPreviewSession:
 
     def _finalize_slider_release_commit(self) -> None:
         """Finalize a drag gesture by running a single fast preview simulation."""
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+
         pending = dict(self._pending_slider_values or {})
         target_set_ids = self.slider_gesture_target_set_ids_snapshot()
         self._pending_slider_values.clear()
@@ -782,6 +786,18 @@ class MainWindowPreviewSession:
         timer.stop()
         timer.setInterval(0)
         timer.start()
+
+    def _dispatch_variable_slider_preview_if_valid(self) -> None:
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+        self._mw._sim_controller.run_simulation_from_slider()
+
+    def _dispatch_species_slider_preview_if_valid(self) -> None:
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+        self._mw._sim_controller.run_simulation_from_slider()
 
     def _ensure_variable_update_timer(self, *, interval_ms: Optional[int] = None):
         if self._variable_update_timer is None:
@@ -803,13 +819,13 @@ class MainWindowPreviewSession:
     def _create_variable_update_timer(self):
         timer = QtCore.QTimer(self._mw)
         timer.setSingleShot(True)
-        timer.timeout.connect(self._mw._sim_controller.run_simulation_from_slider)
+        timer.timeout.connect(self._dispatch_variable_slider_preview_if_valid)
         return timer
 
     def _create_species_slider_update_timer(self):
         timer = QtCore.QTimer(self._mw)
         timer.setSingleShot(True)
-        timer.timeout.connect(self._mw._sim_controller.run_simulation_from_slider)
+        timer.timeout.connect(self._dispatch_species_slider_preview_if_valid)
         return timer
 
     def _create_slider_release_commit_timer(self):

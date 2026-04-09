@@ -201,7 +201,9 @@ def build_mechanism_from_ir(
         if is_equilibrium_step and has_Keq_param:
             user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
             user_kr_explicit = bool(getattr(step, "user_kr_explicit", False))
-            if user_kr_explicit and not user_kf_explicit:
+            if user_kf_explicit and user_kr_explicit:
+                derive_rate = None
+            elif user_kr_explicit and not user_kf_explicit:
                 derive_rate = "kf"
             else:
                 derive_rate = "kr"

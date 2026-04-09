@@ -84,6 +84,7 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                         try:
                             raw = Keq_obj() if callable(Keq_obj) else Keq_obj
                             Keq_val = float(raw)
+                            symtab.define_user(f"K{n}", Keq_val)
                             symtab.define_user(f"Keq{n}", Keq_val)
                         except Exception as exc:
                             _log_skip(f"Failed to evaluate equilibrium constant for Keq{n}", exc)
@@ -103,6 +104,7 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                 try:
                     raw = eq.Keq() if callable(eq.Keq) else eq.Keq
                     Keq_val = float(raw)
+                    symtab.define_user(f"K{i}", Keq_val)
                     symtab.define_user(f"Keq{i}", Keq_val)
                 except Exception as exc:
                     _log_skip(f"Failed to evaluate equilibrium constant for Keq{i}", exc)

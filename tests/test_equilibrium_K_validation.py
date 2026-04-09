@@ -1,5 +1,6 @@
 import pytest
 
+from kindred.core.mechanism import Equilibrium, Reaction
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.step_indexing import canonical_parameter_names
@@ -89,3 +90,53 @@ def test_equilibrium_kf_kr_without_K_does_not_expose_K_param():
     )
     mech = parse_dsl_to_mechanism(dsl, initials={})
     assert canonical_parameter_names(mech) == {"kf1", "kr1"}
+
+
+def test_equilibrium_defensively_copies_mutable_inputs() -> None:
+    stoich_forward = {"A": 1.0}
+    stoich_back = {"B": 1.0}
+    metadata = {"source": "user"}
+
+    eq = Equilibrium(
+        stoich_forward=stoich_forward,
+        stoich_back=stoich_back,
+        Keq=2.0,
+        kf=4.0,
+        kr=2.0,
+        metadata=metadata,
+    )
+
+    stoich_forward["A"] = 9.0
+    stoich_back["B"] = 7.0
+    metadata["source"] = "mutated"
+
+    assert eq.stoich_forward == {"A": 1.0}
+    assert eq.stoich_back == {"B": 1.0}
+    assert eq.metadata == {"source": "user"}
+
+    eq.stoich_forward["A"] = 3.0
+    eq.stoich_back["B"] = 4.0
+    eq.metadata["source"] = "local"
+
+    assert stoich_forward == {"A": 9.0}
+    assert stoich_back == {"B": 7.0}
+    assert metadata == {"source": "mutated"}
+
+
+def test_reaction_defensively_copies_mutable_inputs() -> None:
+    stoich = {"A": -1.0, "B": 1.0}
+    overrides = {"model": "Arrhenius"}
+
+    reaction = Reaction(stoich=stoich, rate=1.0, overrides=overrides)
+
+    stoich["A"] = -2.0
+    overrides["model"] = "Eyring"
+
+    assert reaction.stoich == {"A": -1.0, "B": 1.0}
+    assert reaction.overrides == {"model": "Arrhenius"}
+
+    reaction.stoich["A"] = -3.0
+    reaction.overrides["model"] = "Custom"
+
+    assert stoich == {"A": -2.0, "B": 1.0}
+    assert overrides == {"model": "Eyring"}

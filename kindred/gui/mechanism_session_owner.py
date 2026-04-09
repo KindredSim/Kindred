@@ -121,6 +121,14 @@ class MechanismSessionOwner:
             self._end_edit_session()
 
     def validate_draft(self) -> ValidationResult:
+        if not self._edit_session_active:
+            return ValidationResult(
+                valid=False,
+                error_message="No active edit session",
+                species_count=0,
+                reaction_count=0,
+                equilibria_count=0,
+            )
         if self._draft_validation is None:
             self._draft_validation = self._validate_source(
                 reactions_text=self.draft_reactions_text,
@@ -187,8 +195,6 @@ class MechanismSessionOwner:
         try:
             mechanism = parse_dsl_to_mechanism(validation_dsl, initials={})
         except DSLError as exc:
-            return ValidationResult(False, str(exc), 0, 0, 0)
-        except Exception as exc:
             return ValidationResult(False, str(exc), 0, 0, 0)
         return ValidationResult(
             valid=True,

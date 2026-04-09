@@ -499,7 +499,7 @@ class MainWindow(
                 "State network is read-only while Reactions editing is locked. "
                 "Use Allow Editing to make deliberate changes."
             )
-        return "Edit the state network with full validation. Changes apply directly to the current mechanism."
+        return "Edit the state network with full validation. Changes are staged as a draft until the editor is locked."
 
     def _refresh_mechanism_edit_lock_ui(self) -> None:
         locked = self.mechanism_editing_locked()
@@ -592,8 +592,6 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None:
             return False
-        if not owner.edit_session_active:
-            self._sync_mechanism_session_owner_from_widgets(authoritative=True)
         return bool(owner.is_ready_for_explicit_run())
 
     def is_mechanism_valid_for_preview(self) -> bool:
@@ -662,9 +660,9 @@ class MainWindow(
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
         box.setWindowTitle("Allow Editing")
-        box.setText("Edits in the Reactions editor change the canonical mechanism text.")
+        box.setText("Edits in the Reactions editor are staged as a draft.")
         box.setInformativeText(
-            "Use unlocking only for deliberate edits. Save/load and migration rewrites can still update the editor while it remains locked."
+            "Draft edits take effect when you lock the editor. Save/load and migration rewrites can still update the editor while it remains locked."
         )
         unlock_btn = box.addButton("Unlock", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         cancel_btn = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
@@ -4695,6 +4693,7 @@ class MainWindow(
                 self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
                 self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
                 self._set_mechanism_edit_locked(True)
+                self._dispatch_authoritative_mechanism_consumers()
                 restore_deferred = True
                 def _restore_pending_init_rewrite_suppression() -> None:
                     self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
