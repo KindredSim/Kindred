@@ -163,8 +163,8 @@ class TestDSLParsingEdgeCases:
 
         with patch.object(QtWidgets.QMessageBox, 'warning') as mock_warning:
             main_window.simulation_controller.run_simulation()
-            # Should warn about no mechanism
-            assert mock_warning.called
+            assert mock_warning.called is False
+        assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
     def test_simulation_with_malformed_dsl(self, main_window):
         """Test simulation with syntactically invalid DSL."""
@@ -173,15 +173,11 @@ class TestDSLParsingEdgeCases:
             "this is not valid DSL at all!!!"
         )
 
-        # Short-circuit the worker to emit an error immediately without threading.
-        with patch(
-            "kindred.gui.simulation_worker.SimulationWorker.start",
-            lambda self: self.error.emit("Failed to parse mechanism"),
-        ):
-            with patch.object(QtWidgets.QMessageBox, "critical") as mock_critical:
-                main_window.simulation_controller.run_simulation()
-                QtCore.QCoreApplication.processEvents()
-                assert mock_critical.called
+        with patch.object(QtWidgets.QMessageBox, "critical") as mock_critical:
+            main_window.simulation_controller.run_simulation()
+            QtCore.QCoreApplication.processEvents()
+            assert mock_critical.called is False
+        assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
 
 class TestMenuActionsSafetyNet:

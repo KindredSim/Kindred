@@ -35,6 +35,18 @@ def test_simulation_ports_assign_mechanism_snapshots_to_mechanism_helpers_port()
     assert "def last_mechanism_context(" in mechanism_helpers_block
 
 
+def test_simulation_mechanism_port_exposes_explicit_run_readiness_query() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "ports.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    mechanism_block = _protocol_block(source, "SimulationMechanismPort")
+
+    assert "def auto_lock_for_run(" in mechanism_block
+    assert "def is_mechanism_ready_for_run(" in mechanism_block
+
+
 def test_build_simulation_plumbing_wires_truthful_explicit_owners() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "app_wiring.py"

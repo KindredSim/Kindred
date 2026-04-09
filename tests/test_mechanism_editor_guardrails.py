@@ -23,6 +23,40 @@ def _unlock_reactions_editing(main_window, monkeypatch) -> None:
     assert main_window.mechanism_editing_locked() is False
 
 
+def _consumer_call_recorder(main_window, monkeypatch):
+    calls: list[str] = []
+    original_temperature = main_window._update_temperature_mode_indicator
+    original_authoritative = main_window._on_authoritative_mechanism_input_changed
+    original_overlay = main_window._refresh_overlay_swatches_for_current_mechanism
+
+    def _record_temperature() -> None:
+        calls.append("temperature")
+        original_temperature()
+
+    def _record_authoritative() -> None:
+        calls.append("authoritative")
+        original_authoritative()
+
+    def _record_overlay() -> None:
+        calls.append("overlay")
+        original_overlay()
+
+    monkeypatch.setattr(main_window, "_update_temperature_mode_indicator", _record_temperature)
+    monkeypatch.setattr(main_window, "_on_authoritative_mechanism_input_changed", _record_authoritative)
+    monkeypatch.setattr(main_window, "_refresh_overlay_swatches_for_current_mechanism", _record_overlay)
+    return calls
+
+
+def _set_invalid_reactions_text(main_window, qt_app) -> None:
+    main_window._mechanism_editor._reactions_text.setPlainText("this line does not parse")
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
+
+
+def _set_valid_reactions_text(main_window, qt_app, text: str = "T=400\nreaction: A -> B; k=1.0") -> None:
+    main_window._mechanism_editor._reactions_text.setPlainText(str(text))
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
+
+
 
 
 def _append_text(editor: QtWidgets.QPlainTextEdit, text: str) -> None:
@@ -175,64 +209,53 @@ def test_unlock_reactions_editing_warns_once_per_window(main_window, monkeypatch
     assert action.isChecked() is True
 
 
-def test_textchanged_suppressed_while_editing_unlocked(main_window, monkeypatch, qt_app):
+def test_consumers_disconnected_while_unlocked(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    refresh_events: list[str] = []
-    main_window._invalidate_slider_runtime = lambda: refresh_events.append("invalidate")
-    main_window._plot_tabs._main_plot.refresh_overlay_presentation_for_current_roster = lambda: refresh_events.append(
-        "overlay"
-    )
-
+    calls = _consumer_call_recorder(main_window, monkeypatch)
     main_window._temperature_spinbox.setValue(298.15)
-    main_window._mechanism_editor._reactions_text.setPlainText("T=400\nreaction: A -> B; k=1.0")
+    _set_valid_reactions_text(main_window, qt_app)
     qt_app.processEvents()
 
-    assert getattr(main_window, "_editing_suppression_active", False) is True
-    assert refresh_events == []
+    assert calls == []
     assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
 
-    main_window._mechanism_edit_lock_action.trigger()
-    qt_app.processEvents()
 
-    assert main_window.mechanism_editing_locked() is True
-    assert refresh_events == ["invalidate", "overlay"]
-    assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
-
-
-def test_successful_lock_flushes_consumers_after_validation(main_window, monkeypatch, qt_app):
+def test_consumers_reconnected_on_successful_lock(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    refresh_events: list[str] = []
+    calls = _consumer_call_recorder(main_window, monkeypatch)
     original_validate = main_window._mechanism_editor._validate_dsl
 
     def _validate_and_record() -> None:
-        refresh_events.append("validate")
+        calls.append("validate")
         original_validate()
 
-    main_window._mechanism_editor._validate_dsl = _validate_and_record
-    main_window._invalidate_slider_runtime = lambda: refresh_events.append("invalidate")
-    main_window._plot_tabs._main_plot.refresh_overlay_presentation_for_current_roster = (
-        lambda: refresh_events.append("overlay")
-    )
-
+    monkeypatch.setattr(main_window._mechanism_editor, "_validate_dsl", _validate_and_record)
     main_window._temperature_spinbox.setValue(298.15)
-    main_window._mechanism_editor._reactions_text.setPlainText("T=400\nreaction: A -> B; k=1.0")
+    _set_valid_reactions_text(main_window, qt_app)
     qt_app.processEvents()
 
-    assert refresh_events == []
+    assert calls == ["validate"]
     assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
 
     main_window._mechanism_edit_lock_action.trigger()
     qt_app.processEvents()
 
     assert main_window.mechanism_editing_locked() is True
-    assert refresh_events[0] == "validate"
-    assert "invalidate" in refresh_events
-    assert "overlay" in refresh_events
-    assert refresh_events.index("validate") < refresh_events.index("invalidate")
+    assert calls[0] == "validate"
+    assert calls.count("temperature") == 1
+    assert calls.count("authoritative") == 1
+    assert calls.count("overlay") == 1
     assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
 
+    calls.clear()
+    main_window._mechanism_editor._reactions_text.setPlainText("T=410\nreaction: A -> B; k=1.0")
+    qt_app.processEvents()
+    assert "temperature" in calls
+    assert "authoritative" in calls
+    assert "overlay" in calls
 
-def test_failed_lock_preserves_cached_state(main_window, monkeypatch, qt_app):
+
+def test_failed_lock_preserves_all_cached_state(main_window, monkeypatch, qt_app):
     main_window._load_preset_mechanism("M1")
     qt_app.processEvents()
     _select_batch_rows(main_window, [0])
@@ -270,8 +293,7 @@ def test_failed_lock_preserves_cached_state(main_window, monkeypatch, qt_app):
     main_window._variable_runtime._slider_runtime = slider_runtime_token
     main_window._variable_runtime.set_slider_runtime_dirty(False)
     main_window._temperature_spinbox.setValue(298.15)
-    main_window._mechanism_editor._reactions_text.setPlainText("T=400\nthis line does not parse")
-    qt_app.processEvents()
+    _set_invalid_reactions_text(main_window, qt_app)
 
     main_window._mechanism_edit_lock_action.trigger()
     qt_app.processEvents()
@@ -291,12 +313,79 @@ def test_failed_lock_preserves_cached_state(main_window, monkeypatch, qt_app):
     assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
 
 
+def test_failed_lock_after_invalid_state_network_edit_preserves_all_cached_state(main_window, monkeypatch, qt_app):
+    main_window._load_preset_mechanism("M1")
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    cache = main_window.simulation_controller.batch_cache
+    result_t = np.asarray([0.0, 0.5, 1.0], dtype=float)
+    result_series = {
+        "A": np.asarray([1.0, 0.7, 0.4], dtype=float),
+        "B": np.asarray([0.0, 0.3, 0.6], dtype=float),
+    }
+    cache.active_cache_key = "guardrails-state-network-cache-key"
+    cache.active_batch_set_id = str(main_window._batch_set_id_for_row(0) or "")
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(cache.active_batch_set_id) or "")
+    cache.last_display_selection = [cache.active_batch_set_id]
+    cache.active_cache_invalidated_set_ids = None
+    cache.result_cache[f"{cache.active_cache_key}::{cache.active_batch_set_id}"] = {
+        "t": result_t,
+        "series": result_series,
+    }
+    plot.set_data(result_t, result_series, label=cache.active_batch_set or "set1")
+    main_window._status_label.setText("Ready")
+
+    initial_plot_t = tuple(float(value) for value in plot._t.tolist())
+    initial_plot_series = {
+        str(name): tuple(float(value) for value in values.tolist())
+        for name, values in dict(getattr(plot, "_series", {}) or {}).items()
+    }
+    initial_cache_key = str(cache.active_cache_key or "")
+    initial_invalidated = cache.active_cache_invalidated_set_ids
+
+    _unlock_reactions_editing(main_window, monkeypatch)
+    slider_runtime_token = object()
+    main_window._variable_runtime._slider_runtime = slider_runtime_token
+    main_window._variable_runtime.set_slider_runtime_dirty(False)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_invalid_state_network_dsl())
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is False
+    assert str(cache.active_cache_key or "") == initial_cache_key
+    assert cache.active_cache_invalidated_set_ids == initial_invalidated
+    assert tuple(float(value) for value in plot._t.tolist()) == initial_plot_t
+    assert {
+        str(name): tuple(float(value) for value in values.tolist())
+        for name, values in dict(getattr(plot, "_series", {}) or {}).items()
+    } == initial_plot_series
+    assert main_window._variable_runtime._slider_runtime is slider_runtime_token
+    assert main_window._variable_runtime.slider_runtime_dirty() is False
+
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window._mechanism_edit_lock_action.isChecked() is True
+    assert str(cache.active_cache_key or "") == initial_cache_key
+    assert cache.active_cache_invalidated_set_ids == initial_invalidated
+    assert tuple(float(value) for value in plot._t.tolist()) == initial_plot_t
+    assert {
+        str(name): tuple(float(value) for value in values.tolist())
+        for name, values in dict(getattr(plot, "_series", {}) or {}).items()
+    } == initial_plot_series
+    assert main_window._variable_runtime._slider_runtime is slider_runtime_token
+    assert main_window._variable_runtime.slider_runtime_dirty() is False
+    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
+
+
 def test_lock_action_toggle_reverts_on_failure(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
 
     reactions_widget = main_window._mechanism_editor._reactions_text
-    reactions_widget.setPlainText("this line does not parse")
-    qt_app.processEvents()
+    _set_invalid_reactions_text(main_window, qt_app)
 
     main_window._mechanism_edit_lock_action.trigger()
     qt_app.processEvents()
@@ -320,6 +409,28 @@ def test_auto_lock_for_run_refuses_unchanged_invalid_mechanism(main_window, monk
     assert main_window.auto_lock_for_run() is False
     assert main_window.mechanism_editing_locked() is False
     assert main_window._mechanism_editor.is_mechanism_valid() is False
+
+
+def test_is_mechanism_ready_for_run_independent_of_lock(main_window, monkeypatch, qt_app):
+    _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
+    main_window._mechanism_editor._state_network_editor.clear()
+    qt_app.processEvents()
+    assert main_window.mechanism_editing_locked() is True
+    assert main_window.is_mechanism_ready_for_run() is True
+
+    main_window._force_lock_editor()
+    _set_invalid_reactions_text(main_window, qt_app)
+    assert main_window.mechanism_editing_locked() is True
+    assert main_window.is_mechanism_ready_for_run() is False
+
+    _unlock_reactions_editing(main_window, monkeypatch)
+    _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window.is_mechanism_ready_for_run() is True
+
+    _set_invalid_reactions_text(main_window, qt_app)
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window.is_mechanism_ready_for_run() is False
 
 
 def test_state_network_validation_blocks_lock(main_window, monkeypatch, qt_app):
@@ -384,6 +495,20 @@ def test_auto_lock_for_run_checks_state_network(main_window, monkeypatch, qt_app
     assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
 
+def test_locked_invalid_dsl_blocks_explicit_run(main_window, qt_app):
+    main_window._force_lock_editor()
+    main_window._mechanism_editor.set_reactions_text("this line does not parse", block_signals=True)
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    main_window.simulation_controller.run_simulation_internal.assert_not_called()
+    assert main_window.mechanism_editing_locked() is True
+    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
+
+
 def test_run_auto_locks_editor_from_main_window(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
@@ -409,6 +534,21 @@ def test_run_aborts_if_unchanged_invalid_editor_is_unlocked(main_window, monkeyp
     assert main_window.mechanism_editing_locked() is False
     assert main_window._mechanism_edit_lock_action.isChecked() is True
     main_window.simulation_controller.run_simulation_internal.assert_not_called()
+    assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
+
+
+def test_state_network_invalid_blocks_run_even_when_locked(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(_invalid_state_network_dsl())
+    qt_app.processEvents()
+    main_window._force_lock_editor()
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    main_window.simulation_controller.run_simulation_internal.assert_not_called()
+    assert main_window.is_mechanism_ready_for_run() is False
     assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
 
@@ -635,15 +775,14 @@ def test_load_preset_updates_reactions_while_locked(main_window):
 
 def test_load_preset_while_unlocked_relocks_and_invalidates(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    invalidations: list[str] = []
-    main_window._invalidate_slider_runtime = lambda: invalidations.append("invalidate")
+    calls = _consumer_call_recorder(main_window, monkeypatch)
 
     main_window._load_preset_mechanism("M1")
     qt_app.processEvents()
 
     assert main_window.mechanism_editing_locked() is True
-    assert getattr(main_window, "_editing_suppression_active", False) is False
-    assert invalidations
+    assert "authoritative" in calls
+    assert "overlay" in calls
     assert main_window._mechanism_editor._reactions_text.toPlainText().strip()
 
 
@@ -663,6 +802,22 @@ def test_programmatic_load_always_locks_even_with_invalid_dsl(main_window, monke
     assert main_window._mechanism_editor._reactions_text.isReadOnly() is True
     assert main_window._mechanism_editor.is_mechanism_valid() is False
     assert main_window.mechanism_reactions_text_raw() == "this line does not parse"
+
+
+def test_programmatic_load_refreshes_temperature(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._temperature_spinbox.setValue(298.15)
+    main_window.set_mechanism_reactions_text_with_optional_undo(
+        "T=400\nreaction: A -> B; k=1.0",
+        "Programmatic valid load",
+        record_undo=False,
+    )
+
+    main_window._on_programmatic_mechanism_load()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
 
 
 def test_programmatic_load_while_unlocked_does_not_hit_validation_gate(main_window, monkeypatch, qt_app):
@@ -689,6 +844,64 @@ def test_programmatic_load_while_unlocked_does_not_hit_validation_gate(main_wind
     assert main_window._mechanism_editor._reactions_text.isReadOnly() is True
     assert main_window.mechanism_reactions_text_raw() == invalid_text
     assert main_window._mechanism_editor.is_mechanism_valid() is False
+
+
+def test_programmatic_load_while_unlocked_reconnects_consumers(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    calls = _consumer_call_recorder(main_window, monkeypatch)
+
+    main_window.set_mechanism_reactions_text_with_optional_undo(
+        "reaction: A -> B; k=1.0",
+        "Programmatic valid load",
+        record_undo=False,
+    )
+    main_window._on_programmatic_mechanism_load()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    assert calls.count("temperature") == 1
+    assert calls.count("authoritative") == 1
+    assert calls.count("overlay") == 1
+
+    calls.clear()
+    main_window._mechanism_editor._reactions_text.setPlainText("T=410\nreaction: A -> B; k=1.0")
+    qt_app.processEvents()
+    assert "temperature" in calls
+    assert "authoritative" in calls
+    assert "overlay" in calls
+
+
+def test_validation_label_stays_live_while_unlocked(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+
+    _set_invalid_reactions_text(main_window, qt_app)
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline and "Error:" not in main_window._mechanism_editor._validation_label.text():
+        _process_events_bounded(qt_app, iterations=1)
+        time.sleep(0.01)
+
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window._mechanism_editor.is_mechanism_valid() is False
+    assert "Error:" in main_window._mechanism_editor._validation_label.text()
+
+
+def test_preview_run_not_gated_by_validity(main_window, qt_app):
+    main_window._force_lock_editor()
+    main_window._mechanism_editor.set_reactions_text("this line does not parse", block_signals=True)
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+    main_window.simulation_controller._pending_slider_target_set_ids = ()
+    main_window.simulation_controller._pending_slider_simulation = False
+    main_window.simulation_controller._pending_slider_sim_request_id = None
+    main_window.simulation_controller._simulation_worker = None
+    main_window.simulation_controller._simulation_running = False
+    main_window._run_btn.setEnabled(True)
+
+    main_window.simulation_controller.run_simulation_from_slider()
+    qt_app.processEvents()
+
+    main_window.simulation_controller.run_simulation_internal.assert_called_once()
+    kwargs = main_window.simulation_controller.run_simulation_internal.call_args.kwargs
+    assert kwargs["fast_mode"] is True
 
 
 def test_pending_init_migration_rewrites_reactions_while_locked(main_window, qt_app):
@@ -741,13 +954,9 @@ def test_pending_init_migration_while_unlocked_force_locks_without_validation_ga
     assert main_window._mechanism_editor.is_mechanism_valid() is False
 
 
-def test_pending_init_migration_while_unlocked_keeps_consumers_suppressed(main_window, monkeypatch, qt_app):
+def test_pending_init_migration_while_unlocked_keeps_authoritative_invalidation_guard(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    refresh_events: list[str] = []
-    main_window._invalidate_slider_runtime = lambda: refresh_events.append("invalidate")
-    main_window._plot_tabs._main_plot.refresh_overlay_presentation_for_current_roster = (
-        lambda: refresh_events.append("overlay")
-    )
+    calls = _consumer_call_recorder(main_window, monkeypatch)
     main_window._temperature_spinbox.setValue(298.15)
 
     applied = main_window.apply_pending_init_migration(
@@ -757,7 +966,7 @@ def test_pending_init_migration_while_unlocked_keeps_consumers_suppressed(main_w
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
 
     assert applied is True
-    assert refresh_events == []
+    assert calls == []
     assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
 
 

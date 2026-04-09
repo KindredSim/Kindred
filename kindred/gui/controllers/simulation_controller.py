@@ -1914,6 +1914,9 @@ class SimulationController(QtCore.QObject):
         if not self.ui.mechanism.auto_lock_for_run():
             self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
             return
+        if not self.ui.mechanism.is_mechanism_ready_for_run():
+            self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
+            return
         self._discarded_slider_preview_generation_id = None
         if bool(getattr(self, "_simulation_running", False)):
             logger.info("Superseding active simulation with new Run Selected request")

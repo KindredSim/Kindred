@@ -230,9 +230,9 @@ class MainWindow(
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
         self._mechanism_edit_locked = True
-        self._editing_suppression_active = False
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
+        self._mechanism_edit_consumers_connected = False
 
         # Undo/Redo stack for high-level operations.
         self._undo_stack = controllers.undo_stack
@@ -418,14 +418,61 @@ class MainWindow(
                 if info_label is not None:
                     info_label.setText(self._state_network_dialog_info_text(locked=locked))
 
-    def _flush_mechanism_edit_refresh_consumers(self) -> None:
-        self._update_temperature_mode_indicator()
-        self._on_authoritative_mechanism_input_changed()
-        self._refresh_overlay_swatches_for_current_mechanism()
+    def _disconnect_mechanism_edit_consumers(self) -> None:
+        editor = getattr(self, "_mechanism_editor", None)
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if not bool(getattr(self, "_mechanism_edit_consumers_connected", False)):
+            return
+        reactions_consumers = (
+            self._update_temperature_mode_indicator,
+            self._on_authoritative_mechanism_input_changed,
+            self._refresh_overlay_swatches_for_current_mechanism,
+        )
+        state_network_consumers = (
+            self._on_authoritative_mechanism_input_changed,
+            self._refresh_overlay_swatches_for_current_mechanism,
+        )
+        if reactions_widget is not None:
+            for consumer in reactions_consumers:
+                try:
+                    reactions_widget.textChanged.disconnect(consumer)
+                except (RuntimeError, TypeError):
+                    continue
+        if state_editor is not None:
+            for consumer in state_network_consumers:
+                try:
+                    state_editor.stateNetworkChanged.disconnect(consumer)
+                except (RuntimeError, TypeError, AttributeError):
+                    continue
+        self._mechanism_edit_consumers_connected = False
+
+    def _reconnect_mechanism_edit_consumers(self) -> None:
+        editor = getattr(self, "_mechanism_editor", None)
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None:
+            return
+        if bool(getattr(self, "_mechanism_edit_consumers_connected", False)):
+            return
+        reactions_widget.textChanged.connect(self._update_temperature_mode_indicator)
+        reactions_widget.textChanged.connect(self._on_authoritative_mechanism_input_changed)
+        reactions_widget.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
+        if state_editor is not None:
+            try:
+                state_editor.stateNetworkChanged.connect(self._on_authoritative_mechanism_input_changed)
+                state_editor.stateNetworkChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.state_network_editor.stateNetworkChanged.connect",
+                    message="State network editor did not expose stateNetworkChanged signal",
+                    exc=exc,
+                )
+        self._mechanism_edit_consumers_connected = True
 
     def _force_lock_editor(self) -> bool:
         self._mechanism_edit_locked = True
-        self._editing_suppression_active = False
+        self._reconnect_mechanism_edit_consumers()
         self._refresh_mechanism_edit_lock_ui()
         return True
 
@@ -446,25 +493,49 @@ class MainWindow(
         )
         if not reactions_valid or not state_network_valid:
             return False
-        self._editing_suppression_active = False
-        self._flush_mechanism_edit_refresh_consumers()
-        return self._force_lock_editor()
+        self._reconnect_mechanism_edit_consumers()
+        self._update_temperature_mode_indicator()
+        self._on_authoritative_mechanism_input_changed()
+        self._refresh_overlay_swatches_for_current_mechanism()
+        self._mechanism_edit_locked = True
+        self._refresh_mechanism_edit_lock_ui()
+        return True
 
     def _set_mechanism_edit_locked(self, locked: bool) -> bool:
         if not bool(locked):
             self._mechanism_edit_locked = False
-            self._editing_suppression_active = True
+            self._disconnect_mechanism_edit_consumers()
             self._refresh_mechanism_edit_lock_ui()
             return True
         if self.mechanism_editing_locked():
-            return self._force_lock_editor()
+            self._reconnect_mechanism_edit_consumers()
+            self._refresh_mechanism_edit_lock_ui()
+            return True
         return self._force_lock_editor()
 
     def auto_lock_for_run(self) -> bool:
-        if self.mechanism_editing_locked():
-            self._editing_suppression_active = False
-            return True
-        return self._try_lock_mechanism_editor()
+        if not self.mechanism_editing_locked():
+            return self._try_lock_mechanism_editor()
+        return True
+
+    def is_mechanism_ready_for_run(self) -> bool:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            return False
+        validate = getattr(editor, "_validate_dsl", None)
+        if callable(validate):
+            validate()
+        reactions_valid = bool(
+            hasattr(editor, "is_mechanism_valid")
+            and editor.is_mechanism_valid()
+        )
+        state_editor = getattr(editor, "_state_network_editor", None)
+        state_network_valid = bool(
+            state_editor is not None
+            and hasattr(state_editor, "is_valid")
+            and state_editor.is_valid()
+        )
+        return bool(reactions_valid and state_network_valid)
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -887,6 +958,7 @@ class MainWindow(
             self._preview_session.clear_pending_slider_values()
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
+        self._update_temperature_mode_indicator()
         self._on_authoritative_mechanism_input_changed()
         self._refresh_slider_transaction_button_state()
 
@@ -962,8 +1034,6 @@ class MainWindow(
         ColorManager.instance().set_current_species_roster(roster)
 
     def _refresh_overlay_swatches_for_current_mechanism(self) -> None:
-        if bool(getattr(self, "_editing_suppression_active", False)):
-            return
         self._sync_color_manager_authoritative_roster()
         plot = getattr(self._plot_tabs, "_main_plot", None)
         refresh_overlay_presentation = getattr(plot, "refresh_overlay_presentation_for_current_roster", None)
@@ -1381,24 +1451,7 @@ class MainWindow(
         self._temperature_spinbox.valueChanged.connect(self._on_temperature_user_edit)
         self._num_points_spinbox.valueChanged.connect(self._on_num_points_user_edit)
         self._sim_time_spinbox.textChanged.connect(self._on_sim_time_user_edit)
-        self._mechanism_editor._reactions_text.textChanged.connect(self._update_temperature_mode_indicator)
-        self._mechanism_editor._reactions_text.textChanged.connect(self._on_authoritative_mechanism_input_changed)
-        self._mechanism_editor._reactions_text.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
-        try:
-            self._mechanism_editor._state_network_editor.stateNetworkChanged.connect(
-                self._on_authoritative_mechanism_input_changed
-            )
-            self._mechanism_editor._state_network_editor.stateNetworkChanged.connect(
-                self._refresh_overlay_swatches_for_current_mechanism
-            )
-        except Exception as exc:
-            # State network editor may not expose the signal in some contexts
-            self._state_network_editor_invalidation_signal_available = False
-            self._record_best_effort_failure(
-                "main_window.state_network_editor.stateNetworkChanged.connect",
-                message="State network editor did not expose stateNetworkChanged signal",
-                exc=exc,
-            )
+        self._reconnect_mechanism_edit_consumers()
 
     def _record_best_effort_failure(
         self,
@@ -1427,8 +1480,6 @@ class MainWindow(
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Invalidate stale displayed results when the authoritative mechanism changes."""
-        if bool(getattr(self, "_editing_suppression_active", False)):
-            return
         if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
             return
         # Pending-init rewrite normalizes the DSL after a successful explicit run;
@@ -1627,8 +1678,6 @@ class MainWindow(
         2. T= directive seeds the spinbox value but does not override a schedule.
         3. Otherwise, the temperature spinbox value is used (isothermal).
         """
-        if bool(getattr(self, "_editing_suppression_active", False)):
-            return
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 

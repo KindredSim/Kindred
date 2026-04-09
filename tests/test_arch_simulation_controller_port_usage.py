@@ -208,6 +208,7 @@ MECHANISM_TARGET_METHODS = {
     "slider_overrides",
     "apply_parameter_overrides_to_dsl",
     "auto_lock_for_run",
+    "is_mechanism_ready_for_run",
     "mechanism_reactions_text_raw",
     "has_slider_overrides",
     "apply_overrides_to_text",
@@ -557,6 +558,7 @@ def test_simulation_controller_non_completion_solver_clusters_use_explicit_solve
             "_run_simulation",
             {
                 "auto_lock_for_run",
+                "is_mechanism_ready_for_run",
             },
         ),
         (

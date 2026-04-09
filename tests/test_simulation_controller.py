@@ -231,6 +231,10 @@ class _FakeMainWindow(QtCore.QObject):
         self._auto_lock_for_run_calls = int(getattr(self, "_auto_lock_for_run_calls", 0)) + 1
         return bool(getattr(self, "_auto_lock_for_run_result", True))
 
+    def is_mechanism_ready_for_run(self) -> bool:
+        self._is_mechanism_ready_for_run_calls = int(getattr(self, "_is_mechanism_ready_for_run_calls", 0)) + 1
+        return bool(getattr(self, "_is_mechanism_ready_for_run_result", True))
+
     def temperature_spinbox_value(self) -> float:
         return float(self._temperature_spinbox.value())
 
@@ -643,6 +647,8 @@ def mw(qt_app) -> _FakeMainWindow:
     window._simulation_param_fingerprints = {"": "params-default"}
     window._auto_lock_for_run_result = True
     window._auto_lock_for_run_calls = 0
+    window._is_mechanism_ready_for_run_result = True
+    window._is_mechanism_ready_for_run_calls = 0
 
     window._display_cached_batch_selection = MagicMock(return_value=False)
     window._flush_slider_plot_updates = MagicMock(return_value=False)
