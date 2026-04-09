@@ -276,7 +276,7 @@ class MainWindow(
         self._mechanism_panel = mechanism_dock_components.panel
 
         self._mechanism_editor = self._mechanism_panel.editor
-        self._refresh_mechanism_edit_lock_ui()
+        self._force_lock_editor()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
         self._slider_override_buttons_available = True
@@ -419,30 +419,36 @@ class MainWindow(
                     info_label.setText(self._state_network_dialog_info_text(locked=locked))
 
     def _flush_mechanism_edit_refresh_consumers(self) -> None:
-        previous_editing_suppression = bool(getattr(self, "_editing_suppression_active", False))
-        self._editing_suppression_active = False
-        try:
-            self._update_temperature_mode_indicator()
-            self._on_authoritative_mechanism_input_changed()
-            self._refresh_overlay_swatches_for_current_mechanism()
-        finally:
-            self._editing_suppression_active = previous_editing_suppression
+        self._update_temperature_mode_indicator()
+        self._on_authoritative_mechanism_input_changed()
+        self._refresh_overlay_swatches_for_current_mechanism()
 
-    def _try_lock_mechanism_editor(self) -> bool:
-        editor = getattr(self, "_mechanism_editor", None)
-        self._editing_suppression_active = False
-        self._flush_mechanism_edit_refresh_consumers()
-        if editor is not None and hasattr(editor, "_validate_dsl"):
-            editor._validate_dsl()
-        if editor is not None and hasattr(editor, "is_mechanism_valid") and not editor.is_mechanism_valid():
-            self._mechanism_edit_locked = False
-            self._editing_suppression_active = True
-            self._refresh_mechanism_edit_lock_ui()
-            return False
+    def _force_lock_editor(self) -> bool:
         self._mechanism_edit_locked = True
         self._editing_suppression_active = False
         self._refresh_mechanism_edit_lock_ui()
         return True
+
+    def _try_lock_mechanism_editor(self) -> bool:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is not None and hasattr(editor, "_validate_dsl"):
+            editor._validate_dsl()
+        reactions_valid = bool(
+            editor is not None
+            and hasattr(editor, "is_mechanism_valid")
+            and editor.is_mechanism_valid()
+        )
+        state_editor = getattr(editor, "_state_network_editor", None) if editor is not None else None
+        state_network_valid = bool(
+            state_editor is not None
+            and hasattr(state_editor, "is_valid")
+            and state_editor.is_valid()
+        )
+        if not reactions_valid or not state_network_valid:
+            return False
+        self._editing_suppression_active = False
+        self._flush_mechanism_edit_refresh_consumers()
+        return self._force_lock_editor()
 
     def _set_mechanism_edit_locked(self, locked: bool) -> bool:
         if not bool(locked):
@@ -451,11 +457,8 @@ class MainWindow(
             self._refresh_mechanism_edit_lock_ui()
             return True
         if self.mechanism_editing_locked():
-            self._mechanism_edit_locked = True
-            self._editing_suppression_active = False
-            self._refresh_mechanism_edit_lock_ui()
-            return True
-        return self._try_lock_mechanism_editor()
+            return self._force_lock_editor()
+        return self._force_lock_editor()
 
     def auto_lock_for_run(self) -> bool:
         if self.mechanism_editing_locked():
@@ -545,7 +548,8 @@ class MainWindow(
             self._set_mechanism_edit_locked(False)
             self._status_label.setText("Reactions editing unlocked")
             return
-        if not self._set_mechanism_edit_locked(True):
+        if not self._try_lock_mechanism_editor():
+            self._refresh_mechanism_edit_lock_ui()
             self._status_label.setText("Cannot lock reactions editing: fix mechanism errors")
             return
         self._status_label.setText("Reactions editing locked")
@@ -4528,10 +4532,7 @@ class MainWindow(
                 )
                 self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
                 self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
-                if not self._set_mechanism_edit_locked(True):
-                    self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
-                    self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-                    return False
+                self._set_mechanism_edit_locked(True)
                 restore_deferred = True
                 def _restore_pending_init_rewrite_suppression() -> None:
                     self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
