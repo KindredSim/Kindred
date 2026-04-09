@@ -199,6 +199,44 @@ def test_owner_canonical_text_remains_stable_while_unlocked_edits_are_staged(mai
     assert main_window.mechanism_state_network_dsl_raw() == baseline_state
 
 
+def test_project_serialize_uses_canonical_mechanism_while_edit_session_active(main_window, qt_app):
+    baseline_reactions = "reaction: A -> B; k=1.0"
+    baseline_state = _valid_state_network_dsl()
+    staged_reactions = "reaction: X -> Y; k=99.0"
+    staged_state = "\n".join(
+        [
+            "state: X, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS9, kind=TS, energy=20, energy_unit=kJ/mol, degeneracy=1",
+            "state: Y, kind=GS, energy=-2, energy_unit=kJ/mol, degeneracy=1",
+            "edge: X,TS9",
+            "edge: TS9,Y",
+        ]
+    )
+
+    main_window._mechanism_editor._reactions_text.setPlainText(baseline_reactions)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(baseline_state)
+    _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
+
+    owner = main_window._mechanism_session_owner
+    owner.begin_edit_session()
+
+    # Project save must persist canonical mechanism, not in-progress draft.
+    main_window._mechanism_editor._reactions_text.setPlainText(staged_reactions)
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(staged_state)
+    qt_app.processEvents()
+
+    assert owner.edit_session_active is True
+    assert main_window.mechanism_reactions_text_raw() == baseline_reactions
+    assert main_window.mechanism_state_network_dsl_raw() == baseline_state
+
+    payload = main_window._serialize_project_state()
+
+    assert payload["mechanism"] == baseline_reactions
+    assert payload["mechanism"] != staged_reactions
+    assert payload["state_network"] == baseline_state
+    assert payload["state_network"] != staged_state
+
+
 def test_owner_draft_tracks_unlocked_widget_edits_and_commits_on_lock(main_window, monkeypatch, qt_app):
     baseline_reactions = "reaction: A -> B; k=1.0"
     baseline_state = _valid_state_network_dsl()

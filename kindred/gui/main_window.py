@@ -3634,9 +3634,9 @@ class MainWindow(
         return {
             'project_schema_version': PROJECT_SCHEMA_VERSION,
             'version': KINDRED_VERSION,
-            'mechanism': self._mechanism_editor._reactions_text.toPlainText(),
+            'mechanism': self.mechanism_reactions_text_raw(),
             'notes': self._mechanism_editor._notes_text.toPlainText(),
-            'state_network': self._mechanism_editor._state_network_editor.get_state_network_dsl(),
+            'state_network': self.mechanism_state_network_dsl_raw(),
             "solver": str(solver_label),
             "solver_method": str(solver_method),
             "solver_warning": str(solver_warning) if solver_warning else None,
