@@ -793,7 +793,6 @@ class SimulationController(QtCore.QObject):
             self._on_retained_simulation_worker_finished(worker, worker_name)
 
     def _has_running_owned_simulation_workers(self) -> bool:
-        self._prune_stopped_owned_simulation_workers()
         seen_ids: set[int] = set()
         owned_workers = []
         current_worker = getattr(self, "_simulation_worker", None)
@@ -887,6 +886,7 @@ class SimulationController(QtCore.QObject):
         return not has_running_workers
 
     def _clear_shutdown_request_after_close_cleanup(self) -> None:
+        self._prune_stopped_owned_simulation_workers()
         if bool(getattr(self, "_shutdown_requested_for_close", False)) and (not self._has_running_owned_simulation_workers()):
             self._shutdown_requested_for_close = False
 
@@ -1406,15 +1406,13 @@ class SimulationController(QtCore.QObject):
                 f"Superseded parallel batch future failed after soft supersede (set_id={set_id}, set_name={set_name})",
                 exc,
             )
-            try:
-                self._surface_current_parallel_batch_pool_failure_to_ui(f"Simulation failed:\n\n{exc}")
-            except Exception as ui_exc:
-                self._record_nonfatal_exception(
-                    "Failed to surface superseded parallel batch future failure to current run",
-                    ui_exc,
-                )
-            self._reset_parallel_batch_run_and_shutdown_executor()
-            return False
+            logger.debug(
+                "Stale superseded future failed after active run moved on (set_id=%s, set_name=%s)",
+                set_id,
+                set_name,
+                exc_info=True,
+            )
+            return True
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
             error_payload = coerce_simulation_failure(payload["error"])
@@ -1875,6 +1873,7 @@ class SimulationController(QtCore.QObject):
             logger.debug("Fast slider run currently running; deferring slider update")
             self._pending_slider_simulation = True
             return
+        self._prune_stopped_owned_simulation_workers()
         if self._has_running_owned_simulation_workers():
             logger.warning(
                 "Slider-triggered run blocked while previous simulation worker shutdown remains in progress"
@@ -1912,10 +1911,14 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_simulation(self):
+        if not self.ui.mechanism.auto_lock_for_run():
+            self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
+            return
         self._discarded_slider_preview_generation_id = None
         if bool(getattr(self, "_simulation_running", False)):
             logger.info("Superseding active simulation with new Run Selected request")
             self._cancel_active_run_for_restart()
+        self._prune_stopped_owned_simulation_workers()
         if self._has_running_owned_simulation_workers():
             logger.warning(
                 "Run Selected blocked while previous simulation worker shutdown remains in progress"

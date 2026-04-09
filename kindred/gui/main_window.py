@@ -230,6 +230,7 @@ class MainWindow(
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
         self._mechanism_edit_locked = True
+        self._editing_suppression_active = False
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
 
@@ -417,9 +418,50 @@ class MainWindow(
                 if info_label is not None:
                     info_label.setText(self._state_network_dialog_info_text(locked=locked))
 
-    def _set_mechanism_edit_locked(self, locked: bool) -> None:
-        self._mechanism_edit_locked = bool(locked)
+    def _flush_mechanism_edit_refresh_consumers(self) -> None:
+        previous_editing_suppression = bool(getattr(self, "_editing_suppression_active", False))
+        self._editing_suppression_active = False
+        try:
+            self._update_temperature_mode_indicator()
+            self._on_authoritative_mechanism_input_changed()
+            self._refresh_overlay_swatches_for_current_mechanism()
+        finally:
+            self._editing_suppression_active = previous_editing_suppression
+
+    def _try_lock_mechanism_editor(self) -> bool:
+        editor = getattr(self, "_mechanism_editor", None)
+        self._editing_suppression_active = False
+        self._flush_mechanism_edit_refresh_consumers()
+        if editor is not None and hasattr(editor, "_validate_dsl"):
+            editor._validate_dsl()
+        if editor is not None and hasattr(editor, "is_mechanism_valid") and not editor.is_mechanism_valid():
+            self._mechanism_edit_locked = False
+            self._editing_suppression_active = True
+            self._refresh_mechanism_edit_lock_ui()
+            return False
+        self._mechanism_edit_locked = True
+        self._editing_suppression_active = False
         self._refresh_mechanism_edit_lock_ui()
+        return True
+
+    def _set_mechanism_edit_locked(self, locked: bool) -> bool:
+        if not bool(locked):
+            self._mechanism_edit_locked = False
+            self._editing_suppression_active = True
+            self._refresh_mechanism_edit_lock_ui()
+            return True
+        if self.mechanism_editing_locked():
+            self._mechanism_edit_locked = True
+            self._editing_suppression_active = False
+            self._refresh_mechanism_edit_lock_ui()
+            return True
+        return self._try_lock_mechanism_editor()
+
+    def auto_lock_for_run(self) -> bool:
+        if self.mechanism_editing_locked():
+            self._editing_suppression_active = False
+            return True
+        return self._try_lock_mechanism_editor()
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -503,7 +545,9 @@ class MainWindow(
             self._set_mechanism_edit_locked(False)
             self._status_label.setText("Reactions editing unlocked")
             return
-        self._set_mechanism_edit_locked(True)
+        if not self._set_mechanism_edit_locked(True):
+            self._status_label.setText("Cannot lock reactions editing: fix mechanism errors")
+            return
         self._status_label.setText("Reactions editing locked")
 
     def _prompt_slider_transaction_invalidation(self, action_text: str) -> str:
@@ -914,6 +958,8 @@ class MainWindow(
         ColorManager.instance().set_current_species_roster(roster)
 
     def _refresh_overlay_swatches_for_current_mechanism(self) -> None:
+        if bool(getattr(self, "_editing_suppression_active", False)):
+            return
         self._sync_color_manager_authoritative_roster()
         plot = getattr(self._plot_tabs, "_main_plot", None)
         refresh_overlay_presentation = getattr(plot, "refresh_overlay_presentation_for_current_roster", None)
@@ -1377,6 +1423,8 @@ class MainWindow(
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Invalidate stale displayed results when the authoritative mechanism changes."""
+        if bool(getattr(self, "_editing_suppression_active", False)):
+            return
         if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
             return
         # Pending-init rewrite normalizes the DSL after a successful explicit run;
@@ -1575,6 +1623,8 @@ class MainWindow(
         2. T= directive seeds the spinbox value but does not override a schedule.
         3. Otherwise, the temperature spinbox value is used (isothermal).
         """
+        if bool(getattr(self, "_editing_suppression_active", False)):
+            return
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 
@@ -1634,7 +1684,7 @@ class MainWindow(
                 restore = self._pre_dsl_temperature
                 if restore is None:
                     restore = float(
-                        self.config_controller.get_user_preference("temperature_K")
+                        self.config_controller.get_user_preference("temperature_K") or 298.15
                     )
                 self._temperature_spinbox.blockSignals(True)
                 try:
@@ -4478,7 +4528,10 @@ class MainWindow(
                 )
                 self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
                 self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
-                self._set_mechanism_edit_locked(True)
+                if not self._set_mechanism_edit_locked(True):
+                    self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
+                    self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
+                    return False
                 restore_deferred = True
                 def _restore_pending_init_rewrite_suppression() -> None:
                     self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)

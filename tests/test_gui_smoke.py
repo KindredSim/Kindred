@@ -206,6 +206,14 @@ def test_mechanism_editor_validation_rejects_unsupported_let_named_set_blocks(ma
     assert "let baseline = {" in label
 
 
+def test_validation_label_wraps_long_errors(main_window):
+    label = main_window._mechanism_editor._validation_label
+    size_policy = label.sizePolicy()
+
+    assert label.wordWrap() is True
+    assert size_policy.horizontalPolicy() == QtWidgets.QSizePolicy.Policy.Expanding
+
+
 def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window):
     editor = main_window._mechanism_editor
     editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")

@@ -227,6 +227,10 @@ class _FakeMainWindow(QtCore.QObject):
             return None
         return str(value) if value is not None else None
 
+    def auto_lock_for_run(self) -> bool:
+        self._auto_lock_for_run_calls = int(getattr(self, "_auto_lock_for_run_calls", 0)) + 1
+        return bool(getattr(self, "_auto_lock_for_run_result", True))
+
     def temperature_spinbox_value(self) -> float:
         return float(self._temperature_spinbox.value())
 
@@ -637,6 +641,8 @@ def mw(qt_app) -> _FakeMainWindow:
     window._batch_cache_key = MagicMock(return_value="cache-key")
     window._simulation_schema_id = "schema-default"
     window._simulation_param_fingerprints = {"": "params-default"}
+    window._auto_lock_for_run_result = True
+    window._auto_lock_for_run_calls = 0
 
     window._display_cached_batch_selection = MagicMock(return_value=False)
     window._flush_slider_plot_updates = MagicMock(return_value=False)
@@ -2214,9 +2220,7 @@ def test_superseded_parallel_batch_future_error_is_drained_deterministically(con
 
 
 @pytest.mark.unit
-def test_superseded_parallel_batch_future_exception_tears_down_pool_without_stale_ui_context(
-    controller: SimulationController,
-):
+def test_superseded_future_error_does_not_abort_active_run(controller: SimulationController):
     submitted: list[tuple[str, dict[str, object]]] = []
 
     class _PendingFuture:
@@ -2291,27 +2295,23 @@ def test_superseded_parallel_batch_future_exception_tears_down_pool_without_stal
     }
     controller._on_simulation_error = MagicMock()
     controller._on_simulation_complete = MagicMock()
+    controller._record_nonfatal_exception = MagicMock()
 
     controller._poll_parallel_batch_futures()
 
-    controller._on_simulation_error.assert_called_once()
-    _args, kwargs = controller._on_simulation_error.call_args
-    assert kwargs["run_id"] == 11
-    assert kwargs["request_id"] == 22
-    assert kwargs["cache_key"] == "current-cache"
-    assert kwargs["batch_set"] == ""
-    assert kwargs["batch_set_id"] == ""
-    assert controller._batch_run_context["active"] is False
-    assert first.shutdown_calls == [{"wait": False, "cancel_futures": True}]
-    assert controller.parallel_batch.executor is None
-    assert controller.parallel_batch.future_map == {}
+    controller._on_simulation_error.assert_not_called()
+    controller._record_nonfatal_exception.assert_called_once()
+    assert controller._batch_run_context["active"] is True
+    assert first.shutdown_calls == []
+    assert controller.parallel_batch.executor is first
+    assert controller.parallel_batch.future_map == {"current": current}
     assert controller.parallel_batch.superseded_future_map == {}
-    assert controller._pool_eagerly_created is False
+    assert controller._pool_eagerly_created is True
 
     current.set_result({"payload": "stale"})
     controller._batch_parallel.completed_queue.put(("current", 1.0))
     controller._poll_parallel_batch_futures()
-    controller._on_simulation_complete.assert_not_called()
+    controller._on_simulation_complete.assert_called_once()
 
     controller._batch_run_context = {
         "active": True,
@@ -2334,10 +2334,9 @@ def test_superseded_parallel_batch_future_exception_tears_down_pool_without_stal
 
     controller._start_parallel_batch_simulations()
 
-    assert len(created) == 1
-    assert controller.parallel_batch.executor is created[0]
-    assert created[0] is not first
-    assert [label for label, task in submitted if task.get("set_id") == "fresh"] == [created[0].label]
+    assert created == []
+    assert controller.parallel_batch.executor is first
+    assert [label for label, task in submitted if task.get("set_id") == "fresh"] == [first.label]
 
 
 @pytest.mark.unit
@@ -3238,6 +3237,30 @@ def test_run_simulation_reuses_parallel_executor_for_explicit_multi_set_runs(
     assert kwargs["fast_mode"] is False
     assert kwargs["batch_rows"] == [0, 1]
     assert kwargs["reuse_parallel_executor"] is True
+
+
+@pytest.mark.unit
+def test_run_auto_locks_editor(mw: _FakeMainWindow, controller: SimulationController):
+    mw._batch_rows_for_scope.return_value = [0]
+    controller.run_simulation_internal = MagicMock()
+
+    controller.run_simulation()
+
+    assert mw._auto_lock_for_run_calls == 1
+    controller.run_simulation_internal.assert_called_once()
+
+
+@pytest.mark.unit
+def test_run_aborts_if_mechanism_invalid_while_unlocked(mw: _FakeMainWindow, controller: SimulationController):
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._auto_lock_for_run_result = False
+    controller.run_simulation_internal = MagicMock()
+
+    controller.run_simulation()
+
+    assert mw._auto_lock_for_run_calls == 1
+    controller.run_simulation_internal.assert_not_called()
+    assert mw._status_label.text == "Cannot run: mechanism has errors. Fix and try again."
 
 
 @pytest.mark.unit
@@ -6666,6 +6689,19 @@ def test_consume_parallel_batch_future_error_payload_calls_on_error(controller: 
 
     assert ok is False
     controller.on_simulation_error.assert_called_once()
+
+
+@pytest.mark.unit
+def test_has_running_workers_is_pure_query(controller: SimulationController):
+    worker = _FakeWorker(running=False)
+    controller._simulation_worker = worker
+    controller._retained_simulation_workers = [worker]
+    controller._delete_worker_if_stopped = MagicMock()
+
+    assert controller._has_running_owned_simulation_workers() is False
+    controller._delete_worker_if_stopped.assert_not_called()
+    assert controller._simulation_worker is worker
+    assert controller._retained_simulation_workers == [worker]
 
 
 # ---------------------------------------------------------------------------

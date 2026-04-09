@@ -1,4 +1,5 @@
 import json
+from unittest.mock import MagicMock
 
 import pytest
 from PySide6 import QtGui, QtWidgets
@@ -8,6 +9,9 @@ pytestmark = pytest.mark.gui
 
 
 def _unlock_reactions_editing(main_window, monkeypatch) -> None:
+    reactions_widget = main_window._mechanism_editor._reactions_text
+    if not reactions_widget.toPlainText().strip():
+        reactions_widget.setPlainText("reaction: A -> B; k=1.0")
     monkeypatch.setattr(
         main_window,
         "_prompt_mechanism_edit_unlock_warning",
@@ -98,6 +102,7 @@ def test_unlock_reactions_editing_cancel_keeps_editor_locked(main_window, monkey
 def test_unlock_reactions_editing_warns_once_per_window(main_window, monkeypatch):
     reactions_widget = main_window._mechanism_editor._reactions_text
     action = main_window._mechanism_edit_lock_action
+    reactions_widget.setPlainText("reaction: A -> B; k=1.0")
 
     prompts: list[str] = []
     monkeypatch.setattr(
@@ -125,6 +130,112 @@ def test_unlock_reactions_editing_warns_once_per_window(main_window, monkeypatch
     assert main_window.mechanism_editing_locked() is False
     assert reactions_widget.isReadOnly() is False
     assert action.isChecked() is True
+
+
+def test_textchanged_suppressed_while_editing_unlocked(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    refresh_events: list[str] = []
+    main_window._invalidate_slider_runtime = lambda: refresh_events.append("invalidate")
+    main_window._plot_tabs._main_plot.refresh_overlay_presentation_for_current_roster = lambda: refresh_events.append(
+        "overlay"
+    )
+
+    main_window._temperature_spinbox.setValue(298.15)
+    main_window._mechanism_editor._reactions_text.setPlainText("T=400\nreaction: A -> B; k=1.0")
+    qt_app.processEvents()
+
+    assert getattr(main_window, "_editing_suppression_active", False) is True
+    assert refresh_events == []
+    assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
+
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    assert refresh_events == ["invalidate", "overlay"]
+    assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
+
+
+def test_relock_triggers_full_refresh(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    refresh_events: list[str] = []
+    main_window._invalidate_slider_runtime = lambda: refresh_events.append("invalidate")
+    main_window._plot_tabs._main_plot.refresh_overlay_presentation_for_current_roster = lambda: refresh_events.append(
+        "overlay"
+    )
+
+    main_window._temperature_spinbox.setValue(298.15)
+    main_window._mechanism_editor._reactions_text.setPlainText("T=400\nreaction: A -> B; k=1.0")
+    qt_app.processEvents()
+
+    assert refresh_events == []
+    assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
+
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    assert refresh_events == ["invalidate", "overlay"]
+    assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
+
+
+def test_relock_refused_on_invalid_mechanism(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+
+    reactions_widget = main_window._mechanism_editor._reactions_text
+    reactions_widget.setPlainText("this line does not parse")
+    qt_app.processEvents()
+
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is False
+    assert reactions_widget.isReadOnly() is False
+    assert main_window._mechanism_edit_lock_action.isChecked() is True
+    assert main_window._mechanism_editor.is_mechanism_valid() is False
+
+
+def test_auto_lock_for_run_refuses_unchanged_invalid_mechanism(main_window, monkeypatch, qt_app):
+    monkeypatch.setattr(
+        main_window,
+        "_prompt_mechanism_edit_unlock_warning",
+        lambda: True,
+    )
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window.auto_lock_for_run() is False
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window._mechanism_editor.is_mechanism_valid() is False
+
+
+def test_run_auto_locks_editor_from_main_window(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    qt_app.processEvents()
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    main_window.simulation_controller.run_simulation_internal.assert_called_once()
+
+
+def test_run_aborts_if_unchanged_invalid_editor_is_unlocked(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    main_window._mechanism_editor._reactions_text.setPlainText("")
+    qt_app.processEvents()
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window._mechanism_edit_lock_action.isChecked() is True
+    main_window.simulation_controller.run_simulation_internal.assert_not_called()
+    assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
 
 def test_locked_user_facing_undo_does_not_mutate_reactions_text(main_window, monkeypatch, qt_app):
@@ -346,6 +457,20 @@ def test_load_preset_updates_reactions_while_locked(main_window):
     assert main_window.mechanism_editing_locked() is True
     assert reactions_widget.isReadOnly() is True
     assert reactions_widget.toPlainText().strip()
+
+
+def test_load_preset_while_unlocked_relocks_and_invalidates(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+    invalidations: list[str] = []
+    main_window._invalidate_slider_runtime = lambda: invalidations.append("invalidate")
+
+    main_window._load_preset_mechanism("M1")
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is True
+    assert getattr(main_window, "_editing_suppression_active", False) is False
+    assert invalidations
+    assert main_window._mechanism_editor._reactions_text.toPlainText().strip()
 
 
 def test_pending_init_migration_rewrites_reactions_while_locked(main_window, qt_app):

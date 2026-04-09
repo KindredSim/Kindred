@@ -23,6 +23,9 @@ def _find_state_network_dialog() -> QtWidgets.QDialog:
 
 
 def _unlock_reactions_editing(main_window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+    reactions_widget = main_window._mechanism_editor._reactions_text
+    if not reactions_widget.toPlainText().strip():
+        reactions_widget.setPlainText("reaction: A -> B; k=1.0")
     monkeypatch.setattr(main_window, "_prompt_mechanism_edit_unlock_warning", lambda: True)
     main_window._mechanism_edit_lock_action.trigger()
     assert main_window.mechanism_editing_locked() is False

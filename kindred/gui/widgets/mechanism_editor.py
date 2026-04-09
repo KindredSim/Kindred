@@ -126,6 +126,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Validation indicator (shows DSL parsing status)
         self._validation_label = QtWidgets.QLabel()
+        self._validation_label.setWordWrap(True)
+        self._validation_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         self._validation_label.setStyleSheet("QLabel { padding: 4px; border-radius: 3px; }")
         self._validation_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self._set_validation_state("idle")

@@ -759,6 +759,59 @@ def test_dock_title_bar_close_button_closes_dock(main_window, qt_app) -> None:
     assert dock.isVisible() is False
 
 
+def test_dock_title_bar_drag_initiates_float(main_window, qt_app, qtbot) -> None:
+    dock = main_window._mechanism_dock
+    tb = dock.titleBarWidget()
+
+    main_window.show()
+    qt_app.processEvents()
+
+    start_pos = QtCore.QPoint(12, max(4, tb.height() // 2))
+    qtbot.mousePress(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(tb, start_pos + QtCore.QPoint(40, 0))
+    qtbot.mouseRelease(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos + QtCore.QPoint(40, 0))
+    qt_app.processEvents()
+
+    assert dock.isFloating() is True
+
+
+def test_dock_title_bar_double_click_toggles_float(main_window, qt_app, qtbot) -> None:
+    dock = main_window._sliders_dock
+    tb = dock.titleBarWidget()
+
+    main_window.show()
+    qt_app.processEvents()
+
+    click_pos = QtCore.QPoint(12, max(4, tb.height() // 2))
+    qtbot.mouseDClick(tb, QtCore.Qt.MouseButton.LeftButton, pos=click_pos)
+    qt_app.processEvents()
+    assert dock.isFloating() is True
+
+    qtbot.mouseDClick(tb, QtCore.Qt.MouseButton.LeftButton, pos=click_pos)
+    qt_app.processEvents()
+    assert dock.isFloating() is False
+
+
+def test_minimized_dock_title_bar_drag_still_floats(main_window, qt_app, qtbot) -> None:
+    dock = main_window._batch_dock
+    tb = dock.titleBarWidget()
+    minimize_btn = tb.findChild(QtWidgets.QToolButton, "dockMinimizeButton")
+    assert minimize_btn is not None
+
+    main_window.show()
+    qt_app.processEvents()
+    minimize_btn.click()
+    qt_app.processEvents()
+
+    start_pos = QtCore.QPoint(12, max(4, tb.height() // 2))
+    qtbot.mousePress(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(tb, start_pos + QtCore.QPoint(40, 0))
+    qtbot.mouseRelease(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos + QtCore.QPoint(40, 0))
+    qt_app.processEvents()
+
+    assert dock.isFloating() is True
+
+
 def test_reshow_after_close_while_minimized_auto_restores(main_window, qt_app) -> None:
     dock = main_window._batch_dock
     tb = dock.titleBarWidget()

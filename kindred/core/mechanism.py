@@ -399,7 +399,7 @@ class Mechanism:
         """
         Deterministic serialization of the mechanism structure.
 
-        Note: `rate`, `K`, `kf`, `kr` are stored as-is and may be non-JSON types.
+        Note: `rate`, `Keq`, `kf`, and `kr` are stored as-is and may be non-JSON types.
         Callers are responsible for serializing expressions if needed.
         """
         declaration_order = self.metadata["declaration_order"]

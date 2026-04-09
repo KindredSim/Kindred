@@ -7,7 +7,7 @@ Current contract
 - Accepted keys with normalization:
   T, degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A, k_fast,
   energy=kcal/mol|kJ/mol|J/mol, state, edge
-- If dG_eq/ΔG° is provided and K is omitted, compute K = exp(-ΔG°/(R*T)).
+- If dG_eq/ΔG° is provided and Keq is omitted, compute Keq = exp(-ΔG°/(R*T)).
 - Default per step is Eyring; Arrhenius override via A/Ea.
 - Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C°.
 - TS degree fixed to 2 and enforced; attempts to violate raise a structured error.
