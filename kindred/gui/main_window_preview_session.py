@@ -70,6 +70,9 @@ class MainWindowPreviewSession:
         except Exception:
             logger.debug("Failed to refresh slider transaction button state", exc_info=True)
 
+    def is_mechanism_valid_for_preview(self) -> bool:
+        return bool(self._mw.is_mechanism_valid_for_preview())
+
     def _clear_active_preview_cache_state(self) -> None:
         mw = self._mw
         try:
@@ -85,6 +88,12 @@ class MainWindowPreviewSession:
                         batch_cache.active_preview_scope_set_ids = None
         except Exception:
             logger.debug("Failed to clear active preview cache state", exc_info=True)
+
+    def _show_invalid_preview_state(self) -> None:
+        mw = self._mw
+        self._clear_active_preview_cache_state()
+        mw._refresh_batch_display_from_focus_and_shown()
+        mw._status_label.setText("Mechanism invalid — no preview available.")
 
     def _focused_mechanism_workspace_set_id(self) -> str:
         mw = self._mw
@@ -587,7 +596,7 @@ class MainWindowPreviewSession:
 
     def variable_preview_debounce_ms(self, name: str) -> int:
         name_s = str(name or "")
-        if name_s.startswith("K") and name_s[1:].isdigit():
+        if name_s.startswith("Keq") and name_s[3:].isdigit():
             return self._read_preview_delay_setting(
                 "simulation/equilibrium_preview_debounce_ms",
                 default=150,
@@ -600,6 +609,9 @@ class MainWindowPreviewSession:
     def on_variable_changed(self, name: str, value: float) -> None:
         """Handle variable slider change and queue a fast preview simulation."""
         mw = self._mw
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
         logger.debug("Variable %s changed to %s", name, value)
         self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
@@ -657,6 +669,9 @@ class MainWindowPreviewSession:
     def commit_slider_value(self, name: str, value: float) -> None:
         """Stage a programmatic slider change for preview runs without mutating editor text."""
         mw = self._mw
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
         self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
         self._queue_pending_slider_preview_replay(
@@ -720,6 +735,9 @@ class MainWindowPreviewSession:
     def queue_species_slider_simulation(self, *, label: str, delay_ms: int) -> None:
         """Queue a fast preview run for species-mode slider edits."""
         mw = self._mw
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
         try:
             delay_ms_i = int(delay_ms)
         except Exception:
@@ -745,6 +763,10 @@ class MainWindowPreviewSession:
 
     def _finalize_slider_release_commit(self) -> None:
         """Finalize a drag gesture by running a single fast preview simulation."""
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+
         pending = dict(self._pending_slider_values or {})
         target_set_ids = self.slider_gesture_target_set_ids_snapshot()
         self._pending_slider_values.clear()
@@ -764,6 +786,18 @@ class MainWindowPreviewSession:
         timer.stop()
         timer.setInterval(0)
         timer.start()
+
+    def _dispatch_variable_slider_preview_if_valid(self) -> None:
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+        self._mw._sim_controller.run_simulation_from_slider()
+
+    def _dispatch_species_slider_preview_if_valid(self) -> None:
+        if not self.is_mechanism_valid_for_preview():
+            self._show_invalid_preview_state()
+            return
+        self._mw._sim_controller.run_simulation_from_slider()
 
     def _ensure_variable_update_timer(self, *, interval_ms: Optional[int] = None):
         if self._variable_update_timer is None:
@@ -785,13 +819,13 @@ class MainWindowPreviewSession:
     def _create_variable_update_timer(self):
         timer = QtCore.QTimer(self._mw)
         timer.setSingleShot(True)
-        timer.timeout.connect(self._mw._sim_controller.run_simulation_from_slider)
+        timer.timeout.connect(self._dispatch_variable_slider_preview_if_valid)
         return timer
 
     def _create_species_slider_update_timer(self):
         timer = QtCore.QTimer(self._mw)
         timer.setSingleShot(True)
-        timer.timeout.connect(self._mw._sim_controller.run_simulation_from_slider)
+        timer.timeout.connect(self._dispatch_species_slider_preview_if_valid)
         return timer
 
     def _create_slider_release_commit_timer(self):

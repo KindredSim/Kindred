@@ -62,11 +62,11 @@ def test_slider_drag_does_not_recenter_other_ranges_or_break_ctc(main_window, qt
     )
 
     sliders = main_window._mechanism_editor._variable_sliders
-    assert sliders.has_variable("K1")
+    assert sliders.has_variable("Keq1")
     assert sliders.has_variable("kf1")
     assert sliders.has_variable("kr1")
 
-    k_slider = sliders._sliders["K1"]
+    k_slider = sliders._sliders["Keq1"]
     kr_slider = sliders._sliders["kr1"]
 
     kr_range_before = sliders._slider_ranges["kr1"]
@@ -94,7 +94,7 @@ def test_slider_drag_does_not_recenter_other_ranges_or_break_ctc(main_window, qt
 
     # Qt can deliver queued `valueChanged` events after release; ensure the derived refresh
     # path still does not mutate slider ranges/positions once the drag handler has run.
-    main_window._on_variable_changed("K1", float(sliders.get_variables()["K1"]))
+    main_window._on_variable_changed("Keq1", float(sliders.get_variables()["Keq1"]))
     QtWidgets.QApplication.processEvents()
     assert sliders._slider_ranges["kr1"] == kr_range_before
     assert kr_slider.value() == kr_pos_before

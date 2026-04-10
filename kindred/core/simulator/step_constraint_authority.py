@@ -9,8 +9,8 @@ _DEFAULT_TEMPERATURE_K = 298.15
 _VALID_CONSTRAINT_REASONS = frozenset({"algebra", "wegscheider"})
 _TOP_LEVEL_SCALAR_ASSIGNMENT_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*=\s*[^#;\n]+\s*(?:#.*)?$")
 _TOP_LEVEL_SCALAR_DIRECTIVES = frozenset({"energy", "t", "c0", "c°", "kappa", "κ"})
-_ALGEBRA_STEP_PARAM_ASSIGNMENT_RE = re.compile(r"^\s*param\s+(?:k|kf|kr|K)\d+\s*=", re.IGNORECASE)
-_MECHANISM_STEP_PARAM_RE = re.compile(r"^(k|kf|kr|K)(\d+)$")
+_ALGEBRA_STEP_PARAM_ASSIGNMENT_RE = re.compile(r"^\s*param\s+(?:k|kf|kr|Keq)\d+\s*=", re.IGNORECASE)
+_MECHANISM_STEP_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -293,7 +293,7 @@ def _build_step_constraint_authority_state_from_text(
     from kindred.core.simulator.dsl import parse_dsl_to_mechanism
     from kindred.core.simulator.parameter_algebra import (
         apply_parameter_algebra_spec_to_mechanism,
-        mechanism_parameter_names,
+        mechanism_parameter_namespace,
         parse_parameter_algebra_spec_from_dsl_text,
         read_mechanism_parameter_values,
     )
@@ -337,7 +337,7 @@ def _build_step_constraint_authority_state_from_text(
         scoped_spec = ParameterAlgebraSpec(
             param_statements=list(valid_assignments),
             observable_names=set(spec.observable_names),
-            mechanism_param_names=set(spec.mechanism_param_names),
+            mechanism_namespace=spec.mechanism_namespace,
             scalar_input_names=set(spec.scalar_input_names),
         )
         try:
@@ -444,17 +444,17 @@ def _build_step_constraint_authority_state_from_text(
             mechanism=None,
         )
 
-    mechanism_names = set(mechanism_parameter_names(mechanism))
+    mechanism_namespace = mechanism_parameter_namespace(mechanism)
     try:
         spec = parse_parameter_algebra_spec_from_dsl_text(
             mechanism_text,
-            mechanism_param_names=mechanism_names,
+            mechanism_namespace=mechanism_namespace,
             scalar_input_names=set(scalar_values),
         )
     except ValueError as exc:
         return _StepConstraintAuthorityState(
             analysis=_empty_step_constraint_authority_analysis(
-                mechanism_param_names=frozenset(mechanism_names),
+                mechanism_param_names=frozenset(mechanism_namespace.flat_names()),
                 scalar_input_names=frozenset(scalar_values),
                 builtin_function_names=builtin_function_names,
                 protected_symbol_names=protected_symbol_names,
@@ -633,7 +633,7 @@ def read_step_equilibrium_authoritative_values_from_text(
         )
     return read_mechanism_parameter_values(
         state.mechanism,
-        names={f"kf{int(step_index)}", f"kr{int(step_index)}", f"K{int(step_index)}"},
+        names={f"kf{int(step_index)}", f"kr{int(step_index)}", f"Keq{int(step_index)}"},
     )
 
 

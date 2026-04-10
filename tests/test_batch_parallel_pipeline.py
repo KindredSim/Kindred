@@ -3,11 +3,13 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_parallel import run_batch_simulation_task
 
 pytestmark = [pytest.mark.gui]
 
@@ -31,7 +33,9 @@ class _FakeExecutor:
         fut: Future = Future()
         sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs), future=fut)
         self.submissions.append(sub)
-        if self.done_immediately:
+        if fn is not run_batch_simulation_task:
+            fut.set_result(True)
+        elif self.done_immediately:
             task = dict(args[0] if args else {})
             sid = str(task.get("set_id") or task.get("batch_set_id") or "")
             fut.set_result(
@@ -92,6 +96,10 @@ def _prime_three_batch_sets(main_window) -> list[str]:
     return names[:3]
 
 
+def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:
+    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+
+
 
 def test_worker_policy_uses_num_sets_cpu_minus_one_and_cap(monkeypatch):
     from kindred.core.batch_parallel import compute_effective_batch_workers
@@ -125,11 +133,11 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
     main_window.simulation_controller.run_simulation()
     qtbot.wait(40)
 
-    assert len(fake.submissions) == len(names)
+    assert len(_simulation_submissions(fake)) == len(names)
 
 
 
-def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, monkeypatch, qtbot):
+def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, monkeypatch):
     if hasattr(main_window, "set_simulation_cache_caps"):
         main_window.set_simulation_cache_caps(result_cap=20, preview_cap=20)
     _prime_three_batch_sets(main_window)
@@ -145,7 +153,6 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
 
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "executor_factory", _factory, raising=True)
-
     req1 = main_window.simulation_controller.next_sim_request_id()
     main_window.simulation_controller.run_simulation_internal(fast_mode=False, request_id=int(req1), batch_rows=[0, 1, 2])
     assert len(executors) == 1
@@ -162,30 +169,37 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
     cache_key = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     assert cache_key
 
-    for sub in old_exec.submissions:
-        task = dict(sub.args[0] if sub.args else {})
-        sid = str(task.get("set_id") or "")
-        sub.future.set_result(
-            {
-                "run_id": int(task.get("run_id") or 0),
-                "set_id": sid,
-                "set_name": str(task.get("set_name") or sid),
-                "t": np.array([0.0, 1.0]),
-                "Y": np.array([[111.0, 111.0]]),
-                "species_names": ["A"],
-                "algebra_scalars": {},
-                "mechanism": None,
-                "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
-                "solver_config": dict(task.get("solver_config") or {}),
-                "fallback_occurred": False,
-                "fallback_message": None,
-            }
-        )
+    stale_task = dict(_simulation_submissions(old_exec)[0].args[0] if _simulation_submissions(old_exec)[0].args else {})
+    stale_sid = str(stale_task.get("set_id") or "")
+    main_window.simulation_controller.on_simulation_complete(
+        {
+            "run_id": int(stale_task.get("run_id") or 0),
+            "set_id": stale_sid,
+            "set_name": str(stale_task.get("set_name") or stale_sid),
+            "t": np.array([0.0, 1.0]),
+            "Y": np.array([[111.0, 111.0]]),
+            "species_names": ["A"],
+            "algebra_scalars": {},
+            "mechanism": None,
+            "mechanism_text": str(stale_task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
+            "solver_config": dict(stale_task.get("solver_config") or {}),
+            "fallback_occurred": False,
+            "fallback_message": None,
+        },
+        run_id=int(stale_task.get("run_id") or 0),
+        fast_mode=False,
+        request_id=int(stale_task.get("request_id") or 0),
+        batch_set=str(stale_task.get("set_name") or stale_sid),
+        batch_set_id=stale_sid,
+        cache_key=cache_key,
+    )
 
-    for sub in new_exec.submissions:
+    assert main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{stale_sid}") is None
+
+    for sub in _simulation_submissions(new_exec):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
-        sub.future.set_result(
+        main_window.simulation_controller.on_simulation_complete(
             {
                 "run_id": int(task.get("run_id") or 0),
                 "set_id": sid,
@@ -199,13 +213,17 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
                 "solver_config": dict(task.get("solver_config") or {}),
                 "fallback_occurred": False,
                 "fallback_message": None,
-            }
+            },
+            run_id=int(task.get("run_id") or 0),
+            fast_mode=False,
+            request_id=int(task.get("request_id") or 0),
+            batch_set=str(task.get("set_name") or sid),
+            batch_set_id=sid,
+            cache_key=cache_key,
         )
 
-    qtbot.wait(80)
-
     cached_payloads = []
-    for sub in new_exec.submissions:
+    for sub in _simulation_submissions(new_exec):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
         payload = main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{sid}")
@@ -367,9 +385,11 @@ def test_open_solver_settings_wires_parallel_batch_controls(main_window, monkeyp
         "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
         _FakeDialog,
     )
+    main_window.simulation_controller.parallel_batch_pool_settings_changed = MagicMock()
     main_window._open_solver_settings()
     assert int(main_window.simulation_controller.parallel_batch.max_parallel_workers) == 7
     assert bool(main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker) is False
+    main_window.simulation_controller.parallel_batch_pool_settings_changed.assert_called_once_with()
 
 
 def test_open_solver_settings_persists_preview_debounce_controls(main_window, monkeypatch):
@@ -406,7 +426,7 @@ def test_open_solver_settings_persists_preview_debounce_controls(main_window, mo
     assert main_window._settings.value("simulation/parameter_preview_debounce_ms", type=int) == 35
     assert main_window._settings.value("simulation/equilibrium_preview_debounce_ms", type=int) == 90
     assert main_window._preview_session.variable_preview_debounce_ms("k1") == 35
-    assert main_window._preview_session.variable_preview_debounce_ms("K1") == 90
+    assert main_window._preview_session.variable_preview_debounce_ms("Keq1") == 90
 
 
 def test_slider_release_timer_uses_persisted_preview_debounce_controls(main_window, monkeypatch, qtbot):
@@ -444,12 +464,12 @@ def test_slider_release_timer_uses_persisted_preview_debounce_controls(main_wind
     preview = main_window._preview_session
     sliders = main_window._mechanism_editor._variable_sliders
 
-    main_window._on_slider_drag_started("K1")
-    slider_widget = sliders._sliders["K1"]
+    main_window._on_slider_drag_started("Keq1")
+    slider_widget = sliders._sliders["Keq1"]
     slider_widget.setValue(min(slider_widget.maximum(), slider_widget.value() + 50))
 
-    qtbot.waitUntil(lambda: "K1" in preview._pending_slider_values, timeout=1000)
-    main_window._on_slider_drag_finished("K1")
+    qtbot.waitUntil(lambda: "Keq1" in preview._pending_slider_values, timeout=1000)
+    main_window._on_slider_drag_finished("Keq1")
 
     release_timer = getattr(preview, "_slider_release_commit_timer", None)
     assert release_timer is not None

@@ -59,7 +59,30 @@ def test_post_solve_symbol_table_exposes_canonical_names_only():
     assert symtab.get("k1") == pytest.approx(float(mech.reactions[0].rate))
     assert symtab.get("kf2") == pytest.approx(float(mech.equilibria[0].kf))
     assert symtab.get("kr2") == pytest.approx(float(mech.equilibria[0].kr))
-    assert "K2" not in symtab.user_names()
+    assert "Keq2" not in symtab.user_names()
+
+
+def test_fully_explicit_equilibrium_does_not_mark_a_derived_rate():
+    mech = parse_dsl_to_mechanism(
+        "equilibrium: A <-> B ; kf=10 ; kr=5 ; Keq=2\ninitial: A=1.0\ninitial: B=0.0",
+        initials={},
+    )
+
+    step_map = get_step_index_map(mech)
+
+    assert step_map[0]["derive_rate"] is None
+
+
+def test_symbol_table_exposes_both_K_and_Keq_aliases_for_explicit_equilibrium_constants():
+    mech = parse_dsl_to_mechanism(
+        "equilibrium: A <-> B ; kf=10 ; K=2\ninitial: A=1.0\ninitial: B=0.0",
+        initials={},
+    )
+
+    symtab = build_algebra_symbol_table(mech)
+
+    assert symtab.get("K1") == pytest.approx(2.0)
+    assert symtab.get("Keq1") == pytest.approx(2.0)
 
 
 def test_gui_parameter_enumeration_returns_canonical_names_and_derived_flags():
@@ -76,10 +99,10 @@ def test_gui_parameter_enumeration_returns_canonical_names_and_derived_flags():
     apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
 
     variables, metadata = enumerate_step_parameters_for_gui(mech)
-    assert list(variables.keys()) == ["k1", "kf2", "kr2", "K2", "k3"]
+    assert list(variables.keys()) == ["k1", "kf2", "kr2", "Keq2", "k3"]
 
     # For "kr=...; K=..." (kf not explicit), policy derives kf from kr*K and disables kf slider.
-    assert float(mech.equilibria[0].kf) == pytest.approx(float(mech.equilibria[0].kr) * float(mech.equilibria[0].metadata["K_input"]))
+    assert float(mech.equilibria[0].kf) == pytest.approx(float(mech.equilibria[0].kr) * float(mech.equilibria[0].metadata["Keq_input"]))
     assert metadata["kf2"].get("derived") is True
     assert metadata["kf2"].get("editable") is False
     assert metadata["kr2"].get("derived") is not True

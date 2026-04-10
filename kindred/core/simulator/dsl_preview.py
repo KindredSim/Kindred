@@ -18,7 +18,7 @@ class _StepLike(Protocol):
     kappa: Optional[float]
     is_equilibrium: bool
     dG_eq_J_per_mol: Optional[float]
-    K_input: Optional[float]
+    Keq_input: Optional[float]
     explicit_rates: List[float]
     user_kf_explicit: bool
     user_kr_explicit: bool
@@ -30,7 +30,7 @@ def _preview_source_for_step(step: object) -> str:
         user_kr = bool(getattr(step, "user_kr_explicit", False))
         if user_kf and user_kr:
             return "explicit"
-        if getattr(step, "K_input", None) is not None or getattr(step, "dG_eq_J_per_mol", None) is not None:
+        if getattr(step, "Keq_input", None) is not None or getattr(step, "dG_eq_J_per_mol", None) is not None:
             return "mixed(kr=derived(K))"
         if list(getattr(step, "explicit_rates", []) or []):
             return "derived(k_fast)"

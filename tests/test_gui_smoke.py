@@ -78,10 +78,11 @@ def test_loading_preset_populates_editor(main_window):
 def test_arrhenius_mechanism_runs_by_default(main_window):
     """Arrhenius-style DSL parses and simulates without any toggle."""
     dsl_text = "\n".join([
-        "reaction: A -> B; Ea=55, A=1e12, energy=kJ/mol",
+        "energy=kJ/mol",
+        "T=320",
+        "reaction: A -> B; Ea=55, A=1e12",
         "initial: A=1.0",
         "initial: B=0.0",
-        "T=320",
     ])
     result = main_window._run_dataset_simulation(dsl_text)
     assert result["t"].size > 0
@@ -205,6 +206,14 @@ def test_mechanism_editor_validation_rejects_unsupported_let_named_set_blocks(ma
     assert "let baseline = {" in label
 
 
+def test_validation_label_wraps_long_errors(main_window):
+    label = main_window._mechanism_editor._validation_label
+    size_policy = label.sizePolicy()
+
+    assert label.wordWrap() is True
+    assert size_policy.horizontalPolicy() == QtWidgets.QSizePolicy.Policy.Expanding
+
+
 def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window):
     editor = main_window._mechanism_editor
     editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
@@ -225,3 +234,15 @@ def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window
 
     assert main_window._run_btn.isEnabled() is True
     assert editor.run_btn.isEnabled() is True
+
+
+def test_mechanism_editor_locked_programmatic_text_change_validates_immediately(main_window, qt_app):
+    editor = main_window._mechanism_editor
+
+    assert editor._reactions_text.isReadOnly() is True
+
+    editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    qt_app.processEvents()
+
+    assert editor.is_mechanism_valid() is True
+    assert editor._current_validation_state == "valid"

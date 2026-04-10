@@ -294,7 +294,7 @@ class DatasetManager:
                     continue
                 context = str(entry.get("context") or "")
                 derive_rate = str(entry.get("derive_rate") or "")
-                has_K_param = bool(entry.get("has_K_param"))
+                has_Keq_param = bool(entry.get("has_Keq_param"))
 
                 if kind == "reaction":
                     name = f"k{n}"
@@ -361,17 +361,17 @@ class DatasetManager:
                                 }
                             )
 
-                    # KN only when explicitly represented/used (K_input stored in metadata)
-                    if has_K_param:
-                        K_name = f"K{n}"
-                        if K_name not in constrained:
+                    # KeqN only when explicitly represented/used (Keq_input stored in metadata)
+                    if has_Keq_param:
+                        Keq_name = f"Keq{n}"
+                        if Keq_name not in constrained:
                             meta = getattr(eq, "metadata", {}) or {}
-                            val = _as_float(meta.get("K_input"))
+                            val = _as_float(meta.get("Keq_input"))
                             if val is not None:
-                                mn, mx = self._suggest_parameter_bounds(K_name, val)
+                                mn, mx = self._suggest_parameter_bounds(Keq_name, val)
                                 params.append(
                                     {
-                                        "name": K_name,
+                                        "name": Keq_name,
                                         "value": val,
                                         "min": mn,
                                         "max": mx,
@@ -385,7 +385,7 @@ class DatasetManager:
             for definition in parameter_defs:
                 name = definition.name
                 step_index = getattr(definition, "step_index", None)
-                match = re.match(r"^(kf|kr|K|k)\d*$", str(name))
+                match = re.match(r"^(kf|kr|Keq|k)\d*$", str(name))
                 if match and step_index is not None:
                     family = match.group(1)
                     context_str = str(definition.context)
@@ -394,7 +394,7 @@ class DatasetManager:
                         family = "kf"
                     elif family == "kf" and not is_equilibrium:
                         family = "k"
-                    elif family in {"kr", "K"} and not is_equilibrium:
+                    elif family in {"kr", "Keq"} and not is_equilibrium:
                         family = "k"
                     name = f"{family}{int(step_index)}"
                 if str(name) in constrained:
@@ -813,7 +813,7 @@ class DatasetManager:
             else:
                 min_bound = 1e-10
                 max_bound = 1e10
-        elif param_name.startswith("K") and param_name[0].isupper():
+        elif param_name.startswith("Keq") and param_name[0].isupper():
             if param_value > 0:
                 min_bound = max(param_value * 0.001, 1e-6)
                 max_bound = min(param_value * 1000, 1e6)

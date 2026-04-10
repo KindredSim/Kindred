@@ -126,6 +126,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Validation indicator (shows DSL parsing status)
         self._validation_label = QtWidgets.QLabel()
+        self._validation_label.setWordWrap(True)
+        self._validation_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         self._validation_label.setStyleSheet("QLabel { padding: 4px; border-radius: 3px; }")
         self._validation_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self._set_validation_state("idle")
@@ -256,10 +261,41 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         help_layout.setContentsMargins(0, 0, 0, 0)
         help_scroll = make_scroll_area(self._help_tab)
         help_label = QtWidgets.QLabel(
-            '<pre style="white-space: pre-wrap;"><b>Global DSL Directives and Advanced Features</b>\n'
-            "energy=kJ/mol  (Supported: kJ/mol, kcal/mol)\n"
-            "T=300          (Global isothermal temperature in K)\n"
-            "[A]=1.0        (Hardcode initial conditions directly)\n"
+            '<pre style="white-space: pre-wrap;"><b>Global Directives</b>\n'
+            "energy=kJ/mol       (Supported: kJ/mol, kcal/mol, J/mol)\n"
+            "T=300               (Isothermal temperature in K)\n"
+            "C0=1.0              (Standard concentration in M)\n"
+            "kappa=1.0           (Transmission coefficient; also κ=)\n"
+            "\n"
+            "<b>Initial Conditions</b>\n"
+            "[A]=1.0, [B]=0.2    (Bracket syntax)\n"
+            "init: A=1.0, B=0.2  (Keyword syntax; also initial:)\n"
+            "\n"
+            "<b>Arrows</b>\n"
+            "Irreversible: -&gt; or =&gt;    Reversible: &lt;-&gt; or &lt;=&gt;\n"
+            "\n"
+            "<b>Reaction Parameters</b>\n"
+            "k= or kf=  (forward rate)    kr=  (reverse rate)\n"
+            "K=          (equilibrium constant; also Keq=, K_eq=)\n"
+            "dG_act=     (Eyring activation free energy)\n"
+            "dG_eq=      (equilibrium free energy)\n"
+            "A=, Ea=     (Arrhenius pre-exponential and activation energy)\n"
+            "Per-step: κ= overrides global kappa for Eyring computation.\n"
+            "\n"
+            "<b>Equilibrium Lines</b>\n"
+            "equilibrium: A &lt;=&gt; B ; K=2.5 ; kf=10\n"
+            "Requires K=, dG_eq=, or both kf= and kr=.\n"
+            "K= alone is rejected; at least one of kf= or kr= is needed.\n"
+            "\n"
+            "<b>State Network</b>\n"
+            "state: GS1 ; kind=GS ; energy=0.0\n"
+            "state: TS1 ; kind=TS ; energy=85.5 kJ/mol\n"
+            "edge: GS1,TS1   (or edge: GS1-TS1)\n"
+            "\n"
+            "<b>Temperature Schedules</b>\n"
+            "temp_const: T=350\n"
+            "temp_step: t=[0,50,100], T=[298,320]\n"
+            "temp_response: t=[0,50,100], T=[298,320], tau=10\n"
             "\n"
             "<b>Algebra and Observables (# algebra)</b>\n"
             "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
@@ -432,6 +468,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def _on_text_changed(self):
         """Handle text change event - trigger debounced validation."""
+        if bool(getattr(self, "_reactions_read_only", self._reactions_text.isReadOnly())):
+            self._validation_timer.stop()
+            self._validate_dsl()
+            return
         self._validation_timer.start()
         self._set_validation_state("validating")
 
@@ -583,7 +623,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reactions_edit_status_label.setVisible(bool(text_s.strip()))
 
     def set_reactions_read_only(self, read_only: bool) -> None:
-        self._reactions_text.setReadOnly(bool(read_only))
+        self._reactions_read_only = bool(read_only)
+        self._reactions_text.setReadOnly(self._reactions_read_only)
 
     def reactions_text(self) -> str:
         """Return the current Reaction DSL text."""

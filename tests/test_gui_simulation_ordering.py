@@ -44,7 +44,7 @@ def test_run_does_not_auto_run_pending_slider_simulation(main_window, qtbot, mon
     main_window._extract_and_populate_variables()
 
     sliders = main_window._mechanism_editor._variable_sliders
-    assert sliders.has_variable("K1")
+    assert sliders.has_variable("Keq1")
 
     created: list[dict] = []
     full_run_holder: dict[str, object] = {"worker": None}
@@ -101,13 +101,13 @@ def test_run_does_not_auto_run_pending_slider_simulation(main_window, qtbot, mon
 
     monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _ControlledWorker)
 
-    # Simulate a K1 drag+release to arm the slider-release commit timer.
+    # Simulate a Keq1 drag+release to arm the slider-release commit timer.
     preview = main_window._preview_session
-    main_window._on_slider_drag_started("K1")
-    slider_widget = sliders._sliders["K1"]
+    main_window._on_slider_drag_started("Keq1")
+    slider_widget = sliders._sliders["Keq1"]
     slider_widget.setValue(min(slider_widget.maximum(), slider_widget.value() + 50))
-    qtbot.waitUntil(lambda: "K1" in preview._pending_slider_values, timeout=1000)
-    main_window._on_slider_drag_finished("K1")
+    qtbot.waitUntil(lambda: "Keq1" in preview._pending_slider_values, timeout=1000)
+    main_window._on_slider_drag_finished("Keq1")
 
     # Start a full Run while the release commit is still pending.
     main_window.simulation_controller.run_simulation()

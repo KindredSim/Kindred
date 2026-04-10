@@ -59,6 +59,7 @@ class _ContractMainWindow(QtWidgets.QWidget):
         self.get_mechanism_text_calls = 0
         self.mechanism_reactions_text_raw_calls = 0
         self.temperature_spinbox_value_calls = 0
+        self.finalize_authoritative_write_calls: list[bool] = []
 
     def __getattr__(self, name: str):
         if str(name).startswith("_"):
@@ -82,6 +83,9 @@ class _ContractMainWindow(QtWidgets.QWidget):
     def get_mechanism_text(self) -> str:
         self.get_mechanism_text_calls += 1
         return str(self._mechanism_text)
+
+    def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
+        self.finalize_authoritative_write_calls.append(bool(dispatch_consumers))
 
     def temperature_spinbox_value(self) -> float:
         self.temperature_spinbox_value_calls += 1
@@ -279,7 +283,7 @@ def test_gui_computational_mode_dialog_writes_blocks_and_populates_energy_slider
     assert any(name.startswith("dG_eq__") for name in variables), "Expected ΔG° slider variable"
 
     # Derived kf/kr/K are display-only (not present as sliders in energy mode).
-    assert not any(name.startswith(("k", "kf", "kr", "K")) for name in variables)
+    assert not any(name.startswith(("k", "kf", "kr", "Keq")) for name in variables)
 
     # Close dialog.
     _wait_for_dialog_deletion(dialog, qtbot)

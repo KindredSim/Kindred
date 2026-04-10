@@ -8,20 +8,13 @@ import pytest
 
 from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.gui.main_window import MainWindow
+from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FakeRuntimeHost:
-    _parse_mechanism_semicolon_kv = staticmethod(MainWindow._parse_mechanism_semicolon_kv)
-    _serialize_mechanism_semicolon_kv = staticmethod(MainWindow._serialize_mechanism_semicolon_kv)
-    _dedupe_tokens_case_insensitive = staticmethod(MainWindow._dedupe_tokens_case_insensitive)
-    _get_token_float = staticmethod(MainWindow._get_token_float)
-    _set_token_float = staticmethod(MainWindow._set_token_float)
-    _remove_token_aliases = staticmethod(MainWindow._remove_token_aliases)
-
     def __init__(
         self,
         *,
@@ -44,7 +37,10 @@ class _FakeRuntimeHost:
         self._temperature_override_calls: list[tuple[bool, str]] = []
         self._temperature_mode_indicator_texts: list[str] = []
         self._best_effort_failures: list[tuple[str, str]] = []
-        self._sim_controller = SimpleNamespace(run_state=SimpleNamespace())
+        self._sim_controller = SimpleNamespace(
+            run_state=SimpleNamespace(),
+            ensure_parallel_batch_pool_eagerly_created=lambda: None,
+        )
         self._slider_runtime_dirty = False
         self._slider_overrides: Dict[str, float] = {}
         self._slider_overrides_by_set: Dict[str, Dict[str, float]] = {}
@@ -84,6 +80,9 @@ class _FakeRuntimeHost:
     ) -> None:
         _ = (description, record_undo)
         self._reactions_text = str(new_text)
+
+    def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
+        _ = dispatch_consumers
 
     def temperature_spinbox_value(self) -> float:
         return float(self._temperature_k)
@@ -179,6 +178,54 @@ def test_runtime_extract_and_parameter_refresh_use_public_main_window_boundary()
 
 
 @pytest.mark.unit
+def test_runtime_extract_eagerly_creates_parallel_pool_after_first_successful_parse() -> None:
+    factory_calls: list[tuple[int, bool]] = []
+
+    class _FakeExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self._max_workers = int(max_workers)
+
+        def submit(self, _fn, *_args, **_kwargs):
+            return object()
+
+        def shutdown(self, *args, **kwargs):
+            _ = args, kwargs
+            return None
+
+    class _FakePoolController:
+        def __init__(self) -> None:
+            self.parallel_batch = ParallelBatchExecutor(
+                executor_factory=self._factory,
+                max_parallel_workers=4,
+            )
+            self._pool_eagerly_created = False
+            self.calls = 0
+            self.run_state = SimpleNamespace()
+
+        def _factory(self, max_workers: int, limit_blas_threads: bool) -> _FakeExecutor:
+            factory_calls.append((int(max_workers), bool(limit_blas_threads)))
+            return _FakeExecutor(max_workers)
+
+        def ensure_parallel_batch_pool_eagerly_created(self) -> None:
+            self.calls += 1
+            if self._pool_eagerly_created:
+                return
+            self.parallel_batch.ensure_executor(max_workers=self.parallel_batch.max_parallel_workers)
+            self._pool_eagerly_created = True
+
+    host = _FakeRuntimeHost(reactions_text="reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0")
+    host._sim_controller = _FakePoolController()
+    runtime = MainWindowVariableRuntime(host)
+
+    runtime.extract_and_populate_variables()
+    runtime.extract_and_populate_variables()
+
+    assert host._sim_controller.parallel_batch.executor is not None
+    assert factory_calls == [(4, True)]
+    assert host._sim_controller.calls == 2
+
+
+@pytest.mark.unit
 def test_runtime_extract_ignores_supported_named_inline_initial_set_blocks_without_rewriting_text() -> None:
     host = _FakeRuntimeHost(
         reactions_text="\n".join(
@@ -223,6 +270,87 @@ def test_runtime_extract_keeps_unsupported_let_named_set_blocks_invalid() -> Non
 
 
 @pytest.mark.unit
+def test_runtime_sanitize_mechanism_parameter_conflicts_canonicalizes_keq_to_k() -> None:
+    host = _FakeRuntimeHost(reactions_text="equilibrium: A <-> B ; kf=6 ; Keq=3")
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(
+        host.mechanism_reactions_text_raw()
+    )
+
+    assert sanitized_text == "equilibrium: A <-> B ; kf=6, Keq=3"
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_extract_keq_alias_writeback_preserves_equilibrium_value() -> None:
+    original_text = "equilibrium: A <-> B ; kf=6 ; Keq=3"
+    host = _FakeRuntimeHost(reactions_text=original_text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, _, _ = runtime.sanitize_mechanism_parameter_conflicts(original_text)
+    original = parse_dsl_to_mechanism(original_text, initials={})
+    sanitized = parse_dsl_to_mechanism(sanitized_text, initials={})
+
+    assert sanitized_text == "equilibrium: A <-> B ; kf=6, Keq=3"
+    assert float(original.equilibria[0].kf) == pytest.approx(float(sanitized.equilibria[0].kf))
+    assert float(original.equilibria[0].kr) == pytest.approx(float(sanitized.equilibria[0].kr))
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_duplicate_keq_aliases_leaves_text_unchanged() -> None:
+    text = "equilibrium: A <-> B ; kf=1 ; Keq=3 ; Keq=5"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_case_only_duplicate_keq_aliases_leaves_text_unchanged() -> None:
+    text = "equilibrium: A <-> B ; kf=1 ; Keq=3 ; keq=5"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_duplicate_reaction_k_tokens_leaves_text_unchanged() -> None:
+    text = "reaction: A -> B ; k=3 ; k=5"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
+def test_runtime_sanitize_duplicate_reversible_kf_tokens_leaves_text_unchanged() -> None:
+    text = "reaction: A <-> B ; kf=3 ; kf=5 ; K=2"
+    host = _FakeRuntimeHost(reactions_text=text)
+    runtime = MainWindowVariableRuntime(host)
+
+    sanitized_text, baseline_variables, baseline_metadata = runtime.sanitize_mechanism_parameter_conflicts(text)
+
+    assert sanitized_text == text
+    assert baseline_variables == {}
+    assert baseline_metadata == {}
+
+
+@pytest.mark.unit
 def test_runtime_energy_mode_sync_uses_public_main_window_boundary() -> None:
     host = _FakeRuntimeHost(reactions_text="")
     mechanism = SimpleNamespace(metadata={"temperature_K": 200.0})
@@ -256,7 +384,7 @@ def test_runtime_energy_mode_population_uses_public_slider_and_plot_seams() -> N
     assert any(name.startswith("dGact_fwd__") for name in slider_values)
     assert any(name.startswith("dG_eq__") for name in slider_values)
     assert host._parameter_summary_updates
-    assert "K (A→B via TS1)" in host._parameter_summary_updates[-1]
+    assert "Keq (A→B via TS1)" in host._parameter_summary_updates[-1]
 
 
 @pytest.mark.unit
@@ -295,7 +423,7 @@ def test_runtime_energy_mode_population_accepts_structured_energy_result_mechani
     )
 
     assert host._parameter_summary_updates
-    assert host._parameter_summary_updates[-1]["K (A→B via TS1)"][0] == pytest.approx(
+    assert host._parameter_summary_updates[-1]["Keq (A→B via TS1)"][0] == pytest.approx(
         K_from_deltaG_eq(5000.0, 298.15)
     )
     assert host._best_effort_failures == []

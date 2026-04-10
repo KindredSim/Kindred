@@ -26,7 +26,7 @@ def test_mechanism_clone_copies_mutable_containers_and_shares_rate_objects():
     mech.add_equilibrium(
         {"A": -1.0},
         {"A": 1.0},
-        K=1.0,
+        Keq=1.0,
         metadata={"tag": "eq1"},
     )
 

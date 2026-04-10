@@ -38,7 +38,7 @@ def test_main_window_close_event_defers_for_stubborn_simulation_worker(main_wind
         main_window.closeEvent(event)
 
         assert worker.cancel_called is True
-        assert worker.wait_calls == [2000]
+        assert worker.wait_calls == []
         assert event.isAccepted() is False
         assert worker in main_window.simulation_controller._retained_simulation_workers
     finally:
@@ -62,7 +62,7 @@ def test_main_window_close_event_retries_cleanup_for_retained_running_worker_aft
         main_window.closeEvent(event)
 
         assert worker.cancel_called is True
-        assert worker.wait_calls == [2000]
+        assert worker.wait_calls == []
         assert event.isAccepted() is False
         assert worker in controller._retained_simulation_workers
     finally:
@@ -94,7 +94,7 @@ def test_main_window_close_event_deferral_keeps_tracked_fit_windows_open(main_wi
         main_window.closeEvent(event)
 
         assert worker.cancel_called is True
-        assert worker.wait_calls == [2000]
+        assert worker.wait_calls == []
         assert event.isAccepted() is False
         assert fit_window.close_events == 0
         assert fit_window.isVisible() is True

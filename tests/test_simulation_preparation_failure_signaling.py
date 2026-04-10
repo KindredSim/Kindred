@@ -103,6 +103,31 @@ def test_prepare_simulation_worker_run_rejects_unknown_prepared_payload_version(
         )
 
 
+def test_prepare_bound_mechanism_stops_before_binding_on_namespace_prepass_failure(monkeypatch) -> None:
+    from kindred.core.simulation_preparation import (
+        prepare_bound_mechanism,
+    )
+    from kindred.core.exceptions import FitSimulationError
+
+    monkeypatch.setattr(
+        "kindred.core.simulator.parameter_algebra.mechanism_parameter_namespace",
+        lambda _mechanism: (_ for _ in ()).throw(ValueError("namespace sentinel")),
+    )
+    monkeypatch.setattr(
+        "kindred.core.simulation_preparation._bind_parameters_to_mechanism",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("bind reached")),
+    )
+
+    with pytest.raises(FitSimulationError, match="namespace sentinel") as exc:
+        prepare_bound_mechanism(
+            "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0\n",
+            ["k1"],
+            initials={"A": 1.0, "B": 0.0},
+        )
+
+    assert "parameter_algebra" in str(exc.value)
+
+
 def test_prepare_simulation_worker_run_accepts_structured_execution_request_without_text(monkeypatch) -> None:
     from kindred.core.simulation_preparation import (
         SimulationExecutionRequest,

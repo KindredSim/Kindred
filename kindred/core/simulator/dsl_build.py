@@ -17,6 +17,7 @@ from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
+from .parameter_namespace import _namespace_policy_from_step
 
 logger = logging.getLogger(__name__)
 
@@ -118,33 +119,33 @@ def build_mechanism_from_ir(
             if sc is not None:
                 rxn_overrides["standard_conc_M"] = float(sc)
 
-        reversible = bool(getattr(step, "reversible", False))
         is_equilibrium = bool(getattr(step, "is_equilibrium", False))
+        namespace_policy = _namespace_policy_from_step(step)
         kr_attr = getattr(step, "kr", None)
-        is_equilibrium_step = bool(is_equilibrium or (reversible and kr_attr is not None))
+        is_equilibrium_step = namespace_policy.step_kind == "equilibrium"
 
         if is_equilibrium_step:
             kf_val = float(getattr(step, "kf"))
             kr_val = float(kr_attr) if kr_attr is not None else None
-            K_input = getattr(step, "K_input", None)
+            Keq_input = getattr(step, "Keq_input", None)
             user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
             user_kr_explicit = bool(getattr(step, "user_kr_explicit", False))
 
-            if K_input is not None and kr_val is not None and (user_kr_explicit ^ user_kf_explicit):
+            if Keq_input is not None and kr_val is not None and (user_kr_explicit ^ user_kf_explicit):
                 try:
-                    K_in = float(K_input)
+                    Keq_in = float(Keq_input)
                 except Exception:
-                    K_in = float("nan")
-                if math.isfinite(K_in) and abs(K_in) > 1e-30:
-                    # Deterministic policy so explicit K always has semantics:
-                    # - if only kr was explicitly provided, derive kf from kr and K
-                    # - otherwise derive kr from kf and K
+                    Keq_in = float("nan")
+                if math.isfinite(Keq_in) and abs(Keq_in) > 1e-30:
+                    # Deterministic policy so explicit Keq always has semantics:
+                    # - if only kr was explicitly provided, derive kf from kr and Keq
+                    # - otherwise derive kr from kf and Keq
                     if user_kr_explicit and not user_kf_explicit:
-                        kf_val = kr_val * K_in
+                        kf_val = kr_val * Keq_in
                     else:
-                        kr_val = kf_val / K_in
+                        kr_val = kf_val / Keq_in
 
-            K = kf_val / kr_val if kr_val and kr_val != 0 else None
+            Keq = kf_val / kr_val if kr_val and kr_val != 0 else None
 
             forward_model: Optional[Dict[str, object]] = None
             if model == "Arrhenius" and getattr(step, "arrhenius_A", None) is not None and getattr(
@@ -170,7 +171,7 @@ def build_mechanism_from_ir(
                 dG_eq_J_per_mol=float(getattr(step, "dG_eq_J_per_mol"))
                 if getattr(step, "dG_eq_J_per_mol", None) is not None
                 else None,
-                K_input=K_input,
+                Keq_input=Keq_input,
                 explicit_rates=tuple(float(x) for x in (getattr(step, "explicit_rates", []) or [])),
                 forward_model=forward_model,
                 standard_conc_M=float(getattr(step, "standard_conc_M"))
@@ -182,7 +183,7 @@ def build_mechanism_from_ir(
             mechanism.add_equilibrium(
                 stoich_forward=reactants,
                 stoich_back=products,
-                K=K,
+                Keq=Keq,
                 kf=kf_val,
                 kr=kr_val,
                 fast=is_equilibrium,  # Mark "equilibrium:" lines as fast
@@ -195,24 +196,26 @@ def build_mechanism_from_ir(
         # Record canonical step-index mapping for downstream layers (GUI/algebra/fitting).
         arrow = "<->" if is_equilibrium_step else "->"
         context = f"{_fmt_side(reactants)} {arrow} {_fmt_side(products)}"
-        has_K_param = bool(getattr(step, "K_input", None) is not None)
+        has_Keq_param = namespace_policy.has_explicit_keq
         derive_rate = None
-        if is_equilibrium_step and has_K_param:
+        if is_equilibrium_step and has_Keq_param:
             user_kf_explicit = bool(getattr(step, "user_kf_explicit", False))
             user_kr_explicit = bool(getattr(step, "user_kr_explicit", False))
-            if user_kr_explicit and not user_kf_explicit:
+            if user_kf_explicit and user_kr_explicit:
+                derive_rate = None
+            elif user_kr_explicit and not user_kf_explicit:
                 derive_rate = "kf"
             else:
                 derive_rate = "kr"
 
         entry: Dict[str, object] = {
             "step_index": int(step_no),
-            "kind": "equilibrium" if is_equilibrium_step else "reaction",
+            "kind": namespace_policy.step_kind,
             "context": context,
         }
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
-            entry["has_K_param"] = bool(has_K_param)
+            entry["has_Keq_param"] = bool(has_Keq_param)
             entry["derive_rate"] = derive_rate
             entry["user_provided_kf"] = bool(getattr(step, "user_kf_explicit", False))
             entry["user_provided_kr"] = bool(getattr(step, "user_kr_explicit", False))
@@ -257,7 +260,7 @@ def build_mechanism_from_ir(
             mechanism.add_equilibrium(
                 stoich_forward=eq.stoich_forward,
                 stoich_back=eq.stoich_back,
-                K=eq.K,
+                Keq=eq.Keq,
                 kf=eq.kf,
                 kr=eq.kr,
                 fast=eq.fast,
@@ -265,7 +268,7 @@ def build_mechanism_from_ir(
             )
 
         # Safety guard: state-network generated steps do not participate in canonical step indexing
-        _CANON = re.compile(r"^(k|kf|kr|K)\d+$")
+        _CANON = re.compile(r"^(k|kf|kr|Keq)\d+$")
 
         def _fail(reason: str) -> None:
             raise DSLError(
@@ -297,7 +300,7 @@ def build_mechanism_from_ir(
         for i, eq in enumerate((getattr(mechanism, "equilibria", []) or [])[eq_start:], start=eq_start + 1):
             _check_value(getattr(eq, "kf", None), where=f"State-network equilibrium[{i}].kf")
             _check_value(getattr(eq, "kr", None), where=f"State-network equilibrium[{i}].kr")
-            _check_value(getattr(eq, "K", None), where=f"State-network equilibrium[{i}].K")
+            _check_value(getattr(eq, "Keq", None), where=f"State-network equilibrium[{i}].Keq")
 
         logger.info(
             "After state network integration: %s species, %s reactions, %s equilibria",

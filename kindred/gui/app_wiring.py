@@ -113,7 +113,7 @@ BATCH_DOCK_SPEC = DockShellSpec(
     attr_name="_batch_dock",
     title="Initial Conditions",
     object_name="batchDock",
-    default_area=QtCore.Qt.LeftDockWidgetArea,
+    default_area=QtCore.Qt.RightDockWidgetArea,
 )
 RIGHT_DOCK_SPEC = DockShellSpec(
     identity_key="data",
@@ -175,11 +175,18 @@ def _dock_features() -> Any:
 def build_shell_dock(main_window: MainWindow, spec: DockShellSpec):
     from PySide6 import QtWidgets
 
+    from kindred.gui.widgets.dock_title_bar import DockTitleBar
+
     dock = QtWidgets.QDockWidget(spec.title, main_window)
     dock.setObjectName(spec.object_name)
     configure_module_dock_defaults(dock, default_area=spec.default_area)
     dock.setFeatures(_dock_features())
     dock.setFloating(False)
+
+    title_bar = DockTitleBar(title=spec.title, dock=dock, parent=dock)
+    dock.setTitleBarWidget(title_bar)
+    dock.windowTitleChanged.connect(title_bar.set_title)
+
     return dock
 
 

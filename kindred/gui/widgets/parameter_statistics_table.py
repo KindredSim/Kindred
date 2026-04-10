@@ -59,13 +59,13 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
 
 
 def _param_sort_key(name: str):
-    # Natural-ish ordering for k/kf/kr/K with numeric suffix; otherwise alpha.
+    # Natural-ish ordering for k/kf/kr/Keq with numeric suffix; otherwise alpha.
     import re
 
-    m = re.match(r"^(kf|kr|k|K)(\d+)$", str(name))
+    m = re.match(r"^(kf|kr|k|Keq)(\d+)$", str(name))
     if m:
         family = m.group(1)
         idx = int(m.group(2))
-        fam_order = {"k": 0, "kf": 1, "kr": 2, "K": 3}.get(family, 9)
+        fam_order = {"k": 0, "kf": 1, "kr": 2, "Keq": 3}.get(family, 9)
         return (0, fam_order, idx)
     return (1, str(name))

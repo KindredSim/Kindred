@@ -7,6 +7,16 @@ import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from kindred.core.api.simulation import prepare_bound_mechanism
+from kindred.core.simulator.dsl_text_update import (
+    _dedupe_tokens_case_insensitive,
+    _duplicate_canonical_step_token,
+    _get_token_float,
+    _is_equilibrium_k_token,
+    _parse_mechanism_semicolon_kv,
+    _remove_token_aliases,
+    _serialize_mechanism_semicolon_kv,
+    _set_token_float,
+)
 
 if TYPE_CHECKING:
     from kindred.core.simulation_preparation import BoundMechanism
@@ -114,14 +124,6 @@ class MainWindowVariableRuntime:
         self,
         text: str,
     ) -> tuple[str, "OrderedDict[str, float]", "OrderedDict[str, Dict[str, object]]"]:
-        mw = self._mw
-        parse_components = mw._parse_mechanism_semicolon_kv
-        serialize_line = mw._serialize_mechanism_semicolon_kv
-        dedupe_tokens = mw._dedupe_tokens_case_insensitive
-        get_value = mw._get_token_float
-        set_value = mw._set_token_float
-        remove_keys = mw._remove_token_aliases
-
         lines = text.split("\n")
         changed = False
         variables: OrderedDict[str, float] = OrderedDict()
@@ -133,16 +135,20 @@ class MainWindowVariableRuntime:
                 continue
 
             lower = stripped.lower()
-            prefix, tokens, comment = parse_components(line)
-            tokens = dedupe_tokens(tokens)
+            prefix, tokens, comment = _parse_mechanism_semicolon_kv(line)
+            if _duplicate_canonical_step_token(tokens) is not None:
+                continue
+            tokens = _dedupe_tokens_case_insensitive(tokens)
 
             original_line = line
 
             if "<->" in lower or "<=>" in lower:
-                k_explicit = any(k == "K" for k, _ in tokens)
-                kf_val = get_value(tokens, ("kf", "k"))
-                kr_val = get_value(tokens, ("kr",))
-                k_val = get_value(tokens, ("K",)) if k_explicit else None
+                if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
+                    continue
+                k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)
+                kf_val = _get_token_float(tokens, ("kf", "k"))
+                kr_val = _get_token_float(tokens, ("kr",))
+                k_val = _get_token_float(tokens, ("Keq",)) if k_explicit else None
 
                 if kf_val is not None and (not math.isfinite(kf_val) or kf_val <= 0):
                     kf_val = None
@@ -152,20 +158,20 @@ class MainWindowVariableRuntime:
                     k_val = None
 
                 if kf_val is not None:
-                    set_value(tokens, "kf", kf_val, aliases=("k",))
+                    _set_token_float(tokens, "kf", kf_val, aliases=("k",))
                 if kr_val is not None:
-                    set_value(tokens, "kr", kr_val)
+                    _set_token_float(tokens, "kr", kr_val)
                 if k_explicit and k_val is not None:
-                    set_value(tokens, "K", k_val)
+                    _set_token_float(tokens, "Keq", k_val)
 
-                remove_keys(tokens, ("k",))
-                new_line = serialize_line(prefix, tokens, comment)
+                _remove_token_aliases(tokens, ("k",))
+                new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
             elif "->" in lower:
-                rate_val = get_value(tokens, ("k", "kf"))
+                rate_val = _get_token_float(tokens, ("k", "kf"))
                 if rate_val is not None:
-                    set_value(tokens, "k", rate_val)
-                remove_keys(tokens, ("kf", "kr"))
-                new_line = serialize_line(prefix, tokens, comment)
+                    _set_token_float(tokens, "k", rate_val)
+                _remove_token_aliases(tokens, ("kf", "kr"))
+                new_line = _serialize_mechanism_semicolon_kv(prefix, tokens, comment)
             else:
                 continue
 
@@ -216,6 +222,14 @@ class MainWindowVariableRuntime:
                         "Normalize mechanism parameter tokens for sliders",
                         record_undo=False,
                     )
+                    sync_authoritative_write = getattr(
+                        mw,
+                        "finalize_authoritative_mechanism_widget_write",
+                        None,
+                    )
+                    if not callable(sync_authoritative_write):
+                        raise RuntimeError("MainWindow authoritative write finalizer is unavailable.")
+                    sync_authoritative_write(dispatch_consumers=False)
                 finally:
                     setattr(mw, "_suppress_authoritative_mechanism_input_change", previous_authoritative_suppress)
                 mechanism_text = sanitized_text
@@ -237,6 +251,8 @@ class MainWindowVariableRuntime:
             except Exception as exc:
                 logger.warning("Could not parse mechanism for variable extraction: %s", exc)
                 return
+
+            mw._sim_controller.ensure_parallel_batch_pool_eagerly_created()
 
             unit_map = solver_parameter_units_from_mechanism(mechanism)
 
@@ -379,10 +395,10 @@ class MainWindowVariableRuntime:
 
         # Ensure constrained mechanism parameters are bound even if the user isn't directly editing them.
         try:
-            mechanism_param_names = {k for k in meta_map.keys() if re.match(r"^(k|kf|kr|K)\d+$", str(k))}
+            mechanism_param_names = {k for k in meta_map.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
             spec = mw._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
             if spec is not None and getattr(spec, "param_statements", None):
-                constrained = {p.name for p in spec.param_statements if re.match(r"^(k|kf|kr|K)\d+$", str(p.name))}
+                constrained = {p.name for p in spec.param_statements if re.match(r"^(k|kf|kr|Keq)\d+$", str(p.name))}
                 if constrained:
                     param_names = sorted(set(param_names) | constrained)
         except Exception as exc:
@@ -521,8 +537,8 @@ class MainWindowVariableRuntime:
             try:
                 return float(raw_value() if callable(raw_value) else raw_value)
             except Exception:
-                if role == "K":
-                    meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("K_input")
+                if role == "Keq":
+                    meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("Keq_input")
                     try:
                         return float(meta_value() if callable(meta_value) else meta_value)
                     except Exception:
@@ -653,7 +669,7 @@ class MainWindowVariableRuntime:
                     "std_conc_product_product": std_prod,
                     "kf": _equilibrium_value(eq, "kf"),
                     "kr": _equilibrium_value(eq, "kr"),
-                    "K": _equilibrium_value(eq, "K"),
+                    "Keq": _equilibrium_value(eq, "Keq"),
                     "unit_kf": unit_kf,
                     "unit_kr": unit_kr,
                 }
@@ -910,7 +926,7 @@ class MainWindowVariableRuntime:
             params[f"ΔG° ({label})"] = (dg_eq, energy_unit)
             params[f"k_f ({label})"] = (float(ch["kf"]), str(ch.get("unit_kf") or "1/s"))
             params[f"k_r ({label})"] = (float(ch["kr"]), str(ch.get("unit_kr") or "1/s"))
-            params[f"K ({label})"] = (float(ch["K"]), "1")
+            params[f"Keq ({label})"] = (float(ch["Keq"]), "1")
 
         def _slug(text: str) -> str:
             return re.sub(r"[^A-Za-z0-9_]+", "_", str(text or "").strip()).strip("_") or "fast_eq"
@@ -956,7 +972,7 @@ class MainWindowVariableRuntime:
             params[f"ΔG° ({label})"] = (dg_eq, energy_unit)
             params[f"k_f ({label})"] = (kf_fixed, str(ch.get("unit_kf") or "1/s"))
             params[f"k_r ({label})"] = (kr_val, str(ch.get("unit_kr") or "1/s"))
-            params[f"K ({label})"] = (k_thermo, "1")
+            params[f"Keq ({label})"] = (k_thermo, "1")
 
         self.set_variable_metadata(dict(vmeta))
         visibility_scope_signature = self._slider_visibility_scope_signature(dict(variables), dict(vmeta))

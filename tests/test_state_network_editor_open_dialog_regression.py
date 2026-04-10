@@ -23,6 +23,9 @@ def _find_state_network_dialog() -> QtWidgets.QDialog:
 
 
 def _unlock_reactions_editing(main_window: MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+    reactions_widget = main_window._mechanism_editor._reactions_text
+    if not reactions_widget.toPlainText().strip():
+        reactions_widget.setPlainText("reaction: A -> B; k=1.0")
     monkeypatch.setattr(main_window, "_prompt_mechanism_edit_unlock_warning", lambda: True)
     main_window._mechanism_edit_lock_action.trigger()
     assert main_window.mechanism_editing_locked() is False
@@ -137,7 +140,7 @@ def test_locked_state_network_dialog_opens_read_only_and_blocks_mutation(main_wi
     assert observed["dsl"] == baseline
 
 
-def test_unlocked_state_network_dialog_still_applies_immediate_edits(
+def test_unlocked_state_network_dialog_keeps_canonical_state_until_relock(
     main_window: MainWindow,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -145,7 +148,7 @@ def test_unlocked_state_network_dialog_still_applies_immediate_edits(
     editor = main_window._mechanism_editor._state_network_editor
     editor.clear()
 
-    observed = {"dsl": None}
+    observed = {"canonical_dsl": None, "widget_dsl": None}
 
     def _edit_and_close() -> None:
         dialog = _find_state_network_dialog()
@@ -162,15 +165,17 @@ def test_unlocked_state_network_dialog_still_applies_immediate_edits(
         assert editor._states_table.rowCount() >= 1
         editor._states_table.item(editor._states_table.rowCount() - 1, 0).setText("A")
         _process_events_bounded()
-        observed["dsl"] = main_window.mechanism_state_network_dsl_raw()
+        observed["canonical_dsl"] = main_window.mechanism_state_network_dsl_raw()
+        observed["widget_dsl"] = editor.get_state_network_dsl()
         dialog.reject()
 
     QtCore.QTimer.singleShot(0, _edit_and_close)
     main_window._open_state_network()
     _process_events_bounded()
 
-    assert observed["dsl"] is not None
-    assert "state:" in observed["dsl"]
+    assert observed["canonical_dsl"] == ""
+    assert observed["widget_dsl"] is not None
+    assert "state:" in observed["widget_dsl"]
 
 
 def test_locking_state_network_dialog_closes_active_cell_editor_without_committing(
