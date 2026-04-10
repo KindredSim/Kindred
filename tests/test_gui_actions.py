@@ -35,11 +35,12 @@ def _load_minimal_dataset(window: MainWindow):
 
 
 def test_run_simulation_requires_mechanism(main_window: MainWindow, monkeypatch):
-    """Run Simulation action must surface a warning if DSL is empty."""
+    """Run Simulation action must block early when the mechanism is invalid."""
     main_window._mechanism_editor._reactions_text.setPlainText("")
     warnings = _capture_messagebox(monkeypatch, "warning")
     main_window.simulation_controller.run_simulation()
-    assert any("define" in msg for msg in warnings)
+    assert warnings == []
+    assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
     assert main_window.simulation_controller.run_state.simulation_worker is None
 
 

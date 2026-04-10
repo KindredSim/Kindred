@@ -553,6 +553,26 @@ def test_apply_project_payload_legacy_file_resets_leaky_keys(main_window):
     )
 
 
+def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_change(main_window):
+    calls: list[None] = []
+    main_window._sim_controller.parallel_batch_pool_settings_changed = lambda: calls.append(None)
+    main_window._sim_controller.parallel_batch.max_parallel_workers = 2
+    main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker = True
+
+    payload = {
+        "mechanism": "A -> B; k=1",
+        "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
+        "max_parallel_batch_workers": 7,
+        "limit_blas_threads_per_worker": False,
+    }
+
+    main_window._apply_project_payload(payload, record_undo=False)
+
+    assert int(main_window._sim_controller.parallel_batch.max_parallel_workers) == 7
+    assert bool(main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker) is False
+    assert calls == [None]
+
+
 # ── Three-tier precedence tests ──────────────────────────────────────
 
 

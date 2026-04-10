@@ -553,8 +553,8 @@ def generate_mechanism_hash(mechanism: Any) -> str:
             hasher.update(f"back:{name}:{coeff}".encode('utf-8'))
 
         # Equilibrium constant and rates
-        if eq.K is not None:
-            hasher.update(f"K:{_hash_rate_obj(eq.K)}".encode('utf-8'))
+        if eq.Keq is not None:
+            hasher.update(f"Keq:{_hash_rate_obj(eq.Keq)}".encode('utf-8'))
         if eq.kf is not None:
             hasher.update(f"kf:{_hash_rate_obj(eq.kf)}".encode('utf-8'))
         if eq.kr is not None:

@@ -9,12 +9,12 @@ pytestmark = [pytest.mark.gui]
 _NONDEFAULT_DOCK_AREAS = {
     "_mechanism_dock": QtCore.Qt.RightDockWidgetArea,
     "_sliders_dock": QtCore.Qt.RightDockWidgetArea,
-    "_batch_dock": QtCore.Qt.RightDockWidgetArea,
+    "_batch_dock": QtCore.Qt.LeftDockWidgetArea,
     "_right_dock": QtCore.Qt.LeftDockWidgetArea,
     "_analysis_dock": QtCore.Qt.LeftDockWidgetArea,
 }
-_LEFT_STACK_ATTRS = ("_mechanism_dock", "_sliders_dock", "_batch_dock")
-_RIGHT_STACK_ATTRS = ("_right_dock", "_analysis_dock")
+_LEFT_STACK_ATTRS = ("_mechanism_dock", "_sliders_dock")
+_RIGHT_STACK_ATTRS = ("_batch_dock", "_right_dock", "_analysis_dock")
 
 
 def _get_recent_menu(window) -> QtWidgets.QMenu:
@@ -45,10 +45,37 @@ def _assert_vertical_stack_contract(main_window, dock_attrs: tuple[str, ...], ar
         assert later.top() >= earlier.bottom()
 
 
+def _assert_right_column_contract(main_window) -> None:
+    """Batch on top, Data and Analysis tabified below."""
+    batch = main_window._batch_dock
+    data = main_window._right_dock
+    analysis = main_window._analysis_dock
+    area = QtCore.Qt.RightDockWidgetArea
+
+    for dock in (batch, data, analysis):
+        assert main_window.dockWidgetArea(dock) == area
+        assert dock.isFloating() is False
+
+    batch_geo = batch.geometry()
+    data_geo = data.geometry()
+
+    assert batch_geo.isValid() is True
+    assert batch_geo.width() > 0
+    assert batch_geo.height() > 0
+    assert data_geo.isValid() is True
+    assert data_geo.width() > 0
+    assert data_geo.height() > 0
+
+    assert data_geo.top() >= batch_geo.bottom()
+
+    tabified = main_window.tabifiedDockWidgets(data)
+    assert analysis in tabified
+
+
 def _assert_default_shell_contract(main_window) -> None:
     assert main_window.centralWidget() is main_window._plot_tabs
     _assert_vertical_stack_contract(main_window, _LEFT_STACK_ATTRS, QtCore.Qt.LeftDockWidgetArea)
-    _assert_vertical_stack_contract(main_window, _RIGHT_STACK_ATTRS, QtCore.Qt.RightDockWidgetArea)
+    _assert_right_column_contract(main_window)
 
 
 def _arrange_analysis_dock_into_mechanism_region(main_window, qt_app) -> None:

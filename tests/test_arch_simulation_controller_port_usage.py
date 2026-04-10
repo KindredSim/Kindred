@@ -207,6 +207,8 @@ REMAINING_SOLVER_TARGET_METHODS = {
 MECHANISM_TARGET_METHODS = {
     "slider_overrides",
     "apply_parameter_overrides_to_dsl",
+    "auto_lock_for_run",
+    "is_mechanism_ready_for_run",
     "mechanism_reactions_text_raw",
     "has_slider_overrides",
     "apply_overrides_to_text",
@@ -550,6 +552,13 @@ def test_simulation_controller_non_completion_solver_clusters_use_explicit_solve
                 "apply_overrides_to_state_network_dsl",
                 "mechanism_slider_points_value",
                 "mechanism_slider_solver_value",
+            },
+        ),
+        (
+            "_run_simulation",
+            {
+                "auto_lock_for_run",
+                "is_mechanism_ready_for_run",
             },
         ),
         (

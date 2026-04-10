@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,13 +8,20 @@ from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_to_mechanism,
     evaluate_parameter_algebra,
+    mechanism_parameter_namespace,
     parse_parameter_algebra_spec_from_dsl_text,
+    solver_parameter_units_from_mechanism,
 )
+from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 from kindred.core.simulator.parameter_units import rate_constant_unit
 
 
 def _base_mech(dsl_text: str):
     return parse_dsl_to_mechanism(dsl_text, initials={})
+
+
+def _compat_namespace(names: set[str]):
+    return build_flat_compat_namespace(names)
 
 
 def test_parameter_algebra_recomputes_on_base_change():
@@ -209,19 +217,19 @@ def test_unused_builtin_shadow_scalar_input_does_not_poison_parameter_algebra_ev
         "\n".join(
             [
                 "# Algebra",
-                "param K1 = 5",
+                "param Keq1 = 5",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "K1"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
         scalar_input_names={"sin"},
     )
 
     derived = evaluate_parameter_algebra(
         spec,
-        base_values={"kf1": 6.0, "K1": 3.0, "sin": 2.0},
+        base_values={"kf1": 6.0, "Keq1": 3.0, "sin": 2.0},
     )
 
-    assert derived["K1"] == pytest.approx(5.0)
+    assert derived["Keq1"] == pytest.approx(5.0)
 
 
 def test_referenced_builtin_shadow_scalar_input_is_rejected():
@@ -229,17 +237,17 @@ def test_referenced_builtin_shadow_scalar_input_is_rejected():
         "\n".join(
             [
                 "# Algebra",
-                "param K1 = sin",
+                "param Keq1 = sin",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "K1"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
         scalar_input_names={"sin"},
     )
 
     with pytest.raises(DSLError, match="sin"):
         evaluate_parameter_algebra(
             spec,
-            base_values={"kf1": 6.0, "K1": 3.0, "sin": 2.0},
+            base_values={"kf1": 6.0, "Keq1": 3.0, "sin": 2.0},
         )
 
 
@@ -248,21 +256,254 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
         "\n".join(
             [
                 "# Algebra",
-                "param K2 = a",
+                "param Keq2 = a",
             ]
         ),
-        mechanism_param_names={"kf1", "kr1", "K1", "kf2", "kr2", "K2"},
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1", "kf2", "kr2", "Keq2"}),
         scalar_input_names={"a"},
     )
 
     with pytest.raises(DSLError, match="Non-finite") as exc:
         evaluate_parameter_algebra(
             spec,
-            base_values={"kf1": 6.0, "K1": 3.0, "kf2": 4.0, "K2": 5.0, "a": float("nan")},
+            base_values={"kf1": 6.0, "Keq1": 3.0, "kf2": 4.0, "Keq2": 5.0, "a": float("nan")},
         )
 
     assert exc.value.line_number == 2
-    assert exc.value.line_content == "param K2 = a"
+    assert exc.value.line_content == "param Keq2 = a"
+
+
+@pytest.mark.parametrize(
+    ("line", "mechanism_param_names", "expected_name", "base_values", "expected_value"),
+    [
+        ("param K1 = 5", {"k1"}, "k1", {"k1": 1.0}, 5.0),
+        ("param K1 = 5", {"kf1", "kr1"}, "kf1", {"kf1": 2.0, "kr1": 0.5}, 5.0),
+        ("param k1 = 5", {"kf1", "kr1"}, "kf1", {"kf1": 2.0, "kr1": 0.5}, 5.0),
+        ("param KF2 = 5", {"kf2", "kr2"}, "kf2", {"kf2": 2.0, "kr2": 0.5}, 5.0),
+        ("param KR2 = 5", {"kf2", "kr2"}, "kr2", {"kf2": 2.0, "kr2": 0.5}, 5.0),
+        ("param KEQ3 = 5", {"kf3", "kr3", "Keq3"}, "Keq3", {"kf3": 8.0, "Keq3": 4.0}, 5.0),
+        ("param keq3 = 5", {"kf3", "kr3", "Keq3"}, "Keq3", {"kf3": 8.0, "Keq3": 4.0}, 5.0),
+    ],
+)
+def test_param_targets_resolve_case_insensitively_against_mechanism_namespace(
+    line,
+    mechanism_param_names,
+    expected_name,
+    base_values,
+    expected_value,
+):
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(["# Algebra", line]),
+        mechanism_namespace=_compat_namespace(mechanism_param_names),
+    )
+
+    assert [assignment.name for assignment in spec.param_statements] == [expected_name]
+
+    derived = evaluate_parameter_algebra(spec, base_values=dict(base_values))
+
+    assert derived[expected_name] == pytest.approx(expected_value)
+
+
+def test_param_k_target_rejects_equilibrium_constant_shorthand_with_keq_guidance():
+    with pytest.raises(DSLError, match="Keq1") as exc:
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(
+                [
+                    "# Algebra",
+                    "param K1 = 5",
+                ]
+            ),
+            mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
+        )
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == "param K1 = 5"
+    assert "K1" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("line", "mechanism_param_names"),
+    [
+        ("let K1 = 5", {"k1"}),
+        ("K1 = 5", {"k1"}),
+    ],
+)
+def test_k_like_non_param_assignments_reject_resolved_mechanism_targets(line, mechanism_param_names):
+    with pytest.raises(DSLError, match="use 'param K1 ="):
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(
+                [
+                    "# Algebra",
+                    line,
+                ]
+            ),
+            mechanism_namespace=_compat_namespace(mechanism_param_names),
+        )
+
+
+def test_let_k_like_name_without_mechanism_match_remains_observable():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "let K1 = 5",
+            ]
+        ),
+        mechanism_namespace=_compat_namespace({"k2"}),
+    )
+
+    assert spec.param_statements == []
+    assert spec.observable_names == {"K1"}
+
+
+@pytest.mark.parametrize(
+    ("line", "mechanism_param_names", "base_values", "expected"),
+    [
+        ("param a = 2*K1", {"k1"}, {"k1": 3.0}, 6.0),
+        ("param a = K1 + K2", {"k1", "kf2", "kr2"}, {"k1": 3.0, "kf2": 4.0}, 7.0),
+    ],
+)
+def test_rhs_mechanism_identifiers_resolve_case_insensitively(
+    line,
+    mechanism_param_names,
+    base_values,
+    expected,
+):
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                line,
+            ]
+        ),
+        mechanism_namespace=_compat_namespace(mechanism_param_names),
+    )
+
+    derived = evaluate_parameter_algebra(spec, base_values=dict(base_values))
+
+    assert derived["a"] == pytest.approx(expected)
+
+
+def test_rhs_exact_case_scalar_input_takes_priority_over_mechanism_canonicalization():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param k2 = K1",
+            ]
+        ),
+        mechanism_namespace=_compat_namespace({"k1", "k2"}),
+        scalar_input_names={"K1"},
+    )
+
+    derived = evaluate_parameter_algebra(
+        spec,
+        base_values={"k1": 1.0, "k2": 0.0, "K1": 99.0},
+    )
+
+    assert derived["k2"] == pytest.approx(99.0)
+
+
+def test_rhs_mechanism_canonicalization_applies_when_exact_case_scalar_input_is_absent():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param k2 = K1",
+            ]
+        ),
+        mechanism_namespace=_compat_namespace({"k1", "k2"}),
+    )
+
+    derived = evaluate_parameter_algebra(
+        spec,
+        base_values={"k1": 1.0, "k2": 0.0},
+    )
+
+    assert derived["k2"] == pytest.approx(1.0)
+
+
+def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_guidance():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param a = K1",
+            ]
+        ),
+        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
+    )
+
+    with pytest.raises(DSLError, match="Keq1") as exc:
+        evaluate_parameter_algebra(
+            spec,
+            base_values={"kf1": 6.0, "kr1": 2.0, "Keq1": 3.0},
+        )
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == "param a = K1"
+    assert "K1" in str(exc.value)
+
+
+def test_mechanism_parameter_namespace_requires_authoritative_step_index_map():
+    class _MechanismWithoutStepMap:
+        metadata = {}
+
+    with pytest.raises(ValueError, match="step_index_map"):
+        mechanism_parameter_namespace(_MechanismWithoutStepMap())
+
+
+def test_solver_parameter_units_requires_authoritative_step_index_map():
+    mechanism = SimpleNamespace(
+        metadata={},
+        reactions=[SimpleNamespace(order=1)],
+        equilibria=[SimpleNamespace(stoich_forward={"A": 1.0}, stoich_back={"B": 1.0})],
+    )
+
+    with pytest.raises(ValueError, match="step_index_map"):
+        solver_parameter_units_from_mechanism(mechanism)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "reactions", "equilibria", "expected_error"),
+    [
+        (
+            {"step_index_map": [{"step_index": 1, "kind": "reaction", "reaction_index": "bad"}]},
+            [SimpleNamespace(order=1)],
+            [],
+            "invalid reaction_index",
+        ),
+        (
+            {
+                "step_index_map": [
+                    {
+                        "step_index": 1,
+                        "kind": "equilibrium",
+                        "equilibrium_index": "bad",
+                        "has_Keq_param": False,
+                    }
+                ]
+            },
+            [],
+            [SimpleNamespace(stoich_forward={"A": 1.0}, stoich_back={"B": 1.0})],
+            "invalid equilibrium_index",
+        ),
+    ],
+)
+def test_solver_parameter_units_rejects_malformed_authoritative_indices(
+    metadata,
+    reactions,
+    equilibria,
+    expected_error,
+):
+    mechanism = SimpleNamespace(
+        metadata=metadata,
+        reactions=reactions,
+        equilibria=equilibria,
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        solver_parameter_units_from_mechanism(mechanism)
 
 
 def test_rate_constant_unit_formatting():

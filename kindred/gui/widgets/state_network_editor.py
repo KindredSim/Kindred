@@ -166,6 +166,7 @@ class StateNetworkEditor(QWidget):
         # Track if we're programmatically updating (to prevent signal loops)
         self._read_only = False
         self._updating = False
+        self._has_validation_errors = False
         self._logged_first_change = False
         self._debug_state_net = bool(os.environ.get("KINDRED_DEBUG_STATE_NET"))
         self._debug_states_changed_depth = 0
@@ -422,6 +423,7 @@ class StateNetworkEditor(QWidget):
         self._updating = True
         try:
             self._reset_tables()
+            self._has_validation_errors = False
             self._status_label.setText("")
         finally:
             self._updating = False
@@ -431,7 +433,14 @@ class StateNetworkEditor(QWidget):
     def is_read_only(self) -> bool:
         return bool(getattr(self, "_read_only", False))
 
-    def _close_active_table_editor(self, table: QTableWidget) -> None:
+    def is_valid(self) -> bool:
+        self._change_flush_timer.stop()
+        self._commit_active_table_editor(self._states_table)
+        self._commit_active_table_editor(self._edges_table)
+        self._validate()
+        return not bool(self._has_validation_errors)
+
+    def _open_table_editors(self, table: QTableWidget) -> list[QWidget]:
         open_editors = []
         active_editor = QApplication.focusWidget()
         if active_editor is not None and active_editor is not table and table.isAncestorOf(active_editor):
@@ -441,6 +450,26 @@ class StateNetworkEditor(QWidget):
                 if editor is table or not table.isAncestorOf(editor) or editor in open_editors:
                     continue
                 open_editors.append(editor)
+        return open_editors
+
+    def _commit_active_table_editor(self, table: QTableWidget) -> None:
+        for editor in self._open_table_editors(table):
+            with suppress(RuntimeError, TypeError):
+                delegate = table.itemDelegate()
+                if delegate is not None:
+                    delegate.commitData.emit(editor)
+                    delegate.closeEditor.emit(
+                        editor,
+                        QAbstractItemDelegate.EndEditHint.SubmitModelCache,
+                    )
+            with suppress(RuntimeError, TypeError):
+                table.closeEditor(
+                    editor,
+                    QAbstractItemDelegate.EndEditHint.SubmitModelCache,
+                )
+
+    def _close_active_table_editor(self, table: QTableWidget) -> None:
+        open_editors = self._open_table_editors(table)
         if not open_editors:
             return
         for editor in open_editors:
@@ -656,10 +685,45 @@ class StateNetworkEditor(QWidget):
                 self._debug_reentrancy_exit("validate")
                 return
         try:
-            states = self.get_states()
-            edges = self.get_edges()
-
+            states = []
             errors = []
+            for row in range(self._states_table.rowCount()):
+                name_item = self._states_table.item(row, 0)
+                kind_item = self._states_table.item(row, 1)
+                energy_item = self._states_table.item(row, 2)
+                unit_item = self._states_table.item(row, 3)
+                deg_item = self._states_table.item(row, 4)
+
+                name = name_item.text().strip() if name_item and name_item.text().strip() else ""
+                if not name:
+                    continue
+
+                energy = 0.0
+                energy_text = energy_item.text().strip() if energy_item and energy_item.text().strip() else ""
+                if energy_text:
+                    try:
+                        energy = float(energy_text)
+                    except ValueError:
+                        errors.append(f"State '{name}' has invalid energy")
+
+                degeneracy = 1.0
+                degeneracy_text = deg_item.text().strip() if deg_item and deg_item.text().strip() else ""
+                if degeneracy_text:
+                    try:
+                        degeneracy = float(degeneracy_text)
+                    except ValueError:
+                        errors.append(f"State '{name}' has invalid degeneracy")
+
+                states.append(
+                    {
+                        "name": name,
+                        "kind": kind_item.text().strip() if kind_item and kind_item.text().strip() else "GS",
+                        "energy": energy,
+                        "unit": unit_item.text().strip() if unit_item and unit_item.text().strip() else "kJ/mol",
+                        "degeneracy": degeneracy,
+                    }
+                )
+            edges = self.get_edges()
 
             # Check for duplicate state names
             names = [s["name"] for s in states]
@@ -687,6 +751,7 @@ class StateNetworkEditor(QWidget):
                     if name in degree and degree[name] != 2:
                         errors.append(f"TS '{name}' has degree {degree[name]}, must be 2")
 
+            self._has_validation_errors = bool(errors)
             if errors:
                 self._status_label.setText("⚠️ " + "; ".join(errors))
                 self._status_label.setStyleSheet("font-weight: bold;")

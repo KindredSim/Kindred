@@ -5,7 +5,13 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from queue import Empty, SimpleQueue
 from time import perf_counter
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from kindred.core.batch_parallel import prewarm_worker_imports
+
+
+def _noop_record_nonfatal_exception(_message: str, _exc: BaseException) -> None:
+    return None
 
 
 @dataclass
@@ -20,12 +26,15 @@ class ParallelBatchExecutor:
     executor_factory: Callable[[int, bool], Any]
     max_parallel_workers: int = 12
     limit_blas_threads_per_worker: bool = True
+    record_nonfatal_exception: Callable[[str, BaseException], None] = _noop_record_nonfatal_exception
     executor: Any = None
     future_map: Dict[str, Any] = field(default_factory=dict)
     future_meta: Dict[str, Dict[str, str]] = field(default_factory=dict)
     superseded_future_map: Dict[str, Any] = field(default_factory=dict)
     superseded_future_meta: Dict[str, Dict[str, str]] = field(default_factory=dict)
     completed_queue: SimpleQueue[Tuple[str, float]] = field(default_factory=SimpleQueue)
+    _current_max_workers: Optional[int] = None
+    _pool_stale: bool = False
 
     def reset_active_run_state(self) -> None:
         self.future_map = {}
@@ -55,14 +64,50 @@ class ParallelBatchExecutor:
             self.completed_queue.put((sid, ts))
 
     def ensure_executor(self, *, max_workers: int) -> Any:
-        if self.executor is not None:
-            return self.executor
-        self.executor = self.executor_factory(int(max_workers), bool(self.limit_blas_threads_per_worker))
+        requested_workers = max(1, int(max_workers))
+        executor = self.executor
+        if executor is None:
+            return self._create_and_prewarm_executor(max_workers=requested_workers)
+
+        current_workers = self._current_max_workers
+        if current_workers is None:
+            return executor
+
+        if requested_workers <= current_workers:
+            return executor
+
+        self.shutdown(
+            force_terminate=True,
+            record_nonfatal_exception=self.record_nonfatal_exception,
+        )
+        return self._create_and_prewarm_executor(max_workers=requested_workers)
+
+    def _create_and_prewarm_executor(self, *, max_workers: int) -> Any:
+        try:
+            executor = self.executor_factory(int(max_workers), bool(self.limit_blas_threads_per_worker))
+            self.executor = executor
+            self._current_max_workers = int(max_workers)
+            self._pool_stale = False
+            self._submit_prewarm_tasks(executor, max_workers=int(max_workers))
+        except Exception as exc:
+            self.shutdown(
+                force_terminate=True,
+                record_nonfatal_exception=self.record_nonfatal_exception,
+            )
+            self.executor = None
+            self.record_nonfatal_exception("Failed to create and prewarm batch executor", exc)
+            raise
         return self.executor
+
+    def _submit_prewarm_tasks(self, executor: Any, *, max_workers: int) -> None:
+        for _ in range(max(1, int(max_workers))):
+            executor.submit(prewarm_worker_imports)
 
     def shutdown(self, *, force_terminate: bool, record_nonfatal_exception: Callable[[str, BaseException], None]) -> None:
         prior_futures = int(len(self.future_map or {}))
         self.reset_run_state()
+        self._current_max_workers = None
+        self._pool_stale = False
         executor = self.executor
         self.executor = None
         if executor is None:
@@ -107,6 +152,13 @@ class ParallelBatchExecutor:
                 self.superseded_future_meta[retained_key] = meta
         self.reset_active_run_state()
         return cancelled, running
+
+    @property
+    def is_pool_stale(self) -> bool:
+        return bool(self._pool_stale)
+
+    def mark_pool_stale(self) -> None:
+        self._pool_stale = True
 
     def _reserve_superseded_key(self, set_id: str) -> str:
         sid = str(set_id or "").strip() or "superseded"

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from PySide6 import QtCore
+import shiboken6
 
 from kindred import __version__ as KINDRED_VERSION
 from kindred.core.batch_parallel import (
@@ -129,8 +130,8 @@ def build_fast_preview_solver_grid_context(
         fast_mode
         and slider_drag_active
         and isinstance(last_slider_change_name, str)
-        and last_slider_change_name.startswith("K")
-        and last_slider_change_name[1:].isdigit()
+        and last_slider_change_name.startswith("Keq")
+        and last_slider_change_name[3:].isdigit()
     )
     if preview_mode:
         n_points = min(int(n_points), 120)
@@ -193,6 +194,7 @@ class SimulationController(QtCore.QObject):
             executor_factory=_default_batch_executor_factory,
             max_parallel_workers=12,
             limit_blas_threads_per_worker=True,
+            record_nonfatal_exception=self._record_nonfatal_exception,
         )
 
         self._batch_future_poll_timer = QtCore.QTimer(self)
@@ -214,6 +216,7 @@ class SimulationController(QtCore.QObject):
         self._retained_simulation_workers: List[object] = []
         self._shutdown_requested_for_close: bool = False
         self._discarded_slider_preview_generation_id: Optional[int] = None
+        self._pool_eagerly_created: bool = False
 
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
@@ -549,6 +552,12 @@ class SimulationController(QtCore.QObject):
     def shutdown_batch_executor(self, *, force_terminate: bool) -> None:
         self._shutdown_batch_executor(force_terminate=force_terminate)
 
+    def parallel_batch_pool_settings_changed(self) -> None:
+        self._parallel_batch_pool_settings_changed()
+
+    def ensure_parallel_batch_pool_eagerly_created(self) -> None:
+        self._ensure_parallel_batch_pool_eagerly_created()
+
     def release_current_simulation_worker(self) -> None:
         self._release_current_simulation_worker()
 
@@ -663,8 +672,19 @@ class SimulationController(QtCore.QObject):
     # Worker / executor lifecycle
     # ------------------------------------------------------------------
     @staticmethod
+    def _worker_is_valid(worker) -> bool:
+        if worker is None:
+            return False
+        if isinstance(worker, QtCore.QObject):
+            try:
+                return bool(shiboken6.isValid(worker))
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
     def _worker_is_running(worker) -> bool:
-        if worker is None or not hasattr(worker, "isRunning"):
+        if worker is None or (not SimulationController._worker_is_valid(worker)) or not hasattr(worker, "isRunning"):
             return False
         try:
             return bool(worker.isRunning())
@@ -682,8 +702,19 @@ class SimulationController(QtCore.QObject):
         if worker is None or self._worker_is_running(worker):
             return
         self._forget_retained_simulation_worker(worker)
+        if getattr(self, "_simulation_worker", None) is worker:
+            self._simulation_worker = None
+        if not self._worker_is_valid(worker):
+            return
         if hasattr(worker, "deleteLater"):
-            worker.deleteLater()
+            try:
+                worker.deleteLater()
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    f"Failed to schedule deleteLater() for {str(worker_name)}",
+                    exc,
+                )
+                return
         try:
             QtCore.QCoreApplication.sendPostedEvents(worker, QtCore.QEvent.DeferredDelete)
         except Exception as exc:
@@ -691,6 +722,22 @@ class SimulationController(QtCore.QObject):
                 f"Failed to send deferred delete events for {str(worker_name)}",
                 exc,
             )
+
+    def _prune_stopped_owned_simulation_workers(self) -> None:
+        seen_ids: set[int] = set()
+        owned_workers = []
+        current_worker = getattr(self, "_simulation_worker", None)
+        if current_worker is not None:
+            owned_workers.append(current_worker)
+            seen_ids.add(id(current_worker))
+        for worker in list(self._retained_simulation_workers):
+            if id(worker) in seen_ids:
+                continue
+            owned_workers.append(worker)
+            seen_ids.add(id(worker))
+        for worker in owned_workers:
+            if not self._worker_is_running(worker):
+                self._delete_worker_if_stopped(worker, "simulation worker")
 
     def _on_retained_simulation_worker_finished(self, worker, worker_name: str = "simulation worker") -> None:
         self._forget_retained_simulation_worker(worker)
@@ -717,6 +764,9 @@ class SimulationController(QtCore.QObject):
 
     def _retain_simulation_worker(self, worker, worker_name: str = "simulation worker") -> None:
         if worker is None:
+            return
+        if not self._worker_is_valid(worker):
+            self._delete_worker_if_stopped(worker, worker_name)
             return
         if any(item is worker for item in self._retained_simulation_workers):
             return
@@ -830,11 +880,13 @@ class SimulationController(QtCore.QObject):
             if (not still_running) and getattr(self, "_simulation_worker", None) is worker:
                 self._simulation_worker = None
         self._shutdown_batch_executor(force_terminate=True)
+        self._prune_stopped_owned_simulation_workers()
         has_running_workers = self._has_running_owned_simulation_workers()
         self._shutdown_requested_for_close = bool(has_running_workers)
         return not has_running_workers
 
     def _clear_shutdown_request_after_close_cleanup(self) -> None:
+        self._prune_stopped_owned_simulation_workers()
         if bool(getattr(self, "_shutdown_requested_for_close", False)) and (not self._has_running_owned_simulation_workers()):
             self._shutdown_requested_for_close = False
 
@@ -848,8 +900,9 @@ class SimulationController(QtCore.QObject):
     ) -> bool:
         if worker is None:
             return False
-
-        # Wait for thread to finish (with timeout)
+        if not self._worker_is_valid(worker):
+            self._delete_worker_if_stopped(worker, worker_name)
+            return False
         is_running = self._worker_is_running(worker)
 
         if is_running:
@@ -862,19 +915,6 @@ class SimulationController(QtCore.QObject):
                         f"Failed to request cancellation for {str(worker_name)}",
                         exc,
                     )
-
-            # Wait up to 2 seconds for graceful shutdown
-            waited_ok = True
-            if hasattr(worker, "wait"):
-                try:
-                    waited_ok = bool(worker.wait(2000))
-                except Exception:
-                    waited_ok = True
-            if not waited_ok:
-                logger.error(
-                    "%s did not stop within timeout; continuing without forceful termination",
-                    str(worker_name),
-                )
 
         still_running = self._worker_is_running(worker)
         should_disconnect_application_signals = not (
@@ -901,7 +941,7 @@ class SimulationController(QtCore.QObject):
                 try:
                     finished_signal.connect(worker.deleteLater)
                     try:
-                        if hasattr(worker, "isRunning") and not bool(worker.isRunning()):
+                        if not self._worker_is_running(worker):
                             worker.deleteLater()
                     except Exception as exc:
                         self._record_nonfatal_exception(
@@ -948,12 +988,70 @@ class SimulationController(QtCore.QObject):
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
+        self._pool_eagerly_created = False
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
                 "BATCH_PAR shutdown executor force=%s pending_futures=%s",
                 bool(force_terminate),
                 int(prior_futures),
             )
+
+    def _has_active_parallel_batch_work(self) -> bool:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"):
+            return True
+        return bool(self._batch_parallel.future_map) or bool(self._batch_parallel.superseded_future_map)
+
+    def _parallel_batch_pool_settings_changed(self) -> None:
+        if self._has_active_parallel_batch_work():
+            self._batch_parallel.mark_pool_stale()
+            return
+        self._shutdown_batch_executor(force_terminate=False)
+
+    def _ensure_parallel_batch_pool_eagerly_created(self) -> None:
+        if self._pool_eagerly_created:
+            return
+        try:
+            effective_workers = compute_effective_batch_workers(
+                num_sets=max(1, int(self._batch_parallel.max_parallel_workers)),
+                max_parallel_workers=max(1, int(self._batch_parallel.max_parallel_workers)),
+            )
+            self._batch_parallel.ensure_executor(
+                max_workers=max(1, int(effective_workers))
+            )
+        except Exception:
+            self._pool_eagerly_created = False
+            return
+        self._pool_eagerly_created = True
+
+    def _cleanup_parallel_batch_executor_after_run(
+        self,
+        *,
+        keep_executor_alive: bool,
+        clear_pending_plot_updates: bool = False,
+        stale_fast_handoff_after_display: bool = False,
+    ) -> None:
+        if bool(keep_executor_alive) and (not self._batch_parallel.is_pool_stale):
+            if stale_fast_handoff_after_display:
+                cancelled, running = self._batch_parallel.soft_supersede()
+                timer = getattr(self, "_batch_future_poll_timer", None)
+                if running > 0 and timer is not None:
+                    timer.start()
+                if bool(getattr(self, "_debug_batch_parallel", False)):
+                    logger.info(
+                        "BATCH_PAR soft handoff after stale preview display cancelled=%s running=%s",
+                        int(cancelled),
+                        int(running),
+                    )
+            else:
+                self._batch_parallel.reset_active_run_state()
+            self._stop_batch_future_poll_timer_if_idle()
+            if bool(clear_pending_plot_updates):
+                self._clear_pending_slider_plot_updates()
+            if bool(getattr(self, "_debug_batch_parallel", False)):
+                logger.info("BATCH_PAR keeping executor alive after slider batch completion")
+            return
+        self._shutdown_batch_executor(force_terminate=False)
 
     def _supersede_parallel_batch_run_soft(self) -> None:
         """
@@ -1168,6 +1266,31 @@ class SimulationController(QtCore.QObject):
         self._batch_parallel.superseded_future_map.clear()
         self._batch_parallel.superseded_future_meta.clear()
 
+    def _reset_parallel_batch_run_and_shutdown_executor(self) -> None:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"):
+            ctx["active"] = False
+            self._batch_run_context = dict(ctx)
+        self.shutdown_batch_executor(force_terminate=True)
+        self._pop_all_stale_parallel_batch_futures()
+        self._drain_batch_completion_queue()
+
+    def _surface_current_parallel_batch_pool_failure_to_ui(self, error_msg: object) -> None:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if not (isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel")):
+            return
+        if self._batch_parallel.executor is None:
+            return
+        self.on_simulation_error(
+            error_msg,
+            run_id=int(ctx.get("run_id") or 0),
+            fast_mode=bool(ctx.get("fast_mode")),
+            request_id=int(ctx.get("request_id") or 0),
+            batch_set="",
+            batch_set_id="",
+            cache_key=str(ctx.get("cache_key") or ""),
+        )
+
     def _consume_parallel_batch_future(
         self,
         *,
@@ -1190,6 +1313,10 @@ class SimulationController(QtCore.QObject):
         try:
             payload = fut.result()
         except Exception as exc:
+            self._record_nonfatal_exception(
+                f"Parallel batch future failed while retrieving result (set_id={sid}, source={str(source)})",
+                exc,
+            )
             self.on_simulation_error(
                 f"Simulation failed:\n\n{exc}",
                 run_id=run_id,
@@ -1199,8 +1326,7 @@ class SimulationController(QtCore.QObject):
                 batch_set_id=sid,
                 cache_key=cache_key,
             )
-            self.shutdown_batch_executor(force_terminate=True)
-            self._pop_all_stale_parallel_batch_futures()
+            self._reset_parallel_batch_run_and_shutdown_executor()
             return False
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
@@ -1213,8 +1339,7 @@ class SimulationController(QtCore.QObject):
                 batch_set_id=sid,
                 cache_key=cache_key,
             )
-            self.shutdown_batch_executor(force_terminate=True)
-            self._pop_all_stale_parallel_batch_futures()
+            self._reset_parallel_batch_run_and_shutdown_executor()
             return False
 
         if bool(getattr(self, "_debug_batch_parallel", False)):
@@ -1257,8 +1382,7 @@ class SimulationController(QtCore.QObject):
                     "Failed to surface simulation-complete handling failure to UI",
                     ui_exc,
                 )
-            self.shutdown_batch_executor(force_terminate=True)
-            self._pop_all_stale_parallel_batch_futures()
+            self._reset_parallel_batch_run_and_shutdown_executor()
             return False
         return True
 
@@ -1267,7 +1391,7 @@ class SimulationController(QtCore.QObject):
         *,
         owner_key: str,
         fut: Any,
-    ) -> None:
+    ) -> bool:
         owner = str(owner_key or "")
         meta = dict((self._batch_parallel.superseded_future_meta or {}).get(owner) or {})
         self._batch_parallel.superseded_future_map.pop(owner, None)
@@ -1282,7 +1406,13 @@ class SimulationController(QtCore.QObject):
                 f"Superseded parallel batch future failed after soft supersede (set_id={set_id}, set_name={set_name})",
                 exc,
             )
-            return
+            logger.debug(
+                "Stale superseded future failed after active run moved on (set_id=%s, set_name=%s)",
+                set_id,
+                set_name,
+                exc_info=True,
+            )
+            return True
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
             error_payload = coerce_simulation_failure(payload["error"])
@@ -1291,6 +1421,7 @@ class SimulationController(QtCore.QObject):
                 f"Superseded parallel batch future returned error payload after soft supersede (set_id={set_id}, set_name={set_name})",
                 RuntimeError(error_text),
             )
+        return True
 
     def _stop_batch_future_poll_timer_if_idle(self) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
@@ -1378,7 +1509,14 @@ class SimulationController(QtCore.QObject):
             for owner_key, fut in list((self._batch_parallel.superseded_future_map or {}).items()):
                 if not fut.done():
                     continue
-                self._consume_superseded_parallel_batch_future(owner_key=str(owner_key), fut=fut)
+                if not self._consume_superseded_parallel_batch_future(owner_key=str(owner_key), fut=fut):
+                    return
+            if (
+                self._batch_parallel.is_pool_stale
+                and (not self._batch_parallel.future_map)
+                and (not self._batch_parallel.superseded_future_map)
+            ):
+                self._shutdown_batch_executor(force_terminate=False)
         except Exception as exc:
             # Architecture note (polling safety net):
             # This broad catch is a last-resort guard for the QTimer-driven poll
@@ -1726,7 +1864,7 @@ class SimulationController(QtCore.QObject):
                 self._pending_slider_simulation = True
                 return
 
-        if worker is not None and worker.isRunning():
+        if self._worker_is_running(worker):
             logger.debug("Simulation currently running; deferring slider update")
             self._pending_slider_simulation = True
             return
@@ -1735,6 +1873,7 @@ class SimulationController(QtCore.QObject):
             logger.debug("Fast slider run currently running; deferring slider update")
             self._pending_slider_simulation = True
             return
+        self._prune_stopped_owned_simulation_workers()
         if self._has_running_owned_simulation_workers():
             logger.warning(
                 "Slider-triggered run blocked while previous simulation worker shutdown remains in progress"
@@ -1772,10 +1911,17 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_simulation(self):
+        if not self.ui.mechanism.auto_lock_for_run():
+            self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
+            return
+        if not self.ui.mechanism.is_mechanism_ready_for_run():
+            self.ui.run_ui.set_status_text("Cannot run: mechanism has errors. Fix and try again.")
+            return
         self._discarded_slider_preview_generation_id = None
         if bool(getattr(self, "_simulation_running", False)):
             logger.info("Superseding active simulation with new Run Selected request")
             self._cancel_active_run_for_restart()
+        self._prune_stopped_owned_simulation_workers()
         if self._has_running_owned_simulation_workers():
             logger.warning(
                 "Run Selected blocked while previous simulation worker shutdown remains in progress"
@@ -2209,7 +2355,7 @@ class SimulationController(QtCore.QObject):
             worker = getattr(self, "_simulation_worker", None)
             if worker is not None and hasattr(worker, "isRunning"):
                 try:
-                    active_fast_worker = bool(worker.isRunning()) and bool(getattr(worker, "_fast_mode", False))
+                    active_fast_worker = self._worker_is_running(worker) and bool(getattr(worker, "_fast_mode", False))
                 except Exception:
                     active_fast_worker = False
 
@@ -2379,10 +2525,9 @@ class SimulationController(QtCore.QObject):
         rtol = self.ui.solver.initial_rtol() or 1e-6
         atol = self.ui.solver.initial_atol() or 1e-12
         temperature_K = float(self.ui.solver.temperature_spinbox_value())
-        if state_network_dsl.strip():
-            T_override = self.ui.solver.dsl_global_temperature_K(full_dsl)
-            if T_override is not None:
-                temperature_K = float(T_override)
+        T_override = self.ui.solver.dsl_global_temperature_K(full_dsl)
+        if T_override is not None:
+            temperature_K = float(T_override)
 
         prepared_payload: Optional[Dict[str, Any]] = None
         prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
@@ -3007,12 +3152,10 @@ class SimulationController(QtCore.QObject):
                     self._release_current_simulation_worker()
 
                     keep_executor_alive = bool(isinstance(ctx, dict) and ctx.get("parallel") and ctx.get("keep_executor_alive"))
-                    if keep_executor_alive:
-                        self._batch_parallel.reset_active_run_state()
-                        self._stop_batch_future_poll_timer_if_idle()
-                        self._clear_pending_slider_plot_updates()
-                    else:
-                        self._shutdown_batch_executor(force_terminate=False)
+                    self._cleanup_parallel_batch_executor_after_run(
+                        keep_executor_alive=keep_executor_alive,
+                        clear_pending_plot_updates=True,
+                    )
 
                     self.ui.slider.set_slider_triggered_simulation(False)
                     self._simulation_running = False
@@ -3463,7 +3606,7 @@ class SimulationController(QtCore.QObject):
                     "temperature_K": float(temperature_used),
                     "temperature_source": (
                         "dsl"
-                        if energy_mode and self.ui.solver.dsl_global_temperature_K(mechanism_text) is not None
+                        if self.ui.solver.dsl_global_temperature_K(mechanism_text) is not None
                         else "ui"
                     ),
                     "energy_unit": energy_unit_used,
@@ -3705,25 +3848,10 @@ class SimulationController(QtCore.QObject):
                     and ctx_for_cleanup.get("parallel")
                     and ctx_for_cleanup.get("keep_executor_alive")
                 )
-                if keep_executor_alive:
-                    if stale_fast_handoff_after_display:
-                        cancelled, running = self._batch_parallel.soft_supersede()
-                        timer = getattr(self, "_batch_future_poll_timer", None)
-                        if running > 0 and timer is not None:
-                            timer.start()
-                        if bool(getattr(self, "_debug_batch_parallel", False)):
-                            logger.info(
-                                "BATCH_PAR soft handoff after stale preview display cancelled=%s running=%s",
-                                int(cancelled),
-                                int(running),
-                            )
-                    else:
-                        self._batch_parallel.reset_active_run_state()
-                    self._stop_batch_future_poll_timer_if_idle()
-                    if bool(getattr(self, "_debug_batch_parallel", False)):
-                        logger.info("BATCH_PAR keeping executor alive after slider batch completion")
-                else:
-                    self._shutdown_batch_executor(force_terminate=False)
+                self._cleanup_parallel_batch_executor_after_run(
+                    keep_executor_alive=keep_executor_alive,
+                    stale_fast_handoff_after_display=stale_fast_handoff_after_display,
+                )
                 self.ui.slider.set_slider_triggered_simulation(False)
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)
@@ -3907,7 +4035,7 @@ class SimulationController(QtCore.QObject):
             self._batch_run_context = dict(ctx)
         self._shutdown_batch_executor(force_terminate=True)
 
-        if self._simulation_worker is not None and self._simulation_worker.isRunning():
+        if self._worker_is_running(self._simulation_worker):
             self._simulation_worker.cancel()
             logger.info("Cancellation requested from simulation worker")
             self.ui.run_ui.set_status_text("Cancelling simulation...")

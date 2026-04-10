@@ -31,9 +31,9 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
     - metadata includes:
         type: 'reaction' or 'equilibrium'
         index: canonical step index (1-based)
-        role: 'k'/'kf'/'kr'/'K'
+        role: 'k'/'kf'/'kr'/'Keq'
         label: 'Step N: <context>'
-        editable/derived for K-implied constraints (kr or kf derived when K is explicit)
+        editable/derived for Keq-implied constraints (kr or kf derived when Keq is explicit)
     """
     variables: "OrderedDict[str, float]" = OrderedDict()
     metadata: Dict[str, Dict[str, object]] = {}
@@ -65,7 +65,7 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
             if not (0 <= idx < len(eqs)):
                 continue
             eq = eqs[idx]
-            has_K = bool(entry.get("has_K_param"))
+            has_K = bool(entry.get("has_Keq_param"))
             derive_rate = str(entry.get("derive_rate") or "")
 
             kf_name = f"kf{n}"
@@ -90,19 +90,19 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
             }
 
             if has_K:
-                K_name = f"K{n}"
+                K_name = f"Keq{n}"
                 meta = getattr(eq, "metadata", {}) or {}
-                k_value, k_ok = _try_finite_float(meta.get("K_input"))
+                k_value, k_ok = _try_finite_float(meta.get("Keq_input"))
                 variables[K_name] = float(k_value)
                 metadata[K_name] = {
                     "type": "equilibrium",
                     "index": n,
-                    "role": "K",
+                    "role": "Keq",
                     "label": label,
                     "value_valid": bool(k_ok),
                 }
 
-                # Mark one rate as derived so K always has semantics.
+                # Mark one rate as derived so Keq always has semantics.
                 if derive_rate == "kf":
                     metadata[kf_name]["editable"] = False
                     metadata[kf_name]["derived"] = True

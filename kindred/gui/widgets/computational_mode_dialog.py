@@ -622,6 +622,15 @@ class ComputationalModeDialog(QtWidgets.QDialog):
         )
 
         set_reactions_text(updated, "Apply Computational Mode", record_undo=True)
+        sync_authoritative_write = getattr(
+            self._main_window,
+            "finalize_authoritative_mechanism_widget_write",
+            None,
+        )
+        if not callable(sync_authoritative_write):
+            self._show_error("Mechanism authoritative write finalizer is unavailable.")
+            return False
+        sync_authoritative_write(dispatch_consumers=True)
 
         # Re-parse and refresh energy-mode sliders without running an ODE solve.
         with suppress(ImportError, RuntimeError, TypeError, ValueError):

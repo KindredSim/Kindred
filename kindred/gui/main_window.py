@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass
 import json
 import hashlib
 import logging
@@ -58,6 +59,7 @@ from kindred.gui.app_wiring import (
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
+from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.mixins.ports import FittingMixinPorts, ProfileMixinPorts
@@ -77,6 +79,17 @@ _STARTUP_HEIGHT_RATIO = 0.88
 _MIN_STARTUP_WIDTH = 1280
 _MIN_STARTUP_HEIGHT = 820
 _FALLBACK_STARTUP_SIZE = QtCore.QSize(1440, 900)
+
+
+@dataclass(frozen=True)
+class TemperatureIndicatorState:
+    energy_mode_active: bool
+    t_override_k: Optional[float]
+    schedule_defined: bool
+    schedule_kind: Optional[str]
+    schedule_interval_count: Optional[int]
+    constant_schedule_k: Optional[float]
+    indicator_text: Optional[str]
 _ANALYSIS_SURFACE_NAMES: tuple[str, ...] = ("Statistics", "Parameters")
 _ABOUT_DIALOG_MIN_WIDTH = 420
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
@@ -194,6 +207,8 @@ class MainWindow(
         self._use_sparse_jacobian = False
         self._wegscheider_cyclicity_enabled = False
         self._suppress_preference_updates = False  # Guard: True during document apply and settings load.
+        self._pre_dsl_temperature: float | None = None  # Spinbox value before T= override.
+        self._temperature_dsl_override_active = False
         self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
@@ -227,7 +242,6 @@ class MainWindow(
 
         # Menu/UI objects that controllers may reference.
         self._recent_menu = None
-        self._mechanism_edit_locked = True
         self._mechanism_edit_unlock_warning_shown = False
         self._mechanism_edit_lock_action = None
 
@@ -272,9 +286,12 @@ class MainWindow(
         self._mechanism_dock = mechanism_dock_components.dock
         self._mechanism_panel = mechanism_dock_components.panel
 
-        self._mechanism_section = self._mechanism_panel.section
         self._mechanism_editor = self._mechanism_panel.editor
-        self._refresh_mechanism_edit_lock_ui()
+        self._mechanism_session_owner = MechanismSessionOwner(
+            topology_validator=self._mechanism_session_topology_is_valid,
+        )
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        self._force_lock_editor()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
         self._slider_override_buttons_available = True
@@ -361,7 +378,119 @@ class MainWindow(
         self._set_slider_override_mode_buttons_enabled(bool(dirty))
 
     def mechanism_editing_locked(self) -> bool:
-        return bool(getattr(self, "_mechanism_edit_locked", True))
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            return True
+        return not bool(owner.edit_session_active)
+
+    def _mechanism_session_texts_from_widgets(self) -> tuple[str, str]:
+        editor = getattr(self, "_mechanism_editor", None)
+        if editor is None:
+            raise RuntimeError("Mechanism editor is unavailable.")
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None or state_editor is None:
+            raise RuntimeError("Mechanism editor widgets are unavailable.")
+        reactions_text = str(reactions_widget.toPlainText())
+        state_network_dsl = str(state_editor.get_state_network_dsl() or "")
+        return reactions_text, state_network_dsl
+
+    def _mechanism_session_topology_is_valid(self) -> bool:
+        editor = getattr(self, "_mechanism_editor", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if state_editor is None or not hasattr(state_editor, "is_valid"):
+            raise RuntimeError("State network editor is unavailable.")
+        return bool(state_editor.is_valid())
+
+    def _sync_mechanism_session_owner_from_widgets(self, *, authoritative: bool) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        reactions_text, state_network_dsl = self._mechanism_session_texts_from_widgets()
+        if authoritative:
+            owner.apply_authoritative_update(reactions_text, state_network_dsl)
+            return
+        if not owner.edit_session_active:
+            raise RuntimeError("Mechanism edit session is not active.")
+        owner.update_draft_reactions(reactions_text)
+        owner.update_draft_state_network(state_network_dsl)
+
+    def _sync_mechanism_session_owner_from_widget_signal(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        self._sync_mechanism_session_owner_from_widgets(authoritative=not bool(owner.edit_session_active))
+
+    def _dispatch_authoritative_mechanism_consumers(self) -> None:
+        self._update_temperature_mode_indicator()
+        self._on_authoritative_mechanism_input_changed()
+        self._refresh_overlay_swatches_for_current_mechanism()
+
+    def _sync_mechanism_session_owner_after_authoritative_widget_write(
+        self,
+        *,
+        dispatch_consumers: bool,
+    ) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        session_was_active = bool(owner.edit_session_active)
+        self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        if not session_was_active:
+            return
+        self._set_mechanism_edit_locked(True)
+        if bool(dispatch_consumers):
+            self._dispatch_authoritative_mechanism_consumers()
+
+    def _restore_mechanism_widgets_from_owner_canonical(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        editor = getattr(self, "_mechanism_editor", None)
+        if owner is None or editor is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        reactions_widget = getattr(editor, "_reactions_text", None)
+        state_editor = getattr(editor, "_state_network_editor", None)
+        if reactions_widget is None or state_editor is None:
+            raise RuntimeError("Mechanism editor widgets are unavailable.")
+
+        canonical_reactions = str(owner.canonical_reactions_text)
+        if str(reactions_widget.toPlainText()) != canonical_reactions:
+            reactions_widget.blockSignals(True)
+            try:
+                reactions_widget.setPlainText(canonical_reactions)
+            finally:
+                reactions_widget.blockSignals(False)
+
+        canonical_state_network = str(owner.canonical_state_network_dsl or "")
+        if str(state_editor.get_state_network_dsl() or "") != canonical_state_network:
+            state_editor.blockSignals(True)
+            try:
+                if canonical_state_network.strip():
+                    state_editor.set_state_network_dsl(canonical_state_network)
+                else:
+                    state_editor.clear()
+            finally:
+                state_editor.blockSignals(False)
+
+        validate = getattr(editor, "_validate_dsl", None)
+        if callable(validate):
+            validate()
+
+    def _on_reactions_text_changed_for_main_window(self) -> None:
+        self._sync_mechanism_session_owner_from_widget_signal()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None or bool(owner.edit_session_active):
+            return
+        self._dispatch_authoritative_mechanism_consumers()
+
+    def _on_state_network_changed_for_main_window(self) -> None:
+        self._sync_mechanism_session_owner_from_widget_signal()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None or bool(owner.edit_session_active):
+            return
+        self._dispatch_authoritative_mechanism_consumers()
+
+    def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
+        self._update_temperature_mode_indicator()
 
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
@@ -370,7 +499,7 @@ class MainWindow(
                 "State network is read-only while Reactions editing is locked. "
                 "Use Allow Editing to make deliberate changes."
             )
-        return "Edit the state network with full validation. Changes apply directly to the current mechanism."
+        return "Edit the state network with full validation. Changes are staged as a draft until the editor is locked."
 
     def _refresh_mechanism_edit_lock_ui(self) -> None:
         locked = self.mechanism_editing_locked()
@@ -416,9 +545,60 @@ class MainWindow(
                 if info_label is not None:
                     info_label.setText(self._state_network_dialog_info_text(locked=locked))
 
-    def _set_mechanism_edit_locked(self, locked: bool) -> None:
-        self._mechanism_edit_locked = bool(locked)
+    def _force_lock_editor(self) -> bool:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        if owner.edit_session_active:
+            owner.cancel_edit_session()
+            self._restore_mechanism_widgets_from_owner_canonical()
         self._refresh_mechanism_edit_lock_ui()
+        return True
+
+    def _try_lock_mechanism_editor(self) -> bool:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        if owner.edit_session_active:
+            self._sync_mechanism_session_owner_from_widgets(authoritative=False)
+            if not owner.commit_edit_session():
+                return False
+        elif not self.is_mechanism_ready_for_run():
+            return False
+        self._dispatch_authoritative_mechanism_consumers()
+        self._refresh_mechanism_edit_lock_ui()
+        return True
+
+    def _set_mechanism_edit_locked(self, locked: bool) -> bool:
+        if not bool(locked):
+            owner = getattr(self, "_mechanism_session_owner", None)
+            if owner is None:
+                raise RuntimeError("Mechanism session owner is unavailable.")
+            if not owner.edit_session_active:
+                owner.begin_edit_session()
+            self._refresh_mechanism_edit_lock_ui()
+            return True
+        if self.mechanism_editing_locked():
+            self._refresh_mechanism_edit_lock_ui()
+            return True
+        return self._force_lock_editor()
+
+    def auto_lock_for_run(self) -> bool:
+        if not self.mechanism_editing_locked():
+            return self._try_lock_mechanism_editor()
+        return True
+
+    def is_mechanism_ready_for_run(self) -> bool:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            return False
+        return bool(owner.is_ready_for_explicit_run())
+
+    def is_mechanism_valid_for_preview(self) -> bool:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            return False
+        return bool(owner.validate_canonical().valid)
 
     def _reactions_text_widget(self) -> Optional[QtWidgets.QPlainTextEdit]:
         editor = getattr(self, "_mechanism_editor", None)
@@ -480,9 +660,9 @@ class MainWindow(
         box = QtWidgets.QMessageBox(self)
         box.setIcon(QtWidgets.QMessageBox.Warning)
         box.setWindowTitle("Allow Editing")
-        box.setText("Edits in the Reactions editor change the canonical mechanism text.")
+        box.setText("Edits in the Reactions editor are staged as a draft.")
         box.setInformativeText(
-            "Use unlocking only for deliberate edits. Save/load and migration rewrites can still update the editor while it remains locked."
+            "Draft edits take effect when you lock the editor. Save/load and migration rewrites can still update the editor while it remains locked."
         )
         unlock_btn = box.addButton("Unlock", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         cancel_btn = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
@@ -502,7 +682,10 @@ class MainWindow(
             self._set_mechanism_edit_locked(False)
             self._status_label.setText("Reactions editing unlocked")
             return
-        self._set_mechanism_edit_locked(True)
+        if not self._try_lock_mechanism_editor():
+            self._refresh_mechanism_edit_lock_ui()
+            self._status_label.setText("Cannot lock reactions editing: fix mechanism errors")
+            return
         self._status_label.setText("Reactions editing locked")
 
     def _prompt_slider_transaction_invalidation(self, action_text: str) -> str:
@@ -587,6 +770,7 @@ class MainWindow(
         self._stop_btn = sim_panel.stop_btn
         self._sim_progress = sim_panel.sim_progress
         self._temperature_spinbox = sim_panel.temperature_spinbox
+        self._temperature_label = sim_panel.temperature_label
 
         self._rebind_batch_semantics_signal_bindings()
 
@@ -828,8 +1012,8 @@ class MainWindow(
         Programmatic loads often set editor text with signals blocked (undo commands and some load
         paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
         """
+        self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
-        self._set_mechanism_edit_locked(True)
         try:
             self._mechanism_editor._variable_sliders.clear()
         except Exception:
@@ -837,7 +1021,7 @@ class MainWindow(
             self._preview_session.clear_pending_slider_values()
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
-        self._on_authoritative_mechanism_input_changed()
+        self._dispatch_authoritative_mechanism_consumers()
         self._refresh_slider_transaction_button_state()
 
         try:
@@ -845,8 +1029,6 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to update parameter table after programmatic mechanism load", exc_info=True)
             QtCore.QTimer.singleShot(0, self._update_parameter_table_from_sliders)
-
-        self._refresh_overlay_swatches_for_current_mechanism()
 
     def _bootstrap_existing_datasets(self):
         """Populate dataset visualizations for any datasets already loaded."""
@@ -912,6 +1094,9 @@ class MainWindow(
         ColorManager.instance().set_current_species_roster(roster)
 
     def _refresh_overlay_swatches_for_current_mechanism(self) -> None:
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
         self._sync_color_manager_authoritative_roster()
         plot = getattr(self._plot_tabs, "_main_plot", None)
         refresh_overlay_presentation = getattr(plot, "refresh_overlay_presentation_for_current_roster", None)
@@ -1323,30 +1508,18 @@ class MainWindow(
         self._right_panel._data_manager.datasetRemoved.connect(self._on_dataset_removed)
         self._right_panel._data_manager.loadFinished.connect(self._on_dataset_load_finished)
 
-        # Temperature mode indicator updates
-        self._temperature_spinbox.valueChanged.connect(self._update_temperature_mode_indicator)
+        # Temperature mode indicator and authoritative mechanism consumers.
+        reactions_widget = getattr(self._mechanism_editor, "_reactions_text", None)
+        state_editor = getattr(self._mechanism_editor, "_state_network_editor", None)
+        if reactions_widget is not None:
+            reactions_widget.textChanged.connect(self._on_reactions_text_changed_for_main_window)
+        if state_editor is not None:
+            state_editor.stateNetworkChanged.connect(self._on_state_network_changed_for_main_window)
+        self._temperature_spinbox.valueChanged.connect(self._on_temperature_spinbox_value_changed_for_main_window)
         # User preference tracking for spinbox-only dual-persisted keys.
         self._temperature_spinbox.valueChanged.connect(self._on_temperature_user_edit)
         self._num_points_spinbox.valueChanged.connect(self._on_num_points_user_edit)
         self._sim_time_spinbox.textChanged.connect(self._on_sim_time_user_edit)
-        self._mechanism_editor._reactions_text.textChanged.connect(self._update_temperature_mode_indicator)
-        self._mechanism_editor._reactions_text.textChanged.connect(self._on_authoritative_mechanism_input_changed)
-        self._mechanism_editor._reactions_text.textChanged.connect(self._refresh_overlay_swatches_for_current_mechanism)
-        try:
-            self._mechanism_editor._state_network_editor.stateNetworkChanged.connect(
-                self._on_authoritative_mechanism_input_changed
-            )
-            self._mechanism_editor._state_network_editor.stateNetworkChanged.connect(
-                self._refresh_overlay_swatches_for_current_mechanism
-            )
-        except Exception as exc:
-            # State network editor may not expose the signal in some contexts
-            self._state_network_editor_invalidation_signal_available = False
-            self._record_best_effort_failure(
-                "main_window.state_network_editor.stateNetworkChanged.connect",
-                message="State network editor did not expose stateNetworkChanged signal",
-                exc=exc,
-            )
 
     def _record_best_effort_failure(
         self,
@@ -1375,6 +1548,9 @@ class MainWindow(
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Invalidate stale displayed results when the authoritative mechanism changes."""
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
         if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
             return
         # Pending-init rewrite normalizes the DSL after a successful explicit run;
@@ -1557,33 +1733,143 @@ class MainWindow(
             if stripped:
                 self.config_controller.update_user_preference("simulation_time", stripped)
 
+    def _compute_temperature_indicator_state(
+        self,
+        reactions_text: str,
+        state_network_text: str,
+    ) -> TemperatureIndicatorState:
+        mechanism_text = str(reactions_text)
+        normalized_state_network_text = str(state_network_text or "")
+        energy_mode_active = bool(normalized_state_network_text.strip())
+
+        t_override_k = self._dsl_global_temperature_K(mechanism_text)
+
+        temp_schedule = None
+        schedule_defined = False
+        try:
+            from kindred.core.temperature_dsl import parse_temperature_schedule
+
+            temp_schedule = parse_temperature_schedule(mechanism_text)
+            schedule_defined = temp_schedule is not None
+        except Exception:
+            temp_schedule = None
+            schedule_defined = False
+
+        schedule_kind: Optional[str] = None
+        schedule_interval_count: Optional[int] = None
+        constant_schedule_k: Optional[float] = None
+        indicator_text: Optional[str] = None
+
+        if t_override_k is not None and not schedule_defined:
+            indicator_text = f"Temperature: {t_override_k:.2f} K (from DSL)"
+        elif temp_schedule is not None:
+            if temp_schedule.schedule_type == "constant":
+                schedule_kind = "constant"
+                constant_schedule_k = float(temp_schedule(0.0))
+                indicator_text = f"Temperature: {constant_schedule_k:.2f} K (constant from DSL)"
+            elif temp_schedule.schedule_type == "piecewise":
+                schedule_kind = "piecewise"
+                schedule_interval_count = len(temp_schedule.get_intervals())
+                indicator_text = (
+                    f"Temperature: Schedule ({schedule_interval_count} interval"
+                    f"{'s' if schedule_interval_count != 1 else ''})"
+                )
+            elif temp_schedule.schedule_type == "response":
+                schedule_kind = "response"
+                schedule_interval_count = len(temp_schedule.get_intervals())
+                indicator_text = (
+                    f"Temperature: Schedule (response, {schedule_interval_count} interval"
+                    f"{'s' if schedule_interval_count != 1 else ''})"
+                )
+            else:
+                indicator_text = "Temperature: Schedule (unknown type)"
+
+        return TemperatureIndicatorState(
+            energy_mode_active=energy_mode_active,
+            t_override_k=t_override_k,
+            schedule_defined=schedule_defined,
+            schedule_kind=schedule_kind,
+            schedule_interval_count=schedule_interval_count,
+            constant_schedule_k=constant_schedule_k,
+            indicator_text=indicator_text,
+        )
+
     def _update_temperature_mode_indicator(self) -> None:
         """
         Update temperature mode indicator in status bar.
 
         Shows one of:
-        - "Temperature: XXX K (isothermal)" - when no schedule in DSL
+        - "Temperature: XXX K (from DSL)" - when T= directive found in reactions
+        - "Temperature: XXX K (isothermal)" - when no schedule and no T= in DSL
         - "Temperature: Schedule (N intervals)" - when piecewise schedule detected
-        - "Temperature: Schedule (constant)" - when temp_const detected
+        - "Temperature: XXX K (constant from DSL)" - when temp_const detected
         - "Temperature: Schedule (response, N intervals)" - when temp_response detected
 
         Priority rule:
-        - If temperature schedule is defined in DSL (temp_step, temp_response, or temp_const),
-          it takes precedence during ODE integration.
-        - Otherwise, the temperature spinbox value is used (isothermal).
+        1. Temperature schedule in DSL takes highest priority for indicator and solver.
+        2. T= directive seeds the spinbox value but does not override a schedule.
+        3. Otherwise, the temperature spinbox value is used (isothermal).
         """
         if not hasattr(self, "_temperature_mode_indicator"):
             return
 
-        # Get current mechanism text
-        mechanism_text = self._mechanism_editor._reactions_text.toPlainText()
-        state_network_text = ""
-        try:
-            state_network_text = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        except Exception:
-            state_network_text = ""
-        energy_mode_active = bool(str(state_network_text or "").strip())
-        if energy_mode_active:
+        mechanism_text = self.mechanism_reactions_text_raw()
+        state_network_text = self.mechanism_state_network_dsl_raw()
+        state = self._compute_temperature_indicator_state(
+            reactions_text=mechanism_text,
+            state_network_text=state_network_text,
+        )
+
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is not None and bool(owner.edit_session_active):
+            return
+
+        was_override_active = getattr(self, "_temperature_dsl_override_active", False)
+
+        if state.t_override_k is not None:
+            if not was_override_active:
+                # Capture pre-override spinbox value before DSL write-back.
+                self._pre_dsl_temperature = self._temperature_spinbox.value()
+            self._temperature_dsl_override_active = True
+            # Sync spinbox to DSL-derived temperature without firing preference persistence
+            self._temperature_spinbox.blockSignals(True)
+            try:
+                self._temperature_spinbox.setValue(state.t_override_k)
+            finally:
+                self._temperature_spinbox.blockSignals(False)
+
+            if not state.schedule_defined:
+                # Bare T= without schedule: spinbox visible, disabled, "from DSL"
+                indicator_text = str(state.indicator_text)
+                self._temperature_mode_indicator.setText(indicator_text)
+                self._set_temperature_override_state(
+                    enabled=False,
+                    tooltip="Overridden by DSL (T=...).",
+                )
+                self._set_temperature_spinbox_visible(True)
+                logger.debug(f"Temperature mode indicator updated: {indicator_text}")
+                return
+            # Temperature schedule takes precedence over bare T= directive —
+            # the T= value seeds the spinbox but the schedule dictates the indicator.
+
+        if state.t_override_k is None:
+            if was_override_active:
+                restore = self._pre_dsl_temperature
+                if restore is None:
+                    restore = float(
+                        self.config_controller.get_user_preference("temperature_K") or 298.15
+                    )
+                self._temperature_spinbox.blockSignals(True)
+                try:
+                    self._temperature_spinbox.setValue(float(restore))
+                finally:
+                    self._temperature_spinbox.blockSignals(False)
+                self._pre_dsl_temperature = None
+            self._temperature_dsl_override_active = False
+
+        # Hide spinbox and restore editable state
+        self._set_temperature_spinbox_visible(False)
+        if state.energy_mode_active:
             self._set_temperature_override_state(
                 enabled=True,
                 tooltip="Temperature for thermodynamic calculations (energy mode: add T=... to override).",
@@ -1594,65 +1880,16 @@ class MainWindow(
                 tooltip="Temperature for thermodynamic calculations",
             )
 
-        if energy_mode_active:
-            T_override = self._dsl_global_temperature_K(mechanism_text)
-            if T_override is not None:
-                indicator_text = f"Temperature: {T_override:.2f} K (from DSL)"
-                self._temperature_mode_indicator.setText(indicator_text)
-                self._set_temperature_override_state(
-                    enabled=False,
-                    tooltip="Overridden by energy-mode DSL (T=...).",
-                )
-                logger.debug(f"Temperature mode indicator updated: {indicator_text}")
-                return
-
-        # Try to detect temperature schedule in DSL
-        schedule_defined = False
-        try:
-            from kindred.core.temperature_dsl import parse_temperature_schedule
-
-            temp_schedule = parse_temperature_schedule(mechanism_text)
-            schedule_defined = temp_schedule is not None
-
-            if temp_schedule is not None:
-                # Temperature schedule detected
-                if temp_schedule.schedule_type == "constant":
-                    # Constant temperature from DSL
-                    T = temp_schedule(0.0)
-                    indicator_text = f"Temperature: {T:.2f} K (constant from DSL)"
-                elif temp_schedule.schedule_type == "piecewise":
-                    # Piecewise schedule
-                    intervals = temp_schedule.get_intervals()
-                    n_intervals = len(intervals)
-                    indicator_text = f"Temperature: Schedule ({n_intervals} interval{'s' if n_intervals != 1 else ''})"
-                elif temp_schedule.schedule_type == "response":
-                    intervals = temp_schedule.get_intervals()
-                    n_intervals = len(intervals)
-                    indicator_text = (
-                        f"Temperature: Schedule (response, {n_intervals} interval"
-                        f"{'s' if n_intervals != 1 else ''})"
-                    )
-                else:
-                    indicator_text = "Temperature: Schedule (unknown type)"
-            else:
-                # No temperature schedule - use spinbox value
-                T = self._temperature_spinbox.value()
-                if energy_mode_active:
-                    indicator_text = f"Temperature: {T:.2f} K (energy mode: set T=... in DSL)"
-                else:
-                    indicator_text = f"Temperature: {T:.2f} K (isothermal)"
-
-        except Exception as e:
-            # Fallback if parsing fails
-            logger.debug(f"Temperature schedule parsing failed: {e}")
+        indicator_text = state.indicator_text
+        if indicator_text is None:
             T = self._temperature_spinbox.value()
-            if energy_mode_active:
+            if state.energy_mode_active:
                 indicator_text = f"Temperature: {T:.2f} K (energy mode: set T=... in DSL)"
             else:
                 indicator_text = f"Temperature: {T:.2f} K (isothermal)"
 
         self._temperature_mode_indicator.setText(indicator_text)
-        if energy_mode_active and schedule_defined:
+        if state.energy_mode_active and state.schedule_defined:
             self._set_temperature_override_state(
                 enabled=False,
                 tooltip="Overridden by DSL temperature schedule.",
@@ -2531,12 +2768,13 @@ class MainWindow(
         if not all(dock is not None for dock in (mechanism_dock, sliders_dock, batch_dock, data_dock, analysis_dock)):
             return
 
-        # Left stack order: Mechanism, Interactive Sliders, Batch Initial Conditions.
-        self.splitDockWidget(mechanism_dock, batch_dock, Qt.Vertical)
+        # Left column: Mechanism (top), Interactive Sliders (bottom).
         self.splitDockWidget(mechanism_dock, sliders_dock, Qt.Vertical)
 
-        # Right stack order: Data above Analysis.
-        self.splitDockWidget(data_dock, analysis_dock, Qt.Vertical)
+        # Right column: Initial Conditions (top), Data and Analysis tabified (bottom).
+        self.splitDockWidget(batch_dock, data_dock, Qt.Vertical)
+        self.tabifyDockWidget(data_dock, analysis_dock)
+        data_dock.raise_()
 
     def schedule_restored_floating_dock_recovery(self) -> None:
         if bool(getattr(self, "_restored_floating_dock_recovery_pending", False)):
@@ -2606,6 +2844,9 @@ class MainWindow(
             dock_defaults = self._default_dock_layout()
 
             for dock, _area in dock_defaults:
+                tb = dock.titleBarWidget()
+                if tb is not None and hasattr(tb, "restore"):
+                    tb.restore()
                 dock.setVisible(True)
                 dock.setFloating(False)
 
@@ -2685,13 +2926,9 @@ class MainWindow(
         self.config_controller.toggle_theme()
 
     def _get_mechanism_text(self) -> str:
-        """Get the current mechanism DSL text from editor."""
-        reactions_text = self._mechanism_editor._reactions_text.toPlainText()
-        state_network_dsl = self._mechanism_editor._state_network_editor.get_state_network_dsl()
-        if self.has_slider_overrides():
-            state_network_dsl = self._apply_overrides_to_state_network_dsl(state_network_dsl)
-
-        # Combine DSL texts
+        """Get the canonical mechanism DSL text."""
+        reactions_text = self.mechanism_reactions_text_raw()
+        state_network_dsl = self.mechanism_state_network_dsl_raw()
         full_dsl = reactions_text
         if state_network_dsl.strip():
             full_dsl += "\n\n# State Network\n" + state_network_dsl
@@ -3326,6 +3563,9 @@ class MainWindow(
         if data_manager is not None and hasattr(data_manager, "clear_datasets"):
             data_manager.clear_datasets()
 
+        self._pre_dsl_temperature = None
+        self._temperature_dsl_override_active = False
+
         self._clear_main_plot_project_apply_state()
         self._sync_overlay_catalog()
 
@@ -3394,9 +3634,9 @@ class MainWindow(
         return {
             'project_schema_version': PROJECT_SCHEMA_VERSION,
             'version': KINDRED_VERSION,
-            'mechanism': self._mechanism_editor._reactions_text.toPlainText(),
+            'mechanism': self.mechanism_reactions_text_raw(),
             'notes': self._mechanism_editor._notes_text.toPlainText(),
-            'state_network': self._mechanism_editor._state_network_editor.get_state_network_dsl(),
+            'state_network': self.mechanism_state_network_dsl_raw(),
             "solver": str(solver_label),
             "solver_method": str(solver_method),
             "solver_warning": str(solver_warning) if solver_warning else None,
@@ -3406,7 +3646,11 @@ class MainWindow(
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
-            'temperature_K': self._temperature_spinbox.value(),
+            'temperature_K': (
+                self._pre_dsl_temperature
+                if self._pre_dsl_temperature is not None
+                else self._temperature_spinbox.value()
+            ),
             'simulation_time': str(self._sim_time_spinbox.text()).strip(),
             'num_points': int(self._num_points_spinbox.value()),
             'batch_initial_conditions': self._batch_store.as_serializable(),
@@ -3499,7 +3743,6 @@ class MainWindow(
             "Load project (reactions)",
             record_undo,
         )
-        self._on_programmatic_mechanism_load()
 
         # Batch initial conditions (schema v3+). For older projects, migrate any
         # inline initial concentrations into set1 and rewrite the block stub.
@@ -3543,6 +3786,7 @@ class MainWindow(
         else:
             if current_state_network.strip():
                 state_editor.clear()
+        self._on_programmatic_mechanism_load()
 
         # Fall back to user preference when key absent from payload.
         _pref = self.config_controller.get_user_preference
@@ -3556,6 +3800,8 @@ class MainWindow(
         self._wegscheider_cyclicity_enabled = bool(
             data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
         )
+        previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
+        previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
             self._sim_controller.parallel_batch.max_parallel_workers = max(
                 1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))
@@ -3565,6 +3811,12 @@ class MainWindow(
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
             data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
+        if (
+            previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
+            or previous_limit_blas_threads
+            != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
+        ):
+            self._sim_controller.parallel_batch_pool_settings_changed()
         if 'use_advanced_dsl' in data:
             logger.info(
                 "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
@@ -3573,6 +3825,11 @@ class MainWindow(
         self._temperature_spinbox.setValue(
             data.get('temperature_K', _pref('temperature_K'))
         )
+        # Update stash when project loads while T= override is active.
+        if getattr(self, "_temperature_dsl_override_active", False):
+            self._pre_dsl_temperature = data.get(
+                'temperature_K', _pref('temperature_K')
+            )
         sim_time = data.get('simulation_time', _pref('simulation_time'))
         if isinstance(sim_time, (int, float)):
             sim_time_text = f"{float(sim_time):g}"
@@ -3794,10 +4051,16 @@ class MainWindow(
         self._results_table = table
 
     def mechanism_reactions_text_raw(self) -> str:
-        return str(self._mechanism_editor.reactions_text())
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_reactions_text)
 
     def mechanism_state_network_dsl_raw(self) -> str:
-        return str(self._mechanism_editor.state_network_dsl_raw() or "")
+        owner = getattr(self, "_mechanism_session_owner", None)
+        if owner is None:
+            raise RuntimeError("Mechanism session owner is unavailable.")
+        return str(owner.canonical_state_network_dsl or "")
 
     def mechanism_slider_points_value(self) -> Optional[int]:
         try:
@@ -3869,6 +4132,11 @@ class MainWindow(
             str(new_text),
             str(description),
             bool(record_undo),
+        )
+
+    def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
+        self._sync_mechanism_session_owner_after_authoritative_widget_write(
+            dispatch_consumers=bool(dispatch_consumers)
         )
 
     def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None:
@@ -4421,9 +4689,11 @@ class MainWindow(
                     "Migrate initial concentrations to set table",
                     record_undo=True,
                 )
+                self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
                 self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
                 self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
                 self._set_mechanism_edit_locked(True)
+                self._dispatch_authoritative_mechanism_consumers()
                 restore_deferred = True
                 def _restore_pending_init_rewrite_suppression() -> None:
                     self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
@@ -4490,8 +4760,8 @@ class MainWindow(
         }
         for name, value in parameters.items():
             name_str = str(name)
-            if re.match(r"^(kf|kr|K|k)\d+$", name_str) and hasattr(self, "_update_variable_in_mechanism"):
-                if re.match(r"^(kf|kr|K)\d+$", name_str) and (
+            if re.match(r"^(kf|kr|Keq|k)\d+$", name_str) and hasattr(self, "_update_variable_in_mechanism"):
+                if re.match(r"^(kf|kr|Keq)\d+$", name_str) and (
                     step_analysis_context is None or step_analysis_context.source_text != updated_text
                 ):
                     step_analysis_context = build_current_text_step_analysis_context(
@@ -6043,10 +6313,9 @@ class MainWindow(
             last_slider_change_name=str(self._preview_session.last_slider_change_name() or ""),
         )
         temperature_k = float(self.temperature_spinbox_value())
-        if "\n\n# State Network\n" in str(mechanism_text):
-            t_override = self.dsl_global_temperature_K(str(mechanism_text))
-            if t_override is not None:
-                temperature_k = float(t_override)
+        t_override = self.dsl_global_temperature_K(str(mechanism_text))
+        if t_override is not None:
+            temperature_k = float(t_override)
         solver_config = {
             "solver": str(solver_grid_context.get("solver") or ""),
             "solver_label": str(solver_grid_context.get("solver_label") or ""),
@@ -6346,7 +6615,7 @@ class MainWindow(
             if isinstance(meta, dict) and meta.get("type") == "energy":
                 has_energy_overrides = True
                 continue
-            if re.match(r"^(kf|kr|K)\d+$", str(var_name)):
+            if re.match(r"^(kf|kr|Keq)\d+$", str(var_name)):
                 if step_analysis_context is None or step_analysis_context.source_text != text:
                     step_analysis_context = build_current_text_step_analysis_context(
                         text,
@@ -7054,15 +7323,17 @@ class MainWindow(
 
     def _parameter_algebra_spec_for_ui(self, *, mechanism_param_names: set[str]):
         from kindred.core.simulator.algebra_section import extract_algebra_section_text
+        from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 
         reactions_text = self._mechanism_editor._reactions_text.toPlainText()
         if not extract_algebra_section_text(reactions_text).strip():
             return None
         from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
 
+        mechanism_namespace = build_flat_compat_namespace(mechanism_param_names)
         return parse_parameter_algebra_spec_from_dsl_text(
             str(reactions_text or ""),
-            mechanism_param_names=mechanism_param_names,
+            mechanism_namespace=mechanism_namespace,
         )
 
     def _refresh_derived_parameters_display(self) -> None:
@@ -7070,7 +7341,7 @@ class MainWindow(
         current = sliders.get_variables()
         if not current:
             return
-        mechanism_param_names = {k for k in current.keys() if re.match(r"^(k|kf|kr|K)\d+$", str(k))}
+        mechanism_param_names = {k for k in current.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
         spec = None
         try:
             spec = self._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
@@ -7101,8 +7372,8 @@ class MainWindow(
         # Refresh snapshot after any derived updates.
         current = sliders.get_variables()
 
-        # Apply K-implied equilibrium constraints (canonical step indexing) so derived
-        # rates update immediately when K changes.
+        # Apply Keq-implied equilibrium constraints (canonical step indexing) so derived
+        # rates update immediately when Keq changes.
         step_map = getattr(self, "_step_index_map", None) or []
         if isinstance(step_map, list) and step_map:
             for entry in step_map:
@@ -7110,18 +7381,18 @@ class MainWindow(
                     continue
                 if str(entry.get("kind") or "") != "equilibrium":
                     continue
-                if not bool(entry.get("has_K_param")):
+                if not bool(entry.get("has_Keq_param")):
                     continue
                 try:
                     n = int(entry.get("step_index"))  # type: ignore[arg-type]
                 except Exception as exc:
                     self._record_best_effort_failure(
-                        "main_window.derived_K_constraints.step_index",
-                        message="Invalid step_index while applying K-implied constraints",
+                        "main_window.derived_Keq_constraints.step_index",
+                        message="Invalid step_index while applying Keq-implied constraints",
                         exc=exc,
                     )
                     continue
-                K_key = f"K{n}"
+                K_key = f"Keq{n}"
                 kf_key = f"kf{n}"
                 kr_key = f"kr{n}"
                 if K_key not in current:
@@ -7130,8 +7401,8 @@ class MainWindow(
                     K_val = float(current[K_key])
                 except Exception as exc:
                     self._record_best_effort_failure(
-                        "main_window.derived_K_constraints.K_val",
-                        message=f"Invalid K value for {K_key} while applying K-implied constraints",
+                        "main_window.derived_Keq_constraints.K_val",
+                        message=f"Invalid Keq value for {K_key} while applying Keq-implied constraints",
                         exc=exc,
                     )
                     continue
@@ -7145,7 +7416,7 @@ class MainWindow(
                         kr_val = float(current[kr_key])
                     except Exception as exc:
                         self._record_best_effort_failure(
-                            "main_window.derived_K_constraints.kr_val",
+                            "main_window.derived_Keq_constraints.kr_val",
                             message=f"Invalid kr value for {kr_key} while deriving kf",
                             exc=exc,
                         )
@@ -7165,7 +7436,7 @@ class MainWindow(
                         kf_val = float(current[kf_key])
                     except Exception as exc:
                         self._record_best_effort_failure(
-                            "main_window.derived_K_constraints.kf_val",
+                            "main_window.derived_Keq_constraints.kf_val",
                             message=f"Invalid kf value for {kf_key} while deriving kr",
                             exc=exc,
                         )
@@ -7285,7 +7556,7 @@ class MainWindow(
             f"ΔG° ({label})": (dG_eq, energy_unit),
             f"k_f ({label})": (kf_fixed, unit_kf),
             f"k_r ({label})": (kr, unit_kr),
-            f"K ({label})": (K, "1"),
+            f"Keq ({label})": (K, "1"),
         }
 
     def _energy_mode_params_for_ts_channel(
@@ -7385,14 +7656,14 @@ class MainWindow(
             f"ΔG° ({label})": (dG_eq, energy_unit),
             f"k_f ({label})": (kf, unit_kf),
             f"k_r ({label})": (kr, unit_kr),
-            f"K ({label})": (K, "1"),
+            f"Keq ({label})": (K, "1"),
         }
 
     def _refresh_energy_mode_derived_parameter_table(self) -> None:
         """
         Update the parameter table for energy-mode channels from current slider values.
 
-        This is cheap (no ODE solve) and keeps the read-only k_f/k_r/K display in sync
+        This is cheap (no ODE solve) and keeps the read-only k_f/k_r/Keq display in sync
         while the user drags energy sliders.
         """
         plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
@@ -7615,6 +7886,7 @@ class MainWindow(
                 description=str(description),
             )
             self._undo_stack.push(command)
+            self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         finally:
             self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
@@ -7943,136 +8215,6 @@ class MainWindow(
         self._preview_session.queue_species_slider_simulation(label=label, delay_ms=delay_ms)
 
     @staticmethod
-    def _parse_mechanism_semicolon_kv(line: str) -> tuple[str, list[list[str]], str]:
-        before_comment, sep, comment = str(line or "").partition("#")
-        comment_tail = f"{sep}{comment}" if sep else ""
-        prefix, sep_params, rest = before_comment.partition(";")
-        prefix = prefix.rstrip()
-        tokens: list[list[str]] = []
-        if sep_params:
-            for token in re.split(r"[;,]", rest):
-                token = token.strip()
-                if not token:
-                    continue
-                key, _, val = token.partition("=")
-                tokens.append([key.strip(), val.strip()])
-        return prefix, tokens, comment_tail
-
-    @staticmethod
-    def _serialize_mechanism_semicolon_kv(prefix: str, tokens: list[list[str]], comment_tail: str) -> str:
-        if tokens:
-            params = ", ".join(f"{key}={val}" if val else f"{key}=" for key, val in tokens)
-            base = f"{prefix} ; {params}"
-        else:
-            base = prefix
-        if comment_tail:
-            base = f"{base} {comment_tail.strip()}"
-        return base.strip()
-
-    @staticmethod
-    def _dedupe_tokens_case_insensitive(tokens: list[list[str]]) -> list[list[str]]:
-        seen = set()
-        result: list[list[str]] = []
-        for key, val in tokens:
-            lower = str(key).lower()
-            if lower in seen:
-                continue
-            seen.add(lower)
-            result.append([key, val])
-        return result
-
-    @staticmethod
-    def _get_token_float(tokens: list[list[str]], aliases: tuple[str, ...], default: Optional[float] = None) -> Optional[float]:
-        # Important: treat "K" as case-sensitive so it is never conflated with the
-        # "k"/"kf" forward-rate aliases on equilibrium lines.
-        exact_aliases = set(aliases)
-        alias_set = {alias.lower() for alias in aliases if alias != "K"}
-        for key, val in tokens:
-            if key == "K":
-                if "K" not in exact_aliases:
-                    continue
-                try:
-                    return float(val)
-                except (TypeError, ValueError):
-                    return default
-            if str(key).lower() in alias_set:
-                try:
-                    return float(val)
-                except (TypeError, ValueError):
-                    return default
-        return default
-
-    @staticmethod
-    def _set_token_float(
-        tokens: list[list[str]],
-        canonical_key: str,
-        float_value: float,
-        *,
-        aliases: tuple[str, ...] = (),
-        sig: int | None = None,
-    ) -> None:
-        if sig is None:
-            sanitized = format_authoritative_parameter_value(float_value)
-        else:
-            sanitized = f"{float(float_value):.{int(sig)}g}"
-        exact_aliases = set(aliases)
-
-        if canonical_key == "K":
-            target_index = None
-            for idx, (key, _) in enumerate(tokens):
-                if key == "K":
-                    target_index = idx
-                    break
-            if target_index is not None:
-                tokens[target_index][0] = canonical_key
-                tokens[target_index][1] = sanitized
-            else:
-                tokens.append([canonical_key, sanitized])
-            return
-
-        alias_set = {canonical_key.lower()}
-        alias_set.update(alias.lower() for alias in aliases if alias != "K")
-
-        target_index = None
-        for idx, (key, _) in enumerate(tokens):
-            if key == "K" and "K" not in exact_aliases:
-                continue
-            if str(key).lower() in alias_set:
-                target_index = idx
-                break
-
-        if target_index is not None:
-            tokens[target_index][0] = canonical_key
-            tokens[target_index][1] = sanitized
-        else:
-            tokens.append([canonical_key, sanitized])
-            target_index = len(tokens) - 1
-
-        for idx in range(len(tokens) - 1, -1, -1):
-            if idx == target_index:
-                continue
-            token_key = tokens[idx][0]
-            if token_key == "K" and canonical_key != "K" and "K" not in aliases:
-                continue
-            if str(token_key).lower() in alias_set:
-                tokens.pop(idx)
-
-    @staticmethod
-    def _remove_token_aliases(tokens: list[list[str]], aliases: tuple[str, ...]) -> None:
-        alias_set = {alias.lower() for alias in aliases}
-        exact_aliases = set(aliases)
-        filtered: list[list[str]] = []
-        for key, val in tokens:
-            lower = str(key).lower()
-            if lower not in alias_set:
-                filtered.append([key, val])
-                continue
-            if key == "K" and "K" not in exact_aliases:
-                filtered.append([key, val])
-                continue
-        tokens[:] = filtered
-
-    @staticmethod
     def _derived_equilibrium_role_from_metadata(metadata: dict[str, object], eq_index: int) -> str:
         kf_meta = metadata.get(f"kf{eq_index}")
         kr_meta = metadata.get(f"kr{eq_index}")
@@ -8086,7 +8228,7 @@ class MainWindow(
     @staticmethod
     def _label_for_step_from_metadata(metadata: dict[str, object], step_index: int, fallback_prefix: str) -> str:
         # Preserve canonical labels generated from step_index_map ("Step N: ...").
-        for key in (f"kf{step_index}", f"kr{step_index}", f"K{step_index}", f"k{step_index}"):
+        for key in (f"kf{step_index}", f"kr{step_index}", f"Keq{step_index}", f"k{step_index}"):
             meta0 = metadata.get(key)
             if isinstance(meta0, dict) and isinstance(meta0.get("label"), str) and meta0.get("label"):
                 return str(meta0["label"])
@@ -8127,7 +8269,7 @@ class MainWindow(
         Parameters
         ----------
         name : str
-            Variable name (e.g., 'k1', 'K1', 'kf1')
+            Variable name (e.g., 'k1', 'Keq1', 'kf1')
         value : float
             New value
         source_text : str | None
@@ -8178,22 +8320,22 @@ class MainWindow(
         }
         new_text = str(outcome.updated_text)
 
-        if family == "K":
-            K_val = float(resolved_values[f"K{step_index}"])
+        if family == "Keq":
+            K_val = float(resolved_values[f"Keq{step_index}"])
             kf_val = float(resolved_values[f"kf{step_index}"])
             kr_val = float(resolved_values[f"kr{step_index}"])
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
-            K_meta = dict(metadata.get(f"K{step_index}") or {})
+            K_meta = dict(metadata.get(f"Keq{step_index}") or {})
             K_meta.update(
                 {
                     "type": "equilibrium",
                     "index": step_index,
                     "label": K_meta.get("label") or label_text,
                     "line": line_index,
-                    "role": "K",
+                    "role": "Keq",
                 }
             )
-            metadata[f"K{step_index}"] = K_meta
+            metadata[f"Keq{step_index}"] = K_meta
             kf_meta = dict(metadata.get(f"kf{step_index}") or {})
             kf_meta.update(
                 {
@@ -8217,7 +8359,7 @@ class MainWindow(
             )
             metadata[f"kr{step_index}"] = kr_meta
             if commit:
-                slider_updates.append((f"K{step_index}", float(f"{K_val:.6g}"), metadata[f"K{step_index}"]))
+                slider_updates.append((f"Keq{step_index}", float(f"{K_val:.6g}"), metadata[f"Keq{step_index}"]))
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
         elif family == "kf":
@@ -8246,24 +8388,24 @@ class MainWindow(
                 }
             )
             metadata[f"kr{step_index}"] = kr_meta
-            if f"K{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"K{step_index}"])
-                K_meta = dict(metadata.get(f"K{step_index}") or {})
+            if f"Keq{step_index}" in resolved_values:
+                K_val = float(resolved_values[f"Keq{step_index}"])
+                K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
                         "type": "equilibrium",
                         "index": step_index,
                         "label": K_meta.get("label") or label_text,
                         "line": line_index,
-                        "role": "K",
+                        "role": "Keq",
                     }
                 )
-                metadata[f"K{step_index}"] = K_meta
+                metadata[f"Keq{step_index}"] = K_meta
             if commit:
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
-                if f"K{step_index}" in resolved_values:
-                    slider_updates.append((f"K{step_index}", float(f"{resolved_values[f'K{step_index}']:.6g}"), metadata[f"K{step_index}"]))
+                if f"Keq{step_index}" in resolved_values:
+                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "kr":
             kr_val = float(resolved_values[f"kr{step_index}"])
             kf_val = float(resolved_values[f"kf{step_index}"])
@@ -8290,24 +8432,24 @@ class MainWindow(
                 }
             )
             metadata[f"kf{step_index}"] = kf_meta
-            if f"K{step_index}" in resolved_values:
-                K_val = float(resolved_values[f"K{step_index}"])
-                K_meta = dict(metadata.get(f"K{step_index}") or {})
+            if f"Keq{step_index}" in resolved_values:
+                K_val = float(resolved_values[f"Keq{step_index}"])
+                K_meta = dict(metadata.get(f"Keq{step_index}") or {})
                 K_meta.update(
                     {
                         "type": "equilibrium",
                         "index": step_index,
                         "label": K_meta.get("label") or label_text,
                         "line": line_index,
-                        "role": "K",
+                        "role": "Keq",
                     }
                 )
-                metadata[f"K{step_index}"] = K_meta
+                metadata[f"Keq{step_index}"] = K_meta
             if commit:
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                if f"K{step_index}" in resolved_values:
-                    slider_updates.append((f"K{step_index}", float(f"{resolved_values[f'K{step_index}']:.6g}"), metadata[f"K{step_index}"]))
+                if f"Keq{step_index}" in resolved_values:
+                    slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "k":
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             metadata[name] = {
@@ -8332,7 +8474,7 @@ class MainWindow(
                 sliders.update_variable(slider_name, slider_value)
                 sliders.update_metadata(slider_name, meta)
                 # Only persist user-editable slider values as overrides; derived/read-only
-                # sliders (e.g., kf/kr implied by explicit K, or param-algebra constraints)
+                # sliders (e.g., kf/kr implied by explicit Keq, or param-algebra constraints)
                 # must never be rewritten back into the DSL.
                 if not (isinstance(meta, dict) and meta.get("editable") is False):
                     self._preview_session.stage_slider_value(slider_name, slider_value)
@@ -8374,6 +8516,15 @@ class MainWindow(
             except RuntimeError as exc:
                 logger.debug("Failed to set temperature tooltip: %s", exc, exc_info=True)
                 self._temperature_tooltip_failed = True
+
+    def _set_temperature_spinbox_visible(self, visible: bool) -> None:
+        spin = getattr(self, "_temperature_spinbox", None)
+        if spin is None:
+            return
+        spin.setVisible(bool(visible))
+        label = getattr(self, "_temperature_label", None)
+        if label is not None:
+            label.setVisible(bool(visible))
 
     def _sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None:
         return self._variable_runtime.sync_energy_mode_temperature_from_mechanism(mechanism)
@@ -8595,7 +8746,7 @@ class MainWindow(
             self._preview_session.variable_preview_debounce_ms("k1")
         )
         current_equilibrium_preview_debounce_ms = int(
-            self._preview_session.variable_preview_debounce_ms("K1")
+            self._preview_session.variable_preview_debounce_ms("Keq1")
         )
         current_slider_preview_points = int(self._mechanism_editor.slider_points_value())
         current_slider_preview_solver = str(self._mechanism_editor.slider_solver_value() or "LSODA")
@@ -8678,6 +8829,8 @@ class MainWindow(
                 self._use_sparse_jacobian = bool(settings['use_sparse_jacobian'])
             if 'wegscheider_cyclicity_enabled' in settings:
                 self._wegscheider_cyclicity_enabled = bool(settings['wegscheider_cyclicity_enabled'])
+            previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
+            previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             if 'max_parallel_batch_workers' in settings:
                 try:
                     self._sim_controller.parallel_batch.max_parallel_workers = max(
@@ -8690,6 +8843,12 @@ class MainWindow(
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
                     settings['limit_blas_threads_per_worker']
                 )
+            if (
+                previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
+                or previous_limit_blas_threads
+                != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
+            ):
+                self._sim_controller.parallel_batch_pool_settings_changed()
             if 'result_cache_cap' in settings or 'preview_cache_cap' in settings:
                 self.set_simulation_cache_caps(
                     result_cap=int(

@@ -12,12 +12,12 @@ _ALL_DOCK_AREAS = QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
 _NONDEFAULT_DOCK_AREAS = {
     "_mechanism_dock": QtCore.Qt.RightDockWidgetArea,
     "_sliders_dock": QtCore.Qt.RightDockWidgetArea,
-    "_batch_dock": QtCore.Qt.RightDockWidgetArea,
+    "_batch_dock": QtCore.Qt.LeftDockWidgetArea,
     "_right_dock": QtCore.Qt.LeftDockWidgetArea,
     "_analysis_dock": QtCore.Qt.LeftDockWidgetArea,
 }
-_LEFT_STACK_ATTRS = ("_mechanism_dock", "_sliders_dock", "_batch_dock")
-_RIGHT_STACK_ATTRS = ("_right_dock", "_analysis_dock")
+_LEFT_STACK_ATTRS = ("_mechanism_dock", "_sliders_dock")
+_RIGHT_STACK_ATTRS = ("_batch_dock", "_right_dock", "_analysis_dock")
 _EXPECTED_DOCK_METADATA = {
     "_mechanism_dock": ("Mechanism", "mechanismDock"),
     "_sliders_dock": ("Interactive Sliders", "slidersDock"),
@@ -117,10 +117,39 @@ def _assert_vertical_stack_contract(main_window, dock_attrs: tuple[str, ...], ar
         assert later.top() >= earlier.bottom()
 
 
+def _assert_right_column_contract(main_window) -> None:
+    """Batch on top, Data and Analysis tabified below."""
+    batch = main_window._batch_dock
+    data = main_window._right_dock
+    analysis = main_window._analysis_dock
+    area = QtCore.Qt.RightDockWidgetArea
+
+    for dock in (batch, data, analysis):
+        assert main_window.dockWidgetArea(dock) == area
+        assert dock.isFloating() is False
+
+    batch_geo = batch.geometry()
+    data_geo = data.geometry()
+
+    assert batch_geo.isValid() is True
+    assert batch_geo.width() > 0
+    assert batch_geo.height() > 0
+    assert data_geo.isValid() is True
+    assert data_geo.width() > 0
+    assert data_geo.height() > 0
+
+    # Batch is above the Data/Analysis tab group.
+    assert data_geo.top() >= batch_geo.bottom()
+
+    # Data and Analysis are tabified.
+    tabified = main_window.tabifiedDockWidgets(data)
+    assert analysis in tabified
+
+
 def _assert_default_shell_contract(main_window) -> None:
     assert main_window.centralWidget() is main_window._plot_tabs
     _assert_vertical_stack_contract(main_window, _LEFT_STACK_ATTRS, QtCore.Qt.LeftDockWidgetArea)
-    _assert_vertical_stack_contract(main_window, _RIGHT_STACK_ATTRS, QtCore.Qt.RightDockWidgetArea)
+    _assert_right_column_contract(main_window)
 
 
 def test_main_window_simulation_controller_uses_window_owned_ui_ports(main_window) -> None:
@@ -668,3 +697,171 @@ def test_batch_dock_title_is_initial_conditions_and_tips_in_help_menu(main_windo
     view_menu = _view_menu(main_window)
     view_action_texts = [a.text() for a in view_menu.actions() if a.menu() is None and not a.isSeparator()]
     assert "Panel Layout Tips..." not in view_action_texts
+
+
+def test_mechanism_dock_has_no_collapsible_section(main_window) -> None:
+    """Mechanism dock mounts editor directly, no redundant CollapsibleSection wrapper."""
+    from kindred.gui.widgets.collapsible_section import CollapsibleSection
+
+    panel = main_window._mechanism_panel
+    assert not isinstance(getattr(panel, "section", None), CollapsibleSection)
+    assert main_window._mechanism_dock.findChild(CollapsibleSection) is None
+
+
+def test_all_shell_docks_have_custom_title_bar(main_window) -> None:
+    from kindred.gui.widgets.dock_title_bar import DockTitleBar
+
+    for dock in _all_shell_docks(main_window):
+        tb = dock.titleBarWidget()
+        assert isinstance(tb, DockTitleBar), f"{dock.objectName()} missing custom title bar"
+        assert tb.findChild(QtWidgets.QLabel, "dockTitleLabel") is not None
+        assert tb.findChild(QtWidgets.QToolButton, "dockMinimizeButton") is not None
+        assert tb.findChild(QtWidgets.QToolButton, "dockCloseButton") is not None
+
+
+def test_minimize_hides_dock_content_and_restore_shows_it(main_window, qt_app) -> None:
+    dock = main_window._mechanism_dock
+    tb = dock.titleBarWidget()
+    minimize_btn = tb.findChild(QtWidgets.QToolButton, "dockMinimizeButton")
+
+    main_window.show()
+    qt_app.processEvents()
+
+    assert tb.is_minimized() is False
+    assert dock.widget().isVisible() is True
+
+    minimize_btn.click()
+    qt_app.processEvents()
+
+    assert tb.is_minimized() is True
+    assert dock.widget().isVisible() is False
+
+    minimize_btn.click()
+    qt_app.processEvents()
+
+    assert tb.is_minimized() is False
+    assert dock.widget().isVisible() is True
+
+
+def test_dock_title_bar_close_button_closes_dock(main_window, qt_app) -> None:
+    dock = main_window._sliders_dock
+    tb = dock.titleBarWidget()
+    close_btn = tb.findChild(QtWidgets.QToolButton, "dockCloseButton")
+
+    main_window.show()
+    qt_app.processEvents()
+
+    assert dock.isVisible() is True
+
+    close_btn.click()
+    qt_app.processEvents()
+
+    assert dock.isVisible() is False
+
+
+def test_dock_title_bar_drag_initiates_float(main_window, qt_app, qtbot) -> None:
+    dock = main_window._mechanism_dock
+    tb = dock.titleBarWidget()
+
+    main_window.show()
+    qt_app.processEvents()
+
+    start_pos = QtCore.QPoint(12, max(4, tb.height() // 2))
+    qtbot.mousePress(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(tb, start_pos + QtCore.QPoint(40, 0))
+    qtbot.mouseRelease(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos + QtCore.QPoint(40, 0))
+    qt_app.processEvents()
+
+    assert dock.isFloating() is True
+
+
+def test_dock_title_bar_double_click_toggles_float(main_window, qt_app, qtbot) -> None:
+    dock = main_window._sliders_dock
+    tb = dock.titleBarWidget()
+
+    main_window.show()
+    qt_app.processEvents()
+
+    click_pos = QtCore.QPoint(12, max(4, tb.height() // 2))
+    qtbot.mouseDClick(tb, QtCore.Qt.MouseButton.LeftButton, pos=click_pos)
+    qt_app.processEvents()
+    assert dock.isFloating() is True
+
+    qtbot.mouseDClick(tb, QtCore.Qt.MouseButton.LeftButton, pos=click_pos)
+    qt_app.processEvents()
+    assert dock.isFloating() is False
+
+
+def test_minimized_dock_title_bar_drag_still_floats(main_window, qt_app, qtbot) -> None:
+    dock = main_window._batch_dock
+    tb = dock.titleBarWidget()
+    minimize_btn = tb.findChild(QtWidgets.QToolButton, "dockMinimizeButton")
+    assert minimize_btn is not None
+
+    main_window.show()
+    qt_app.processEvents()
+    minimize_btn.click()
+    qt_app.processEvents()
+
+    start_pos = QtCore.QPoint(12, max(4, tb.height() // 2))
+    qtbot.mousePress(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos)
+    qtbot.mouseMove(tb, start_pos + QtCore.QPoint(40, 0))
+    qtbot.mouseRelease(tb, QtCore.Qt.MouseButton.LeftButton, pos=start_pos + QtCore.QPoint(40, 0))
+    qt_app.processEvents()
+
+    assert dock.isFloating() is True
+
+
+def test_reshow_after_close_while_minimized_auto_restores(main_window, qt_app) -> None:
+    dock = main_window._batch_dock
+    tb = dock.titleBarWidget()
+    minimize_btn = tb.findChild(QtWidgets.QToolButton, "dockMinimizeButton")
+
+    main_window.show()
+    qt_app.processEvents()
+
+    minimize_btn.click()
+    qt_app.processEvents()
+    assert tb.is_minimized() is True
+
+    dock.close()
+    qt_app.processEvents()
+
+    dock.show()
+    qt_app.processEvents()
+
+    assert tb.is_minimized() is False
+    assert dock.widget().isVisible() is True
+
+
+def test_reset_layout_restores_minimized_docks(main_window, qt_app) -> None:
+    dock = main_window._right_dock
+    tb = dock.titleBarWidget()
+    minimize_btn = tb.findChild(QtWidgets.QToolButton, "dockMinimizeButton")
+
+    main_window.show()
+    qt_app.processEvents()
+
+    minimize_btn.click()
+    qt_app.processEvents()
+    assert tb.is_minimized() is True
+
+    main_window._reset_layout()
+    qt_app.processEvents()
+
+    assert tb.is_minimized() is False
+    assert dock.widget().isVisible() is True
+
+
+def test_factory_layout_has_batch_on_right_and_data_analysis_tabified(main_window, qt_app) -> None:
+    main_window.show()
+    qt_app.processEvents()
+    main_window._reset_layout()
+    qt_app.processEvents()
+
+    assert main_window.dockWidgetArea(main_window._batch_dock) == QtCore.Qt.RightDockWidgetArea
+    assert main_window.dockWidgetArea(main_window._mechanism_dock) == QtCore.Qt.LeftDockWidgetArea
+    assert main_window.dockWidgetArea(main_window._sliders_dock) == QtCore.Qt.LeftDockWidgetArea
+
+    tabified = main_window.tabifiedDockWidgets(main_window._right_dock)
+    assert main_window._analysis_dock in tabified

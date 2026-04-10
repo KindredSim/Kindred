@@ -5,8 +5,8 @@ Canonical rule:
 - Every kinetic step in DSL order gets a 1-based index N.
 - Reaction step -> parameter kN
 - Equilibrium step -> parameters kfN and krN
-- Equilibrium constant parameter KN exists only when explicitly represented/used
-  (currently: when the DSL provided K=... on that step; stored as metadata K_input).
+- Equilibrium constant parameter KeqN exists only when explicitly represented/used
+  (currently: when the DSL provided K=... on that step; stored as metadata Keq_input).
 
 Policy:
 - State-network generated steps are excluded from the step-index map to avoid
@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.validation import try_parse_int
 
 __all__ = [
@@ -27,7 +28,7 @@ __all__ = [
     "lookup_step_param_target",
 ]
 
-_CANON_PARAM_RE = re.compile(r"^(k|kf|kr|K)(\d+)$")
+_CANON_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
 
 
 def get_step_index_map(mechanism: object) -> List[Dict[str, object]]:
@@ -49,24 +50,24 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
     """
     Yield (param_name, step_entry, role).
 
-    role is one of: "k", "kf", "kr", "K".
+    role is one of: "k", "kf", "kr", "Keq".
     """
-    for entry in get_step_index_map(mechanism):
-        n, ok = try_parse_int(entry.get("step_index"))
-        if not ok:
+    step_map = get_step_index_map(mechanism)
+    namespace = build_namespace_from_mechanism(mechanism)
+    for item in namespace.ordered_items:
+        if item.source_index is None:
             continue
-        kind = str(entry.get("kind") or "")
-        if kind == "reaction":
-            yield (f"k{n}", entry, "k")
-        elif kind == "equilibrium":
-            yield (f"kf{n}", entry, "kf")
-            yield (f"kr{n}", entry, "kr")
-            if bool(entry.get("has_K_param")):
-                yield (f"K{n}", entry, "K")
+        if not (0 <= int(item.source_index) < len(step_map)):
+            continue
+        entry = step_map[int(item.source_index)]
+        role = item.info.role
+        if role is None:
+            continue
+        yield (item.canonical_name, entry, role)
 
 
 def canonical_parameter_names(mechanism: object) -> Set[str]:
-    return {name for name, _entry, _role in iter_canonical_parameters(mechanism)}
+    return build_namespace_from_mechanism(mechanism).flat_names()
 
 
 def lookup_step_param_target(
@@ -78,7 +79,7 @@ def lookup_step_param_target(
     Returns (kind, index, role, entry) where:
     - kind: "reaction" or "equilibrium"
     - index: 0-based index into mechanism.reactions or mechanism.equilibria
-    - role: "k" / "kf" / "kr" / "K"
+    - role: "k" / "kf" / "kr" / "Keq"
     """
     m = _CANON_PARAM_RE.match(str(name))
     if not m:
@@ -102,10 +103,10 @@ def lookup_step_param_target(
             if not ok:
                 return None
             return ("reaction", idx, "k", entry)
-        if role in {"kf", "kr", "K"}:
+        if role in {"kf", "kr", "Keq"}:
             if kind != "equilibrium":
                 return None
-            if role == "K" and not bool(entry.get("has_K_param")):
+            if role == "Keq" and not bool(entry.get("has_Keq_param")):
                 return None
             idx_raw = entry.get("equilibrium_index")
             idx, ok = try_parse_int(idx_raw)

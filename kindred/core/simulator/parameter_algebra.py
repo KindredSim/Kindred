@@ -17,6 +17,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_namespace import (
+    MechanismParameterNamespace,
+    build_namespace_from_mechanism,
+)
 from kindred.core.simulator.parameter_algebra_eval import (
     evaluate_parameter_algebra,
     evaluate_parameter_algebra_in_context as _evaluate_param_block_in_context,
@@ -31,7 +35,6 @@ from kindred.core.simulator.parameter_algebra_spec import (
     parse_parameter_algebra_spec_from_dsl_text,
 )
 from kindred.core.simulator.step_indexing import (
-    canonical_parameter_names,
     get_step_index_map,
     iter_canonical_parameters,
     lookup_step_param_target,
@@ -56,22 +59,12 @@ _PUBLIC_REEXPORTS = (
 )
 
 
+def mechanism_parameter_namespace(mechanism: object) -> MechanismParameterNamespace:
+    return build_namespace_from_mechanism(mechanism)
+
+
 def mechanism_parameter_names(mechanism: object) -> Set[str]:
-    # Canonical global step-index naming (kN / kfN / krN / KN).
-    out = canonical_parameter_names(mechanism)
-    if out:
-        return out
-    # Fallback for legacy/hand-constructed Mechanism instances without a step_index_map.
-    n_rxn = len(getattr(mechanism, "reactions", []) or [])
-    n_eq = len(getattr(mechanism, "equilibria", []) or [])
-    legacy: Set[str] = set()
-    for i in range(1, n_rxn + 1):
-        legacy.add(f"k{i}")
-    for i in range(1, n_eq + 1):
-        legacy.add(f"kf{i}")
-        legacy.add(f"kr{i}")
-        legacy.add(f"K{i}")
-    return legacy
+    return mechanism_parameter_namespace(mechanism).flat_names()
 
 
 def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[str]] = None) -> Dict[str, float]:
@@ -86,51 +79,32 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
         except Exception:
             return None
 
-    # Prefer canonical step map if present.
-    step_map = get_step_index_map(mechanism)
-    if step_map:
-        rxns = getattr(mechanism, "reactions", []) or []
-        eqs = getattr(mechanism, "equilibria", []) or []
-        for name, entry, role in iter_canonical_parameters(mechanism):
-            if name not in wanted:
-                continue
-            kind = str(entry.get("kind") or "")
-            if kind == "reaction" and role == "k":
-                idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
-                if 0 <= idx < len(rxns):
-                    v = _as_float(getattr(rxns[idx], "rate", None))
-                    if v is not None:
-                        out[name] = v
-            elif kind == "equilibrium":
-                idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
-                if not (0 <= idx < len(eqs)):
-                    continue
-                eq = eqs[idx]
-                if role in {"kf", "kr"}:
-                    v = _as_float(getattr(eq, role, None))
-                    if v is not None:
-                        out[name] = v
-                elif role == "K":
-                    meta = getattr(eq, "metadata", {}) or {}
-                    v = _as_float(meta.get("K_input"))
-                    if v is not None:
-                        out[name] = v
-        return out
-
-    # Legacy fallback: per-type ordinals.
-    for i, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
-        key = f"k{i}"
-        if key in wanted:
-            v = _as_float(getattr(rxn, "rate", None))
-            if v is not None:
-                out[key] = v
-    for i, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-        for base, attr in (("kf", "kf"), ("kr", "kr"), ("K", "K")):
-            key = f"{base}{i}"
-            if key in wanted:
-                v = _as_float(getattr(eq, attr, None))
+    rxns = getattr(mechanism, "reactions", []) or []
+    eqs = getattr(mechanism, "equilibria", []) or []
+    for name, entry, role in iter_canonical_parameters(mechanism):
+        if name not in wanted:
+            continue
+        kind = str(entry.get("kind") or "")
+        if kind == "reaction" and role == "k":
+            idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
+            if 0 <= idx < len(rxns):
+                v = _as_float(getattr(rxns[idx], "rate", None))
                 if v is not None:
-                    out[key] = v
+                    out[name] = v
+        elif kind == "equilibrium":
+            idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
+            if not (0 <= idx < len(eqs)):
+                continue
+            eq = eqs[idx]
+            if role in {"kf", "kr"}:
+                v = _as_float(getattr(eq, role, None))
+                if v is not None:
+                    out[name] = v
+            elif role == "Keq":
+                meta = getattr(eq, "metadata", {}) or {}
+                v = _as_float(meta.get("Keq_input"))
+                if v is not None:
+                    out[name] = v
     return out
 
 
@@ -210,28 +184,28 @@ def _set_mechanism_param(
                 raise DSLError(f"Parameter {name!r} is not mutable in this run (missing binding)")
             eqs[idx] = replace(eq, **{role: float(value)})
             return
-        if role == "K":
+        if role == "Keq":
             meta = dict(getattr(eq, "metadata", {}) or {})
-            current = meta.get("K_input")
+            current = meta.get("Keq_input")
             if require_mutable:
                 if hasattr(current, "set"):
                     current.set(float(value))  # type: ignore[call-arg]
                     return
-                # Allow creating a binding for K_input if not already mutable.
+                # Allow creating a binding for Keq_input if not already mutable.
                 b = RateBinding(name=str(name), value=float(value))
-                meta["K_input"] = b
+                meta["Keq_input"] = b
                 eqs[idx] = replace(eq, metadata=meta)
                 return
-            meta["K_input"] = float(value)
+            meta["Keq_input"] = float(value)
             eqs[idx] = replace(eq, metadata=meta)
             return
 
     raise DSLError(f"Unsupported parameter target for {name!r}")
 
 
-def _apply_equilibrium_K_constraints_to_values(mechanism: object, base_values: Dict[str, float]) -> None:
+def _apply_equilibrium_Keq_constraints_to_values(mechanism: object, base_values: Dict[str, float]) -> None:
     """
-    Populate derived equilibrium rate values implied by explicit K parameters.
+    Populate derived equilibrium rate values implied by explicit Keq parameters.
 
     This ensures parameter-algebra expressions that reference the derived rate
     see a consistent value.
@@ -239,48 +213,48 @@ def _apply_equilibrium_K_constraints_to_values(mechanism: object, base_values: D
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
-        if not bool(entry.get("has_K_param")):
+        if not bool(entry.get("has_Keq_param")):
             continue
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium K-constraint entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
+            logger.debug("Skipping equilibrium Keq-constraint entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
             continue
         derive_rate = str(entry.get("derive_rate") or "kr")
         kf_key = f"kf{n}"
         kr_key = f"kr{n}"
-        K_key = f"K{n}"
-        if K_key not in base_values:
+        keq_key = f"Keq{n}"
+        if keq_key not in base_values:
             continue
-        K = float(base_values[K_key])
-        if not math.isfinite(K) or abs(K) < 1e-30:
+        keq = float(base_values[keq_key])
+        if not math.isfinite(keq) or abs(keq) < 1e-30:
             continue
         if derive_rate == "kf":
             if kr_key in base_values:
-                base_values[kf_key] = float(base_values[kr_key]) * K
+                base_values[kf_key] = float(base_values[kr_key]) * keq
         else:
             if kf_key in base_values:
-                base_values[kr_key] = float(base_values[kf_key]) / K
+                base_values[kr_key] = float(base_values[kf_key]) / keq
 
 
-def _apply_equilibrium_K_constraints_to_mechanism(mechanism: object, *, require_mutable: bool) -> Dict[str, float]:
+def _apply_equilibrium_Keq_constraints_to_mechanism(mechanism: object, *, require_mutable: bool) -> Dict[str, float]:
     """
-    Apply equilibrium constraints implied by explicit K parameters to the mechanism in-place.
+    Apply equilibrium constraints implied by explicit Keq parameters to the mechanism in-place.
 
     Returns a map of derived rate updates (e.g., {'kr2': 1.23}).
     """
     updates: Dict[str, float] = {}
     values = read_mechanism_parameter_values(mechanism)
-    _apply_equilibrium_K_constraints_to_values(mechanism, values)
+    _apply_equilibrium_Keq_constraints_to_values(mechanism, values)
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
-        if not bool(entry.get("has_K_param")):
+        if not bool(entry.get("has_Keq_param")):
             continue
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium K-constraint (mechanism) entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
+            logger.debug("Skipping equilibrium Keq-constraint (mechanism) entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
             continue
         derive_rate = str(entry.get("derive_rate") or "kr")
         if derive_rate == "kf":
@@ -307,7 +281,7 @@ def _apply_wegscheider_cyclicity_constraints_to_mechanism(
     Policy (hard constraints):
     - Operates on ln(kf/kr) edge potentials over the complex graph.
     - Builds a deterministic spanning forest; non-tree, non-fixed edges are derived.
-    - Explicit-K equilibria (step_index_map has_K_param) are treated as fixed ratios.
+    - Explicit-Keq equilibria (step_index_map has_Keq_param) are treated as fixed ratios.
     - Derived targets are recorded into constrained_params for GUI + fit-scan exclusion.
     """
     meta = getattr(mechanism, "metadata", {}) or {}
@@ -463,7 +437,7 @@ def apply_parameter_algebra_spec_to_mechanism(
     base_values: Dict[str, float] = {}
     base_values.update(read_mechanism_parameter_values(mechanism, names=spec.mechanism_param_names))
     base_values.update(_read_scalar_param_values(mechanism, require_mutable=require_mutable))
-    _apply_equilibrium_K_constraints_to_values(mechanism, base_values)
+    _apply_equilibrium_Keq_constraints_to_values(mechanism, base_values)
 
     derived: Dict[str, float] = {}
     if spec.param_statements:
@@ -498,7 +472,7 @@ def apply_parameter_algebra_spec_to_mechanism(
             tmp_spec = ParameterAlgebraSpec(
                 param_statements=[stmt],
                 observable_names=set(spec.observable_names),
-                mechanism_param_names=set(spec.mechanism_param_names),
+                mechanism_namespace=spec.mechanism_namespace,
                 scalar_input_names=set(spec.scalar_input_names),
             )
             tmp_vals = _evaluate_param_block_in_context(tmp_spec, base_values=dict(base_values), enforce_defaults=False)
@@ -556,13 +530,13 @@ def apply_parameter_algebra_spec_to_mechanism(
         if _MECH_PARAM_RE.match(nm):
             _set_mechanism_param(mechanism, nm, val, require_mutable=require_mutable)
 
-    # Apply K-implied equilibrium constraints after any parameter algebra updates.
-    eq_updates = _apply_equilibrium_K_constraints_to_mechanism(mechanism, require_mutable=require_mutable)
+    # Apply Keq-implied equilibrium constraints after any parameter algebra updates.
+    eq_updates = _apply_equilibrium_Keq_constraints_to_mechanism(mechanism, require_mutable=require_mutable)
     if eq_updates:
         derived = dict(derived)
         derived.update(eq_updates)
 
-    # Apply Wegscheider cyclicity constraints last (after explicit-K implied rates).
+    # Apply Wegscheider cyclicity constraints last (after explicit-Keq implied rates).
     cy_updates = _apply_wegscheider_cyclicity_constraints_to_mechanism(
         mechanism,
         require_mutable=require_mutable,
@@ -588,8 +562,11 @@ def apply_parameter_algebra_to_mechanism(
     - In prepared/bound mode (`require_mutable=True`), updates must target mutable
       bindings (RateBinding-like objects with `.set()`).
     """
-    mech_names = mechanism_parameter_names(mechanism)
-    spec = parse_parameter_algebra_spec_from_dsl_text(dsl_text, mechanism_param_names=mech_names)
+    mechanism_namespace = mechanism_parameter_namespace(mechanism)
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        dsl_text,
+        mechanism_namespace=mechanism_namespace,
+    )
     return apply_parameter_algebra_spec_to_mechanism(
         spec,
         mechanism=mechanism,
@@ -599,71 +576,51 @@ def apply_parameter_algebra_to_mechanism(
 
 def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
     """
-    Best-effort unit map for solver parameters.
+    Unit map for solver parameters backed by authoritative step metadata.
 
     - k{i}: based on Reaction.order (mass-action), units M^(1-order)/s
     - kf{i}, kr{i}: based on equilibrium forward/back molecularity
-    - K{i}: dimensionless ("1")
+    - Keq{i}: dimensionless ("1")
     - scalar params: dimensionless ("1") (if present in metadata)
     """
     from kindred.core.simulator.parameter_units import rate_constant_unit
 
     units: Dict[str, str] = {}
-    step_map = get_step_index_map(mechanism)
     rxns = getattr(mechanism, "reactions", []) or []
     eqs = getattr(mechanism, "equilibria", []) or []
-    if step_map:
-        for name, entry, role in iter_canonical_parameters(mechanism):
-            kind = str(entry.get("kind") or "")
-            if kind == "reaction" and role == "k":
-                try:
-                    idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
-                except (TypeError, ValueError) as exc:
-                    logger.debug("Skipping reaction index with invalid reaction_index=%r: %s", entry.get("reaction_index"), exc)
-                    continue
-                if 0 <= idx < len(rxns):
-                    try:
-                        order = int(getattr(rxns[idx], "order", 1))
-                    except Exception:
-                        order = 1
-                    units[name] = rate_constant_unit(order)
-            elif kind == "equilibrium":
-                try:
-                    idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
-                except (TypeError, ValueError) as exc:
-                    logger.debug(
-                        "Skipping equilibrium index with invalid equilibrium_index=%r: %s",
-                        entry.get("equilibrium_index"),
-                        exc,
-                    )
-                    continue
-                if not (0 <= idx < len(eqs)):
-                    continue
-                eq = eqs[idx]
-                if role == "K":
-                    units[name] = "1"
-                    continue
-                try:
-                    fwd_order = int(round(sum(getattr(eq, "stoich_forward", {}).values())))
-                except Exception:
-                    fwd_order = 1
-                try:
-                    back_order = int(round(sum(getattr(eq, "stoich_back", {}).values())))
-                except Exception:
-                    back_order = 1
-                if role == "kf":
-                    units[name] = rate_constant_unit(fwd_order)
-                elif role == "kr":
-                    units[name] = rate_constant_unit(back_order)
-    else:
-        # Legacy fallback: per-type ordinals.
-        for i, rxn in enumerate(rxns, start=1):
+    for name, entry, role in iter_canonical_parameters(mechanism):
+        kind = str(entry.get("kind") or "")
+        if kind == "reaction" and role == "k":
             try:
-                order = int(getattr(rxn, "order", 1))
+                idx = int(entry.get("reaction_index", -1))  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has an invalid reaction_index."
+                ) from exc
+            if not (0 <= idx < len(rxns)):
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has reaction_index {idx} out of range."
+                )
+            try:
+                order = int(getattr(rxns[idx], "order", 1))
             except Exception:
                 order = 1
-            units[f"k{i}"] = rate_constant_unit(order)
-        for i, eq in enumerate(eqs, start=1):
+            units[name] = rate_constant_unit(order)
+        elif kind == "equilibrium":
+            try:
+                idx = int(entry.get("equilibrium_index", -1))  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has an invalid equilibrium_index."
+                ) from exc
+            if not (0 <= idx < len(eqs)):
+                raise ValueError(
+                    f"Authoritative step metadata for {name!r} has equilibrium_index {idx} out of range."
+                )
+            eq = eqs[idx]
+            if role == "Keq":
+                units[name] = "1"
+                continue
             try:
                 fwd_order = int(round(sum(getattr(eq, "stoich_forward", {}).values())))
             except Exception:
@@ -672,9 +629,10 @@ def solver_parameter_units_from_mechanism(mechanism: object) -> Dict[str, str]:
                 back_order = int(round(sum(getattr(eq, "stoich_back", {}).values())))
             except Exception:
                 back_order = 1
-            units[f"kf{i}"] = rate_constant_unit(fwd_order)
-            units[f"kr{i}"] = rate_constant_unit(back_order)
-            units[f"K{i}"] = "1"
+            if role == "kf":
+                units[name] = rate_constant_unit(fwd_order)
+            elif role == "kr":
+                units[name] = rate_constant_unit(back_order)
 
     meta = getattr(mechanism, "metadata", {}) or {}
     scalar_info = meta.get("scalar_param_info") or {}

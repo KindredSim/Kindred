@@ -6,11 +6,28 @@ from typing import List, Sequence, Set, Tuple
 
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
 _PARAM_STMT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
 _LET_STMT_RE = re.compile(r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.IGNORECASE)
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
-_MECH_PARAM_RE = re.compile(r"^(k|kf|kr|K)(\d+)$")
+_MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
+_MECH_PARAM_CI_RE = re.compile(r"^(?:k|kf|kr|keq)(\d+)$", re.IGNORECASE)
+
+
+def _raise_equilibrium_constant_alias_error(
+    raw_name: str,
+    *,
+    equilibrium_name: str,
+    line_number: int,
+    line_content: str,
+) -> None:
+    raise DSLError(
+        f"{raw_name!r} refers to an equilibrium constant; use {equilibrium_name} for equilibrium constants",
+        suggestion=f"Replace {raw_name} with {equilibrium_name}.",
+        line_number=line_number,
+        line_content=line_content,
+    )
 
 
 @dataclass(frozen=True)
@@ -53,8 +70,12 @@ class ParameterAlgebraSpec:
 
     param_statements: List[ParameterAssignment]
     observable_names: Set[str]
-    mechanism_param_names: Set[str]
+    mechanism_namespace: MechanismParameterNamespace
     scalar_input_names: Set[str] = field(default_factory=set)
+
+    @property
+    def mechanism_param_names(self) -> Set[str]:
+        return self.mechanism_namespace.flat_names()
 
     def param_assignment_names(self) -> Set[str]:
         return {p.name for p in self.param_statements}
@@ -65,7 +86,7 @@ class ParameterAlgebraSpec:
     def namespace_model(self) -> ParameterAlgebraNamespace:
         symtab = SymbolTable()
         return ParameterAlgebraNamespace(
-            mechanism_param_names=set(self.mechanism_param_names),
+            mechanism_param_names=self.mechanism_namespace.flat_names(),
             param_assignment_names=self.param_assignment_names(),
             scalar_input_names=set(self.scalar_input_names),
             observable_names=set(self.observable_names),
@@ -119,10 +140,11 @@ def collect_algebra_section_lines(dsl_text: str) -> List[Tuple[int, str]]:
 def extract_parameter_assignments_from_algebra_lines(
     algebra_lines: Sequence[Tuple[int, str]],
     *,
-    mechanism_param_names: Set[str],
+    mechanism_namespace: MechanismParameterNamespace,
 ) -> List[ParameterAssignment]:
     assignments: List[ParameterAssignment] = []
     seen: Set[str] = set()
+    mechanism_param_names = mechanism_namespace.flat_names()
 
     for line_no, raw in algebra_lines:
         original = raw.rstrip("\n")
@@ -136,7 +158,16 @@ def extract_parameter_assignments_from_algebra_lines(
 
         m_param = _PARAM_STMT_RE.match(code)
         if m_param:
-            name = m_param.group(1)
+            raw_name = m_param.group(1)
+            resolution = mechanism_namespace.resolve(raw_name)
+            if resolution.equilibrium_conflict_name is not None:
+                _raise_equilibrium_constant_alias_error(
+                    raw_name,
+                    equilibrium_name=resolution.equilibrium_conflict_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
+            name = resolution.canonical_name or raw_name
             expr = m_param.group(2).strip()
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
@@ -145,11 +176,11 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            m_mech = _MECH_PARAM_RE.match(name)
-            if m_mech and name not in mechanism_param_names:
+            m_mech = _MECH_PARAM_CI_RE.match(raw_name)
+            if m_mech and resolution.canonical_name is None and name not in mechanism_param_names:
                 raise DSLError(
-                    f"Unknown mechanism parameter {name!r} in Algebra param statement",
-                    suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, K1) or define the parameter on a reaction line.",
+                    f"Unknown mechanism parameter {raw_name!r} in Algebra param statement",
+                    suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, Keq1) or define the parameter on a reaction line.",
                     examples=["reaction: A -> B; k=1.0", "param k1 = 4*k2"],
                     line_number=line_no,
                     line_content=original,
@@ -174,12 +205,21 @@ def extract_parameter_assignments_from_algebra_lines(
 
         m_let = _LET_STMT_RE.match(code)
         if m_let:
-            target = m_let.group(1)
-            if target in mechanism_param_names:
+            target_raw = m_let.group(1)
+            resolution = mechanism_namespace.resolve(target_raw)
+            if resolution.equilibrium_conflict_name is not None:
+                _raise_equilibrium_constant_alias_error(
+                    target_raw,
+                    equilibrium_name=resolution.equilibrium_conflict_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
+            target = resolution.canonical_name or target_raw
+            if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
-                    f"{target!r} is a rate/equilibrium parameter; use 'param {target} = ...' for parameter algebra",
-                    suggestion=f"Replace this with: param {target} = ...",
-                    examples=[f"param {target} = 4*k2"],
+                    f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
+                    suggestion=f"Replace this with: param {target_raw} = ...",
+                    examples=[f"param {target_raw} = 4*k2"],
                     line_number=line_no,
                     line_content=original,
                 )
@@ -187,12 +227,21 @@ def extract_parameter_assignments_from_algebra_lines(
 
         m_assign = _ASSIGN_RE.match(code)
         if m_assign:
-            target = m_assign.group(1)
-            if target in mechanism_param_names:
+            target_raw = m_assign.group(1)
+            resolution = mechanism_namespace.resolve(target_raw)
+            if resolution.equilibrium_conflict_name is not None:
+                _raise_equilibrium_constant_alias_error(
+                    target_raw,
+                    equilibrium_name=resolution.equilibrium_conflict_name,
+                    line_number=line_no,
+                    line_content=original,
+                )
+            target = resolution.canonical_name or target_raw
+            if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
-                    f"{target!r} is a rate/equilibrium parameter; use 'param {target} = ...' for parameter algebra",
-                    suggestion=f"Replace this with: param {target} = ...",
-                    examples=[f"param {target} = 4*k2"],
+                    f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
+                    suggestion=f"Replace this with: param {target_raw} = ...",
+                    examples=[f"param {target_raw} = 4*k2"],
                     line_number=line_no,
                     line_content=original,
                 )
@@ -203,11 +252,11 @@ def extract_parameter_assignments_from_algebra_lines(
 def extract_parameter_assignments_from_dsl_text(
     dsl_text: str,
     *,
-    mechanism_param_names: Set[str],
+    mechanism_namespace: MechanismParameterNamespace,
 ) -> List[ParameterAssignment]:
     return extract_parameter_assignments_from_algebra_lines(
         collect_algebra_section_lines(dsl_text),
-        mechanism_param_names=mechanism_param_names,
+        mechanism_namespace=mechanism_namespace,
     )
 
 
@@ -235,11 +284,11 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
 def parse_parameter_algebra_spec_from_dsl_text(
     dsl_text: str,
     *,
-    mechanism_param_names: Set[str],
+    mechanism_namespace: MechanismParameterNamespace,
     scalar_input_names: Set[str] | None = None,
 ) -> ParameterAlgebraSpec:
     lines = collect_algebra_section_lines(dsl_text)
-    assignments = extract_parameter_assignments_from_algebra_lines(lines, mechanism_param_names=mechanism_param_names)
+    assignments = extract_parameter_assignments_from_algebra_lines(lines, mechanism_namespace=mechanism_namespace)
     observables = extract_observable_names_from_algebra_lines(lines)
     for assignment in assignments:
         if assignment.name in observables:
@@ -255,6 +304,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
     return ParameterAlgebraSpec(
         param_statements=list(assignments),
         observable_names=set(observables),
-        mechanism_param_names=set(mechanism_param_names),
+        mechanism_namespace=mechanism_namespace,
         scalar_input_names=set(scalar_input_names or ()),
     )

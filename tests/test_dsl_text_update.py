@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import kindred.core.simulator.dsl_text_update as dsl_text_update
+import pytest
 
 from kindred.core.simulator.dsl_text_update import (
     analyze_parameter_updates_to_dsl_text,
@@ -103,7 +104,7 @@ def test_authoritative_parameter_change_name_aware_respects_step_writer_floor_fo
         return str(text).replace("K=0", f"{name[:-1]}={effective:.15g}", 1)
 
     assert authoritative_parameter_change_name_aware(
-        "K1",
+        "Keq1",
         0.0,
         -0.0,
         source_text="equilibrium: A <-> B ; kf=1, K=0",
@@ -152,7 +153,7 @@ def test_analyze_step_parameter_update_reports_derived_equilibrium_rate_as_unwri
 def test_analyze_step_parameter_update_uses_current_text_owner_when_metadata_is_stale():
     outcome = analyze_step_parameter_update(
         "equilibrium: A <-> B ; kr=2, K=3",
-        "K1",
+        "Keq1",
         6.0,
         authoritative_current_value=3.0,
         step_metadata={
@@ -161,7 +162,7 @@ def test_analyze_step_parameter_update_uses_current_text_owner_when_metadata_is_
         },
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is True
     assert outcome.effective_authoritative_written_value == 6.0
@@ -169,7 +170,7 @@ def test_analyze_step_parameter_update_uses_current_text_owner_when_metadata_is_
     assert outcome.would_change_text is True
     assert outcome.canonicalization_only_change is False
     assert outcome.warning_reason is None
-    assert "K=6" in outcome.updated_text
+    assert "Keq=6" in outcome.updated_text
     assert "kr=2" in outcome.updated_text
     assert "kf=" not in outcome.updated_text
 
@@ -177,11 +178,11 @@ def test_analyze_step_parameter_update_uses_current_text_owner_when_metadata_is_
 def test_analyze_step_parameter_update_ignores_stale_constraint_metadata_when_current_text_is_editable():
     outcome = analyze_step_parameter_update(
         "equilibrium: A <-> B ; kf=6, K=3",
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
         step_metadata={
-            "K1": {
+            "Keq1": {
                 "editable": False,
                 "derived": True,
                 "constraint_reason": "algebra",
@@ -189,33 +190,33 @@ def test_analyze_step_parameter_update_ignores_stale_constraint_metadata_when_cu
         },
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is True
     assert outcome.effective_authoritative_written_value == 8.0
     assert outcome.semantic_value_change is True
     assert outcome.would_change_text is True
     assert outcome.canonicalization_only_change is False
-    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, K=8"
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, Keq=8"
     assert outcome.warning_reason is None
 
 
 def test_analyze_step_parameter_update_blocks_explicit_k_target_for_current_text_constraint():
     outcome = analyze_step_parameter_update(
-        "equilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = 4",
-        "K1",
+        "equilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4",
+        "Keq1",
         8.0,
         authoritative_current_value=4.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 4.0
     assert outcome.semantic_value_change is False
     assert outcome.would_change_text is False
     assert outcome.canonicalization_only_change is False
-    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = 4"
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4"
     assert outcome.warning_reason == "target_unwritable"
 
 
@@ -240,20 +241,20 @@ def test_analyze_step_parameter_update_blocks_plain_k_target_for_current_text_co
 
 def test_analyze_step_parameter_update_blocks_explicit_k_target_for_current_text_scalar_backed_constraint():
     outcome = analyze_step_parameter_update(
-        "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = alpha",
-        "K1",
+        "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha",
+        "Keq1",
         8.0,
         authoritative_current_value=2.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 2.0
     assert outcome.semantic_value_change is False
     assert outcome.would_change_text is False
     assert outcome.canonicalization_only_change is False
-    assert outcome.updated_text == "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = alpha"
+    assert outcome.updated_text == "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha"
     assert outcome.warning_reason == "target_unwritable"
 
 
@@ -262,12 +263,12 @@ def test_analyze_step_parameter_update_blocks_K_edit_when_explicit_kr_token_woul
 
     outcome = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 3.0
@@ -300,7 +301,7 @@ def test_analyze_step_parameter_update_blocks_kf_edit_when_explicit_kr_token_wou
 
 
 def test_analyze_step_parameter_update_blocks_kr_edit_when_explicit_K_token_would_be_rewritten_and_is_constrained():
-    source_text = "equilibrium: A <-> B ; kf=6, kr=2, K=3\n\n# Algebra\nparam K1 = 3"
+    source_text = "equilibrium: A <-> B ; kf=6, kr=2, K=3\n\n# Algebra\nparam Keq1 = 3"
 
     outcome = analyze_step_parameter_update(
         source_text,
@@ -321,7 +322,7 @@ def test_analyze_step_parameter_update_blocks_kr_edit_when_explicit_K_token_woul
 
 
 def test_analyze_step_parameter_update_allows_kf_edit_when_constrained_explicit_K_is_preserved():
-    source_text = "equilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam K1 = 5"
+    source_text = "equilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 5"
 
     outcome = analyze_step_parameter_update(
         source_text,
@@ -337,7 +338,7 @@ def test_analyze_step_parameter_update_allows_kf_edit_when_constrained_explicit_
     assert outcome.semantic_value_change is True
     assert outcome.would_change_text is True
     assert outcome.canonicalization_only_change is False
-    assert outcome.updated_text == "equilibrium: A <-> B ; kf=9, K=3\n\n# Algebra\nparam K1 = 5"
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=9, Keq=3\n\n# Algebra\nparam Keq1 = 5"
     assert outcome.warning_reason is None
 
 
@@ -346,12 +347,12 @@ def test_analyze_step_parameter_update_blocks_K_edit_when_constrained_explicit_k
 
     outcome = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 3.0
@@ -367,19 +368,19 @@ def test_analyze_step_parameter_update_allows_K_edit_when_constrained_explicit_k
 
     outcome = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is True
     assert outcome.effective_authoritative_written_value == 8.0
     assert outcome.semantic_value_change is True
     assert outcome.would_change_text is True
     assert outcome.canonicalization_only_change is False
-    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, K=8\n\n# Algebra\nparam kf1 = 6"
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, Keq=8\n\n# Algebra\nparam kf1 = 6"
     assert outcome.warning_reason is None
 
 
@@ -392,18 +393,18 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
             "",
             "# Algebra",
             "param kf1 = 6",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
 
     outcome = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is True
     assert outcome.effective_authoritative_written_value == 8.0
@@ -413,12 +414,12 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
     assert outcome.updated_text == "\n".join(
         [
             "sin = 2",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
             "param kf1 = 6",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
     assert outcome.warning_reason is None
@@ -433,18 +434,18 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
             "",
             "# Algebra",
             "param kf1 = 6",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
 
     outcome = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is True
     assert outcome.effective_authoritative_written_value == 8.0
@@ -454,12 +455,12 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
     assert outcome.updated_text == "\n".join(
         [
             "a = nan",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
             "param kf1 = 6",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
     assert outcome.warning_reason is None
@@ -476,12 +477,12 @@ def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when
                 "",
                 "# Algebra",
                 "let alpha = [A]",
-                "param K1 = 5",
+                "param Keq1 = 5",
             ]
         )
     )
 
-    assert reasons["K1"] == "algebra"
+    assert reasons["Keq1"] == "algebra"
 
 
 def test_analyze_step_parameter_update_keeps_explicit_k_block_when_scalar_name_matches_observable():
@@ -493,15 +494,15 @@ def test_analyze_step_parameter_update_keeps_explicit_k_block_when_scalar_name_m
                 "",
                 "# Algebra",
                 "let alpha = [A]",
-                "param K1 = 5",
+                "param Keq1 = 5",
             ]
         ),
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=5.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 5.0
@@ -521,12 +522,12 @@ def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = 5",
+                "param Keq1 = 5",
             ]
         )
     )
 
-    assert reasons["K1"] == "algebra"
+    assert reasons["Keq1"] == "algebra"
 
 
 def test_analyze_step_parameter_update_keeps_explicit_k_block_when_unused_builtin_shadow_scalar_input_present():
@@ -537,15 +538,15 @@ def test_analyze_step_parameter_update_keeps_explicit_k_block_when_unused_builti
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = 5",
+                "param Keq1 = 5",
             ]
         ),
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=5.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 5.0
@@ -563,7 +564,7 @@ def test_build_current_text_step_analysis_context_records_constraint_analysis_fa
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = sin",
+                "param Keq1 = sin",
             ]
         )
     )
@@ -582,15 +583,15 @@ def test_analyze_step_parameter_update_blocks_when_current_text_constraint_analy
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "param K1 = sin",
+                "param Keq1 = sin",
             ]
         ),
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
 
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.found_target is True
     assert outcome.writable is False
     assert outcome.effective_authoritative_written_value == 3.0
@@ -609,7 +610,7 @@ def test_build_current_text_step_analysis_context_scopes_constraint_analysis_fai
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
                 "# Algebra",
-                "param K2 = sin",
+                "param Keq2 = sin",
             ]
         )
     )
@@ -629,13 +630,13 @@ def test_analyze_step_parameter_update_scopes_current_text_constraint_analysis_f
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
 
     unaffected = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
@@ -646,18 +647,18 @@ def test_analyze_step_parameter_update_scopes_current_text_constraint_analysis_f
         authoritative_current_value=4.0,
     )
 
-    assert unaffected.parameter_name == "K1"
+    assert unaffected.parameter_name == "Keq1"
     assert unaffected.found_target is True
     assert unaffected.writable is True
     assert unaffected.warning_reason is None
     assert unaffected.updated_text == "\n".join(
         [
             "sin = 2",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
     assert affected.parameter_name == "kf2"
@@ -675,7 +676,7 @@ def test_build_current_text_step_analysis_context_scopes_nonfinite_scalar_failur
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
                 "# Algebra",
-                "param K2 = a",
+                "param Keq2 = a",
             ]
         )
     )
@@ -696,13 +697,13 @@ def test_analyze_step_parameter_update_scopes_nonfinite_current_text_scalar_fail
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
 
     unaffected = analyze_step_parameter_update(
         source_text,
-        "K1",
+        "Keq1",
         8.0,
         authoritative_current_value=3.0,
     )
@@ -713,18 +714,18 @@ def test_analyze_step_parameter_update_scopes_nonfinite_current_text_scalar_fail
         authoritative_current_value=4.0,
     )
 
-    assert unaffected.parameter_name == "K1"
+    assert unaffected.parameter_name == "Keq1"
     assert unaffected.found_target is True
     assert unaffected.writable is True
     assert unaffected.warning_reason is None
     assert unaffected.updated_text == "\n".join(
         [
             "a = nan",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
     assert affected.parameter_name == "kf2"
@@ -752,19 +753,133 @@ def test_analyze_step_parameter_update_distinguishes_canonicalization_only_step_
     assert outcome.warning_reason is None
 
 
+def test_analyze_step_parameter_update_rewrites_keq_target_to_canonical_k_token():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; kf=6 ; Keq=3",
+        "Keq1",
+        5.0,
+        authoritative_current_value=3.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=6, Keq=5"
+    assert outcome.semantic_value_change is True
+    assert outcome.canonicalization_only_change is False
+
+
+def test_analyze_step_parameter_update_canonicalizes_keq_spelling_when_kf_is_rewritten():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; kf=6 ; Keq=3",
+        "kf1",
+        10.0,
+        authoritative_current_value=6.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=10, Keq=3"
+    assert outcome.semantic_value_change is True
+    assert outcome.canonicalization_only_change is False
+
+
+def test_analyze_step_parameter_update_marks_keq_spelling_only_rewrite_as_canonicalization_only():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; kf=1 ; Keq=3",
+        "Keq1",
+        3.0,
+        authoritative_current_value=3.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; kf=1, Keq=3"
+    assert outcome.semantic_value_change is False
+    assert outcome.would_change_text is True
+    assert outcome.canonicalization_only_change is True
+
+
+def test_analyze_step_parameter_update_marks_k_eq_spelling_only_rewrite_as_canonicalization_only():
+    outcome = analyze_step_parameter_update(
+        "equilibrium: A <-> B ; K_eq=3 ; kf=1",
+        "Keq1",
+        3.0,
+        authoritative_current_value=3.0,
+    )
+
+    assert outcome.updated_text == "equilibrium: A <-> B ; Keq=3, kf=1"
+    assert outcome.semantic_value_change is False
+    assert outcome.would_change_text is True
+    assert outcome.canonicalization_only_change is True
+
+
+def test_analyze_step_parameter_update_rejects_identical_duplicate_keq_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "equilibrium: A <-> B ; kf=1 ; Keq=3 ; Keq=5",
+            "kf1",
+            2.0,
+            authoritative_current_value=1.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_case_only_duplicate_keq_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "equilibrium: A <-> B ; kf=1 ; Keq=3 ; keq=5",
+            "Keq1",
+            4.0,
+            authoritative_current_value=3.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_reaction_k_tokens():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "reaction: A -> B ; k=3 ; k=5",
+            "k1",
+            4.0,
+            authoritative_current_value=5.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_reversible_kf_tokens():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "reaction: A <-> B ; kf=3 ; kf=5 ; K=2",
+            "kf1",
+            6.0,
+            authoritative_current_value=5.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_equilibrium_dg_eq_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "equilibrium: A <-> B ; kf=1 ; dG_eq=-1 ; DG_EQ=-2",
+            "kf1",
+            2.0,
+            authoritative_current_value=1.0,
+        )
+
+
+def test_analyze_step_parameter_update_rejects_duplicate_reaction_ea_aliases():
+    with pytest.raises(ValueError, match="Duplicate parameter"):
+        analyze_step_parameter_update(
+            "reaction: A -> B ; k=1 ; Ea=5 ; ea=6",
+            "k1",
+            2.0,
+            authoritative_current_value=1.0,
+        )
+
+
 def test_analyze_parameter_updates_to_dsl_text_reports_step_floor_as_real_semantic_change():
     analysis = analyze_parameter_updates_to_dsl_text(
         "equilibrium: A <-> B ; kf=1, K=0",
-        {"K1": -0.0},
-        authoritative_values={"K1": 0.0},
+        {"Keq1": -0.0},
+        authoritative_values={"Keq1": 0.0},
     )
 
-    assert analysis.updated_text == "equilibrium: A <-> B ; kf=1, K=1e-12"
+    assert analysis.updated_text == "equilibrium: A <-> B ; kf=1, Keq=1e-12"
     assert analysis.missing == ()
     assert analysis.update_errors == ()
     assert len(analysis.step_outcomes) == 1
     outcome = analysis.step_outcomes[0]
-    assert outcome.parameter_name == "K1"
+    assert outcome.parameter_name == "Keq1"
     assert outcome.effective_authoritative_written_value == 1e-12
     assert outcome.semantic_value_change is True
     assert outcome.would_change_text is True
@@ -804,19 +919,19 @@ def test_analyze_parameter_updates_to_dsl_text_reuses_shared_step_analysis_conte
 
     analysis = analyze_parameter_updates_to_dsl_text(
         "equilibrium: A <-> B ; kr=2, K=3",
-        {"kf1": 9.0, "K1": 6.0},
-        authoritative_values={"kf1": 6.0, "K1": 3.0},
+        {"kf1": 9.0, "Keq1": 6.0},
+        authoritative_values={"kf1": 6.0, "Keq1": 3.0},
     )
 
     assert calls == ["equilibrium: A <-> B ; kr=2, K=3"]
-    assert analysis.updated_text == "equilibrium: A <-> B ; kr=2, K=6"
+    assert analysis.updated_text == "equilibrium: A <-> B ; kr=2, Keq=6"
     assert analysis.missing == ()
     assert analysis.update_errors == ()
     assert len(analysis.step_outcomes) == 2
     assert analysis.step_outcomes[0].parameter_name == "kf1"
     assert analysis.step_outcomes[0].writable is False
     assert analysis.step_outcomes[0].updated_text == "equilibrium: A <-> B ; kr=2, K=3"
-    assert analysis.step_outcomes[1].parameter_name == "K1"
+    assert analysis.step_outcomes[1].parameter_name == "Keq1"
     assert analysis.step_outcomes[1].writable is True
 
 
@@ -829,30 +944,30 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
 
     analysis = analyze_parameter_updates_to_dsl_text(
         source_text,
-        {"alpha": 2.0, "K1": 8.0, "K2": 9.0},
-        authoritative_values={"alpha": 1.0, "K1": 3.0, "K2": 5.0},
+        {"alpha": 2.0, "Keq1": 8.0, "Keq2": 9.0},
+        authoritative_values={"alpha": 1.0, "Keq1": 3.0, "Keq2": 5.0},
     )
 
     assert analysis.updated_text == "\n".join(
         [
             "alpha = 2",
             "sin = 2",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = sin",
+            "param Keq2 = sin",
         ]
     )
     assert analysis.missing == ()
     assert analysis.update_errors == ()
-    assert [outcome.parameter_name for outcome in analysis.step_outcomes] == ["K1", "K2"]
+    assert [outcome.parameter_name for outcome in analysis.step_outcomes] == ["Keq1", "Keq2"]
     assert analysis.step_outcomes[0].writable is True
     assert analysis.step_outcomes[0].warning_reason is None
     assert analysis.step_outcomes[1].writable is False
@@ -868,30 +983,30 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
 
     analysis = analyze_parameter_updates_to_dsl_text(
         source_text,
-        {"alpha": 2.0, "K1": 8.0, "K2": 9.0},
-        authoritative_values={"alpha": 1.0, "K1": 3.0, "K2": 5.0},
+        {"alpha": 2.0, "Keq1": 8.0, "Keq2": 9.0},
+        authoritative_values={"alpha": 1.0, "Keq1": 3.0, "Keq2": 5.0},
     )
 
     assert analysis.updated_text == "\n".join(
         [
             "alpha = 2",
             "a = nan",
-            "equilibrium: A <-> B ; kf=6, K=8",
+            "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
             "# Algebra",
-            "param K2 = a",
+            "param Keq2 = a",
         ]
     )
     assert analysis.missing == ()
     assert analysis.update_errors == ()
-    assert [outcome.parameter_name for outcome in analysis.step_outcomes] == ["K1", "K2"]
+    assert [outcome.parameter_name for outcome in analysis.step_outcomes] == ["Keq1", "Keq2"]
     assert analysis.step_outcomes[0].writable is True
     assert analysis.step_outcomes[0].warning_reason is None
     assert analysis.step_outcomes[1].writable is False

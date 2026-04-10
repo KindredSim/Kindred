@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import scipy.constants
 
 from kindred.core.constants import R
+from kindred.core.simulator.common import normalize_energy_unit
 
 __all__ = [
     "COMP_BLOCK_START",
@@ -53,21 +54,8 @@ def hartree_to_jmol(x_hartree: float) -> float:
     return float(x_hartree) * float(scipy.constants.value("Hartree energy")) * float(scipy.constants.N_A)
 
 
-def _normalize_energy_unit(value: str) -> str:
-    s = str(value or "").strip().lower()
-    if s in {"hartree", "eh"}:
-        return "hartree"
-    if s in {"j/mol", "j"}:
-        return "J/mol"
-    if s in {"kj/mol", "kj"}:
-        return "kJ/mol"
-    if s in {"kcal/mol", "kcal"}:
-        return "kcal/mol"
-    raise ValueError(f"unsupported energy_unit {value!r}")
-
-
 def _energy_to_jmol(value: float, unit: str) -> float:
-    unit_n = _normalize_energy_unit(unit)
+    unit_n = normalize_energy_unit(unit, allow_hartree=True)
     if unit_n == "hartree":
         return hartree_to_jmol(float(value))
     if unit_n == "J/mol":
@@ -259,6 +247,10 @@ class CompReaction:
     via_ts: Optional[str] = None
     fast_k: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reactants", dict(self.reactants))
+        object.__setattr__(self, "products", dict(self.products))
+
 
 @dataclass(frozen=True)
 class CompSpec:
@@ -271,12 +263,20 @@ class CompSpec:
     species: Dict[str, CompSpecies] = field(default_factory=dict)
     reactions: List[CompReaction] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kfast_by_order", dict(self.kfast_by_order))
+        object.__setattr__(self, "species", dict(self.species))
+        object.__setattr__(self, "reactions", list(self.reactions))
+
 
 @dataclass(frozen=True)
 class CompiledComp:
     spec: CompSpec
     species_G_std_J_per_mol: Dict[str, float]
     generated_reaction_dsl: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "species_G_std_J_per_mol", dict(self.species_G_std_J_per_mol))
 
 
 def extract_marked_block(text: str, *, start_marker: str, end_marker: str) -> Optional[str]:
@@ -418,7 +418,7 @@ def parse_comp_block(comp_block_body: str) -> CompSpec:
                 pressure_Pa = _parse_pressure_Pa(val)
                 continue
             if key == "energy_unit":
-                energy_unit = _normalize_energy_unit(val)
+                energy_unit = normalize_energy_unit(val, allow_hartree=True)
                 continue
             if key == "std_default":
                 std_default_M = _parse_conc_M(val)
@@ -556,7 +556,7 @@ def compile_comp_spec(spec: CompSpec, *, output_energy_unit: str = "kJ/mol") -> 
     energy_unit = str(spec.energy_unit)
     std_default = float(spec.std_default_M)
 
-    out_energy_unit = _normalize_energy_unit(output_energy_unit)
+    out_energy_unit = normalize_energy_unit(output_energy_unit, allow_hartree=True)
     if out_energy_unit not in {"kJ/mol", "kcal/mol"}:
         raise ValueError("output_energy_unit must be 'kJ/mol' or 'kcal/mol'")
     from kindred.core.units import UnitsModel

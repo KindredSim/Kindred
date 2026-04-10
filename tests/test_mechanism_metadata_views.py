@@ -54,6 +54,17 @@ def test_mechanism_metadata_view_defaults_invalid_energy_unit_and_numeric_inputs
 
 
 @pytest.mark.unit
+def test_mechanism_metadata_view_normalizes_mixed_case_energy_unit() -> None:
+    view = MechanismMetadataView.from_metadata(
+        {
+            MechanismMetadataKeys.ENERGY_UNIT: "KCAL/MOL",
+        }
+    )
+
+    assert view.energy_unit == "kcal/mol"
+
+
+@pytest.mark.unit
 def test_bound_mechanism_worker_payload_uses_metadata_view_for_temperature_schedule(monkeypatch) -> None:
     from kindred.core.simulation_preparation import BoundMechanism
 

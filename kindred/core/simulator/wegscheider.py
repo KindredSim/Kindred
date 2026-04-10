@@ -111,7 +111,7 @@ def enumerate_reversible_edges(mechanism: object) -> List[WegscheiderEdge]:
                 v=v,
                 kf_name=f"kf{n}",
                 kr_name=f"kr{n}",
-                has_explicit_K=bool(entry.get("has_K_param")),
+                has_explicit_K=bool(entry.get("has_Keq_param")),
                 derive_rate=(str(entry.get("derive_rate")) if entry.get("derive_rate") is not None else None),
             )
         )

@@ -22,8 +22,20 @@ from .step_constraint_authority import (
 
 
 AUTHORITATIVE_PARAMETER_SIG_DIGITS = 15
-_STEP_PARAMETER_RE = re.compile(r"^(kf|kr|K|k)\d+$")
+_STEP_PARAMETER_RE = re.compile(r"^(kf|kr|Keq|k)\d+$")
 _STEP_PARAMETER_FLOOR = 1e-12
+_EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq", "k_eq"})
+_STEP_TOKEN_CANONICAL_ALIASES = {
+    "a": "A",
+    "ea": "Ea",
+    "dg_act": "dG_act",
+    "dg_eq": "dG_eq",
+    "k": "k",
+    "kf": "kf",
+    "kr": "kr",
+    "kappa": "κ",
+    "κ": "κ",
+}
 
 
 __all__ = [
@@ -203,18 +215,56 @@ def _dedupe_tokens_case_insensitive(tokens: list[list[str]]) -> list[list[str]]:
     return result
 
 
+def _is_equilibrium_k_token(key: object) -> bool:
+    key_str = str(key).strip()
+    return key_str == "K" or key_str.lower() in _EQUILIBRIUM_K_ALIAS_LOWER
+
+
+def _token_matches_alias(key: object, alias: str) -> bool:
+    if str(alias) == "Keq":
+        return _is_equilibrium_k_token(key)
+    alias_str = str(alias)
+    if _is_equilibrium_k_token(key):
+        return False
+    return str(key).strip().lower() == alias_str.lower()
+
+
+def _canonical_step_token_key_for_duplicate_check(key: object) -> str | None:
+    key_str = str(key).strip()
+    if not key_str:
+        return None
+    if _is_equilibrium_k_token(key_str):
+        return "Keq"
+    return _STEP_TOKEN_CANONICAL_ALIASES.get(key_str.lower())
+
+
+def _duplicate_canonical_step_token(tokens: list[list[str]]) -> tuple[str, str, str] | None:
+    seen: dict[str, str] = {}
+    for key, _ in tokens:
+        raw_key = str(key).strip()
+        canonical_key = _canonical_step_token_key_for_duplicate_check(raw_key)
+        if canonical_key is None:
+            continue
+        previous_spelling = seen.get(canonical_key)
+        if previous_spelling is not None:
+            return previous_spelling, raw_key, canonical_key
+        seen[canonical_key] = raw_key
+    return None
+
+
+def _raise_on_duplicate_canonical_step_tokens(tokens: list[list[str]]) -> None:
+    duplicate = _duplicate_canonical_step_token(tokens)
+    if duplicate is None:
+        return
+    previous_spelling, raw_key, canonical_key = duplicate
+    raise ValueError(
+        f"Duplicate parameter: '{previous_spelling}' and '{raw_key}' both resolve to {canonical_key}"
+    )
+
+
 def _get_token_float(tokens: list[list[str]], aliases: tuple[str, ...], default: float | None = None) -> float | None:
-    exact_aliases = set(aliases)
-    alias_set = {alias.lower() for alias in aliases if alias != "K"}
     for key, val in tokens:
-        if key == "K":
-            if "K" not in exact_aliases:
-                continue
-            try:
-                return float(val)
-            except (TypeError, ValueError):
-                return default
-        if str(key).lower() in alias_set:
+        if any(_token_matches_alias(key, alias) for alias in aliases):
             try:
                 return float(val)
             except (TypeError, ValueError):
@@ -223,14 +273,8 @@ def _get_token_float(tokens: list[list[str]], aliases: tuple[str, ...], default:
 
 
 def _has_token_alias(tokens: list[list[str]], aliases: tuple[str, ...]) -> bool:
-    exact_aliases = set(aliases)
-    alias_set = {alias.lower() for alias in aliases if alias != "K"}
     for key, _ in tokens:
-        if key == "K":
-            if "K" in exact_aliases:
-                return True
-            continue
-        if str(key).lower() in alias_set:
+        if any(_token_matches_alias(key, alias) for alias in aliases):
             return True
     return False
 
@@ -247,12 +291,11 @@ def _set_token_float(
         sanitized = format_authoritative_parameter_value(float_value)
     else:
         sanitized = f"{float(float_value):.{int(sig)}g}"
-    exact_aliases = set(aliases)
 
-    if canonical_key == "K":
+    if canonical_key == "Keq":
         target_index = None
         for idx, (key, _) in enumerate(tokens):
-            if key == "K":
+            if _is_equilibrium_k_token(key):
                 target_index = idx
                 break
         if target_index is not None:
@@ -260,20 +303,22 @@ def _set_token_float(
             tokens[target_index][1] = sanitized
         else:
             tokens.append([canonical_key, sanitized])
+            target_index = len(tokens) - 1
+        for idx in range(len(tokens) - 1, -1, -1):
+            if idx == target_index:
+                continue
+            if _is_equilibrium_k_token(tokens[idx][0]):
+                tokens.pop(idx)
         return
 
-    alias_set = {canonical_key.lower()}
-    alias_set.update(alias.lower() for alias in aliases if alias != "K")
-
-    target_index = None
+    exact_index = None
     for idx, (key, _) in enumerate(tokens):
-        if key == "K" and "K" not in exact_aliases:
-            continue
-        if str(key).lower() in alias_set:
-            target_index = idx
+        if _token_matches_alias(key, canonical_key):
+            exact_index = idx
             break
 
-    if target_index is not None:
+    if exact_index is not None:
+        target_index = exact_index
         tokens[target_index][0] = canonical_key
         tokens[target_index][1] = sanitized
     else:
@@ -283,25 +328,15 @@ def _set_token_float(
     for idx in range(len(tokens) - 1, -1, -1):
         if idx == target_index:
             continue
-        token_key = tokens[idx][0]
-        if token_key == "K" and canonical_key != "K" and "K" not in aliases:
-            continue
-        if str(token_key).lower() in alias_set:
+        if any(_token_matches_alias(tokens[idx][0], alias) for alias in (canonical_key, *aliases)):
             tokens.pop(idx)
 
 
 def _remove_token_aliases(tokens: list[list[str]], aliases: tuple[str, ...]) -> None:
-    alias_set = {alias.lower() for alias in aliases}
-    exact_aliases = set(aliases)
     filtered: list[list[str]] = []
     for key, val in tokens:
-        lower = str(key).lower()
-        if lower not in alias_set:
+        if not any(_token_matches_alias(key, alias) for alias in aliases):
             filtered.append([key, val])
-            continue
-        if key == "K" and "K" not in exact_aliases:
-            filtered.append([key, val])
-            continue
     tokens[:] = filtered
 
 
@@ -421,7 +456,7 @@ def _normalize_rate_value(value: float) -> float:
 
 
 def _derive_equilibrium_role_from_tokens(tokens: list[list[str]]) -> str:
-    if not _has_token_alias(tokens, ("K",)):
+    if not _has_token_alias(tokens, ("Keq",)):
         return ""
     user_kf_explicit = _has_token_alias(tokens, ("kf", "k"))
     user_kr_explicit = _has_token_alias(tokens, ("kr",))
@@ -449,8 +484,8 @@ def _current_effective_step_value(
 ) -> float | None:
     if family == "k":
         return _coerce_optional_float(_get_token_float(tokens, ("k",), None))
-    if family == "K":
-        explicit_k = _coerce_optional_float(_get_token_float(tokens, ("K",), None))
+    if family == "Keq":
+        explicit_k = _coerce_optional_float(_get_token_float(tokens, ("Keq",), None))
         if explicit_k is not None:
             return _normalize_k_value(explicit_k)
         kf_val = _coerce_optional_float(_get_token_float(tokens, ("kf", "k"), None))
@@ -464,7 +499,7 @@ def _current_effective_step_value(
             return _normalize_rate_value(kf_val)
         if has_explicit_k:
             kr_val = _coerce_optional_float(_get_token_float(tokens, ("kr",), None))
-            k_val = _coerce_optional_float(_get_token_float(tokens, ("K",), None))
+            k_val = _coerce_optional_float(_get_token_float(tokens, ("Keq",), None))
             if kr_val is None or k_val is None:
                 return None
             return _normalize_rate_value(kr_val * _normalize_k_value(k_val))
@@ -475,7 +510,7 @@ def _current_effective_step_value(
             return _normalize_rate_value(kr_val)
         if has_explicit_k:
             kf_val = _coerce_optional_float(_get_token_float(tokens, ("kf", "k"), None))
-            k_val = _coerce_optional_float(_get_token_float(tokens, ("K",), None))
+            k_val = _coerce_optional_float(_get_token_float(tokens, ("Keq",), None))
             if kf_val is None or k_val is None:
                 return None
             normalized_k = _normalize_k_value(k_val)
@@ -511,7 +546,7 @@ def _semantic_equilibrium_changed_constrained_targets(
 ) -> tuple[str, ...]:
     constrained_family_names = tuple(
         name
-        for name in (f"kf{step_index}", f"kr{step_index}", f"K{step_index}")
+        for name in (f"kf{step_index}", f"kr{step_index}", f"Keq{step_index}")
         if step_analysis_context.step_constraint_reasons.get(name)
     )
     if not constrained_family_names:
@@ -591,6 +626,7 @@ def analyze_step_parameter_update(
                 resolved_values=(),
             )
         prefix, tokens, comment = _parse_mechanism_semicolon_kv(lines[line_index])
+        _raise_on_duplicate_canonical_step_tokens(tokens)
         tokens = _dedupe_tokens_case_insensitive(tokens)
         current_step_constraints = current_text_context.step_constraint_reasons
         current_effective = _current_effective_step_value(family, tokens, has_explicit_k=False)
@@ -671,8 +707,9 @@ def analyze_step_parameter_update(
         )
 
     prefix, tokens, comment = _parse_mechanism_semicolon_kv(lines[line_index])
+    _raise_on_duplicate_canonical_step_tokens(tokens)
     tokens = _dedupe_tokens_case_insensitive(tokens)
-    has_explicit_k = _has_token_alias(tokens, ("K",))
+    has_explicit_k = _has_token_alias(tokens, ("Keq",))
     derive_rate = _derive_equilibrium_role(tokens, step_index=step_index, step_metadata=step_metadata)
     current_step_constraints = current_text_context.step_constraint_reasons
     current_effective = _current_effective_step_value(family, tokens, has_explicit_k=has_explicit_k)
@@ -692,7 +729,7 @@ def analyze_step_parameter_update(
     elif non_k_block_reason:
         writable = False
         warning_reason = "target_unwritable"
-    elif family == "K" and not has_explicit_k:
+    elif family == "Keq" and not has_explicit_k:
         writable = False
         warning_reason = "target_unwritable"
     elif family == "kf" and has_explicit_k and derive_rate == "kf":
@@ -724,7 +761,7 @@ def analyze_step_parameter_update(
     working_tokens = [list(token) for token in tokens]
     resolved_values: list[tuple[str, float]] = []
 
-    if family == "K":
+    if family == "Keq":
         k_value = _normalize_k_value(requested_float)
         if derive_rate == "kf":
             kr_value = _current_effective_step_value("kr", working_tokens, has_explicit_k=has_explicit_k)
@@ -732,7 +769,7 @@ def analyze_step_parameter_update(
                 kr_value = 1.0
             kr_value = _normalize_rate_value(kr_value)
             kf_value = _normalize_rate_value(kr_value * k_value)
-            _set_token_float(working_tokens, "K", k_value)
+            _set_token_float(working_tokens, "Keq", k_value)
             _set_token_float(working_tokens, "kr", kr_value, aliases=("kr",))
             _remove_token_aliases(working_tokens, ("kf", "k"))
         else:
@@ -741,13 +778,13 @@ def analyze_step_parameter_update(
                 kf_value = 1.0
             kf_value = _normalize_rate_value(kf_value)
             kr_value = _normalize_rate_value(kf_value / k_value)
-            _set_token_float(working_tokens, "K", k_value)
+            _set_token_float(working_tokens, "Keq", k_value)
             _set_token_float(working_tokens, "kf", kf_value, aliases=("k",))
             _remove_token_aliases(working_tokens, ("kr",))
         effective_value = k_value
         resolved_values.extend(
             (
-                (f"K{step_index}", k_value),
+                (f"Keq{step_index}", k_value),
                 (f"kf{step_index}", kf_value),
                 (f"kr{step_index}", kr_value),
             )
@@ -755,18 +792,18 @@ def analyze_step_parameter_update(
     elif family == "kf":
         kf_value = _normalize_rate_value(requested_float)
         if not has_explicit_k:
-            _remove_token_aliases(working_tokens, ("K",))
+            _remove_token_aliases(working_tokens, ("Keq",))
         _set_token_float(working_tokens, "kf", kf_value, aliases=("k",))
 
         kr_value = _coerce_optional_float(_get_token_float(working_tokens, ("kr",), None))
-        k_value = _coerce_optional_float(_get_token_float(working_tokens, ("K",), None))
+        k_value = _coerce_optional_float(_get_token_float(working_tokens, ("Keq",), None))
         k_valid = k_value is not None and abs(k_value) > _STEP_PARAMETER_FLOOR
         kr_valid = kr_value is not None and abs(kr_value) > _STEP_PARAMETER_FLOOR
 
         if has_explicit_k and k_valid:
             normalized_k = _normalize_k_value(float(k_value))
             kr_value = _normalize_rate_value(kf_value / normalized_k)
-            _set_token_float(working_tokens, "K", normalized_k)
+            _set_token_float(working_tokens, "Keq", normalized_k)
             if derive_rate == "kr":
                 _remove_token_aliases(working_tokens, ("kr",))
             else:
@@ -780,26 +817,26 @@ def analyze_step_parameter_update(
                 kr_value = _normalize_rate_value(float(kr_value))
             if has_explicit_k:
                 k_value = _normalize_k_value(kf_value / kr_value)
-                _set_token_float(working_tokens, "K", k_value)
+                _set_token_float(working_tokens, "Keq", k_value)
         effective_value = kf_value
         resolved_values.append((f"kf{step_index}", kf_value))
         if kr_value is not None:
             resolved_values.append((f"kr{step_index}", kr_value))
         if has_explicit_k and k_value is not None:
-            resolved_values.append((f"K{step_index}", k_value))
+            resolved_values.append((f"Keq{step_index}", k_value))
     else:
         kr_value = _normalize_rate_value(requested_float)
         if not has_explicit_k:
-            _remove_token_aliases(working_tokens, ("K",))
+            _remove_token_aliases(working_tokens, ("Keq",))
         _set_token_float(working_tokens, "kr", kr_value, aliases=("kr",))
 
-        k_value = _coerce_optional_float(_get_token_float(working_tokens, ("K",), None)) if has_explicit_k else None
+        k_value = _coerce_optional_float(_get_token_float(working_tokens, ("Keq",), None)) if has_explicit_k else None
         k_valid = k_value is not None and abs(k_value) > _STEP_PARAMETER_FLOOR
 
         if has_explicit_k and derive_rate == "kf" and k_valid:
             normalized_k = _normalize_k_value(float(k_value))
             kf_value = _normalize_rate_value(kr_value * normalized_k)
-            _set_token_float(working_tokens, "K", normalized_k)
+            _set_token_float(working_tokens, "Keq", normalized_k)
             _remove_token_aliases(working_tokens, ("kf", "k"))
             k_value = normalized_k
         else:
@@ -811,7 +848,7 @@ def analyze_step_parameter_update(
 
             if has_explicit_k:
                 k_value = _normalize_k_value(kf_value / kr_value)
-                _set_token_float(working_tokens, "K", k_value)
+                _set_token_float(working_tokens, "Keq", k_value)
                 if derive_rate == "kf":
                     _remove_token_aliases(working_tokens, ("kf", "k"))
         effective_value = kr_value
@@ -819,7 +856,7 @@ def analyze_step_parameter_update(
         if kf_value is not None:
             resolved_values.append((f"kf{step_index}", kf_value))
         if has_explicit_k and k_value is not None:
-            resolved_values.append((f"K{step_index}", k_value))
+            resolved_values.append((f"Keq{step_index}", k_value))
 
     new_lines = list(lines)
     new_lines[line_index] = _serialize_mechanism_semicolon_kv(prefix, working_tokens, comment)
@@ -1001,7 +1038,7 @@ def apply_parameter_updates_to_dsl_text(
     parameters:
         Mapping of {name: value}. Values are coerced to float.
     canonical_updater:
-        Optional callable for canonical step-indexed parameters (k1, kf1, kr1, K1).
+        Optional callable for canonical step-indexed parameters (k1, kf1, kr1, Keq1).
         Signature: (name, value, text) -> updated_text.
 
     Returns

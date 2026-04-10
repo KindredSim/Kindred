@@ -795,17 +795,17 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
                 eq = mech.equilibria[idx]
                 parsed, ok = try_parse_callable_finite_float(getattr(eq, role, None))
                 init = float(parsed) if ok else 1.0
-            elif kind == "equilibrium" and role == "K":
+            elif kind == "equilibrium" and role == "Keq":
                 eq = mech.equilibria[idx]
                 meta = getattr(eq, "metadata", {}) or {}
                 parsed, ok = try_parse_callable_finite_float(
-                    meta.get(EquilibriumMetadataKeys.K_INPUT),
+                    meta.get(EquilibriumMetadataKeys.KEQ_INPUT),
                 )
                 if ok:
                     init = float(parsed)
                 else:
                     fallback, ok_fallback = try_parse_callable_finite_float(
-                        getattr(eq, "K", 1.0),
+                        getattr(eq, "Keq", 1.0),
                     )
                     init = float(fallback) if ok_fallback else 1.0
             else:
@@ -819,10 +819,10 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
         elif kind == "equilibrium" and role in {"kf", "kr"}:
             eq = mech.equilibria[idx]
             mech.equilibria[idx] = replace(eq, **{role: binding})
-        elif kind == "equilibrium" and role == "K":
+        elif kind == "equilibrium" and role == "Keq":
             eq = mech.equilibria[idx]
             meta = dict(getattr(eq, "metadata", {}) or {})
-            meta[EquilibriumMetadataKeys.K_INPUT] = binding
+            meta[EquilibriumMetadataKeys.KEQ_INPUT] = binding
             mech.equilibria[idx] = replace(eq, metadata=meta)
 
     return bindings
@@ -847,7 +847,7 @@ class _StateNetworkEnergyBindingState:
         self.metadata["dG_act_rev_J_per_mol"] = float(self.dG_act_rev_J_per_mol())
         self.metadata["kf"] = float(self.kf())
         self.metadata["kr"] = float(self.kr())
-        self.metadata["K"] = float(self.K())
+        self.metadata["Keq"] = float(self.Keq())
 
     def dG_act_rev_J_per_mol(self) -> float:
         return float(self.dG_act_fwd_J_per_mol - self.dG_eq_J_per_mol)
@@ -874,7 +874,7 @@ class _StateNetworkEnergyBindingState:
             std_ratio=self.std_ratio_rev,
         )
 
-    def K(self) -> float:
+    def Keq(self) -> float:
         from kindred.core.kinetics import K_from_deltaG_eq
 
         return float(K_from_deltaG_eq(self.dG_eq_J_per_mol, self.temperature_K))
@@ -888,8 +888,8 @@ class _StateNetworkEnergyBindingState:
             return float(self.kf())
         if role == "kr":
             return float(self.kr())
-        if role == "K":
-            return float(self.K())
+        if role == "Keq":
+            return float(self.Keq())
         raise KeyError(f"Unknown state-network energy binding role: {role}")
 
     def apply_slider_value(self, role: str, value: float) -> None:
@@ -917,9 +917,9 @@ class _FastEquilibriumEnergyBindingState:
         self.metadata[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
         self.metadata["kf"] = float(self.kf())
         self.metadata["kr"] = float(self.kr())
-        self.metadata["K"] = float(self.K())
+        self.metadata["Keq"] = float(self.Keq())
 
-    def K(self) -> float:
+    def Keq(self) -> float:
         from kindred.core.kinetics import K_from_deltaG_eq
 
         return float(K_from_deltaG_eq(self.dG_eq_J_per_mol, self.temperature_K))
@@ -930,7 +930,7 @@ class _FastEquilibriumEnergyBindingState:
         return float(self.kf_fixed)
 
     def kr(self) -> float:
-        return float(self.kf() / (self.K() * self.std_ratio))
+        return float(self.kf() / (self.Keq() * self.std_ratio))
 
     def binding_value(self, role: str) -> float:
         if role == "dG_eq_fast":
@@ -939,8 +939,8 @@ class _FastEquilibriumEnergyBindingState:
             return float(self.kf())
         if role == "kr":
             return float(self.kr())
-        if role == "K":
-            return float(self.K())
+        if role == "Keq":
+            return float(self.Keq())
         raise KeyError(f"Unknown fast-equilibrium energy binding role: {role}")
 
     def apply_slider_value(self, role: str, value: float) -> None:
@@ -949,17 +949,17 @@ class _FastEquilibriumEnergyBindingState:
         value_f = float(value)
         if role == "dG_eq_fast":
             self.dG_eq_J_per_mol = float(self.units.to_jmol(value_f))
-        elif role == "K":
+        elif role == "Keq":
             if not (math.isfinite(value_f) and value_f > 0.0):
-                raise ValueError("Fast-equilibrium K must be positive and finite")
+                raise ValueError("Fast-equilibrium Keq must be positive and finite")
             self.dG_eq_J_per_mol = float(-float(R) * float(self.temperature_K) * math.log(value_f))
         elif role == "kr":
             if not (math.isfinite(value_f) and value_f > 0.0):
                 raise ValueError("Fast-equilibrium kr must be positive and finite")
-            K_value = float(self.kf() / (value_f * self.std_ratio))
-            if not (math.isfinite(K_value) and K_value > 0.0):
-                raise ValueError("Fast-equilibrium derived K must be positive and finite")
-            self.dG_eq_J_per_mol = float(-float(R) * float(self.temperature_K) * math.log(K_value))
+            Keq_value = float(self.kf() / (value_f * self.std_ratio))
+            if not (math.isfinite(Keq_value) and Keq_value > 0.0):
+                raise ValueError("Fast-equilibrium derived Keq must be positive and finite")
+            self.dG_eq_J_per_mol = float(-float(R) * float(self.temperature_K) * math.log(Keq_value))
         elif role == "kf":
             if not (math.isfinite(value_f) and value_f > 0.0):
                 raise ValueError("Fast-equilibrium kf must be positive and finite")
@@ -1048,13 +1048,13 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
             state._sync_metadata()
             kf_binding = _StructuredEnergyBinding(name=f"{act_name}:kf", state=state, role="kf")
             kr_binding = _StructuredEnergyBinding(name=f"{eq_name}:kr", state=state, role="kr")
-            K_binding = _StructuredEnergyBinding(name=f"{eq_name}:K", state=state, role="K")
-            metadata[EquilibriumMetadataKeys.K_INPUT] = K_binding
+            Keq_binding = _StructuredEnergyBinding(name=f"{eq_name}:Keq", state=state, role="Keq")
+            metadata[EquilibriumMetadataKeys.KEQ_INPUT] = Keq_binding
             mechanism.equilibria[index] = replace(
                 eq,
                 kf=kf_binding,
                 kr=kr_binding,
-                K=K_binding,
+                Keq=Keq_binding,
                 metadata=metadata,
             )
             if act_name in requested:
@@ -1086,9 +1086,9 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
         if dG_eq_ok:
             dG_eq_J_per_mol = float(dG_eq_parsed)
         else:
-            K_input_value, K_input_ok = try_parse_callable_finite_float(metadata.get(EquilibriumMetadataKeys.K_INPUT))
-            if K_input_ok and math.isfinite(K_input_value) and K_input_value > 0.0:
-                dG_eq_J_per_mol = float(-float(R) * float(mech_meta.temperature_K) * math.log(float(K_input_value)))
+            Keq_input_value, Keq_input_ok = try_parse_callable_finite_float(metadata.get(EquilibriumMetadataKeys.KEQ_INPUT))
+            if Keq_input_ok and math.isfinite(Keq_input_value) and Keq_input_value > 0.0:
+                dG_eq_J_per_mol = float(-float(R) * float(mech_meta.temperature_K) * math.log(float(Keq_input_value)))
             else:
                 dG_eq_J_per_mol = 0.0
         state = _FastEquilibriumEnergyBindingState(
@@ -1103,12 +1103,12 @@ def _install_energy_bindings(mechanism: Any, names: List[str]) -> Dict[str, Any]
         )
         state._sync_metadata()
         kr_binding = _StructuredEnergyBinding(name=f"{slider_name}:kr", state=state, role="kr")
-        K_binding = _StructuredEnergyBinding(name=f"{slider_name}:K", state=state, role="K")
-        metadata[EquilibriumMetadataKeys.K_INPUT] = K_binding
+        Keq_binding = _StructuredEnergyBinding(name=f"{slider_name}:Keq", state=state, role="Keq")
+        metadata[EquilibriumMetadataKeys.KEQ_INPUT] = Keq_binding
         mechanism.equilibria[index] = replace(
             eq,
             kr=kr_binding,
-            K=K_binding,
+            Keq=Keq_binding,
             metadata=metadata,
         )
         bindings[slider_name] = _StructuredEnergyBinding(name=slider_name, state=state, role="dG_eq_fast")
@@ -1156,23 +1156,26 @@ def prepare_bound_mechanism(
 
     try:
         from kindred.core.simulator.parameter_algebra import (
-            mechanism_parameter_names,
+            mechanism_parameter_namespace,
             parse_parameter_algebra_spec_from_dsl_text,
         )
         from kindred.core.simulator.step_indexing import get_step_index_map
 
-        mech_param_names = mechanism_parameter_names(mechanism)
-        spec = parse_parameter_algebra_spec_from_dsl_text(mechanism_text, mechanism_param_names=mech_param_names)
+        mechanism_namespace = mechanism_parameter_namespace(mechanism)
+        spec = parse_parameter_algebra_spec_from_dsl_text(
+            mechanism_text,
+            mechanism_namespace=mechanism_namespace,
+        )
         constrained = {
             stmt.name
             for stmt in (spec.param_statements or [])
-            if re.match(r"^(k|kf|kr|K)\d+$", str(stmt.name))
+            if re.match(r"^(k|kf|kr|Keq)\d+$", str(stmt.name))
         }
         k_derived = set()
         for entry in get_step_index_map(mechanism):
             if str(entry.get("kind") or "") != "equilibrium":
                 continue
-            if not bool(entry.get("has_K_param")):
+            if not bool(entry.get("has_Keq_param")):
                 continue
             step_idx_raw = entry.get("step_index")
             if isinstance(step_idx_raw, int):
@@ -1188,27 +1191,24 @@ def prepare_bound_mechanism(
 
         wegscheider_derived = set()
         if bool(wegscheider_cyclicity_enabled):
-            try:
-                from kindred.core.simulator.wegscheider import derived_parameter_names_for_cyclicity
+            from kindred.core.simulator.wegscheider import derived_parameter_names_for_cyclicity
 
-                wegscheider_derived = derived_parameter_names_for_cyclicity(
-                    mechanism,
-                    constrained_param_names={str(x) for x in constrained},
-                )
-            except Exception as exc:
-                logger.debug("Wegscheider derived-parameter discovery failed: %s", exc)
-                wegscheider_derived = set()
+            wegscheider_derived = derived_parameter_names_for_cyclicity(
+                mechanism,
+                constrained_param_names={str(x) for x in constrained},
+            )
         requested = set(param_names or [])
         mech_bind_names = sorted(
             {
                 str(n)
                 for n in (requested | constrained | k_derived | wegscheider_derived)
-                if re.match(r"^(k|kf|kr|K)\d+$", str(n))
+                if re.match(r"^(k|kf|kr|Keq)\d+$", str(n))
             }
         )
     except Exception as exc:
-        logger.debug("Prepared parameter-algebra binding prepass failed: %s", exc)
-        mech_bind_names = list(param_names)
+        raise _fit_simulation_error_from_preparation_error(
+            _prepare_preparation_failure("parameter_algebra", exc)
+        ) from exc
 
     bindings = _bind_parameters_to_mechanism(mechanism, mech_bind_names)
 

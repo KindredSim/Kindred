@@ -54,21 +54,22 @@ def test_empty_mechanism_editor_keeps_reactions_primary(qt_app, qtbot) -> None:
     assert splitter.widget(1).height() < editor._reactions_text.height()
 
 
-def test_side_first_default_shell_stacks_mechanism_sliders_and_batch_docks(main_window) -> None:
+def test_side_first_default_shell_stacks_mechanism_and_sliders_left_batch_right(main_window) -> None:
     main_window.show()
     QtWidgets.QApplication.processEvents()
 
     mechanism_geometry = main_window._mechanism_dock.geometry()
     sliders_geometry = main_window._sliders_dock.geometry()
-    batch_geometry = main_window._batch_dock.geometry()
 
+    # Left column: Mechanism above Sliders.
     assert main_window.dockWidgetArea(main_window._mechanism_dock) == QtCore.Qt.LeftDockWidgetArea
     assert main_window.dockWidgetArea(main_window._sliders_dock) == QtCore.Qt.LeftDockWidgetArea
-    assert main_window.dockWidgetArea(main_window._batch_dock) == QtCore.Qt.LeftDockWidgetArea
-    assert mechanism_geometry.left() == sliders_geometry.left() == batch_geometry.left()
-    assert mechanism_geometry.width() == sliders_geometry.width() == batch_geometry.width()
+    assert mechanism_geometry.left() == sliders_geometry.left()
+    assert abs(mechanism_geometry.width() - sliders_geometry.width()) <= 2
     assert sliders_geometry.top() >= mechanism_geometry.bottom()
-    assert batch_geometry.top() >= sliders_geometry.bottom()
+
+    # Batch (Initial Conditions) on the right.
+    assert main_window.dockWidgetArea(main_window._batch_dock) == QtCore.Qt.RightDockWidgetArea
 
 
 def test_simulation_controls_are_positioned_above_batch_table(main_window) -> None:

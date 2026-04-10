@@ -19,6 +19,7 @@ from .dsl import (
 )
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .errors import DSLError
+from .parameter_namespace import build_namespace_from_ir_steps
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ def _parameter_family(key: str) -> str | None:
     """
     Determine the canonical parameter family for a DSL key.
 
-    Recognizes keys like k, k1, kf2, kr, A, Ea, dG_act, dG_eq, and K variants.
+    Recognizes keys like k, k1, kf2, kr, A, Ea, dG_act, dG_eq, and Keq variants.
     """
     normalized = key.strip()
     lower = normalized.lower()
@@ -65,10 +66,10 @@ def _parameter_family(key: str) -> str | None:
         if lower.startswith(fam_lower) and suffix.isdigit():
             return fam
 
-    if normalized == "K":
-        return "K"
-    if normalized.startswith("K") and normalized[1:].isdigit():
-        return "K"
+    if normalized == "Keq":
+        return "Keq"
+    if normalized.startswith("Keq") and normalized[3:].isdigit():
+        return "Keq"
 
     return None
 
@@ -103,9 +104,14 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
             continue
 
         try:
-            stoich_part, kv = _split_stoich_and_params(rest)
+            stoich_part, kv = _split_stoich_and_params(
+                rest,
+                reject_duplicate_canonical_keys=True,
+            )
             react, prod, arrow = _parse_stoich(stoich_part)
-        except DSLError:
+        except DSLError as exc:
+            if str(exc.message).startswith("Duplicate parameter:"):
+                raise
             # Best-effort extraction utility: ignore malformed lines rather than failing the caller.
             continue
 
@@ -130,7 +136,7 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
                 source = "Arrhenius"
             elif family == "dg_act":
                 source = "Eyring"
-            elif family in ("dg_eq", "K"):
+            elif family in ("dg_eq", "Keq"):
                 source = "Equilibrium constant"
             elif family == "kf":
                 source = "Forward rate"
@@ -152,6 +158,10 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
     return parameters
 
 
+def _scan_mechanism_param_names(ir) -> set[str]:
+    return build_namespace_from_ir_steps(ir.steps).flat_names()
+
+
 def extract_parameter_names_from_dsl(text: str) -> set[str]:
     """
     Extract all parameter names from DSL content.
@@ -169,18 +179,11 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
         param_names.add(param.name)
 
     ir = _parse_dsl_ir(text)
-    n_rxn = sum(1 for step in ir.steps if not step.is_equilibrium)
-    n_eq = sum(1 for step in ir.steps if step.is_equilibrium)
-
-    mechanism_param_names: set[str] = {f"k{i}" for i in range(1, n_rxn + 1)}
-    for i in range(1, n_eq + 1):
-        mechanism_param_names.add(f"kf{i}")
-        mechanism_param_names.add(f"kr{i}")
-        mechanism_param_names.add(f"K{i}")
+    mechanism_namespace = build_namespace_from_ir_steps(ir.steps)
 
     spec = parameter_algebra.parse_parameter_algebra_spec_from_dsl_text(
         text,
-        mechanism_param_names=mechanism_param_names,
+        mechanism_namespace=mechanism_namespace,
     )
     param_names.update(spec.observable_names)
     param_names.update({assignment.name for assignment in spec.param_statements})

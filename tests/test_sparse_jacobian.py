@@ -101,7 +101,7 @@ def test_sparse_jacobian_programmatic_nonfast_k_only_equilibrium_preserves_valid
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=2.0,
+        Keq=2.0,
     )
 
     jac = build_sparse_jacobian(mechanism)
@@ -124,7 +124,7 @@ def test_sparse_jacobian_programmatic_reverse_anchor_equilibrium_preserves_valid
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=5.0,
+        Keq=5.0,
         kf=None,
         kr=2.0,
     )
@@ -154,10 +154,10 @@ def test_sparse_jacobian_programmatic_nonfast_k_only_equilibrium_rejects_invalid
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=K_value,
+        Keq=K_value,
     )
 
-    with pytest.raises(ValueError, match="K must be positive and finite"):
+    with pytest.raises(ValueError, match="Keq must be positive and finite"):
         build_sparse_jacobian(mechanism)
 
 
@@ -175,10 +175,10 @@ def test_sparse_jacobian_programmatic_reverse_anchor_equilibrium_rejects_invalid
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=K_value,
+        Keq=K_value,
         kf=None,
         kr=2.0,
     )
 
-    with pytest.raises(ValueError, match="K must be positive and finite"):
+    with pytest.raises(ValueError, match="Keq must be positive and finite"):
         build_sparse_jacobian(mechanism)

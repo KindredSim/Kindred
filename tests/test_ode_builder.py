@@ -39,7 +39,7 @@ def test_equilibrium_net_rates_avoid_inf_minus_inf_cancellation():
 
 
 def test_fast_equilibrium_K_only_derives_rates_via_common_policy():
-    K = 2.0
+    Keq = 2.0
     mechanism = Mechanism()
     mechanism.add_species("A", 0.0)
     mechanism.add_species("B", 0.0)
@@ -48,7 +48,7 @@ def test_fast_equilibrium_K_only_derives_rates_via_common_policy():
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=K,
+        Keq=Keq,
         kf=None,
         kr=None,
         fast=True,
@@ -61,7 +61,7 @@ def test_fast_equilibrium_K_only_derives_rates_via_common_policy():
     B_idx = species_names.index("B")
     T = float(mechanism.metadata["temperature_K"])
 
-    fe = derive_equilibrium_rates(K=K, T=T, explicit_rates=None)
+    fe = derive_equilibrium_rates(Keq=Keq, T=T, explicit_rates=None)
 
     y = np.zeros(len(species_names), dtype=float)
     y[A_idx] = 1.0
@@ -85,7 +85,7 @@ def test_programmatic_nonfast_K_only_equilibrium_builds_and_evaluates():
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=2.0,
+        Keq=2.0,
     )
 
     rhs = build_ode_rhs_from_mechanism(mechanism)
@@ -115,7 +115,7 @@ def test_programmatic_reverse_anchor_equilibrium_builds_and_evaluates():
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=5.0,
+        Keq=5.0,
         kf=None,
         kr=2.0,
     )
@@ -147,7 +147,7 @@ def test_programmatic_forward_anchor_equilibrium_builds_and_evaluates():
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=5.0,
+        Keq=5.0,
         kf=10.0,
         kr=None,
     )
@@ -189,13 +189,13 @@ def test_programmatic_nonfast_K_only_equilibrium_rejects_invalid_K(K_value, labe
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=K_value,
+        Keq=K_value,
     )
 
     rhs = build_ode_rhs_from_mechanism(mechanism)
     y = np.array([1.0, 0.0], dtype=float)
 
-    with pytest.raises(ValueError, match="K must be positive and finite"):
+    with pytest.raises(ValueError, match="Keq must be positive and finite"):
         rhs(0.0, y)
 
 
@@ -218,7 +218,7 @@ def test_programmatic_forward_anchor_equilibrium_rejects_invalid_K(K_value, labe
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=K_value,
+        Keq=K_value,
         kf=2.0,
         kr=None,
     )
@@ -226,7 +226,7 @@ def test_programmatic_forward_anchor_equilibrium_rejects_invalid_K(K_value, labe
     rhs = build_ode_rhs_from_mechanism(mechanism)
     y = np.array([1.0, 0.0], dtype=float)
 
-    with pytest.raises(ValueError, match="K must be positive and finite"):
+    with pytest.raises(ValueError, match="Keq must be positive and finite"):
         rhs(0.0, y)
 
 
@@ -249,7 +249,7 @@ def test_programmatic_reverse_anchor_equilibrium_rejects_invalid_K(K_value, labe
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        K=K_value,
+        Keq=K_value,
         kf=None,
         kr=2.0,
     )
@@ -257,7 +257,7 @@ def test_programmatic_reverse_anchor_equilibrium_rejects_invalid_K(K_value, labe
     rhs = build_ode_rhs_from_mechanism(mechanism)
     y = np.array([1.0, 0.0], dtype=float)
 
-    with pytest.raises(ValueError, match="K must be positive and finite"):
+    with pytest.raises(ValueError, match="Keq must be positive and finite"):
         rhs(0.0, y)
 
 
@@ -272,7 +272,7 @@ def test_runtime_equilibrium_without_usable_anchor_data_raises():
             stoich_back={"B": 1.0},
             kf=None,
             kr=None,
-            K=None,
+            Keq=None,
             fast=True,
             metadata={},
         )

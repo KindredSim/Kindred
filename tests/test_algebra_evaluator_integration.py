@@ -42,7 +42,7 @@ def test_algebra_uses_explicit_kf_kr_and_K():
             [
                 "# Algebra",
                 "let ratio = kf2 / kr2",
-                "let checkK = ratio - K2",
+                "let checkK = ratio - Keq2",
             ]
         )
     )
@@ -71,7 +71,7 @@ def test_algebra_sees_derived_kr_from_K():
         "\n".join(
             [
                 "# Algebra",
-                "let derived = kr1 - (kf1 / K1)",
+                "let derived = kr1 - (kf1 / Keq1)",
                 "let forward_ok = kf1 - 10.0",
             ]
         )
