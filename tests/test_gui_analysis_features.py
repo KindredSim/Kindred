@@ -521,11 +521,11 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         finished = _QtCore.Signal(dict)
         error = _QtCore.Signal(str)
 
-        def __init__(self, datasets, shared_params, *, simulation_func=None, log10_params=None, **kwargs):
+        def __init__(self, datasets, shared_params, *, fit_evaluator=None, log10_params=None, **kwargs):
             super().__init__()
             captured["shared_params"] = dict(shared_params)
             captured["log10_params"] = dict(log10_params or {})
-            captured["simulation_func"] = simulation_func
+            captured["fit_evaluator"] = fit_evaluator
 
         def start(self):
             return None
@@ -571,7 +571,7 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
 
         assert captured["shared_params"] == {"k1": pytest.approx(0.2)}
 
-        sim = captured["simulation_func"]
+        sim = captured["fit_evaluator"]
         assert callable(sim)
         sim({"k1": 0.2, "init:A": 1.0})
         assert float(seen.get("k2")) == pytest.approx(9.87)

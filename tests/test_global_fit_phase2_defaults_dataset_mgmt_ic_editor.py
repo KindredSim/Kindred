@@ -1608,7 +1608,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
 
         window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
-        first_simulation = captured_runs[0]["kwargs"]["simulation_func"]
+        first_simulation = captured_runs[0]["kwargs"]["fit_evaluator"]
         first_result = first_simulation({"k1": 0.2, "init:A": 1.0})
         assert set(first_result["species"]) == {"A", "B"}
 
@@ -1627,7 +1627,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
 
-        second_simulation = captured_runs[1]["kwargs"]["simulation_func"]
+        second_simulation = captured_runs[1]["kwargs"]["fit_evaluator"]
         second_result = second_simulation({"k1": 0.2, "k2": 0.4, "init:A": 1.0})
         assert set(second_result["species"]) == {"A", "B", "C"}
         assert "C" in second_result["species"]

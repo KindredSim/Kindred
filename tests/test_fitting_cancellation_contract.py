@@ -44,7 +44,7 @@ def test_global_fit_worker_translates_typed_cancellation_to_standard_message(qtb
     worker = GlobalFitWorker(
         datasets,
         {"k": 1.0},
-        simulation_func=simulation,
+        fit_evaluator=simulation,
         fit_func=fake_fit_global,
     )
 

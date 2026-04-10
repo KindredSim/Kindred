@@ -33,6 +33,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.core.exceptions import FittingCancelled, FitSimulationError, SimulationCancelled
 from kindred.core.fitting_optimization import fit_parameters
+from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
 from kindred.core.analysis.x_mapping import normalize_x_mapping_mode
@@ -473,7 +474,7 @@ class _GlobalFitObjective:
     def __init__(
         self,
         *,
-        simulation_func: Callable[[Dict[str, float]], Dict[str, np.ndarray]],
+        fit_evaluator,
         payloads: List[FitDatasetSpec],
         shared_params: Dict[str, float],
         dataset_params: Dict[str, Dict[str, float]],
@@ -484,7 +485,7 @@ class _GlobalFitObjective:
         progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]],
         cancellation_check: Optional[Callable[[], bool]],
     ) -> None:
-        self._simulation_func = simulation_func
+        self._fit_evaluator = fit_evaluator
         self._payloads = payloads
         self._shared_params = shared_params
         self._dataset_params = dataset_params
@@ -568,7 +569,7 @@ class _GlobalFitObjective:
             )
 
             try:
-                sim_result = self._simulation_func(full_params)
+                sim_result = self._fit_evaluator.evaluate_series(full_params)
                 sim_time, sim_species = _extract_simulation_payload(sim_result)
             except FitSimulationError as exc:
                 self._ctx.set_error(exc, {"dataset": ds_id, "provenance": getattr(exc, "provenance", None)})
@@ -789,7 +790,7 @@ class _GlobalFitObjective:
 
 def _assemble_global_fit_result(
     *,
-    simulation_func: Callable[[Dict[str, float]], Dict[str, np.ndarray]],
+    fit_evaluator,
     payloads: List[FitDatasetSpec],
     fitted_params: Dict[str, float],
     combined_dataset_params: Dict[str, Dict[str, float]],
@@ -836,7 +837,7 @@ def _assemble_global_fit_result(
         sim_time: Optional[np.ndarray] = None
         sim_species: Dict[str, np.ndarray] = {}
         try:
-            sim_result = simulation_func(full_params)
+            sim_result = fit_evaluator.evaluate_series(full_params)
             sim_time, sim_species = _extract_simulation_payload(sim_result)
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
@@ -1065,7 +1066,7 @@ def _assemble_global_fit_result(
 
 
 def fit_global(
-    simulation_func: Callable[[Dict[str, float]], Dict[str, np.ndarray]],
+    fit_evaluator,
     datasets: List[object],
     shared_params: Dict[str, float],
     dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
@@ -1092,10 +1093,10 @@ def fit_global(
 
     Parameters
     ----------
-    simulation_func : callable
-        Function that takes parameters dict and returns simulated data.
-        Signature: f(params: Dict[str, float]) -> Dict[str, np.ndarray]
-        Must return dict with keys matching dataset target species.
+    fit_evaluator : object
+        Shared fitting evaluation boundary. Must expose
+        `evaluate_series(params: Dict[str, float]) -> SimulationSeriesPayload`,
+        or be a callable that returns a compatible simulation-series payload.
     datasets : list of dict
         List of experimental datasets. Each dict must contain:
         - 't': np.ndarray of time points
@@ -1221,8 +1222,10 @@ def fit_global(
         raise ValueError(f"Unknown optimization method: {method}")
 
     ctx = ObjectiveContext()
+    fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator)
+
     objective_impl = _GlobalFitObjective(
-        simulation_func=simulation_func,
+        fit_evaluator=fit_evaluator,
         payloads=payloads,
         shared_params=shared_params,
         dataset_params=dataset_params_map,
@@ -1359,7 +1362,7 @@ def fit_global(
             logger.debug("Failed to calculate uncertainties: %s", exc)
 
     return _assemble_global_fit_result(
-        simulation_func=simulation_func,
+        fit_evaluator=fit_evaluator,
         payloads=payloads,
         fitted_params=fitted_params,
         combined_dataset_params=combined_dataset_params,

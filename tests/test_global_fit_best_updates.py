@@ -51,7 +51,7 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
     worker = GlobalFitWorker(
         datasets,
         {"k": 1.0},
-        simulation_func=simulation,
+        fit_evaluator=simulation,
         fit_func=fake_fit_global,
         best_update_interval_s=0.0,
         plot_update_interval_s=0.0,
@@ -64,6 +64,8 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
 
 
 def test_global_fit_worker_best_payload_stats_remain_raw_under_target_weighting(qt_app):
+    from kindred.core.fitting_evaluation import CallableFittingEvaluator
+
     t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
 
     def simulation(_params):
@@ -86,7 +88,7 @@ def test_global_fit_worker_best_payload_stats_remain_raw_under_target_weighting(
             }
         ],
         {"k": 0.2},
-        simulation_func=simulation,
+        fit_evaluator=CallableFittingEvaluator(simulation),
         best_update_interval_s=0.0,
     )
 

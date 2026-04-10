@@ -22,6 +22,7 @@ def _dataset_spec(dataset_id: str = "ds1"):
 
 def test_fit_global_accepts_typed_dataset_specs() -> None:
     from kindred.core.analysis.global_fitting import fit_global
+    from kindred.core.fitting_evaluation import CallableFittingEvaluator
 
     spec = _dataset_spec()
 
@@ -30,7 +31,7 @@ def test_fit_global_accepts_typed_dataset_specs() -> None:
         return {"t": t, "species": {"A": np.full_like(t, float(params["k"]))}}
 
     result = fit_global(
-        simulate,
+        CallableFittingEvaluator(simulate),
         [spec],
         {"k": 1.0},
         max_nfev=2,
@@ -82,7 +83,7 @@ def test_global_fit_worker_accepts_typed_dataset_specs() -> None:
     worker = GlobalFitWorker(
         [spec],
         {"k": 1.0},
-        simulation_func=simulation,
+        fit_evaluator=simulation,
         fit_func=fake_fit_global,
     )
 
@@ -108,7 +109,7 @@ def test_global_fit_worker_emits_structured_failure_payload(qtbot) -> None:
     worker = GlobalFitWorker(
         [spec],
         {"k": 1.0},
-        simulation_func=simulation,
+        fit_evaluator=simulation,
         fit_func=fake_fit_global,
     )
 
@@ -232,6 +233,103 @@ def test_fitting_window_preserves_invalid_payload_reason_during_rebuild(qt_app, 
         assert captured
         assert "invalid payload" in captured[-1].lower()
         assert "invalid x_obs" in captured[-1].lower()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.gui
+def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monkeypatch) -> None:
+    from PySide6 import QtCore, QtWidgets
+
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.gui.fitting.window import FittingWindow
+
+    t = np.linspace(0.0, 1.0, 5)
+    warnings: list[str] = []
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda _parent, _title, text, *args, **kwargs: warnings.append(str(text)) or QtWidgets.QMessageBox.StandardButton.Ok,
+    )
+
+    class _FakeWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        finished = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+        bestUpdated = QtCore.Signal(dict)
+
+        def __init__(self, datasets, shared_params, *, fit_evaluator=None, **kwargs):
+            super().__init__()
+            captured["datasets"] = list(datasets)
+            captured["shared_params"] = dict(shared_params)
+            captured["fit_evaluator"] = fit_evaluator
+
+        def start(self):
+            return
+
+        def isRunning(self):
+            return False
+
+        def cancel(self):
+            return
+
+    build_calls: list[tuple[str, tuple[str, ...], str, float, float]] = []
+
+    def _build_simulation(mechanism_text, param_names, *, solver, rtol, atol):
+        build_calls.append((str(mechanism_text), tuple(param_names), str(solver), float(rtol), float(atol)))
+        context = prepare_fitting_execution_context(
+            mechanism_text=str(mechanism_text),
+            param_names=list(param_names),
+            t_end=1.0,
+            num_points=5,
+            solver=str(solver),
+            rtol=float(rtol),
+            atol=float(atol),
+            initial_prefix="init:",
+        )
+        return SerialFittingEvaluator(context)
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "ds1",
+                "t": t.copy(),
+                "species_data": {"A": np.ones_like(t)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        simulation_func=None,
+        simulation_builder=_build_simulation,
+        mechanism_text_getter=lambda: mechanism_text,
+        dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}],
+        dataset_weights={"ds1": 1.0},
+    )
+    try:
+        config = window._params_ics_tab._collect_parameter_config()
+        assert config is not None
+        selection = window._collect_dataset_selection()
+        window._start_global_fit(config, selection)
+
+        assert build_calls
+        assert warnings == []
+        assert isinstance(captured.get("fit_evaluator"), SerialFittingEvaluator)
     finally:
         window.close()
         qt_app.processEvents()

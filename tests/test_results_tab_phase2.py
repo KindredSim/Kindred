@@ -142,7 +142,7 @@ def _make_best_update_worker(
     return GlobalFitWorker(
         [{"id": "ds1", "t": t.copy(), "y": np.array([1.0, 0.5], dtype=float), "species": "A"}],
         {"k1": 1.0},
-        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.array([1.0, 0.5], dtype=float)}},
+        fit_evaluator=lambda _params: {"t": t.copy(), "species": {"A": np.array([1.0, 0.5], dtype=float)}},
         best_update_interval_s=best_update_interval_s,
         plot_update_interval_s=plot_update_interval_s,
     )

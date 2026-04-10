@@ -145,7 +145,7 @@ def test_global_fit_worker_defaults_to_fitting_solver(qt_app):
     worker = GlobalFitWorker(
         [{"id": "ds1", "t": t.copy(), "y": np.array([1.0, 0.5], dtype=float), "species": "A"}],
         {"k1": 1.0},
-        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.array([1.0, 0.5], dtype=float)}},
+        fit_evaluator=lambda _params: {"t": t.copy(), "species": {"A": np.array([1.0, 0.5], dtype=float)}},
     )
 
     try:

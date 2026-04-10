@@ -10,6 +10,7 @@ from kindred.core.analysis.global_fitting import (
     _normalize_weights,
     fit_global,
 )
+from kindred.core.fitting_evaluation import CallableFittingEvaluator
 from kindred.core.objective import ObjectiveContext
 from kindred.core.exceptions import FitSimulationError
 
@@ -325,7 +326,7 @@ def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_w
         log10_params=None,
     )
     objective = _GlobalFitObjective(
-        simulation_func=lambda _params: {"t": t_obs.copy(), "species": {}},
+        fit_evaluator=CallableFittingEvaluator(lambda _params: {"t": t_obs.copy(), "species": {}}),
         payloads=[payload],
         shared_params={"k": 0.5},
         dataset_params={},
@@ -401,7 +402,7 @@ def test_global_fit_objective_rebalances_targets_without_raw_cross_dataset_infla
             log10_params=None,
         )
         objective = _GlobalFitObjective(
-            simulation_func=simulation_func,
+            fit_evaluator=CallableFittingEvaluator(simulation_func),
             payloads=payloads,
             shared_params={"k": 0.5},
             dataset_params={},
@@ -465,7 +466,7 @@ def test_global_fit_objective_keeps_dx_penalty_dataset_weighted_only_when_target
             log10_params=None,
         )
         objective = _GlobalFitObjective(
-            simulation_func=simulation_func,
+            fit_evaluator=CallableFittingEvaluator(simulation_func),
             payloads=[payload],
             shared_params={"k": 0.5},
             dataset_params={},

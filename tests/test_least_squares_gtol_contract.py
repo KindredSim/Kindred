@@ -6,6 +6,7 @@ import pytest
 import kindred.core.analysis.global_fitting as global_fitting
 import kindred.core.fitting_optimization as fitting_optimization
 from kindred.core.exceptions import FittingCancelled
+from kindred.core.fitting_evaluation import CallableFittingEvaluator
 from kindred.core.optimization_least_squares import build_least_squares_kwargs
 
 
@@ -79,7 +80,7 @@ def test_fit_global_passes_gtol_equal_ftol(monkeypatch):
 
     with pytest.raises(FittingCancelled, match="cancelled"):
         global_fitting.fit_global(
-            simulate,
+            CallableFittingEvaluator(simulate),
             datasets,
             {"k": 0.1},
             method="trf",
@@ -161,7 +162,7 @@ def test_fit_global_passes_scalar_diff_step_for_lm(monkeypatch):
         return {"t": np.array([0.0, 1.0], dtype=float), "B": np.array([0.0, 0.0], dtype=float)}
 
     result = global_fitting.fit_global(
-        simulate,
+        CallableFittingEvaluator(simulate),
         datasets,
         {"k": 0.1},
         method="lm",

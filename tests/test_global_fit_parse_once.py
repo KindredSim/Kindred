@@ -67,20 +67,21 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
 
     monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
 
-    # Count session-level prepared simulation construction at the launch boundary.
+    # Count session-level fitting execution-context construction at the launch boundary.
     import kindred.gui.fitting.launch as fitting_launch
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
 
-    counts = {"build_prepared": 0}
-    _orig_build_prepared_simulation_func = fitting_launch.build_prepared_simulation_func
+    counts = {"build_context": 0}
+    _orig_prepare_fitting_execution_context = fitting_launch.prepare_fitting_execution_context
 
-    def _counting_build_prepared_simulation_func(*args, **kwargs):
-        counts["build_prepared"] += 1
-        return _orig_build_prepared_simulation_func(*args, **kwargs)
+    def _counting_prepare_fitting_execution_context(*args, **kwargs):
+        counts["build_context"] += 1
+        return _orig_prepare_fitting_execution_context(*args, **kwargs)
 
     monkeypatch.setattr(
         fitting_launch,
-        "build_prepared_simulation_func",
-        _counting_build_prepared_simulation_func,
+        "prepare_fitting_execution_context",
+        _counting_prepare_fitting_execution_context,
     )
 
     # Stub solve_ode to keep this test fast and deterministic; parsing still happens.
@@ -98,12 +99,13 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
 
     main_window._run_global_fit()
     sim_func = captured["kwargs"]["simulation_func"]
-    assert counts["build_prepared"] == 1
+    assert isinstance(sim_func, SerialFittingEvaluator)
+    assert counts["build_context"] == 1
 
     for k in (0.05, 0.1, 0.2, 0.4, 0.8):
         _ = sim_func({"k1": float(k), "init:A": 1.0})
 
-    assert counts["build_prepared"] == 1
+    assert counts["build_context"] == 1
 
 
 def test_prepared_global_fit_simulation_matches_parse_each_call(monkeypatch):

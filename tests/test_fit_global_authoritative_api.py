@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.resources
 
+import numpy as np
 import pytest
 
 
@@ -26,3 +27,32 @@ def test_gui_global_fit_code_imports_from_core_api_not_gui_shim() -> None:
         source = importlib.resources.files(package).joinpath(filename).read_text(encoding="utf-8")
         assert "from kindred.gui.compat.shims import fit_global" not in source
         assert "from kindred.core.api.fitting import fit_global" in source
+
+
+@pytest.mark.unit
+def test_authoritative_fit_global_api_accepts_shared_fitting_evaluator_contract() -> None:
+    from kindred.core.api.fitting import fit_global
+    from kindred.core.fitting_evaluation import CallableFittingEvaluator
+
+    datasets = [
+        {
+            "id": "ds1",
+            "t": np.array([0.0, 1.0], dtype=float),
+            "y": np.array([1.0, np.exp(-0.2)], dtype=float),
+            "species": "A",
+        }
+    ]
+
+    def simulate(params):
+        t = np.array([0.0, 1.0], dtype=float)
+        return {"t": t, "species": {"A": np.exp(-float(params["k"]) * t)}}
+
+    result = fit_global(
+        CallableFittingEvaluator(simulate),
+        datasets,
+        {"k": 0.2},
+        method="trf",
+        max_nfev=2,
+    )
+
+    assert result.success is True

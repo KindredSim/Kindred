@@ -82,7 +82,7 @@ def test_global_fit_worker_accepts_typed_dataset_overrides():
         [{"id": "ds1", "t": np.array([0.0, 1.0], dtype=float), "y": np.array([1.0, 0.8], dtype=float), "species": "A"}],
         {"k": 0.2},
         dataset_overrides=overrides,
-        simulation_func=simulation,
+        fit_evaluator=simulation,
         fit_func=fake_fit_global,
     )
 

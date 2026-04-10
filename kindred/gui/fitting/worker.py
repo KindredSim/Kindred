@@ -91,7 +91,7 @@ class GlobalFitWorker(QtCore.QThread):
         xtol: float = 1e-10,
         seed: Optional[int] = None,
         log10_params: Optional[Dict[str, bool]] = None,
-        simulation_func: Optional[Callable[[Dict[str, float]], Dict[str, np.ndarray]]] = None,
+        fit_evaluator: Optional[object] = None,
         fit_func: Optional[Callable[..., "GlobalFitResult"]] = None,
         solver: str = FITTING_DEFAULT_SOLVER,
         rtol: float = 1e-6,
@@ -138,7 +138,7 @@ class GlobalFitWorker(QtCore.QThread):
         self._xtol = float(xtol)
         self._seed = seed
         self._log10_params = {str(k): bool(v) for k, v in (log10_params or {}).items()}
-        self._simulation_func = simulation_func
+        self._fit_evaluator = fit_evaluator
         self._fit_func = fit_func or fit_global
         solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_method, _solver_warning = normalize_solver_name(solver_label)
@@ -237,8 +237,8 @@ class GlobalFitWorker(QtCore.QThread):
         """Execute fit_global with progress and cancellation hooks."""
         if not self._datasets:
             raise RuntimeError("No datasets were provided.")
-        if self._simulation_func is None:
-            raise RuntimeError("Simulation function is not configured.")
+        if self._fit_evaluator is None:
+            raise RuntimeError("Fit evaluator is not configured.")
 
         def progress_callback(iteration: int, cost: float, params: Dict[str, float]) -> None:
             self._wait_if_paused()
@@ -264,7 +264,7 @@ class GlobalFitWorker(QtCore.QThread):
 
         self.progress.emit(5, f"Running global fit... [{self._solver}]")
         result = self._fit_func(
-            self._simulation_func,
+            self._fit_evaluator,
             self._datasets,
             dict(self._shared_params),
             dataset_overrides=list(self._dataset_overrides),
@@ -516,7 +516,10 @@ class GlobalFitWorker(QtCore.QThread):
         self,
         full_params: dict[str, float],
     ) -> tuple[Optional[np.ndarray], dict[str, np.ndarray]]:
-        sim_result = self._simulation_func(full_params) if self._simulation_func else {}
+        if self._fit_evaluator is None:
+            sim_result = {}
+        else:
+            sim_result = self._fit_evaluator.evaluate_series(full_params)
         payload = coerce_simulation_series_payload(sim_result)
         sim_time = np.asarray(payload.t, dtype=float).reshape(-1)
         return (sim_time if sim_time.size else None), dict(payload.species)

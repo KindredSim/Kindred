@@ -1606,7 +1606,7 @@ class FittingWindow(QtWidgets.QDialog):
         rtol: float = 1e-6,
         atol: float = 1e-12,
     ) -> None:
-        if self._simulation_func is None:
+        if self._simulation_func is None and not callable(getattr(self, "_simulation_builder", None)):
             QtWidgets.QMessageBox.warning(self, "Global Fit", "Simulation callback is unavailable.")
             self._set_running_state(False)
             return
@@ -1702,7 +1702,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
         fixed_params = self._fixed_params_for_run(config)
-        simulation_with_fixed = _SimulationWithFixedParams(self._simulation_func, fixed_params)
+        simulation_with_fixed = self._simulation_with_fixed_params(self._simulation_func, fixed_params)
         self._start_global_fit_worker(
             datasets=dataset_specs,
             config=config,
@@ -1711,7 +1711,7 @@ class FittingWindow(QtWidgets.QDialog):
             requested_solver=requested_solver,
             requested_rtol=requested_rtol,
             requested_atol=requested_atol,
-            simulation_func=simulation_with_fixed,
+            fit_evaluator=simulation_with_fixed,
             stamp=stamp,
             stamp_hash=stamp_hash,
             stamp_short=stamp_short,
@@ -1816,10 +1816,28 @@ class FittingWindow(QtWidgets.QDialog):
         if simulation_func is None:
             return None
         try:
+            prepared = getattr(simulation_func, "prepared_metadata", None)
+        except Exception:
+            prepared = None
+        meta = coerce_prepared_simulation_metadata(prepared)
+        if meta is not None:
+            return meta
+        try:
             prepared = getattr(simulation_func, "_kindred_prepared_simulation_meta", None)
         except Exception:
             return None
         return coerce_prepared_simulation_metadata(prepared)
+
+    @staticmethod
+    def _simulation_with_fixed_params(simulation_func, fixed_params: Dict[str, float]):
+        if simulation_func is None:
+            return None
+        if hasattr(simulation_func, "with_fixed_params"):
+            try:
+                return simulation_func.with_fixed_params(fixed_params)
+            except Exception:
+                logger.debug("Failed to build fixed-params fitting evaluator; falling back to wrapper.", exc_info=True)
+        return _SimulationWithFixedParams(simulation_func, fixed_params)
 
     @staticmethod
     def _prepared_solver_normalized(prepared_simulation: Optional[PreparedSimulationMetadata]) -> str:
@@ -2004,7 +2022,7 @@ class FittingWindow(QtWidgets.QDialog):
         requested_solver: str,
         requested_rtol: float,
         requested_atol: float,
-        simulation_func,
+        fit_evaluator,
         stamp: Dict[str, Any],
         stamp_hash: str,
         stamp_short: str,
@@ -2021,7 +2039,7 @@ class FittingWindow(QtWidgets.QDialog):
             xtol=config.get("xtol", 1e-10),
             seed=config.get("seed"),
             log10_params=config.get("log10_params"),
-            simulation_func=simulation_func,
+            fit_evaluator=fit_evaluator,
             fit_func=self._fit_func,
             solver=requested_solver,
             rtol=float(requested_rtol),

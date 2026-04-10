@@ -8,6 +8,7 @@ from kindred.core.analysis.global_fitting import (
     fit_global,
 )
 from kindred.core.objective import ObjectiveContext
+from kindred.core.fitting_evaluation import CallableFittingEvaluator
 from kindred.core.simulation_preparation import build_prepared_simulation_func
 from kindred.core.simulator.solvers import SimulationOutput
 
@@ -94,7 +95,7 @@ def test_global_fit_objective_penalizes_nonfinite_param_without_stale_binding_re
         upper=np.asarray([1.0, 1.0], dtype=float),
     )
     objective = _GlobalFitObjective(
-        simulation_func=simulation_func,
+        fit_evaluator=CallableFittingEvaluator(simulation_func),
         payloads=[payload],
         shared_params={"k1": 0.25, "k2": 0.5},
         dataset_params={},

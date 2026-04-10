@@ -60,7 +60,7 @@ def _build_worker(*, fit_func):
     worker = GlobalFitWorker(
         datasets,
         {"k": 1.0},
-        simulation_func=simulation,
+        fit_evaluator=simulation,
         fit_func=fit_func,
         best_update_interval_s=0.0,
         max_nfev=1000,

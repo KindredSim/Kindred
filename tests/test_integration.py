@@ -237,7 +237,7 @@ class TestFittingWorkflow:
 
         # Global fit (k shared, A0 dataset-specific)
         result = fit_global(
-            simulation_func=sim_func,
+            fit_evaluator=sim_func,
             datasets=datasets,
             shared_params={'k': 0.3},
             dataset_params={

@@ -246,7 +246,7 @@ def test_global_fit_worker_smoke(monkeypatch, qtbot):
         bounds={"k": (0.05, 0.6)},
         method="trf",
         max_nfev=24,
-        simulation_func=_simulate,
+        fit_evaluator=_simulate,
     )
 
     with qtbot.waitSignal(worker.finished, timeout=7000) as blocker:

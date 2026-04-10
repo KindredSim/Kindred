@@ -70,6 +70,7 @@ def test_fitting_mixin_run_global_fit_delegates_to_launch_owner(main_window, mon
 def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkeypatch):
     from PySide6 import QtWidgets
 
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
     from kindred.gui.fitting import launch_global_fit_session
 
     _seed_one_dataset(main_window)
@@ -105,6 +106,10 @@ def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkey
     kwargs = captured.get("kwargs")
     assert isinstance(kwargs, dict)
     assert "simulation_func" in kwargs
+    assert isinstance(kwargs["simulation_func"], SerialFittingEvaluator)
+    prepared_payload = kwargs["simulation_func"].context.execution_request.to_payload()["prepared_payload"]
+    assert isinstance(prepared_payload, dict)
+    assert "rhs" not in prepared_payload
     assert kwargs.get("dataset_payloads")
     assert kwargs["dataset_payloads"][0]["id"] == "ds1"
     assert callable(kwargs.get("project_apply_callback"))
