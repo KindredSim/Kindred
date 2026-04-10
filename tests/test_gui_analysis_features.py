@@ -578,3 +578,123 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
     finally:
         window._set_running_state(False)
         window.close()
+
+
+def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, monkeypatch):
+    from PySide6 import QtCore as _QtCore
+
+    from kindred.gui.fitting.window import FittingWindow
+
+    t_axis = np.linspace(0.0, 1.0, 5)
+    seen = {}
+
+    class _EvaluateOnly:
+        def evaluate_series(self, params):
+            seen.clear()
+            seen.update(dict(params))
+            return {
+                "t": t_axis,
+                "species": {"A": np.exp(-float(params.get("k1", 0.2)) * t_axis)},
+            }
+
+    captured = {}
+
+    class _FakeWorker(_QtCore.QObject):
+        progress = _QtCore.Signal(int, str)
+        bestUpdated = _QtCore.Signal(dict)
+        finished = _QtCore.Signal(dict)
+        error = _QtCore.Signal(str)
+
+        def __init__(self, datasets, shared_params, *, fit_evaluator=None, log10_params=None, **kwargs):
+            super().__init__()
+            captured["shared_params"] = dict(shared_params)
+            captured["log10_params"] = dict(log10_params or {})
+            captured["fit_evaluator"] = fit_evaluator
+
+        def start(self):
+            return None
+
+        def isRunning(self):
+            return False
+
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[
+            {"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0},
+            {"name": "k2", "value": 0.3, "min": 0.01, "max": 1.0},
+        ],
+        dataset_entries=[
+            {
+                "id": "demo",
+                "label": "demo",
+                "t": t_axis,
+                "species_data": {"A": np.exp(-0.2 * t_axis)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        simulation_func=_EvaluateOnly(),
+        dataset_payloads=[{"id": "demo", "t": t_axis, "y": np.vstack([np.exp(-0.2 * t_axis)]), "species": ["A"]}],
+        dataset_weights={"demo": 1.0},
+        apply_callback=lambda params: None,
+    )
+    try:
+        window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
+        window._params_ics_tab._param_table.item(1, 3).setText("9.87")
+
+        config = window._params_ics_tab._collect_parameter_config()
+        dataset_selection = window._collect_dataset_selection()
+        window._start_global_fit(config, dataset_selection)
+
+        sim = captured["fit_evaluator"]
+        assert callable(sim)
+        assert hasattr(sim, "evaluate_series")
+        sim.evaluate_series({"k1": 0.2, "init:A": 1.0})
+        assert float(seen.get("k2")) == pytest.approx(9.87)
+    finally:
+        window._set_running_state(False)
+        window.close()
+
+
+def test_global_fit_fixed_params_preserve_with_fixed_params_branch(qt_app):
+    from kindred.gui.fitting.window import FittingWindow
+
+    t_axis = np.linspace(0.0, 1.0, 5)
+    fixed_capture = {}
+    seen = {}
+
+    class _EvaluatorWithFixedParams:
+        def evaluate_series(self, params):
+            return {
+                "t": t_axis,
+                "species": {"A": np.exp(-float(params.get("k1", 0.2)) * t_axis)},
+            }
+
+        def with_fixed_params(self, fixed_params):
+            fixed_capture.clear()
+            fixed_capture.update(dict(fixed_params))
+
+            class _EvaluateOnly:
+                def evaluate_series(self_inner, params):
+                    seen.clear()
+                    seen.update(dict(params))
+                    return {
+                        "t": t_axis,
+                        "species": {"A": np.exp(-float(params.get("k1", 0.2)) * t_axis)},
+                    }
+
+            return _EvaluateOnly()
+
+    wrapped = FittingWindow._simulation_with_fixed_params(_EvaluatorWithFixedParams(), {"k2": 9.87})
+
+    assert callable(wrapped)
+    assert hasattr(wrapped, "evaluate_series")
+    wrapped.evaluate_series({"k1": 0.2, "init:A": 1.0})
+    assert fixed_capture == {"k2": 9.87}
+    assert float(seen.get("k1")) == pytest.approx(0.2)

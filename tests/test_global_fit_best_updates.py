@@ -8,7 +8,10 @@ from kindred.gui.fitting.worker import GlobalFitWorker
 def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
     emitted = []
 
-    def fake_fit_global(*_args, **kwargs):
+    def fake_fit_global(*args, **kwargs):
+        fit_evaluator = args[0]
+        assert callable(fit_evaluator)
+        assert hasattr(fit_evaluator, "evaluate_series")
         progress = kwargs.get("progress_callback")
         assert progress is not None
         progress(1, 10.0, {"k": 1.0})
@@ -109,3 +112,80 @@ def test_global_fit_worker_best_payload_stats_remain_raw_under_target_weighting(
         np.full_like(t_obs, -2.0),
     )
     assert dataset_stats["ds1"]["chi_squared"] == pytest.approx(2.5)
+
+
+def test_global_fit_worker_best_payload_accepts_raw_callable_evaluator(qt_app):
+    t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
+    emitted = []
+
+    def simulation(params):
+        return {
+            "t": t_obs.copy(),
+            "species": {
+                "A": np.exp(-float(params["k"]) * t_obs),
+            },
+        }
+
+    worker = GlobalFitWorker(
+        [
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": np.exp(-0.2 * t_obs),
+                "species": "A",
+            }
+        ],
+        {"k": 0.2},
+        fit_evaluator=simulation,
+        best_update_interval_s=0.0,
+        plot_update_interval_s=0.0,
+    )
+    worker.bestUpdated.connect(lambda payload: emitted.append(payload))
+
+    worker._maybe_emit_best(1, 0.1, {"k": 0.2})
+
+    assert len(emitted) == 1
+    payload = emitted[0]
+    assert payload["model_series"]["ds1"]["A"].shape == t_obs.shape
+    assert payload["plot_model_series"]["ds1"]["A"].shape == t_obs.shape
+    np.testing.assert_allclose(payload["plot_model_x"]["ds1"], t_obs)
+    assert payload["dataset_stats"]["ds1"]["chi_squared"] == pytest.approx(0.0)
+
+
+def test_global_fit_worker_best_payload_accepts_evaluate_series_only_evaluator(qt_app):
+    t_obs = np.linspace(0.0, 1.0, 5, dtype=float)
+    emitted = []
+
+    class _EvaluateOnly:
+        def evaluate_series(self, params):
+            return {
+                "t": t_obs.copy(),
+                "species": {
+                    "A": np.exp(-float(params["k"]) * t_obs),
+                },
+            }
+
+    worker = GlobalFitWorker(
+        [
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": np.exp(-0.2 * t_obs),
+                "species": "A",
+            }
+        ],
+        {"k": 0.2},
+        fit_evaluator=_EvaluateOnly(),
+        best_update_interval_s=0.0,
+        plot_update_interval_s=0.0,
+    )
+    worker.bestUpdated.connect(lambda payload: emitted.append(payload))
+
+    worker._maybe_emit_best(1, 0.1, {"k": 0.2})
+
+    assert len(emitted) == 1
+    payload = emitted[0]
+    assert payload["model_series"]["ds1"]["A"].shape == t_obs.shape
+    assert payload["plot_model_series"]["ds1"]["A"].shape == t_obs.shape
+    np.testing.assert_allclose(payload["plot_model_x"]["ds1"], t_obs)
+    assert payload["dataset_stats"]["ds1"]["chi_squared"] == pytest.approx(0.0)

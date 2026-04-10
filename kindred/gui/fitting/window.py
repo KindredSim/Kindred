@@ -10,7 +10,7 @@ import hashlib
 import logging
 import math
 import weakref
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -37,6 +37,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
+from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     coerce_prepared_simulation_metadata,
@@ -61,6 +62,11 @@ from kindred.core.analysis.dataset_sampling import compute_sampled_indices, comp
 from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
 
 logger = logging.getLogger(__name__)
+
+
+class _EvaluateSeriesEvaluatorLike(Protocol):
+    def evaluate_series(self, params: Mapping[str, float]) -> Dict[str, Any]:
+        ...
 
 _PROJECT_APPLY_SCOPE_PARAMETERS = "parameters"
 _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS = "initial_conditions"
@@ -224,16 +230,24 @@ def validate_de_bounds(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
 
 class _SimulationWithFixedParams:
-    def __init__(self, base_simulation: Callable, fixed_params: Dict[str, float]):
-        self.base_simulation = base_simulation
-        self.fixed_params = fixed_params
+    def __init__(self, base_evaluator: object, fixed_params: Dict[str, float]):
+        self.base_evaluator = coerce_fitting_series_evaluator(base_evaluator)
+        self.fixed_params = dict(fixed_params)
 
-    def __call__(self, params: Dict[str, float]) -> Dict[str, np.ndarray]:
-        if not self.fixed_params:
-            return self.base_simulation(params)
+    @property
+    def prepared_metadata(self) -> Optional[PreparedSimulationMetadata]:
+        try:
+            return getattr(self.base_evaluator, "prepared_metadata", None)
+        except Exception:
+            return None
+
+    def __call__(self, params: Dict[str, float]):
+        return self.evaluate_series(params)
+
+    def evaluate_series(self, params: Dict[str, float]):
         merged = dict(self.fixed_params)
         merged.update(dict(params or {}))
-        return self.base_simulation(merged)
+        return self.base_evaluator.evaluate_series(merged)
 
 
 class FittingWindow(QtWidgets.QDialog):
@@ -258,7 +272,9 @@ class FittingWindow(QtWidgets.QDialog):
         parameter_defs: Sequence[Dict[str, Any]],
         dataset_entries: Sequence[Dict[str, Any]],
         dataset_manager: Optional[Any] = None,
-        simulation_func: Optional[Callable[[Dict[str, float]], Dict[str, np.ndarray]]] = None,
+        simulation_func: Optional[
+            Callable[[Dict[str, float]], Dict[str, np.ndarray]] | _EvaluateSeriesEvaluatorLike
+        ] = None,
         fit_func: Optional[Callable[..., "GlobalFitResult"]] = None,
         mechanism_species: Optional[Sequence[str]] = None,
         mechanism_text_getter: Optional[Callable[[], str]] = None,
@@ -1832,12 +1848,11 @@ class FittingWindow(QtWidgets.QDialog):
     def _simulation_with_fixed_params(simulation_func, fixed_params: Dict[str, float]):
         if simulation_func is None:
             return None
-        if hasattr(simulation_func, "with_fixed_params"):
-            try:
-                return simulation_func.with_fixed_params(fixed_params)
-            except Exception:
-                logger.debug("Failed to build fixed-params fitting evaluator; falling back to wrapper.", exc_info=True)
-        return _SimulationWithFixedParams(simulation_func, fixed_params)
+        normalized = coerce_fitting_series_evaluator(simulation_func)
+        with_fixed_params = getattr(simulation_func, "with_fixed_params", None)
+        if callable(with_fixed_params):
+            return coerce_fitting_series_evaluator(with_fixed_params(fixed_params))
+        return _SimulationWithFixedParams(normalized, fixed_params)
 
     @staticmethod
     def _prepared_solver_normalized(prepared_simulation: Optional[PreparedSimulationMetadata]) -> str:

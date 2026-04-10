@@ -43,6 +43,16 @@ __all__ = [
 ]
 
 
+def _prepared_metadata_from_evaluator(value) -> Optional[PreparedSimulationMetadata]:
+    try:
+        return coerce_prepared_simulation_metadata(
+            getattr(value, "prepared_metadata", None)
+            or getattr(value, "_kindred_prepared_simulation_meta", None)
+        )
+    except Exception:
+        return None
+
+
 class CallableFittingEvaluator:
     """Adapter that lifts a callable simulation boundary into the evaluator contract."""
 
@@ -53,21 +63,37 @@ class CallableFittingEvaluator:
 
     @property
     def prepared_metadata(self) -> Optional[PreparedSimulationMetadata]:
-        try:
-            return coerce_prepared_simulation_metadata(
-                getattr(self._simulation_func, "prepared_metadata", None)
-                or getattr(self._simulation_func, "_kindred_prepared_simulation_meta", None)
-            )
-        except Exception:
-            return None
+        return _prepared_metadata_from_evaluator(self._simulation_func)
+
+    def __call__(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
+        return self.evaluate_series(params)
 
     def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
         return coerce_simulation_series_payload(self._simulation_func(dict(params or {})))
 
 
+class _EvaluateSeriesMethodAdapter:
+    """Adapter that makes evaluate_series-only evaluators callable."""
+
+    def __init__(self, evaluator) -> None:
+        self._evaluator = evaluator
+
+    @property
+    def prepared_metadata(self) -> Optional[PreparedSimulationMetadata]:
+        return _prepared_metadata_from_evaluator(self._evaluator)
+
+    def __call__(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
+        return self.evaluate_series(params)
+
+    def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
+        return coerce_simulation_series_payload(self._evaluator.evaluate_series(dict(params or {})))
+
+
 def coerce_fitting_series_evaluator(value):
     if hasattr(value, "evaluate_series") and callable(getattr(value, "evaluate_series")):
-        return value
+        if callable(value):
+            return value
+        return _EvaluateSeriesMethodAdapter(value)
     if callable(value):
         return CallableFittingEvaluator(value)
     raise TypeError("Fitting evaluator must expose evaluate_series(params) or be callable.")

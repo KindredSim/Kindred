@@ -56,3 +56,31 @@ def test_authoritative_fit_global_api_accepts_shared_fitting_evaluator_contract(
     )
 
     assert result.success is True
+
+
+@pytest.mark.unit
+def test_authoritative_fit_global_api_accepts_raw_callable_evaluator() -> None:
+    from kindred.core.api.fitting import fit_global
+
+    datasets = [
+        {
+            "id": "ds1",
+            "t": np.array([0.0, 1.0], dtype=float),
+            "y": np.array([1.0, np.exp(-0.2)], dtype=float),
+            "species": "A",
+        }
+    ]
+
+    def simulate(params):
+        t = np.array([0.0, 1.0], dtype=float)
+        return {"t": t, "species": {"A": np.exp(-float(params["k"]) * t)}}
+
+    result = fit_global(
+        simulate,
+        datasets,
+        {"k": 0.2},
+        method="trf",
+        max_nfev=2,
+    )
+
+    assert result.success is True

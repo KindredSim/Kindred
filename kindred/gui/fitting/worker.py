@@ -25,6 +25,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
+from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.api.fitting import fit_global
@@ -138,7 +139,7 @@ class GlobalFitWorker(QtCore.QThread):
         self._xtol = float(xtol)
         self._seed = seed
         self._log10_params = {str(k): bool(v) for k, v in (log10_params or {}).items()}
-        self._fit_evaluator = fit_evaluator
+        self._fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator) if fit_evaluator is not None else None
         self._fit_func = fit_func or fit_global
         solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_method, _solver_warning = normalize_solver_name(solver_label)
