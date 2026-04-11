@@ -84,3 +84,62 @@ def test_authoritative_fit_global_api_accepts_raw_callable_evaluator() -> None:
     )
 
     assert result.success is True
+
+
+@pytest.mark.unit
+def test_coerced_non_callable_evaluator_preserves_origin_aware_method() -> None:
+    from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
+
+    calls = []
+
+    class _OriginAwareEvaluateOnly:
+        def evaluate_series(self, params):
+            calls.append(("plain", dict(params)))
+            return {"t": [0.0], "species": {"A": [1.0]}}
+
+        def evaluate_series_with_parameter_origins(self, params, origins=None, *, failed_params=None):
+            calls.append(("origin", dict(params), dict(origins or {}), dict(failed_params or {})))
+            return {"t": [0.0], "species": {"A": [2.0]}}
+
+    evaluator = coerce_fitting_series_evaluator(_OriginAwareEvaluateOnly())
+
+    result = evaluator.evaluate_series_with_parameter_origins(
+        {"k": 0.2},
+        {"k": "optimizer_shared"},
+        failed_params={"k": 0.2},
+    )
+
+    assert calls == [("origin", {"k": 0.2}, {"k": "optimizer_shared"}, {"k": 0.2})]
+    assert np.asarray(result.species["A"], dtype=float).tolist() == [2.0]
+
+
+@pytest.mark.unit
+def test_evaluate_fitting_series_normalizes_callable_origin_aware_result() -> None:
+    from kindred.core.fitting_evaluation import evaluate_fitting_series
+    from kindred.core.simulation_series_payload import SimulationSeriesPayload
+
+    calls = []
+
+    class _CallableOriginAware:
+        def __call__(self, params):
+            calls.append(("call", dict(params)))
+            return {"t": [0.0], "species": {"A": [0.0]}}
+
+        def evaluate_series(self, params):
+            calls.append(("plain", dict(params)))
+            return {"t": [0.0], "species": {"A": [1.0]}}
+
+        def evaluate_series_with_parameter_origins(self, params, origins=None, *, failed_params=None):
+            calls.append(("origin", dict(params), dict(origins or {}), dict(failed_params or {})))
+            return {"t": [0.0], "species": {"A": [2.0]}}
+
+    result = evaluate_fitting_series(
+        _CallableOriginAware(),
+        {"k": 0.2},
+        origins={"k": "optimizer_shared"},
+        failed_params={"k": 0.2},
+    )
+
+    assert calls == [("origin", {"k": 0.2}, {"k": "optimizer_shared"}, {"k": 0.2})]
+    assert isinstance(result, SimulationSeriesPayload)
+    assert np.asarray(result.species["A"], dtype=float).tolist() == [2.0]

@@ -36,11 +36,28 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CallableFittingEvaluator",
+    "FITTING_PARAM_ORIGIN_CONFIGURED_DATASET",
+    "FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR",
+    "FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET",
+    "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
     "PreparedFittingExecutionContext",
     "SerialFittingEvaluator",
     "coerce_fitting_series_evaluator",
+    "evaluate_fitting_series",
     "prepare_fitting_execution_context",
 ]
+
+FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED = "optimizer_shared"
+FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET = "optimizer_dataset"
+FITTING_PARAM_ORIGIN_CONFIGURED_DATASET = "configured_dataset"
+FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR = "configured_evaluator"
+
+_OPTIMIZER_PARAMETER_ORIGINS = frozenset(
+    {
+        FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+        FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+    }
+)
 
 
 def _prepared_metadata_from_evaluator(value) -> Optional[PreparedSimulationMetadata]:
@@ -51,6 +68,60 @@ def _prepared_metadata_from_evaluator(value) -> Optional[PreparedSimulationMetad
         )
     except Exception:
         return None
+
+
+def _parameter_origin_for(name: str, origins: Optional[Mapping[str, str]]) -> str:
+    origin = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR) or "").strip()
+    return origin or FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
+
+
+def _coerce_consumed_parameter_value(
+    *,
+    name: str,
+    raw_value: object,
+    origins: Optional[Mapping[str, str]],
+    failed_params: Optional[Dict[str, float]],
+) -> float:
+    try:
+        value = float(raw_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FitSimulationError(
+            f"Invalid parameter value for {name!r}: {raw_value!r}",
+            failed_params=dict(failed_params or {}) or None,
+            details={
+                "fatal": True,
+                "parameter_origin": _parameter_origin_for(name, origins),
+            },
+        ) from exc
+    if np.isfinite(value):
+        return value
+    origin = _parameter_origin_for(name, origins)
+    raise FitSimulationError(
+        f"Non-finite parameter value for {name!r}: {raw_value!r}",
+        failed_params=dict(failed_params or {}) or None,
+        details={
+            "fatal": origin not in _OPTIMIZER_PARAMETER_ORIGINS,
+            "parameter_origin": origin,
+        },
+    )
+
+
+def _raise_for_forwarded_parameter_values(
+    params: Mapping[str, float],
+    *,
+    origins: Optional[Mapping[str, str]],
+    failed_params: Optional[Dict[str, float]],
+) -> None:
+    for raw_name, raw_value in dict(params or {}).items():
+        name = str(raw_name)
+        if not name.strip():
+            continue
+        _coerce_consumed_parameter_value(
+            name=name,
+            raw_value=raw_value,
+            origins=origins,
+            failed_params=failed_params,
+        )
 
 
 class CallableFittingEvaluator:
@@ -71,6 +142,21 @@ class CallableFittingEvaluator:
     def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
         return coerce_simulation_series_payload(self._simulation_func(dict(params or {})))
 
+    def evaluate_series_with_parameter_origins(
+        self,
+        params: Mapping[str, float],
+        origins: Optional[Mapping[str, str]] = None,
+        *,
+        failed_params: Optional[Dict[str, float]] = None,
+    ) -> SimulationSeriesPayload:
+        forwarded = dict(params or {})
+        _raise_for_forwarded_parameter_values(
+            forwarded,
+            origins=origins,
+            failed_params=failed_params,
+        )
+        return self.evaluate_series(forwarded)
+
 
 class _EvaluateSeriesMethodAdapter:
     """Adapter that makes evaluate_series-only evaluators callable."""
@@ -88,6 +174,34 @@ class _EvaluateSeriesMethodAdapter:
     def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
         return coerce_simulation_series_payload(self._evaluator.evaluate_series(dict(params or {})))
 
+    def evaluate_series_with_parameter_origins(
+        self,
+        params: Mapping[str, float],
+        origins: Optional[Mapping[str, str]] = None,
+        *,
+        failed_params: Optional[Dict[str, float]] = None,
+    ) -> SimulationSeriesPayload:
+        origin_aware_evaluate_series = getattr(
+            self._evaluator,
+            "evaluate_series_with_parameter_origins",
+            None,
+        )
+        if callable(origin_aware_evaluate_series):
+            return coerce_simulation_series_payload(
+                origin_aware_evaluate_series(
+                    dict(params or {}),
+                    dict(origins or {}),
+                    failed_params=failed_params,
+                )
+            )
+        forwarded = dict(params or {})
+        _raise_for_forwarded_parameter_values(
+            forwarded,
+            origins=origins,
+            failed_params=failed_params,
+        )
+        return self.evaluate_series(forwarded)
+
 
 def coerce_fitting_series_evaluator(value):
     if hasattr(value, "evaluate_series") and callable(getattr(value, "evaluate_series")):
@@ -97,6 +211,32 @@ def coerce_fitting_series_evaluator(value):
     if callable(value):
         return CallableFittingEvaluator(value)
     raise TypeError("Fitting evaluator must expose evaluate_series(params) or be callable.")
+
+
+def evaluate_fitting_series(
+    evaluator,
+    params: Mapping[str, float],
+    *,
+    origins: Optional[Mapping[str, str]] = None,
+    failed_params: Optional[Dict[str, float]] = None,
+) -> SimulationSeriesPayload:
+    normalized = coerce_fitting_series_evaluator(evaluator)
+    origin_method = getattr(normalized, "evaluate_series_with_parameter_origins", None)
+    if callable(origin_method):
+        return coerce_simulation_series_payload(
+            origin_method(
+                dict(params or {}),
+                dict(origins or {}),
+                failed_params=failed_params,
+            )
+        )
+    forwarded = dict(params or {})
+    _raise_for_forwarded_parameter_values(
+        forwarded,
+        origins=origins,
+        failed_params=failed_params,
+    )
+    return coerce_simulation_series_payload(normalized.evaluate_series(forwarded))
 
 
 @dataclass(frozen=True)
@@ -237,10 +377,16 @@ class SerialFittingEvaluator:
         context: PreparedFittingExecutionContext,
         *,
         fixed_params: Optional[Mapping[str, float]] = None,
+        fixed_param_origins: Optional[Mapping[str, str]] = None,
     ) -> None:
         self._context = context.clone()
         self._fixed_params = {
             str(name): float(value) for name, value in dict(fixed_params or {}).items() if str(name).strip()
+        }
+        raw_fixed_origins = dict(fixed_param_origins or {})
+        self._fixed_param_origins = {
+            name: _parameter_origin_for(name, raw_fixed_origins)
+            for name in self._fixed_params
         }
         self._prepared_run = None
         self._bindings: Dict[str, Any] = {}
@@ -260,43 +406,74 @@ class SerialFittingEvaluator:
 
     def with_fixed_params(self, fixed_params: Mapping[str, float]) -> "SerialFittingEvaluator":
         merged = dict(self._fixed_params)
+        merged_origins = dict(self._fixed_param_origins)
         for name, value in dict(fixed_params or {}).items():
             if str(name).strip():
-                merged[str(name)] = float(value)
-        return type(self)(self._context, fixed_params=merged)
+                param_name = str(name)
+                merged[param_name] = float(value)
+                merged_origins[param_name] = FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
+        return type(self)(self._context, fixed_params=merged, fixed_param_origins=merged_origins)
 
     def __call__(self, params: Dict[str, float]) -> SimulationSeriesPayload:
         return self.evaluate_series(params)
 
     def evaluate_series(self, params: Mapping[str, float]) -> SimulationSeriesPayload:
+        configured_origins = {
+            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
+            for name in dict(params or {})
+            if str(name).strip()
+        }
+        return self.evaluate_series_with_parameter_origins(
+            params,
+            configured_origins,
+            failed_params=None,
+        )
+
+    def evaluate_series_with_parameter_origins(
+        self,
+        params: Mapping[str, float],
+        origins: Optional[Mapping[str, str]] = None,
+        *,
+        failed_params: Optional[Dict[str, float]] = None,
+    ) -> SimulationSeriesPayload:
         self._ensure_prepared()
         prepared_run = self._prepared_run
         if prepared_run is None:
             raise RuntimeError("Prepared fitting lane unavailable.")
 
         param_map = {str(name): float(value) for name, value in self._fixed_params.items()}
-        param_map.update({str(name): value for name, value in dict(params or {}).items()})
+        origin_map = dict(self._fixed_param_origins)
+        runtime_origins = dict(origins or {})
+        for raw_name, raw_value in dict(params or {}).items():
+            name = str(raw_name)
+            if not name.strip():
+                continue
+            param_map[name] = raw_value
+            origin_map[name] = _parameter_origin_for(name, runtime_origins)
 
         initial_overrides: Dict[str, float] = {}
         shared_values: Dict[str, float] = {}
         for key, raw_val in param_map.items():
             name = str(key)
-            try:
-                value = float(raw_val)
-            except (TypeError, ValueError) as exc:
-                raise FitSimulationError(
-                    f"Invalid parameter value for {name!r}: {raw_val!r}",
-                    details={"fatal": True},
-                ) from exc
-            if not np.isfinite(value):
-                raise FitSimulationError(
-                    f"Non-finite parameter value for {name!r}: {raw_val!r}",
-                    details={"fatal": True},
-                )
             if name.startswith(self._context.initial_prefix):
-                initial_overrides[name[len(self._context.initial_prefix) :]] = value
+                species_name = name[len(self._context.initial_prefix) :]
+                if species_name not in self._species_index:
+                    continue
+                initial_overrides[species_name] = _coerce_consumed_parameter_value(
+                    name=name,
+                    raw_value=raw_val,
+                    origins=origin_map,
+                    failed_params=failed_params,
+                )
             else:
-                shared_values[name] = value
+                if name not in self._bindings:
+                    continue
+                shared_values[name] = _coerce_consumed_parameter_value(
+                    name=name,
+                    raw_value=raw_val,
+                    origins=origin_map,
+                    failed_params=failed_params,
+                )
 
         shared_fp = tuple(sorted((name, float(val)) for name, val in shared_values.items()))
         if shared_fp != self._last_shared_fp:

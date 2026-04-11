@@ -37,7 +37,11 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
-from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
+from kindred.core.fitting_evaluation import (
+    FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
+    coerce_fitting_series_evaluator,
+    evaluate_fitting_series,
+)
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     coerce_prepared_simulation_metadata,
@@ -245,9 +249,38 @@ class _SimulationWithFixedParams:
         return self.evaluate_series(params)
 
     def evaluate_series(self, params: Dict[str, float]):
+        origins = {
+            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
+            for name in dict(params or {})
+            if str(name).strip()
+        }
+        return self.evaluate_series_with_parameter_origins(params, origins)
+
+    def evaluate_series_with_parameter_origins(
+        self,
+        params: Dict[str, float],
+        origins: Optional[Dict[str, str]] = None,
+        *,
+        failed_params: Optional[Dict[str, float]] = None,
+    ):
         merged = dict(self.fixed_params)
+        merged_origins = {
+            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
+            for name in merged
+            if str(name).strip()
+        }
         merged.update(dict(params or {}))
-        return self.base_evaluator.evaluate_series(merged)
+        for raw_name in dict(params or {}):
+            name = str(raw_name)
+            if not name.strip():
+                continue
+            merged_origins[name] = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR))
+        return evaluate_fitting_series(
+            self.base_evaluator,
+            merged,
+            origins=merged_origins,
+            failed_params=failed_params,
+        )
 
 
 class FittingWindow(QtWidgets.QDialog):
@@ -1681,17 +1714,6 @@ class FittingWindow(QtWidgets.QDialog):
             self._set_running_state(False)
             return
 
-        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
-        shared_param_keys = self._shared_param_keys_for_run(config)
-        dataset_params_for_run = self._dataset_params_for_run(selected_ids, shared_param_keys, staged_params)
-        variable_params = self._variable_params_for_run(selected_ids, shared_param_keys, staged_params)
-        dataset_overrides = coerce_fit_dataset_parameter_overrides(
-            dataset_ids=selected_ids,
-            dataset_params=dataset_params_for_run,
-            dataset_variable_params=variable_params,
-        )
-        _dataset_params_map, variable_params_map = split_fit_dataset_parameter_overrides(dataset_overrides)
-        self._active_variable_specs = variable_params_map
         weights = self._weights_for_run(dataset_selection)
         param_names = self._param_names_for_fit_run(prepared_simulation)
         ok, prepared_simulation = self._ensure_simulation_for_integration_settings(
@@ -1705,6 +1727,18 @@ class FittingWindow(QtWidgets.QDialog):
         if not ok:
             self._set_running_state(False)
             return
+
+        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
+        shared_param_keys = self._shared_param_keys_for_run(config)
+        dataset_params_for_run = self._dataset_params_for_run(selected_ids, shared_param_keys, staged_params)
+        variable_params = self._variable_params_for_run(selected_ids, shared_param_keys, staged_params)
+        dataset_overrides = coerce_fit_dataset_parameter_overrides(
+            dataset_ids=selected_ids,
+            dataset_params=dataset_params_for_run,
+            dataset_variable_params=variable_params,
+        )
+        _dataset_params_map, variable_params_map = split_fit_dataset_parameter_overrides(dataset_overrides)
+        self._active_variable_specs = variable_params_map
 
         stamp, stamp_hash, stamp_short = self._store_run_stamp_and_update_ui(
             dataset_selection=dataset_selection,
@@ -1757,6 +1791,82 @@ class FittingWindow(QtWidgets.QDialog):
         keys |= {str(k) for k in (config.get("fixed_params") or {}).keys() if str(k).strip()}
         return keys
 
+    @staticmethod
+    def _prepared_species_names_from_evaluator(evaluator: object) -> set[str]:
+        candidates = [evaluator]
+        try:
+            base_evaluator = getattr(evaluator, "base_evaluator", None)
+        except Exception:
+            base_evaluator = None
+        if base_evaluator is not None:
+            candidates.append(base_evaluator)
+
+        for candidate in candidates:
+            try:
+                context = getattr(candidate, "context", None)
+            except Exception:
+                context = None
+            if context is None:
+                try:
+                    context = getattr(candidate, "_kindred_fitting_execution_context", None)
+                except Exception:
+                    context = None
+            request = getattr(context, "execution_request", None)
+            if request is None:
+                continue
+            payload = None
+            to_payload = getattr(request, "to_payload", None)
+            if callable(to_payload):
+                try:
+                    payload = to_payload()
+                except Exception:
+                    payload = None
+            elif isinstance(request, Mapping):
+                payload = request
+            if not isinstance(payload, Mapping):
+                continue
+            prepared_payload = payload.get("prepared_payload")
+            if not isinstance(prepared_payload, Mapping):
+                continue
+            species_names = {
+                str(name)
+                for name in (prepared_payload.get("species_names") or [])
+                if str(name).strip()
+            }
+            if species_names:
+                return species_names
+        return set()
+
+    def _consumable_dataset_param_names_for_run(self) -> tuple[set[str], Optional[set[str]]]:
+        species_names = self._prepared_species_names_from_evaluator(self._simulation_func)
+        if not species_names:
+            species_names = {
+                str(name)
+                for name in (self._params_ics_tab.get_mechanism_species() or [])
+                if str(name).strip()
+            }
+        prepared_simulation = self._prepared_simulation_meta(self._simulation_func)
+        if prepared_simulation is not None:
+            prepared_param_names = {
+                str(name)
+                for name in (prepared_simulation.param_names or [])
+                if str(name).strip()
+            }
+            return species_names, prepared_param_names
+        return species_names, None
+
+    @staticmethod
+    def _dataset_param_consumable(
+        name: str,
+        *,
+        mechanism_species: set[str],
+        prepared_param_names: Optional[set[str]],
+    ) -> bool:
+        if name.startswith(INITIAL_PREFIX):
+            species_name = name[len(INITIAL_PREFIX) :]
+            return not mechanism_species or species_name in mechanism_species
+        return prepared_param_names is None or name in prepared_param_names
+
     def _dataset_params_for_run(
         self,
         selected_ids: Sequence[str],
@@ -1765,6 +1875,7 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> dict[str, dict[str, float]]:
         global_ds_params = self._params_ics_tab.get_global_dataset_params()
         dataset_params_for_run: dict[str, dict[str, float]] = {}
+        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run()
         for ds_id in selected_ids:
             merged = dict(global_ds_params.get(ds_id, {}))
             stage_map = staged_params.get(ds_id)
@@ -1772,6 +1883,15 @@ class FittingWindow(QtWidgets.QDialog):
                 merged.update(stage_map)
             for key in shared_param_keys:
                 merged.pop(key, None)
+            merged = {
+                str(key): value
+                for key, value in merged.items()
+                if self._dataset_param_consumable(
+                    str(key),
+                    mechanism_species=mechanism_species,
+                    prepared_param_names=prepared_param_names,
+                )
+            }
             dataset_params_for_run[ds_id] = merged
         return dataset_params_for_run
 
@@ -1783,6 +1903,7 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> dict[str, dict[str, dict[str, float]]]:
         global_ds_var_params = self._params_ics_tab.get_global_dataset_variable_params()
         variable_params: dict[str, dict[str, dict[str, float]]] = {}
+        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run()
         for ds_id in selected_ids:
             specs = global_ds_var_params.get(ds_id)
             if not isinstance(specs, dict) or not specs:
@@ -1793,6 +1914,12 @@ class FittingWindow(QtWidgets.QDialog):
                 if not isinstance(spec, dict):
                     continue
                 if str(param_name) in shared_param_keys:
+                    continue
+                if not self._dataset_param_consumable(
+                    str(param_name),
+                    mechanism_species=mechanism_species,
+                    prepared_param_names=prepared_param_names,
+                ):
                     continue
                 spec_copy = dict(spec)
                 spec_copy.setdefault("log10", False)

@@ -33,7 +33,13 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.core.exceptions import FittingCancelled, FitSimulationError, SimulationCancelled
 from kindred.core.fitting_optimization import fit_parameters
-from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
+from kindred.core.fitting_evaluation import (
+    FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
+    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+    coerce_fitting_series_evaluator,
+    evaluate_fitting_series,
+)
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
 from kindred.core.analysis.x_mapping import normalize_x_mapping_mode
@@ -45,7 +51,6 @@ __all__ = [
     "DatasetFitInfo",
     "fit_global",
 ]
-
 
 def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
     if cancellation_check is not None and cancellation_check():
@@ -558,10 +563,26 @@ class _GlobalFitObjective:
                 target_weights=target_weights,
             )
 
-            full_params = dict(param_dict)
-            full_params.update(self._dataset_params.get(ds_id, {}))
-            full_params.update(self._layout.dataset_var_params_for_dataset(ds_id, params))
-            full_params = self._format_params(full_params)
+            optimizer_dataset_params = self._layout.dataset_var_params_for_dataset(ds_id, params)
+            raw_full_params: Dict[str, float] = {}
+            parameter_origins: Dict[str, str] = {}
+            for values, origin in (
+                (param_dict, FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED),
+                (self._dataset_params.get(ds_id, {}), FITTING_PARAM_ORIGIN_CONFIGURED_DATASET),
+                (optimizer_dataset_params, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
+            ):
+                for raw_name, raw_value in dict(values or {}).items():
+                    name = str(raw_name or "").strip()
+                    if not name:
+                        continue
+                    raw_full_params[name] = float(raw_value)
+                    parameter_origins[name] = origin
+            full_params = self._format_params(raw_full_params)
+            parameter_origins = {
+                name: parameter_origins[name]
+                for name in full_params
+                if name in parameter_origins
+            }
             failed_param_snapshot = self._build_failed_param_snapshot(
                 ds_id=ds_id,
                 shared_params=param_dict,
@@ -569,7 +590,12 @@ class _GlobalFitObjective:
             )
 
             try:
-                sim_result = self._fit_evaluator.evaluate_series(full_params)
+                sim_result = evaluate_fitting_series(
+                    self._fit_evaluator,
+                    full_params,
+                    origins=parameter_origins,
+                    failed_params=failed_param_snapshot,
+                )
                 sim_time, sim_species = _extract_simulation_payload(sim_result)
             except FitSimulationError as exc:
                 self._ctx.set_error(exc, {"dataset": ds_id, "provenance": getattr(exc, "provenance", None)})
@@ -792,6 +818,7 @@ def _assemble_global_fit_result(
     *,
     fit_evaluator,
     payloads: List[FitDatasetSpec],
+    layout: _FitParameterLayout,
     fitted_params: Dict[str, float],
     combined_dataset_params: Dict[str, Dict[str, float]],
     weights: Dict[str, float],
@@ -828,6 +855,15 @@ def _assemble_global_fit_result(
 
         full_params = dict(fitted_params)
         full_params.update(combined_dataset_params.get(ds_id, {}))
+        parameter_origins = {
+            name: FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
+            for name in fitted_params
+        }
+        for name in combined_dataset_params.get(ds_id, {}):
+            if name in layout.dataset_var_index.get(ds_id, {}):
+                parameter_origins[name] = FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
+            else:
+                parameter_origins[name] = FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
         failed_param_snapshot = _GlobalFitObjective._build_failed_param_snapshot(
             ds_id=ds_id,
             shared_params=fitted_params,
@@ -837,7 +873,12 @@ def _assemble_global_fit_result(
         sim_time: Optional[np.ndarray] = None
         sim_species: Dict[str, np.ndarray] = {}
         try:
-            sim_result = fit_evaluator.evaluate_series(full_params)
+            sim_result = evaluate_fitting_series(
+                fit_evaluator,
+                full_params,
+                origins=parameter_origins,
+                failed_params=failed_param_snapshot,
+            )
             sim_time, sim_species = _extract_simulation_payload(sim_result)
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
@@ -1364,6 +1405,7 @@ def fit_global(
     return _assemble_global_fit_result(
         fit_evaluator=fit_evaluator,
         payloads=payloads,
+        layout=layout,
         fitted_params=fitted_params,
         combined_dataset_params=combined_dataset_params,
         weights=weights_norm,

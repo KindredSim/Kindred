@@ -166,7 +166,8 @@ def test_serial_fitting_evaluator_with_fixed_params_keeps_evaluators_isolated() 
     )
 
 
-def test_serial_fitting_evaluator_rejects_nonfinite_parameter_values() -> None:
+def test_serial_fitting_evaluator_rejects_nonfinite_consumed_parameter_values() -> None:
+    from kindred.core.exceptions import FitSimulationError
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 
     mechanism_text = "\n".join(
@@ -188,8 +189,107 @@ def test_serial_fitting_evaluator_rejects_nonfinite_parameter_values() -> None:
     )
     evaluator = SerialFittingEvaluator(context)
 
-    with pytest.raises(Exception, match="Non-finite parameter value"):
+    with pytest.raises(FitSimulationError, match="Non-finite parameter value") as exc_info:
         evaluator({"k1": float("nan"), "init:A": 1.0})
+
+    assert exc_info.value.details["fatal"] is True
+
+
+def test_serial_fitting_evaluator_ignores_nonfinite_unconsumed_parameter_values() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    expected = evaluator({"k1": 0.2, "init:A": 1.0})
+    actual = evaluator(
+        {
+            "k1": 0.2,
+            "init:A": 1.0,
+            "init:Removed": float("nan"),
+            "unused_rate": float("inf"),
+            "arbitrary_extra": float("-inf"),
+        }
+    )
+
+    assert np.allclose(
+        np.asarray(actual.species["B"], dtype=float),
+        np.asarray(expected.species["B"], dtype=float),
+    )
+
+
+def test_serial_fitting_evaluator_rejects_non_numeric_parameter_values_fatally() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    with pytest.raises(FitSimulationError, match="Invalid parameter value") as exc_info:
+        evaluator({"k1": "not-a-number", "init:A": 1.0})
+
+    assert exc_info.value.details["fatal"] is True
+
+
+def test_serial_fitting_evaluator_rejects_nonfinite_fixed_params_fatally() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context).with_fixed_params({"k1": float("nan")})
+
+    with pytest.raises(FitSimulationError, match="Non-finite parameter value") as exc_info:
+        evaluator({"init:A": 1.0})
+
+    assert exc_info.value.details["fatal"] is True
 
 
 def test_serial_fitting_evaluator_normalizes_solver_failures_to_fit_simulation_error(monkeypatch) -> None:

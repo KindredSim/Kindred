@@ -698,3 +698,164 @@ def test_global_fit_fixed_params_preserve_with_fixed_params_branch(qt_app):
     wrapped.evaluate_series({"k1": 0.2, "init:A": 1.0})
     assert fixed_capture == {"k2": 9.87}
     assert float(seen.get("k1")) == pytest.approx(0.2)
+
+
+def test_global_fit_fixed_param_wrapper_fatals_configured_nonfinite_forwarded_key(qt_app):
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.gui.fitting.window import FittingWindow
+
+    t_axis = np.linspace(0.0, 1.0, 5)
+
+    def _simulate(_params):
+        return {"t": t_axis, "species": {"A": np.ones_like(t_axis)}}
+
+    wrapped = FittingWindow._simulation_with_fixed_params(_simulate, {"unused_fixed": float("nan")})
+
+    with pytest.raises(FitSimulationError, match="Non-finite parameter value") as exc_info:
+        wrapped.evaluate_series({"k1": 0.2, "init:A": 1.0})
+
+    assert getattr(exc_info.value, "details", {}).get("fatal") is True
+
+
+def test_global_fit_run_prep_prunes_stale_and_unknown_dataset_params(qt_app):
+    from kindred.gui.fitting.window import FittingWindow
+    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+
+    t_axis = np.linspace(0.0, 1.0, 5)
+
+    def _simulate(params):
+        return {"t": t_axis, "species": {"A": np.ones_like(t_axis)}}
+
+    _simulate._kindred_prepared_simulation_meta = PreparedSimulationMetadata(  # type: ignore[attr-defined]
+        version=1,
+        mechanism_text_sha256="abc",
+        mechanism_text_len=3,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        temperature_K=298.15,
+        solver_requested="LSODA",
+        solver_normalized="LSODA",
+        solver_warning=None,
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "ds1",
+                "t": t_axis,
+                "species_data": {"A": np.ones_like(t_axis)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_params={
+            "ds1": {
+                "k1": 9.0,
+                "init:A": 1.0,
+                "init:Removed": float("nan"),
+                "unknown_extra": float("inf"),
+            }
+        },
+        dataset_variable_params={
+            "ds1": {
+                "init:Removed": {"initial": 1.0, "min": 0.0, "max": 2.0},
+                "unknown_extra": {"initial": 1.0, "min": 0.0, "max": 2.0},
+            }
+        },
+        simulation_func=_simulate,
+        mechanism_species=["A"],
+        dataset_payloads=[{"id": "ds1", "t": t_axis, "y": np.vstack([np.ones_like(t_axis)]), "species": ["A"]}],
+        apply_callback=lambda params: None,
+    )
+    try:
+        fixed = window._dataset_params_for_run(["ds1"], {"k1"}, {})
+        variable = window._variable_params_for_run(["ds1"], {"k1"}, {})
+
+        assert fixed == {"ds1": {"init:A": pytest.approx(1.0)}}
+        assert variable == {}
+    finally:
+        window.close()
+
+
+def test_global_fit_run_prep_uses_prepared_metadata_for_dataset_param_pruning(qt_app):
+    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+    from kindred.gui.fitting.window import FittingWindow
+
+    t_axis = np.linspace(0.0, 1.0, 5)
+
+    def _simulate(params):
+        return {"t": t_axis, "species": {"A": np.ones_like(t_axis)}}
+
+    _simulate._kindred_prepared_simulation_meta = PreparedSimulationMetadata(  # type: ignore[attr-defined]
+        version=1,
+        mechanism_text_sha256="abc",
+        mechanism_text_len=3,
+        param_names=["prepared_only"],
+        t_end=1.0,
+        num_points=5,
+        temperature_K=298.15,
+        solver_requested="LSODA",
+        solver_normalized="LSODA",
+        solver_warning=None,
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "table_only", "value": 0.2, "min": 0.01, "max": 1.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "ds1",
+                "t": t_axis,
+                "species_data": {"A": np.ones_like(t_axis)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        simulation_func=_simulate,
+        mechanism_species=["A"],
+        dataset_params={
+            "ds1": {
+                "prepared_only": 2.0,
+                "table_only": 3.0,
+                "init:A": 1.0,
+                "init:Removed": float("nan"),
+            }
+        },
+        dataset_variable_params={
+            "ds1": {
+                "prepared_only": {"initial": 2.0, "min": 0.0, "max": 10.0},
+                "table_only": {"initial": 3.0, "min": 0.0, "max": 10.0},
+                "init:Removed": {"initial": 1.0, "min": 0.0, "max": 2.0},
+            }
+        },
+        dataset_payloads=[{"id": "ds1", "t": t_axis, "y": np.vstack([np.ones_like(t_axis)]), "species": ["A"]}],
+        apply_callback=lambda params: None,
+    )
+    try:
+        fixed = window._dataset_params_for_run(["ds1"], {"shared_only"}, {})
+        variable = window._variable_params_for_run(["ds1"], {"shared_only"}, {})
+        stripped = window._dataset_params_for_run(["ds1"], {"prepared_only"}, {})
+
+        assert fixed == {"ds1": {"prepared_only": pytest.approx(2.0), "init:A": pytest.approx(1.0)}}
+        assert set(variable["ds1"]) == {"prepared_only"}
+        assert variable["ds1"]["prepared_only"]["initial"] == pytest.approx(2.0)
+        assert stripped == {"ds1": {"init:A": pytest.approx(1.0)}}
+    finally:
+        window.close()
