@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,17 +10,19 @@ import pytest
 
 
 class _FinalPhaseFatalEvaluator:
-    def __init__(self, *, t_axis, state):
+    def __init__(self, *, t_axis, state, lane_id=None):
         self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
         self._state = state
+        self._lane_id = lane_id
 
     def _kindred_clone_fitting_evaluator_lane(self):
         with self._state["lock"]:
+            lane_id = int(self._state["clone_count"])
             self._state["clone_count"] += 1
             phase_counts = self._state.setdefault("phase_clone_counts", {})
             phase = str(self._state["phase"])
             phase_counts[phase] = int(phase_counts.get(phase, 0)) + 1
-        return type(self)(t_axis=self._t_axis, state=self._state)
+        return type(self)(t_axis=self._t_axis, state=self._state, lane_id=lane_id)
 
     def evaluate_series(self, params):
         from kindred.core.exceptions import FitSimulationError
@@ -28,7 +31,12 @@ class _FinalPhaseFatalEvaluator:
         if self._state["phase"] == "final":
             with self._state["lock"]:
                 self._state.setdefault("final_values", []).append(value)
-        if self._state["phase"] == "final" and value == 10.0:
+                if self._lane_id is None:
+                    self._state.setdefault("final_base_values", []).append(value)
+                else:
+                    self._state.setdefault("final_lane_values", []).append((int(self._lane_id), value))
+        fatal_marker = float(dict(params).get("fatal_marker", 0.0))
+        if self._state["phase"] == "final" and fatal_marker > 0.5:
             raise FitSimulationError("final fatal lane failure", details={"fatal": True})
         return {
             "t": self._t_axis.copy(),
@@ -89,6 +97,11 @@ class _SlotRetentionTrackingEvaluator:
 
     def evaluate_series(self, params):
         value = float(dict(params).get("init:A", 0.0))
+        barrier_by_value = self._state.get("barrier_by_value")
+        if barrier_by_value is not None:
+            barrier = barrier_by_value.get(value)
+            if barrier is not None:
+                barrier.wait(timeout=5.0)
         with self._state["lock"]:
             if self._lane_id is None:
                 self._state["base_calls"] += 1
@@ -446,7 +459,8 @@ def test_dataset_lane_pool_retains_only_bounded_reusable_slot_lanes() -> None:
         _evaluate_dataset_simulations,
     )
 
-    dataset_count = int(_MAX_PARALLEL_DATASET_LANES) + 6
+    lane_cap = int(_MAX_PARALLEL_DATASET_LANES)
+    dataset_count = lane_cap * 2 + 1
     payloads = [_payload(f"ds{i}", [0.0, 0.0]) for i in range(dataset_count)]
     items = [
         _ObjectiveDatasetInput(
@@ -458,20 +472,56 @@ def test_dataset_lane_pool_retains_only_bounded_reusable_slot_lanes() -> None:
         )
         for idx, payload in enumerate(payloads)
     ]
+    first_wave_barrier = threading.Barrier(lane_cap)
+    second_wave_barrier = threading.Barrier(lane_cap)
     state = {"lock": threading.Lock(), "clone_count": 0, "base_calls": 0}
+    state["barrier_by_value"] = {
+        **{float(i + 1): first_wave_barrier for i in range(lane_cap)},
+        **{float(i + 1): second_wave_barrier for i in range(lane_cap, lane_cap * 2)},
+    }
     evaluator = _SlotRetentionTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state)
     lane_pool = _DatasetEvaluatorLanePool(evaluator)
+    original_lane_for_slot = lane_pool.lane_for_slot
+    retained_lane_object_ids_by_slot = {}
+    retained_underlying_ids_by_slot = {}
+
+    def tracking_lane_for_slot(slot):
+        lane = original_lane_for_slot(slot)
+        if lane is not None:
+            slot_index = int(slot)
+            lane_object_id = id(lane)
+            underlying_id = id(getattr(lane, "_evaluator", lane))
+            retained_lane_object_ids_by_slot.setdefault(slot_index, lane_object_id)
+            retained_underlying_ids_by_slot.setdefault(slot_index, underlying_id)
+            assert retained_lane_object_ids_by_slot[slot_index] == lane_object_id
+            assert retained_underlying_ids_by_slot[slot_index] == underlying_id
+        return lane
+
+    lane_pool.lane_for_slot = tracking_lane_for_slot
 
     results = _evaluate_dataset_simulations(evaluator, items, lane_pool=lane_pool)
 
     assert len(results) == dataset_count
     assert [result.index for result in results] == list(range(dataset_count))
-    assert len(lane_pool._lanes) == int(_MAX_PARALLEL_DATASET_LANES)
-    assert sorted(lane_pool._lanes) == list(range(int(_MAX_PARALLEL_DATASET_LANES)))
-    assert state["clone_count"] == int(_MAX_PARALLEL_DATASET_LANES)
+    assert len(lane_pool._lanes) == lane_cap
+    assert sorted(lane_pool._lanes) == list(range(lane_cap))
+    assert sorted(retained_lane_object_ids_by_slot) == list(range(lane_cap))
+    assert sorted(retained_underlying_ids_by_slot) == list(range(lane_cap))
+    retained_lane_ids = {
+        getattr(lane, "_evaluator", lane)._lane_id for lane in lane_pool._lanes.values()
+    }
+    assert len(retained_lane_ids) == lane_cap
+    assert state["clone_count"] == lane_cap
     assert state["base_calls"] == 0
+    lane_ids_for_calls = [lane_id for lane_id, _value in state["lane_calls"]]
+    lane_call_counts = Counter(lane_ids_for_calls)
+    assert set(lane_call_counts) == retained_lane_ids
+    assert sorted(lane_call_counts.values()) == ([2] * (lane_cap - 1)) + [3]
     called_values = sorted(value for _lane_id, value in state["lane_calls"])
     assert called_values == [float(i + 1) for i in range(dataset_count)]
+    for result in results:
+        expected_value = float(result.index + 1)
+        np.testing.assert_allclose(result.sim_species["A"], np.full(2, expected_value, dtype=float))
 
 
 def test_global_fit_objective_parallel_lanes_preserve_residual_order_and_isolation() -> None:
@@ -1556,29 +1606,67 @@ def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatc
     monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
     monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", counting_assemble)
 
+    lane_cap = int(global_fitting._MAX_PARALLEL_DATASET_LANES)
+    dataset_count = lane_cap + 3
+    dataset_ids = [f"ds{i}" for i in range(1, dataset_count + 1)]
+    early_fatal_dataset_id = "ds2"
+    overflow_fatal_dataset_id = dataset_ids[lane_cap + 1]
+    fatal_dataset_ids = {early_fatal_dataset_id, overflow_fatal_dataset_id}
+    dataset_values = {
+        dataset_id: (101.0 if dataset_id in {"ds1", early_fatal_dataset_id} else float(index + 100))
+        for index, dataset_id in enumerate(dataset_ids, start=1)
+    }
+    fatal_markers = {
+        dataset_id: (1.0 if dataset_id in fatal_dataset_ids else 0.0)
+        for dataset_id in dataset_ids
+    }
     result = global_fitting.fit_global(
         _FinalPhaseFatalEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
         [
-            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds3", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds4", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds5", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
+            {"id": dataset_id, "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)}
+            for dataset_id in dataset_ids
         ],
         {"k1": 1.0},
         dataset_params={
-            "ds1": {"init:A": 1.0},
-            "ds2": {"init:A": 10.0},
-            "ds3": {"init:A": 3.0},
-            "ds4": {"init:A": 4.0},
-            "ds5": {"init:A": 5.0},
+            dataset_id: {"init:A": value, "fatal_marker": fatal_markers[dataset_id]}
+            for dataset_id, value in dataset_values.items()
         },
         method="trf",
         max_nfev=1,
     )
 
     assert result.success is False
-    assert "final fatal lane failure" in result.dataset_errors["ds2"]
-    assert state["phase_clone_counts"] == {"objective": 4}
-    assert sorted(set(state["final_values"])) == [1.0, 3.0, 4.0, 5.0, 10.0]
-    assert "ds5" in result.model_series
+    assert set(result.dataset_errors) == fatal_dataset_ids
+    for dataset_id in fatal_dataset_ids:
+        assert "final fatal lane failure" in result.dataset_errors[dataset_id]
+    assert state["phase_clone_counts"] == {
+        "objective": min(dataset_count, lane_cap)
+    }
+    assert sorted(state["final_values"]) == sorted(dataset_values.values())
+    assert state.get("final_base_values", []) == []
+    assert sorted(value for _lane_id, value in state["final_lane_values"]) == sorted(dataset_values.values())
+    assert sorted({lane_id for lane_id, _value in state["final_lane_values"]}) == list(range(lane_cap))
+    successful_dataset_ids = [dataset_id for dataset_id in dataset_ids if dataset_id not in fatal_dataset_ids]
+    assert list(result.model_series) == successful_dataset_ids
+    assert [info.dataset_id for info in result.dataset_info] == dataset_ids
+    assert sorted(result.residual_series) == sorted(dataset_ids)
+    assert sorted(result.plot_model_x) == sorted(dataset_ids)
+    assert sorted(result.plot_model_series) == sorted(successful_dataset_ids)
+    dataset_info_by_id = {info.dataset_id: info for info in result.dataset_info}
+    for dataset_id in successful_dataset_ids:
+        np.testing.assert_allclose(
+            result.model_series[dataset_id]["A"],
+            np.full(2, dataset_values[dataset_id], dtype=float),
+        )
+        np.testing.assert_allclose(
+            result.residual_series[dataset_id]["A"],
+            np.full(2, dataset_values[dataset_id], dtype=float),
+        )
+        assert dataset_info_by_id[dataset_id].n_points == 2
+    for dataset_id in fatal_dataset_ids:
+        assert dataset_id not in result.model_series
+        assert dataset_id not in result.plot_model_series
+        assert "A" in result.residual_series[dataset_id]
+        np.testing.assert_allclose(result.residual_series[dataset_id]["A"], np.full(2, 1e6, dtype=float))
+        np.testing.assert_allclose(dataset_info_by_id[dataset_id].residuals, np.full(2, 1e6, dtype=float))
+        assert dataset_info_by_id[dataset_id].n_points == 2
