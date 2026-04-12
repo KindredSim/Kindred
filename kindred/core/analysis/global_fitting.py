@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -39,6 +41,7 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
     _clone_fitting_series_evaluator_lane,
+    _prepared_metadata_from_evaluator,
     _supports_fitting_evaluator_cancellation_check,
     _supports_isolated_fitting_evaluator_lanes,
     _with_fitting_evaluator_cancellation_check,
@@ -70,6 +73,77 @@ def _raise_if_fitting_cancel_requested(cancellation_check: Optional[Callable[[],
     cancel_requested = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
     if bool(cancel_requested()):
         raise FittingCancelled()
+
+
+class _DatasetLaneCancellation:
+    def __init__(self, cancellation_check: Optional[Callable[[], bool]]) -> None:
+        self._cancellation_check = cancellation_check
+        self._internal_abort = threading.Event()
+
+    def request_internal_abort(self) -> None:
+        self._internal_abort.set()
+
+    def internal_abort_requested(self) -> bool:
+        return self._internal_abort.is_set()
+
+    def _kindred_nonblocking_cancelled(self) -> bool:
+        if self._internal_abort.is_set():
+            return True
+        if self._cancellation_check is None:
+            return False
+        cancel_requested = getattr(
+            self._cancellation_check,
+            "_kindred_nonblocking_cancelled",
+            self._cancellation_check,
+        )
+        return bool(cancel_requested())
+
+    def __call__(self) -> bool:
+        return self._kindred_nonblocking_cancelled()
+
+    def raise_if_cancel_requested(self) -> None:
+        if self._kindred_nonblocking_cancelled():
+            raise FittingCancelled()
+
+    def submission_paused_requested(self) -> bool:
+        pause_requested = getattr(self._cancellation_check, "_kindred_nonblocking_paused", None)
+        if not callable(pause_requested):
+            self.raise_if_cancel_requested()
+            return False
+        self.raise_if_cancel_requested()
+        return bool(pause_requested())
+
+    def wait_if_submission_paused(self) -> None:
+        if not self.submission_paused_requested():
+            return
+        wait_for_resume = getattr(self._cancellation_check, "_kindred_wait_for_resume", None)
+        while self.submission_paused_requested():
+            self.raise_if_cancel_requested()
+            if callable(wait_for_resume):
+                wait_for_resume(0.05)
+            else:
+                time.sleep(0.01)
+        self.raise_if_cancel_requested()
+
+
+def _fitting_evaluator_uses_lsoda(fit_evaluator) -> bool:
+    metadata = _prepared_metadata_from_evaluator(fit_evaluator)
+    if metadata is None:
+        return False
+    return str(metadata.solver_normalized or "").strip().upper() == "LSODA"
+
+
+def _acquire_lane_execution_lock(
+    lane_execution_lock: Optional[threading.Lock],
+    lane_cancellation: Optional[_DatasetLaneCancellation],
+) -> bool:
+    if lane_execution_lock is None:
+        return False
+    while True:
+        if lane_cancellation is not None:
+            lane_cancellation.raise_if_cancel_requested()
+        if lane_execution_lock.acquire(timeout=0.05):
+            return True
 
 
 @dataclass
@@ -530,10 +604,14 @@ def _evaluate_dataset_simulation(
     item: _ObjectiveDatasetInput,
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
+    lane_cancellation: Optional[_DatasetLaneCancellation] = None,
+    lane_execution_lock: Optional[threading.Lock] = None,
 ) -> _DatasetSimulationEvaluation:
     ds_id = item.payload.dataset_id
+    lock_acquired = False
     try:
         _raise_if_fitting_cancel_requested(cancellation_check)
+        lock_acquired = _acquire_lane_execution_lock(lane_execution_lock, lane_cancellation)
         sim_result = evaluate_fitting_series(
             fit_evaluator,
             item.full_params,
@@ -570,6 +648,9 @@ def _evaluate_dataset_simulation(
             error_provenance={"dataset": ds_id},
             final_error_message=str(exc),
         )
+    finally:
+        if lock_acquired and lane_execution_lock is not None:
+            lane_execution_lock.release()
 
 
 def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
@@ -611,6 +692,8 @@ def _evaluate_dataset_simulations(
         )
 
     max_workers = min(len(items), _MAX_PARALLEL_DATASET_LANES)
+    lane_cancellation = _DatasetLaneCancellation(cancellation_check)
+    lane_execution_lock = threading.Lock() if _fitting_evaluator_uses_lsoda(fit_evaluator) else None
     results: List[Optional[_DatasetSimulationEvaluation]] = [None] * len(items)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index: Dict[Future, int] = {}
@@ -620,7 +703,7 @@ def _evaluate_dataset_simulations(
 
         def submit_next_dataset_lane() -> None:
             nonlocal next_pos
-            _raise_if_fitting_cancel_requested(cancellation_check)
+            lane_cancellation.wait_if_submission_paused()
             pos = next_pos
             next_pos += 1
             lane = lane_cache.pop(pos, None)
@@ -628,13 +711,15 @@ def _evaluate_dataset_simulations(
                 lane = _clone_fitting_series_evaluator_lane(fit_evaluator)
             if lane is None:
                 raise RuntimeError("Fitting evaluator lane construction failed for a scheduled dataset lane.")
-            lane = _with_fitting_evaluator_cancellation_check(lane, cancellation_check)
+            lane = _with_fitting_evaluator_cancellation_check(lane, lane_cancellation)
             future_to_index[
                 executor.submit(
                     _evaluate_dataset_simulation,
                     lane,
                     items[pos],
-                    cancellation_check=cancellation_check,
+                    cancellation_check=lane_cancellation,
+                    lane_cancellation=lane_cancellation,
+                    lane_execution_lock=lane_execution_lock,
                 )
             ] = pos
 
@@ -650,15 +735,22 @@ def _evaluate_dataset_simulations(
                 try:
                     result = future.result()
                     results[pos] = result
-                    _raise_if_fitting_cancel_requested(cancellation_check)
-                except Exception:
+                    lane_cancellation.raise_if_cancel_requested()
+                except Exception as exc:
+                    if lane_cancellation.internal_abort_requested() and isinstance(
+                        exc, (FittingCancelled, SimulationCancelled)
+                    ):
+                        continue
                     _cancel_pending_dataset_evaluations(tuple(future_to_index))
                     raise
                 if stop_on_fatal and _dataset_evaluation_is_fatal(result):
                     stop_submitting = True
+                    lane_cancellation.request_internal_abort()
                     _cancel_pending_dataset_evaluations(tuple(future_to_index))
-                while not stop_submitting and next_pos < len(items) and len(future_to_index) < max_workers:
-                    submit_next_dataset_lane()
+            while not stop_submitting and next_pos < len(items) and len(future_to_index) < max_workers:
+                if lane_cancellation.submission_paused_requested() and future_to_index:
+                    break
+                submit_next_dataset_lane()
 
     return [result for result in results if result is not None]
 
