@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from kindred.core.exceptions import ErrorContext, FitSimulationError, SimulationCancelled
+from kindred.core.exceptions import ErrorContext, FitSimulationError, FittingCancelled, SimulationCancelled
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
@@ -124,6 +124,28 @@ def _raise_for_forwarded_parameter_values(
         )
 
 
+def _build_fitting_cancellation_event(cancellation_check):
+    if cancellation_check is None:
+        return None
+    cancel_requested = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
+
+    def _cancel_event(_t, _y):
+        return -1.0 if bool(cancel_requested()) else 1.0
+
+    _cancel_event.terminal = True
+    _cancel_event.direction = -1.0
+    _cancel_event._kindred_cancel_event = True
+    _cancel_event._kindred_cancelled = cancel_requested
+    return _cancel_event
+
+
+def _fitting_cancel_requested(cancellation_check) -> bool:
+    if cancellation_check is None:
+        return False
+    cancel_requested = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
+    return bool(cancel_requested())
+
+
 class CallableFittingEvaluator:
     """Adapter that lifts a callable simulation boundary into the evaluator contract."""
 
@@ -211,6 +233,59 @@ def coerce_fitting_series_evaluator(value):
     if callable(value):
         return CallableFittingEvaluator(value)
     raise TypeError("Fitting evaluator must expose evaluate_series(params) or be callable.")
+
+
+def _fitting_series_evaluator_lane_clone_method(value):
+    normalized = coerce_fitting_series_evaluator(value)
+    if isinstance(normalized, _EvaluateSeriesMethodAdapter):
+        clone_lane = getattr(normalized._evaluator, "_kindred_clone_fitting_evaluator_lane", None)
+    else:
+        clone_lane = getattr(normalized, "_kindred_clone_fitting_evaluator_lane", None)
+    return clone_lane if callable(clone_lane) else None
+
+
+def _clone_fitting_series_evaluator_lane(value):
+    normalized = coerce_fitting_series_evaluator(value)
+    source = normalized._evaluator if isinstance(normalized, _EvaluateSeriesMethodAdapter) else normalized
+    clone_lane = _fitting_series_evaluator_lane_clone_method(value)
+    if clone_lane is None:
+        return None
+    try:
+        clone = clone_lane()
+    except Exception:
+        return None
+    if clone is source or clone is normalized:
+        return None
+    try:
+        return coerce_fitting_series_evaluator(clone)
+    except Exception:
+        return None
+
+
+def _with_fitting_evaluator_cancellation_check(value, cancellation_check):
+    normalized = coerce_fitting_series_evaluator(value)
+    target = normalized._evaluator if isinstance(normalized, _EvaluateSeriesMethodAdapter) else normalized
+    attach = getattr(target, "_kindred_set_fitting_cancellation_check", None)
+    if callable(attach):
+        attach(cancellation_check)
+    return normalized
+
+
+def _supports_fitting_evaluator_cancellation_check(value) -> bool:
+    try:
+        normalized = coerce_fitting_series_evaluator(value)
+    except Exception:
+        return False
+    target = normalized._evaluator if isinstance(normalized, _EvaluateSeriesMethodAdapter) else normalized
+    return callable(getattr(target, "_kindred_set_fitting_cancellation_check", None))
+
+
+def _supports_isolated_fitting_evaluator_lanes(value) -> bool:
+    try:
+        clone_lane = _fitting_series_evaluator_lane_clone_method(value)
+    except Exception:
+        return False
+    return clone_lane is not None
 
 
 def evaluate_fitting_series(
@@ -395,6 +470,7 @@ class SerialFittingEvaluator:
         self._parameter_algebra_spec = None
         self._compiled_algebra = None
         self._kindred_fitting_execution_context = self._context
+        self._cancellation_check = None
 
     @property
     def prepared_metadata(self) -> PreparedSimulationMetadata:
@@ -413,6 +489,17 @@ class SerialFittingEvaluator:
                 merged[param_name] = float(value)
                 merged_origins[param_name] = FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
         return type(self)(self._context, fixed_params=merged, fixed_param_origins=merged_origins)
+
+    def _kindred_clone_fitting_evaluator_lane(self) -> "SerialFittingEvaluator":
+        return type(self)(
+            self._context,
+            fixed_params=dict(self._fixed_params),
+            fixed_param_origins=dict(self._fixed_param_origins),
+        )
+
+    def _kindred_set_fitting_cancellation_check(self, cancellation_check) -> "SerialFittingEvaluator":
+        self._cancellation_check = cancellation_check
+        return self
 
     def __call__(self, params: Dict[str, float]) -> SimulationSeriesPayload:
         return self.evaluate_series(params)
@@ -440,6 +527,8 @@ class SerialFittingEvaluator:
         prepared_run = self._prepared_run
         if prepared_run is None:
             raise RuntimeError("Prepared fitting lane unavailable.")
+        if _fitting_cancel_requested(self._cancellation_check):
+            raise FittingCancelled()
 
         param_map = {str(name): float(value) for name, value in self._fixed_params.items()}
         origin_map = dict(self._fixed_param_origins)
@@ -487,6 +576,11 @@ class SerialFittingEvaluator:
                 continue
             y0[idx] = float(value)
 
+        events = list(prepared_run.request.events or [])
+        cancellation_event = _build_fitting_cancellation_event(self._cancellation_check)
+        if cancellation_event is not None:
+            events.append(cancellation_event)
+
         request = SimulationRequest(
             rhs=prepared_run.request.rhs,
             t_span=tuple(map(float, prepared_run.request.t_span)),
@@ -497,6 +591,7 @@ class SerialFittingEvaluator:
             grid=dict(prepared_run.request.grid or {}),
             jacobian_func=prepared_run.request.jacobian_func,
             temperature_schedule=prepared_run.request.temperature_schedule,
+            events=tuple(events) if events else None,
         )
         try:
             result = _solve_request(request)

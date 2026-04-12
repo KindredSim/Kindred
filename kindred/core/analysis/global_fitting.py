@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import logging
 import math
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -37,6 +38,10 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+    _clone_fitting_series_evaluator_lane,
+    _supports_fitting_evaluator_cancellation_check,
+    _supports_isolated_fitting_evaluator_lanes,
+    _with_fitting_evaluator_cancellation_check,
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
@@ -46,6 +51,8 @@ from kindred.core.analysis.x_mapping import normalize_x_mapping_mode
 
 logger = logging.getLogger(__name__)
 
+_MAX_PARALLEL_DATASET_LANES = 4
+
 __all__ = [
     "GlobalFitResult",
     "DatasetFitInfo",
@@ -54,6 +61,14 @@ __all__ = [
 
 def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
     if cancellation_check is not None and cancellation_check():
+        raise FittingCancelled()
+
+
+def _raise_if_fitting_cancel_requested(cancellation_check: Optional[Callable[[], bool]]) -> None:
+    if cancellation_check is None:
+        return
+    cancel_requested = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
+    if bool(cancel_requested()):
         raise FittingCancelled()
 
 
@@ -475,6 +490,200 @@ class _ParametricXAligner:
             raise
 
 
+@dataclass(frozen=True)
+class _ObjectiveDatasetInput:
+    index: int
+    payload: FitDatasetSpec
+    full_params: Dict[str, float]
+    parameter_origins: Dict[str, str]
+    failed_param_snapshot: Dict[str, float]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "full_params", dict(self.full_params))
+        object.__setattr__(self, "parameter_origins", dict(self.parameter_origins))
+        object.__setattr__(self, "failed_param_snapshot", dict(self.failed_param_snapshot))
+
+
+@dataclass(frozen=True)
+class _DatasetSimulationEvaluation:
+    index: int
+    sim_time: Optional[np.ndarray]
+    sim_species: Dict[str, np.ndarray]
+    error: Optional[BaseException] = None
+    error_provenance: Optional[Dict[str, Any]] = None
+    final_error_message: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sim_species", dict(self.sim_species))
+        if self.error_provenance is not None:
+            object.__setattr__(self, "error_provenance", dict(self.error_provenance))
+
+
+def _dataset_evaluation_is_fatal(result: _DatasetSimulationEvaluation) -> bool:
+    return isinstance(result.error, FitSimulationError) and bool(
+        getattr(result.error, "details", {}).get("fatal")
+    )
+
+
+def _evaluate_dataset_simulation(
+    fit_evaluator,
+    item: _ObjectiveDatasetInput,
+    *,
+    cancellation_check: Optional[Callable[[], bool]] = None,
+) -> _DatasetSimulationEvaluation:
+    ds_id = item.payload.dataset_id
+    try:
+        _raise_if_fitting_cancel_requested(cancellation_check)
+        sim_result = evaluate_fitting_series(
+            fit_evaluator,
+            item.full_params,
+            origins=item.parameter_origins,
+            failed_params=item.failed_param_snapshot,
+        )
+        sim_time, sim_species = _extract_simulation_payload(sim_result)
+        _raise_if_fitting_cancel_requested(cancellation_check)
+        return _DatasetSimulationEvaluation(
+            index=int(item.index),
+            sim_time=sim_time,
+            sim_species=sim_species,
+        )
+    except FitSimulationError as exc:
+        return _DatasetSimulationEvaluation(
+            index=int(item.index),
+            sim_time=None,
+            sim_species={},
+            error=exc,
+            error_provenance={"dataset": ds_id, "provenance": getattr(exc, "provenance", None)},
+            final_error_message=str(exc),
+        )
+    except Exception as exc:
+        if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+            raise FittingCancelled() from exc
+        return _DatasetSimulationEvaluation(
+            index=int(item.index),
+            sim_time=None,
+            sim_species={},
+            error=FitSimulationError(
+                f"Simulation failed for dataset '{ds_id}': {exc}",
+                failed_params=item.failed_param_snapshot,
+            ),
+            error_provenance={"dataset": ds_id},
+            final_error_message=str(exc),
+        )
+
+
+def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
+    for future in futures:
+        future.cancel()
+
+
+def _evaluate_dataset_simulations(
+    fit_evaluator,
+    items: Sequence[_ObjectiveDatasetInput],
+    *,
+    cancellation_check: Optional[Callable[[], bool]] = None,
+    stop_on_fatal: bool = True,
+) -> List[_DatasetSimulationEvaluation]:
+    if not items:
+        return []
+    supports_cancellable_lanes = cancellation_check is None or _supports_fitting_evaluator_cancellation_check(
+        fit_evaluator
+    )
+    if (
+        len(items) == 1
+        or not _supports_isolated_fitting_evaluator_lanes(fit_evaluator)
+        or not supports_cancellable_lanes
+    ):
+        return _evaluate_dataset_simulations_serial(
+            fit_evaluator,
+            items,
+            cancellation_check=cancellation_check,
+            stop_on_fatal=stop_on_fatal,
+        )
+
+    first_lane = _clone_fitting_series_evaluator_lane(fit_evaluator)
+    if first_lane is None:
+        return _evaluate_dataset_simulations_serial(
+            fit_evaluator,
+            items,
+            cancellation_check=cancellation_check,
+            stop_on_fatal=stop_on_fatal,
+        )
+
+    max_workers = min(len(items), _MAX_PARALLEL_DATASET_LANES)
+    results: List[Optional[_DatasetSimulationEvaluation]] = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index: Dict[Future, int] = {}
+        lane_cache = {0: first_lane}
+        next_pos = 0
+        stop_submitting = False
+
+        def submit_next_dataset_lane() -> None:
+            nonlocal next_pos
+            _raise_if_fitting_cancel_requested(cancellation_check)
+            pos = next_pos
+            next_pos += 1
+            lane = lane_cache.pop(pos, None)
+            if lane is None:
+                lane = _clone_fitting_series_evaluator_lane(fit_evaluator)
+            if lane is None:
+                raise RuntimeError("Fitting evaluator lane construction failed for a scheduled dataset lane.")
+            lane = _with_fitting_evaluator_cancellation_check(lane, cancellation_check)
+            future_to_index[
+                executor.submit(
+                    _evaluate_dataset_simulation,
+                    lane,
+                    items[pos],
+                    cancellation_check=cancellation_check,
+                )
+            ] = pos
+
+        while next_pos < len(items) and len(future_to_index) < max_workers:
+            submit_next_dataset_lane()
+
+        while future_to_index:
+            done, _pending = wait(tuple(future_to_index), return_when=FIRST_COMPLETED)
+            for future in done:
+                pos = future_to_index.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    result = future.result()
+                    results[pos] = result
+                    _raise_if_fitting_cancel_requested(cancellation_check)
+                except Exception:
+                    _cancel_pending_dataset_evaluations(tuple(future_to_index))
+                    raise
+                if stop_on_fatal and _dataset_evaluation_is_fatal(result):
+                    stop_submitting = True
+                    _cancel_pending_dataset_evaluations(tuple(future_to_index))
+                while not stop_submitting and next_pos < len(items) and len(future_to_index) < max_workers:
+                    submit_next_dataset_lane()
+
+    return [result for result in results if result is not None]
+
+
+def _evaluate_dataset_simulations_serial(
+    fit_evaluator,
+    items: Sequence[_ObjectiveDatasetInput],
+    *,
+    cancellation_check: Optional[Callable[[], bool]],
+    stop_on_fatal: bool,
+) -> List[_DatasetSimulationEvaluation]:
+    results = []
+    for item in items:
+        _raise_if_fitting_cancelled(cancellation_check)
+        result = _evaluate_dataset_simulation(
+            fit_evaluator,
+            item,
+            cancellation_check=cancellation_check,
+        )
+        results.append(result)
+        if stop_on_fatal and _dataset_evaluation_is_fatal(result):
+            break
+    return results
+
+
 class _GlobalFitObjective:
     def __init__(
         self,
@@ -545,24 +754,12 @@ class _GlobalFitObjective:
 
         param_dict = self._layout.shared_param_dict_from_vector(params)
         all_residuals: List[float] = []
+        dataset_inputs: List[_ObjectiveDatasetInput] = []
 
-        for payload in self._payloads:
-            _raise_if_fitting_cancelled(self._cancellation_check)
+        for index, payload in enumerate(self._payloads):
+            _raise_if_fitting_cancel_requested(self._cancellation_check)
 
             ds_id = payload.dataset_id
-            species_list = payload.species_list
-            y_matrix = payload.y_matrix
-            t_exp = payload.t_exp
-            x_name = payload.x_name
-            x_obs = payload.x_obs if x_name != "t" else None
-            x_mode = payload.x_mode
-            weight = self._weights.get(ds_id, 1.0)
-            target_weights = dict(getattr(payload, "target_weights", {}) or {})
-            target_multipliers = _normalized_target_weight_multipliers(
-                species_list=species_list,
-                target_weights=target_weights,
-            )
-
             optimizer_dataset_params = self._layout.dataset_var_params_for_dataset(ds_id, params)
             raw_full_params: Dict[str, float] = {}
             parameter_origins: Dict[str, str] = {}
@@ -588,19 +785,67 @@ class _GlobalFitObjective:
                 shared_params=param_dict,
                 full_params=full_params,
             )
-
-            try:
-                sim_result = evaluate_fitting_series(
-                    self._fit_evaluator,
-                    full_params,
-                    origins=parameter_origins,
-                    failed_params=failed_param_snapshot,
+            dataset_inputs.append(
+                _ObjectiveDatasetInput(
+                    index=int(index),
+                    payload=payload,
+                    full_params=full_params,
+                    parameter_origins=parameter_origins,
+                    failed_param_snapshot=failed_param_snapshot,
                 )
-                sim_time, sim_species = _extract_simulation_payload(sim_result)
-            except FitSimulationError as exc:
-                self._ctx.set_error(exc, {"dataset": ds_id, "provenance": getattr(exc, "provenance", None)})
+            )
+
+        simulation_evaluations = {
+            int(result.index): result
+            for result in _evaluate_dataset_simulations(
+                self._fit_evaluator,
+                dataset_inputs,
+                cancellation_check=self._cancellation_check,
+            )
+        }
+
+        for evaluation in simulation_evaluations.values():
+            if not _dataset_evaluation_is_fatal(evaluation):
+                continue
+            exc = evaluation.error
+            if isinstance(exc, FitSimulationError):
+                self._ctx.set_error(exc, evaluation.error_provenance)
+                raise exc
+
+        for item in dataset_inputs:
+            _raise_if_fitting_cancel_requested(self._cancellation_check)
+
+            payload = item.payload
+            ds_id = payload.dataset_id
+            species_list = payload.species_list
+            y_matrix = payload.y_matrix
+            t_exp = payload.t_exp
+            x_name = payload.x_name
+            x_obs = payload.x_obs if x_name != "t" else None
+            x_mode = payload.x_mode
+            weight = self._weights.get(ds_id, 1.0)
+            target_weights = dict(getattr(payload, "target_weights", {}) or {})
+            target_multipliers = _normalized_target_weight_multipliers(
+                species_list=species_list,
+                target_weights=target_weights,
+            )
+            failed_param_snapshot = item.failed_param_snapshot
+            evaluation = simulation_evaluations.get(int(item.index))
+            if evaluation is None:
+                raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
+
+            if evaluation.error is not None:
+                exc = evaluation.error
+                if not isinstance(exc, FitSimulationError):
+                    if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+                        raise FittingCancelled() from exc
+                    exc = FitSimulationError(
+                        f"Simulation failed for dataset '{ds_id}': {exc}",
+                        failed_params=failed_param_snapshot,
+                    )
+                self._ctx.set_error(exc, evaluation.error_provenance)
                 if bool(getattr(exc, "details", {}).get("fatal")):
-                    raise
+                    raise exc
                 key = (str(ds_id), "__simulation__", str(exc).splitlines()[0])
                 if key not in self._warned_objective_keys:
                     self._warned_objective_keys.add(key)
@@ -618,31 +863,9 @@ class _GlobalFitObjective:
                         * np.ones_like(np.asarray(t_exp, dtype=float).reshape(-1), dtype=float)
                     )
                 continue
-            except Exception as exc:
-                if isinstance(exc, (FittingCancelled, SimulationCancelled)):
-                    raise FittingCancelled() from exc
-                err = FitSimulationError(
-                    f"Simulation failed for dataset '{ds_id}': {exc}",
-                    failed_params=failed_param_snapshot,
-                )
-                self._ctx.set_error(err, {"dataset": ds_id})
-                key = (str(ds_id), "__simulation__", str(err).splitlines()[0])
-                if key not in self._warned_objective_keys:
-                    self._warned_objective_keys.add(key)
-                    logger.warning("Simulation failed for %s: %s", ds_id, err)
-                for idx in range(int(y_matrix.shape[0])):
-                    species_name = str(species_list[idx])
-                    target_weight = float(target_multipliers.get(species_name, 1.0))
-                    y_exp = np.asarray(y_matrix[idx], dtype=float).reshape(-1)
-                    all_residuals.extend(
-                        (float(weight) * float(target_weight) * self._penalty_value) * np.ones_like(y_exp, dtype=float)
-                    )
-                if x_name != "t" and x_mode in ("auto", "time_guided"):
-                    all_residuals.extend(
-                        (float(weight) * self._penalty_value)
-                        * np.ones_like(np.asarray(t_exp, dtype=float).reshape(-1), dtype=float)
-                    )
-                continue
+
+            sim_time = evaluation.sim_time
+            sim_species = evaluation.sim_species
 
             need_dx_penalty = bool(x_name != "t" and x_mode in ("auto", "time_guided"))
             dx_penalty_scale = 1.0
@@ -843,14 +1066,9 @@ def _assemble_global_fit_result(
     final_dataset_warnings: Dict[str, str] = {}
     alignment_report: Dict[str, Dict[str, float]] = {}
 
-    for payload in payloads:
+    dataset_inputs: List[_ObjectiveDatasetInput] = []
+    for index, payload in enumerate(payloads):
         ds_id = payload.dataset_id
-        species_list = payload.species_list
-        y_matrix = payload.y_matrix
-        t_exp = payload.t_exp
-        x_name = payload.x_name
-        x_obs = payload.x_obs if x_name != "t" else None
-        x_mode = payload.x_mode
         _raise_if_fitting_cancelled(cancellation_check)
 
         full_params = dict(fitted_params)
@@ -869,22 +1087,50 @@ def _assemble_global_fit_result(
             shared_params=fitted_params,
             full_params=full_params,
         )
+        dataset_inputs.append(
+            _ObjectiveDatasetInput(
+                index=int(index),
+                payload=payload,
+                full_params=full_params,
+                parameter_origins=parameter_origins,
+                failed_param_snapshot=failed_param_snapshot,
+            )
+        )
+
+    simulation_evaluations = {
+        int(result.index): result
+        for result in _evaluate_dataset_simulations(
+            fit_evaluator,
+            dataset_inputs,
+            cancellation_check=cancellation_check,
+            stop_on_fatal=False,
+        )
+    }
+
+    for item in dataset_inputs:
+        payload = item.payload
+        ds_id = payload.dataset_id
+        species_list = payload.species_list
+        y_matrix = payload.y_matrix
+        t_exp = payload.t_exp
+        x_name = payload.x_name
+        x_obs = payload.x_obs if x_name != "t" else None
+        x_mode = payload.x_mode
+        failed_param_snapshot = item.failed_param_snapshot
+        _raise_if_fitting_cancelled(cancellation_check)
 
         sim_time: Optional[np.ndarray] = None
         sim_species: Dict[str, np.ndarray] = {}
-        try:
-            sim_result = evaluate_fitting_series(
-                fit_evaluator,
-                full_params,
-                origins=parameter_origins,
-                failed_params=failed_param_snapshot,
-            )
-            sim_time, sim_species = _extract_simulation_payload(sim_result)
-        except Exception as exc:
-            if isinstance(exc, (FittingCancelled, SimulationCancelled)):
-                raise FittingCancelled() from exc
+        evaluation = simulation_evaluations.get(int(item.index))
+        if evaluation is None:
+            raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
+        if evaluation.error is not None:
+            exc = evaluation.error
             if ds_id not in final_dataset_errors:
-                final_dataset_errors[ds_id] = str(exc)
+                final_dataset_errors[ds_id] = str(evaluation.final_error_message or exc)
+        else:
+            sim_time = evaluation.sim_time
+            sim_species = evaluation.sim_species
 
         plot_mask: Optional[np.ndarray] = None
         if x_name == "t":

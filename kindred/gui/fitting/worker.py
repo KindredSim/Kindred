@@ -255,6 +255,8 @@ class GlobalFitWorker(QtCore.QThread):
             self._wait_if_paused()
             return self._cancelled
 
+        cancellation_check._kindred_nonblocking_cancelled = lambda: self._cancelled
+
         self._best_cost = float("inf")
         self._best_iteration = 0
         self._best_params = {}

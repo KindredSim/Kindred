@@ -166,6 +166,247 @@ def test_serial_fitting_evaluator_with_fixed_params_keeps_evaluators_isolated() 
     )
 
 
+def test_serial_fitting_evaluator_lane_clone_keeps_context_and_bindings_isolated() -> None:
+    from kindred.core.fitting_evaluation import (
+        SerialFittingEvaluator,
+        _clone_fitting_series_evaluator_lane,
+        prepare_fitting_execution_context,
+    )
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    base = SerialFittingEvaluator(context).with_fixed_params({"k1": 0.1})
+    lane = _clone_fitting_series_evaluator_lane(base)
+
+    assert lane is not None
+    assert lane is not base
+    assert lane.context is not base.context
+    assert lane.context.execution_request is not base.context.execution_request
+    assert lane.context.execution_request.prepared_payload is not base.context.execution_request.prepared_payload
+    assert (
+        lane.context.execution_request.prepared_payload["bindings"]
+        is not base.context.execution_request.prepared_payload["bindings"]
+    )
+
+    baseline = base({"init:A": 1.0})
+    lane_result = lane({"k1": 1.0, "init:A": 1.0})
+    repeat = base({"init:A": 1.0})
+
+    np.testing.assert_allclose(
+        np.asarray(repeat.species["B"], dtype=float),
+        np.asarray(baseline.species["B"], dtype=float),
+    )
+    assert not np.allclose(
+        np.asarray(lane_result.species["B"], dtype=float),
+        np.asarray(baseline.species["B"], dtype=float),
+    )
+
+
+def test_fitting_evaluator_lane_clone_rejects_self_clone() -> None:
+    from kindred.core.fitting_evaluation import _clone_fitting_series_evaluator_lane
+
+    class _SelfCloningEvaluator:
+        def _kindred_clone_fitting_evaluator_lane(self):
+            return self
+
+        def evaluate_series(self, params):
+            return {
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "species": {"A": np.asarray([0.0, 0.0], dtype=float)},
+            }
+
+    evaluator = _SelfCloningEvaluator()
+
+    assert _clone_fitting_series_evaluator_lane(evaluator) is None
+
+
+def test_fitting_evaluator_lane_clone_rejects_invalid_clone() -> None:
+    from kindred.core.fitting_evaluation import _clone_fitting_series_evaluator_lane
+
+    class _InvalidCloningEvaluator:
+        def _kindred_clone_fitting_evaluator_lane(self):
+            return object()
+
+        def evaluate_series(self, params):
+            return {
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "species": {"A": np.asarray([0.0, 0.0], dtype=float)},
+            }
+
+    assert _clone_fitting_series_evaluator_lane(_InvalidCloningEvaluator()) is None
+
+
+def test_serial_fitting_evaluator_lane_cancellation_check_reaches_solver_events(monkeypatch) -> None:
+    from kindred.core.fitting_evaluation import (
+        SerialFittingEvaluator,
+        _clone_fitting_series_evaluator_lane,
+        _with_fitting_evaluator_cancellation_check,
+        prepare_fitting_execution_context,
+    )
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    from kindred.core.simulator.solvers import SimulationOutput
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=3,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    base = SerialFittingEvaluator(context).with_fixed_params({"k1": 0.2})
+    lane = _clone_fitting_series_evaluator_lane(base)
+    blocking_check_calls = 0
+
+    def _blocking_check() -> bool:
+        nonlocal blocking_check_calls
+        blocking_check_calls += 1
+        return False
+
+    _blocking_check._kindred_nonblocking_cancelled = lambda: False
+    lane = _with_fitting_evaluator_cancellation_check(lane, _blocking_check)
+    captured = {}
+
+    def _capture_request(request):
+        events = list(request.events or [])
+        captured["cancel_events"] = [
+            event for event in events if bool(getattr(event, "_kindred_cancel_event", False))
+        ]
+        t = np.linspace(float(request.t_span[0]), float(request.t_span[1]), 3)
+        y0 = np.asarray(request.y0, dtype=float).reshape(-1)
+        return SimulationOutput(
+            t=t,
+            Y=np.vstack([np.full_like(t, y0[0]), np.full_like(t, y0[1])]),
+            provenance={},
+        )
+
+    monkeypatch.setattr(fitting_evaluation, "_solve_request", _capture_request)
+
+    result = lane({"init:A": 1.0})
+
+    assert np.asarray(result.t, dtype=float).size == 3
+    assert len(captured["cancel_events"]) == 1
+    assert captured["cancel_events"][0](0.0, np.asarray([1.0, 0.0], dtype=float)) == 1.0
+    assert blocking_check_calls == 0
+
+
+def test_serial_fitting_evaluator_lane_rejects_cancellation_before_solver(monkeypatch) -> None:
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_evaluation import (
+        SerialFittingEvaluator,
+        _clone_fitting_series_evaluator_lane,
+        _with_fitting_evaluator_cancellation_check,
+        prepare_fitting_execution_context,
+    )
+    import kindred.core.fitting_evaluation as fitting_evaluation
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=3,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    base = SerialFittingEvaluator(context).with_fixed_params({"k1": 0.2})
+    lane = _clone_fitting_series_evaluator_lane(base)
+    lane = _with_fitting_evaluator_cancellation_check(lane, lambda: True)
+
+    def _unexpected_solve(_request):
+        raise AssertionError("cancelled fitting lane must not reach the solver")
+
+    monkeypatch.setattr(fitting_evaluation, "_solve_request", _unexpected_solve)
+
+    with pytest.raises(FittingCancelled):
+        lane({"init:A": 1.0})
+
+
+def test_serial_fitting_evaluator_lane_solver_event_reports_mid_solve_cancellation(monkeypatch) -> None:
+    from kindred.core.exceptions import SimulationCancelled
+    from kindred.core.fitting_evaluation import (
+        SerialFittingEvaluator,
+        _clone_fitting_series_evaluator_lane,
+        _with_fitting_evaluator_cancellation_check,
+        prepare_fitting_execution_context,
+    )
+    import kindred.core.fitting_evaluation as fitting_evaluation
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=3,
+        solver="LSODA",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    cancel_state = {"cancelled": False}
+
+    def _blocking_check() -> bool:
+        return False
+
+    _blocking_check._kindred_nonblocking_cancelled = lambda: bool(cancel_state["cancelled"])
+    base = SerialFittingEvaluator(context).with_fixed_params({"k1": 0.2})
+    lane = _clone_fitting_series_evaluator_lane(base)
+    lane = _with_fitting_evaluator_cancellation_check(lane, _blocking_check)
+
+    def _simulate_event_cancellation(request):
+        events = [
+            event for event in list(request.events or []) if bool(getattr(event, "_kindred_cancel_event", False))
+        ]
+        assert len(events) == 1
+        assert events[0](0.0, np.asarray([1.0, 0.0], dtype=float)) == 1.0
+        cancel_state["cancelled"] = True
+        assert events[0](0.5, np.asarray([1.0, 0.0], dtype=float)) == -1.0
+        raise SimulationCancelled()
+
+    monkeypatch.setattr(fitting_evaluation, "_solve_request", _simulate_event_cancellation)
+
+    with pytest.raises(SimulationCancelled):
+        lane({"init:A": 1.0})
+
+
 def test_serial_fitting_evaluator_rejects_nonfinite_consumed_parameter_values() -> None:
     from kindred.core.exceptions import FitSimulationError
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
