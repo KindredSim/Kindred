@@ -75,6 +75,31 @@ class _LaneTrackingEvaluator:
                 self._state["active"] -= 1
 
 
+class _SlotRetentionTrackingEvaluator:
+    def __init__(self, *, t_axis, state, lane_id=None):
+        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
+        self._state = state
+        self._lane_id = lane_id
+
+    def _kindred_clone_fitting_evaluator_lane(self):
+        with self._state["lock"]:
+            lane_id = int(self._state["clone_count"])
+            self._state["clone_count"] += 1
+        return type(self)(t_axis=self._t_axis, state=self._state, lane_id=lane_id)
+
+    def evaluate_series(self, params):
+        value = float(dict(params).get("init:A", 0.0))
+        with self._state["lock"]:
+            if self._lane_id is None:
+                self._state["base_calls"] += 1
+            else:
+                self._state.setdefault("lane_calls", []).append((int(self._lane_id), value))
+        return {
+            "t": self._t_axis.copy(),
+            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
+        }
+
+
 class _FatalObjectiveEvaluator:
     def __init__(self, *, t_axis, state):
         self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
@@ -411,6 +436,42 @@ def _payload(dataset_id: str, y_values) -> object:
         x_mode="auto",
         target_weights={},
     )
+
+
+def test_dataset_lane_pool_retains_only_bounded_reusable_slot_lanes() -> None:
+    from kindred.core.analysis.global_fitting import (
+        _MAX_PARALLEL_DATASET_LANES,
+        _DatasetEvaluatorLanePool,
+        _ObjectiveDatasetInput,
+        _evaluate_dataset_simulations,
+    )
+
+    dataset_count = int(_MAX_PARALLEL_DATASET_LANES) + 6
+    payloads = [_payload(f"ds{i}", [0.0, 0.0]) for i in range(dataset_count)]
+    items = [
+        _ObjectiveDatasetInput(
+            index=idx,
+            payload=payload,
+            full_params={"init:A": float(idx + 1)},
+            parameter_origins={},
+            failed_param_snapshot={},
+        )
+        for idx, payload in enumerate(payloads)
+    ]
+    state = {"lock": threading.Lock(), "clone_count": 0, "base_calls": 0}
+    evaluator = _SlotRetentionTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state)
+    lane_pool = _DatasetEvaluatorLanePool(evaluator)
+
+    results = _evaluate_dataset_simulations(evaluator, items, lane_pool=lane_pool)
+
+    assert len(results) == dataset_count
+    assert [result.index for result in results] == list(range(dataset_count))
+    assert len(lane_pool._lanes) == int(_MAX_PARALLEL_DATASET_LANES)
+    assert sorted(lane_pool._lanes) == list(range(int(_MAX_PARALLEL_DATASET_LANES)))
+    assert state["clone_count"] == int(_MAX_PARALLEL_DATASET_LANES)
+    assert state["base_calls"] == 0
+    called_values = sorted(value for _lane_id, value in state["lane_calls"])
+    assert called_values == [float(i + 1) for i in range(dataset_count)]
 
 
 def test_global_fit_objective_parallel_lanes_preserve_residual_order_and_isolation() -> None:
@@ -1315,21 +1376,24 @@ def test_fit_global_reuses_warmed_bounded_serial_lanes_across_fit_run(monkeypatc
         initial_prefix="init:",
     )
 
+    dataset_count = int(global_fitting._MAX_PARALLEL_DATASET_LANES) + 2
     result = global_fitting.fit_global(
         SerialFittingEvaluator(context),
         [
-            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
+            {"id": f"ds{i}", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)}
+            for i in range(1, dataset_count + 1)
         ],
         {"k1": 0.2},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 2.0}},
+        dataset_params={f"ds{i}": {"init:A": float(i)} for i in range(1, dataset_count + 1)},
         method="trf",
         max_nfev=2,
     )
 
     assert result.success is True
     assert state["objective_calls"] == 2
-    assert state["prepare_counts"] == {"objective_call_1": 2}
+    assert state["prepare_counts"] == {
+        "objective_call_1": int(global_fitting._MAX_PARALLEL_DATASET_LANES)
+    }
 
 
 def test_fit_global_de_uses_same_parallel_objective_without_de_workers(monkeypatch) -> None:
@@ -1515,6 +1579,6 @@ def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatc
 
     assert result.success is False
     assert "final fatal lane failure" in result.dataset_errors["ds2"]
-    assert state["phase_clone_counts"] == {"objective": 5}
+    assert state["phase_clone_counts"] == {"objective": 4}
     assert sorted(set(state["final_values"])) == [1.0, 3.0, 4.0, 5.0, 10.0]
     assert "ds5" in result.model_series

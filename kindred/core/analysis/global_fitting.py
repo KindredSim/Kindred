@@ -661,17 +661,22 @@ def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
 class _DatasetEvaluatorLanePool:
     def __init__(self, fit_evaluator) -> None:
         self._fit_evaluator = fit_evaluator
+        self._max_lanes = _MAX_PARALLEL_DATASET_LANES
         self._lanes: Dict[int, Any] = {}
 
-    def lane_for_position(self, position: int):
-        pos = int(position)
-        lane = self._lanes.get(pos)
+    def lane_for_slot(self, slot: int):
+        slot_index = int(slot)
+        if slot_index < 0 or slot_index >= self._max_lanes:
+            raise RuntimeError(
+                f"Fitting evaluator lane slot {slot_index} is outside the retained lane cap {self._max_lanes}."
+            )
+        lane = self._lanes.get(slot_index)
         if lane is not None:
             return lane
         lane = _clone_fitting_series_evaluator_lane(self._fit_evaluator)
         if lane is None:
             return None
-        self._lanes[pos] = lane
+        self._lanes[slot_index] = lane
         return lane
 
 
@@ -700,8 +705,9 @@ def _evaluate_dataset_simulations(
             stop_on_fatal=stop_on_fatal,
         )
 
+    max_workers = min(len(items), _MAX_PARALLEL_DATASET_LANES)
     active_lane_pool = lane_pool or _DatasetEvaluatorLanePool(fit_evaluator)
-    first_lane = active_lane_pool.lane_for_position(0)
+    first_lane = active_lane_pool.lane_for_slot(0)
     if first_lane is None:
         return _evaluate_dataset_simulations_serial(
             fit_evaluator,
@@ -710,42 +716,45 @@ def _evaluate_dataset_simulations(
             stop_on_fatal=stop_on_fatal,
         )
 
-    max_workers = min(len(items), _MAX_PARALLEL_DATASET_LANES)
     lane_cancellation = _DatasetLaneCancellation(cancellation_check)
     lane_execution_lock = threading.Lock() if _fitting_evaluator_uses_lsoda(fit_evaluator) else None
     results: List[Optional[_DatasetSimulationEvaluation]] = [None] * len(items)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index: Dict[Future, int] = {}
+        future_to_slot: Dict[Future, int] = {}
+        available_slots: List[int] = list(range(max_workers))
         next_pos = 0
         stop_submitting = False
 
-        def submit_next_dataset_lane() -> None:
+        def submit_next_dataset_lane(slot: int) -> None:
             nonlocal next_pos
             lane_cancellation.wait_if_submission_paused()
             pos = next_pos
             next_pos += 1
-            lane = first_lane if pos == 0 else active_lane_pool.lane_for_position(pos)
+            lane = first_lane if int(slot) == 0 else active_lane_pool.lane_for_slot(slot)
             if lane is None:
                 raise RuntimeError("Fitting evaluator lane construction failed for a scheduled dataset lane.")
             lane = _with_fitting_evaluator_cancellation_check(lane, lane_cancellation)
-            future_to_index[
-                executor.submit(
-                    _evaluate_dataset_simulation,
-                    lane,
-                    items[pos],
-                    cancellation_check=lane_cancellation,
-                    lane_cancellation=lane_cancellation,
-                    lane_execution_lock=lane_execution_lock,
-                )
-            ] = pos
+            future = executor.submit(
+                _evaluate_dataset_simulation,
+                lane,
+                items[pos],
+                cancellation_check=lane_cancellation,
+                lane_cancellation=lane_cancellation,
+                lane_execution_lock=lane_execution_lock,
+            )
+            future_to_index[future] = pos
+            future_to_slot[future] = int(slot)
 
-        while next_pos < len(items) and len(future_to_index) < max_workers:
-            submit_next_dataset_lane()
+        while next_pos < len(items) and available_slots:
+            submit_next_dataset_lane(available_slots.pop(0))
 
         while future_to_index:
             done, _pending = wait(tuple(future_to_index), return_when=FIRST_COMPLETED)
             for future in done:
                 pos = future_to_index.pop(future)
+                slot = future_to_slot.pop(future)
+                available_slots.append(int(slot))
                 if future.cancelled():
                     continue
                 try:
@@ -763,10 +772,11 @@ def _evaluate_dataset_simulations(
                     stop_submitting = True
                     lane_cancellation.request_internal_abort()
                     _cancel_pending_dataset_evaluations(tuple(future_to_index))
-            while not stop_submitting and next_pos < len(items) and len(future_to_index) < max_workers:
+            available_slots.sort()
+            while not stop_submitting and next_pos < len(items) and available_slots:
                 if lane_cancellation.submission_paused_requested() and future_to_index:
                     break
-                submit_next_dataset_lane()
+                submit_next_dataset_lane(available_slots.pop(0))
 
     return [result for result in results if result is not None]
 
