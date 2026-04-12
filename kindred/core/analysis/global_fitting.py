@@ -658,12 +658,30 @@ def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
         future.cancel()
 
 
+class _DatasetEvaluatorLanePool:
+    def __init__(self, fit_evaluator) -> None:
+        self._fit_evaluator = fit_evaluator
+        self._lanes: Dict[int, Any] = {}
+
+    def lane_for_position(self, position: int):
+        pos = int(position)
+        lane = self._lanes.get(pos)
+        if lane is not None:
+            return lane
+        lane = _clone_fitting_series_evaluator_lane(self._fit_evaluator)
+        if lane is None:
+            return None
+        self._lanes[pos] = lane
+        return lane
+
+
 def _evaluate_dataset_simulations(
     fit_evaluator,
     items: Sequence[_ObjectiveDatasetInput],
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     stop_on_fatal: bool = True,
+    lane_pool: Optional[_DatasetEvaluatorLanePool] = None,
 ) -> List[_DatasetSimulationEvaluation]:
     if not items:
         return []
@@ -682,7 +700,8 @@ def _evaluate_dataset_simulations(
             stop_on_fatal=stop_on_fatal,
         )
 
-    first_lane = _clone_fitting_series_evaluator_lane(fit_evaluator)
+    active_lane_pool = lane_pool or _DatasetEvaluatorLanePool(fit_evaluator)
+    first_lane = active_lane_pool.lane_for_position(0)
     if first_lane is None:
         return _evaluate_dataset_simulations_serial(
             fit_evaluator,
@@ -697,7 +716,6 @@ def _evaluate_dataset_simulations(
     results: List[Optional[_DatasetSimulationEvaluation]] = [None] * len(items)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index: Dict[Future, int] = {}
-        lane_cache = {0: first_lane}
         next_pos = 0
         stop_submitting = False
 
@@ -706,9 +724,7 @@ def _evaluate_dataset_simulations(
             lane_cancellation.wait_if_submission_paused()
             pos = next_pos
             next_pos += 1
-            lane = lane_cache.pop(pos, None)
-            if lane is None:
-                lane = _clone_fitting_series_evaluator_lane(fit_evaluator)
+            lane = first_lane if pos == 0 else active_lane_pool.lane_for_position(pos)
             if lane is None:
                 raise RuntimeError("Fitting evaluator lane construction failed for a scheduled dataset lane.")
             lane = _with_fitting_evaluator_cancellation_check(lane, lane_cancellation)
@@ -790,6 +806,7 @@ class _GlobalFitObjective:
         ctx: ObjectiveContext,
         progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]],
         cancellation_check: Optional[Callable[[], bool]],
+        lane_pool: Optional[_DatasetEvaluatorLanePool] = None,
     ) -> None:
         self._fit_evaluator = fit_evaluator
         self._payloads = payloads
@@ -801,6 +818,7 @@ class _GlobalFitObjective:
         self._ctx = ctx
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
+        self._lane_pool = lane_pool or _DatasetEvaluatorLanePool(fit_evaluator)
 
         self._iteration = 0
         self._best_cost = float("inf")
@@ -893,6 +911,7 @@ class _GlobalFitObjective:
                 self._fit_evaluator,
                 dataset_inputs,
                 cancellation_check=self._cancellation_check,
+                lane_pool=self._lane_pool,
             )
         }
 
@@ -1145,6 +1164,7 @@ def _assemble_global_fit_result(
     covariance: Optional[np.ndarray],
     objective_residuals: Optional[np.ndarray],
     uncertainties: Optional[Dict[str, float]],
+    lane_pool: Optional[_DatasetEvaluatorLanePool] = None,
 ) -> GlobalFitResult:
     dataset_info = []
     total_ss_res = 0.0
@@ -1196,6 +1216,7 @@ def _assemble_global_fit_result(
             dataset_inputs,
             cancellation_check=cancellation_check,
             stop_on_fatal=False,
+            lane_pool=lane_pool,
         )
     }
 
@@ -1602,6 +1623,7 @@ def fit_global(
 
     ctx = ObjectiveContext()
     fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator)
+    lane_pool = _DatasetEvaluatorLanePool(fit_evaluator)
 
     objective_impl = _GlobalFitObjective(
         fit_evaluator=fit_evaluator,
@@ -1614,6 +1636,7 @@ def fit_global(
         ctx=ctx,
         progress_callback=progress_callback,
         cancellation_check=cancellation_check,
+        lane_pool=lane_pool,
     )
     objective_wrapper = ObjectiveWrapper(objective_impl, ctx)
 
@@ -1755,4 +1778,5 @@ def fit_global(
         covariance=covariance,
         objective_residuals=objective_residuals,
         uncertainties=uncertainties,
+        lane_pool=lane_pool,
     )

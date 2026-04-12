@@ -1233,6 +1233,105 @@ def test_fit_global_least_squares_uses_parallel_dataset_lanes(monkeypatch) -> No
     np.testing.assert_allclose(result.residual_series["ds2"]["A"], np.asarray([10.0, 10.0]))
 
 
+def test_fit_global_reuses_warmed_bounded_serial_lanes_across_fit_run(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    import kindred.core.fitting_optimization as fitting_optimization
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.simulator.solvers import SimulationOutput
+
+    state = {
+        "phase": "setup",
+        "objective_calls": 0,
+        "prepare_counts": {},
+        "lock": threading.Lock(),
+    }
+    original_assemble = global_fitting._assemble_global_fit_result
+    original_prepare = fitting_evaluation.prepare_simulation_worker_run
+
+    def counting_prepare(*args, **kwargs):
+        with state["lock"]:
+            phase = str(state["phase"])
+            state["prepare_counts"][phase] = int(state["prepare_counts"].get(phase, 0)) + 1
+        return original_prepare(*args, **kwargs)
+
+    def fake_solve_request(request):
+        t = np.linspace(
+            float(request.t_span[0]),
+            float(request.t_span[1]),
+            int((request.grid or {}).get("N") or 2),
+            dtype=float,
+        )
+        y0 = np.asarray(request.y0, dtype=float).reshape(-1)
+        return SimulationOutput(
+            t=t,
+            Y=np.tile(y0.reshape(-1, 1), (1, t.size)),
+            provenance={},
+        )
+
+    def fake_least_squares(fun, x0, **kwargs):
+        state["phase"] = "objective_call_1"
+        first_residuals = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
+        state["objective_calls"] += 1
+        state["phase"] = "objective_call_2"
+        second_residuals = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
+        state["objective_calls"] += 1
+        state["phase"] = "optimal_residual_recheck"
+        return SimpleNamespace(
+            x=np.asarray(x0, dtype=float),
+            success=True,
+            message="ok",
+            nfev=2,
+            fun=second_residuals,
+            jac=np.eye(len(first_residuals), len(np.asarray(x0, dtype=float))),
+        )
+
+    def fake_de(*_args, **_kwargs):
+        raise AssertionError("DE should not be used for this test")
+
+    def counting_assemble(*args, **kwargs):
+        state["phase"] = "final_assembly"
+        return original_assemble(*args, **kwargs)
+
+    monkeypatch.setattr(fitting_evaluation, "prepare_simulation_worker_run", counting_prepare)
+    monkeypatch.setattr(fitting_evaluation, "_solve_request", fake_solve_request)
+    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
+    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", counting_assemble)
+
+    context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=2,
+        solver="Radau",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    result = global_fitting.fit_global(
+        SerialFittingEvaluator(context),
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
+            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
+        ],
+        {"k1": 0.2},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 2.0}},
+        method="trf",
+        max_nfev=2,
+    )
+
+    assert result.success is True
+    assert state["objective_calls"] == 2
+    assert state["prepare_counts"] == {"objective_call_1": 2}
+
+
 def test_fit_global_de_uses_same_parallel_objective_without_de_workers(monkeypatch) -> None:
     from kindred.core.analysis import global_fitting
     import kindred.core.fitting_optimization as fitting_optimization
@@ -1369,10 +1468,11 @@ def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatc
         "clone_count": 0,
         "phase": "objective",
     }
+    original_assemble = global_fitting._assemble_global_fit_result
 
     def fake_least_squares(func, x0, **kwargs):
         residuals = np.asarray(func(np.asarray(x0, dtype=float)), dtype=float)
-        state["phase"] = "final"
+        state["phase"] = "optimal_residual_recheck"
         return SimpleNamespace(
             x=np.asarray(x0, dtype=float),
             success=True,
@@ -1385,7 +1485,12 @@ def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatc
     def fake_de(*_args, **_kwargs):
         raise AssertionError("DE should not be used for this test")
 
+    def counting_assemble(*args, **kwargs):
+        state["phase"] = "final"
+        return original_assemble(*args, **kwargs)
+
     monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
+    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", counting_assemble)
 
     result = global_fitting.fit_global(
         _FinalPhaseFatalEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
@@ -1410,6 +1515,6 @@ def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatc
 
     assert result.success is False
     assert "final fatal lane failure" in result.dataset_errors["ds2"]
-    assert state["phase_clone_counts"]["final"] >= 5
+    assert state["phase_clone_counts"] == {"objective": 5}
     assert sorted(set(state["final_values"])) == [1.0, 3.0, 4.0, 5.0, 10.0]
     assert "ds5" in result.model_series
