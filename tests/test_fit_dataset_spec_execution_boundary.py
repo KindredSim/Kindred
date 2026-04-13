@@ -243,6 +243,7 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monk
     from PySide6 import QtCore, QtWidgets
 
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
     from kindred.gui.fitting.window import FittingWindow
 
     t = np.linspace(0.0, 1.0, 5)
@@ -276,6 +277,9 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monk
         def cancel(self):
             return
 
+    class _DeferredGuiSerialFittingEvaluator(SerialFittingEvaluator):
+        pass
+
     build_calls: list[tuple[str, tuple[str, ...], str, float, float]] = []
 
     def _build_simulation(mechanism_text, param_names, *, solver, rtol, atol):
@@ -290,7 +294,7 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monk
             atol=float(atol),
             initial_prefix="init:",
         )
-        return SerialFittingEvaluator(context)
+        return _DeferredGuiSerialFittingEvaluator(context)
 
     monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
@@ -330,6 +334,8 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monk
         assert build_calls
         assert warnings == []
         assert isinstance(captured.get("fit_evaluator"), SerialFittingEvaluator)
+        assert type(captured["fit_evaluator"]) is _DeferredGuiSerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(captured["fit_evaluator"]) is None
     finally:
         window.close()
         qt_app.processEvents()

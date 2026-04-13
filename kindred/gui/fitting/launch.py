@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 __all__ = ["GlobalFitLaunchContext", "launch_global_fit_session"]
 
 
+class _GuiSerialFittingEvaluator(SerialFittingEvaluator):
+    """Prepared GUI evaluator that must remain on the in-process path."""
+
+
 @dataclass(frozen=True)
 class GlobalFitLaunchContext:
     parent: QtWidgets.QWidget
@@ -416,7 +420,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
     except FitSimulationError:
         logger.debug("Global-fit launch deferred fitting evaluator construction until run.", exc_info=True)
     else:
-        simulation_func = SerialFittingEvaluator(fit_context)
+        simulation_func = _GuiSerialFittingEvaluator(fit_context)
 
     def _build_simulation(
         mechanism_text_for_run: str,
@@ -458,7 +462,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             wegscheider_cyclicity_enabled=bool(current_solver_settings.get("wegscheider_cyclicity_enabled", False)),
             initial_prefix=initial_prefix,
         )
-        return SerialFittingEvaluator(fit_context)
+        return _GuiSerialFittingEvaluator(fit_context)
 
     window_factory = _resolve_window_factory(context)
     window = window_factory(

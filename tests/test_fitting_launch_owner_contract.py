@@ -20,6 +20,26 @@ def _seed_one_dataset(main_window) -> None:
     }
 
 
+def _seed_two_datasets(main_window) -> None:
+    data_panel = main_window._right_panel._data_manager
+    data_panel._datasets.clear()
+    t = np.linspace(0.0, 1.0, 6)
+    data_panel._datasets["ds1"] = {
+        "t": t.copy(),
+        "species": {
+            "A": np.linspace(1.0, 0.5, t.size),
+            "B": np.linspace(0.0, 0.4, t.size),
+        },
+    }
+    data_panel._datasets["ds2"] = {
+        "t": t.copy(),
+        "species": {
+            "A": np.linspace(0.8, 0.3, t.size),
+            "B": np.linspace(0.1, 0.5, t.size),
+        },
+    }
+
+
 def _seed_simple_mechanism(main_window) -> None:
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -113,6 +133,315 @@ def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkey
     assert kwargs.get("dataset_payloads")
     assert kwargs["dataset_payloads"][0]["id"] == "ds1"
     assert callable(kwargs.get("project_apply_callback"))
+
+
+@pytest.mark.gui
+def test_fitting_package_launch_owner_uses_serial_evaluator_subclass_without_process_export(
+    qt_app,
+    main_window,
+    monkeypatch,
+):
+    from PySide6 import QtWidgets
+
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
+    from kindred.gui.fitting import launch_global_fit_session
+
+    _seed_one_dataset(main_window)
+    _seed_simple_mechanism(main_window)
+    monkeypatch.setattr(
+        main_window._dataset_manager,
+        "scan_mechanism_parameters",
+        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+    )
+
+    captured: dict[str, object] = {}
+
+    class _FakeWindow(QtWidgets.QDialog):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            captured["kwargs"] = dict(kwargs)
+
+        def setWindowTitle(self, *_args):
+            return None
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):
+            return None
+
+    context = replace(main_window._build_global_fit_launch_context(), window_factory=_FakeWindow)
+    window = launch_global_fit_session(context)
+    try:
+        assert isinstance(window, QtWidgets.QDialog)
+        kwargs = captured.get("kwargs")
+        assert isinstance(kwargs, dict)
+
+        simulation_func = kwargs.get("simulation_func")
+        assert isinstance(simulation_func, SerialFittingEvaluator)
+        assert type(simulation_func) is not SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(simulation_func) is None
+
+        fixed = simulation_func.with_fixed_params({"k_fixed": 1.23})
+        assert isinstance(fixed, SerialFittingEvaluator)
+        assert type(fixed) is not SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(fixed) is None
+
+        simulation_builder = kwargs.get("simulation_builder")
+        assert callable(simulation_builder)
+        rebuilt = simulation_builder(
+            "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
+            ["k1"],
+            solver="LSODA",
+            rtol=1e-6,
+            atol=1e-12,
+        )
+        assert isinstance(rebuilt, SerialFittingEvaluator)
+        assert type(rebuilt) is not SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(rebuilt) is None
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+@pytest.mark.gui
+def test_fitting_package_launch_owner_preserves_serial_subclass_through_worker_handoff(
+    qt_app,
+    main_window,
+    monkeypatch,
+):
+    from PySide6 import QtCore, QtWidgets
+
+    from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
+    from kindred.gui.fitting import launch_global_fit_session
+    from kindred.gui.fitting.window import FittingWindow
+
+    _seed_one_dataset(main_window)
+    _seed_simple_mechanism(main_window)
+    monkeypatch.setattr(
+        main_window._dataset_manager,
+        "scan_mechanism_parameters",
+        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+    )
+
+    captured: dict[str, object] = {}
+    launch_kwargs: dict[str, object] = {}
+
+    class _FakeWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        finished = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+        bestUpdated = QtCore.Signal(dict)
+
+        def __init__(self, datasets, shared_params, *, fit_evaluator=None, **kwargs):
+            super().__init__()
+            captured["datasets"] = list(datasets)
+            captured["shared_params"] = dict(shared_params)
+            captured["fit_evaluator"] = fit_evaluator
+
+        def start(self):
+            return
+
+        def isRunning(self):
+            return False
+
+        def cancel(self):
+            return
+
+    class _CaptureWindow(QtWidgets.QDialog):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            launch_kwargs.update(kwargs)
+
+        def setWindowTitle(self, *_args):
+            return None
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+
+    window = launch_global_fit_session(replace(main_window._build_global_fit_launch_context(), window_factory=_CaptureWindow))
+    assert isinstance(window, QtWidgets.QDialog)
+    eager_window = FittingWindow(**launch_kwargs)
+    try:
+        config = eager_window._params_ics_tab._collect_parameter_config()
+        assert config is not None
+        selection = eager_window._collect_dataset_selection()
+        assert selection["ids"] == ["ds1"]
+        fixed_params = eager_window._fixed_params_for_run(config)
+        fit_evaluator = eager_window._simulation_with_fixed_params(eager_window._simulation_func, fixed_params)
+        assert isinstance(fit_evaluator, SerialFittingEvaluator)
+        assert type(fit_evaluator) is not SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(fit_evaluator) is None
+
+        t = np.linspace(0.0, 1.0, 6)
+        eager_window._start_global_fit_worker(
+            datasets=[
+                FitDatasetSpec(
+                    dataset_id="ds1",
+                    t_exp=t,
+                    species_list=["A"],
+                    y_matrix=np.vstack([np.ones_like(t)]),
+                    point_count=int(t.size),
+                    x_name="t",
+                    x_obs=None,
+                    x_mode="auto",
+                )
+            ],
+            config=config,
+            dataset_overrides=[],
+            weights=eager_window._weights_for_run(selection),
+            requested_solver="LSODA",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=fit_evaluator,
+            stamp={},
+            stamp_hash="stamp-hash",
+            stamp_short="stamp",
+        )
+
+        captured_fit_evaluator = captured.get("fit_evaluator")
+        assert isinstance(captured_fit_evaluator, SerialFittingEvaluator)
+        assert type(captured_fit_evaluator) is not SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(captured_fit_evaluator) is None
+    finally:
+        eager_window.close()
+        eager_window.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+@pytest.mark.gui
+def test_fitting_package_launch_owner_keeps_multi_dataset_gui_fit_off_process_lanes(
+    qtbot,
+    qt_app,
+    main_window,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from PySide6 import QtWidgets
+
+    from kindred.core.analysis import global_fitting
+    from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
+    from kindred.core.api.fitting import fit_global
+    import kindred.core.fitting_optimization as fitting_optimization
+    from kindred.gui.fitting import launch_global_fit_session
+    from kindred.gui.fitting.window import FittingWindow
+
+    _seed_two_datasets(main_window)
+    _seed_simple_mechanism(main_window)
+    monkeypatch.setattr(
+        main_window._dataset_manager,
+        "scan_mechanism_parameters",
+        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+    )
+
+    launch_kwargs: dict[str, object] = {}
+    captured: dict[str, object] = {}
+    state = {"objective_calls": 0}
+    original_assemble = global_fitting._assemble_global_fit_result
+
+    class _CaptureWindow(QtWidgets.QDialog):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            launch_kwargs.update(kwargs)
+
+        def setWindowTitle(self, *_args):
+            return None
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):
+            return None
+
+    def fake_least_squares(fun, x0, **kwargs):
+        first_residuals = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
+        state["objective_calls"] += 1
+        second_residuals = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
+        state["objective_calls"] += 1
+        return SimpleNamespace(
+            x=np.asarray(x0, dtype=float),
+            success=True,
+            message="ok",
+            nfev=2,
+            fun=second_residuals,
+            jac=np.eye(len(first_residuals), len(np.asarray(x0, dtype=float))),
+        )
+
+    def fake_de(*_args, **_kwargs):
+        raise AssertionError("DE should not be used for this test")
+
+    def counting_assemble(*args, **kwargs):
+        captured["lane_pool"] = kwargs["lane_pool"]
+        return original_assemble(*args, **kwargs)
+
+    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
+    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", counting_assemble)
+
+    window = launch_global_fit_session(replace(main_window._build_global_fit_launch_context(), window_factory=_CaptureWindow))
+    assert isinstance(window, QtWidgets.QDialog)
+    eager_window = FittingWindow(**launch_kwargs)
+    try:
+        config = eager_window._params_ics_tab._collect_parameter_config()
+        assert config is not None
+        selection = eager_window._collect_dataset_selection()
+        assert selection["ids"] == ["ds1", "ds2"]
+
+        fixed_params = eager_window._fixed_params_for_run(config)
+        fit_evaluator = eager_window._simulation_with_fixed_params(eager_window._simulation_func, fixed_params)
+        eager_window._fit_func = fit_global
+        eager_window._start_global_fit_worker(
+            datasets=coerce_fit_dataset_specs(list(launch_kwargs["dataset_payloads"])),
+            config=config,
+            dataset_overrides=[],
+            weights=eager_window._weights_for_run(selection),
+            requested_solver="LSODA",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=fit_evaluator,
+            stamp={},
+            stamp_hash="stamp-hash",
+            stamp_short="stamp",
+        )
+        assert eager_window._worker is not None
+        captured["worker_fit_evaluator"] = eager_window._worker._fit_evaluator
+        qtbot.waitUntil(lambda: "lane_pool" in captured, timeout=5000)
+        qtbot.waitUntil(lambda: eager_window._worker is not None and not eager_window._worker.isRunning(), timeout=5000)
+        qtbot.waitUntil(lambda: eager_window._last_result is not None, timeout=5000)
+        result = eager_window._last_result
+
+        assert result.success is True
+        assert state["objective_calls"] == 2
+        assert len(selection["ids"]) == 2
+        assert captured["worker_fit_evaluator"] is fit_evaluator
+        assert captured["lane_pool"]._kindred_process_worker_pids() == ()
+        assert captured["lane_pool"]._kindred_process_slot_stats() == {}
+    finally:
+        eager_window.close()
+        eager_window.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 @pytest.mark.gui
