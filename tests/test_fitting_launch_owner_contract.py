@@ -136,7 +136,7 @@ def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkey
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_uses_serial_evaluator_subclass_without_process_export(
+def test_fitting_package_launch_owner_uses_process_exportable_serial_evaluator(
     qt_app,
     main_window,
     monkeypatch,
@@ -183,13 +183,13 @@ def test_fitting_package_launch_owner_uses_serial_evaluator_subclass_without_pro
 
         simulation_func = kwargs.get("simulation_func")
         assert isinstance(simulation_func, SerialFittingEvaluator)
-        assert type(simulation_func) is not SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(simulation_func) is None
+        assert type(simulation_func) is SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(simulation_func) is not None
 
         fixed = simulation_func.with_fixed_params({"k_fixed": 1.23})
         assert isinstance(fixed, SerialFittingEvaluator)
-        assert type(fixed) is not SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(fixed) is None
+        assert type(fixed) is SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(fixed) is not None
 
         simulation_builder = kwargs.get("simulation_builder")
         assert callable(simulation_builder)
@@ -201,8 +201,8 @@ def test_fitting_package_launch_owner_uses_serial_evaluator_subclass_without_pro
             atol=1e-12,
         )
         assert isinstance(rebuilt, SerialFittingEvaluator)
-        assert type(rebuilt) is not SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(rebuilt) is None
+        assert type(rebuilt) is SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(rebuilt) is not None
     finally:
         window.close()
         window.deleteLater()
@@ -210,7 +210,7 @@ def test_fitting_package_launch_owner_uses_serial_evaluator_subclass_without_pro
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_preserves_serial_subclass_through_worker_handoff(
+def test_fitting_package_launch_owner_preserves_process_exportable_serial_evaluator_through_worker_handoff(
     qt_app,
     main_window,
     monkeypatch,
@@ -285,8 +285,8 @@ def test_fitting_package_launch_owner_preserves_serial_subclass_through_worker_h
         fixed_params = eager_window._fixed_params_for_run(config)
         fit_evaluator = eager_window._simulation_with_fixed_params(eager_window._simulation_func, fixed_params)
         assert isinstance(fit_evaluator, SerialFittingEvaluator)
-        assert type(fit_evaluator) is not SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(fit_evaluator) is None
+        assert type(fit_evaluator) is SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(fit_evaluator) is not None
 
         t = np.linspace(0.0, 1.0, 6)
         eager_window._start_global_fit_worker(
@@ -316,8 +316,8 @@ def test_fitting_package_launch_owner_preserves_serial_subclass_through_worker_h
 
         captured_fit_evaluator = captured.get("fit_evaluator")
         assert isinstance(captured_fit_evaluator, SerialFittingEvaluator)
-        assert type(captured_fit_evaluator) is not SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(captured_fit_evaluator) is None
+        assert type(captured_fit_evaluator) is SerialFittingEvaluator
+        assert fitting_process_lane_payload_from_evaluator(captured_fit_evaluator) is not None
     finally:
         eager_window.close()
         eager_window.deleteLater()
@@ -327,7 +327,7 @@ def test_fitting_package_launch_owner_preserves_serial_subclass_through_worker_h
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_keeps_multi_dataset_gui_fit_off_process_lanes(
+def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_lanes(
     qtbot,
     qt_app,
     main_window,
@@ -426,7 +426,10 @@ def test_fitting_package_launch_owner_keeps_multi_dataset_gui_fit_off_process_la
         assert eager_window._worker is not None
         captured["worker_fit_evaluator"] = eager_window._worker._fit_evaluator
         qtbot.waitUntil(lambda: "lane_pool" in captured, timeout=5000)
-        qtbot.waitUntil(lambda: eager_window._worker is not None and not eager_window._worker.isRunning(), timeout=5000)
+        qtbot.waitUntil(
+            lambda: eager_window._worker is None or not eager_window._worker.isRunning(),
+            timeout=5000,
+        )
         qtbot.waitUntil(lambda: eager_window._last_result is not None, timeout=5000)
         result = eager_window._last_result
 
@@ -434,8 +437,12 @@ def test_fitting_package_launch_owner_keeps_multi_dataset_gui_fit_off_process_la
         assert state["objective_calls"] == 2
         assert len(selection["ids"]) == 2
         assert captured["worker_fit_evaluator"] is fit_evaluator
-        assert captured["lane_pool"]._kindred_process_worker_pids() == ()
-        assert captured["lane_pool"]._kindred_process_slot_stats() == {}
+        process_pids = captured["lane_pool"]._kindred_process_worker_pids()
+        slot_stats = captured["lane_pool"]._kindred_process_slot_stats()
+        assert len(process_pids) >= 2
+        assert len(set(process_pids)) >= 2
+        assert set(slot_stats) == {0, 1}
+        assert all(int(stats["eval_count"]) >= 1 for stats in slot_stats.values())
     finally:
         eager_window.close()
         eager_window.deleteLater()
