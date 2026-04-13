@@ -9,6 +9,14 @@ import numpy as np
 import pytest
 
 
+def _sleep_for_process_termination_probe(seconds: float) -> int:
+    import os
+    import time
+
+    time.sleep(float(seconds))
+    return int(os.getpid())
+
+
 class _FinalPhaseFatalEvaluator:
     def __init__(self, *, t_axis, state, lane_id=None):
         self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
@@ -558,12 +566,10 @@ def test_global_fit_objective_parallel_lanes_preserve_residual_order_and_isolati
     assert state["max_active"] == 2
 
 
-def test_global_fit_objective_parallel_lanes_with_serial_fitting_evaluator(monkeypatch) -> None:
+def test_global_fit_objective_parallel_lanes_with_serial_fitting_evaluator() -> None:
     from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-    import kindred.core.fitting_evaluation as fitting_evaluation
     from kindred.core.objective import ObjectiveContext
-    from kindred.core.simulator.solvers import SimulationOutput
 
     mechanism_text = "\n".join(
         [
@@ -582,26 +588,6 @@ def test_global_fit_objective_parallel_lanes_with_serial_fitting_evaluator(monke
         atol=1e-12,
         initial_prefix="init:",
     )
-    state = _lane_state()
-
-    def fake_solve_request(request):
-        with state["lock"]:
-            state["active"] += 1
-            state["max_active"] = max(state["max_active"], state["active"])
-        try:
-            state["barrier"].wait(timeout=2.0)
-            t = np.linspace(float(request.t_span[0]), float(request.t_span[1]), 2)
-            y0 = np.asarray(request.y0, dtype=float).reshape(-1)
-            return SimulationOutput(
-                t=t,
-                Y=np.vstack([np.full_like(t, y0[0]), np.full_like(t, y0[1])]),
-                provenance={},
-            )
-        finally:
-            with state["lock"]:
-                state["active"] -= 1
-
-    monkeypatch.setattr(fitting_evaluation, "_solve_request", fake_solve_request)
 
     payloads = [_payload("ds1", [0.0, 0.0]), _payload("ds2", [0.0, 0.0])]
     layout = _build_parameter_layout(
@@ -623,19 +609,38 @@ def test_global_fit_objective_parallel_lanes_with_serial_fitting_evaluator(monke
         progress_callback=None,
         cancellation_check=None,
     )
+    class _InProcessSerialFittingEvaluator(SerialFittingEvaluator):
+        pass
 
-    residuals = objective(layout.x0.copy())
+    reference = _GlobalFitObjective(
+        fit_evaluator=_InProcessSerialFittingEvaluator(context),
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        weights={"ds1": 1.0, "ds2": 1.0},
+        layout=layout,
+        penalty_value=1e6,
+        ctx=ObjectiveContext(),
+        progress_callback=None,
+        cancellation_check=None,
+    )
+    expected = reference(layout.x0.copy())
 
-    np.testing.assert_allclose(residuals, np.asarray([1.0, 1.0, 10.0, 10.0], dtype=float))
-    assert state["max_active"] == 2
+    try:
+        residuals = objective(layout.x0.copy())
+    finally:
+        objective._lane_pool.close()
+
+    assert residuals.shape == (4,)
+    assert np.all(np.isfinite(residuals))
+    np.testing.assert_allclose(residuals, expected)
+    assert len(set(objective._lane_pool._kindred_process_worker_pids())) > 1
 
 
-def test_global_fit_objective_serializes_lsoda_lanes_without_penalty_residuals(monkeypatch) -> None:
+def test_global_fit_objective_process_lsoda_lanes_without_penalty_residuals() -> None:
     from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-    import kindred.core.fitting_evaluation as fitting_evaluation
     from kindred.core.objective import ObjectiveContext
-    from kindred.core.simulator.solvers import SimulationOutput
 
     mechanism_text = "\n".join(
         [
@@ -654,43 +659,6 @@ def test_global_fit_objective_serializes_lsoda_lanes_without_penalty_residuals(m
         atol=1e-12,
         initial_prefix="init:",
     )
-    state = {
-        "lock": threading.Lock(),
-        "active": 0,
-        "max_active": 0,
-        "starts": 0,
-        "first_entered": threading.Event(),
-        "second_entered": threading.Event(),
-        "release_first": threading.Event(),
-    }
-
-    def fake_solve_request(request):
-        with state["lock"]:
-            state["starts"] += 1
-            call_index = int(state["starts"])
-            state["active"] += 1
-            state["max_active"] = max(state["max_active"], state["active"])
-            if call_index == 1:
-                state["first_entered"].set()
-            elif call_index == 2:
-                state["second_entered"].set()
-            if state["active"] > 1:
-                raise RuntimeError("lsoda concurrency sentinel")
-        try:
-            if call_index == 1:
-                state["release_first"].wait(timeout=2.0)
-            t = np.linspace(float(request.t_span[0]), float(request.t_span[1]), 2)
-            y0 = np.asarray(request.y0, dtype=float).reshape(-1)
-            return SimulationOutput(
-                t=t,
-                Y=np.vstack([np.full_like(t, y0[0]), np.full_like(t, y0[1])]),
-                provenance={},
-            )
-        finally:
-            with state["lock"]:
-                state["active"] -= 1
-
-    monkeypatch.setattr(fitting_evaluation, "_solve_request", fake_solve_request)
 
     payloads = [_payload("ds1", [0.0, 0.0]), _payload("ds2", [0.0, 0.0])]
     layout = _build_parameter_layout(
@@ -713,29 +681,34 @@ def test_global_fit_objective_serializes_lsoda_lanes_without_penalty_residuals(m
         progress_callback=None,
         cancellation_check=None,
     )
-    result_box = {}
+    class _InProcessSerialFittingEvaluator(SerialFittingEvaluator):
+        pass
 
-    def _run_objective():
-        try:
-            result_box["residuals"] = objective(layout.x0.copy())
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(target=_run_objective)
-    thread.start()
-    assert state["first_entered"].wait(timeout=2.0)
-    assert not state["second_entered"].wait(timeout=0.1)
-    state["release_first"].set()
-    thread.join(timeout=2.0)
-
-    assert not thread.is_alive()
-    assert "error" not in result_box
-    assert state["max_active"] == 1
-    assert ctx.last_error is None
-    np.testing.assert_allclose(
-        result_box["residuals"],
-        np.asarray([1.0, 1.0, 10.0, 10.0], dtype=float),
+    reference = _GlobalFitObjective(
+        fit_evaluator=_InProcessSerialFittingEvaluator(context),
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        weights={"ds1": 1.0, "ds2": 1.0},
+        layout=layout,
+        penalty_value=1e6,
+        ctx=ObjectiveContext(),
+        progress_callback=None,
+        cancellation_check=None,
     )
+    expected = reference(layout.x0.copy())
+
+    try:
+        residuals = objective(layout.x0.copy())
+    finally:
+        objective._lane_pool.close()
+
+    assert ctx.last_error is None
+    assert residuals.shape == (4,)
+    assert np.all(np.isfinite(residuals))
+    assert not np.allclose(residuals, np.full(4, 1e6, dtype=float))
+    np.testing.assert_allclose(residuals, expected)
+    assert len(set(objective._lane_pool._kindred_process_worker_pids())) > 1
 
 
 def test_global_fit_objective_parallel_fatal_lane_raises_original_error() -> None:
@@ -1344,50 +1317,22 @@ def test_fit_global_least_squares_uses_parallel_dataset_lanes(monkeypatch) -> No
     np.testing.assert_allclose(result.residual_series["ds2"]["A"], np.asarray([10.0, 10.0]))
 
 
-def test_fit_global_reuses_warmed_bounded_serial_lanes_across_fit_run(monkeypatch) -> None:
+def test_fit_global_reuses_warmed_bounded_process_lanes_across_fit_run(monkeypatch) -> None:
     from kindred.core.analysis import global_fitting
-    import kindred.core.fitting_evaluation as fitting_evaluation
     import kindred.core.fitting_optimization as fitting_optimization
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-    from kindred.core.simulator.solvers import SimulationOutput
 
     state = {
-        "phase": "setup",
         "objective_calls": 0,
-        "prepare_counts": {},
-        "lock": threading.Lock(),
     }
+    captured = {}
     original_assemble = global_fitting._assemble_global_fit_result
-    original_prepare = fitting_evaluation.prepare_simulation_worker_run
-
-    def counting_prepare(*args, **kwargs):
-        with state["lock"]:
-            phase = str(state["phase"])
-            state["prepare_counts"][phase] = int(state["prepare_counts"].get(phase, 0)) + 1
-        return original_prepare(*args, **kwargs)
-
-    def fake_solve_request(request):
-        t = np.linspace(
-            float(request.t_span[0]),
-            float(request.t_span[1]),
-            int((request.grid or {}).get("N") or 2),
-            dtype=float,
-        )
-        y0 = np.asarray(request.y0, dtype=float).reshape(-1)
-        return SimulationOutput(
-            t=t,
-            Y=np.tile(y0.reshape(-1, 1), (1, t.size)),
-            provenance={},
-        )
 
     def fake_least_squares(fun, x0, **kwargs):
-        state["phase"] = "objective_call_1"
         first_residuals = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
         state["objective_calls"] += 1
-        state["phase"] = "objective_call_2"
         second_residuals = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
         state["objective_calls"] += 1
-        state["phase"] = "optimal_residual_recheck"
         return SimpleNamespace(
             x=np.asarray(x0, dtype=float),
             success=True,
@@ -1401,11 +1346,9 @@ def test_fit_global_reuses_warmed_bounded_serial_lanes_across_fit_run(monkeypatc
         raise AssertionError("DE should not be used for this test")
 
     def counting_assemble(*args, **kwargs):
-        state["phase"] = "final_assembly"
+        captured["lane_pool"] = kwargs["lane_pool"]
         return original_assemble(*args, **kwargs)
 
-    monkeypatch.setattr(fitting_evaluation, "prepare_simulation_worker_run", counting_prepare)
-    monkeypatch.setattr(fitting_evaluation, "_solve_request", fake_solve_request)
     monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
     monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", counting_assemble)
 
@@ -1441,9 +1384,10 @@ def test_fit_global_reuses_warmed_bounded_serial_lanes_across_fit_run(monkeypatc
 
     assert result.success is True
     assert state["objective_calls"] == 2
-    assert state["prepare_counts"] == {
-        "objective_call_1": int(global_fitting._MAX_PARALLEL_DATASET_LANES)
-    }
+    slot_stats = captured["lane_pool"]._kindred_process_slot_stats()
+    assert len(slot_stats) == int(global_fitting._MAX_PARALLEL_DATASET_LANES)
+    assert all(int(stats["cold_starts"]) == 1 for stats in slot_stats.values())
+    assert all(int(stats["eval_count"]) > int(stats["cold_starts"]) for stats in slot_stats.values())
 
 
 def test_fit_global_de_uses_same_parallel_objective_without_de_workers(monkeypatch) -> None:
@@ -1487,6 +1431,122 @@ def test_fit_global_de_uses_same_parallel_objective_without_de_workers(monkeypat
     np.testing.assert_allclose(result.model_series["ds2"]["A"], np.asarray([10.0, 10.0]))
     np.testing.assert_allclose(result.residual_series["ds1"]["A"], np.asarray([1.0, 1.0]))
     np.testing.assert_allclose(result.residual_series["ds2"]["A"], np.asarray([10.0, 10.0]))
+
+
+def test_fit_global_de_restarts_process_lanes_after_fatal_penalty(monkeypatch) -> None:
+    from concurrent.futures import Future
+
+    from kindred.core.analysis import global_fitting
+    import kindred.core.fitting_optimization as fitting_optimization
+
+    created_pools = []
+    captured = {}
+
+    class _ScriptedProcessPool:
+        def __init__(self, _payload, *, max_lanes):
+            self.max_lanes = int(max_lanes)
+            self.closed = False
+            self.shutdown_calls = []
+            self.recorded_payloads = []
+            self.generation = len(created_pools) + 1
+            created_pools.append(self)
+
+        def submit(self, slot, task):
+            future = Future()
+            if self.generation == 1:
+                future.set_result(
+                    {
+                        "ok": False,
+                        "index": int(task["index"]),
+                        "dataset_id": str(task["dataset_id"]),
+                        "slot": int(slot),
+                        "worker_pid": 20000 + int(slot),
+                        "cold_start": True,
+                        "prepare_count": 1,
+                        "eval_count": 1,
+                        "error": {
+                            "kind": "fit_simulation",
+                            "message": "fatal de probe failure",
+                            "failed_params": {},
+                            "details": {"fatal": True},
+                            "context": None,
+                            "error_provenance": {"dataset": str(task["dataset_id"])},
+                            "final_error_message": "fatal de probe failure",
+                        },
+                    }
+                )
+                return future
+
+            value = float(dict(task["full_params"]).get("init:A", 0.0))
+            future.set_result(
+                {
+                    "ok": True,
+                    "index": int(task["index"]),
+                    "dataset_id": str(task["dataset_id"]),
+                    "slot": int(slot),
+                    "worker_pid": 20000 + self.generation * 10 + int(slot),
+                    "sim_time": np.linspace(0.0, 0.1, 3),
+                    "sim_species": {"A": np.full(3, value, dtype=float)},
+                    "cold_start": self.generation == 2,
+                    "prepare_count": 1,
+                    "eval_count": 1,
+                }
+            )
+            return future
+
+        def record_result(self, payload):
+            self.recorded_payloads.append(dict(payload))
+
+        def worker_pids(self):
+            return tuple(sorted({int(payload["worker_pid"]) for payload in self.recorded_payloads}))
+
+        def slot_stats(self):
+            return {
+                int(payload["slot"]): {
+                    "pid": int(payload["worker_pid"]),
+                    "cold_starts": int(payload.get("prepare_count") or 0),
+                    "eval_count": int(payload.get("eval_count") or 0),
+                }
+                for payload in self.recorded_payloads
+            }
+
+        def shutdown(self, *, wait=True, cancel_futures=True, terminate=False):
+            self.closed = True
+            self.shutdown_calls.append((wait, cancel_futures, terminate))
+
+    def fake_least_squares(*_args, **_kwargs):
+        raise AssertionError("least_squares should not be used for this test")
+
+    def fake_de(func, bounds, **kwargs):
+        captured["workers"] = kwargs.get("workers")
+        x = np.asarray([(float(lo) + float(hi)) / 2.0 for lo, hi in bounds], dtype=float)
+        first = float(func(x))
+        second = float(func(x))
+        captured["de_values"] = (first, second)
+        return SimpleNamespace(x=x, success=True, message="ok", nfev=2)
+
+    monkeypatch.setattr(global_fitting, "ProcessBackedFittingEvaluatorLanePool", _ScriptedProcessPool)
+    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
+
+    result = global_fitting.fit_global(
+        _build_process_lane_serial_evaluator(),
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+            {"id": "ds2", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+        ],
+        {"k1": 0.2},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        bounds={"k1": (0.1, 1.0)},
+        method="de",
+        max_nfev=2,
+    )
+
+    assert result.success is True
+    assert captured["workers"] == 1
+    assert captured["de_values"][0] > captured["de_values"][1]
+    assert len(created_pools) == 2
+    assert created_pools[0].shutdown_calls == [(False, True, True)]
+    assert created_pools[1].shutdown_calls[-1] == (True, True, False)
 
 
 def test_fit_global_evaluate_series_only_evaluator_stays_serial_for_public_surface(monkeypatch) -> None:
@@ -1670,3 +1730,581 @@ def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatc
         np.testing.assert_allclose(result.residual_series[dataset_id]["A"], np.full(2, 1e6, dtype=float))
         np.testing.assert_allclose(dataset_info_by_id[dataset_id].residuals, np.full(2, 1e6, dtype=float))
         assert dataset_info_by_id[dataset_id].n_points == 2
+
+
+def _build_process_lane_serial_evaluator():
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k1"],
+        t_end=0.1,
+        num_points=3,
+        solver="Radau",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    return SerialFittingEvaluator(context)
+
+
+def test_serial_fitting_process_dataset_evaluation_matches_serial_seam() -> None:
+    from kindred.core.analysis import global_fitting
+
+    evaluator = _build_process_lane_serial_evaluator()
+    payloads = global_fitting._build_dataset_payloads(
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+            {"id": "ds2", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+        ]
+    )
+    items = [
+        global_fitting._ObjectiveDatasetInput(
+            index=index,
+            payload=payload,
+            full_params={"k1": 0.2, "init:A": float(index + 1)},
+            parameter_origins={},
+            failed_param_snapshot={"k1": 0.2, f"{payload.dataset_id}::init:A": float(index + 1)},
+        )
+        for index, payload in enumerate(payloads)
+    ]
+
+    serial = global_fitting._evaluate_dataset_simulations_serial(
+        evaluator,
+        items,
+        cancellation_check=None,
+        stop_on_fatal=True,
+    )
+    lane_pool = global_fitting._DatasetEvaluatorLanePool(evaluator)
+    try:
+        process_backed = global_fitting._evaluate_dataset_simulations(
+            evaluator,
+            items,
+            cancellation_check=None,
+            lane_pool=lane_pool,
+        )
+    finally:
+        lane_pool.close()
+
+    assert len(process_backed) == len(serial)
+    assert len(set(lane_pool._kindred_process_worker_pids())) > 1
+    for actual, expected in zip(process_backed, serial):
+        assert actual.index == expected.index
+        assert actual.error is None
+        assert expected.error is None
+        np.testing.assert_allclose(actual.sim_time, expected.sim_time)
+        assert set(actual.sim_species) == set(expected.sim_species)
+        for name in expected.sim_species:
+            np.testing.assert_allclose(actual.sim_species[name], expected.sim_species[name])
+
+
+def test_fit_global_serial_evaluator_process_lanes_use_child_pids_and_reuse_warm_slots(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    import kindred.core.fitting_optimization as fitting_optimization
+
+    captured = {}
+    original_assemble = global_fitting._assemble_global_fit_result
+
+    def fake_least_squares(fun, x0, **kwargs):
+        first = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
+        second = np.asarray(fun(np.asarray(x0, dtype=float)), dtype=float).reshape(-1)
+        return SimpleNamespace(
+            x=np.asarray(x0, dtype=float),
+            success=True,
+            message="ok",
+            nfev=2,
+            fun=second,
+            jac=np.eye(len(first), len(np.asarray(x0, dtype=float))),
+        )
+
+    def fake_de(*_args, **_kwargs):
+        raise AssertionError("DE should not be used for this test")
+
+    def capture_assemble(*args, **kwargs):
+        captured["lane_pool"] = kwargs["lane_pool"]
+        return original_assemble(*args, **kwargs)
+
+    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
+    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", capture_assemble)
+
+    lane_cap = int(global_fitting._MAX_PARALLEL_DATASET_LANES)
+    dataset_count = lane_cap + 2
+    result = global_fitting.fit_global(
+        _build_process_lane_serial_evaluator(),
+        [
+            {"id": f"ds{i}", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)}
+            for i in range(1, dataset_count + 1)
+        ],
+        {"k1": 0.2},
+        dataset_params={f"ds{i}": {"init:A": float(i)} for i in range(1, dataset_count + 1)},
+        method="trf",
+        max_nfev=2,
+    )
+
+    lane_pool = captured["lane_pool"]
+    process_pids = set(lane_pool._kindred_process_worker_pids())
+    slot_stats = lane_pool._kindred_process_slot_stats()
+
+    assert result.success is True
+    assert len(process_pids) > 1
+    assert len(slot_stats) == lane_cap
+    assert {int(slot) for slot in slot_stats} == set(range(lane_cap))
+    assert sum(int(stats["cold_starts"]) for stats in slot_stats.values()) == lane_cap
+    assert all(int(stats["cold_starts"]) == 1 for stats in slot_stats.values())
+    assert all(int(stats["eval_count"]) > int(stats["cold_starts"]) for stats in slot_stats.values())
+
+
+def test_fit_global_closes_lane_pool_when_post_optimizer_reconstruction_overflows(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    lane_pools = []
+
+    class _FakeLanePool:
+        def __init__(self, _fit_evaluator) -> None:
+            self.close_calls = []
+            lane_pools.append(self)
+
+        def close(self, *, wait=True, cancel_futures=True, terminate=False) -> None:
+            self.close_calls.append((wait, cancel_futures, terminate))
+
+    def fake_fit_parameters(*_args, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters={"k1": 10000.0},
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(1),
+            nfev=1,
+            message="extreme optimum",
+            covariance=None,
+        )
+
+    def evaluator(_params):
+        return {"t": np.array([0.0]), "species": {"A": np.array([1.0])}}
+
+    monkeypatch.setattr(global_fitting, "_DatasetEvaluatorLanePool", _FakeLanePool)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    with pytest.raises(OverflowError):
+        global_fitting.fit_global(
+            evaluator,
+            [{"id": "ds1", "t": np.array([0.0]), "species": "A", "y": np.array([1.0])}],
+            {"k1": 1.0},
+            bounds={"k1": (1e-9, 1e9)},
+            log10_params={"k1": True},
+            method="trf",
+            max_nfev=1,
+        )
+
+    assert len(lane_pools) == 1
+    assert lane_pools[0].close_calls == [(True, True, False)]
+
+
+def test_fit_global_process_submit_failure_aborts_batch_before_outer_close(monkeypatch) -> None:
+    from concurrent.futures import Future
+
+    from kindred.core.analysis import global_fitting
+
+    lane_pools = []
+
+    class _FakeProcessPool:
+        max_lanes = 2
+
+        def __init__(self) -> None:
+            self.pending_future = Future()
+            self.shutdown_calls = []
+            self.submit_calls = 0
+
+        def submit(self, slot, task):
+            self.submit_calls += 1
+            if self.submit_calls == 1:
+                return self.pending_future
+            raise RuntimeError("submit boom")
+
+        def shutdown(self, *, wait, cancel_futures, terminate):
+            self.shutdown_calls.append((wait, cancel_futures, terminate))
+
+    class _FakeLanePool:
+        def __init__(self, _fit_evaluator) -> None:
+            self._process_pool = _FakeProcessPool()
+            self.close_calls = []
+            lane_pools.append(self)
+
+        def process_pool(self):
+            return self._process_pool
+
+        def close(self, *, wait=True, cancel_futures=True, terminate=False) -> None:
+            assert self._process_pool.shutdown_calls[:1] == [(False, True, True)]
+            self.close_calls.append((wait, cancel_futures, terminate))
+            self._process_pool.shutdown(wait=wait, cancel_futures=cancel_futures, terminate=terminate)
+
+    def fake_fit_parameters(objective_func, initial_params, **_kwargs):
+        objective_func(np.asarray([1.0], dtype=float))
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(global_fitting, "_DatasetEvaluatorLanePool", _FakeLanePool)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        lambda _params: {"t": np.array([0.0]), "species": {"A": np.array([1.0])}},
+        [
+            {"id": "ds1", "t": np.array([0.0]), "species": "A", "y": np.array([1.0])},
+            {"id": "ds2", "t": np.array([0.0]), "species": "A", "y": np.array([1.0])},
+        ],
+        {"k1": 1.0},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.success is False
+    assert result.message == "Fitting failed: submit boom"
+    assert len(lane_pools) == 1
+    assert lane_pools[0]._process_pool.shutdown_calls[0] == (False, True, True)
+    assert lane_pools[0].close_calls == [(True, True, False)]
+
+
+def test_serial_fitting_evaluator_subclass_stays_on_in_process_path() -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
+
+    class _CustomSerialFittingEvaluator(SerialFittingEvaluator):
+        pass
+
+    base = _build_process_lane_serial_evaluator()
+    evaluator = _CustomSerialFittingEvaluator(base.context)
+    payloads = global_fitting._build_dataset_payloads(
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+            {"id": "ds2", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+        ]
+    )
+    items = [
+        global_fitting._ObjectiveDatasetInput(
+            index=index,
+            payload=payload,
+            full_params={"k1": 0.2, "init:A": float(index + 1)},
+            parameter_origins={},
+            failed_param_snapshot={"k1": 0.2, f"{payload.dataset_id}::init:A": float(index + 1)},
+        )
+        for index, payload in enumerate(payloads)
+    ]
+    lane_pool = global_fitting._DatasetEvaluatorLanePool(evaluator)
+
+    results = global_fitting._evaluate_dataset_simulations(evaluator, items, lane_pool=lane_pool)
+
+    assert fitting_process_lane_payload_from_evaluator(evaluator) is None
+    assert lane_pool._kindred_process_worker_pids() == ()
+    assert len(results) == 2
+    assert all(result.error is None for result in results)
+
+
+def test_serial_fitting_evaluator_process_export_failure_stays_on_in_process_path() -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
+
+    evaluator = _build_process_lane_serial_evaluator()
+
+    def _boom():
+        raise RuntimeError("export failed")
+
+    evaluator._kindred_process_lane_payload = _boom
+    payloads = global_fitting._build_dataset_payloads(
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+            {"id": "ds2", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+        ]
+    )
+    items = [
+        global_fitting._ObjectiveDatasetInput(
+            index=index,
+            payload=payload,
+            full_params={"k1": 0.2, "init:A": float(index + 1)},
+            parameter_origins={},
+            failed_param_snapshot={"k1": 0.2, f"{payload.dataset_id}::init:A": float(index + 1)},
+        )
+        for index, payload in enumerate(payloads)
+    ]
+    lane_pool = global_fitting._DatasetEvaluatorLanePool(evaluator)
+
+    results = global_fitting._evaluate_dataset_simulations(evaluator, items, lane_pool=lane_pool)
+
+    assert fitting_process_lane_payload_from_evaluator(evaluator) is None
+    assert lane_pool._kindred_process_worker_pids() == ()
+    assert len(results) == 2
+    assert all(result.error is None for result in results)
+
+
+def test_process_lane_shutdown_terminates_private_workers_without_public_terminate() -> None:
+    from kindred.core.fitting_process_lanes import ProcessBackedFittingEvaluatorLanePool, _ProcessLaneSlot
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+            self.join_calls = []
+
+        def is_alive(self):
+            return not self.killed
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def join(self, timeout=None):
+            self.join_calls.append(timeout)
+
+    class _FakeExecutor:
+        def __init__(self, process) -> None:
+            self._processes = {1: process}
+            self.shutdown_calls = []
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    process = _FakeProcess()
+    executor = _FakeExecutor(process)
+    pool = ProcessBackedFittingEvaluatorLanePool({}, max_lanes=1)
+    pool._slots[0] = _ProcessLaneSlot(slot=0, executor=executor)
+
+    pool.shutdown(wait=False, cancel_futures=True, terminate=True)
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.join_calls == [0.2, 0.2]
+    assert executor.shutdown_calls == [(False, True)]
+
+
+def test_process_lane_shutdown_terminates_real_running_child_process() -> None:
+    import multiprocessing as mp
+    import time
+    from concurrent.futures import ProcessPoolExecutor
+
+    from kindred.core.fitting_process_lanes import ProcessBackedFittingEvaluatorLanePool
+
+    executor = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
+    processes = []
+    try:
+        executor.submit(_sleep_for_process_termination_probe, 30.0)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            processes = list((getattr(executor, "_processes", None) or {}).values())
+            if processes and all(process.is_alive() for process in processes):
+                break
+            time.sleep(0.01)
+        assert processes
+
+        handled = ProcessBackedFittingEvaluatorLanePool._terminate_executor_workers(
+            executor,
+            cancel_futures=True,
+        )
+
+        assert handled is True
+        assert all(not process.is_alive() for process in processes)
+    finally:
+        if any(process.is_alive() for process in processes):
+            ProcessBackedFittingEvaluatorLanePool._terminate_executor_workers(
+                executor,
+                cancel_futures=True,
+            )
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_process_dataset_fatal_result_terminates_active_sibling_lanes() -> None:
+    from concurrent.futures import Future
+
+    from kindred.core.analysis import global_fitting
+
+    class _FakeProcessPool:
+        max_lanes = 2
+
+        def __init__(self) -> None:
+            self.shutdown_calls = []
+            self.recorded_payloads = []
+            self.pending_future = None
+
+        def submit(self, slot, task):
+            future = Future()
+            if int(slot) == 0:
+                future.set_result(
+                    {
+                        "ok": False,
+                        "index": int(task["index"]),
+                        "dataset_id": str(task["dataset_id"]),
+                        "slot": int(slot),
+                        "worker_pid": 12345,
+                        "cold_start": True,
+                        "prepare_count": 1,
+                        "eval_count": 1,
+                        "error": {
+                            "kind": "fit_simulation",
+                            "message": "fatal child failure",
+                            "failed_params": {},
+                            "details": {"fatal": True},
+                            "context": None,
+                            "error_provenance": {"dataset": str(task["dataset_id"])},
+                            "final_error_message": "fatal child failure",
+                        },
+                    }
+                )
+            else:
+                self.pending_future = future
+            return future
+
+        def record_result(self, payload):
+            self.recorded_payloads.append(dict(payload))
+
+        def shutdown(self, *, wait, cancel_futures, terminate):
+            self.shutdown_calls.append((wait, cancel_futures, terminate))
+            if self.pending_future is not None:
+                self.pending_future.cancel()
+
+    class _FakeLanePool:
+        def __init__(self, process_pool) -> None:
+            self._process_pool = process_pool
+
+        def process_pool(self):
+            return self._process_pool
+
+    payloads = global_fitting._build_dataset_payloads(
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+            {"id": "ds2", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+        ]
+    )
+    items = [
+        global_fitting._ObjectiveDatasetInput(
+            index=index,
+            payload=payload,
+            full_params={"k1": 0.2, "init:A": float(index + 1)},
+            parameter_origins={},
+            failed_param_snapshot={},
+        )
+        for index, payload in enumerate(payloads)
+    ]
+    process_pool = _FakeProcessPool()
+
+    results = global_fitting._evaluate_dataset_simulations_process(
+        items,
+        cancellation_check=None,
+        stop_on_fatal=True,
+        lane_pool=_FakeLanePool(process_pool),
+    )
+
+    assert len(results) == 1
+    assert global_fitting._dataset_evaluation_is_fatal(results[0])
+    assert process_pool.shutdown_calls == [(False, True, True)]
+
+
+def test_process_submit_failure_terminates_active_batch() -> None:
+    from concurrent.futures import Future
+
+    from kindred.core.analysis import global_fitting
+
+    class _FakeProcessPool:
+        max_lanes = 2
+
+        def __init__(self) -> None:
+            self.shutdown_calls = []
+            self.pending_future = Future()
+            self.submit_calls = 0
+
+        def submit(self, slot, task):
+            self.submit_calls += 1
+            if self.submit_calls == 1:
+                return self.pending_future
+            raise RuntimeError("submit boom")
+
+        def shutdown(self, *, wait, cancel_futures, terminate):
+            self.shutdown_calls.append((wait, cancel_futures, terminate))
+
+        def record_result(self, payload):
+            raise AssertionError("record_result should not be called")
+
+    class _FakeLanePool:
+        def __init__(self, process_pool) -> None:
+            self._process_pool = process_pool
+
+        def process_pool(self):
+            return self._process_pool
+
+    payloads = global_fitting._build_dataset_payloads(
+        [
+            {"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+            {"id": "ds2", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)},
+        ]
+    )
+    items = [
+        global_fitting._ObjectiveDatasetInput(
+            index=index,
+            payload=payload,
+            full_params={"k1": 0.2, "init:A": float(index + 1)},
+            parameter_origins={},
+            failed_param_snapshot={},
+        )
+        for index, payload in enumerate(payloads)
+    ]
+    process_pool = _FakeProcessPool()
+
+    with pytest.raises(RuntimeError, match="submit boom"):
+        global_fitting._evaluate_dataset_simulations_process(
+            items,
+            cancellation_check=None,
+            stop_on_fatal=True,
+            lane_pool=_FakeLanePool(process_pool),
+        )
+
+    assert process_pool.pending_future.cancelled() is True
+    assert process_pool.shutdown_calls == [(False, True, True)]
+
+
+def test_process_error_payload_preserves_error_context() -> None:
+    from kindred.core.analysis import global_fitting
+
+    payload = global_fitting._build_dataset_payloads(
+        [{"id": "ds1", "t": np.linspace(0.0, 0.1, 3), "species": "A", "y": np.zeros(3)}]
+    )[0]
+    item = global_fitting._ObjectiveDatasetInput(
+        index=0,
+        payload=payload,
+        full_params={"k1": 0.2},
+        parameter_origins={},
+        failed_param_snapshot={"k1": 0.2},
+    )
+
+    result = global_fitting._dataset_evaluation_from_process_payload(
+        {
+            "ok": False,
+            "index": 0,
+            "slot": 0,
+            "worker_pid": 12345,
+            "prepare_count": 1,
+            "eval_count": 1,
+            "error": {
+                "kind": "fit_simulation",
+                "message": "context failure",
+                "failed_params": {"k1": 0.2},
+                "details": {"fatal": True},
+                "context": {"line": 7, "col": 3, "line_text": "bad", "file_path": None, "stack_trace": None},
+                "error_provenance": {"dataset": "ds1"},
+                "final_error_message": "context failure",
+            },
+        },
+        item,
+    )
+
+    assert result.error is not None
+    assert getattr(result.error, "context", None) is not None
+    assert result.error.context.line == 7
+    assert result.error.context.col == 3
+    assert result.error.context.line_text == "bad"

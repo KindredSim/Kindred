@@ -497,6 +497,17 @@ class SerialFittingEvaluator:
             fixed_param_origins=dict(self._fixed_param_origins),
         )
 
+    def _kindred_process_lane_payload(self) -> Dict[str, Any]:
+        return {
+            "execution_request": self._context.execution_request.to_payload(),
+            "requested_param_names": list(self._context.requested_param_names),
+            "prepared_metadata": self._context.prepared_metadata.to_serializable_dict(),
+            "temperature_K": float(self._context.temperature_K),
+            "initial_prefix": str(self._context.initial_prefix),
+            "fixed_params": dict(self._fixed_params),
+            "fixed_param_origins": dict(self._fixed_param_origins),
+        }
+
     def _kindred_set_fitting_cancellation_check(self, cancellation_check) -> "SerialFittingEvaluator":
         self._cancellation_check = cancellation_check
         return self
