@@ -1,436 +1,11 @@
 from __future__ import annotations
 
+import os
 import threading
-import time
-from collections import Counter
-from types import SimpleNamespace
+from concurrent.futures import Future
 
 import numpy as np
 import pytest
-
-class _FinalPhaseFatalEvaluator:
-    def __init__(self, *, t_axis, state, lane_id=None):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._lane_id = lane_id
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            lane_id = int(self._state["clone_count"])
-            self._state["clone_count"] += 1
-            phase_counts = self._state.setdefault("phase_clone_counts", {})
-            phase = str(self._state["phase"])
-            phase_counts[phase] = int(phase_counts.get(phase, 0)) + 1
-        return type(self)(t_axis=self._t_axis, state=self._state, lane_id=lane_id)
-
-    def evaluate_series(self, params):
-        from kindred.core.exceptions import FitSimulationError
-
-        value = float(dict(params).get("init:A", 0.0))
-        if self._state["phase"] == "final":
-            with self._state["lock"]:
-                self._state.setdefault("final_values", []).append(value)
-                if self._lane_id is None:
-                    self._state.setdefault("final_base_values", []).append(value)
-                else:
-                    self._state.setdefault("final_lane_values", []).append((int(self._lane_id), value))
-        fatal_marker = float(dict(params).get("fatal_marker", 0.0))
-        if self._state["phase"] == "final" and fatal_marker > 0.5:
-            raise FitSimulationError("final fatal lane failure", details={"fatal": True})
-        return {
-            "t": self._t_axis.copy(),
-            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-        }
-
-
-class _LaneTrackingEvaluator:
-    def __init__(self, *, t_axis, state, is_lane=False):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._is_lane = bool(is_lane)
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, is_lane=True)
-
-    def evaluate_series(self, params):
-        return self.evaluate_series_with_parameter_origins(params, {})
-
-    def evaluate_series_with_parameter_origins(self, params, origins=None, *, failed_params=None):
-        if not self._is_lane:
-            with self._state["lock"]:
-                self._state["base_calls"] += 1
-            value = float(dict(params).get("init:A", 0.0))
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-
-        with self._state["lock"]:
-            self._state["active"] += 1
-            self._state["max_active"] = max(self._state["max_active"], self._state["active"])
-        try:
-            self._state["barrier"].wait(timeout=2.0)
-            value = float(dict(params).get("init:A", 0.0))
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-        finally:
-            with self._state["lock"]:
-                self._state["active"] -= 1
-
-
-class _SlotRetentionTrackingEvaluator:
-    def __init__(self, *, t_axis, state, lane_id=None):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._lane_id = lane_id
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            lane_id = int(self._state["clone_count"])
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, lane_id=lane_id)
-
-    def evaluate_series(self, params):
-        value = float(dict(params).get("init:A", 0.0))
-        barrier_by_value = self._state.get("barrier_by_value")
-        if barrier_by_value is not None:
-            barrier = barrier_by_value.get(value)
-            if barrier is not None:
-                barrier.wait(timeout=5.0)
-        with self._state["lock"]:
-            if self._lane_id is None:
-                self._state["base_calls"] += 1
-            else:
-                self._state.setdefault("lane_calls", []).append((int(self._lane_id), value))
-        return {
-            "t": self._t_axis.copy(),
-            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-        }
-
-
-class _FatalObjectiveEvaluator:
-    def __init__(self, *, t_axis, state):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state)
-
-    def evaluate_series(self, params):
-        from kindred.core.exceptions import FitSimulationError
-
-        value = float(dict(params).get("init:A", 0.0))
-        with self._state["lock"]:
-            self._state["values"].append(value)
-        if value == 10.0:
-            raise FitSimulationError("objective fatal lane failure", details={"fatal": True})
-        return {
-            "t": self._t_axis.copy(),
-            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-        }
-
-
-class _CancellableLaneTrackingEvaluator:
-    def __init__(self, *, t_axis, state, is_lane=False):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._is_lane = bool(is_lane)
-        self._cancellation_check = None
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, is_lane=True)
-
-    def _kindred_set_fitting_cancellation_check(self, cancellation_check):
-        self._cancellation_check = cancellation_check
-        return self
-
-    def evaluate_series(self, params):
-        if not self._is_lane:
-            with self._state["lock"]:
-                self._state["base_calls"] += 1
-            value = float(dict(params).get("init:A", 0.0))
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-
-        with self._state["lock"]:
-            self._state["active"] += 1
-            self._state["max_active"] = max(self._state["max_active"], self._state["active"])
-            if self._state["active"] == self._state["expected_active"]:
-                self._state["all_active"].set()
-        try:
-            self._state["release"].wait(timeout=2.0)
-            value = float(dict(params).get("init:A", 0.0))
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-        finally:
-            with self._state["lock"]:
-                self._state["active"] -= 1
-
-
-class _PauseAwareLaneTrackingEvaluator:
-    def __init__(self, *, t_axis, state, is_lane=False):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._is_lane = bool(is_lane)
-        self._cancellation_check = None
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, is_lane=True)
-
-    def _kindred_set_fitting_cancellation_check(self, cancellation_check):
-        self._cancellation_check = cancellation_check
-        return self
-
-    def evaluate_series(self, params):
-        value = float(dict(params).get("init:A", 0.0))
-        if not self._is_lane:
-            with self._state["lock"]:
-                self._state["base_calls"] += 1
-                self._state["starts"].append(value)
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-
-        with self._state["lock"]:
-            self._state["starts"].append(value)
-            self._state["active"] += 1
-            self._state["max_active"] = max(self._state["max_active"], self._state["active"])
-            if self._state["active"] == self._state["expected_active"]:
-                self._state["all_active"].set()
-        try:
-            if value <= 4.0:
-                self._state["release"].wait(timeout=2.0)
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-        finally:
-            with self._state["lock"]:
-                self._state["active"] -= 1
-
-
-class _FatalCooperativeLaneEvaluator:
-    def __init__(self, *, t_axis, state, is_lane=False):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._is_lane = bool(is_lane)
-        self._cancellation_check = None
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, is_lane=True)
-
-    def _kindred_set_fitting_cancellation_check(self, cancellation_check):
-        self._cancellation_check = cancellation_check
-        return self
-
-    def evaluate_series(self, params):
-        from kindred.core.exceptions import FitSimulationError, FittingCancelled
-
-        value = float(dict(params).get("init:A", 0.0))
-        if not self._is_lane:
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-
-        if value == 1.0:
-            self._state["fatal_entered"].set()
-            self._state["all_siblings_active"].wait(timeout=2.0)
-            raise FitSimulationError("objective fatal lane failure", details={"fatal": True})
-
-        with self._state["lock"]:
-            self._state["siblings_active"] += 1
-            if self._state["siblings_active"] == 3:
-                self._state["all_siblings_active"].set()
-        while not self._state["normal_release"].is_set():
-            if self._cancellation_check is not None and self._cancellation_check():
-                with self._state["lock"]:
-                    self._state["cooperative_stops"] += 1
-                raise FittingCancelled()
-            self._state["poll"].wait(timeout=0.001)
-        return {
-            "t": self._t_axis.copy(),
-            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-        }
-
-
-class _FatalWhilePauseCallbackBlocksEvaluator:
-    def __init__(self, *, t_axis, state, is_lane=False):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._is_lane = bool(is_lane)
-        self._cancellation_check = None
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, is_lane=True)
-
-    def _kindred_set_fitting_cancellation_check(self, cancellation_check):
-        self._cancellation_check = cancellation_check
-        return self
-
-    def evaluate_series(self, params):
-        from kindred.core.exceptions import FitSimulationError, FittingCancelled
-
-        value = float(dict(params).get("init:A", 0.0))
-        if not self._is_lane:
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-
-        if value == 1.0:
-            self._state["fatal_entered"].set()
-            self._state["siblings_ready_to_poll"].wait(timeout=2.0)
-            self._state["callback_should_block"].set()
-            self._state["allow_sibling_poll"].set()
-            time.sleep(0.05)
-            raise FitSimulationError("objective fatal lane failure", details={"fatal": True})
-
-        with self._state["lock"]:
-            self._state["siblings_ready"] += 1
-            if self._state["siblings_ready"] == 3:
-                self._state["siblings_ready_to_poll"].set()
-        self._state["allow_sibling_poll"].wait(timeout=2.0)
-        while not self._state["normal_release"].is_set():
-            if self._cancellation_check is not None and self._cancellation_check():
-                with self._state["lock"]:
-                    self._state["cooperative_stops"] += 1
-                raise FittingCancelled()
-            self._state["poll"].wait(timeout=0.001)
-        return {
-            "t": self._t_axis.copy(),
-            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-        }
-
-
-class _PauseRefillThenFatalEvaluator:
-    def __init__(self, *, t_axis, state, is_lane=False):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-        self._is_lane = bool(is_lane)
-        self._cancellation_check = None
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return type(self)(t_axis=self._t_axis, state=self._state, is_lane=True)
-
-    def _kindred_set_fitting_cancellation_check(self, cancellation_check):
-        self._cancellation_check = cancellation_check
-        return self
-
-    def evaluate_series(self, params):
-        from kindred.core.exceptions import FitSimulationError, FittingCancelled
-
-        value = float(dict(params).get("init:A", 0.0))
-        if not self._is_lane:
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-
-        with self._state["lock"]:
-            self._state["starts"].append(value)
-            if len(self._state["starts"]) == 4:
-                self._state["initial_lanes_started"].set()
-
-        if value == 1.0:
-            self._state["release_nonfatal"].wait(timeout=2.0)
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-        if value == 2.0:
-            self._state["release_fatal"].wait(timeout=2.0)
-            raise FitSimulationError("objective fatal lane failure", details={"fatal": True})
-
-        while not self._state["normal_release"].is_set():
-            if self._cancellation_check is not None and self._cancellation_check():
-                with self._state["lock"]:
-                    self._state["cooperative_stops"] += 1
-                raise FittingCancelled()
-            self._state["poll"].wait(timeout=0.001)
-        return {
-            "t": self._t_axis.copy(),
-            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-        }
-
-
-class _EvaluateOnlyNoClone:
-    def __init__(self, *, t_axis, state):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-
-    def evaluate_series(self, params):
-        with self._state["lock"]:
-            self._state["base_calls"] += 1
-            self._state["active"] += 1
-            self._state["max_active"] = max(self._state["max_active"], self._state["active"])
-        try:
-            value = float(dict(params).get("init:A", 0.0))
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-        finally:
-            with self._state["lock"]:
-                self._state["active"] -= 1
-
-
-class _SelfCloningEvaluator:
-    def __init__(self, *, t_axis, state):
-        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
-        self._state = state
-
-    def _kindred_clone_fitting_evaluator_lane(self):
-        with self._state["lock"]:
-            self._state["clone_count"] += 1
-        return self
-
-    def evaluate_series(self, params):
-        with self._state["lock"]:
-            self._state["base_calls"] += 1
-            self._state["active"] += 1
-            self._state["max_active"] = max(self._state["max_active"], self._state["active"])
-        try:
-            value = float(dict(params).get("init:A", 0.0))
-            return {
-                "t": self._t_axis.copy(),
-                "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
-            }
-        finally:
-            with self._state["lock"]:
-                self._state["active"] -= 1
-
-
-def _lane_state(parties: int = 2):
-    return {
-        "lock": threading.Lock(),
-        "barrier": threading.Barrier(parties),
-        "clone_count": 0,
-        "base_calls": 0,
-        "active": 0,
-        "max_active": 0,
-    }
 
 
 def _payload(dataset_id: str, y_values) -> object:
@@ -450,132 +25,18 @@ def _payload(dataset_id: str, y_values) -> object:
     )
 
 
-def test_dataset_lane_pool_retains_only_bounded_reusable_slot_lanes() -> None:
-    from kindred.core.analysis.global_fitting import (
-        _MAX_PARALLEL_DATASET_LANES,
-        _DatasetEvaluatorLanePool,
-        _ObjectiveDatasetInput,
-        _evaluate_dataset_simulations,
-    )
-
-    lane_cap = int(_MAX_PARALLEL_DATASET_LANES)
-    dataset_count = lane_cap * 2 + 1
-    payloads = [_payload(f"ds{i}", [0.0, 0.0]) for i in range(dataset_count)]
-    items = [
-        _ObjectiveDatasetInput(
-            index=idx,
-            payload=payload,
-            full_params={"init:A": float(idx + 1)},
-            parameter_origins={},
-            failed_param_snapshot={},
-        )
-        for idx, payload in enumerate(payloads)
-    ]
-    first_wave_barrier = threading.Barrier(lane_cap)
-    second_wave_barrier = threading.Barrier(lane_cap)
-    state = {"lock": threading.Lock(), "clone_count": 0, "base_calls": 0}
-    state["barrier_by_value"] = {
-        **{float(i + 1): first_wave_barrier for i in range(lane_cap)},
-        **{float(i + 1): second_wave_barrier for i in range(lane_cap, lane_cap * 2)},
+def _raw_dataset(dataset_id: str, y_values) -> dict[str, object]:
+    y = np.asarray(y_values, dtype=float).reshape(-1)
+    return {
+        "id": str(dataset_id),
+        "t": np.linspace(0.0, 1.0, y.size),
+        "species": "A",
+        "y": y,
     }
-    evaluator = _SlotRetentionTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state)
-    lane_pool = _DatasetEvaluatorLanePool(evaluator)
-    original_lane_for_slot = lane_pool.lane_for_slot
-    retained_lane_object_ids_by_slot = {}
-    retained_underlying_ids_by_slot = {}
-
-    def tracking_lane_for_slot(slot):
-        lane = original_lane_for_slot(slot)
-        if lane is not None:
-            slot_index = int(slot)
-            lane_object_id = id(lane)
-            underlying_id = id(getattr(lane, "_evaluator", lane))
-            retained_lane_object_ids_by_slot.setdefault(slot_index, lane_object_id)
-            retained_underlying_ids_by_slot.setdefault(slot_index, underlying_id)
-            assert retained_lane_object_ids_by_slot[slot_index] == lane_object_id
-            assert retained_underlying_ids_by_slot[slot_index] == underlying_id
-        return lane
-
-    lane_pool.lane_for_slot = tracking_lane_for_slot
-
-    results = _evaluate_dataset_simulations(evaluator, items, lane_pool=lane_pool)
-
-    assert len(results) == dataset_count
-    assert [result.index for result in results] == list(range(dataset_count))
-    assert len(lane_pool._lanes) == lane_cap
-    assert sorted(lane_pool._lanes) == list(range(lane_cap))
-    assert sorted(retained_lane_object_ids_by_slot) == list(range(lane_cap))
-    assert sorted(retained_underlying_ids_by_slot) == list(range(lane_cap))
-    retained_lane_ids = {
-        getattr(lane, "_evaluator", lane)._lane_id for lane in lane_pool._lanes.values()
-    }
-    assert len(retained_lane_ids) == lane_cap
-    assert state["clone_count"] == lane_cap
-    assert state["base_calls"] == 0
-    lane_ids_for_calls = [lane_id for lane_id, _value in state["lane_calls"]]
-    lane_call_counts = Counter(lane_ids_for_calls)
-    assert set(lane_call_counts) == retained_lane_ids
-    assert sorted(lane_call_counts.values()) == ([2] * (lane_cap - 1)) + [3]
-    called_values = sorted(value for _lane_id, value in state["lane_calls"])
-    assert called_values == [float(i + 1) for i in range(dataset_count)]
-    for result in results:
-        expected_value = float(result.index + 1)
-        np.testing.assert_allclose(result.sim_species["A"], np.full(2, expected_value, dtype=float))
 
 
-def test_dataset_lane_pool_refuses_reuse_after_close() -> None:
-    from kindred.core.analysis.global_fitting import _DatasetEvaluatorLanePool
-
-    evaluator = _LaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=_lane_state())
-    lane_pool = _DatasetEvaluatorLanePool(evaluator)
-    lane = lane_pool.lane_for_slot(0)
-
-    assert lane is not None
-
-    lane_pool.close()
-
-    with pytest.raises(RuntimeError, match="closed"):
-        lane_pool.lane_for_slot(0)
-
-
-def test_global_fit_objective_parallel_lanes_preserve_residual_order_and_isolation() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [_payload("ds1", [0.0, 0.0]), _payload("ds2", [0.0, 0.0])]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = _lane_state()
-    objective = _GlobalFitObjective(
-        fit_evaluator=_LaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        weights={"ds1": 1.0, "ds2": 1.0},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=None,
-    )
-
-    residuals = objective(layout.x0.copy())
-
-    np.testing.assert_allclose(residuals, np.asarray([1.0, 1.0, 10.0, 10.0], dtype=float))
-    assert state["clone_count"] == 2
-    assert state["base_calls"] == 0
-    assert state["max_active"] == 2
-
-
-def test_global_fit_objective_parallel_lanes_with_serial_fitting_evaluator() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-    from kindred.core.objective import ObjectiveContext
+def _serial_context(*, solver: str = "BDF", num_points: int = 6):
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
 
     mechanism_text = "\n".join(
         [
@@ -584,596 +45,501 @@ def test_global_fit_objective_parallel_lanes_with_serial_fitting_evaluator() -> 
             "initial: B=0.0",
         ]
     )
-    context = prepare_fitting_execution_context(
+    return prepare_fitting_execution_context(
         mechanism_text=mechanism_text,
         param_names=["k1"],
         t_end=1.0,
-        num_points=2,
-        solver="Radau",
+        num_points=num_points,
+        solver=solver,
         rtol=1e-6,
         atol=1e-12,
         initial_prefix="init:",
     )
 
-    payloads = [_payload("ds1", [0.0, 0.0]), _payload("ds2", [0.0, 0.0])]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
+
+def _make_serial_evaluator(*, solver: str = "BDF", num_points: int = 6):
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+
+    return SerialFittingEvaluator(_serial_context(solver=solver, num_points=num_points)).with_fixed_params({"k1": 0.2})
+
+
+def _dataset_input(index: int, dataset_id: str, init_a: float):
+    from kindred.core.analysis.global_fitting import _ObjectiveDatasetInput
+
+    return _ObjectiveDatasetInput(
+        index=int(index),
+        payload=_payload(dataset_id, [0.0, 0.0]),
+        full_params={"init:A": float(init_a)},
+        parameter_origins={},
+        failed_param_snapshot={"init:A": float(init_a)},
     )
-    objective = _GlobalFitObjective(
-        fit_evaluator=SerialFittingEvaluator(context),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        weights={"ds1": 1.0, "ds2": 1.0},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=None,
+
+
+class _EvaluateOnlyNoClone:
+    def __init__(self, *, t_axis, state):
+        self._t_axis = np.asarray(t_axis, dtype=float).reshape(-1)
+        self._state = state
+
+    def evaluate_series(self, params):
+        self._state["base_calls"] += 1
+        value = float(dict(params).get("init:A", 0.0))
+        return {
+            "t": self._t_axis.copy(),
+            "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
+        }
+
+
+def test_effective_fitting_process_workers_uses_dataset_cpu_and_cap(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+
+    monkeypatch.setattr(global_fitting.os, "cpu_count", lambda: 12)
+
+    assert global_fitting._effective_fitting_process_workers(0) == 1
+    assert global_fitting._effective_fitting_process_workers(1) == 1
+    assert global_fitting._effective_fitting_process_workers(2) == 2
+    assert global_fitting._effective_fitting_process_workers(20) == global_fitting._MAX_PARALLEL_DATASET_LANES
+
+
+def test_fitting_process_pool_worker_pids_are_spawned_processes() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    evaluator = _make_serial_evaluator()
+    items = [
+        _dataset_input(0, "ds1", 1.0),
+        _dataset_input(1, "ds2", 2.0),
+    ]
+    pool = FittingProcessPool(evaluator.to_process_payload(), max_workers=2)
+
+    try:
+        futures = [pool.submit(item) for item in items]
+        payloads = [future.result() for future in futures]
+        worker_pids = pool.worker_pids()
+    finally:
+        pool.shutdown(force_terminate=False)
+
+    assert len(worker_pids) == 2
+    assert os.getpid() not in worker_pids
+    assert {int(payload["worker_pid"]) for payload in payloads}.issubset(set(worker_pids))
+
+
+def test_fitting_process_pool_initializer_limits_blas_threads_before_prepare(monkeypatch) -> None:
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    from kindred.core.fitting_process_pool import initialize_fitting_worker
+
+    captured = {}
+    original_from_process_payload = fitting_evaluation.SerialFittingEvaluator.from_process_payload
+
+    def fake_from_process_payload(cls, payload):
+        evaluator = original_from_process_payload(payload)
+        original_ensure_prepared = evaluator._ensure_prepared
+
+        def tracking_ensure_prepared():
+            captured["omp"] = os.environ.get("OMP_NUM_THREADS")
+            captured["mkl"] = os.environ.get("MKL_NUM_THREADS")
+            captured["openblas"] = os.environ.get("OPENBLAS_NUM_THREADS")
+            return original_ensure_prepared()
+
+        evaluator._ensure_prepared = tracking_ensure_prepared
+        return evaluator
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.setenv("MKL_NUM_THREADS", "8")
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
+    monkeypatch.setattr(
+        fitting_evaluation.SerialFittingEvaluator,
+        "from_process_payload",
+        classmethod(fake_from_process_payload),
     )
+
+    initialize_fitting_worker(
+        _make_serial_evaluator(num_points=4).to_process_payload(),
+        cancel_event=None,
+        limit_blas_threads=True,
+    )
+
+    assert captured == {
+        "omp": "1",
+        "mkl": "1",
+        "openblas": "1",
+    }
+
+
+def test_initialize_fitting_worker_skips_prepare_when_cancel_is_already_set(monkeypatch) -> None:
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    from kindred.core.fitting_process_pool import initialize_fitting_worker
+
+    captured = {"prepared": False}
+    original_from_process_payload = fitting_evaluation.SerialFittingEvaluator.from_process_payload
+
+    def fake_from_process_payload(cls, payload):
+        evaluator = original_from_process_payload(payload)
+
+        def tracking_ensure_prepared():
+            captured["prepared"] = True
+            return None
+
+        evaluator._ensure_prepared = tracking_ensure_prepared
+        return evaluator
+
+    class _CancelledEvent:
+        def is_set(self):
+            return True
+
+    monkeypatch.setattr(
+        fitting_evaluation.SerialFittingEvaluator,
+        "from_process_payload",
+        classmethod(fake_from_process_payload),
+    )
+
+    initialize_fitting_worker(
+        _make_serial_evaluator(num_points=4).to_process_payload(),
+        cancel_event=_CancelledEvent(),
+        limit_blas_threads=True,
+    )
+
+    assert captured["prepared"] is False
+
+
+def test_initialize_fitting_worker_stops_prepare_when_cancel_arrives_mid_prepare(monkeypatch) -> None:
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    import kindred.core.fitting_process_pool as fitting_process_pool
+    from kindred.core.fitting_process_pool import initialize_fitting_worker
+
+    cancel_event = type(
+        "_ToggleEvent",
+        (),
+        {
+            "__init__": lambda self: setattr(self, "flag", False),
+            "is_set": lambda self: bool(self.flag),
+        },
+    )()
+    original_prepare = fitting_evaluation.prepare_simulation_worker_run
+
+    def fake_prepare_simulation_worker_run(*args, **kwargs):
+        prepared = original_prepare(*args, **kwargs)
+        cancel_event.flag = True
+        return prepared
+
+    monkeypatch.setattr(
+        fitting_evaluation,
+        "prepare_simulation_worker_run",
+        fake_prepare_simulation_worker_run,
+    )
+
+    initialize_fitting_worker(
+        _make_serial_evaluator(num_points=4).to_process_payload(),
+        cancel_event=cancel_event,
+        limit_blas_threads=True,
+    )
+
+    assert fitting_process_pool._WORKER_EVALUATOR is not None
+    assert fitting_process_pool._WORKER_EVALUATOR._prepared_run is None
+
+
+def test_fitting_process_pool_cancel_event_crosses_process_boundary() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+
+    try:
+        pool.cancel()
+        payload = pool.submit(_dataset_input(0, "ds1", 1.0)).result()
+    finally:
+        pool.shutdown(force_terminate=True)
+
+    assert payload["ok"] is False
+    assert payload["error"]["kind"] == "fitting_cancelled"
+    assert int(payload["worker_pid"]) in set(pool.worker_pids()) | {int(payload["worker_pid"])}
+
+
+def test_fitting_process_pool_shutdown_sets_cancel_event_before_executor_shutdown() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    calls = []
+
+    class _FakeEvent:
+        def set(self):
+            calls.append("event.set")
+
+    class _FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            calls.append(("executor.shutdown", bool(wait), bool(cancel_futures)))
+
+    class _FakeManager:
+        def shutdown(self):
+            calls.append("manager.shutdown")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._shutdown_in_progress = False
+    pool._startup_cancelled = False
+    pool._state_lock = threading.Lock()
+
+    pool.shutdown(force_terminate=False)
+
+    assert calls == [
+        "event.set",
+        ("executor.shutdown", True, True),
+        "manager.shutdown",
+    ]
+
+
+def test_fitting_process_pool_shutdown_cleans_partial_construction_even_when_closed() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    calls = []
+
+    class _FakeEvent:
+        def set(self):
+            calls.append("event.set")
+
+    class _FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            calls.append(("executor.shutdown", bool(wait), bool(cancel_futures)))
+
+    class _FakeManager:
+        def shutdown(self):
+            calls.append("manager.shutdown")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = True
+    pool._prewarm_in_progress = False
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+
+    pool.shutdown(force_terminate=True)
+
+    assert calls == [
+        "event.set",
+        ("executor.shutdown", False, True),
+        "manager.shutdown",
+    ]
+
+
+def test_fitting_process_pool_submit_holds_lock_during_executor_submit() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, run_fitting_evaluation_task
+
+    class _RecordingLock:
+        def __init__(self):
+            self.held = False
+
+        def __enter__(self):
+            assert self.held is False
+            self.held = True
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.held = False
+            return False
+
+    lock = _RecordingLock()
+
+    class _FakeExecutor:
+        def submit(self, fn, item):
+            assert lock.held is True
+            assert fn is run_fitting_evaluation_task
+            future = Future()
+            future.set_result(item)
+            return future
+
+    pool = object.__new__(FittingProcessPool)
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._shutdown_in_progress = False
+    pool._startup_cancelled = False
+    pool._executor = _FakeExecutor()
+    pool._state_lock = lock
+
+    future = pool.submit("payload")
+
+    assert future.result() == "payload"
+    assert lock.held is False
+
+
+def test_fitting_process_pool_prewarm_polls_startup_cancel() -> None:
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    import pytest
+
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeEvent:
+        def __init__(self):
+            self.set_calls = 0
+
+        def set(self):
+            self.set_calls += 1
+
+    pool = object.__new__(FittingProcessPool)
+    pool._max_workers = 1
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._shutdown_in_progress = False
+    pool._startup_cancelled = False
+    pool._state_lock = threading.Lock()
+    pool._cancel_event = _FakeEvent()
+
+    class _FakeFuture:
+        def __init__(self):
+            self.calls = 0
+
+        def result(self, *, timeout):
+            self.calls += 1
+            pool.cancel()
+            raise FutureTimeoutError()
+
+    future = _FakeFuture()
+
+    class _FakeExecutor:
+        def submit(self, _fn):
+            return future
+
+    pool._executor = _FakeExecutor()
+
+    with pytest.raises(FittingCancelled):
+        pool._prewarm()
+
+    assert future.calls == 1
+    assert pool._cancel_event.set_calls == 1
+
+
+def test_fitting_process_pool_submit_raises_fitting_cancelled_after_shutdown_starts() -> None:
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeExecutor:
+        def submit(self, _fn, _item):
+            raise AssertionError("executor.submit should not run after shutdown has started")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._closed = False
+    pool._executor = _FakeExecutor()
+    pool._prewarm_in_progress = False
+    pool._shutdown_in_progress = True
+    pool._startup_cancelled = False
+    pool._state_lock = threading.Lock()
+
+    with pytest.raises(FittingCancelled):
+        pool.submit("payload")
+
+
+def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    calls = []
+
+    class _FakeEvent:
+        def __init__(self):
+            self.set_calls = 0
+
+        def set(self):
+            self.set_calls += 1
+            calls.append("event.set")
+
+    executor = object()
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = executor
+    pool._manager = None
+    pool._closed = False
+    pool._prewarm_in_progress = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        FittingProcessPool,
+        "_terminate_processes_best_effort",
+        lambda self, target: calls.append(("terminate", target is executor)),
+    )
+
+    pool.cancel()
+
+    assert calls == [
+        "event.set",
+        ("terminate", True),
+    ]
+    assert pool._startup_cancelled is True
+
+
+def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_is_in_progress(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    calls = []
+
+    class _FakeEvent:
+        def set(self):
+            calls.append("event.set")
+
+    class _FakeExecutor:
+        pass
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = None
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        FittingProcessPool,
+        "_terminate_processes_best_effort",
+        lambda self, executor: calls.append(("terminate", executor is pool._executor)),
+    )
+
+    pool.shutdown(force_terminate=True)
+
+    assert calls == [
+        "event.set",
+        ("terminate", True),
+    ]
+
+
+def test_fitting_process_pool_publishes_handle_before_prewarm(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    published = {}
+    original_prewarm = FittingProcessPool._prewarm
+
+    def tracking_prewarm(self):
+        assert published["pool"] is self
+        return original_prewarm(self)
+
+    monkeypatch.setattr(FittingProcessPool, "_prewarm", tracking_prewarm)
+
+    pool = FittingProcessPool(
+        _make_serial_evaluator().to_process_payload(),
+        max_workers=1,
+        publish_callback=lambda process_pool: published.setdefault("pool", process_pool),
+    )
+
+    try:
+        assert published["pool"] is pool
+    finally:
+        pool.shutdown(force_terminate=False)
+
+
+def test_global_fit_objective_process_pool_matches_serial_reference() -> None:
+    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_process_pool import FittingProcessPool
+    from kindred.core.objective import ObjectiveContext
+
     class _InProcessSerialFittingEvaluator(SerialFittingEvaluator):
         pass
 
-    reference = _GlobalFitObjective(
-        fit_evaluator=_InProcessSerialFittingEvaluator(context),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        weights={"ds1": 1.0, "ds2": 1.0},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=None,
-    )
-    expected = reference(layout.x0.copy())
-
-    try:
-        residuals = objective(layout.x0.copy())
-    finally:
-        objective._lane_pool.close()
-
-    assert residuals.shape == (4,)
-    assert np.all(np.isfinite(residuals))
-    np.testing.assert_allclose(residuals, expected)
-
-
-def test_global_fit_objective_parallel_fatal_lane_raises_original_error() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-        _payload("ds5", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {"lock": threading.Lock(), "clone_count": 0, "values": []}
-    objective = _GlobalFitObjective(
-        fit_evaluator=_FatalObjectiveEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={
-            "ds1": {"init:A": 1.0},
-            "ds2": {"init:A": 10.0},
-            "ds3": {"init:A": 3.0},
-            "ds4": {"init:A": 4.0},
-            "ds5": {"init:A": 5.0},
-        },
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=None,
-    )
-
-    with pytest.raises(FitSimulationError, match="objective fatal lane failure"):
-        objective(layout.x0.copy())
-
-    assert state["clone_count"] >= 2
-    assert 10.0 in state["values"]
-
-
-def test_global_fit_objective_cancel_signals_bounded_active_lane_set() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.exceptions import FittingCancelled
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-        _payload("ds5", [0.0, 0.0]),
-        _payload("ds6", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {
-        "lock": threading.Lock(),
-        "clone_count": 0,
-        "base_calls": 0,
-        "active": 0,
-        "max_active": 0,
-        "expected_active": 4,
-        "all_active": threading.Event(),
-        "release": threading.Event(),
-    }
-    cancelled = {"value": False}
-    progress_calls = []
-    result_box = {}
-
-    objective = _GlobalFitObjective(
-        fit_evaluator=_CancellableLaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={
-            "ds1": {"init:A": 1.0},
-            "ds2": {"init:A": 2.0},
-            "ds3": {"init:A": 3.0},
-            "ds4": {"init:A": 4.0},
-            "ds5": {"init:A": 5.0},
-            "ds6": {"init:A": 6.0},
-        },
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=lambda *args: progress_calls.append(args),
-        cancellation_check=lambda: bool(cancelled["value"]),
-    )
-
-    def _run_objective():
-        try:
-            result_box["residuals"] = objective(layout.x0.copy())
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(target=_run_objective)
-    thread.start()
-    assert state["all_active"].wait(timeout=2.0)
-
-    cancelled["value"] = True
-    state["release"].set()
-    thread.join(timeout=2.0)
-
-    assert not thread.is_alive()
-    assert isinstance(result_box.get("error"), FittingCancelled)
-    assert "residuals" not in result_box
-    assert progress_calls == []
-    assert state["max_active"] == 4
-    assert state["clone_count"] == 4
-
-
-def test_global_fit_objective_pause_blocks_new_lane_submission_until_resume() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-        _payload("ds5", [0.0, 0.0]),
-        _payload("ds6", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {
-        "lock": threading.Lock(),
-        "starts": [],
-        "clone_count": 0,
-        "base_calls": 0,
-        "active": 0,
-        "max_active": 0,
-        "expected_active": 4,
-        "all_active": threading.Event(),
-        "release": threading.Event(),
-    }
-    pause = {"value": False}
-    resumed = threading.Event()
-    resumed.set()
-
-    def cancellation_check():
-        return False
-
-    cancellation_check._kindred_nonblocking_cancelled = lambda: False
-    cancellation_check._kindred_nonblocking_paused = lambda: bool(pause["value"])
-    cancellation_check._kindred_wait_for_resume = lambda timeout: resumed.wait(timeout=timeout)
-
-    objective = _GlobalFitObjective(
-        fit_evaluator=_PauseAwareLaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={f"ds{i}": {"init:A": float(i)} for i in range(1, 7)},
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=cancellation_check,
-    )
-    result_box = {}
-
-    def _run_objective():
-        try:
-            result_box["residuals"] = objective(layout.x0.copy())
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(target=_run_objective)
-    thread.start()
-    assert state["all_active"].wait(timeout=2.0)
-
-    pause["value"] = True
-    resumed.clear()
-    state["release"].set()
-    assert not resumed.wait(timeout=0.1)
-
-    with state["lock"]:
-        starts_while_paused = list(state["starts"])
-    assert starts_while_paused == [1.0, 2.0, 3.0, 4.0]
-    assert thread.is_alive()
-
-    pause["value"] = False
-    resumed.set()
-    thread.join(timeout=2.0)
-
-    assert not thread.is_alive()
-    assert "error" not in result_box
-    with state["lock"]:
-        assert sorted(state["starts"]) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    np.testing.assert_allclose(
-        result_box["residuals"],
-        np.asarray([1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0], dtype=float),
-    )
-
-
-def test_global_fit_objective_fatal_lane_cooperatively_stops_active_siblings() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {
-        "lock": threading.Lock(),
-        "clone_count": 0,
-        "siblings_active": 0,
-        "cooperative_stops": 0,
-        "fatal_entered": threading.Event(),
-        "all_siblings_active": threading.Event(),
-        "normal_release": threading.Event(),
-        "poll": threading.Event(),
-    }
-
-    def cancellation_check():
-        return False
-
-    objective = _GlobalFitObjective(
-        fit_evaluator=_FatalCooperativeLaneEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={f"ds{i}": {"init:A": float(i)} for i in range(1, 5)},
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=cancellation_check,
-    )
-    result_box = {}
-
-    def _run_objective():
-        try:
-            result_box["residuals"] = objective(layout.x0.copy())
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(target=_run_objective)
-    thread.start()
-    assert state["fatal_entered"].wait(timeout=2.0)
-    assert state["all_siblings_active"].wait(timeout=2.0)
-    thread.join(timeout=0.5)
-
-    if thread.is_alive():
-        state["normal_release"].set()
-        state["poll"].set()
-        thread.join(timeout=2.0)
-
-    assert not thread.is_alive()
-    assert isinstance(result_box.get("error"), FitSimulationError)
-    assert "objective fatal lane failure" in str(result_box["error"])
-    assert "residuals" not in result_box
-    assert state["normal_release"].is_set() is False
-    assert state["cooperative_stops"] == 3
-
-
-def test_global_fit_objective_fatal_lane_stops_siblings_blocked_by_pause_callback() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {
-        "lock": threading.Lock(),
-        "clone_count": 0,
-        "siblings_ready": 0,
-        "cooperative_stops": 0,
-        "fatal_entered": threading.Event(),
-        "siblings_ready_to_poll": threading.Event(),
-        "allow_sibling_poll": threading.Event(),
-        "callback_should_block": threading.Event(),
-        "normal_release": threading.Event(),
-        "poll": threading.Event(),
-        "pause_gate": threading.Event(),
-        "blocking_callback_calls": 0,
-        "blocking_callback_waits": 0,
-    }
-
-    def blocking_pause_callback():
-        with state["lock"]:
-            state["blocking_callback_calls"] += 1
-            should_block = state["callback_should_block"].is_set()
-            if should_block:
-                state["blocking_callback_waits"] += 1
-        if should_block:
-            state["pause_gate"].wait(timeout=2.0)
-        return False
-
-    blocking_pause_callback._kindred_nonblocking_cancelled = lambda: False
-    blocking_pause_callback._kindred_nonblocking_paused = lambda: False
-
-    objective = _GlobalFitObjective(
-        fit_evaluator=_FatalWhilePauseCallbackBlocksEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={f"ds{i}": {"init:A": float(i)} for i in range(1, 5)},
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=blocking_pause_callback,
-    )
-    result_box = {}
-
-    def _run_objective():
-        try:
-            result_box["residuals"] = objective(layout.x0.copy())
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(target=_run_objective)
-    thread.start()
-    assert state["fatal_entered"].wait(timeout=2.0)
-    assert state["siblings_ready_to_poll"].wait(timeout=2.0)
-    thread.join(timeout=0.5)
-
-    finished_before_resume = not thread.is_alive()
-    if thread.is_alive():
-        state["pause_gate"].set()
-        state["normal_release"].set()
-        state["poll"].set()
-        thread.join(timeout=2.0)
-
-    assert finished_before_resume
-    assert not thread.is_alive()
-    assert isinstance(result_box.get("error"), FitSimulationError)
-    assert "objective fatal lane failure" in str(result_box["error"])
-    assert "residuals" not in result_box
-    assert state["normal_release"].is_set() is False
-    assert state["blocking_callback_waits"] == 0
-    assert state["cooperative_stops"] == 3
-
-
-def test_global_fit_objective_fatal_lane_wins_over_paused_refill_wait() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-        _payload("ds5", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {
-        "lock": threading.Lock(),
-        "clone_count": 0,
-        "starts": [],
-        "cooperative_stops": 0,
-        "initial_lanes_started": threading.Event(),
-        "release_nonfatal": threading.Event(),
-        "release_fatal": threading.Event(),
-        "normal_release": threading.Event(),
-        "poll": threading.Event(),
-    }
-    pause = {"value": False}
-    resumed = threading.Event()
-    resumed.set()
-
-    def cancellation_check():
-        return False
-
-    cancellation_check._kindred_nonblocking_cancelled = lambda: False
-    cancellation_check._kindred_nonblocking_paused = lambda: bool(pause["value"])
-    cancellation_check._kindred_wait_for_resume = lambda timeout: resumed.wait(timeout=timeout)
-
-    objective = _GlobalFitObjective(
-        fit_evaluator=_PauseRefillThenFatalEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={f"ds{i}": {"init:A": float(i)} for i in range(1, 6)},
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=cancellation_check,
-    )
-    result_box = {}
-
-    def _run_objective():
-        try:
-            result_box["residuals"] = objective(layout.x0.copy())
-        except BaseException as exc:
-            result_box["error"] = exc
-
-    thread = threading.Thread(target=_run_objective)
-    thread.start()
-    assert state["initial_lanes_started"].wait(timeout=2.0)
-
-    pause["value"] = True
-    resumed.clear()
-    state["release_nonfatal"].set()
-    time.sleep(0.05)
-    with state["lock"]:
-        starts_while_paused = list(state["starts"])
-    assert starts_while_paused == [1.0, 2.0, 3.0, 4.0]
-
-    state["release_fatal"].set()
-    thread.join(timeout=0.5)
-    finished_before_resume = not thread.is_alive()
-    if thread.is_alive():
-        pause["value"] = False
-        resumed.set()
-        state["normal_release"].set()
-        state["poll"].set()
-        thread.join(timeout=2.0)
-
-    assert finished_before_resume
-    assert not thread.is_alive()
-    assert isinstance(result_box.get("error"), FitSimulationError)
-    assert "objective fatal lane failure" in str(result_box["error"])
-    assert "residuals" not in result_box
-    with state["lock"]:
-        assert 5.0 not in state["starts"]
-    assert state["normal_release"].is_set() is False
-    assert state["cooperative_stops"] == 2
-
-
-def test_global_fit_objective_does_not_refill_before_inspecting_same_batch_fatal(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.core.objective import ObjectiveContext
-
-    payloads = [
-        _payload("ds1", [0.0, 0.0]),
-        _payload("ds2", [0.0, 0.0]),
-        _payload("ds3", [0.0, 0.0]),
-        _payload("ds4", [0.0, 0.0]),
-        _payload("ds5", [0.0, 0.0]),
-    ]
-    layout = _build_parameter_layout(
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_variable_params={},
-        bounds=None,
-        log10_params=None,
-    )
-    state = {"lock": threading.Lock(), "clone_count": 0, "values": []}
-
-    def ordered_wait(futures, return_when=None):
-        future_list = list(futures)
-        deadline = time.monotonic() + 2.0
-        while not all(future.done() for future in future_list):
-            if time.monotonic() > deadline:
-                raise AssertionError("expected initial bounded lane batch to finish")
-            time.sleep(0.001)
-        ordered = sorted(
-            future_list,
-            key=lambda future: (future.result().index == 0, future.result().index),
-        )
-        return ordered, set()
-
-    monkeypatch.setattr(global_fitting, "wait", ordered_wait)
-    objective = _GlobalFitObjective(
-        fit_evaluator=_FatalObjectiveEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        payloads=payloads,
-        shared_params={"k1": 1.0},
-        dataset_params={
-            "ds1": {"init:A": 10.0},
-            "ds2": {"init:A": 2.0},
-            "ds3": {"init:A": 3.0},
-            "ds4": {"init:A": 4.0},
-            "ds5": {"init:A": 5.0},
-        },
-        weights={payload.dataset_id: 1.0 for payload in payloads},
-        layout=layout,
-        penalty_value=1e6,
-        ctx=ObjectiveContext(),
-        progress_callback=None,
-        cancellation_check=None,
-    )
-
-    with pytest.raises(FitSimulationError, match="objective fatal lane failure"):
-        objective(layout.x0.copy())
-
-    assert sorted(state["values"]) == [2.0, 3.0, 4.0, 10.0]
-    assert 5.0 not in state["values"]
-
-
-def test_global_fit_objective_uses_serial_path_for_custom_lanes_when_cancellable() -> None:
-    from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
-    from kindred.core.objective import ObjectiveContext
-
     payloads = [_payload("ds1", [0.0, 0.0]), _payload("ds2", [0.0, 0.0])]
     layout = _build_parameter_layout(
         payloads=payloads,
@@ -1182,9 +548,12 @@ def test_global_fit_objective_uses_serial_path_for_custom_lanes_when_cancellable
         bounds=None,
         log10_params=None,
     )
-    state = _lane_state()
+    exact_evaluator = SerialFittingEvaluator(_serial_context(solver="Radau", num_points=2))
+    reference_evaluator = _InProcessSerialFittingEvaluator(_serial_context(solver="Radau", num_points=2))
+    process_pool = FittingProcessPool(exact_evaluator.to_process_payload(), max_workers=2)
+
     objective = _GlobalFitObjective(
-        fit_evaluator=_LaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
+        fit_evaluator=exact_evaluator,
         payloads=payloads,
         shared_params={"k1": 1.0},
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
@@ -1193,330 +562,445 @@ def test_global_fit_objective_uses_serial_path_for_custom_lanes_when_cancellable
         penalty_value=1e6,
         ctx=ObjectiveContext(),
         progress_callback=None,
-        cancellation_check=lambda: False,
+        cancellation_check=None,
+        process_pool=process_pool,
     )
-
-    residuals = objective(layout.x0.copy())
-
-    np.testing.assert_allclose(residuals, np.asarray([1.0, 1.0, 10.0, 10.0], dtype=float))
-    assert state["clone_count"] == 0
-    assert state["base_calls"] == 2
-
-
-def test_fit_global_least_squares_uses_parallel_dataset_lanes(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    import kindred.core.fitting_optimization as fitting_optimization
-
-    state = _lane_state()
-
-    def fake_least_squares(func, x0, **kwargs):
-        residuals = np.asarray(func(np.asarray(x0, dtype=float)), dtype=float)
-        return SimpleNamespace(
-            x=np.asarray(x0, dtype=float),
-            success=True,
-            message="ok",
-            nfev=1,
-            fun=residuals,
-            jac=np.eye(len(residuals), len(np.asarray(x0, dtype=float))),
-        )
-
-    def fake_de(*_args, **_kwargs):
-        raise AssertionError("DE should not be used for this test")
-
-    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
-
-    result = global_fitting.fit_global(
-        _LaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        [
-            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-        ],
-        {"k1": 1.0},
+    reference = _GlobalFitObjective(
+        fit_evaluator=reference_evaluator,
+        payloads=payloads,
+        shared_params={"k1": 1.0},
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        method="trf",
-        max_nfev=1,
+        weights={"ds1": 1.0, "ds2": 1.0},
+        layout=layout,
+        penalty_value=1e6,
+        ctx=ObjectiveContext(),
+        progress_callback=None,
+        cancellation_check=None,
+        process_pool=None,
     )
 
-    assert result.success is True
-    assert state["clone_count"] >= 2
-    assert state["base_calls"] == 0
-    assert state["max_active"] == 2
-    assert [info.dataset_id for info in result.dataset_info] == ["ds1", "ds2"]
-    np.testing.assert_allclose(result.model_series["ds1"]["A"], np.asarray([1.0, 1.0]))
-    np.testing.assert_allclose(result.model_series["ds2"]["A"], np.asarray([10.0, 10.0]))
-    np.testing.assert_allclose(result.residual_series["ds1"]["A"], np.asarray([1.0, 1.0]))
-    np.testing.assert_allclose(result.residual_series["ds2"]["A"], np.asarray([10.0, 10.0]))
+    try:
+        residuals = objective(layout.x0.copy())
+        expected = reference(layout.x0.copy())
+    finally:
+        process_pool.shutdown(force_terminate=False)
+
+    np.testing.assert_allclose(residuals, expected)
 
 
-def test_fit_global_de_uses_same_parallel_objective_without_de_workers(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    import kindred.core.fitting_optimization as fitting_optimization
+def test_evaluate_dataset_simulations_process_pool_cancels_on_fatal_result() -> None:
+    from kindred.core.analysis.global_fitting import _dataset_evaluation_is_fatal, _evaluate_dataset_simulations
 
-    state = _lane_state()
-    captured = {}
-
-    def fake_least_squares(*_args, **_kwargs):
-        raise AssertionError("least_squares should not be used for this test")
-
-    def fake_de(func, bounds, **kwargs):
-        captured["workers"] = kwargs.get("workers")
-        x = np.asarray([(float(lo) + float(hi)) / 2.0 for lo, hi in bounds], dtype=float)
-        _ = func(x)
-        return SimpleNamespace(x=x, success=True, message="ok", nfev=1)
-
-    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
-
-    result = global_fitting.fit_global(
-        _LaneTrackingEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        [
-            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-        ],
-        {"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        bounds={"k1": (0.1, 2.0)},
-        method="de",
-        max_nfev=1,
-    )
-
-    assert result.success is True
-    assert captured["workers"] == 1
-    assert state["clone_count"] >= 2
-    assert state["base_calls"] == 0
-    assert state["max_active"] == 2
-    assert [info.dataset_id for info in result.dataset_info] == ["ds1", "ds2"]
-    np.testing.assert_allclose(result.model_series["ds1"]["A"], np.asarray([1.0, 1.0]))
-    np.testing.assert_allclose(result.model_series["ds2"]["A"], np.asarray([10.0, 10.0]))
-    np.testing.assert_allclose(result.residual_series["ds1"]["A"], np.asarray([1.0, 1.0]))
-    np.testing.assert_allclose(result.residual_series["ds2"]["A"], np.asarray([10.0, 10.0]))
-
-
-def test_fit_global_evaluate_series_only_evaluator_stays_serial_for_public_surface(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    import kindred.core.fitting_optimization as fitting_optimization
-
-    state = _lane_state()
-
-    def fake_least_squares(func, x0, **kwargs):
-        residuals = np.asarray(func(np.asarray(x0, dtype=float)), dtype=float)
-        return SimpleNamespace(
-            x=np.asarray(x0, dtype=float),
-            success=True,
-            message="ok",
-            nfev=1,
-            fun=residuals,
-            jac=np.eye(len(residuals), len(np.asarray(x0, dtype=float))),
-        )
-
-    def fake_de(*_args, **_kwargs):
-        raise AssertionError("DE should not be used for this test")
-
-    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
-
-    result = global_fitting.fit_global(
-        _EvaluateOnlyNoClone(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        [
-            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-        ],
-        {"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        method="trf",
-        max_nfev=1,
-    )
-
-    assert result.success is True
-    assert state["clone_count"] == 0
-    assert state["base_calls"] >= 2
-    assert state["max_active"] == 1
-    np.testing.assert_allclose(result.model_series["ds1"]["A"], np.asarray([1.0, 1.0]))
-    np.testing.assert_allclose(result.model_series["ds2"]["A"], np.asarray([10.0, 10.0]))
-
-
-def test_fit_global_self_cloning_evaluator_falls_back_to_serial(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    import kindred.core.fitting_optimization as fitting_optimization
-
-    state = _lane_state()
-
-    def fake_least_squares(func, x0, **kwargs):
-        residuals = np.asarray(func(np.asarray(x0, dtype=float)), dtype=float)
-        return SimpleNamespace(
-            x=np.asarray(x0, dtype=float),
-            success=True,
-            message="ok",
-            nfev=1,
-            fun=residuals,
-            jac=np.eye(len(residuals), len(np.asarray(x0, dtype=float))),
-        )
-
-    def fake_de(*_args, **_kwargs):
-        raise AssertionError("DE should not be used for this test")
-
-    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
-
-    result = global_fitting.fit_global(
-        _SelfCloningEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        [
-            {"id": "ds1", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-            {"id": "ds2", "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)},
-        ],
-        {"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        method="trf",
-        max_nfev=1,
-    )
-
-    assert result.success is True
-    assert state["clone_count"] >= 2
-    assert state["base_calls"] >= 2
-    assert state["max_active"] == 1
-    np.testing.assert_allclose(result.model_series["ds1"]["A"], np.asarray([1.0, 1.0]))
-    np.testing.assert_allclose(result.model_series["ds2"]["A"], np.asarray([10.0, 10.0]))
-
-
-def test_fit_global_final_assembly_records_parallel_fatal_lane_errors(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    import kindred.core.fitting_optimization as fitting_optimization
-
-    state = {
-        "lock": threading.Lock(),
-        "clone_count": 0,
-        "phase": "objective",
-    }
-    original_assemble = global_fitting._assemble_global_fit_result
-
-    def fake_least_squares(func, x0, **kwargs):
-        residuals = np.asarray(func(np.asarray(x0, dtype=float)), dtype=float)
-        state["phase"] = "optimal_residual_recheck"
-        return SimpleNamespace(
-            x=np.asarray(x0, dtype=float),
-            success=True,
-            message="ok",
-            nfev=1,
-            fun=residuals,
-            jac=np.eye(len(residuals), len(np.asarray(x0, dtype=float))),
-        )
-
-    def fake_de(*_args, **_kwargs):
-        raise AssertionError("DE should not be used for this test")
-
-    def counting_assemble(*args, **kwargs):
-        state["phase"] = "final"
-        return original_assemble(*args, **kwargs)
-
-    monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
-    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", counting_assemble)
-
-    lane_cap = int(global_fitting._MAX_PARALLEL_DATASET_LANES)
-    dataset_count = lane_cap + 3
-    dataset_ids = [f"ds{i}" for i in range(1, dataset_count + 1)]
-    early_fatal_dataset_id = "ds2"
-    overflow_fatal_dataset_id = dataset_ids[lane_cap + 1]
-    fatal_dataset_ids = {early_fatal_dataset_id, overflow_fatal_dataset_id}
-    dataset_values = {
-        dataset_id: (101.0 if dataset_id in {"ds1", early_fatal_dataset_id} else float(index + 100))
-        for index, dataset_id in enumerate(dataset_ids, start=1)
-    }
-    fatal_markers = {
-        dataset_id: (1.0 if dataset_id in fatal_dataset_ids else 0.0)
-        for dataset_id in dataset_ids
-    }
-    result = global_fitting.fit_global(
-        _FinalPhaseFatalEvaluator(t_axis=np.linspace(0.0, 1.0, 2), state=state),
-        [
-            {"id": dataset_id, "t": np.linspace(0.0, 1.0, 2), "species": "A", "y": np.zeros(2)}
-            for dataset_id in dataset_ids
-        ],
-        {"k1": 1.0},
-        dataset_params={
-            dataset_id: {"init:A": value, "fatal_marker": fatal_markers[dataset_id]}
-            for dataset_id, value in dataset_values.items()
+    fatal_payload = {
+        "index": 0,
+        "dataset_id": "ds1",
+        "worker_pid": os.getpid(),
+        "ok": False,
+        "series_payload": None,
+        "error": {
+            "kind": "fit_simulation",
+            "message": "fatal worker failure",
+            "code": "E404",
+            "details": {"fatal": True},
+            "failed_params": {"init:A": 1.0},
+            "context": None,
         },
-        method="trf",
-        max_nfev=1,
+        "error_provenance": {"dataset": "ds1"},
+        "final_error_message": "fatal worker failure",
+    }
+    pending_payload = Future()
+
+    class _FakeProcessPool:
+        def __init__(self):
+            self.max_workers = 2
+            self.cancel_calls = 0
+            self.submit_count = 0
+
+        def submit(self, item):
+            self.submit_count += 1
+            future = Future()
+            if self.submit_count == 1:
+                future.set_result(dict(fatal_payload))
+                return future
+            return pending_payload
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+
+    pool = _FakeProcessPool()
+    results = _evaluate_dataset_simulations(
+        _make_serial_evaluator(),
+        [_dataset_input(0, "ds1", 1.0), _dataset_input(1, "ds2", 2.0)],
+        process_pool=pool,
+        stop_on_fatal=True,
     )
 
-    assert result.success is False
-    assert set(result.dataset_errors) == fatal_dataset_ids
-    for dataset_id in fatal_dataset_ids:
-        assert "final fatal lane failure" in result.dataset_errors[dataset_id]
-    assert state["phase_clone_counts"] == {
-        "objective": min(dataset_count, lane_cap)
-    }
-    assert sorted(state["final_values"]) == sorted(dataset_values.values())
-    assert state.get("final_base_values", []) == []
-    assert sorted(value for _lane_id, value in state["final_lane_values"]) == sorted(dataset_values.values())
-    assert sorted({lane_id for lane_id, _value in state["final_lane_values"]}) == list(range(lane_cap))
-    successful_dataset_ids = [dataset_id for dataset_id in dataset_ids if dataset_id not in fatal_dataset_ids]
-    assert list(result.model_series) == successful_dataset_ids
-    assert [info.dataset_id for info in result.dataset_info] == dataset_ids
-    assert sorted(result.residual_series) == sorted(dataset_ids)
-    assert sorted(result.plot_model_x) == sorted(dataset_ids)
-    assert sorted(result.plot_model_series) == sorted(successful_dataset_ids)
-    dataset_info_by_id = {info.dataset_id: info for info in result.dataset_info}
-    for dataset_id in successful_dataset_ids:
-        np.testing.assert_allclose(
-            result.model_series[dataset_id]["A"],
-            np.full(2, dataset_values[dataset_id], dtype=float),
-        )
-        np.testing.assert_allclose(
-            result.residual_series[dataset_id]["A"],
-            np.full(2, dataset_values[dataset_id], dtype=float),
-        )
-        assert dataset_info_by_id[dataset_id].n_points == 2
-    for dataset_id in fatal_dataset_ids:
-        assert dataset_id not in result.model_series
-        assert dataset_id not in result.plot_model_series
-        assert "A" in result.residual_series[dataset_id]
-        np.testing.assert_allclose(result.residual_series[dataset_id]["A"], np.full(2, 1e6, dtype=float))
-        np.testing.assert_allclose(dataset_info_by_id[dataset_id].residuals, np.full(2, 1e6, dtype=float))
-        assert dataset_info_by_id[dataset_id].n_points == 2
+    assert len(results) == 1
+    assert _dataset_evaluation_is_fatal(results[0]) is True
+    assert pool.cancel_calls == 1
+    assert pending_payload.cancelled() is True
 
 
-def test_fit_global_closes_lane_pool_when_post_optimizer_reconstruction_overflows(monkeypatch) -> None:
+def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator(monkeypatch) -> None:
     from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
     from kindred.core.fitting_optimization import FitResult
 
-    lane_pools = []
+    pools = []
 
-    class _FakeLanePool:
-        def __init__(self, _fit_evaluator) -> None:
-            self.close_calls = []
-            lane_pools.append(self)
+    class _FakeProcessPool:
+        def __init__(self, evaluator_payload, *, max_workers, limit_blas_threads, publish_callback=None):
+            self._evaluator = SerialFittingEvaluator.from_process_payload(evaluator_payload)
+            self.max_workers = int(max_workers)
+            self.limit_blas_threads = bool(limit_blas_threads)
+            self.submit_count = 0
+            self.shutdown_calls = []
+            pools.append(self)
+            if publish_callback is not None:
+                publish_callback(self)
 
-        def close(self) -> None:
-            self.close_calls.append(True)
+        def submit(self, item):
+            from kindred.core.fitting_evaluation import evaluate_fitting_series
 
-    def fake_fit_parameters(*_args, **_kwargs):
+            self.submit_count += 1
+            future = Future()
+            future.set_result(
+                {
+                    "index": int(item.index),
+                    "dataset_id": str(item.payload.dataset_id),
+                    "worker_pid": os.getpid(),
+                    "ok": True,
+                    "series_payload": evaluate_fitting_series(
+                        self._evaluator,
+                        item.full_params,
+                        origins=item.parameter_origins,
+                        failed_params=item.failed_param_snapshot,
+                    ),
+                    "error": None,
+                    "error_provenance": None,
+                    "final_error_message": None,
+                }
+            )
+            return future
+
+        def cancel(self) -> None:
+            return None
+
+        def shutdown(self, *, force_terminate: bool) -> None:
+            if self.shutdown_calls:
+                return
+            self.shutdown_calls.append(bool(force_terminate))
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
         return FitResult(
             success=True,
-            parameters={"k1": 10000.0},
+            parameters=dict(initial_params),
             uncertainties=None,
             chi_squared=0.0,
             r_squared=1.0,
-            residuals=np.zeros(1),
+            residuals=np.zeros(4, dtype=float),
             nfev=1,
-            message="extreme optimum",
+            message="ok",
             covariance=None,
         )
 
-    def evaluator(_params):
-        return {"t": np.array([0.0]), "species": {"A": np.array([1.0])}}
-
-    monkeypatch.setattr(global_fitting, "_DatasetEvaluatorLanePool", _FakeLanePool)
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", _FakeProcessPool)
     monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
 
-    with pytest.raises(OverflowError):
+    result = global_fitting.fit_global(
+        _make_serial_evaluator(),
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.success is True
+    assert len(pools) == 1
+    assert pools[0].max_workers == 2
+    assert pools[0].limit_blas_threads is True
+    assert pools[0].submit_count == 2
+    assert pools[0].shutdown_calls == [False]
+
+
+def test_fit_global_ignores_cleanup_process_pool_callback_error(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_optimization import FitResult
+
+    pools = []
+    callback_values = []
+
+    class _FakeProcessPool:
+        def __init__(self, evaluator_payload, *, max_workers, limit_blas_threads, publish_callback=None):
+            self._evaluator = SerialFittingEvaluator.from_process_payload(evaluator_payload)
+            self.max_workers = int(max_workers)
+            self.limit_blas_threads = bool(limit_blas_threads)
+            self.shutdown_calls = []
+            pools.append(self)
+            if publish_callback is not None:
+                publish_callback(self)
+
+        def submit(self, item):
+            from kindred.core.fitting_evaluation import evaluate_fitting_series
+
+            future = Future()
+            future.set_result(
+                {
+                    "index": int(item.index),
+                    "dataset_id": str(item.payload.dataset_id),
+                    "worker_pid": os.getpid(),
+                    "ok": True,
+                    "series_payload": evaluate_fitting_series(
+                        self._evaluator,
+                        item.full_params,
+                        origins=item.parameter_origins,
+                        failed_params=item.failed_param_snapshot,
+                    ),
+                    "error": None,
+                    "error_provenance": None,
+                    "final_error_message": None,
+                }
+            )
+            return future
+
+        def cancel(self) -> None:
+            return None
+
+        def shutdown(self, *, force_terminate: bool) -> None:
+            if self.shutdown_calls:
+                return
+            self.shutdown_calls.append(bool(force_terminate))
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    def process_pool_callback(pool):
+        callback_values.append(pool)
+        if pool is None:
+            raise RuntimeError("cleanup callback failed")
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", _FakeProcessPool)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _make_serial_evaluator(),
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+        process_pool_callback=process_pool_callback,
+    )
+
+    assert result.success is True
+    assert callback_values == [pools[0], None]
+    assert pools[0].shutdown_calls == [False]
+
+
+def test_fit_global_single_dataset_serial_fitting_evaluator_stays_in_process(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process pool should not be created for a single dataset fit")
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(2, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _make_serial_evaluator(),
+        [_raw_dataset("ds1", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.success is True
+
+
+def test_fit_global_custom_evaluator_stays_in_process(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    state = {"base_calls": 0}
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process pool should not be created for a custom evaluator")
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _EvaluateOnlyNoClone(t_axis=np.linspace(0.0, 1.0, 2), state=state),
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.success is True
+    assert state["base_calls"] == 2
+
+
+def test_fit_global_serial_fitting_evaluator_subclass_stays_in_process(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_optimization import FitResult
+
+    class _InstrumentedSerialFittingEvaluator(SerialFittingEvaluator):
+        pass
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process pool should not be created for a SerialFittingEvaluator subclass")
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _InstrumentedSerialFittingEvaluator(_serial_context()),
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.success is True
+
+
+def test_global_fit_worker_retro_cancels_process_pool_when_handle_arrives_late() -> None:
+    from kindred.gui.fitting.worker import GlobalFitWorker
+
+    worker = GlobalFitWorker(
+        datasets=[_raw_dataset("ds1", [0.0, 0.0])],
+        shared_params={"k1": 1.0},
+        fit_evaluator=lambda _params: {"t": np.asarray([0.0, 1.0]), "species": {"A": np.asarray([0.0, 0.0])}},
+        fit_func=lambda *_args, **_kwargs: None,
+        max_nfev=1,
+    )
+
+    class _FakeProcessPool:
+        def __init__(self):
+            self.cancel_calls = 0
+
+        def cancel(self):
+            self.cancel_calls += 1
+
+    pool = _FakeProcessPool()
+    worker.cancel()
+    worker._set_active_process_pool(pool)
+
+    assert pool.cancel_calls == 1
+
+
+def test_fit_global_process_pool_shutdown_on_post_optimizer_error(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    pools = []
+
+    class _FakeProcessPool:
+        def __init__(self, _evaluator_payload, *, max_workers, limit_blas_threads, publish_callback=None):
+            self.max_workers = int(max_workers)
+            self.limit_blas_threads = bool(limit_blas_threads)
+            self.shutdown_calls = []
+            pools.append(self)
+            if publish_callback is not None:
+                publish_callback(self)
+
+        def submit(self, item):
+            raise AssertionError(f"submit should not be reached for {item.payload.dataset_id}")
+
+        def cancel(self) -> None:
+            return None
+
+        def shutdown(self, *, force_terminate: bool) -> None:
+            if self.shutdown_calls:
+                return
+            self.shutdown_calls.append(bool(force_terminate))
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    def raising_assemble(*_args, **_kwargs):
+        raise OverflowError("post-optimizer reconstruction overflow")
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", _FakeProcessPool)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", raising_assemble)
+
+    with pytest.raises(OverflowError, match="post-optimizer reconstruction overflow"):
         global_fitting.fit_global(
-            evaluator,
-            [{"id": "ds1", "t": np.array([0.0]), "species": "A", "y": np.array([1.0])}],
+            _make_serial_evaluator(),
+            [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
             {"k1": 1.0},
-            bounds={"k1": (1e-9, 1e9)},
-            log10_params={"k1": True},
+            dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
             method="trf",
             max_nfev=1,
         )
 
-    assert len(lane_pools) == 1
-    assert lane_pools[0].close_calls == [True]
+    assert len(pools) == 1
+    assert pools[0].shutdown_calls == [True]

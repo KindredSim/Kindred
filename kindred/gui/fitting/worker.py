@@ -150,6 +150,8 @@ class GlobalFitWorker(QtCore.QThread):
         self._cancelled = False
         self._pause_event = threading.Event()
         self._pause_event.set()
+        self._active_process_pool = None
+        self._active_process_pool_lock = threading.Lock()
         self._run_stamp = dict(run_stamp or {}) if isinstance(run_stamp, dict) else {}
         self._run_stamp_hash = str(run_stamp_hash or "")
         self._run_stamp_short = str(run_stamp_short or "")
@@ -173,6 +175,37 @@ class GlobalFitWorker(QtCore.QThread):
         """Request cancellation from the worker."""
         self._cancelled = True
         self._pause_event.set()
+        self._cancel_active_process_pool()
+
+    def _set_active_process_pool(self, process_pool) -> None:
+        with self._active_process_pool_lock:
+            self._active_process_pool = process_pool
+        if process_pool is not None and self._cancelled:
+            try:
+                process_pool.cancel()
+            except Exception as exc:
+                logger.debug("Failed to retro-cancel active fitting process pool: %s", exc, exc_info=True)
+
+    def _cancel_active_process_pool(self) -> None:
+        with self._active_process_pool_lock:
+            process_pool = self._active_process_pool
+        if process_pool is None:
+            return
+        try:
+            process_pool.cancel()
+        except Exception as exc:
+            logger.debug("Failed to cancel active fitting process pool: %s", exc, exc_info=True)
+
+    def force_shutdown_active_process_pool(self) -> None:
+        with self._active_process_pool_lock:
+            process_pool = self._active_process_pool
+            self._active_process_pool = None
+        if process_pool is None:
+            return
+        try:
+            process_pool.shutdown(force_terminate=True)
+        except Exception as exc:
+            logger.debug("Failed to force shutdown active fitting process pool: %s", exc, exc_info=True)
 
     def pause(self) -> None:
         """Pause optimization at the next cooperative boundary."""
@@ -288,6 +321,7 @@ class GlobalFitWorker(QtCore.QThread):
             log10_params=self._log10_params,
             progress_callback=progress_callback,
             cancellation_check=cancellation_check,
+            process_pool_callback=self._set_active_process_pool,
         )
         if self._cancelled:
             raise FittingCancelled()

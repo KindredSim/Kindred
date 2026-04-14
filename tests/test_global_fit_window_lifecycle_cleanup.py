@@ -235,6 +235,7 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
     class _StuckWorker:
         def __init__(self):
             self.cancel_called = False
+            self.force_shutdown_active_process_pool_called = False
             self.terminate_called = False
             self.wait_calls = []
             self.deleted = False
@@ -246,6 +247,9 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
 
         def cancel(self):
             self.cancel_called = True
+
+        def force_shutdown_active_process_pool(self):
+            self.force_shutdown_active_process_pool_called = True
 
         def wait(self, msecs: int | None = None):
             self.wait_calls.append(msecs)
@@ -265,6 +269,7 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
 
     assert stuck.cancel_called is True
     assert stuck.wait_calls and int(stuck.wait_calls[0]) == 2000
+    assert stuck.force_shutdown_active_process_pool_called is True
     assert stuck.terminate_called is True
     assert stuck.deleted is False
     assert window._worker_registry.contains_thread(window._worker)

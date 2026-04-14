@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import pickle
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -497,9 +498,59 @@ class SerialFittingEvaluator:
             fixed_param_origins=dict(self._fixed_param_origins),
         )
 
+    def to_process_payload(self) -> Dict[str, Any]:
+        payload = {
+            "execution_request": self._context.execution_request.to_payload(),
+            "requested_param_names": list(self._context.requested_param_names),
+            "prepared_metadata": self._context.prepared_metadata.to_serializable_dict(),
+            "temperature_K": float(self._context.temperature_K),
+            "initial_prefix": str(self._context.initial_prefix),
+            "fixed_params": dict(self._fixed_params),
+            "fixed_param_origins": dict(self._fixed_param_origins),
+        }
+        payload_copy = copy.deepcopy(payload)
+        pickle.dumps(payload_copy)
+        return payload_copy
+
+    @classmethod
+    def from_process_payload(cls, payload: Mapping[str, Any]) -> "SerialFittingEvaluator":
+        required_keys = (
+            "execution_request",
+            "requested_param_names",
+            "prepared_metadata",
+            "temperature_K",
+            "initial_prefix",
+            "fixed_params",
+            "fixed_param_origins",
+        )
+        if not isinstance(payload, Mapping):
+            raise TypeError("Process payload must be a mapping.")
+        missing = [name for name in required_keys if name not in payload]
+        if missing:
+            raise KeyError(f"Process payload is missing required keys: {', '.join(missing)}")
+        return cls(
+            PreparedFittingExecutionContext(
+                execution_request=SimulationExecutionRequest.from_mapping(
+                    dict(payload["execution_request"])
+                ),
+                requested_param_names=list(payload["requested_param_names"]),
+                prepared_metadata=PreparedSimulationMetadata.from_mapping(
+                    dict(payload["prepared_metadata"])
+                ),
+                temperature_K=float(payload["temperature_K"]),
+                initial_prefix=str(payload["initial_prefix"]),
+            ),
+            fixed_params=dict(payload["fixed_params"]),
+            fixed_param_origins=dict(payload["fixed_param_origins"]),
+        )
+
     def _kindred_set_fitting_cancellation_check(self, cancellation_check) -> "SerialFittingEvaluator":
         self._cancellation_check = cancellation_check
         return self
+
+    def _raise_if_cancel_requested(self) -> None:
+        if _fitting_cancel_requested(self._cancellation_check):
+            raise FittingCancelled()
 
     def __call__(self, params: Dict[str, float]) -> SimulationSeriesPayload:
         return self.evaluate_series(params)
@@ -523,12 +574,11 @@ class SerialFittingEvaluator:
         *,
         failed_params: Optional[Dict[str, float]] = None,
     ) -> SimulationSeriesPayload:
+        self._raise_if_cancel_requested()
         self._ensure_prepared()
         prepared_run = self._prepared_run
         if prepared_run is None:
             raise RuntimeError("Prepared fitting lane unavailable.")
-        if _fitting_cancel_requested(self._cancellation_check):
-            raise FittingCancelled()
 
         param_map = {str(name): float(value) for name, value in self._fixed_params.items()}
         origin_map = dict(self._fixed_param_origins)
@@ -666,7 +716,9 @@ class SerialFittingEvaluator:
     def _ensure_prepared(self) -> None:
         if self._prepared_run is not None:
             return
+        self._raise_if_cancel_requested()
         prepared_run = prepare_simulation_worker_run(execution_request=self._context.execution_request)
+        self._raise_if_cancel_requested()
         prepared_payload = dict(self._context.execution_request.prepared_payload or {})
         bindings = prepared_payload.get("bindings") or {}
         if not isinstance(bindings, Mapping):
@@ -674,6 +726,7 @@ class SerialFittingEvaluator:
         self._prepared_run = prepared_run
         self._bindings = dict(bindings)
         self._species_index = {name: idx for idx, name in enumerate(prepared_run.species_names)}
+        self._raise_if_cancel_requested()
 
         from kindred.core.algebra.simulation_series import (
             CompiledAlgebraSeries,
@@ -682,6 +735,7 @@ class SerialFittingEvaluator:
         from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
 
         self._parameter_algebra_spec = parameter_algebra_spec_from_mechanism(prepared_run.mechanism)
+        self._raise_if_cancel_requested()
 
         compiled_algebra: Optional[CompiledAlgebraSeries] = None
         algebra_text = metadata_view_for_mechanism(prepared_run.mechanism).algebra_text
@@ -701,6 +755,7 @@ class SerialFittingEvaluator:
                     context=ErrorContext(line=stmt.line, col=stmt.col, line_text=stmt.line_text),
                 )
         self._compiled_algebra = compiled_algebra
+        self._raise_if_cancel_requested()
 
     def _apply_shared_values(self, shared_values: Mapping[str, float]) -> None:
         prepared_run = self._prepared_run

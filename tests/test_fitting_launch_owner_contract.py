@@ -320,7 +320,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_threaded_lanes(
+def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_pool(
     qtbot,
     qt_app,
     main_window,
@@ -385,7 +385,8 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_threaded_l
         raise AssertionError("DE should not be used for this test")
 
     def counting_assemble(*args, **kwargs):
-        captured["lane_slots"] = tuple(sorted(kwargs["lane_pool"]._lanes))
+        process_pool = kwargs["process_pool"]
+        captured["process_pool_workers"] = None if process_pool is None else int(process_pool.max_workers)
         return original_assemble(*args, **kwargs)
 
     monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
@@ -418,7 +419,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_threaded_l
         )
         assert eager_window._worker is not None
         captured["worker_fit_evaluator"] = eager_window._worker._fit_evaluator
-        qtbot.waitUntil(lambda: "lane_slots" in captured, timeout=5000)
+        qtbot.waitUntil(lambda: "process_pool_workers" in captured, timeout=5000)
         qtbot.waitUntil(
             lambda: eager_window._worker is None or not eager_window._worker.isRunning(),
             timeout=5000,
@@ -430,7 +431,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_threaded_l
         assert state["objective_calls"] == 2
         assert len(selection["ids"]) == 2
         assert captured["worker_fit_evaluator"] is fit_evaluator
-        assert set(captured["lane_slots"]) == {0, 1}
+        assert captured["process_pool_workers"] == 2
     finally:
         eager_window.close()
         eager_window.deleteLater()

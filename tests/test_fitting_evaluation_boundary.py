@@ -407,6 +407,150 @@ def test_serial_fitting_evaluator_lane_solver_event_reports_mid_solve_cancellati
         lane({"init:A": 1.0})
 
 
+def test_serial_fitting_evaluator_process_payload_round_trip_matches_original() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context).with_fixed_params({"k1": 0.2})
+
+    expected = evaluator({"init:A": 1.0})
+    payload = evaluator.to_process_payload()
+    restored = SerialFittingEvaluator.from_process_payload(payload)
+    actual = restored({"init:A": 1.0})
+
+    np.testing.assert_allclose(np.asarray(actual.t, dtype=float), np.asarray(expected.t, dtype=float))
+    np.testing.assert_allclose(
+        np.asarray(actual.species["A"], dtype=float),
+        np.asarray(expected.species["A"], dtype=float),
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual.species["B"], dtype=float),
+        np.asarray(expected.species["B"], dtype=float),
+    )
+
+
+def test_serial_fitting_evaluator_process_payload_is_picklable_without_prepared_rhs() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    _ = evaluator({"k1": 0.2, "init:A": 1.0})
+
+    payload = evaluator.to_process_payload()
+
+    assert payload["execution_request"]["prepared_payload"] is not None
+    assert "rhs" not in payload["execution_request"]["prepared_payload"]
+    pickle.dumps(payload)
+
+
+def test_serial_fitting_evaluator_process_payload_handles_empty_param_names() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        t_end=1.0,
+        num_points=4,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    restored = SerialFittingEvaluator.from_process_payload(evaluator.to_process_payload())
+    result = restored({"init:A": 1.0})
+
+    assert np.asarray(result.t, dtype=float).size == 4
+    assert set(result.species) == {"A", "B"}
+
+
+def test_serial_fitting_evaluator_process_payload_handles_large_mechanism() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    lines = []
+    for idx in range(100):
+        lines.append(f"reaction: S{idx} -> S{idx + 1}; k=0.1")
+    for idx in range(101):
+        value = "1.0" if idx == 0 else "0.0"
+        lines.append(f"initial: S{idx}={value}")
+    mechanism_text = "\n".join(lines)
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        t_end=1.0,
+        num_points=3,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    payload = evaluator.to_process_payload()
+    restored = SerialFittingEvaluator.from_process_payload(payload)
+    result = restored({"init:S0": 1.0})
+
+    assert payload["requested_param_names"] == []
+    assert np.asarray(result.t, dtype=float).size == 3
+    assert "S100" in result.species
+
+
+def test_serial_fitting_evaluator_from_process_payload_requires_all_fields() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+
+    with pytest.raises(KeyError, match="execution_request"):
+        SerialFittingEvaluator.from_process_payload(
+            {
+                "requested_param_names": [],
+                "prepared_metadata": {},
+                "temperature_K": 298.15,
+                "initial_prefix": "init:",
+                "fixed_params": {},
+                "fixed_param_origins": {},
+            }
+        )
+
+
 def test_serial_fitting_evaluator_rejects_nonfinite_consumed_parameter_values() -> None:
     from kindred.core.exceptions import FitSimulationError
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
