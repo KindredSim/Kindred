@@ -87,6 +87,35 @@ def _arrange_analysis_dock_into_mechanism_region(main_window, qt_app) -> None:
     qt_app.processEvents()
 
 
+def _pump_qt_events(qt_app, *, iterations: int = 5) -> None:
+    for _ in range(max(1, int(iterations))):
+        qt_app.processEvents()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+    for _ in range(max(1, int(iterations))):
+        qt_app.processEvents()
+
+
+def _dock_area_matches(main_window, dock, target_area) -> bool:
+    return main_window.dockWidgetArea(dock) == target_area and dock.isFloating() is False and dock.isHidden() is False
+
+
+def _wait_for_dock_area(main_window, qt_app, dock, target_area, *, attempts: int = 12) -> None:
+    for _ in range(max(1, int(attempts))):
+        if _dock_area_matches(main_window, dock, target_area):
+            return
+        _pump_qt_events(qt_app)
+    assert _dock_area_matches(main_window, dock, target_area)
+
+
+def _wait_for_floating_dock(qt_app, dock, *, attempts: int = 12) -> None:
+    for _ in range(max(1, int(attempts))):
+        if dock.isFloating() is True and dock.isVisible() is True:
+            return
+        _pump_qt_events(qt_app)
+    assert dock.isFloating() is True
+    assert dock.isVisible() is True
+
+
 def test_recent_files_menu_populates_placeholder_when_empty(main_window):
     main_window._settings.setValue("recent_files", [])
     main_window._settings.sync()
@@ -333,7 +362,7 @@ def test_maximized_state_round_trips_via_window_settings(main_window, qt_app):
     assert main_window.isMaximized() is False
 
     main_window.config_controller.load_settings()
-    qt_app.processEvents()
+    _pump_qt_events(qt_app)
 
     assert main_window.isMaximized() is True
 
@@ -497,7 +526,7 @@ def test_dock_area_round_trips_via_window_state(main_window, qt_app, dock_attr, 
     qt_app.processEvents()
 
     main_window.config_controller.load_settings()
-    qt_app.processEvents()
+    _wait_for_dock_area(main_window, qt_app, dock, target_area)
 
     assert main_window.dockWidgetArea(dock) == target_area
     assert dock.isHidden() is False
@@ -523,7 +552,7 @@ def test_default_side_first_arrangement_round_trips_via_window_state(main_window
     assert main_window._sliders_dock.isHidden() is True
 
     main_window.config_controller.load_settings()
-    qt_app.processEvents()
+    _pump_qt_events(qt_app, iterations=12)
 
     _assert_default_shell_contract(main_window)
 
@@ -639,7 +668,7 @@ def test_compact_on_screen_sliders_dock_floating_state_round_trips_via_window_st
     assert dock.isFloating() is False
 
     main_window.config_controller.load_settings()
-    qt_app.processEvents()
+    _wait_for_floating_dock(qt_app, dock)
 
     assert dock.isFloating() is True
     assert dock.isVisible() is True

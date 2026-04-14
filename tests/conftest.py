@@ -2,6 +2,7 @@ import gc
 import os
 import sys
 import logging
+from contextlib import suppress
 
 # Ensure Qt always runs headless before importing PySide6/pytest-qt fixtures
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -46,6 +47,24 @@ def qt_app():
     if app is None:
         app = QtWidgets.QApplication([])
     return app
+
+
+@pytest.fixture(autouse=True)
+def _drain_qt_between_tests():
+    yield
+    try:
+        from PySide6 import QtCore, QtWidgets
+    except Exception:
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for _ in range(5):
+        app.processEvents()
+    with suppress(RuntimeError, TypeError):
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+    for _ in range(5):
+        app.processEvents()
 
 
 @pytest.fixture
