@@ -44,7 +44,7 @@ def test_fingerprint_simulation_request_includes_temperature_schedule_fingerprin
         rhs=rhs,
         t_span=(0.0, 1.0),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         grid={"N": 10},
         temperature_schedule=TemperatureSchedule.constant(300.0),
     )
@@ -52,7 +52,7 @@ def test_fingerprint_simulation_request_includes_temperature_schedule_fingerprin
         rhs=rhs,
         t_span=(0.0, 1.0),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         grid={"N": 10},
         temperature_schedule=TemperatureSchedule.constant(310.0),
     )
@@ -82,7 +82,7 @@ def test_fingerprint_simulation_request_is_deterministic_for_equivalent_plain_ca
         rhs=rhs,
         t_span=(0.0, 1.0),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         grid={"N": 10},
         temperature_schedule=_PlainCallableSchedule(300.0),
     )
@@ -90,7 +90,7 @@ def test_fingerprint_simulation_request_is_deterministic_for_equivalent_plain_ca
         rhs=rhs,
         t_span=(0.0, 1.0),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         grid={"N": 10},
         temperature_schedule=_PlainCallableSchedule(300.0),
     )
@@ -98,7 +98,7 @@ def test_fingerprint_simulation_request_is_deterministic_for_equivalent_plain_ca
         rhs=rhs,
         t_span=(0.0, 1.0),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         grid={"N": 10},
         temperature_schedule=_PlainCallableSchedule(310.0),
     )

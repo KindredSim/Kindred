@@ -8,6 +8,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
+from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 from kindred.gui.ui_helpers import make_scroll_area
 
 # Direct imports required to avoid circular dependency with widgets/__init__.py
@@ -208,8 +209,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         # Slider solver
         slider_runtime_layout.addWidget(QtWidgets.QLabel("Solver:"))
         self._slider_solver_combo = QtWidgets.QComboBox()
-        self._slider_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._slider_solver_combo.setCurrentText("LSODA")
+        self._slider_solver_combo.addItems(["Radau", "BDF"])
+        self._slider_solver_combo.setCurrentText("BDF")
         self._slider_solver_combo.setToolTip("ODE solver used for slider preview simulations")
         slider_runtime_layout.addWidget(self._slider_solver_combo)
         slider_runtime_layout.addStretch()
@@ -568,7 +569,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def set_slider_solver_value(self, s: str) -> None:
         """Set the slider solver value."""
-        idx = self._slider_solver_combo.findText(s)
+        solver_name, _warning = normalize_solver_name(s)
+        idx = self._slider_solver_combo.findText(solver_name)
+        if idx < 0:
+            idx = self._slider_solver_combo.findText(DEFAULT_SOLVER_NAME)
         self._slider_solver_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     @property

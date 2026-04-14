@@ -12,13 +12,26 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
+from kindred.core.simulator.solvers import normalize_solver_name
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["Profile", "ProfileManager"]
+
+
+def _coerce_positive_float(value: object, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return float(default)
+    return float(parsed)
 
 
 @dataclass
@@ -33,7 +46,7 @@ class Profile:
     description : str
         Human-readable description
     solver_method : str
-        ODE solver method (LSODA, Radau, BDF)
+        ODE solver method (BDF, Radau)
     rtol : float
         Relative tolerance
     atol : float
@@ -51,7 +64,7 @@ class Profile:
     """
     name: str
     description: str = ""
-    solver_method: str = "LSODA"
+    solver_method: str = "BDF"
     rtol: float = 1e-6
     atol: float = 1e-12
     grid_n: int = 1000
@@ -77,17 +90,26 @@ class Profile:
         Profile
             Profile instance
         """
-        solver = data.get("solver", {})
-        grid = data.get("grid", {})
-        ui = data.get("ui", {})
-        export = data.get("export", {})
+        def _section(name: str) -> Dict[str, Any]:
+            value = data.get(name, {})
+            if value is None:
+                return {}
+            if not isinstance(value, dict):
+                raise TypeError(f"Profile section '{name}' must be a mapping.")
+            return value
+
+        solver = _section("solver")
+        grid = _section("grid")
+        ui = _section("ui")
+        export = _section("export")
+        solver_method, _warning = normalize_solver_name(solver.get("method", "BDF"))
 
         return cls(
             name=data.get("name", "Unknown"),
             description=data.get("description", ""),
-            solver_method=solver.get("method", "LSODA"),
-            rtol=solver.get("rtol", 1e-6),
-            atol=solver.get("atol", 1e-12),
+            solver_method=solver_method,
+            rtol=_coerce_positive_float(solver.get("rtol", 1e-6), default=1e-6),
+            atol=_coerce_positive_float(solver.get("atol", 1e-12), default=1e-12),
             grid_n=grid.get("N", 1000),
             theme=ui.get("theme", "default"),
             export_format=export.get("default_format", "csv"),
@@ -272,7 +294,7 @@ class ProfileManager:
         self,
         name: str,
         description: str = "",
-        solver_method: str = "LSODA",
+        solver_method: str = "BDF",
         rtol: float = 1e-6,
         atol: float = 1e-12,
         grid_n: int = 1000,
@@ -306,12 +328,13 @@ class ProfileManager:
         Profile
             New profile instance
         """
+        normalized_solver, _warning = normalize_solver_name(solver_method)
         profile = Profile(
             name=name,
             description=description,
-            solver_method=solver_method,
-            rtol=rtol,
-            atol=atol,
+            solver_method=normalized_solver,
+            rtol=_coerce_positive_float(rtol, default=1e-6),
+            atol=_coerce_positive_float(atol, default=1e-12),
             grid_n=grid_n,
             theme=theme,
             export_format=export_format,

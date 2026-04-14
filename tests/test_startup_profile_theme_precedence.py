@@ -158,15 +158,15 @@ def test_explicit_profile_bootstrap_preserves_explicit_startup_solver_overrides(
     monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
     _enable_profiles_menu(monkeypatch)
 
-    window = MainWindow(profile="Explicit Light", solver="LSODA", rtol=1e-8, atol=1e-13)
+    window = MainWindow(profile="Explicit Light", solver="BDF", rtol=1e-8, atol=1e-13)
     try:
         active = window._profile_manager.get_active_profile()
         assert active is not None
         assert active.name == "Explicit Light"
-        assert window._initial_solver == "LSODA"
+        assert window._initial_solver == "BDF"
         assert window._initial_rtol == pytest.approx(1e-8)
         assert window._initial_atol == pytest.approx(1e-13)
-        assert window._solver_method_combo.currentText() == "LSODA"
+        assert window._solver_method_combo.currentText() == "BDF"
         assert window._dark_mode is False
     finally:
         window.close()
@@ -189,15 +189,15 @@ def test_persisted_profile_bootstrap_preserves_explicit_startup_solver_overrides
     monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
     _enable_profiles_menu(monkeypatch)
 
-    window = MainWindow(solver="LSODA", rtol=1e-8, atol=1e-13)
+    window = MainWindow(solver="BDF", rtol=1e-8, atol=1e-13)
     try:
         active = window._profile_manager.get_active_profile()
         assert active is not None
         assert active.name == "Stored Dark"
-        assert window._initial_solver == "LSODA"
+        assert window._initial_solver == "BDF"
         assert window._initial_rtol == pytest.approx(1e-8)
         assert window._initial_atol == pytest.approx(1e-13)
-        assert window._solver_method_combo.currentText() == "LSODA"
+        assert window._solver_method_combo.currentText() == "BDF"
         assert window._dark_mode is True
     finally:
         window.close()

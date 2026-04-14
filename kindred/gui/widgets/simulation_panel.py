@@ -7,6 +7,8 @@ from typing import Callable, Optional
 
 from PySide6 import QtWidgets
 
+from kindred.core.simulator.solvers import normalize_solver_name
+
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
@@ -64,8 +66,9 @@ class SimulationPanel(QtWidgets.QWidget):
         points_label = QtWidgets.QLabel("Points:", controls_row_widget)
 
         self.solver_method_combo = QtWidgets.QComboBox(controls_row_widget)
-        self.solver_method_combo.addItems(["LSODA", "Radau", "BDF"])
-        self.solver_method_combo.setCurrentText(str(initial_solver))
+        self.solver_method_combo.addItems(["Radau", "BDF"])
+        solver_name, _warning = normalize_solver_name(initial_solver)
+        self.solver_method_combo.setCurrentText(solver_name)
         self.solver_method_combo.setMaximumWidth(100)
         self.solver_method_combo.currentTextChanged.connect(on_solver_method_changed)
 

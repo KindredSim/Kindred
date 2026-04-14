@@ -20,7 +20,7 @@ def test_prepared_simulation_returns_typed_series_payload() -> None:
         param_names=["k1"],
         t_end=1.0,
         num_points=5,
-        solver="LSODA",
+        solver="BDF",
     )
 
     result = prepared({"k1": 0.5})

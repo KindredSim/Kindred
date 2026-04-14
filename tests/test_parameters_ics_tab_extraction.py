@@ -8,7 +8,7 @@ from PySide6 import QtWidgets
 pytestmark = [pytest.mark.gui]
 
 
-def _make_tab(*, entries=None, species=None, integration_defaults=("LSODA", 1e-6, 1e-12)):
+def _make_tab(*, entries=None, species=None, integration_defaults=("BDF", 1e-6, 1e-12)):
     from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 

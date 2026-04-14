@@ -29,7 +29,7 @@ def _worker_payload(prepared, mechanism_text):
         "species_names": ["A", "B"],
         "mechanism": prepared.get("mechanism") if prepared else None,
         "mechanism_text": mechanism_text,
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
 
@@ -881,7 +881,7 @@ def test_hidden_mechanism_slider_does_not_leak_into_later_load_with_reused_name(
         "species_names": ["C", "D"],
         "mechanism": None,
         "mechanism_text": main_window._mechanism_editor._reactions_text.toPlainText(),
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
     main_window._preview_session._slider_triggered_simulation = False
@@ -930,7 +930,7 @@ def test_hidden_mechanism_slider_persists_across_same_universe_dsl_text_edit_com
         "species_names": ["A", "B"],
         "mechanism": None,
         "mechanism_text": main_window._mechanism_editor._reactions_text.toPlainText(),
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
     main_window._preview_session._slider_triggered_simulation = False
@@ -997,7 +997,7 @@ def test_hidden_mechanism_slider_persists_across_same_universe_scalar_reorder_co
         "species_names": ["A", "B"],
         "mechanism": None,
         "mechanism_text": main_window._mechanism_editor._reactions_text.toPlainText(),
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
     main_window._preview_session._slider_triggered_simulation = False
@@ -1043,7 +1043,7 @@ def test_hidden_mechanism_slider_persists_across_primary_explicit_completion_rep
         "species_names": ["A", "B"],
         "mechanism": None,
         "mechanism_text": main_window._mechanism_editor._reactions_text.toPlainText(),
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
     main_window._preview_session._slider_triggered_simulation = False
@@ -1090,7 +1090,7 @@ def test_hidden_mechanism_slider_persists_across_energy_mode_refresh_repopulatio
         "species_names": mechanism.species_names(),
         "mechanism": mechanism,
         "mechanism_text": mechanism_text,
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
     main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
@@ -1972,7 +1972,7 @@ def test_stale_slider_worker_completion_does_not_override_latest(main_window, mo
         "species_names": ["A"],
         "mechanism": None,
         "mechanism_text": "old",
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
         "algebra_scalars": {},
         "algebra_errors": [],
         "provenance": {},
@@ -2017,7 +2017,7 @@ def test_simulation_worker_cleanup_does_not_wait():
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0",
         {},
         (0.0, 1.0),
-        {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     )
     worker.cleanup()
 

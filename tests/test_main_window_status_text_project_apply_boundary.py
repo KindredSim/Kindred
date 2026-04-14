@@ -333,7 +333,7 @@ def test_apply_project_payload_syncs_solver_runtime_state_and_visible_combo(main
     payload["rtol"] = 1e-5
     payload["atol"] = 1e-9
 
-    main_window._solver_method_combo.setCurrentText("LSODA")
+    main_window._solver_method_combo.setCurrentText("BDF")
     main_window._initial_rtol = 1e-6
     main_window._initial_atol = 1e-12
 
@@ -345,13 +345,36 @@ def test_apply_project_payload_syncs_solver_runtime_state_and_visible_combo(main
     assert main_window._solver_method_combo.currentText() == "BDF"
 
 
-def test_apply_project_payload_invalid_tolerances_preserve_existing_runtime_values(main_window):
+def test_apply_project_payload_normalizes_invalid_solver_to_bdf(main_window):
+    payload = main_window._serialize_project_state()
+    payload["solver"] = "unknown_solver_name"
+
+    main_window._solver_method_combo.setCurrentText("Radau")
+    main_window._initial_solver = "Radau"
+
+    main_window._apply_project_payload(payload, record_undo=False)
+
+    assert main_window._initial_solver == "BDF"
+    assert main_window._solver_method_combo.currentText() == "BDF"
+
+
+def test_apply_solver_runtime_state_normalizes_unknown_solver_and_syncs_combo(main_window):
+    main_window._solver_method_combo.setCurrentText("Radau")
+    main_window._initial_solver = "Radau"
+
+    main_window.apply_solver_runtime_state(solver="unknown_solver_name")
+
+    assert main_window._initial_solver == "BDF"
+    assert main_window._solver_method_combo.currentText() == "BDF"
+
+
+def test_apply_project_payload_invalid_tolerances_reset_runtime_values_to_defaults(main_window):
     payload = main_window._serialize_project_state()
     payload["solver"] = "BDF"
     payload["rtol"] = "bad-rtol"
     payload["atol"] = "bad-atol"
 
-    main_window._solver_method_combo.setCurrentText("LSODA")
+    main_window._solver_method_combo.setCurrentText("BDF")
     main_window._initial_rtol = 1e-6
     main_window._initial_atol = 1e-12
 
@@ -671,12 +694,12 @@ def test_dialog_update_user_preference_roundtrips(main_window):
     settings.sync()
 
     main_window.config_controller.load_settings()
-    main_window.config_controller.update_user_preference("solver", "LSODA")
+    main_window.config_controller.update_user_preference("solver", "BDF")
     main_window.config_controller.update_user_preference("rtol", 1e-8)
 
     main_window.config_controller.save_settings()
 
-    assert settings.value("simulation/solver") == "LSODA"
+    assert settings.value("simulation/solver") == "BDF"
     assert settings.value("simulation/rtol", type=float) == pytest.approx(1e-8)
 
 

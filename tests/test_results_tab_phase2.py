@@ -179,7 +179,7 @@ def _make_params_tab(parameter_state: list[dict]) -> QtWidgets.QWidget:
         worker_running_getter=lambda: False,
         dataset_manager_getter=lambda: None,
         reactions_text_getter=lambda: "",
-        integration_defaults=("LSODA", 1e-6, 1e-12),
+        integration_defaults=("BDF", 1e-6, 1e-12),
         config_defaults={},
         ic_panel=species_table,
     )
@@ -952,7 +952,7 @@ def test_existing_summary_api_is_preserved(qt_app):
 
     tab = RunResultsTab(parent=None)
     try:
-        tab.set_run_stamp({"solver": "LSODA"}, "abc123hash", "abc123")
+        tab.set_run_stamp({"solver": "BDF"}, "abc123hash", "abc123")
         tab.update_statistics({"Datasets": 3, "SSQ": 1.5})
         tab.open_results_summary_dialog()
         qt_app.processEvents()

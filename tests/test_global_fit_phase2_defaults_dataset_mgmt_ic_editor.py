@@ -1606,7 +1606,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
         first_simulation = captured_runs[0]["kwargs"]["fit_evaluator"]
         first_result = first_simulation({"k1": 0.2, "init:A": 1.0})
@@ -1624,7 +1624,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
 
         second_simulation = captured_runs[1]["kwargs"]["fit_evaluator"]
@@ -1700,7 +1700,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1713,7 +1713,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _parameter_table_names(window) == ["k2"]
         assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k2"]
@@ -1782,7 +1782,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1795,7 +1795,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _ic_table_species(window) == ["A", "C"]
         table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")
@@ -1875,7 +1875,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         assert "init:A" in config["parameters"]
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1888,7 +1888,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert "Global A_0" in _parameter_table_names(window)
 
@@ -1971,7 +1971,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1984,7 +1984,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
 
         rows_after = _parameter_table_rows(window)
@@ -2064,13 +2064,13 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         main_window._mechanism_editor._reactions_text.setPlainText("")
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="LSODA", rtol=1e-6, atol=1e-12)
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
         assert warning_calls
         assert warning_calls[-1] == ("Global Fit", "Mechanism text is empty.")

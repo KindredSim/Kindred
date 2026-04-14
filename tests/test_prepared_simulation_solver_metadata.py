@@ -25,9 +25,9 @@ def test_build_prepared_simulation_meta_uses_typed_metadata_object() -> None:
 
     assert isinstance(meta, PreparedSimulationMetadata)
     assert meta.solver_requested == "unknown_solver_name"
-    assert meta.solver_normalized == "Radau"
+    assert meta.solver_normalized == "BDF"
     assert meta.param_names == ["k1"]
     serialized = meta.to_serializable_dict()
     assert serialized["solver_requested"] == "unknown_solver_name"
-    assert serialized["solver_normalized"] == "Radau"
+    assert serialized["solver_normalized"] == "BDF"
     assert "solver" not in serialized

@@ -92,7 +92,7 @@ def test_prepare_simulation_worker_run_rejects_unknown_prepared_payload_version(
             mechanism_text="reaction: A -> A; k=1.0",
             initials={"A": 1.0},
             t_span=(0.0, 1.0),
-            solver_config={"solver": "LSODA", "grid": {"N": 5}},
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
             prepared_payload={
                 "version": 99,
                 "mechanism": mechanism,
@@ -162,7 +162,7 @@ def test_prepare_simulation_worker_run_accepts_structured_execution_request_with
             },
             initials={"A": 3.0},
             t_span=(0.0, 1.0),
-            solver_config={"solver": "LSODA", "grid": {"N": 5}},
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
             mechanism_text="",
             simulation_identity={"schema_id": "schema", "param_fingerprint": "fingerprint"},
         )
@@ -224,7 +224,7 @@ def test_prepare_simulation_worker_run_structured_prepared_request_ignores_stale
             },
             initials={"A": 3.0},
             t_span=(0.0, 1.0),
-            solver_config={"solver": "LSODA", "grid": {"N": 5}},
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
             mechanism_text="reaction: A -> B; k=PRIMARY",
             simulation_identity={"schema_id": "schema", "param_fingerprint": "fingerprint"},
         )
@@ -274,7 +274,7 @@ def test_prepare_simulation_worker_run_keeps_energy_prepared_request_authoritati
             prepared_payload=bound.as_serializable_execution_payload(),
             initials={"A": 3.0},
             t_span=(0.0, 1.0),
-            solver_config={"solver": "LSODA", "grid": {"N": 5}},
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
             mechanism_text="reaction: A -> B; k=PRIMARY",
             simulation_identity={"schema_id": "schema", "param_fingerprint": "fingerprint"},
         )
@@ -301,7 +301,7 @@ def test_fitting_preparation_uses_same_failure_stage_as_simulation_preparation()
             mechanism_text="reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
             initials={"A": 1.0, "B": 0.0},
             t_span=(0.0, 1.0),
-            solver_config={"solver": "LSODA", "rtol": 0.0, "grid": {"N": 5}},
+            solver_config={"solver": "BDF", "rtol": 0.0, "grid": {"N": 5}},
         )
 
     objective = build_fitting_objective(
@@ -310,7 +310,7 @@ def test_fitting_preparation_uses_same_failure_stage_as_simulation_preparation()
         t_exp=np.asarray([0.0, 1.0], dtype=float),
         y_exp=np.asarray([0.0, 1.0], dtype=float),
         target_species="B",
-        solver="LSODA",
+        solver="BDF",
         rtol=0.0,
     )
 

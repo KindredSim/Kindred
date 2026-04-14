@@ -32,8 +32,8 @@ def _make_window(*, selected_species: list[str]):
         t_end=1.0,
         num_points=6,
         temperature_K=298.15,
-        solver_requested="LSODA",
-        solver_normalized="LSODA",
+        solver_requested="BDF",
+        solver_normalized="BDF",
         solver_warning=None,
         rtol=1e-6,
         atol=1e-12,
@@ -148,8 +148,8 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         assert hasattr(rrt, "_last_run_stamp")
         assert rrt._last_run_stamp["fit_targets_applied"]["ds1"] == ["A"]
         assert rrt._last_run_stamp.get("prepared_simulation") is not None
-        assert rrt._last_run_stamp["prepared_simulation"]["solver_requested"] == "LSODA"
-        assert rrt._last_run_stamp["prepared_simulation"]["solver_normalized"] == "LSODA"
+        assert rrt._last_run_stamp["prepared_simulation"]["solver_requested"] == "BDF"
+        assert rrt._last_run_stamp["prepared_simulation"]["solver_normalized"] == "BDF"
         assert "solver" not in rrt._last_run_stamp["prepared_simulation"]
         assert rrt._last_run_stamp.get("kindred_version") == kindred_version
         assert rrt._last_run_stamp.get("dataset_params") is not None
@@ -242,8 +242,8 @@ def test_run_stamp_hash_stable_across_dataset_orderings():
         t_end=1.0,
         num_points=6,
         temperature_K=298.15,
-        solver_requested="LSODA",
-        solver_normalized="LSODA",
+        solver_requested="BDF",
+        solver_normalized="BDF",
         solver_warning=None,
         rtol=1e-6,
         atol=1e-12,
@@ -259,8 +259,8 @@ def test_run_stamp_hash_stable_across_dataset_orderings():
         t_end=1.0,
         num_points=6,
         temperature_K=298.15,
-        solver_requested="LSODA",
-        solver_normalized="LSODA",
+        solver_requested="BDF",
+        solver_normalized="BDF",
         solver_warning=None,
         rtol=1e-6,
         atol=1e-12,

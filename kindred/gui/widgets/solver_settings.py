@@ -3,9 +3,9 @@ Simulation Settings dialog.
 
 Current dialog contract
 -----------------------
-- Exposes SciPy `solve_ivp` solver selection restricted to `LSODA`, `Radau`,
-  and `BDF`, plus tolerances (rtol/atol) and the sparse-J toggle for
-  supported stiff solvers.
+- Exposes SciPy `solve_ivp` solver selection restricted to `Radau` and `BDF`,
+  plus tolerances (rtol/atol) and the sparse-J toggle for supported stiff
+  solvers.
 - Exposes slider-preview defaults separately from the main run controls:
   preview solver, preview point count, and preview debounce timings.
 - Does NOT expose temperature, t_end, or point-grid controls (those are surfaced
@@ -31,6 +31,7 @@ Returned schema
 from __future__ import annotations
 
 import logging
+import math
 from typing import Dict, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["SolverSettingsDialog"]
 
 
-_SOLVERS = ["LSODA", "Radau", "BDF"]
+_SOLVERS = ["Radau", "BDF"]
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
@@ -81,9 +82,9 @@ class SolverSettingsDialog(QtWidgets.QDialog):
 
         self._combo_solver = QtWidgets.QComboBox(self)
         self._combo_solver.addItems(_SOLVERS)
-        self._combo_solver.setCurrentText("Radau")
+        self._combo_solver.setCurrentText("BDF")
         self._combo_solver.setMaximumWidth(max_input_width)
-        self._combo_solver.setToolTip("ODE integration method. Radau and BDF are implicit (stiff-capable). LSODA auto-switches.")
+        self._combo_solver.setToolTip("ODE integration method. Radau and BDF are implicit and stiff-capable.")
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Solver:", self))
         row.addWidget(self._combo_solver)
@@ -153,7 +154,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
 
         self._combo_slider_preview_solver = QtWidgets.QComboBox(self)
         self._combo_slider_preview_solver.addItems(_SOLVERS)
-        self._combo_slider_preview_solver.setCurrentText("LSODA")
+        self._combo_slider_preview_solver.setCurrentText("BDF")
         self._combo_slider_preview_solver.setMaximumWidth(max_input_width)
         self._combo_slider_preview_solver.setToolTip("ODE solver used for fast slider preview simulations.")
         row = QtWidgets.QHBoxLayout()
@@ -452,7 +453,26 @@ class SolverSettingsDialog(QtWidgets.QDialog):
 
     def set_settings(self, cfg: Dict) -> None:
         cfg = dict(cfg or {})
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+
+        def _coerce_positive_float(value: object, *, default: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return float(default)
+            if not math.isfinite(parsed) or parsed <= 0.0:
+                return float(default)
+            return float(parsed)
+
+        def _coerce_bool(value: object) -> bool:
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "on"}:
+                    return True
+                if normalized in {"", "0", "false", "no", "off"}:
+                    return False
+                return False
+            return bool(value)
 
         cfg.setdefault("solver", str(DEFAULT_SOLVER_NAME))
         cfg.setdefault("rtol", 1e-6)
@@ -461,34 +481,28 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         cfg.setdefault("wegscheider_cyclicity_enabled", False)
         cfg.setdefault("max_parallel_batch_workers", 12)
         cfg.setdefault("limit_blas_threads_per_worker", True)
-        cfg.setdefault("slider_preview_solver", "LSODA")
+        cfg.setdefault("slider_preview_solver", "BDF")
         cfg.setdefault("slider_preview_points", 100)
         cfg.setdefault("parameter_preview_debounce_ms", 80)
         cfg.setdefault("equilibrium_preview_debounce_ms", 150)
         cfg.setdefault("result_cache_cap", None)
         cfg.setdefault("preview_cache_cap", None)
-        solver = cfg.get("solver")
-        if solver in _SOLVERS:
-            self._combo_solver.setCurrentText(str(solver))
+        solver_name, _warning = normalize_solver_name(cfg.get("solver", DEFAULT_SOLVER_NAME))
+        self._combo_solver.setCurrentText(solver_name)
 
-        rtol = cfg.get("rtol")
-        if isinstance(rtol, (int, float)) and rtol > 0:
-            self._spin_rtol.setValue(float(rtol))
-        atol = cfg.get("atol")
-        if isinstance(atol, (int, float)) and atol > 0:
-            self._spin_atol.setValue(float(atol))
+        self._spin_rtol.setValue(_coerce_positive_float(cfg.get("rtol"), default=1e-6))
+        self._spin_atol.setValue(_coerce_positive_float(cfg.get("atol"), default=1e-12))
 
-        self._sparse_checkbox.setChecked(bool(cfg.get("use_sparse_jacobian")))
-        self._wegscheider_checkbox.setChecked(bool(cfg.get("wegscheider_cyclicity_enabled")))
+        self._sparse_checkbox.setChecked(_coerce_bool(cfg.get("use_sparse_jacobian")))
+        self._wegscheider_checkbox.setChecked(_coerce_bool(cfg.get("wegscheider_cyclicity_enabled")))
         try:
             workers = int(cfg.get("max_parallel_batch_workers", 12))
         except Exception:
             workers = 12
         self._max_parallel_workers_spin.setValue(max(1, workers))
-        self._limit_blas_checkbox.setChecked(bool(cfg.get("limit_blas_threads_per_worker", True)))
-        slider_preview_solver = cfg.get("slider_preview_solver")
-        if slider_preview_solver in _SOLVERS:
-            self._combo_slider_preview_solver.setCurrentText(str(slider_preview_solver))
+        self._limit_blas_checkbox.setChecked(_coerce_bool(cfg.get("limit_blas_threads_per_worker", True)))
+        slider_solver_name, _warning = normalize_solver_name(cfg.get("slider_preview_solver", DEFAULT_SOLVER_NAME))
+        self._combo_slider_preview_solver.setCurrentText(slider_solver_name)
         try:
             slider_preview_points = int(cfg.get("slider_preview_points", 100))
         except Exception:

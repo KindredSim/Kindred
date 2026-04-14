@@ -70,7 +70,6 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
     # Count session-level fitting execution-context construction at the launch boundary.
     import kindred.gui.fitting.launch as fitting_launch
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
-    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
 
     counts = {"build_context": 0}
     _orig_prepare_fitting_execution_context = fitting_launch.prepare_fitting_execution_context
@@ -102,7 +101,6 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
     sim_func = captured["kwargs"]["simulation_func"]
     assert isinstance(sim_func, SerialFittingEvaluator)
     assert type(sim_func) is SerialFittingEvaluator
-    assert fitting_process_lane_payload_from_evaluator(sim_func) is not None
     assert counts["build_context"] == 1
 
     for k in (0.05, 0.1, 0.2, 0.4, 0.8):

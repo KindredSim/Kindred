@@ -612,7 +612,7 @@ def mw(qt_app) -> _FakeMainWindow:
     window._sim_progress = _FakeProgress()
     window._temperature_spinbox = _FakeSpinBox(298.15)
     window._num_points_spinbox = _FakeSpinBox(100.0)
-    window._initial_solver = "LSODA"
+    window._initial_solver = "BDF"
     window._initial_rtol = 1e-6
     window._initial_atol = 1e-12
     window._last_fit_metadata = None
@@ -2329,7 +2329,7 @@ def test_superseded_future_error_does_not_abort_active_run(controller: Simulatio
         "request_id": 23,
         "full_dsl": "reaction: A -> B; k=1",
         "mechanism_signature": "sig",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "effective_workers": 2,
         "fast_mode": False,
@@ -2954,7 +2954,7 @@ def test_consume_parallel_batch_future_exception_tears_down_pool_and_next_parall
         "request_id": 11,
         "full_dsl": "reaction: A -> B; k=1",
         "mechanism_signature": "sig",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "effective_workers": 2,
         "fast_mode": False,
@@ -3324,7 +3324,7 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
     mw._mechanism_editor = _MechanismEditor()
     mw._apply_overrides_to_text = MagicMock(side_effect=lambda t: t)
     mw._apply_overrides_to_state_network_dsl = MagicMock(side_effect=lambda t: t)
-    mw._initial_solver = "LSODA"
+    mw._initial_solver = "BDF"
     mw._initial_rtol = 1e-6
     mw._initial_atol = 1e-12
     mw._parse_sim_time_seconds.return_value = 10.0
@@ -3427,7 +3427,7 @@ def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_in
     mw._mechanism_editor = _MechanismEditor()
     mw._apply_overrides_to_text = MagicMock(side_effect=lambda t: t)
     mw._apply_overrides_to_state_network_dsl = MagicMock(side_effect=lambda t: t)
-    mw._initial_solver = "LSODA"
+    mw._initial_solver = "BDF"
     mw._initial_rtol = 1e-6
     mw._initial_atol = 1e-12
     mw._parse_sim_time_seconds.return_value = 10.0
@@ -4213,7 +4213,7 @@ def test_start_next_batch_simulation_explicit_run_ignores_staged_concentration_o
         "queue_ids": ["id2"],
         "queue_names": ["set2"],
         "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,
         "request_id": 7,
@@ -4270,7 +4270,7 @@ def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentrat
         "request_id": 11,
         "full_dsl": "reaction: A -> B; k=1",
         "mechanism_signature": "sig",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "effective_workers": 2,
         "fast_mode": False,
@@ -4325,7 +4325,7 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
         "full_dsl": "reaction: A -> B; k=1",
         "mechanism_signature": "sig",
         "mechanism_signature_by_set_id": {"id1": "sig-1", "id2": "sig-2"},
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "effective_workers": 2,
         "fast_mode": False,
@@ -4399,12 +4399,12 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
                 "prepared_payload": {"version": 2, "prepared_for": "id2"},
                 "initials": {"A": 1.5},
                 "t_span": (0.0, 10.0),
-                "solver_config": {"solver": "LSODA"},
+                "solver_config": {"solver": "BDF"},
                 "mechanism_text": "reaction: A -> B; k=3",
                 "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
             },
         },
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": True,
         "request_id": 7,
@@ -4482,7 +4482,7 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
         },
         "execution_request": None,
         "execution_request_by_set_id": {},
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": True,
         "request_id": 11,
@@ -4572,7 +4572,7 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_exec
                 "simulation_identity": {"schema_id": "schema-a", "param_fingerprint": "fingerprint-a"},
             },
         },
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": True,
         "request_id": 12,
@@ -4588,7 +4588,7 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_exec
     assert created["prepared"] is None
     assert created["mechanism_text"] == "reaction: A -> B; k=3"
     assert created["initials"] == {"A": 4.0}
-    assert created["solver_config"] == {"solver": "LSODA"}
+    assert created["solver_config"] == {"solver": "BDF"}
     assert created["started"] is True
     assert getattr(controller._simulation_worker, "_execution_request", None) is None
 
@@ -4646,7 +4646,7 @@ def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fall
         "mechanism_signature_by_set_id": {"id1": "sig-1"},
         "prepared": None,
         "prepared_by_set_id": {},
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": True,
         "request_id": 9,
@@ -4710,7 +4710,7 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
         "mechanism_signature_by_set_id": {"id1": "sig-1"},
         "prepared": None,
         "prepared_by_set_id": {},
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": True,
         "request_id": 9,
@@ -4723,7 +4723,7 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
                 "schema_id": "schema-preview",
                 "param_fingerprint": "params-id1",
                 "solver": {
-                    "solver": "LSODA",
+                    "solver": "BDF",
                     "rtol": 1e-6,
                     "atol": 1e-12,
                     "grid_n": 100,
@@ -4795,7 +4795,7 @@ def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_se
         "queue_ids": ["id1"],
         "queue_names": ["randomname3"],
         "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,
         "request_id": 7,
@@ -4852,7 +4852,7 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
         "request_id": 11,
         "full_dsl": "reaction: A -> B; k=1",
         "mechanism_signature": "sig",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "effective_workers": 2,
         "fast_mode": False,
@@ -5176,7 +5176,7 @@ def test_start_next_batch_simulation_invalid_initials_after_pending_init_migrati
         "queue_ids": ["id1"],
         "queue_names": ["set1"],
         "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,
         "request_id": 7,
@@ -5226,7 +5226,7 @@ def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_mi
         "request_id": 11,
         "full_dsl": "reaction: A -> B; k=1",
         "mechanism_signature": "sig",
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "effective_workers": 2,
         "fast_mode": False,
@@ -5352,7 +5352,7 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
     mw._batch_preferred_primary_set_id.return_value = "id1"
     mw._batch_cache_key.return_value = "ck"
     mw._mechanism_editor = _MechanismEditor()
-    mw._initial_solver = "LSODA"
+    mw._initial_solver = "BDF"
     mw._initial_rtol = 1e-6
     mw._initial_atol = 1e-12
     mw._parse_sim_time_seconds.return_value = 10.0
@@ -6577,7 +6577,7 @@ def test_on_simulation_complete_uses_truthful_scipy_fallback_warning_text(
 
     result = _successful_result_payload()
     result["fallback_occurred"] = True
-    result["fallback_message"] = "LSODA failed; succeeded with Radau"
+    result["fallback_message"] = "BDF failed; succeeded with Radau"
 
     controller._on_simulation_complete(
         result,
@@ -6591,7 +6591,7 @@ def test_on_simulation_complete_uses_truthful_scipy_fallback_warning_text(
 
     assert warnings == [("Solver fallback", warnings[0][1])]
     message = warnings[0][1]
-    assert "LSODA failed; succeeded with Radau" in message
+    assert "BDF failed; succeeded with Radau" in message
     assert "alternative stiff SciPy solver" in message
     assert "RK4" not in message
     assert "fixed-step" not in message
@@ -7042,7 +7042,7 @@ def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
         "prepared_by_set_id": {
             "id1": {"prepared_for": "id1", "version": 1},
         },
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,  # explicit run
         "request_id": 42,
@@ -7104,12 +7104,12 @@ def test_start_next_batch_simulation_non_fast_mode_sets_structured_execution_req
                 "prepared_payload": {"version": 1, "prepared_for": "id1"},
                 "initials": {"A": 3.0},
                 "t_span": (0.0, 10.0),
-                "solver_config": {"solver": "LSODA"},
+                "solver_config": {"solver": "BDF"},
                 "mechanism_text": "reaction: A -> B; k=1",
                 "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
             },
         },
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,
         "request_id": 42,
@@ -7175,12 +7175,12 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
                 "prepared_payload": {"version": 1, "prepared_for": "id2"},
                 "initials": {"A": 3.0},
                 "t_span": (0.0, 10.0),
-                "solver_config": {"solver": "LSODA"},
+                "solver_config": {"solver": "BDF"},
                 "mechanism_text": "reaction: A -> B; k=2",
                 "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
             },
         },
-        "solver_config": {"solver": "LSODA"},
+        "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,
         "request_id": 42,

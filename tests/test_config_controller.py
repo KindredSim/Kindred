@@ -174,7 +174,7 @@ def test_save_then_load_settings_round_trip(main_window):
     main_window._sim_time_spinbox.setText("1.0")
     main_window._num_points_spinbox.setValue(1)
     main_window._mechanism_editor.set_slider_points_value(100)
-    main_window._mechanism_editor.set_slider_solver_value("LSODA")
+    main_window._mechanism_editor.set_slider_solver_value("BDF")
     main_window._use_sparse_jacobian = False
     main_window._wegscheider_cyclicity_enabled = False
     main_window.simulation_controller.parallel_batch.max_parallel_workers = 1
@@ -648,7 +648,7 @@ def test_compact_on_screen_sliders_dock_floating_state_round_trips_via_window_st
 def test_explicit_startup_solver_overrides_survive_settings_load(main_window, qt_app):
     settings = QtCore.QSettings("Kindred", "KindredGUI")
     settings.clear()
-    settings.setValue("simulation/solver", "LSODA")
+    settings.setValue("simulation/solver", "BDF")
     settings.setValue("simulation/rtol", "1e-4")
     settings.setValue("simulation/atol", "1e-7")
     settings.sync()

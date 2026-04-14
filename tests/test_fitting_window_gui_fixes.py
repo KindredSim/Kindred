@@ -93,8 +93,8 @@ def _make_window():
         t_end=1.0,
         num_points=6,
         temperature_K=298.15,
-        solver_requested="LSODA",
-        solver_normalized="LSODA",
+        solver_requested="BDF",
+        solver_normalized="BDF",
         solver_warning=None,
         rtol=1e-6,
         atol=1e-12,
@@ -173,7 +173,7 @@ def test_parameters_tab_has_no_splitter_after_ic_extraction(qt_app):
         worker_running_getter=lambda: False,
         dataset_manager_getter=lambda: None,
         reactions_text_getter=lambda: "",
-        integration_defaults=("LSODA", 1e-6, 1e-12),
+        integration_defaults=("BDF", 1e-6, 1e-12),
         config_defaults={},
     )
     try:

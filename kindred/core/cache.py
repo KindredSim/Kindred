@@ -882,7 +882,7 @@ from kindred.core.results import integrate_ctc
 
 # Decorate simulation function
 @cache_simulation(maxsize=256)
-def run_simulation(mechanism, t_span=(0, 100), solver='LSODA', rtol=1e-6):
+def run_simulation(mechanism, t_span=(0, 100), solver='BDF', rtol=1e-6):
     return integrate_ctc(mechanism, t_span, solver=solver, rtol=rtol)
 
 # First run: cache miss

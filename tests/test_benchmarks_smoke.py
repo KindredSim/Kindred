@@ -24,7 +24,7 @@ def test_nonstiff_case_simulates_without_regression():
         t_span=(0.0, 4.0),
         y0=y0,
         grid={"N": 12},
-        solver="LSODA",
+        solver="BDF",
         rtol=1e-7,
         atol=1e-10,
     )

@@ -9,9 +9,8 @@ This module provides:
 """
 
 import logging
-import threading
 import numpy as np
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 from PySide6 import QtCore
 from PySide6.QtCore import Signal
 
@@ -28,31 +27,6 @@ from kindred.core.simulation_result_payload import (
 )
 
 logger = logging.getLogger(__name__)
-
-_LSODA_LOCK = threading.Lock()
-
-def _acquire_lock_polling(
-    lock: threading.Lock,
-    *,
-    cancelled: Callable[[], bool],
-    timeout_s: float = 0.5,
-) -> bool:
-    """
-    Acquire *lock* using a timed polling loop.
-
-    Returns True when acquired, False when cancelled before acquisition.
-    """
-    acquired = False
-    while not acquired:
-        if cancelled():
-            return False
-        acquired = bool(lock.acquire(timeout=float(timeout_s)))
-    return True
-
-def _release_lock_if_acquired(lock: threading.Lock, acquired: bool) -> None:
-    """Release *lock* only when *acquired* is True."""
-    if bool(acquired):
-        lock.release()
 
 
 class SimulationWorker(QtCore.QThread):
@@ -100,7 +74,7 @@ class SimulationWorker(QtCore.QThread):
             initials: Initial conditions {species: concentration}
             t_span: Time span (t_start, t_end)
             solver_config: Solver configuration:
-                - solver: 'LSODA', 'Radau', or 'BDF'
+                - solver: 'Radau' or 'BDF'
                 - rtol: Relative tolerance (default: 1e-6)
                 - atol: Absolute tolerance (default: 1e-12)
                 - grid: Grid configuration (default: {'N': 100})
@@ -186,22 +160,9 @@ class SimulationWorker(QtCore.QThread):
             return None
 
     def _solve_prepared_request(self, *, solve_ode, request) -> object:  # noqa: ANN001
-        solver_upper = str(getattr(request, "solver", "") or "").upper()
-        if solver_upper != "LSODA":
-            return solve_ode(request)
-        lock_acquired = _acquire_lock_polling(
-            _LSODA_LOCK,
-            cancelled=lambda: bool(self._cancelled),
-            timeout_s=0.5,
-        )
-        if not lock_acquired:
+        if self._cancelled:
             raise SimulationCancelled()
-        try:
-            if self._cancelled:
-                raise SimulationCancelled()
-            return solve_ode(request)
-        finally:
-            _release_lock_if_acquired(_LSODA_LOCK, lock_acquired)
+        return solve_ode(request)
 
     def _evaluate_algebra_outputs(
         self,

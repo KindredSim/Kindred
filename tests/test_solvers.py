@@ -110,7 +110,7 @@ def test_solve_ode_scipy_path_injects_temperature_calls_progress_sets_note_and_c
 
     assert calls["progress"] == 11
     assert all(t >= 300.0 for t in calls["rhs_T"])
-    assert out.provenance["emulation_note"] == "Unknown solver name; using Radau"
+    assert out.provenance["emulation_note"] == "Unknown solver name; using BDF"
     assert out.provenance["temperature_schedule"] == "TempSchedule(str)"
     assert out.provenance["events"] == [[0.5]]
     assert float(out.Y[0, 0]) == 0.0
@@ -207,14 +207,31 @@ def test_solve_ode_progress_callback_cancellation_propagates(monkeypatch):
         )
 
 
-def test_scipy_method_for_maps_ros_to_radau_with_note():
+def test_scipy_method_for_unknown_names_fall_back_to_bdf_with_note():
     method, note = solvers._scipy_method_for("ROS3")
-    assert method == "Radau"
-    assert note and "deprecated" in note
+    assert method == "BDF"
+    assert note == "Unknown solver name; using BDF"
 
     method2, note2 = solvers._scipy_method_for("ROS4")
-    assert method2 == "Radau"
-    assert note2 and "deprecated" in note2
+    assert method2 == "BDF"
+    assert note2 == "Unknown solver name; using BDF"
+
+
+@pytest.mark.parametrize(
+    ("solver_name", "expected"),
+    [
+        ("", ("BDF", "Unknown solver name; using BDF")),
+        (None, ("BDF", "Unknown solver name; using BDF")),
+        ("   ", ("BDF", "Unknown solver name; using BDF")),
+        ("legacy_solver", ("BDF", "Unknown solver name; using BDF")),
+        ("LEGACY_SOLVER", ("BDF", "Unknown solver name; using BDF")),
+        ("Legacy_Solver", ("BDF", "Unknown solver name; using BDF")),
+        (123, ("BDF", "Unknown solver name; using BDF")),
+        ("x" * 10000, ("BDF", "Unknown solver name; using BDF")),
+    ],
+)
+def test_normalize_solver_name_handles_unknown_inputs(solver_name, expected):
+    assert solvers.normalize_solver_name(solver_name) == expected
 
 
 def test_make_scipy_jac_converts_real_banded_storage_to_dense():
@@ -226,33 +243,6 @@ def test_make_scipy_jac_converts_real_banded_storage_to_dense():
     Jd = jac(0.0, np.array([1.0, 2.0]))
     assert Jd.shape == (2, 2)
     assert np.allclose(Jd, np.array([[-2.0, 1.0], [1.0, -3.0]]))
-
-
-def test_solve_ode_lsoda_omits_jac_and_jac_sparsity_for_banded_config(monkeypatch):
-    seen = {}
-
-    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
-        seen.update(kwargs)
-        t_eval = np.asarray(kwargs["t_eval"], float)
-        y = np.vstack([np.ones_like(t_eval), np.ones_like(t_eval)])
-        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
-
-    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
-
-    req = solvers.SimulationRequest(
-        rhs=lambda _t, y: np.array([-2.0 * y[0] + y[1], y[0] - 3.0 * y[1]]),
-        t_span=(0.0, 1.0),
-        y0=np.array([1.0, 2.0]),
-        solver="LSODA",
-        t_eval=np.array([0.0, 1.0]),
-        rosenbrock_jacobian=JacobianConfig(mode="banded", ml=1, mu=1),
-    )
-
-    solvers.solve_ode(req)
-
-    assert seen["method"] == "LSODA"
-    assert "jac" not in seen
-    assert "jac_sparsity" not in seen
 
 
 def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
@@ -312,13 +302,13 @@ def test_solve_ode_exercises_implicit_alternatives_and_raises_after_exhaustion(m
                 rhs=lambda t, y: -y,
                 t_span=(0.0, 1.0),
                 y0=np.array([1.0]),
-                solver="LSODA",
+                solver="BDF",
                 grid={"N": 2},
             )
         )
 
-    assert calls == ["LSODA", "Radau", "BDF"]
-    assert "attempted methods: LSODA, Radau, BDF" in str(exc_info.value)
+    assert calls == ["BDF", "Radau"]
+    assert "attempted methods: BDF, Radau" in str(exc_info.value)
 
 
 def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
@@ -336,8 +326,8 @@ def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
         method = kwargs.get("method")
         calls.append(method)
         t_eval = np.asarray(kwargs["t_eval"], float)
-        if method == "LSODA":
-            return DummySolution(success=False, message="LSODA failure", t_eval=t_eval[:1])
+        if method == "BDF":
+            return DummySolution(success=False, message="BDF failure", t_eval=t_eval[:1])
         return DummySolution(success=True, message="ok", t_eval=t_eval)
 
     monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
@@ -347,15 +337,15 @@ def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
             rhs=lambda t, y: -y,
             t_span=(0.0, 1.0),
             y0=np.array([1.0]),
-            solver="LSODA",
+            solver="BDF",
             grid={"N": 2},
         )
     )
 
-    assert calls == ["LSODA", "Radau"]
+    assert calls == ["BDF", "Radau"]
     assert out.fallback_occurred is True
     assert out.provenance["solver_alternative_used"] == "Radau"
-    assert out.provenance["solver_requested"] == "LSODA"
+    assert out.provenance["solver_requested"] == "BDF"
     assert out.provenance["solver_used"] == "Radau"
     assert "solver" not in out.provenance
 

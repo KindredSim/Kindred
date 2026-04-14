@@ -118,7 +118,7 @@ def test_cache_hits_for_identical_requests():
         rhs=rhs,
         t_span=(0.0, 1.0),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         rtol=1e-6,
         atol=1e-12,
         grid={"N": 25},

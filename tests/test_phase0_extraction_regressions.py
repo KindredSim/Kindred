@@ -43,7 +43,7 @@ def _make_data_tab(*, worker_running=False):
 # Helpers — ParametersIcsTab
 # ---------------------------------------------------------------------------
 
-def _make_params_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12),
+def _make_params_tab(*, integration_defaults=("BDF", 1e-6, 1e-12),
                      entries=None, species=None):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
     from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
@@ -163,11 +163,11 @@ def test_remove_button_disabled_during_active_fit(qt_app):
 
 def test_integration_defaults_from_active_method(qt_app):
     """ParametersIcsTab populates rtol/atol fields from integration_defaults tuple."""
-    tab = _make_params_tab(integration_defaults=("LSODA", 1e-3, 1e-9))
+    tab = _make_params_tab(integration_defaults=("BDF", 1e-3, 1e-9))
     try:
         assert tab._integration_rtol_edit.text() == "0.001"
         assert tab._integration_atol_edit.text() == "1e-9"
-        assert tab._integration_solver_combo.currentText() == "LSODA"
+        assert tab._integration_solver_combo.currentText() == "BDF"
     finally:
         tab.close()
         qt_app.processEvents()

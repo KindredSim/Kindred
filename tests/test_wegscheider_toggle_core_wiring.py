@@ -58,7 +58,7 @@ def test_build_fitting_objective_accepts_toggle_and_enforces_cyclicity():
         target_species="A",
         temperature_K=298.15,
         initials={},
-        solver="LSODA",
+        solver="BDF",
         rtol=1e-6,
         atol=1e-12,
         wegscheider_cyclicity_enabled=True,

@@ -41,7 +41,7 @@ from .jacobian import JacobianConfig, compute_jacobian
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SOLVER_NAME = "Radau"
+DEFAULT_SOLVER_NAME = "BDF"
 
 
 def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[float, float], y0: np.ndarray, **kwargs: Any):
@@ -104,26 +104,23 @@ class SimulationOutput:
     fallback_message: Optional[str] = None
 
 
-def _scipy_method_for(name: str) -> Tuple[str, Optional[str]]:
+def _scipy_method_for(name: object) -> Tuple[str, Optional[str]]:
     """Map solver name to SciPy method name with correct capitalization."""
-    n = name.upper()
+    n = str(name or "").strip().upper()
     scipy_methods = {
-        "LSODA": "LSODA",
         "RADAU": "Radau",
         "BDF": "BDF",
     }
     if n in scipy_methods:
         return scipy_methods[n], None
-    if n in ("ROS3", "ROS4"):
-        return DEFAULT_SOLVER_NAME, f"{n} deprecated; using {DEFAULT_SOLVER_NAME}"
     return DEFAULT_SOLVER_NAME, f"Unknown solver name; using {DEFAULT_SOLVER_NAME}"
 
 
-def normalize_solver_name(name: str) -> Tuple[str, Optional[str]]:
+def normalize_solver_name(name: object) -> Tuple[str, Optional[str]]:
     """
     Normalize a user-specified solver name to a SciPy `solve_ivp` method name.
 
-    Returns (method, warning). The warning is non-empty when a deprecated/unknown
+    Returns (method, warning). The warning is non-empty when an unknown
     name is mapped to a supported solver.
     """
     return _scipy_method_for(name)
@@ -258,9 +255,8 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
 
 def _implicit_scipy_alternatives(primary: str) -> List[str]:
     order = {
-        "LSODA": ["Radau", "BDF"],
-        "Radau": ["BDF"],
         "BDF": ["Radau"],
+        "Radau": ["BDF"],
     }
     return [m for m in order.get(primary, []) if m != primary]
 

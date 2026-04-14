@@ -91,11 +91,11 @@ def test_mechanism_helpers_snapshot_state_round_trips_through_owner_boundary() -
     helper = MainWindowMechanismHelpers(host)
     mechanism = object()
 
-    helper.remember_last_mechanism(mechanism, "reaction: A -> B; k=1.0", {"solver": "LSODA"})
+    helper.remember_last_mechanism(mechanism, "reaction: A -> B; k=1.0", {"solver": "BDF"})
 
     assert helper.last_mechanism() is mechanism
     assert helper.last_mechanism_context()["dsl_text"] == "reaction: A -> B; k=1.0"
-    assert helper.last_mechanism_context()["solver_config"] == {"solver": "LSODA"}
+    assert helper.last_mechanism_context()["solver_config"] == {"solver": "BDF"}
 
     helper.clear_last_mechanism()
 
@@ -106,11 +106,11 @@ def test_mechanism_helpers_snapshot_context_returns_copies() -> None:
     host = _FakeMechanismHost()
     helper = MainWindowMechanismHelpers(host)
 
-    helper.remember_last_mechanism(object(), "reaction: A -> B; k=1.0", {"solver": "LSODA"})
+    helper.remember_last_mechanism(object(), "reaction: A -> B; k=1.0", {"solver": "BDF"})
     snapshot = helper.last_mechanism_context()
     snapshot["solver_config"]["solver"] = "BDF"
 
-    assert helper.last_mechanism_context()["solver_config"] == {"solver": "LSODA"}
+    assert helper.last_mechanism_context()["solver_config"] == {"solver": "BDF"}
 
 
 def test_mechanism_helpers_delegate_full_controller_surface_without_storing_main_window() -> None:

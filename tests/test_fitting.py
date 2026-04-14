@@ -25,7 +25,7 @@ def test_de_penalty_scales_with_failure_time(monkeypatch):
 
     def objective(_params: np.ndarray) -> np.ndarray:
         try:
-            raise create_solver_error("LSODA", 0.25, "boom")
+            raise create_solver_error("BDF", 0.25, "boom")
         except Exception as cause:
             raise FitSimulationError("Sim failed") from cause
 

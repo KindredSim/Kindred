@@ -37,7 +37,7 @@ def test_simulation_worker_completes_small_decay(qtbot):
         mechanism,
         initials,
         (0.0, 1.5),
-        {"solver": "LSODA", "rtol": 1e-5, "atol": 1e-8, "grid": {"N": 40}},
+        {"solver": "BDF", "rtol": 1e-5, "atol": 1e-8, "grid": {"N": 40}},
     )
 
     with qtbot.waitSignal(worker.result_ready, timeout=5000) as blocker:
@@ -64,7 +64,7 @@ def test_simulation_worker_surfaces_solver_failure(monkeypatch, qtbot):
         mechanism,
         {"A": 1.0, "B": 0.0},
         (0.0, 0.5),
-        {"solver": "LSODA", "grid": {"N": 10}},
+        {"solver": "BDF", "grid": {"N": 10}},
     )
 
     with qtbot.waitSignal(worker.error, timeout=3000) as blocker:
@@ -78,7 +78,7 @@ def test_simulation_worker_surfaces_solver_failure(monkeypatch, qtbot):
 
 
 def test_simulation_worker_cancellation_wires_scipy_terminal_event(monkeypatch, qtbot):
-    """Regression: cancellation must not raise from progress callbacks (Fortran-unsafe for LSODA)."""
+    """Regression: cancellation must not raise from progress callbacks."""
     mechanism = "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0"
 
     def _fake_solve_ode(request):
@@ -106,7 +106,7 @@ def test_simulation_worker_cancellation_wires_scipy_terminal_event(monkeypatch, 
         mechanism,
         {"A": 1.0, "B": 0.0},
         (0.0, 1.0),
-        {"solver": "LSODA", "grid": {"N": 5}},
+        {"solver": "BDF", "grid": {"N": 5}},
     )
 
     with qtbot.waitSignal(worker.result_ready, timeout=3000) as blocker:
@@ -117,7 +117,7 @@ def test_simulation_worker_cancellation_wires_scipy_terminal_event(monkeypatch, 
     assert result["success"] is True
 
 
-def test_simulation_worker_treats_brentq_valueerror_during_cancellation_as_clean_exit(
+def test_simulation_worker_treats_brentq_valueerror_during_cancellation_as_clean_exit_radau(
     monkeypatch,
     qtbot,
 ):
@@ -134,7 +134,7 @@ def test_simulation_worker_treats_brentq_valueerror_during_cancellation_as_clean
         mechanism,
         {"A": 1.0, "B": 0.0},
         (0.0, 1.0),
-        {"solver": "LSODA", "grid": {"N": 5}},
+        {"solver": "BDF", "grid": {"N": 5}},
     )
 
     with qtbot.waitSignal(worker.error, timeout=3000) as blocker:
@@ -145,7 +145,7 @@ def test_simulation_worker_treats_brentq_valueerror_during_cancellation_as_clean
     assert blocker.args[0]["message"] == "Simulation cancelled by user"
 
 
-def test_simulation_worker_treats_brentq_valueerror_during_cancellation_as_clean_exit_non_lsoda(
+def test_simulation_worker_treats_brentq_valueerror_during_cancellation_as_clean_exit(
     monkeypatch,
     qtbot,
 ):
@@ -204,7 +204,7 @@ def test_simulation_worker_cancel_immediately_after_start_prevents_solve_entry(m
         mechanism,
         {"A": 1.0, "B": 0.0},
         (0.0, 1.0),
-        {"solver": "LSODA", "grid": {"N": 5}},
+        {"solver": "BDF", "grid": {"N": 5}},
     )
     worker.error.connect(lambda payload: errors.append(payload))
     worker.result_ready.connect(lambda payload: results.append(payload))

@@ -185,7 +185,7 @@ class ConfigController(QtCore.QObject):
         self._ui.set_num_points(num_points)
         slider_preview_points = self._read_int_setting(settings, "simulation/slider_preview_points", 100)
         self._ui.set_slider_preview_points(max(50, min(20000, slider_preview_points)))
-        slider_preview_solver = str(settings.value("simulation/slider_preview_solver", "LSODA") or "LSODA").strip() or "LSODA"
+        slider_preview_solver = str(settings.value("simulation/slider_preview_solver", "BDF") or "BDF").strip() or "BDF"
         self._ui.set_slider_preview_solver(slider_preview_solver)
         explicit_solver_value = self._ui.explicit_startup_solver_name()
         explicit_rtol_value = self._ui.explicit_startup_rtol()

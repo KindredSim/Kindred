@@ -25,7 +25,7 @@ def _build_simple_objective():
         t_exp=t_exp,
         y_exp=y_exp,
         target_species="B",
-        solver="LSODA",
+        solver="BDF",
     )
 
 
@@ -93,7 +93,7 @@ def test_objective_penalizes_nonfinite_simulation(monkeypatch):
         t_exp=t_exp,
         y_exp=y_exp,
         target_species="B",
-        solver="LSODA",
+        solver="BDF",
     )
 
     residuals = objective(np.array([0.25]))
@@ -138,7 +138,7 @@ def test_de_objective_penalizes_nonfinite(monkeypatch):
         t_exp=t_exp,
         y_exp=y_exp,
         target_species="B",
-        solver="LSODA",
+        solver="BDF",
     )
 
     result = fit_parameters(

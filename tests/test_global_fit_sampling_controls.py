@@ -94,7 +94,7 @@ def test_advanced_integration_settings_widgets_present(qt_app):
         assert atol_edit is not None
 
         items = [solver_combo.itemText(i) for i in range(solver_combo.count())]
-        assert items == ["LSODA", "Radau", "BDF"]
+        assert items == ["Radau", "BDF"]
         assert rtol_edit.text() == "1e-6"
         assert atol_edit.text() == "1e-12"
     finally:

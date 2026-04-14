@@ -79,7 +79,7 @@ def test_computational_mode_fast_equilibrium_is_reversible_in_simulation():
         rhs=rhs,
         t_span=(0.0, 1e-2),
         y0=y0,
-        solver="LSODA",
+        solver="BDF",
         rtol=1e-9,
         atol=1e-12,
         grid={"N": 200},

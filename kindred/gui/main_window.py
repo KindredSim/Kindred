@@ -1618,7 +1618,6 @@ class MainWindow(
         value: object,
         *,
         field_name: str,
-        current_value: Optional[float],
         default_value: float,
     ) -> Optional[float]:
         if value is None:
@@ -1626,13 +1625,11 @@ class MainWindow(
         try:
             parsed = float(value)
         except (TypeError, ValueError):
-            fallback = current_value if current_value is not None else default_value
-            logger.warning("Invalid solver tolerance %s=%r; keeping %s", field_name, value, fallback)
-            return current_value
+            logger.warning("Invalid solver tolerance %s=%r; using %s", field_name, value, default_value)
+            return float(default_value)
         if not math.isfinite(parsed) or parsed <= 0.0:
-            fallback = current_value if current_value is not None else default_value
-            logger.warning("Invalid solver tolerance %s=%r; keeping %s", field_name, value, fallback)
-            return current_value
+            logger.warning("Invalid solver tolerance %s=%r; using %s", field_name, value, default_value)
+            return float(default_value)
         return float(parsed)
 
     def _apply_solver_runtime_state(
@@ -1641,48 +1638,45 @@ class MainWindow(
         solver: object = _SOLVER_STATE_UNSET,
         rtol: object = _SOLVER_STATE_UNSET,
         atol: object = _SOLVER_STATE_UNSET,
-        sync_combo: bool = True,
     ) -> None:
         solver_contract = load_solver_contract()
 
         if solver is not _SOLVER_STATE_UNSET:
             solver_label = str(solver or "").strip() or solver_contract.default_solver_name
-            self._initial_solver = str(solver_label)
+            solver_method, _warning = solver_contract.normalize_solver_name(solver_label)
+            self._initial_solver = str(solver_method)
         if rtol is not _SOLVER_STATE_UNSET:
             self._initial_rtol = self._coerce_solver_tolerance(
                 rtol,
                 field_name="rtol",
-                current_value=self._initial_rtol,
                 default_value=1e-6,
             )
         if atol is not _SOLVER_STATE_UNSET:
             self._initial_atol = self._coerce_solver_tolerance(
                 atol,
                 field_name="atol",
-                current_value=self._initial_atol,
                 default_value=1e-12,
             )
 
-        if bool(sync_combo):
-            combo = getattr(self, "_solver_method_combo", None)
-            if combo is not None:
-                solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
-                combo.blockSignals(True)
-                try:
-                    idx = int(combo.findText(str(solver_label)))
-                    if idx >= 0:
-                        combo.setCurrentIndex(idx)
-                    else:
-                        default_idx = int(combo.findText(str(solver_contract.default_solver_name)))
-                        if default_idx >= 0:
-                            combo.setCurrentIndex(default_idx)
-                finally:
-                    combo.blockSignals(False)
+        combo = getattr(self, "_solver_method_combo", None)
+        if combo is not None:
+            solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip() or solver_contract.default_solver_name
+            combo.blockSignals(True)
+            try:
+                idx = int(combo.findText(str(solver_label)))
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                else:
+                    default_idx = int(combo.findText(str(solver_contract.default_solver_name)))
+                    if default_idx >= 0:
+                        combo.setCurrentIndex(default_idx)
+            finally:
+                combo.blockSignals(False)
 
         self._update_solver_summary_label()
 
     def _on_solver_method_changed(self, v: str) -> None:
-        self._apply_solver_runtime_state(solver=str(v), sync_combo=False)
+        self._apply_solver_runtime_state(solver=str(v))
         if not self._suppress_preference_updates:
             self.config_controller.update_user_preference("solver", self._initial_solver)
 
@@ -3866,13 +3860,11 @@ class MainWindow(
         solver: object = _SOLVER_STATE_UNSET,
         rtol: object = _SOLVER_STATE_UNSET,
         atol: object = _SOLVER_STATE_UNSET,
-        sync_combo: bool = True,
     ) -> None:
         self._apply_solver_runtime_state(
             solver=solver,
             rtol=rtol,
             atol=atol,
-            sync_combo=bool(sync_combo),
         )
 
     def add_to_recent_files(self, filepath: str) -> None:
@@ -8749,7 +8741,7 @@ class MainWindow(
             self._preview_session.variable_preview_debounce_ms("Keq1")
         )
         current_slider_preview_points = int(self._mechanism_editor.slider_points_value())
-        current_slider_preview_solver = str(self._mechanism_editor.slider_solver_value() or "LSODA")
+        current_slider_preview_solver = str(self._mechanism_editor.slider_solver_value() or "BDF")
 
         # Populate dialog with current settings
         current_settings = {

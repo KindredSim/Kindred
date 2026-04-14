@@ -38,7 +38,7 @@ Structured logging (JSON)::
     logger.info("Simulation complete", extra={
         "duration": 2.5,
         "n_species": 10,
-        "solver": "LSODA"
+        "solver": "BDF"
     })
 
 Operation tracking::

@@ -117,7 +117,7 @@ def test_gui_energy_mode_temperature_comes_from_dsl(main_window, monkeypatch):
         "species_names": species_names,
         "mechanism": mech,
         "mechanism_text": dsl,
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
     main_window.simulation_controller.on_simulation_complete(payload)
 
@@ -161,7 +161,7 @@ def _prime_energy_mode_sliders(main_window, monkeypatch, *, T: float = 200.0) ->
         "species_names": species_names,
         "mechanism": mech,
         "mechanism_text": dsl,
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
     main_window.simulation_controller.on_simulation_complete(payload)
     return dsl
@@ -205,7 +205,7 @@ def _prime_energy_mode_sliders_in_reaction_editor(main_window, monkeypatch, *, T
         "species_names": list(species_names),
         "mechanism": mech,
         "mechanism_text": dsl,
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
     main_window.simulation_controller.on_simulation_complete(payload)
     return dsl
@@ -367,7 +367,7 @@ def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(m
         "species_names": mech_after.species_names(),
         "mechanism": mech_after,
         "mechanism_text": editor_text,
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
     # Manual "Run Simulation" paths clear the slider-triggered flag before completion refresh.
     preview._slider_triggered_simulation = False

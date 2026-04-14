@@ -85,7 +85,7 @@ def test_simulation_worker_keeps_valid_algebra_series_when_one_fails(monkeypatch
         dsl,
         {"PBMPBPIN": 1.0, "PBMP": 0.0, "pinBOH": 0.0},
         (0.0, 2.0),
-        {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 3}},
+        {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 3}},
     )
 
     with qtbot.waitSignal(worker.result_ready, timeout=3000) as blocker:

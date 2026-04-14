@@ -19,7 +19,7 @@ def _fake_sim_result(*, marker: float = 1.0) -> dict:
         "algebra_scalars": {},
         "mechanism": None,
         "mechanism_text": "reaction: A -> B; k1=1.0",
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15},
         "fallback_occurred": False,
         "fallback_message": None,
     }

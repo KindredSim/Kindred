@@ -9,6 +9,7 @@ import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
@@ -477,8 +478,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
         self._integration_solver_combo = QtWidgets.QComboBox(params_group)
         self._integration_solver_combo.setObjectName("global_fit_integration_solver")
-        self._integration_solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        self._integration_solver_combo.setCurrentText(default_solver)
+        self._integration_solver_combo.addItems(["Radau", "BDF"])
+        solver_name, _warning = normalize_solver_name(default_solver)
+        self._integration_solver_combo.setCurrentText(solver_name)
 
         self._integration_rtol_edit = QtWidgets.QLineEdit(_fmt(default_rtol), params_group)
         self._integration_rtol_edit.setObjectName("global_fit_integration_rtol")
@@ -1548,7 +1550,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
         from kindred.core.simulator.solvers import normalize_solver_name
 
-        allowed = ("LSODA", "Radau", "BDF")
+        allowed = ("Radau", "BDF")
         combo = getattr(self, "_integration_solver_combo", None)
         solver_label = str(combo.currentText()).strip() if combo is not None else FITTING_DEFAULT_SOLVER
         if solver_label not in allowed:

@@ -55,7 +55,7 @@ def test_simulation_worker_result_payload_includes_mechanism_for_prepared_comple
         mechanism_text="reaction: A -> A ; k=0.0",
         initials={"A": 1.0},
         t_span=(0.0, 1.0),
-        solver_config={"solver": "LSODA", "grid": {"N": 2}},
+        solver_config={"solver": "BDF", "grid": {"N": 2}},
         prepared=prepared,
     )
 
@@ -100,7 +100,7 @@ def test_simulation_worker_result_payload_omits_mechanism_for_secondary_completi
         mechanism_text="reaction: A -> A ; k=0.0",
         initials={"A": 1.0},
         t_span=(0.0, 1.0),
-        solver_config={"solver": "LSODA", "grid": {"N": 2}},
+        solver_config={"solver": "BDF", "grid": {"N": 2}},
         prepared=prepared,
         include_mechanism_in_result_payload=False,
     )
@@ -146,7 +146,7 @@ def test_simulation_worker_secondary_payload_reports_base_species_count_for_alge
         mechanism_text="reaction: A -> A ; k=0.0",
         initials={"A": 1.0},
         t_span=(0.0, 1.0),
-        solver_config={"solver": "LSODA", "grid": {"N": 2}},
+        solver_config={"solver": "BDF", "grid": {"N": 2}},
         prepared=prepared,
         include_mechanism_in_result_payload=False,
     )

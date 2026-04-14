@@ -112,7 +112,7 @@ class TestSimulationWorkflow:
             rhs=rhs,
             t_span=(0, 10),
             y0=y0,
-            solver='LSODA',
+            solver='BDF',
             grid={'N': 100}
         )
         result = solve_ode(request)
@@ -141,7 +141,7 @@ class TestSimulationWorkflow:
             rhs=rhs,
             t_span=(0, 20),
             y0=y0,
-            solver='LSODA',
+            solver='BDF',
             grid={'N': 200}
         )
         result = solve_ode(request)
@@ -168,7 +168,7 @@ class TestSimulationWorkflow:
             rhs=rhs,
             t_span=(0, 50),
             y0=y0,
-            solver='LSODA',
+            solver='BDF',
             grid={'N': 500}
         )
         result = solve_ode(request)
@@ -204,7 +204,7 @@ class TestFittingWorkflow:
                 rhs=rhs,
                 t_span=(0, 10),
                 y0=y0,
-                solver='LSODA',
+                solver='BDF',
                 grid={'N': 50}
             )
             result = solve_ode(request)
@@ -372,7 +372,7 @@ class TestCacheIntegration:
                 rhs=rhs,
                 t_span=t_span,
                 y0=y0,
-                solver='LSODA',
+                solver='BDF',
                 grid={'N': 50}
             )
             return solve_ode(request)

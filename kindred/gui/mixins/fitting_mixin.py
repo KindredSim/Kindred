@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.dsl_text_update import (
     StepParameterUpdateOutcome,
     analyze_parameter_updates_to_dsl_text,
@@ -553,8 +554,9 @@ class FittingMixin:
         integration_layout = QtWidgets.QFormLayout(integration_group)
 
         solver_combo = QtWidgets.QComboBox()
-        solver_combo.addItems(["LSODA", "Radau", "BDF"])
-        solver_combo.setCurrentText(str(defaults.get("solver", "LSODA")))
+        solver_combo.addItems(["Radau", "BDF"])
+        solver_name, _warning = normalize_solver_name(defaults.get("solver", "BDF"))
+        solver_combo.setCurrentText(solver_name)
         integration_layout.addRow("Solver:", solver_combo)
 
         rtol_edit = QtWidgets.QLineEdit(str(defaults.get("rtol", "1e-6")))

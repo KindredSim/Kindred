@@ -17,7 +17,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -34,23 +34,18 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
-from kindred.core.exceptions import ErrorContext, FittingCancelled, FitSimulationError, SimulationCancelled
+from kindred.core.exceptions import FittingCancelled, FitSimulationError, SimulationCancelled
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
     _clone_fitting_series_evaluator_lane,
-    _prepared_metadata_from_evaluator,
     _supports_fitting_evaluator_cancellation_check,
     _supports_isolated_fitting_evaluator_lanes,
     _with_fitting_evaluator_cancellation_check,
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
-)
-from kindred.core.fitting_process_lanes import (
-    ProcessBackedFittingEvaluatorLanePool,
-    fitting_process_lane_payload_from_evaluator,
 )
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
@@ -128,27 +123,6 @@ class _DatasetLaneCancellation:
             else:
                 time.sleep(0.01)
         self.raise_if_cancel_requested()
-
-
-def _fitting_evaluator_uses_lsoda(fit_evaluator) -> bool:
-    metadata = _prepared_metadata_from_evaluator(fit_evaluator)
-    if metadata is None:
-        return False
-    return str(metadata.solver_normalized or "").strip().upper() == "LSODA"
-
-
-def _acquire_lane_execution_lock(
-    lane_execution_lock: Optional[threading.Lock],
-    lane_cancellation: Optional[_DatasetLaneCancellation],
-) -> bool:
-    if lane_execution_lock is None:
-        return False
-    while True:
-        if lane_cancellation is not None:
-            lane_cancellation.raise_if_cancel_requested()
-        if lane_execution_lock.acquire(timeout=0.05):
-            return True
-
 
 @dataclass
 class DatasetFitInfo:
@@ -590,11 +564,6 @@ class _DatasetSimulationEvaluation:
     error: Optional[BaseException] = None
     error_provenance: Optional[Dict[str, Any]] = None
     final_error_message: Optional[str] = None
-    process_worker_pid: Optional[int] = None
-    process_slot: Optional[int] = None
-    process_cold_start: bool = False
-    process_prepare_count: int = 0
-    process_eval_count: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sim_species", dict(self.sim_species))
@@ -614,13 +583,10 @@ def _evaluate_dataset_simulation(
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     lane_cancellation: Optional[_DatasetLaneCancellation] = None,
-    lane_execution_lock: Optional[threading.Lock] = None,
 ) -> _DatasetSimulationEvaluation:
     ds_id = item.payload.dataset_id
-    lock_acquired = False
     try:
         _raise_if_fitting_cancel_requested(cancellation_check)
-        lock_acquired = _acquire_lane_execution_lock(lane_execution_lock, lane_cancellation)
         sim_result = evaluate_fitting_series(
             fit_evaluator,
             item.full_params,
@@ -657,94 +623,11 @@ def _evaluate_dataset_simulation(
             error_provenance={"dataset": ds_id},
             final_error_message=str(exc),
         )
-    finally:
-        if lock_acquired and lane_execution_lock is not None:
-            lane_execution_lock.release()
 
 
 def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
     for future in futures:
         future.cancel()
-
-
-def _process_task_payload_from_dataset_input(item: _ObjectiveDatasetInput) -> Dict[str, Any]:
-    return {
-        "index": int(item.index),
-        "dataset_id": str(item.payload.dataset_id),
-        "full_params": dict(item.full_params),
-        "parameter_origins": dict(item.parameter_origins),
-        "failed_param_snapshot": dict(item.failed_param_snapshot),
-    }
-
-
-def _dataset_evaluation_from_process_payload(
-    payload: Mapping[str, Any],
-    item: _ObjectiveDatasetInput,
-) -> _DatasetSimulationEvaluation:
-    process_worker_pid = int(payload["worker_pid"]) if payload.get("worker_pid") is not None else None
-    process_slot = int(payload["slot"]) if payload.get("slot") is not None else None
-    process_prepare_count = int(payload.get("prepare_count") or 0)
-    process_eval_count = int(payload.get("eval_count") or 0)
-    if bool(payload.get("ok")):
-        return _DatasetSimulationEvaluation(
-            index=int(payload["index"]),
-            sim_time=np.asarray(payload.get("sim_time"), dtype=float).reshape(-1),
-            sim_species={
-                str(name): np.asarray(values, dtype=float).reshape(-1)
-                for name, values in dict(payload.get("sim_species") or {}).items()
-            },
-            process_worker_pid=process_worker_pid,
-            process_slot=process_slot,
-            process_cold_start=bool(payload.get("cold_start")),
-            process_prepare_count=process_prepare_count,
-            process_eval_count=process_eval_count,
-        )
-
-    error_payload = dict(payload.get("error") or {})
-    error_kind = str(error_payload.get("kind") or "")
-    failed_params = dict(error_payload.get("failed_params") or item.failed_param_snapshot)
-    message = str(error_payload.get("message") or "Fitting process lane evaluation failed.")
-    context_payload = error_payload.get("context")
-    error_context = None
-    if isinstance(context_payload, Mapping):
-        error_context = ErrorContext(
-            line=context_payload.get("line"),
-            col=context_payload.get("col"),
-            line_text=context_payload.get("line_text"),
-            file_path=context_payload.get("file_path"),
-            stack_trace=context_payload.get("stack_trace"),
-        )
-    if error_kind == "fit_simulation":
-        error = FitSimulationError(
-            message,
-            failed_params=failed_params,
-            details=dict(error_payload.get("details") or {}),
-            context=error_context,
-        )
-    else:
-        error = FitSimulationError(
-            f"Simulation failed for dataset '{item.payload.dataset_id}': {message}",
-            failed_params=failed_params,
-            context=error_context,
-        )
-    return _DatasetSimulationEvaluation(
-        index=int(payload.get("index", item.index)),
-        sim_time=None,
-        sim_species={},
-        error=error,
-        error_provenance=dict(error_payload.get("error_provenance") or {"dataset": item.payload.dataset_id}),
-        final_error_message=str(error_payload.get("final_error_message") or message),
-        process_worker_pid=process_worker_pid,
-        process_slot=process_slot,
-        process_cold_start=bool(payload.get("cold_start")),
-        process_prepare_count=process_prepare_count,
-        process_eval_count=process_eval_count,
-    )
-
-
-def _record_process_lane_result(process_pool: ProcessBackedFittingEvaluatorLanePool, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-    process_pool.record_result(payload)
-    return payload
 
 
 def _run_parallel_dataset_lane_batch(
@@ -833,47 +716,17 @@ def _run_parallel_dataset_lane_batch(
     return [result for result in results if result is not None]
 
 
-def _evaluate_dataset_simulations_process(
-    items: Sequence[_ObjectiveDatasetInput],
-    *,
-    cancellation_check: Optional[Callable[[], bool]],
-    stop_on_fatal: bool,
-    lane_pool: _DatasetEvaluatorLanePool,
-) -> List[_DatasetSimulationEvaluation]:
-    process_pool = lane_pool.process_pool()
-    if process_pool is None:
-        raise RuntimeError("Fitting process lane pool requested for an unsupported evaluator.")
-
-    max_workers = min(len(items), process_pool.max_lanes)
-    lane_cancellation = _DatasetLaneCancellation(cancellation_check)
-    return _run_parallel_dataset_lane_batch(
-        items,
-        max_workers=max_workers,
-        lane_cancellation=lane_cancellation,
-        stop_on_fatal=stop_on_fatal,
-        submit_item=lambda slot, item: process_pool.submit(
-            int(slot),
-            _process_task_payload_from_dataset_input(item),
-        ),
-        resolve_result=lambda future, item: _dataset_evaluation_from_process_payload(
-            _record_process_lane_result(process_pool, future.result()),
-            item,
-        ),
-        abort_backend=lambda: process_pool.shutdown(wait=False, cancel_futures=True, terminate=True),
-        wait_timeout=0.05,
-    )
-
-
 class _DatasetEvaluatorLanePool:
     def __init__(self, fit_evaluator) -> None:
         self._fit_evaluator = fit_evaluator
         self._max_lanes = _MAX_PARALLEL_DATASET_LANES
         self._lanes: Dict[int, Any] = {}
-        self._process_payload = fitting_process_lane_payload_from_evaluator(fit_evaluator)
-        self._process_pool: Optional[ProcessBackedFittingEvaluatorLanePool] = None
+        self._closed = False
 
     def lane_for_slot(self, slot: int):
         slot_index = int(slot)
+        if self._closed:
+            raise RuntimeError("Fitting evaluator lane pool is closed.")
         if slot_index < 0 or slot_index >= self._max_lanes:
             raise RuntimeError(
                 f"Fitting evaluator lane slot {slot_index} is outside the retained lane cap {self._max_lanes}."
@@ -887,30 +740,9 @@ class _DatasetEvaluatorLanePool:
         self._lanes[slot_index] = lane
         return lane
 
-    def process_pool(self) -> Optional[ProcessBackedFittingEvaluatorLanePool]:
-        if self._process_payload is None:
-            return None
-        if self._process_pool is None or self._process_pool.closed:
-            self._process_pool = ProcessBackedFittingEvaluatorLanePool(
-                self._process_payload,
-                max_lanes=self._max_lanes,
-            )
-        return self._process_pool
-
-    def close(self, *, wait: bool = True, cancel_futures: bool = True, terminate: bool = False) -> None:
-        if self._process_pool is None:
-            return
-        self._process_pool.shutdown(wait=wait, cancel_futures=cancel_futures, terminate=terminate)
-
-    def _kindred_process_worker_pids(self) -> Tuple[int, ...]:
-        if self._process_pool is None:
-            return ()
-        return self._process_pool.worker_pids()
-
-    def _kindred_process_slot_stats(self) -> Dict[int, Dict[str, int]]:
-        if self._process_pool is None:
-            return {}
-        return self._process_pool.slot_stats()
+    def close(self) -> None:
+        self._lanes.clear()
+        self._closed = True
 
 
 def _evaluate_dataset_simulations(
@@ -924,18 +756,6 @@ def _evaluate_dataset_simulations(
     if not items:
         return []
     active_lane_pool = lane_pool or _DatasetEvaluatorLanePool(fit_evaluator)
-    local_lane_pool_owner = lane_pool is None
-    if len(items) > 1 and active_lane_pool.process_pool() is not None:
-        try:
-            return _evaluate_dataset_simulations_process(
-                items,
-                cancellation_check=cancellation_check,
-                stop_on_fatal=stop_on_fatal,
-                lane_pool=active_lane_pool,
-            )
-        finally:
-            if local_lane_pool_owner:
-                active_lane_pool.close()
     supports_cancellable_lanes = cancellation_check is None or _supports_fitting_evaluator_cancellation_check(
         fit_evaluator
     )
@@ -962,7 +782,6 @@ def _evaluate_dataset_simulations(
         )
 
     lane_cancellation = _DatasetLaneCancellation(cancellation_check)
-    lane_execution_lock = threading.Lock() if _fitting_evaluator_uses_lsoda(fit_evaluator) else None
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         def submit_item(slot: int, item: _ObjectiveDatasetInput) -> Future:
             lane = first_lane if int(slot) == 0 else active_lane_pool.lane_for_slot(slot)
@@ -975,7 +794,6 @@ def _evaluate_dataset_simulations(
                 item,
                 cancellation_check=lane_cancellation,
                 lane_cancellation=lane_cancellation,
-                lane_execution_lock=lane_execution_lock,
             )
 
         return _run_parallel_dataset_lane_batch(
@@ -1942,7 +1760,7 @@ def fit_global(
             message = f"{message} | last_error_dataset={ds_tag}: {objective_wrapper.last_error}"
 
     except FittingCancelled:
-        lane_pool.close(wait=False, cancel_futures=True, terminate=True)
+        lane_pool.close()
         raise
     except FitSimulationError as exc:
         logger.error("Global fitting failed: %s", exc, exc_info=False)
@@ -1950,7 +1768,7 @@ def fit_global(
         return _failed_result(str(exc), failed_params=exc.failed_params)
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)) or "cancelled" in str(exc).lower():
-            lane_pool.close(wait=False, cancel_futures=True, terminate=True)
+            lane_pool.close()
             raise FittingCancelled() from exc
         logger.error("Global fitting failed: %s", exc, exc_info=True)
         lane_pool.close()

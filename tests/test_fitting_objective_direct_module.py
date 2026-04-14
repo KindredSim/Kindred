@@ -31,7 +31,7 @@ def test_direct_module_build_fitting_objective_rejects_nonmonotone_time_grid() -
         t_exp=np.array([0.0, 0.5, 0.5]),
         y_exp=np.zeros(3, dtype=float),
         target_species="B",
-        solver="LSODA",
+        solver="BDF",
     )
 
     with pytest.raises(FitSimulationError, match="strictly increasing"):

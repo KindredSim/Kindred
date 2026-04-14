@@ -274,6 +274,37 @@ def test_active_integration_defaults_none_check_not_falsy_or(qt_app):
         window.close()
 
 
+@pytest.mark.parametrize("solver_value", ["radau", " Radau "])
+def test_active_integration_defaults_normalizes_valid_solver_names(qt_app, solver_value):
+    """Lowercase and padded valid solver names should normalize before UI defaults are read."""
+    import numpy as np
+    from kindred.gui.fitting.window import FittingWindow
+
+    t = np.linspace(0.0, 1.0, 5)
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+        dataset_entries=[{
+            "id": "ds1", "label": "ds1",
+            "t": t.copy(), "species_data": {"A": np.ones_like(t)},
+            "selected_species": ["A"], "weight": 1.0, "include": True,
+        }],
+        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.ones_like(t)}},
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}
+        ],
+        dataset_weights={"ds1": 1.0},
+        config_defaults={"solver": solver_value, "rtol": 1e-5, "atol": 1e-11},
+    )
+    try:
+        solver, rtol, atol = window._active_integration_defaults_for_ui()
+        assert solver == "Radau"
+        assert rtol == 1e-5
+        assert atol == 1e-11
+    finally:
+        window.close()
+
+
 def test_fitting_defaults_empty_at_startup(main_window):
     """No document loaded at startup means no document overrides."""
     assert main_window._fitting_defaults == {}, (

@@ -136,7 +136,7 @@ def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkey
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_uses_process_exportable_serial_evaluator(
+def test_fitting_package_launch_owner_uses_serial_evaluator(
     qt_app,
     main_window,
     monkeypatch,
@@ -144,7 +144,6 @@ def test_fitting_package_launch_owner_uses_process_exportable_serial_evaluator(
     from PySide6 import QtWidgets
 
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
-    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
     from kindred.gui.fitting import launch_global_fit_session
 
     _seed_one_dataset(main_window)
@@ -184,25 +183,22 @@ def test_fitting_package_launch_owner_uses_process_exportable_serial_evaluator(
         simulation_func = kwargs.get("simulation_func")
         assert isinstance(simulation_func, SerialFittingEvaluator)
         assert type(simulation_func) is SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(simulation_func) is not None
 
         fixed = simulation_func.with_fixed_params({"k_fixed": 1.23})
         assert isinstance(fixed, SerialFittingEvaluator)
         assert type(fixed) is SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(fixed) is not None
 
         simulation_builder = kwargs.get("simulation_builder")
         assert callable(simulation_builder)
         rebuilt = simulation_builder(
             "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
             ["k1"],
-            solver="LSODA",
+            solver="BDF",
             rtol=1e-6,
             atol=1e-12,
         )
         assert isinstance(rebuilt, SerialFittingEvaluator)
         assert type(rebuilt) is SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(rebuilt) is not None
     finally:
         window.close()
         window.deleteLater()
@@ -210,7 +206,7 @@ def test_fitting_package_launch_owner_uses_process_exportable_serial_evaluator(
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_preserves_process_exportable_serial_evaluator_through_worker_handoff(
+def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_handoff(
     qt_app,
     main_window,
     monkeypatch,
@@ -219,7 +215,6 @@ def test_fitting_package_launch_owner_preserves_process_exportable_serial_evalua
 
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
-    from kindred.core.fitting_process_lanes import fitting_process_lane_payload_from_evaluator
     from kindred.gui.fitting import launch_global_fit_session
     from kindred.gui.fitting.window import FittingWindow
 
@@ -286,7 +281,6 @@ def test_fitting_package_launch_owner_preserves_process_exportable_serial_evalua
         fit_evaluator = eager_window._simulation_with_fixed_params(eager_window._simulation_func, fixed_params)
         assert isinstance(fit_evaluator, SerialFittingEvaluator)
         assert type(fit_evaluator) is SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(fit_evaluator) is not None
 
         t = np.linspace(0.0, 1.0, 6)
         eager_window._start_global_fit_worker(
@@ -305,7 +299,7 @@ def test_fitting_package_launch_owner_preserves_process_exportable_serial_evalua
             config=config,
             dataset_overrides=[],
             weights=eager_window._weights_for_run(selection),
-            requested_solver="LSODA",
+            requested_solver="BDF",
             requested_rtol=1e-6,
             requested_atol=1e-12,
             fit_evaluator=fit_evaluator,
@@ -317,7 +311,6 @@ def test_fitting_package_launch_owner_preserves_process_exportable_serial_evalua
         captured_fit_evaluator = captured.get("fit_evaluator")
         assert isinstance(captured_fit_evaluator, SerialFittingEvaluator)
         assert type(captured_fit_evaluator) is SerialFittingEvaluator
-        assert fitting_process_lane_payload_from_evaluator(captured_fit_evaluator) is not None
     finally:
         eager_window.close()
         eager_window.deleteLater()
@@ -327,7 +320,7 @@ def test_fitting_package_launch_owner_preserves_process_exportable_serial_evalua
 
 
 @pytest.mark.gui
-def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_lanes(
+def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_threaded_lanes(
     qtbot,
     qt_app,
     main_window,
@@ -392,7 +385,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_la
         raise AssertionError("DE should not be used for this test")
 
     def counting_assemble(*args, **kwargs):
-        captured["lane_pool"] = kwargs["lane_pool"]
+        captured["lane_slots"] = tuple(sorted(kwargs["lane_pool"]._lanes))
         return original_assemble(*args, **kwargs)
 
     monkeypatch.setattr(fitting_optimization, "load_scipy_optimize", lambda: (fake_least_squares, fake_de))
@@ -415,7 +408,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_la
             config=config,
             dataset_overrides=[],
             weights=eager_window._weights_for_run(selection),
-            requested_solver="LSODA",
+            requested_solver="BDF",
             requested_rtol=1e-6,
             requested_atol=1e-12,
             fit_evaluator=fit_evaluator,
@@ -425,7 +418,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_la
         )
         assert eager_window._worker is not None
         captured["worker_fit_evaluator"] = eager_window._worker._fit_evaluator
-        qtbot.waitUntil(lambda: "lane_pool" in captured, timeout=5000)
+        qtbot.waitUntil(lambda: "lane_slots" in captured, timeout=5000)
         qtbot.waitUntil(
             lambda: eager_window._worker is None or not eager_window._worker.isRunning(),
             timeout=5000,
@@ -437,12 +430,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_la
         assert state["objective_calls"] == 2
         assert len(selection["ids"]) == 2
         assert captured["worker_fit_evaluator"] is fit_evaluator
-        process_pids = captured["lane_pool"]._kindred_process_worker_pids()
-        slot_stats = captured["lane_pool"]._kindred_process_slot_stats()
-        assert len(process_pids) >= 2
-        assert len(set(process_pids)) >= 2
-        assert set(slot_stats) == {0, 1}
-        assert all(int(stats["eval_count"]) >= 1 for stats in slot_stats.values())
+        assert set(captured["lane_slots"]) == {0, 1}
     finally:
         eager_window.close()
         eager_window.deleteLater()

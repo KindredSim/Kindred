@@ -17,7 +17,7 @@ def _run_fake_simulation(window: MainWindow, monkeypatch):
         "Y": np.vstack([species_a, species_b]),
         "species_names": ["A", "B"],
         "mechanism_text": window._get_mechanism_text(),
-        "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
         "mechanism": None,
     }
 

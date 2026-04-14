@@ -37,7 +37,7 @@ def _build_serial_fit_components():
             param_names=["k1"],
             t_end=1.0,
             num_points=2,
-            solver="LSODA",
+            solver="BDF",
             rtol=1e-6,
             atol=1e-12,
             initial_prefix="init:",
@@ -148,7 +148,7 @@ def test_global_fit_objective_penalizes_nonfinite_param_without_stale_binding_re
         param_names=["k1", "k2"],
         t_end=1.0,
         num_points=2,
-        solver="LSODA",
+        solver="BDF",
         rtol=1e-6,
         atol=1e-12,
     )

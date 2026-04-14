@@ -7,7 +7,7 @@ from PySide6 import QtWidgets
 pytestmark = [pytest.mark.gui]
 
 
-def _make_parameters_tab(*, integration_defaults=("LSODA", 1e-6, 1e-12)):
+def _make_parameters_tab(*, integration_defaults=("BDF", 1e-6, 1e-12)):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
     from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
@@ -118,7 +118,7 @@ def test_parameters_integration_controls_are_visible_without_expanding_section(q
 def test_fitting_default_solver_constant_and_parameters_tab_default(qtbot):
     from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
-    assert FITTING_DEFAULT_SOLVER == "LSODA"
+    assert FITTING_DEFAULT_SOLVER == "BDF"
 
     tab, species_table = _make_parameters_tab(
         integration_defaults=(FITTING_DEFAULT_SOLVER, 1e-6, 1e-12)
@@ -155,8 +155,8 @@ def test_global_fit_worker_defaults_to_fitting_solver(qt_app):
         qt_app.processEvents()
 
 
-def test_fitting_window_solver_combo_defaults_to_lsoda_even_with_radau_prepared_meta(qt_app):
-    """Combo must show LSODA regardless of what the main simulation was prepared with."""
+def test_fitting_window_solver_combo_defaults_to_bdf_even_with_radau_prepared_meta(qt_app):
+    """Combo must show BDF regardless of what the main simulation was prepared with."""
     from dataclasses import dataclass
     from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
     from kindred.gui.fitting.window import FittingWindow

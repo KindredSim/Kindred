@@ -32,9 +32,9 @@ def test_simulation_worker_emits_preparation_warning_payload(monkeypatch, qtbot)
             species_names=["A"],
             initials_for_algebra={"A": 1.0},
             warnings=["Sparse Jacobian unavailable; falling back to dense Jacobian: sparsity blew up"],
-            request=SimpleNamespace(solver="LSODA"),
+            request=SimpleNamespace(solver="BDF"),
             solver_warning=None,
-            solver_input="LSODA",
+            solver_input="BDF",
             temperature_schedule=None,
         ),
     )
@@ -51,7 +51,7 @@ def test_simulation_worker_emits_preparation_warning_payload(monkeypatch, qtbot)
         "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
         {"A": 1.0, "B": 0.0},
         (0.0, 1.0),
-        {"solver": "LSODA", "grid": {"N": 5}},
+        {"solver": "BDF", "grid": {"N": 5}},
     )
 
     with qtbot.waitSignal(worker.result_ready, timeout=3000) as blocker:

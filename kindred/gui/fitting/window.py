@@ -42,6 +42,7 @@ from kindred.core.fitting_evaluation import (
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
+from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     coerce_prepared_simulation_metadata,
@@ -498,10 +499,10 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _active_integration_defaults_for_ui(self) -> Tuple[str, float, float]:
         """Read fitting integration defaults from the persisted fitting preferences."""
-        allowed = ("LSODA", "Radau", "BDF")
-
         _solver_raw = self._config_defaults.get("solver")
-        solver_default = str(_solver_raw) if _solver_raw is not None else FITTING_DEFAULT_SOLVER
+        solver_default, _warning = normalize_solver_name(
+            _solver_raw if _solver_raw is not None else FITTING_DEFAULT_SOLVER
+        )
         try:
             _rtol_raw = self._config_defaults.get("rtol")
             rtol_default = float(_rtol_raw) if _rtol_raw is not None else 1e-6
@@ -513,8 +514,6 @@ class FittingWindow(QtWidgets.QDialog):
         except (TypeError, ValueError):
             atol_default = 1e-12
 
-        if solver_default not in allowed:
-            solver_default = FITTING_DEFAULT_SOLVER
         if not (np.isfinite(rtol_default) and rtol_default > 0.0):
             rtol_default = 1e-6
         if not (np.isfinite(atol_default) and atol_default > 0.0):

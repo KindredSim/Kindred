@@ -49,7 +49,7 @@ class ImmediateWorker(QtCore.QObject):
             "species_names": ["A", "B"],
             "mechanism": None,
             "mechanism_text": "reaction: A -> B; k=0.5\ninitial: A=1.0\ninitial: B=0.0",
-            "solver_config": {"solver": "LSODA", "rtol": 1e-6, "atol": 1e-12},
+            "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
         }
 
     def start(self) -> None:

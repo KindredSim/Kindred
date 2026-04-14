@@ -124,7 +124,7 @@ def test_run_batch_simulation_task_sanitizes_unpicklable_solve_ode_exceptions(mo
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -173,7 +173,7 @@ def test_run_batch_simulation_task_returns_structured_error_payload_on_solver_fa
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -190,7 +190,7 @@ def test_run_batch_simulation_task_uses_shared_preparation_failure_payload_for_i
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA", "rtol": "bad"},
+            "solver_config": {"solver": "BDF", "rtol": "bad"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -255,7 +255,7 @@ def test_run_batch_simulation_task_reports_algebra_errors_with_shared_schema(mon
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -322,7 +322,7 @@ def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(mon
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -332,7 +332,7 @@ def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(mon
     assert payload["success"] is True
     assert payload["warnings"] == []
     assert payload["message"] == "Simulation completed successfully"
-    assert payload["solver"] == "LSODA"
+    assert payload["solver"] == "BDF"
     assert payload["nfev"] == 17
     assert payload["provenance"] == {"path": "batch"}
 
@@ -389,7 +389,7 @@ def test_run_batch_simulation_task_secondary_payload_reports_base_species_count(
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -466,7 +466,7 @@ def test_run_batch_simulation_task_preserves_structured_execution_request_proven
                 },
                 "initials": {"A": 3.0},
                 "t_span": (0.0, 1.0),
-                "solver_config": {"solver": "LSODA", "grid": {"N": 2}},
+                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
                 "mechanism_text": "reaction: A -> B; k=SET1",
                 "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
             },
@@ -545,7 +545,7 @@ def test_run_batch_simulation_task_can_include_mechanism_for_primary_completion_
                 },
                 "initials": {"A": 3.0},
                 "t_span": (0.0, 1.0),
-                "solver_config": {"solver": "LSODA", "grid": {"N": 2}},
+                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
                 "mechanism_text": "reaction: A -> B; k=SET1",
                 "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
             },
@@ -617,7 +617,7 @@ def test_run_batch_simulation_task_logs_warning_on_invalid_t_span_and_falls_back
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_span": "not-a-seq",
             "t_end": 1.0,
             "set_id": "id1",
@@ -680,7 +680,7 @@ def test_run_batch_simulation_task_normalizes_solver_config_defaults(monkeypatch
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA"},
+            "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -688,7 +688,7 @@ def test_run_batch_simulation_task_normalizes_solver_config_defaults(monkeypatch
     )
 
     solver_config = payload["solver_config"]
-    assert solver_config["solver"] == "LSODA"
+    assert solver_config["solver"] == "BDF"
     assert solver_config["rtol"] == 1e-6
     assert solver_config["atol"] == 1e-12
     assert solver_config["grid"] == {"N": 100}
@@ -761,7 +761,7 @@ def test_run_batch_simulation_task_does_not_mutate_prepared_mechanism_and_avoids
     batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA", "use_sparse_jacobian": False, "wegscheider_cyclicity_enabled": True},
+            "solver_config": {"solver": "BDF", "use_sparse_jacobian": False, "wegscheider_cyclicity_enabled": True},
             "t_end": 1.0,
             "initials": {"A": 1.0},
             "set_id": "id1",
@@ -771,7 +771,7 @@ def test_run_batch_simulation_task_does_not_mutate_prepared_mechanism_and_avoids
     batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA", "use_sparse_jacobian": False, "wegscheider_cyclicity_enabled": False},
+            "solver_config": {"solver": "BDF", "use_sparse_jacobian": False, "wegscheider_cyclicity_enabled": False},
             "t_end": 1.0,
             "initials": {"A": 2.0},
             "set_id": "id1",
@@ -876,7 +876,7 @@ def test_run_batch_simulation_task_non_structured_text_path_invalidates_worker_c
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _capture_request)
 
     base_task = {
-        "solver_config": {"solver": "LSODA", "temperature_K": 298.15},
+        "solver_config": {"solver": "BDF", "temperature_K": 298.15},
         "t_span": (0.0, 1.0),
         "set_id": "id1",
         "set_name": "set1",
@@ -959,7 +959,7 @@ def test_run_batch_simulation_task_honors_energy_prepared_payload_over_stale_tex
                 "prepared_payload": bound.as_serializable_execution_payload(),
                 "initials": {"A": 3.0, "B": 0.0},
                 "t_span": (0.0, 1.0),
-                "solver_config": {"solver": "LSODA", "grid": {"N": 2}},
+                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
                 "mechanism_text": "reaction: A -> B; k=PRIMARY",
                 "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
             },

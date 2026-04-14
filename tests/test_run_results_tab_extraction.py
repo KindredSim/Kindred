@@ -45,10 +45,10 @@ def test_set_run_stamp(qt_app):
     """set_run_stamp stores stamp data internally."""
     tab = _make_tab()
     try:
-        tab.set_run_stamp({"solver": "LSODA"}, "abc123hash", "abc123")
+        tab.set_run_stamp({"solver": "BDF"}, "abc123hash", "abc123")
         qt_app.processEvents()
 
-        assert tab._last_run_stamp == {"solver": "LSODA"}
+        assert tab._last_run_stamp == {"solver": "BDF"}
         assert tab._last_run_stamp_hash == "abc123hash"
         assert tab._last_run_stamp_short == "abc123"
     finally:

@@ -62,8 +62,8 @@ def test_solver_records_successful_fallback(monkeypatch):
         t_eval = kwargs.get("t_eval")
         if t_eval is None:
             t_eval = np.array([0.0, 1.0])
-        if method == "LSODA":
-            return DummySolution(False, "LSODA failure", t_eval[:1])
+        if method == "BDF":
+            return DummySolution(False, "BDF failure", t_eval[:1])
         return DummySolution(True, "ok", t_eval)
 
     monkeypatch.setattr(solvers, "_solve_ivp", _fake_solve_ivp)
@@ -72,16 +72,16 @@ def test_solver_records_successful_fallback(monkeypatch):
         rhs=lambda t, y: -y,
         t_span=(0.0, 1.0),
         y0=np.array([1.0]),
-        solver="LSODA",
+        solver="BDF",
         grid={"N": 2},
     )
 
     out = solvers.solve_ode(req)
 
-    assert calls == ["LSODA", "Radau"]
+    assert calls == ["BDF", "Radau"]
     assert out.fallback_occurred is True
-    assert out.fallback_message == "LSODA failed; succeeded with Radau"
-    assert out.provenance.get("solver_requested") == "LSODA"
+    assert out.fallback_message == "BDF failed; succeeded with Radau"
+    assert out.provenance.get("solver_requested") == "BDF"
     assert out.provenance.get("solver_used") == "Radau"
     assert "solver" not in out.provenance
 

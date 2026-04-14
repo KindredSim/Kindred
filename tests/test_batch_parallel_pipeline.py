@@ -286,7 +286,7 @@ def test_batch_task_surfaces_solver_validation_from_preparation_owner(monkeypatc
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA", "rtol": "bad"},
+            "solver_config": {"solver": "BDF", "rtol": "bad"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -327,7 +327,7 @@ def test_batch_task_surfaces_solver_validation_from_preparation_owner_after_prep
     payload = batch_parallel.run_batch_simulation_task(
         {
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "LSODA", "rtol": "bad"},
+            "solver_config": {"solver": "BDF", "rtol": "bad"},
             "t_span": (2.0, 5.0),
             "initials": {"A": 3.0},
             "set_id": "id1",
@@ -373,7 +373,7 @@ def test_open_solver_settings_wires_parallel_batch_controls(main_window, monkeyp
 
         def get_settings(self):
             return {
-                "solver": "LSODA",
+                "solver": "BDF",
                 "rtol": 1e-6,
                 "atol": 1e-12,
                 "use_sparse_jacobian": False,
