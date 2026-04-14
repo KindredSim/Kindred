@@ -101,9 +101,9 @@ def _dock_area_matches(main_window, dock, target_area) -> bool:
 
 def _wait_for_dock_area(main_window, qt_app, dock, target_area, *, attempts: int = 12) -> None:
     for _ in range(max(1, int(attempts))):
+        _pump_qt_events(qt_app)
         if _dock_area_matches(main_window, dock, target_area):
             return
-        _pump_qt_events(qt_app)
     assert _dock_area_matches(main_window, dock, target_area)
 
 
@@ -114,6 +114,23 @@ def _wait_for_floating_dock(qt_app, dock, *, attempts: int = 12) -> None:
         _pump_qt_events(qt_app)
     assert dock.isFloating() is True
     assert dock.isVisible() is True
+
+
+def test_wait_for_dock_area_pumps_events_before_first_match_check(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "tests.test_config_controller._pump_qt_events",
+        lambda _qt_app, *, iterations=5: calls.append(f"pump:{int(iterations)}"),
+    )
+    monkeypatch.setattr(
+        "tests.test_config_controller._dock_area_matches",
+        lambda _main_window, _dock, _target_area: calls.append("match") or True,
+    )
+
+    _wait_for_dock_area(object(), object(), object(), object(), attempts=1)
+
+    assert calls == ["pump:5", "match"]
 
 
 def test_recent_files_menu_populates_placeholder_when_empty(main_window):
