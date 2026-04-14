@@ -36,6 +36,19 @@ class _FakeExecutor:
         )
 
 
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.terminate_calls = 0
+        self._alive = True
+
+    def is_alive(self) -> bool:
+        return bool(self._alive)
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._alive = False
+
+
 @pytest.mark.unit
 def test_ensure_executor_recreates_pool_when_worker_count_increases() -> None:
     created: list[tuple[int, bool, _FakeExecutor]] = []
@@ -172,3 +185,33 @@ def test_create_and_prewarm_executor_submit_failure_clears_executor_and_records_
     assert batch.executor is None
     assert batch._current_max_workers is None
     assert recorded == [("Failed to create and prewarm batch executor", "submit boom")]
+
+
+@pytest.mark.unit
+def test_shutdown_force_terminate_uses_process_snapshot_after_executor_shutdown() -> None:
+    process = _FakeProcess()
+
+    class _ClearingExecutor(_FakeExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=1)
+            self._processes = {1: process}
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+            self._processes = None
+
+    batch = ParallelBatchExecutor(executor_factory=lambda max_workers, limit_blas_threads: _ClearingExecutor())
+    executor = _ClearingExecutor()
+    batch.executor = executor
+    batch._current_max_workers = 1
+
+    recorded: list[tuple[str, str]] = []
+
+    batch.shutdown(
+        force_terminate=True,
+        record_nonfatal_exception=lambda message, exc: recorded.append((str(message), str(exc))),
+    )
+
+    assert executor.shutdown_calls == [{"wait": False, "cancel_futures": True}]
+    assert process.terminate_calls == 1
+    assert recorded == []

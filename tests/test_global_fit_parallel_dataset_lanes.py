@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from concurrent.futures import Future
 
 import numpy as np
@@ -73,6 +74,31 @@ def _dataset_input(index: int, dataset_id: str, init_a: float):
         parameter_origins={},
         failed_param_snapshot={"init:A": float(init_a)},
     )
+
+
+def _sleeping_worker_task(_item) -> dict[str, object]:
+    time.sleep(5.0)
+    return {
+        "index": 0,
+        "dataset_id": "sleep",
+        "worker_pid": os.getpid(),
+        "ok": True,
+        "series_payload": {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "species": {"A": np.asarray([0.0, 0.0], dtype=float)},
+        },
+        "error": None,
+        "error_provenance": None,
+        "final_error_message": None,
+    }
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    return True
 
 
 class _EvaluateOnlyNoClone:
@@ -250,6 +276,34 @@ def test_fitting_process_pool_cancel_event_crosses_process_boundary() -> None:
     assert payload["ok"] is False
     assert payload["error"]["kind"] == "fitting_cancelled"
     assert int(payload["worker_pid"]) in set(pool.worker_pids()) | {int(payload["worker_pid"])}
+
+
+def test_fitting_process_pool_force_shutdown_terminates_running_worker_process(monkeypatch) -> None:
+    import kindred.core.fitting_process_pool as fitting_process_pool
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    monkeypatch.setattr(fitting_process_pool, "run_fitting_evaluation_task", _sleeping_worker_task)
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    worker_pid = None
+    try:
+        _ = pool.submit(_dataset_input(0, "ds1", 1.0))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            worker_pids = pool.worker_pids()
+            if worker_pids:
+                worker_pid = int(worker_pids[0])
+                break
+            time.sleep(0.05)
+        assert worker_pid is not None
+        assert _pid_exists(worker_pid) is True
+    finally:
+        pool.shutdown(force_terminate=True)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and _pid_exists(worker_pid):
+        time.sleep(0.05)
+    assert _pid_exists(worker_pid) is False
 
 
 def test_fitting_process_pool_shutdown_sets_cancel_event_before_executor_shutdown() -> None:
@@ -437,6 +491,13 @@ def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypat
 
     calls = []
 
+    class _FakeProcess:
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            calls.append("process.terminate")
+
     class _FakeEvent:
         def __init__(self):
             self.set_calls = 0
@@ -445,7 +506,11 @@ def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypat
             self.set_calls += 1
             calls.append("event.set")
 
-    executor = object()
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {1: _FakeProcess()}
+
+    executor = _FakeExecutor()
     pool = object.__new__(FittingProcessPool)
     pool._cancel_event = _FakeEvent()
     pool._executor = executor
@@ -459,14 +524,14 @@ def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypat
     monkeypatch.setattr(
         FittingProcessPool,
         "_terminate_processes_best_effort",
-        lambda self, target: calls.append(("terminate", target is executor)),
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
     )
 
     pool.cancel()
 
     assert calls == [
         "event.set",
-        ("terminate", True),
+        ("terminate_target_len", 1),
     ]
     assert pool._startup_cancelled is True
 
@@ -481,7 +546,8 @@ def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_i
             calls.append("event.set")
 
     class _FakeExecutor:
-        pass
+        def __init__(self):
+            self._processes = {1: object()}
 
     pool = object.__new__(FittingProcessPool)
     pool._cancel_event = _FakeEvent()
@@ -496,14 +562,14 @@ def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_i
     monkeypatch.setattr(
         FittingProcessPool,
         "_terminate_processes_best_effort",
-        lambda self, executor: calls.append(("terminate", executor is pool._executor)),
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
     )
 
     pool.shutdown(force_terminate=True)
 
     assert calls == [
         "event.set",
-        ("terminate", True),
+        ("terminate_target_len", 1),
     ]
 
 

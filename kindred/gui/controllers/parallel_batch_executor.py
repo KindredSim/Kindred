@@ -112,6 +112,11 @@ class ParallelBatchExecutor:
         self.executor = None
         if executor is None:
             return
+        terminate_target = ()
+        if bool(force_terminate):
+            processes = getattr(executor, "_processes", None)
+            if isinstance(processes, dict):
+                terminate_target = tuple(processes.values())
         try:
             executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
@@ -120,8 +125,8 @@ class ParallelBatchExecutor:
         except Exception as exc:
             record_nonfatal_exception("Failed executor.shutdown during batch executor shutdown", exc)
 
-        if bool(force_terminate):
-            self._terminate_processes_best_effort(executor, record_nonfatal_exception)
+        if terminate_target:
+            self._terminate_processes_best_effort(terminate_target, record_nonfatal_exception)
 
         _ = prior_futures
 
@@ -172,11 +177,8 @@ class ParallelBatchExecutor:
             suffix += 1
 
     @staticmethod
-    def _terminate_processes_best_effort(executor: Any, record_nonfatal_exception: Callable[[str, BaseException], None]) -> None:
-        processes = getattr(executor, "_processes", None)
-        if not isinstance(processes, dict):
-            return
-        for proc in list(processes.values()):
+    def _terminate_processes_best_effort(processes: tuple[Any, ...], record_nonfatal_exception: Callable[[str, BaseException], None]) -> None:
+        for proc in tuple(processes):
             try:
                 if proc is not None and hasattr(proc, "is_alive") and proc.is_alive():
                     proc.terminate()

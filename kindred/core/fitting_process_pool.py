@@ -256,15 +256,17 @@ class FittingProcessPool:
 
     def cancel(self) -> None:
         self._startup_cancelled = True
-        terminate_target = None
+        terminate_target = ()
         with self._state_lock:
             cancel_event = self._cancel_event
             if self._prewarm_in_progress and not self._closed:
-                terminate_target = self._executor
+                processes = getattr(self._executor, "_processes", None)
+                if isinstance(processes, dict):
+                    terminate_target = tuple(processes.values())
         with suppress(Exception):
             if cancel_event is not None:
                 cancel_event.set()
-        if terminate_target is not None:
+        if terminate_target:
             self._terminate_processes_best_effort(terminate_target)
 
     def worker_pids(self) -> tuple[int, ...]:
@@ -283,7 +285,7 @@ class FittingProcessPool:
         execute_shutdown = False
         executor = None
         manager = None
-        terminate_target = None
+        terminate_target = ()
         with self._state_lock:
             if self._closed and self._executor is None and self._manager is None:
                 return
@@ -291,13 +293,18 @@ class FittingProcessPool:
             manager = self._manager
             if self._shutdown_in_progress:
                 if bool(force_terminate) and executor is not None:
-                    terminate_target = executor
+                    processes = getattr(executor, "_processes", None)
+                    if isinstance(processes, dict):
+                        terminate_target = tuple(processes.values())
             else:
                 self._shutdown_in_progress = True
                 execute_shutdown = True
-                terminate_target = executor if bool(force_terminate) and executor is not None else None
+                if bool(force_terminate) and executor is not None:
+                    processes = getattr(executor, "_processes", None)
+                    if isinstance(processes, dict):
+                        terminate_target = tuple(processes.values())
         if not execute_shutdown:
-            if terminate_target is not None:
+            if terminate_target:
                 self._terminate_processes_best_effort(terminate_target)
             return
         try:
@@ -308,8 +315,8 @@ class FittingProcessPool:
                     with suppress(Exception):
                         executor.shutdown(wait=not bool(force_terminate))
         finally:
-            if bool(force_terminate) and executor is not None:
-                self._terminate_processes_best_effort(executor)
+            if terminate_target:
+                self._terminate_processes_best_effort(terminate_target)
             with suppress(Exception):
                 if manager is not None:
                     manager.shutdown()
@@ -363,11 +370,8 @@ class FittingProcessPool:
                     raise FittingCancelled() from exc
                 raise
 
-    def _terminate_processes_best_effort(self, executor: Any) -> None:
-        processes = getattr(executor, "_processes", None)
-        if not isinstance(processes, dict):
-            return
-        for proc in list(processes.values()):
+    def _terminate_processes_best_effort(self, processes: tuple[Any, ...]) -> None:
+        for proc in tuple(processes):
             with suppress(Exception):
                 if proc is not None and hasattr(proc, "is_alive") and proc.is_alive():
                     proc.terminate()
