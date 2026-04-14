@@ -790,6 +790,50 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
     assert pools[0].shutdown_calls == [False]
 
 
+def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_process(monkeypatch, caplog) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    evaluator = _make_serial_evaluator()
+    evaluator.context.execution_request.prepared_payload["temperature_schedule"] = lambda _t: 298.15
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process pool should not be created for an unpicklable evaluator payload")
+
+    def fake_fit_parameters(objective, initial_params, **_kwargs):
+        residuals = np.asarray(objective(np.asarray([float(value) for value in initial_params.values()], dtype=float)))
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=float(np.dot(residuals, residuals)),
+            r_squared=1.0,
+            residuals=residuals,
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    caplog.set_level("WARNING", logger="kindred.core.analysis.global_fitting")
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    callback_values = []
+    result = global_fitting.fit_global(
+        evaluator,
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+        process_pool_callback=lambda pool: callback_values.append(pool),
+    )
+
+    assert result.success is True
+    assert callback_values == [None]
+    assert "pickl" in caplog.text.lower()
+
+
 def test_fit_global_ignores_cleanup_process_pool_callback_error(monkeypatch) -> None:
     from kindred.core.analysis import global_fitting
     from kindred.core.fitting_evaluation import SerialFittingEvaluator

@@ -1683,14 +1683,23 @@ def fit_global(
     ctx = ObjectiveContext()
     fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator)
     process_pool: Optional[FittingProcessPool] = None
+    process_payload = None
     try:
         if type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
-            process_pool = FittingProcessPool(
-                fit_evaluator.to_process_payload(),
-                max_workers=_effective_fitting_process_workers(len(payloads)),
-                limit_blas_threads=True,
-                publish_callback=process_pool_callback,
-            )
+            try:
+                process_payload = fit_evaluator.to_process_payload()
+            except Exception as exc:
+                logger.warning(
+                    "Fitting evaluator payload is not process-picklable; using serial evaluation: %s",
+                    exc,
+                )
+            if process_payload is not None:
+                process_pool = FittingProcessPool(
+                    process_payload,
+                    max_workers=_effective_fitting_process_workers(len(payloads)),
+                    limit_blas_threads=True,
+                    publish_callback=process_pool_callback,
+                )
     except Exception:
         if process_pool is not None:
             process_pool.shutdown(force_terminate=True)
