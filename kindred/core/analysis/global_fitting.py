@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import pickle
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import suppress
@@ -1688,7 +1689,7 @@ def fit_global(
         if type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
             try:
                 process_payload = fit_evaluator.to_process_payload()
-            except Exception as exc:
+            except (pickle.PicklingError, TypeError) as exc:
                 logger.warning(
                     "Fitting evaluator payload is not process-picklable; using serial evaluation: %s",
                     exc,
