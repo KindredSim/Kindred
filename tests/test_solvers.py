@@ -208,11 +208,11 @@ def test_solve_ode_progress_callback_cancellation_propagates(monkeypatch):
 
 
 def test_scipy_method_for_unknown_names_fall_back_to_bdf_with_note():
-    method, note = solvers._scipy_method_for("ROS3")
+    method, note = solvers._scipy_method_for("UNKNOWN_SOLVER_A")
     assert method == "BDF"
     assert note == "Unknown solver name; using BDF"
 
-    method2, note2 = solvers._scipy_method_for("ROS4")
+    method2, note2 = solvers._scipy_method_for("UNKNOWN_SOLVER_B")
     assert method2 == "BDF"
     assert note2 == "Unknown solver name; using BDF"
 

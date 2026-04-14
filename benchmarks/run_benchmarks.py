@@ -83,7 +83,7 @@ def benchmark_simulation(
     mechanism,
     mechanism_name: str,
     t_span=(0, 100),
-    solver='LSODA',
+    solver='BDF',
     rtol=1e-6,
     atol=1e-12,
 ) -> BenchmarkResult:
@@ -241,7 +241,7 @@ def run_benchmark_suite(
                     integration_time=0.0,
                     peak_memory_mb=0.0,
                     n_steps=0,
-                    solver="LSODA",
+                    solver="BDF",
                     success=False,
                     error_message=str(exc),
                 )

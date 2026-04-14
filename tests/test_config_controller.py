@@ -666,6 +666,27 @@ def test_explicit_startup_solver_overrides_survive_settings_load(main_window, qt
         settings.sync()
 
 
+def test_invalid_explicit_startup_tolerances_do_not_override_saved_settings(qt_app):
+    settings = QtCore.QSettings("Kindred", "KindredGUI")
+    settings.clear()
+    settings.setValue("simulation/solver", "BDF")
+    settings.setValue("simulation/rtol", "1e-4")
+    settings.setValue("simulation/atol", "1e-7")
+    settings.sync()
+
+    restored = MainWindow(solver="BDF", rtol=float("nan"), atol=float("inf"))
+    try:
+        assert restored._initial_solver == "BDF"
+        assert restored._initial_rtol == pytest.approx(1e-4)
+        assert restored._initial_atol == pytest.approx(1e-7)
+        assert restored._solver_method_combo.currentText() == "BDF"
+    finally:
+        restored.close()
+        qt_app.processEvents()
+        settings.clear()
+        settings.sync()
+
+
 def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, caplog):
     settings = main_window._settings
     settings.clear()
@@ -688,20 +709,20 @@ def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, cap
     assert "simulation/preview_cache_cap='bad-preview'" in caplog.text
 
 
-def test_load_settings_invalid_tolerances_fall_back_without_crashing(main_window, caplog):
+def test_load_settings_invalid_tolerances_preserve_active_values(main_window, caplog):
     settings = main_window._settings
     settings.clear()
     settings.setValue("simulation/rtol", "bad-rtol")
     settings.setValue("simulation/atol", "bad-atol")
     settings.sync()
 
-    default_rtol = main_window._initial_rtol
-    default_atol = main_window._initial_atol
+    main_window._initial_rtol = 1e-9
+    main_window._initial_atol = 1e-11
 
     with caplog.at_level("WARNING"):
         main_window.config_controller.load_settings()
 
-    assert main_window._initial_rtol == pytest.approx(default_rtol)
-    assert main_window._initial_atol == pytest.approx(default_atol)
+    assert main_window._initial_rtol == pytest.approx(1e-9)
+    assert main_window._initial_atol == pytest.approx(1e-11)
     assert "Invalid solver tolerance rtol='bad-rtol'" in caplog.text
     assert "Invalid solver tolerance atol='bad-atol'" in caplog.text

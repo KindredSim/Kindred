@@ -169,17 +169,37 @@ class MainWindow(
         rtol: Optional[float],
         atol: Optional[float],
     ) -> None:
+        normalized_rtol = self._normalize_startup_solver_tolerance(rtol, field_name="rtol")
+        normalized_atol = self._normalize_startup_solver_tolerance(atol, field_name="atol")
         # Store launch overrides for later use.
         self._initial_profile = profile
         self._initial_solver = solver
-        self._initial_rtol = rtol
-        self._initial_atol = atol
+        self._initial_rtol = normalized_rtol
+        self._initial_atol = normalized_atol
         self._explicit_startup_solver_value = solver
-        self._explicit_startup_rtol_value = rtol
-        self._explicit_startup_atol_value = atol
+        self._explicit_startup_rtol_value = normalized_rtol
+        self._explicit_startup_atol_value = normalized_atol
         self._explicit_startup_solver_override = solver is not None
-        self._explicit_startup_rtol_override = rtol is not None
-        self._explicit_startup_atol_override = atol is not None
+        self._explicit_startup_rtol_override = normalized_rtol is not None
+        self._explicit_startup_atol_override = normalized_atol is not None
+
+    def _normalize_startup_solver_tolerance(
+        self,
+        value: Optional[float],
+        *,
+        field_name: str,
+    ) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid startup solver tolerance %s=%r", field_name, value)
+            return None
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            logger.warning("Ignoring invalid startup solver tolerance %s=%r", field_name, value)
+            return None
+        return float(parsed)
 
     def _init_simulation_plumbing_and_state(self) -> None:
         self._preview_session = MainWindowPreviewSession(self)
@@ -1618,18 +1638,34 @@ class MainWindow(
         value: object,
         *,
         field_name: str,
-        default_value: float,
+        current_value: Optional[float],
     ) -> Optional[float]:
         if value is None:
-            return None
+            logger.warning(
+                "Invalid solver tolerance %s=%r; keeping current value %s",
+                field_name,
+                value,
+                current_value,
+            )
+            return current_value
         try:
             parsed = float(value)
         except (TypeError, ValueError):
-            logger.warning("Invalid solver tolerance %s=%r; using %s", field_name, value, default_value)
-            return float(default_value)
+            logger.warning(
+                "Invalid solver tolerance %s=%r; keeping current value %s",
+                field_name,
+                value,
+                current_value,
+            )
+            return current_value
         if not math.isfinite(parsed) or parsed <= 0.0:
-            logger.warning("Invalid solver tolerance %s=%r; using %s", field_name, value, default_value)
-            return float(default_value)
+            logger.warning(
+                "Invalid solver tolerance %s=%r; keeping current value %s",
+                field_name,
+                value,
+                current_value,
+            )
+            return current_value
         return float(parsed)
 
     def _apply_solver_runtime_state(
@@ -1649,13 +1685,13 @@ class MainWindow(
             self._initial_rtol = self._coerce_solver_tolerance(
                 rtol,
                 field_name="rtol",
-                default_value=1e-6,
+                current_value=self._initial_rtol,
             )
         if atol is not _SOLVER_STATE_UNSET:
             self._initial_atol = self._coerce_solver_tolerance(
                 atol,
                 field_name="atol",
-                default_value=1e-12,
+                current_value=self._initial_atol,
             )
 
         combo = getattr(self, "_solver_method_combo", None)

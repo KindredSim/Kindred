@@ -368,21 +368,82 @@ def test_apply_solver_runtime_state_normalizes_unknown_solver_and_syncs_combo(ma
     assert main_window._solver_method_combo.currentText() == "BDF"
 
 
-def test_apply_project_payload_invalid_tolerances_reset_runtime_values_to_defaults(main_window):
+@pytest.mark.parametrize(
+    ("invalid_rtol", "invalid_atol"),
+    [
+        ("garbage", "also-garbage"),
+        (None, None),
+        ("", ""),
+        ("   ", "   "),
+        ("nan", "nan"),
+        (float("inf"), float("inf")),
+        (float("-inf"), float("-inf")),
+        (0, 0),
+        (-1.0, -1.0),
+        (float("nan"), float("nan")),
+    ],
+)
+def test_apply_solver_runtime_state_preserves_active_tolerances_for_invalid_values(
+    main_window,
+    invalid_rtol,
+    invalid_atol,
+):
+    main_window._initial_rtol = 1e-9
+    main_window._initial_atol = 1e-11
+
+    main_window.apply_solver_runtime_state(rtol=invalid_rtol, atol=invalid_atol)
+
+    assert main_window._initial_rtol == pytest.approx(1e-9)
+    assert main_window._initial_atol == pytest.approx(1e-11)
+
+
+def test_apply_solver_runtime_state_accepts_extreme_finite_tolerances(main_window):
+    main_window._initial_rtol = 1e-9
+    main_window._initial_atol = 1e-11
+
+    main_window.apply_solver_runtime_state(rtol=1e-300, atol=1e300)
+
+    assert main_window._initial_rtol == pytest.approx(1e-300)
+    assert main_window._initial_atol == pytest.approx(1e300)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_rtol", "expected_atol"),
+    [
+        ({"rtol": "bad-rtol", "atol": 1e-8}, 1e-9, 1e-8),
+        ({"rtol": 1e-7, "atol": "bad-atol"}, 1e-7, 1e-11),
+    ],
+)
+def test_apply_solver_runtime_state_mixed_validity_updates_fields_independently(
+    main_window,
+    kwargs,
+    expected_rtol,
+    expected_atol,
+):
+    main_window._initial_rtol = 1e-9
+    main_window._initial_atol = 1e-11
+
+    main_window.apply_solver_runtime_state(**kwargs)
+
+    assert main_window._initial_rtol == pytest.approx(expected_rtol)
+    assert main_window._initial_atol == pytest.approx(expected_atol)
+
+
+def test_apply_project_payload_invalid_tolerances_preserve_active_runtime_values(main_window):
     payload = main_window._serialize_project_state()
     payload["solver"] = "BDF"
     payload["rtol"] = "bad-rtol"
     payload["atol"] = "bad-atol"
 
     main_window._solver_method_combo.setCurrentText("BDF")
-    main_window._initial_rtol = 1e-6
-    main_window._initial_atol = 1e-12
+    main_window._initial_rtol = 1e-9
+    main_window._initial_atol = 1e-11
 
     main_window._apply_project_payload(payload, record_undo=False)
 
     assert main_window._initial_solver == "BDF"
-    assert main_window._initial_rtol == pytest.approx(1e-6)
-    assert main_window._initial_atol == pytest.approx(1e-12)
+    assert main_window._initial_rtol == pytest.approx(1e-9)
+    assert main_window._initial_atol == pytest.approx(1e-11)
     assert main_window._solver_method_combo.currentText() == "BDF"
 
 
