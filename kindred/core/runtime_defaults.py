@@ -5,7 +5,14 @@ import os
 USE_SPARSE_JACOBIAN_DEFAULT = True
 WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT = True
 LIMIT_BLAS_THREADS_PER_WORKER_DEFAULT = True
-MAX_PARALLEL_BATCH_WORKERS_DEFAULT = max(1, (os.cpu_count() or 1) - 1)
+
+
+def _compute_max_parallel_batch_workers_default(cpu_count: int | None = None) -> int:
+    detected_cpu_count = os.cpu_count() if cpu_count is None else cpu_count
+    return min(max(1, (detected_cpu_count or 1) - 1), 16)
+
+
+MAX_PARALLEL_BATCH_WORKERS_DEFAULT = _compute_max_parallel_batch_workers_default()
 RESULT_CACHE_CAP_DEFAULT = 1000
 PREVIEW_CACHE_CAP_DEFAULT = 1000
 

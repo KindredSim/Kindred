@@ -107,15 +107,16 @@ def test_solver_settings_dialog_factory_defaults_match_schema_and_cache_defaults
     assert dialog._sparse_checkbox.isChecked() is bool(PROJECT_DEFAULTS["use_sparse_jacobian"])
     assert dialog._wegscheider_checkbox.isChecked() is bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"])
     assert dialog._max_parallel_workers_spin.value() == int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+    assert dialog._max_parallel_workers_spin.maximum() == 60
     assert dialog._limit_blas_checkbox.isChecked() is bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])
     assert dialog._spin_result_cache_cap.value() == int(BatchSimulationCache.result_cache_cap)
     assert dialog._spin_preview_cache_cap.value() == int(BatchSimulationCache.preview_cache_cap)
 
 
-def test_solver_settings_dialog_preserves_worker_count_above_256(qt_app):
+def test_solver_settings_dialog_caps_worker_count_at_60(qt_app):
     dialog = SolverSettingsDialog()
 
     dialog.set_settings({"max_parallel_batch_workers": 400})
 
-    assert dialog._max_parallel_workers_spin.maximum() >= 400
-    assert dialog._max_parallel_workers_spin.value() == 400
+    assert dialog._max_parallel_workers_spin.maximum() == 60
+    assert dialog._max_parallel_workers_spin.value() == 60

@@ -86,7 +86,20 @@ class TestProjectDefaults:
 
         assert PROJECT_DEFAULTS["use_sparse_jacobian"] is True
         assert PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"] is True
-        assert PROJECT_DEFAULTS["max_parallel_batch_workers"] == max(1, (os.cpu_count() or 1) - 1)
+        assert PROJECT_DEFAULTS["max_parallel_batch_workers"] == min(
+            max(1, (os.cpu_count() or 1) - 1),
+            16,
+        )
+
+    def test_runtime_default_batch_workers_caps_high_cpu_count(self):
+        from kindred.core import runtime_defaults
+
+        assert runtime_defaults._compute_max_parallel_batch_workers_default(cpu_count=32) == 16
+
+    def test_runtime_default_batch_workers_uses_cpu_minus_one_below_cap(self):
+        from kindred.core import runtime_defaults
+
+        assert runtime_defaults._compute_max_parallel_batch_workers_default(cpu_count=8) == 7
 
 
 EXPECTED_DUAL_PERSISTED_KEYS = {

@@ -49,7 +49,7 @@ __all__ = ["SolverSettingsDialog"]
 _SOLVERS = ["Radau", "BDF"]
 _DEFAULT_RESULT_CACHE_CAP = int(RESULT_CACHE_CAP_DEFAULT)
 _DEFAULT_PREVIEW_CACHE_CAP = int(PREVIEW_CACHE_CAP_DEFAULT)
-_MIN_MAX_PARALLEL_WORKERS_SPIN_MAX = 256
+_MAX_PARALLEL_WORKERS_SPIN_MAX = 60
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
@@ -139,7 +139,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         solver_section_layout.addWidget(self._wegscheider_help)
 
         self._max_parallel_workers_spin = QtWidgets.QSpinBox(self)
-        self._max_parallel_workers_spin.setRange(1, _MIN_MAX_PARALLEL_WORKERS_SPIN_MAX)
+        self._max_parallel_workers_spin.setRange(1, _MAX_PARALLEL_WORKERS_SPIN_MAX)
         self._ensure_parallel_worker_spin_capacity(
             int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
         )
@@ -560,10 +560,8 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self._refresh_cache_status()
 
     def _ensure_parallel_worker_spin_capacity(self, workers: int) -> None:
-        bounded_workers = max(1, int(workers))
-        maximum = max(_MIN_MAX_PARALLEL_WORKERS_SPIN_MAX, bounded_workers)
-        if self._max_parallel_workers_spin.maximum() != maximum:
-            self._max_parallel_workers_spin.setMaximum(maximum)
+        if self._max_parallel_workers_spin.maximum() != _MAX_PARALLEL_WORKERS_SPIN_MAX:
+            self._max_parallel_workers_spin.setMaximum(_MAX_PARALLEL_WORKERS_SPIN_MAX)
 
     def _on_accept(self) -> None:
         try:

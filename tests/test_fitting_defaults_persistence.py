@@ -335,6 +335,37 @@ def test_dialog_change_takes_effect_on_session_defaults(main_window):
     )
 
 
+def test_new_project_leaves_document_fitting_defaults_empty(main_window, monkeypatch):
+    main_window.config_controller.update_user_preference("fitting_solver", "Radau")
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Discard,
+    )
+
+    main_window.project_controller.new_project()
+
+    assert main_window._fitting_defaults == {}
+
+
+def test_new_project_session_defaults_follow_live_user_preferences(main_window, monkeypatch):
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Discard,
+    )
+    main_window.project_controller.new_project()
+
+    session_before = main_window._get_fitting_session_defaults()
+    assert session_before["max_nfev"] == 1000
+
+    main_window.config_controller.update_user_preference("fitting_max_nfev", 5000)
+
+    session_after = main_window._get_fitting_session_defaults()
+    assert main_window._fitting_defaults == {}
+    assert session_after["max_nfev"] == 5000
+
+
 def test_document_override_preserved_after_dialog_change(main_window):
     """A document override must take precedence even after the user changes
     the same key via the Fitting Defaults dialog."""

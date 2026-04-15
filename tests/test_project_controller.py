@@ -715,7 +715,7 @@ def test_new_project_discard_clears_state(controller_and_mw):
 
 def test_new_project_payload_uses_explicit_user_preference_payload(controller_and_mw):
     """new_project() sends a complete payload with user preferences resolved."""
-    from kindred.gui.project_schema import PROJECT_DEFAULTS
+    from kindred.gui.project_schema import FITTING_DEFAULTS_KEYS, PROJECT_DEFAULTS
 
     controller, mw = controller_and_mw
     preference_values = {
@@ -723,7 +723,6 @@ def test_new_project_payload_uses_explicit_user_preference_payload(controller_an
         "use_sparse_jacobian": False,
         "max_parallel_batch_workers": 7,
         "limit_blas_threads_per_worker": False,
-        "fitting_parallel_enabled": True,
     }
     mw.config_controller.get_user_preference.side_effect = (
         lambda key: preference_values.get(key, PROJECT_DEFAULTS[key])
@@ -737,13 +736,14 @@ def test_new_project_payload_uses_explicit_user_preference_payload(controller_an
     mw.apply_project_payload.assert_called_once()
     payload = mw.apply_project_payload.call_args[0][0]
 
-    assert set(payload.keys()) == set(PROJECT_DEFAULTS.keys())
+    assert set(payload.keys()) == (set(PROJECT_DEFAULTS.keys()) - set(FITTING_DEFAULTS_KEYS))
     assert payload["mechanism"] == PROJECT_DEFAULTS["mechanism"]
     assert payload["solver"] == "Radau"
     assert payload["use_sparse_jacobian"] is False
     assert payload["max_parallel_batch_workers"] == 7
     assert payload["limit_blas_threads_per_worker"] is False
-    assert payload["fitting_parallel_enabled"] is True
+    for key in FITTING_DEFAULTS_KEYS:
+        assert key not in payload
 
 
 def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and_mw):
@@ -753,7 +753,6 @@ def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and
         "use_sparse_jacobian": False,
         "max_parallel_batch_workers": 9,
         "limit_blas_threads_per_worker": False,
-        "fitting_parallel_enabled": True,
     }.get(key)
     mw._settings.value.side_effect = lambda key, default=None, type=None: {
         "simulation/solver": "BDF",
@@ -774,7 +773,7 @@ def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and
     assert payload["use_sparse_jacobian"] is False
     assert payload["max_parallel_batch_workers"] == 9
     assert payload["limit_blas_threads_per_worker"] is False
-    assert payload["fitting_parallel_enabled"] is True
+    assert "fitting_parallel_enabled" not in payload
 
 
 def test_new_project_save_then_clear(controller_and_mw):
