@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any, Dict, Optional, Tuple
 
 from kindred.core.batch_parallel import prewarm_worker_imports
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
@@ -65,7 +66,10 @@ class ParallelBatchExecutor:
             self.completed_queue.put((sid, ts))
 
     def ensure_executor(self, *, max_workers: int) -> Any:
-        requested_workers = max(1, int(max_workers))
+        requested_workers = min(
+            int(MAX_PARALLEL_WORKERS_CEILING),
+            max(1, int(max_workers)),
+        )
         executor = self.executor
         if executor is None:
             return self._create_and_prewarm_executor(max_workers=requested_workers)

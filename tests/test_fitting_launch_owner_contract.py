@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from tests.conftest import CAN_CREATE_PROCESS_POOL, PROCESS_POOL_SKIP_REASON
+
 
 def _seed_one_dataset(main_window) -> None:
     data_panel = main_window._right_panel._data_manager
@@ -320,6 +322,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
 
 
 @pytest.mark.gui
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_pool(
     qtbot,
     qt_app,

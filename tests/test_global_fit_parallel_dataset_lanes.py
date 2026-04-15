@@ -8,6 +8,8 @@ from concurrent.futures import Future
 import numpy as np
 import pytest
 
+from tests.conftest import CAN_CREATE_PROCESS_POOL, PROCESS_POOL_SKIP_REASON
+
 
 def _payload(dataset_id: str, y_values) -> object:
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
@@ -126,6 +128,20 @@ def test_effective_fitting_process_workers_uses_dataset_cpu_and_cap(monkeypatch)
     assert global_fitting._effective_fitting_process_workers(20) == global_fitting._MAX_PARALLEL_DATASET_LANES
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_caps_requested_workers_at_shared_ceiling() -> None:
+    from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=200)
+
+    try:
+        assert pool.max_workers == int(MAX_PARALLEL_WORKERS_CEILING)
+    finally:
+        pool.shutdown(force_terminate=False)
+
+
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_fitting_process_pool_worker_pids_are_spawned_processes() -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
@@ -262,6 +278,7 @@ def test_initialize_fitting_worker_stops_prepare_when_cancel_arrives_mid_prepare
     assert fitting_process_pool._WORKER_EVALUATOR._prepared_run is None
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_fitting_process_pool_cancel_event_crosses_process_boundary() -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
@@ -278,6 +295,7 @@ def test_fitting_process_pool_cancel_event_crosses_process_boundary() -> None:
     assert int(payload["worker_pid"]) in set(pool.worker_pids()) | {int(payload["worker_pid"])}
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_fitting_process_pool_force_shutdown_terminates_running_worker_process(monkeypatch) -> None:
     import kindred.core.fitting_process_pool as fitting_process_pool
     from kindred.core.fitting_process_pool import FittingProcessPool
@@ -573,6 +591,7 @@ def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_i
     ]
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_fitting_process_pool_publishes_handle_before_prewarm(monkeypatch) -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
@@ -597,6 +616,7 @@ def test_fitting_process_pool_publishes_handle_before_prewarm(monkeypatch) -> No
         pool.shutdown(force_terminate=False)
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_global_fit_objective_process_pool_matches_serial_reference() -> None:
     from kindred.core.analysis.global_fitting import _GlobalFitObjective, _build_parameter_layout
     from kindred.core.fitting_evaluation import SerialFittingEvaluator

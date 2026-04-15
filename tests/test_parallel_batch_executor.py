@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.batch_parallel import prewarm_worker_imports
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 
@@ -131,6 +132,23 @@ def test_ensure_executor_prewarms_all_workers_after_fresh_creation() -> None:
     assert all(sub.fn is prewarm_worker_imports for sub in executor.submissions)
     assert all(sub.args == () for sub in executor.submissions)
     assert all(sub.kwargs == {} for sub in executor.submissions)
+
+
+@pytest.mark.unit
+def test_ensure_executor_caps_worker_count_at_shared_ceiling() -> None:
+    created: list[tuple[int, bool]] = []
+
+    def _factory(max_workers: int, limit_blas_threads: bool) -> _FakeExecutor:
+        created.append((int(max_workers), bool(limit_blas_threads)))
+        return _FakeExecutor(max_workers=max_workers)
+
+    batch = ParallelBatchExecutor(executor_factory=_factory)
+
+    executor = batch.ensure_executor(max_workers=200)
+
+    assert created == [(int(MAX_PARALLEL_WORKERS_CEILING), True)]
+    assert batch._current_max_workers == int(MAX_PARALLEL_WORKERS_CEILING)
+    assert len(executor.submissions) == int(MAX_PARALLEL_WORKERS_CEILING)
 
 
 @pytest.mark.unit

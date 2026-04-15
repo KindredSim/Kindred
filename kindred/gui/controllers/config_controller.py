@@ -9,6 +9,8 @@ from typing import Callable, List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 from shiboken6 import isValid
 
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["ConfigController"]
@@ -97,6 +99,11 @@ class ConfigController(QtCore.QObject):
         from kindred.gui.project_schema import QSETTINGS_KEY_MAP
         if key not in QSETTINGS_KEY_MAP:
             raise ValueError(f"Unknown user preference key: {key!r}")
+        if key == "max_parallel_batch_workers":
+            value = min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(value)),
+            )
         self._user_preferences[key] = value
 
     def get_user_preference(self, key: str) -> object:
@@ -233,12 +240,15 @@ class ConfigController(QtCore.QObject):
             )
         )
         self._ui.set_max_parallel_batch_workers(
-            max(
-                1,
-                self._read_int_setting(
-                    settings,
-                    "simulation/max_parallel_batch_workers",
-                    int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+            min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(
+                    1,
+                    self._read_int_setting(
+                        settings,
+                        "simulation/max_parallel_batch_workers",
+                        int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+                    ),
                 ),
             )
         )

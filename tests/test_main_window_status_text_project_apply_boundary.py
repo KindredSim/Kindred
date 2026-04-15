@@ -688,6 +688,23 @@ def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_ch
     assert calls == [None]
 
 
+def test_apply_project_payload_clamps_parallel_workers_to_shared_ceiling(main_window):
+    from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
+    payload = {
+        "mechanism": "A -> B; k=1",
+        "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
+        "max_parallel_batch_workers": 200,
+    }
+
+    main_window._apply_project_payload(payload, record_undo=False)
+
+    assert (
+        main_window._sim_controller.parallel_batch.max_parallel_workers
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+
+
 # ── Three-tier precedence tests ──────────────────────────────────────
 
 

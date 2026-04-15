@@ -5,6 +5,8 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from PySide6 import QtCore
 
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
 if TYPE_CHECKING:
     from PySide6.QtGui import QUndoStack
     from PySide6.QtWidgets import QDockWidget, QWidget
@@ -271,7 +273,10 @@ def build_settings_and_controllers(main_window: MainWindow) -> SettingsControlle
         set_max_parallel_batch_workers=lambda value: setattr(
             main_window.simulation_controller.parallel_batch,
             "max_parallel_workers",
-            int(value),
+            min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(value)),
+            ),
         ),
         limit_blas_threads_per_worker=lambda: bool(
             main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker

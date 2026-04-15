@@ -11,6 +11,7 @@ import pytest
 
 from kindred.core import batch_parallel
 from kindred.core.mechanism import Mechanism
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
@@ -201,6 +202,17 @@ def test_run_batch_simulation_task_uses_shared_preparation_failure_payload_for_i
     assert payload["success"] is False
     assert payload["error"]["kind"] == "preparation_error"
     assert payload["error"]["details"]["stage"] == "solver_config"
+
+
+def test_compute_effective_batch_workers_caps_requested_workers_at_shared_ceiling(monkeypatch):
+    monkeypatch.setattr(batch_parallel.os, "cpu_count", lambda: 128)
+
+    effective = batch_parallel.compute_effective_batch_workers(
+        num_sets=100,
+        max_parallel_workers=200,
+    )
+
+    assert effective == int(MAX_PARALLEL_WORKERS_CEILING)
 
 
 def test_run_batch_simulation_task_reports_algebra_errors_with_shared_schema(monkeypatch):

@@ -260,6 +260,50 @@ def test_save_then_load_settings_round_trip(main_window):
     assert main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker is False
 
 
+def test_load_settings_clamps_parallel_batch_workers_to_shared_ceiling(main_window):
+    from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
+    settings = main_window._settings
+    settings.clear()
+    settings.setValue("simulation/max_parallel_batch_workers", 200)
+    settings.sync()
+
+    main_window.simulation_controller.parallel_batch.max_parallel_workers = 1
+
+    main_window.config_controller.load_settings()
+
+    assert (
+        main_window.simulation_controller.parallel_batch.max_parallel_workers
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+    assert (
+        main_window.config_controller.get_user_preference("max_parallel_batch_workers")
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+
+
+def test_programmatic_parallel_batch_worker_setter_clamps_to_shared_ceiling(main_window):
+    from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
+    main_window.config_controller._ui.set_max_parallel_batch_workers(200)
+
+    assert (
+        main_window.simulation_controller.parallel_batch.max_parallel_workers
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+
+
+def test_update_user_preference_clamps_parallel_batch_workers_to_shared_ceiling(main_window):
+    from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
+    main_window.config_controller.update_user_preference("max_parallel_batch_workers", 200)
+
+    assert (
+        main_window.config_controller.get_user_preference("max_parallel_batch_workers")
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+
+
 def test_insert_preference_surface_removed(main_window):
     assert not hasattr(main_window, "_insert_preference")
     assert not hasattr(main_window, "_reset_insert_preference")

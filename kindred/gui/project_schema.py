@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from kindred.core.runtime_defaults import (
     LIMIT_BLAS_THREADS_PER_WORKER_DEFAULT,
     MAX_PARALLEL_BATCH_WORKERS_DEFAULT,
+    MAX_PARALLEL_WORKERS_CEILING,
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
@@ -119,7 +120,10 @@ def get_user_preference_payload(settings: QSettings) -> dict[str, object]:
             elif isinstance(default, int):
                 raw = settings.value(qs_key, default, type=int)
                 if key == "max_parallel_batch_workers":
-                    raw = max(1, raw)
+                    raw = min(
+                        int(MAX_PARALLEL_WORKERS_CEILING),
+                        max(1, raw),
+                    )
                 result[key] = raw
             elif key == "simulation_time":
                 raw = settings.value(qs_key, default)

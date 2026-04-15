@@ -20,6 +20,7 @@ from kindred.core.simulation_result_payload import (
     build_simulation_success_payload,
 )
 from kindred.core.runtime_defaults import (
+    MAX_PARALLEL_WORKERS_CEILING,
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
@@ -51,10 +52,13 @@ _WORKER_PREPARED_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 def compute_effective_batch_workers(*, num_sets: int, max_parallel_workers: int) -> int:
     """
     Return effective worker count using:
-    min(num_sets, max(1, cpu_count-1), max_parallel_workers).
+    min(num_sets, max(1, cpu_count-1), max_parallel_workers, MAX_PARALLEL_WORKERS_CEILING).
     """
     n_sets = max(0, int(num_sets))
-    cap = max(1, int(max_parallel_workers))
+    cap = min(
+        int(MAX_PARALLEL_WORKERS_CEILING),
+        max(1, int(max_parallel_workers)),
+    )
     cpu = os.cpu_count()
     cpu_cap = max(1, int(cpu) - 1) if isinstance(cpu, int) and cpu > 0 else 1
     if n_sets <= 0:

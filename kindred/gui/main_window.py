@@ -24,6 +24,7 @@ from PySide6.QtCore import Qt, QSettings
 
 from kindred import __version__ as KINDRED_VERSION
 from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
     build_current_text_step_analysis_context,
@@ -3838,8 +3839,9 @@ class MainWindow(
         previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
         previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
-            self._sim_controller.parallel_batch.max_parallel_workers = max(
-                1, int(resolved_payload['max_parallel_batch_workers'])
+            self._sim_controller.parallel_batch.max_parallel_workers = min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(resolved_payload['max_parallel_batch_workers'])),
             )
         except Exception:
             self._sim_controller.parallel_batch.max_parallel_workers = int(PROJECT_DEFAULTS['max_parallel_batch_workers'])
@@ -8864,9 +8866,12 @@ class MainWindow(
             previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             if 'max_parallel_batch_workers' in settings:
                 try:
-                    self._sim_controller.parallel_batch.max_parallel_workers = max(
-                        1,
-                        int(settings['max_parallel_batch_workers']),
+                    self._sim_controller.parallel_batch.max_parallel_workers = min(
+                        int(MAX_PARALLEL_WORKERS_CEILING),
+                        max(
+                            1,
+                            int(settings['max_parallel_batch_workers']),
+                        ),
                     )
                 except Exception:
                     self._sim_controller.parallel_batch.max_parallel_workers = int(

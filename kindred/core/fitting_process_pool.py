@@ -8,6 +8,8 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeou
 from contextlib import suppress
 from typing import Any, Callable, Mapping, MutableMapping, Optional
 
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
 BLAS_THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -200,7 +202,10 @@ class FittingProcessPool:
         limit_blas_threads: bool = True,
         publish_callback: Optional[Callable[[Optional["FittingProcessPool"]], None]] = None,
     ) -> None:
-        requested_workers = max(1, int(max_workers))
+        requested_workers = min(
+            int(MAX_PARALLEL_WORKERS_CEILING),
+            max(1, int(max_workers)),
+        )
         ctx = mp.get_context("spawn")
         payload = dict(evaluator_payload or {})
         payload_copy = dict(payload)

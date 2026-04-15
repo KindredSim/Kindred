@@ -198,6 +198,18 @@ class TestGetUserPreferencePayload:
         payload = get_user_preference_payload(settings)
         assert payload["max_parallel_batch_workers"] >= 1
 
+    def test_workers_clamped_to_shared_ceiling(self, main_window):
+        from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+        from kindred.gui.project_schema import get_user_preference_payload
+
+        settings = main_window._settings
+        settings.clear()
+        settings.setValue("simulation/max_parallel_batch_workers", 200)
+        settings.sync()
+
+        payload = get_user_preference_payload(settings)
+        assert payload["max_parallel_batch_workers"] == int(MAX_PARALLEL_WORKERS_CEILING)
+
     def test_project_only_keys_use_factory_defaults(self, main_window):
         from kindred.gui.project_schema import PROJECT_DEFAULTS, get_user_preference_payload
 

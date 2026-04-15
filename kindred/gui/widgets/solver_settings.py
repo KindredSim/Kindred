@@ -36,7 +36,11 @@ from typing import Dict, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACHE_CAP_DEFAULT
+from kindred.core.runtime_defaults import (
+    MAX_PARALLEL_WORKERS_CEILING,
+    PREVIEW_CACHE_CAP_DEFAULT,
+    RESULT_CACHE_CAP_DEFAULT,
+)
 from kindred.core.validation import try_parse_int
 from kindred.gui.ports import SimulationCacheControlsPort, SimulationCacheOpResult
 from kindred.gui.project_schema import PROJECT_DEFAULTS
@@ -49,7 +53,7 @@ __all__ = ["SolverSettingsDialog"]
 _SOLVERS = ["Radau", "BDF"]
 _DEFAULT_RESULT_CACHE_CAP = int(RESULT_CACHE_CAP_DEFAULT)
 _DEFAULT_PREVIEW_CACHE_CAP = int(PREVIEW_CACHE_CAP_DEFAULT)
-_MAX_PARALLEL_WORKERS_SPIN_MAX = 60
+_MAX_PARALLEL_WORKERS_SPIN_MAX = int(MAX_PARALLEL_WORKERS_CEILING)
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
