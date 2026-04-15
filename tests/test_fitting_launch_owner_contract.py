@@ -342,6 +342,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_po
 
     _seed_two_datasets(main_window)
     _seed_simple_mechanism(main_window)
+    main_window.config_controller.update_user_preference("fitting_parallel_enabled", True)
     monkeypatch.setattr(
         main_window._dataset_manager,
         "scan_mechanism_parameters",
@@ -441,6 +442,118 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_po
         window.close()
         window.deleteLater()
         qt_app.processEvents()
+
+
+@pytest.mark.gui
+def test_fitting_defaults_checkbox_controls_new_window_parallel_snapshot(
+    qt_app,
+    main_window,
+    monkeypatch,
+):
+    from PySide6 import QtCore, QtWidgets
+
+    from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
+    from kindred.gui.fitting import launch_global_fit_session
+    from kindred.gui.fitting.window import FittingWindow
+
+    _seed_one_dataset(main_window)
+    _seed_simple_mechanism(main_window)
+    monkeypatch.setattr(
+        main_window._dataset_manager,
+        "scan_mechanism_parameters",
+        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+    )
+
+    captured_parallel_enabled: list[bool] = []
+    launch_kwargs: dict[str, object] = {}
+
+    class _FakeWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        finished = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+        bestUpdated = QtCore.Signal(dict)
+
+        def __init__(self, datasets, shared_params, *, parallel_enabled=None, **kwargs):
+            super().__init__()
+            captured_parallel_enabled.append(bool(parallel_enabled))
+
+        def start(self):
+            return
+
+        def isRunning(self):
+            return False
+
+        def cancel(self):
+            return
+
+    class _CaptureWindow(QtWidgets.QDialog):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            launch_kwargs.clear()
+            launch_kwargs.update(kwargs)
+
+        def setWindowTitle(self, *_args):
+            return None
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):
+            return None
+
+    def configure_parallel_checkbox(enabled: bool) -> None:
+        def fake_exec(dialog):
+            for checkbox in dialog.findChildren(QtWidgets.QCheckBox):
+                if checkbox.text() == "Enable parallel fitting":
+                    checkbox.setChecked(bool(enabled))
+            return QtWidgets.QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(QtWidgets.QDialog, "exec", fake_exec)
+        main_window._configure_fitting()
+
+    def launch_and_start_fit() -> None:
+        window = launch_global_fit_session(
+            replace(main_window._build_global_fit_launch_context(), window_factory=_CaptureWindow)
+        )
+        assert isinstance(window, QtWidgets.QDialog)
+        eager_window = FittingWindow(**launch_kwargs)
+        try:
+            assert launch_kwargs["config_defaults"]["parallel_enabled"] in {True, False}
+            config = eager_window._params_ics_tab._collect_parameter_config()
+            assert config is not None
+            selection = eager_window._collect_dataset_selection()
+            eager_window._start_global_fit_worker(
+                datasets=coerce_fit_dataset_specs(list(launch_kwargs["dataset_payloads"])),
+                config=config,
+                dataset_overrides=[],
+                weights=eager_window._weights_for_run(selection),
+                requested_solver="BDF",
+                requested_rtol=1e-6,
+                requested_atol=1e-12,
+                fit_evaluator=eager_window._simulation_func,
+                stamp={},
+                stamp_hash="stamp-hash",
+                stamp_short="stamp",
+            )
+        finally:
+            eager_window.close()
+            eager_window.deleteLater()
+            window.close()
+            window.deleteLater()
+            qt_app.processEvents()
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+
+    configure_parallel_checkbox(True)
+    launch_and_start_fit()
+
+    configure_parallel_checkbox(False)
+    launch_and_start_fit()
+
+    assert captured_parallel_enabled == [True, False]
 
 
 @pytest.mark.gui

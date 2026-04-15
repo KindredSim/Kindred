@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
-import os
+import operator
 import pickle
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
@@ -53,8 +53,6 @@ from kindred.core.analysis.x_mapping import normalize_x_mapping_mode
 
 logger = logging.getLogger(__name__)
 
-_MAX_PARALLEL_DATASET_LANES = 4
-
 __all__ = [
     "GlobalFitResult",
     "DatasetFitInfo",
@@ -62,13 +60,23 @@ __all__ = [
 ]
 
 
-def _effective_fitting_process_workers(num_datasets: int) -> int:
-    dataset_count = max(0, int(num_datasets))
-    cpu = os.cpu_count()
-    cpu_cap = max(1, int(cpu) - 1) if isinstance(cpu, int) and cpu > 0 else 1
-    if dataset_count <= 0:
-        return 1
-    return int(min(dataset_count, cpu_cap, _MAX_PARALLEL_DATASET_LANES))
+def _coerce_parallel_worker_count(value: object, *, setting_name: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{setting_name} must be an integer.")
+    try:
+        worker_count = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{setting_name} must be an integer.") from exc
+    if worker_count < 1:
+        raise ValueError(f"{setting_name} must be at least 1.")
+    return int(worker_count)
+
+
+def _coerce_parallel_blas_flag(value: object, *, setting_name: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{setting_name} must be a boolean.")
+    return bool(value)
+
 
 def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
     if cancellation_check is not None and cancellation_check():
@@ -1536,6 +1544,9 @@ def fit_global(
     max_nfev: int = 1000,
     ftol: float = 1e-10,
     xtol: float = 1e-10,
+    parallel_enabled: bool = False,
+    max_parallel_workers: int = 1,
+    limit_blas_threads: bool = True,
     seed: Optional[int] = None,
     log10_params: Optional[Dict[str, bool]] = None,
     progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]] = None,
@@ -1579,6 +1590,12 @@ def fit_global(
         Optimization method ('trf', 'dogbox', 'lm', 'de')
     max_nfev : int
         Maximum number of function evaluations
+    parallel_enabled : bool
+        When True, allow process-pool dataset evaluation if all other pool gates pass.
+    max_parallel_workers : int
+        Upper bound for dataset-evaluation process workers when parallel fitting is enabled.
+    limit_blas_threads : bool
+        Whether each fitting worker process should limit BLAS threads.
     seed : int, optional
         Random seed for differential evolution (reproducibility).
     log10_params : dict, optional
@@ -1686,7 +1703,7 @@ def fit_global(
     process_pool: Optional[FittingProcessPool] = None
     process_payload = None
     try:
-        if type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
+        if bool(parallel_enabled) and type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
             try:
                 process_payload = fit_evaluator.to_process_payload()
             except (pickle.PicklingError, TypeError) as exc:
@@ -1695,10 +1712,17 @@ def fit_global(
                     exc,
                 )
             if process_payload is not None:
+                requested_max_workers = _coerce_parallel_worker_count(
+                    max_parallel_workers,
+                    setting_name="max_parallel_workers",
+                )
                 process_pool = FittingProcessPool(
                     process_payload,
-                    max_workers=_effective_fitting_process_workers(len(payloads)),
-                    limit_blas_threads=True,
+                    max_workers=min(len(payloads), requested_max_workers),
+                    limit_blas_threads=_coerce_parallel_blas_flag(
+                        limit_blas_threads,
+                        setting_name="limit_blas_threads",
+                    ),
                     publish_callback=process_pool_callback,
                 )
     except Exception:

@@ -491,6 +491,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         apply_callback=context.write_fit_results_to_mechanism,
         project_apply_callback=context.apply_fit_results_to_project,
         config_defaults=context.load_fitting_defaults(),
+        shared_solver_settings_getter=context.get_solver_settings,
         dataset_settings_updater=context.apply_dataset_initial_updates,
         parent=context.parent,
     )

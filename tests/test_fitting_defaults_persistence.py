@@ -174,6 +174,7 @@ def test_fitting_defaults_dialog_updates_dialog_managed_keys(qt_app, monkeypatch
             "fitting_max_nfev",
             "fitting_ftol",
             "fitting_xtol",
+            "fitting_parallel_enabled",
             "fitting_use_seed",
             "fitting_seed",
             "fitting_solver",
@@ -215,7 +216,13 @@ def test_fitting_key_to_short_matches_fitting_defaults_keys():
     """_FITTING_KEY_TO_SHORT must match the fitting defaults shown in the dialog."""
     from kindred.gui.mixins.fitting_mixin import _FITTING_KEY_TO_SHORT
 
-    assert set(_FITTING_KEY_TO_SHORT.keys()) == (set(FITTING_DEFAULTS_KEYS) - {"fitting_parallel_enabled"})
+    assert set(_FITTING_KEY_TO_SHORT.keys()) == set(FITTING_DEFAULTS_KEYS)
+
+
+def test_parallel_enabled_factory_default_flows_into_session_defaults(main_window):
+    session = main_window._get_fitting_session_defaults()
+    assert PROJECT_DEFAULTS["fitting_parallel_enabled"] is False
+    assert session["parallel_enabled"] is False
 
 
 def test_session_defaults_reads_fitting_defaults_not_user_prefs(main_window):

@@ -116,18 +116,6 @@ class _EvaluateOnlyNoClone:
             "species": {"A": np.full_like(self._t_axis, value, dtype=float)},
         }
 
-
-def test_effective_fitting_process_workers_uses_dataset_cpu_and_cap(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-
-    monkeypatch.setattr(global_fitting.os, "cpu_count", lambda: 12)
-
-    assert global_fitting._effective_fitting_process_workers(0) == 1
-    assert global_fitting._effective_fitting_process_workers(1) == 1
-    assert global_fitting._effective_fitting_process_workers(2) == 2
-    assert global_fitting._effective_fitting_process_workers(20) == global_fitting._MAX_PARALLEL_DATASET_LANES
-
-
 @pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
 def test_fitting_process_pool_caps_requested_workers_at_shared_ceiling() -> None:
     from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
@@ -800,14 +788,90 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
         method="trf",
         max_nfev=1,
+        parallel_enabled=True,
+        max_parallel_workers=9,
+        limit_blas_threads=False,
     )
 
     assert result.success is True
     assert len(pools) == 1
     assert pools[0].max_workers == 2
-    assert pools[0].limit_blas_threads is True
+    assert pools[0].limit_blas_threads is False
     assert pools[0].submit_count == 2
     assert pools[0].shutdown_calls == [False]
+
+
+def test_fit_global_parallel_disabled_by_default_stays_in_process(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process pool should not be created when parallel fitting is disabled by default")
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _make_serial_evaluator(),
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.success is True
+
+
+def test_fit_global_parallel_disabled_explicitly_stays_in_process(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("process pool should not be created when parallel fitting is disabled")
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _make_serial_evaluator(),
+        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+        {"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+        method="trf",
+        max_nfev=1,
+        parallel_enabled=False,
+        max_parallel_workers=8,
+        limit_blas_threads=True,
+    )
+
+    assert result.success is True
 
 
 def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_process(monkeypatch, caplog) -> None:
@@ -858,6 +922,9 @@ def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_p
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
         method="trf",
         max_nfev=1,
+        parallel_enabled=True,
+        max_parallel_workers=5,
+        limit_blas_threads=True,
         process_pool_callback=lambda pool: callback_values.append(pool),
     )
 
@@ -943,6 +1010,9 @@ def test_fit_global_ignores_cleanup_process_pool_callback_error(monkeypatch) -> 
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
         method="trf",
         max_nfev=1,
+        parallel_enabled=True,
+        max_parallel_workers=4,
+        limit_blas_threads=True,
         process_pool_callback=process_pool_callback,
     )
 
@@ -981,6 +1051,9 @@ def test_fit_global_single_dataset_serial_fitting_evaluator_stays_in_process(mon
         dataset_params={"ds1": {"init:A": 1.0}},
         method="trf",
         max_nfev=1,
+        parallel_enabled=True,
+        max_parallel_workers=4,
+        limit_blas_threads=True,
     )
 
     assert result.success is True
@@ -1018,6 +1091,9 @@ def test_fit_global_custom_evaluator_stays_in_process(monkeypatch) -> None:
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
         method="trf",
         max_nfev=1,
+        parallel_enabled=True,
+        max_parallel_workers=4,
+        limit_blas_threads=True,
     )
 
     assert result.success is True
@@ -1058,6 +1134,9 @@ def test_fit_global_serial_fitting_evaluator_subclass_stays_in_process(monkeypat
         dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
         method="trf",
         max_nfev=1,
+        parallel_enabled=True,
+        max_parallel_workers=4,
+        limit_blas_threads=True,
     )
 
     assert result.success is True
@@ -1086,6 +1165,64 @@ def test_global_fit_worker_retro_cancels_process_pool_when_handle_arrives_late()
     worker._set_active_process_pool(pool)
 
     assert pool.cancel_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("max_parallel_workers", "limit_blas_threads", "error_type", "message"),
+    [
+        (0, True, ValueError, "max_parallel_workers must be at least 1."),
+        (3.7, True, TypeError, "max_parallel_workers must be an integer."),
+        (2, "yes", TypeError, "limit_blas_threads must be a boolean."),
+    ],
+)
+def test_global_fit_worker_rejects_invalid_parallel_runtime_settings(
+    max_parallel_workers,
+    limit_blas_threads,
+    error_type,
+    message,
+) -> None:
+    from kindred.gui.fitting.worker import GlobalFitWorker
+
+    with pytest.raises(error_type, match=message):
+        GlobalFitWorker(
+            datasets=[_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+            shared_params={"k1": 1.0},
+            fit_evaluator=_make_serial_evaluator(),
+            fit_func=lambda *_args, **_kwargs: None,
+            max_nfev=1,
+            parallel_enabled=True,
+            max_parallel_workers=max_parallel_workers,
+            limit_blas_threads=limit_blas_threads,
+        )
+
+
+@pytest.mark.parametrize(
+    ("max_parallel_workers", "limit_blas_threads", "error_type", "message"),
+    [
+        (0, True, ValueError, "max_parallel_workers must be at least 1."),
+        (3.7, True, TypeError, "max_parallel_workers must be an integer."),
+        (2, "yes", TypeError, "limit_blas_threads must be a boolean."),
+    ],
+)
+def test_fit_global_rejects_invalid_parallel_runtime_settings(
+    max_parallel_workers,
+    limit_blas_threads,
+    error_type,
+    message,
+) -> None:
+    from kindred.core.analysis import global_fitting
+
+    with pytest.raises(error_type, match=message):
+        global_fitting.fit_global(
+            _make_serial_evaluator(),
+            [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+            {"k1": 1.0},
+            method="trf",
+            max_nfev=1,
+            parallel_enabled=True,
+            max_parallel_workers=max_parallel_workers,
+            limit_blas_threads=limit_blas_threads,
+        )
 
 
 def test_fit_global_process_pool_shutdown_on_post_optimizer_error(monkeypatch) -> None:
@@ -1142,6 +1279,9 @@ def test_fit_global_process_pool_shutdown_on_post_optimizer_error(monkeypatch) -
             dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
             method="trf",
             max_nfev=1,
+            parallel_enabled=True,
+            max_parallel_workers=6,
+            limit_blas_threads=True,
         )
 
     assert len(pools) == 1

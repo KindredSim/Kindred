@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import operator
 import weakref
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
 
@@ -81,6 +82,24 @@ _PROJECT_APPLY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("Initial conditions only", _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS),
     ("Parameters and initial conditions", _PROJECT_APPLY_SCOPE_BOTH),
 )
+
+
+def _coerce_parallel_worker_count(value: object, *, setting_name: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{setting_name} must be an integer.")
+    try:
+        worker_count = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{setting_name} must be an integer.") from exc
+    if worker_count < 1:
+        raise ValueError(f"{setting_name} must be at least 1.")
+    return int(worker_count)
+
+
+def _coerce_parallel_blas_flag(value: object, *, setting_name: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{setting_name} must be a boolean.")
+    return bool(value)
 
 __all__ = [
     "DEFAULT_PARALLEL_STARTS",
@@ -324,6 +343,7 @@ class FittingWindow(QtWidgets.QDialog):
         project_apply_callback: Optional[Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]] = None,
         dataset_settings_updater: Optional[Callable[[str, Dict[str, float]], None]] = None,
         config_defaults: Optional[Dict[str, Any]] = None,
+        shared_solver_settings_getter: Optional[Callable[[], Dict[str, object]]] = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ):
         super().__init__(parent)
@@ -349,6 +369,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._project_apply_callback = project_apply_callback
         self._dataset_settings_updater = dataset_settings_updater
         self._config_defaults = dict(config_defaults or {})
+        self._shared_solver_settings_getter = shared_solver_settings_getter
 
         self._global_dataset_params = dict(dataset_params or {})
         self._global_dataset_variable_params = dict(dataset_variable_params or {})
@@ -519,6 +540,28 @@ class FittingWindow(QtWidgets.QDialog):
         if not (np.isfinite(atol_default) and atol_default > 0.0):
             atol_default = 1e-12
         return str(solver_default), float(rtol_default), float(atol_default)
+
+    def _parallel_fit_runtime_settings_for_run(self) -> Tuple[int, bool]:
+        getter = self._shared_solver_settings_getter
+        if not callable(getter):
+            raise RuntimeError("Shared solver settings getter is unavailable.")
+        settings = getter()
+        if not isinstance(settings, Mapping):
+            raise TypeError("Shared solver settings payload must be a mapping.")
+        if "max_parallel_batch_workers" not in settings:
+            raise KeyError("Shared solver settings are missing max_parallel_batch_workers.")
+        if "limit_blas_threads_per_worker" not in settings:
+            raise KeyError("Shared solver settings are missing limit_blas_threads_per_worker.")
+
+        max_parallel_workers = _coerce_parallel_worker_count(
+            settings["max_parallel_batch_workers"],
+            setting_name="max_parallel_batch_workers",
+        )
+        limit_blas_threads = _coerce_parallel_blas_flag(
+            settings["limit_blas_threads_per_worker"],
+            setting_name="limit_blas_threads_per_worker",
+        )
+        return max_parallel_workers, limit_blas_threads
 
     def _modeled_series_names_for_x_axis(self) -> set[str]:
         modeled = {str(x) for x in (self._params_ics_tab.get_mechanism_species() or []) if str(x).strip()}
@@ -1752,19 +1795,25 @@ class FittingWindow(QtWidgets.QDialog):
 
         fixed_params = self._fixed_params_for_run(config)
         simulation_with_fixed = self._simulation_with_fixed_params(self._simulation_func, fixed_params)
-        self._start_global_fit_worker(
-            datasets=dataset_specs,
-            config=config,
-            dataset_overrides=dataset_overrides,
-            weights=weights,
-            requested_solver=requested_solver,
-            requested_rtol=requested_rtol,
-            requested_atol=requested_atol,
-            fit_evaluator=simulation_with_fixed,
-            stamp=stamp,
-            stamp_hash=stamp_hash,
-            stamp_short=stamp_short,
-        )
+        try:
+            self._start_global_fit_worker(
+                datasets=dataset_specs,
+                config=config,
+                dataset_overrides=dataset_overrides,
+                weights=weights,
+                requested_solver=requested_solver,
+                requested_rtol=requested_rtol,
+                requested_atol=requested_atol,
+                fit_evaluator=simulation_with_fixed,
+                stamp=stamp,
+                stamp_hash=stamp_hash,
+                stamp_short=stamp_short,
+            )
+        except Exception as exc:
+            logger.exception("Failed to start fit worker.")
+            self._set_running_state(False)
+            QtWidgets.QMessageBox.warning(self, "Global Fit", f"Failed to start fit:\n{exc}")
+            return
 
     def _datasets_payloads_for_run(self, selected_ids: Sequence[str]) -> Optional[list[dict[str, Any]]]:
         datasets: list[dict[str, Any]] = []
@@ -2168,6 +2217,12 @@ class FittingWindow(QtWidgets.QDialog):
         stamp_hash: str,
         stamp_short: str,
     ) -> None:
+        parallel_enabled = bool(config.get("parallel_enabled", self._config_defaults.get("parallel_enabled", False)))
+        if parallel_enabled:
+            max_parallel_workers, limit_blas_threads = self._parallel_fit_runtime_settings_for_run()
+        else:
+            max_parallel_workers = 1
+            limit_blas_threads = True
         worker = GlobalFitWorker(
             datasets,
             dict(config["parameters"]),
@@ -2178,6 +2233,9 @@ class FittingWindow(QtWidgets.QDialog):
             max_nfev=config.get("max_nfev", 1000),
             ftol=config.get("ftol", 1e-10),
             xtol=config.get("xtol", 1e-10),
+            parallel_enabled=parallel_enabled,
+            max_parallel_workers=max_parallel_workers,
+            limit_blas_threads=limit_blas_threads,
             seed=config.get("seed"),
             log10_params=config.get("log10_params"),
             fit_evaluator=fit_evaluator,
