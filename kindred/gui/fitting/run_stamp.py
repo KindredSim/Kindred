@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 from kindred.core.analysis.dataset_parameter_overrides import (
@@ -20,6 +20,24 @@ except Exception:  # pragma: no cover - defensive fallback
     KINDRED_VERSION = ""
 
 __all__ = ["build_global_fit_run_stamp", "hash_global_fit_run_stamp"]
+
+_REQUIRED_PREPARED_SIMULATION_KEYS = frozenset(
+    {
+        "mechanism_text_sha256",
+        "mechanism_text_len",
+        "param_names",
+        "t_end",
+        "num_points",
+        "temperature_K",
+        "solver_requested",
+        "solver_normalized",
+        "rtol",
+        "atol",
+        "use_sparse_jacobian",
+        "wegscheider_cyclicity_enabled",
+        "initial_prefix",
+    }
+)
 
 
 def _sha256_hex(text: str) -> str:
@@ -139,7 +157,6 @@ def _normalize_fit_config_dict(fit_config: Dict[str, Any]) -> tuple[dict[str, An
     except Exception:
         config["max_nfev"] = 0
     config["seed"] = config.get("seed")
-    config["use_parallel"] = bool(config.get("use_parallel", False))
     try:
         config["parallel_starts"] = int(config.get("parallel_starts") or 0)
     except Exception:
@@ -234,6 +251,13 @@ def _normalize_dataset_variable_params_block(
 
 
 def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) -> Optional[dict[str, Any]]:
+    if isinstance(prepared_simulation, Mapping):
+        missing = sorted(_REQUIRED_PREPARED_SIMULATION_KEYS.difference(prepared_simulation.keys()))
+        if missing:
+            raise ValueError(
+                "Incomplete prepared simulation metadata: missing "
+                + ", ".join(missing)
+            )
     prepared_meta = coerce_prepared_simulation_metadata(prepared_simulation)
     if prepared_meta is None:
         return None
@@ -249,8 +273,8 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
         "solver_normalized": str(serialized.get("solver_normalized") or ""),
         "rtol": _float_to_canonical_str(serialized.get("rtol")),
         "atol": _float_to_canonical_str(serialized.get("atol")),
-        "use_sparse_jacobian": bool(serialized.get("use_sparse_jacobian", False)),
-        "wegscheider_cyclicity_enabled": bool(serialized.get("wegscheider_cyclicity_enabled", False)),
+        "use_sparse_jacobian": bool(serialized["use_sparse_jacobian"]),
+        "wegscheider_cyclicity_enabled": bool(serialized["wegscheider_cyclicity_enabled"]),
         "initial_prefix": str(serialized.get("initial_prefix") or ""),
     }
 
@@ -326,7 +350,6 @@ def build_global_fit_run_stamp(
             "method": str(config.get("method") or ""),
             "max_nfev": int(config.get("max_nfev") or 0),
             "seed": (int(config["seed"]) if config.get("seed") is not None else None),
-            "use_parallel": bool(config.get("use_parallel", False)),
             "parallel_starts": int(config.get("parallel_starts") or 0),
         },
         "parameters": {

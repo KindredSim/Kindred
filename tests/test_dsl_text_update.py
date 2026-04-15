@@ -740,6 +740,7 @@ def test_analyze_step_parameter_update_distinguishes_canonicalization_only_step_
         "kf1",
         1.0,
         authoritative_current_value=1.0,
+        step_constraint_context={"wegscheider_cyclicity_enabled": False},
     )
 
     assert outcome.parameter_name == "kf1"
@@ -872,6 +873,7 @@ def test_analyze_parameter_updates_to_dsl_text_reports_step_floor_as_real_semant
         "equilibrium: A <-> B ; kf=1, K=0",
         {"Keq1": -0.0},
         authoritative_values={"Keq1": 0.0},
+        step_constraint_context={"wegscheider_cyclicity_enabled": False},
     )
 
     assert analysis.updated_text == "equilibrium: A <-> B ; kf=1, Keq=1e-12"

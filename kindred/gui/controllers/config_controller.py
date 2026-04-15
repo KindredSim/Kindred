@@ -152,7 +152,9 @@ class ConfigController(QtCore.QObject):
 
     def load_settings(self) -> None:
         settings = self._settings()
+        from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACHE_CAP_DEFAULT
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+        from kindred.gui.project_schema import PROJECT_DEFAULTS
 
         restore_maximized = settings.value("window/is_maximized", False, type=bool)
         self._restore_gui_state_setting(
@@ -219,34 +221,38 @@ class ConfigController(QtCore.QObject):
         self._ui.set_use_sparse_jacobian(
             settings.value(
                 "simulation/use_sparse_jacobian",
-                False,
+                bool(PROJECT_DEFAULTS["use_sparse_jacobian"]),
                 type=bool,
             )
         )
         self._ui.set_wegscheider_cyclicity_enabled(
             settings.value(
                 "simulation/wegscheider_cyclicity_enabled",
-                False,
+                bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
                 type=bool,
             )
         )
         self._ui.set_max_parallel_batch_workers(
             max(
                 1,
-                self._read_int_setting(settings, "simulation/max_parallel_batch_workers", 12),
+                self._read_int_setting(
+                    settings,
+                    "simulation/max_parallel_batch_workers",
+                    int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+                ),
             )
         )
 
         self._ui.set_limit_blas_threads_per_worker(
             settings.value(
                 "simulation/limit_blas_threads_per_worker",
-                True,
+                bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
                 type=bool,
             )
         )
 
-        default_result_cap = self._ui.result_cache_cap()
-        default_preview_cap = self._ui.preview_cache_cap()
+        default_result_cap = int(RESULT_CACHE_CAP_DEFAULT)
+        default_preview_cap = int(PREVIEW_CACHE_CAP_DEFAULT)
         result_cap = self._read_int_setting(settings, "simulation/result_cache_cap", default_result_cap)
         preview_cap = self._read_int_setting(settings, "simulation/preview_cache_cap", default_preview_cap)
         self._ui.set_cache_caps(result_cap=result_cap, preview_cap=preview_cap, persist=False)

@@ -791,11 +791,23 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
 
 
 def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_process(monkeypatch, caplog) -> None:
+    import pickle
+
     from kindred.core.analysis import global_fitting
     from kindred.core.fitting_optimization import FitResult
 
+    class _PickleRefusal:
+        def __call__(self, _time):
+            return 298.15
+
+        def __deepcopy__(self, memo):
+            return self
+
+        def __reduce__(self):
+            raise pickle.PicklingError("refuse process-pool payload pickling")
+
     evaluator = _make_serial_evaluator()
-    evaluator.context.execution_request.prepared_payload["temperature_schedule"] = lambda _t: 298.15
+    evaluator.context.execution_request.prepared_payload["temperature_schedule"] = _PickleRefusal()
 
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("process pool should not be created for an unpicklable evaluator payload")

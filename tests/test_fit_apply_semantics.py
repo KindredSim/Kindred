@@ -9,6 +9,7 @@ from kindred.gui.controllers.dataset_manager import DatasetFitSettings
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.mixins.fitting_mixin import FittingMixin
 from kindred.gui.mixins.ports import FittingMixinPorts
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
 def _make_fit_result() -> GlobalFitResult:
@@ -207,8 +208,15 @@ class _PlanHost(QtWidgets.QWidget, FittingMixin):
         authoritative_params: dict[str, float],
         batch_rows: list[dict[str, object]],
         settings_by_dataset: dict[str, DatasetFitSettings],
+        solver_settings: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
+        self._solver_settings = {
+            "use_sparse_jacobian": bool(PROJECT_DEFAULTS["use_sparse_jacobian"]),
+            "wegscheider_cyclicity_enabled": bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
+        }
+        if solver_settings:
+            self._solver_settings.update(dict(solver_settings))
         self._fitting_ports = FittingMixinPorts(
             mechanism_editor=_PlanMechanismEditor(mechanism_text),
             dataset_manager=_PlanDatasetManager(settings_by_dataset),
@@ -220,6 +228,9 @@ class _PlanHost(QtWidgets.QWidget, FittingMixin):
         self._preview_session = SimpleNamespace(param_store=DocumentParameterStore())
         self._preview_session.param_store.sync_shared_params(dict(authoritative_params))
         self._batch_store = _PlanBatchStore(batch_rows)
+
+    def _get_solver_settings(self) -> dict[str, object]:
+        return dict(self._solver_settings)
 
 
 class _NoRewritePlanHost(_PlanHost):
@@ -1041,6 +1052,7 @@ def test_build_fit_project_apply_plan_treats_step_canonicalization_only_rewrite_
         authoritative_params={"kf1": 1.0},
         batch_rows=[],
         settings_by_dataset={},
+        solver_settings={"wegscheider_cyclicity_enabled": False},
     )
 
     try:
@@ -1138,6 +1150,7 @@ def test_build_fit_project_apply_plan_treats_step_parameter_signed_zero_floor_as
         authoritative_params={"Keq1": 0.0},
         batch_rows=[],
         settings_by_dataset={},
+        solver_settings={"wegscheider_cyclicity_enabled": False},
     )
 
     try:

@@ -38,6 +38,7 @@ from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecuto
 from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
 from kindred.gui.controllers.simulation_run_state import SimulationRunState
 from kindred.gui.controllers.slider_plot_coalescer import SliderPlotCoalescer
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.batch_initial_conditions import (
     migrate_reaction_dsl_initial_concentration_sets,
     strip_reaction_dsl_initial_concentrations,
@@ -180,7 +181,7 @@ class SimulationController(QtCore.QObject):
         self._batch_run_results: Dict[str, Dict[str, Any]] = {}
 
         # Cache + selection state (explicit full results vs slider previews)
-        self._batch_cache = BatchSimulationCache(result_cache_cap=100, preview_cache_cap=3)
+        self._batch_cache = BatchSimulationCache()
         self._cache_admin = SimulationCacheAdmin(
             cache=self._batch_cache,
             settings_set_value=self.ui.settings.settings_set_value,
@@ -192,8 +193,8 @@ class SimulationController(QtCore.QObject):
         # Parallel batch orchestration (process pool + futures bookkeeping)
         self._batch_parallel = ParallelBatchExecutor(
             executor_factory=_default_batch_executor_factory,
-            max_parallel_workers=12,
-            limit_blas_threads_per_worker=True,
+            max_parallel_workers=int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+            limit_blas_threads_per_worker=bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
 
@@ -2707,14 +2708,22 @@ class SimulationController(QtCore.QObject):
                         simulation_identity=identity.to_payload(),
                     ).to_payload()
                 else:
-                    mechanism_signature_by_set_id[str(set_id)] = batch_mechanism_signature(
-                        mechanism_text=str(request_mechanism_text),
-                        temperature_K=float(solver_config.get("temperature_K") or 298.15),
-                        use_sparse_jacobian=bool(solver_config.get("use_sparse_jacobian")),
-                        wegscheider_cyclicity_enabled=bool(
-                            solver_config.get("wegscheider_cyclicity_enabled", False)
-                        ),
-                    )
+                        mechanism_signature_by_set_id[str(set_id)] = batch_mechanism_signature(
+                            mechanism_text=str(request_mechanism_text),
+                            temperature_K=float(solver_config.get("temperature_K") or 298.15),
+                            use_sparse_jacobian=bool(
+                                solver_config.get(
+                                    "use_sparse_jacobian",
+                                    PROJECT_DEFAULTS["use_sparse_jacobian"],
+                                )
+                            ),
+                            wegscheider_cyclicity_enabled=bool(
+                                solver_config.get(
+                                    "wegscheider_cyclicity_enabled",
+                                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+                                )
+                            ),
+                        )
                 continue
 
             try:

@@ -11,6 +11,7 @@ import pytest
 
 from kindred.core import batch_parallel
 from kindred.core.mechanism import Mechanism
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
 pytestmark = pytest.mark.unit
@@ -693,8 +694,10 @@ def test_run_batch_simulation_task_normalizes_solver_config_defaults(monkeypatch
     assert solver_config["atol"] == 1e-12
     assert solver_config["grid"] == {"N": 100}
     assert solver_config["temperature_K"] == 298.15
-    assert solver_config["wegscheider_cyclicity_enabled"] is False
-    assert solver_config["use_sparse_jacobian"] is False
+    assert solver_config["wegscheider_cyclicity_enabled"] is bool(
+        PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]
+    )
+    assert solver_config["use_sparse_jacobian"] is bool(PROJECT_DEFAULTS["use_sparse_jacobian"])
 
 
 def test_run_batch_simulation_task_does_not_mutate_prepared_mechanism_and_avoids_frozen_instance_error(monkeypatch):

@@ -228,7 +228,6 @@ def test_run_stamp_hash_stable_across_dataset_orderings():
         "method": "trf",
         "max_nfev": 10,
         "seed": 42,
-        "use_parallel": False,
         "parallel_starts": 4,
     }
 
@@ -298,3 +297,29 @@ def test_run_stamp_hash_stable_across_dataset_orderings():
         },
     )
     assert hash_global_fit_run_stamp(stamp_a) == hash_global_fit_run_stamp(stamp_b)
+
+
+def test_build_global_fit_run_stamp_rejects_incomplete_prepared_simulation_mapping():
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp
+
+    with pytest.raises(ValueError, match="Incomplete prepared simulation metadata"):
+        build_global_fit_run_stamp(
+            dataset_rows=[{"id": "ds1", "label": "ds1", "include": True, "weight": 1.0}],
+            included_ids=["ds1"],
+            applied_fit_targets={"ds1": ["A"]},
+            weights_used={"ds1": 1.0},
+            weight_mode="custom",
+            fit_config={
+                "parameters": {"k1": 0.2},
+                "bounds": {"k1": (0.01, 1.0)},
+                "log10_params": {"k1": False},
+                "fixed_params": {},
+                "method": "trf",
+                "max_nfev": 10,
+                "seed": 42,
+                "parallel_starts": 4,
+            },
+            mechanism_text="rxn: A -> B; k=0.2",
+            reactions_text="rxn: A -> B; k=0.2",
+            prepared_simulation={"solver_requested": "BDF"},
+        )

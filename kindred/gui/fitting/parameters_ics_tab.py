@@ -440,7 +440,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         setup_scientific_validator(self._xtol_edit)
         algo_form.addRow("xtol:", self._xtol_edit)
 
-        self._use_parallel_check = QtWidgets.QCheckBox("Parallel multi-start (DE only)")
         self._seed_check = QtWidgets.QCheckBox("Use fixed random seed")
         self._seed_check.setChecked(True)
         self._seed_spin = QtWidgets.QSpinBox()
@@ -448,7 +447,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_spin.setValue(42)
         self._seed_spin.setEnabled(self._seed_check.isChecked())
         self._seed_check.toggled.connect(self._seed_spin.setEnabled)
-        algo_form.addRow(self._use_parallel_check)
         algo_form.addRow(self._seed_check, self._seed_spin)
         params_layout.addLayout(algo_form)
 
@@ -563,9 +561,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 continue
             if value > 0.0:
                 widget.setText(_fmt_sci(value))
-
-        if "use_parallel" in defaults:
-            self._use_parallel_check.setChecked(bool(defaults.get("use_parallel")))
 
         if "use_seed" in defaults:
             self._seed_check.setChecked(bool(defaults.get("use_seed")))
@@ -1462,7 +1457,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "ftol": max(safe_float_parse(self._ftol_edit.text(), 1e-10), 1e-15),
             "xtol": max(safe_float_parse(self._xtol_edit.text(), 1e-10), 1e-15),
             "seed": self._seed_spin.value() if self._seed_check.isChecked() else None,
-            "use_parallel": self._use_parallel_check.isChecked(),
             "parallel_starts": DEFAULT_PARALLEL_STARTS,
         }
         return config

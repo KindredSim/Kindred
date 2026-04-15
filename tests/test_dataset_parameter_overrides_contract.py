@@ -67,7 +67,6 @@ def test_run_stamp_accepts_typed_dataset_overrides() -> None:
             "method": "trf",
             "max_nfev": 10,
             "seed": 7,
-            "use_parallel": False,
             "parallel_starts": 1,
         },
         mechanism_text="rxn: A -> B; k1=0.2",

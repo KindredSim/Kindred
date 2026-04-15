@@ -20,7 +20,7 @@ def test_all_fitting_keys_in_project_defaults_and_qsettings_key_map():
         "fitting_max_nfev",
         "fitting_ftol",
         "fitting_xtol",
-        "fitting_use_parallel",
+        "fitting_parallel_enabled",
         "fitting_use_seed",
         "fitting_seed",
         "fitting_solver",
@@ -62,7 +62,7 @@ def test_round_trip_kin_save_load(main_window):
         "fitting_max_nfev": 500,
         "fitting_ftol": 1e-8,
         "fitting_xtol": 1e-8,
-        "fitting_use_parallel": True,
+        "fitting_parallel_enabled": True,
         "fitting_use_seed": False,
         "fitting_seed": 99,
         "fitting_solver": "Radau",
@@ -142,8 +142,8 @@ def test_keyboard_shortcuts_action_absent(main_window):
     assert action is None
 
 
-def test_fitting_defaults_dialog_updates_all_keys(qt_app, monkeypatch):
-    """Fitting Defaults dialog updates all fitting keys via config_controller."""
+def test_fitting_defaults_dialog_updates_dialog_managed_keys(qt_app, monkeypatch):
+    """Fitting Defaults dialog updates only the fitting keys it exposes."""
     from kindred.gui.mixins.fitting_mixin import FittingMixin
 
     persisted = {}
@@ -169,8 +169,17 @@ def test_fitting_defaults_dialog_updates_all_keys(qt_app, monkeypatch):
     host = _Host()
     try:
         host._configure_fitting()
-        # All 10 fitting keys should have been persisted
-        expected_keys = set(FITTING_DEFAULTS_KEYS)
+        expected_keys = {
+            "fitting_method",
+            "fitting_max_nfev",
+            "fitting_ftol",
+            "fitting_xtol",
+            "fitting_use_seed",
+            "fitting_seed",
+            "fitting_solver",
+            "fitting_rtol",
+            "fitting_atol",
+        }
         assert expected_keys <= set(persisted.keys()), (
             f"Missing persisted keys: {expected_keys - set(persisted.keys())}"
         )
@@ -203,10 +212,10 @@ def test_load_fitting_defaults_reads_user_prefs_not_document_overrides(main_wind
 
 
 def test_fitting_key_to_short_matches_fitting_defaults_keys():
-    """_FITTING_KEY_TO_SHORT must cover exactly the same keys as FITTING_DEFAULTS_KEYS."""
+    """_FITTING_KEY_TO_SHORT must match the fitting defaults shown in the dialog."""
     from kindred.gui.mixins.fitting_mixin import _FITTING_KEY_TO_SHORT
 
-    assert set(_FITTING_KEY_TO_SHORT.keys()) == set(FITTING_DEFAULTS_KEYS)
+    assert set(_FITTING_KEY_TO_SHORT.keys()) == (set(FITTING_DEFAULTS_KEYS) - {"fitting_parallel_enabled"})
 
 
 def test_session_defaults_reads_fitting_defaults_not_user_prefs(main_window):
@@ -353,7 +362,7 @@ def test_partial_document_load_stores_only_present_keys(main_window):
     payload["fitting_max_nfev"] = 500
     payload["fitting_solver"] = "Radau"
     # Ensure the other 7 are absent
-    for key in ("fitting_ftol", "fitting_xtol", "fitting_use_parallel",
+    for key in ("fitting_ftol", "fitting_xtol", "fitting_parallel_enabled",
                 "fitting_use_seed", "fitting_seed", "fitting_rtol", "fitting_atol"):
         payload.pop(key, None)
 
@@ -363,7 +372,7 @@ def test_partial_document_load_stores_only_present_keys(main_window):
     assert "fitting_max_nfev" in main_window._fitting_defaults
     assert "fitting_solver" in main_window._fitting_defaults
     assert "fitting_ftol" not in main_window._fitting_defaults
-    assert "fitting_use_parallel" not in main_window._fitting_defaults
+    assert "fitting_parallel_enabled" not in main_window._fitting_defaults
 
     session = main_window._get_fitting_session_defaults()
     from kindred.gui.mixins.fitting_mixin import _FITTING_KEY_TO_SHORT

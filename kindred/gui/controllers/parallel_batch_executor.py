@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any, Dict, Optional, Tuple
 
 from kindred.core.batch_parallel import prewarm_worker_imports
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 
 def _noop_record_nonfatal_exception(_message: str, _exc: BaseException) -> None:
@@ -24,8 +25,8 @@ class ParallelBatchExecutor:
     """
 
     executor_factory: Callable[[int, bool], Any]
-    max_parallel_workers: int = 12
-    limit_blas_threads_per_worker: bool = True
+    max_parallel_workers: int = int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+    limit_blas_threads_per_worker: bool = bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])
     record_nonfatal_exception: Callable[[str, BaseException], None] = _noop_record_nonfatal_exception
     executor: Any = None
     future_map: Dict[str, Any] = field(default_factory=dict)

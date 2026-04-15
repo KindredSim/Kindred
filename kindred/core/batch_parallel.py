@@ -19,6 +19,10 @@ from kindred.core.simulation_result_payload import (
     build_secondary_simulation_success_payload,
     build_simulation_success_payload,
 )
+from kindred.core.runtime_defaults import (
+    USE_SPARSE_JACOBIAN_DEFAULT,
+    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +86,8 @@ def batch_mechanism_signature(
     *,
     mechanism_text: str = "",
     temperature_K: float = 298.15,
-    use_sparse_jacobian: bool = False,
-    wegscheider_cyclicity_enabled: bool = False,
+    use_sparse_jacobian: bool = USE_SPARSE_JACOBIAN_DEFAULT,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     simulation_identity: Mapping[str, Any] | object | None = None,
 ) -> str:
     """Stable signature for per-process prepared-runtime reuse."""
@@ -193,8 +197,15 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         initials = dict(execution_request.get("initials") or initials)
         simulation_identity = execution_request.get("simulation_identity") or simulation_identity
     temperature_K = float(solver_config.get("temperature_K") or 298.15)
-    wegscheider_enabled = bool(solver_config.get("wegscheider_cyclicity_enabled", False))
-    use_sparse_jacobian = bool(solver_config.get("use_sparse_jacobian"))
+    wegscheider_enabled = bool(
+        solver_config.get(
+            "wegscheider_cyclicity_enabled",
+            WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+        )
+    )
+    use_sparse_jacobian = bool(
+        solver_config.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
+    )
     # Structured prepared execution is authoritative and may safely reuse a
     # structural prepared-runtime key. Text-driven batch preview tasks must key
     # the worker cache by the actual mechanism text, otherwise later slider

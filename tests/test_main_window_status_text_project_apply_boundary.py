@@ -637,6 +637,37 @@ def test_apply_project_payload_legacy_file_resets_leaky_keys(main_window):
     )
 
 
+def test_apply_project_payload_missing_simulation_keys_ignores_user_preferences(main_window):
+    main_window.config_controller.update_user_preference("solver", "Radau")
+    main_window.config_controller.update_user_preference("rtol", 1e-4)
+    main_window.config_controller.update_user_preference("atol", 1e-8)
+    main_window.config_controller.update_user_preference("use_sparse_jacobian", False)
+    main_window.config_controller.update_user_preference("wegscheider_cyclicity_enabled", False)
+    main_window.config_controller.update_user_preference("max_parallel_batch_workers", 7)
+    main_window.config_controller.update_user_preference("limit_blas_threads_per_worker", False)
+
+    legacy_payload = {
+        "mechanism": "A -> B; k=1",
+        "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
+    }
+
+    main_window._apply_project_payload(legacy_payload, record_undo=False)
+
+    assert main_window._initial_solver == PROJECT_DEFAULTS["solver"]
+    assert main_window._initial_rtol == PROJECT_DEFAULTS["rtol"]
+    assert main_window._initial_atol == PROJECT_DEFAULTS["atol"]
+    assert main_window._use_sparse_jacobian == PROJECT_DEFAULTS["use_sparse_jacobian"]
+    assert main_window._wegscheider_cyclicity_enabled == PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]
+    assert (
+        main_window._sim_controller.parallel_batch.max_parallel_workers
+        == PROJECT_DEFAULTS["max_parallel_batch_workers"]
+    )
+    assert (
+        main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker
+        == PROJECT_DEFAULTS["limit_blas_threads_per_worker"]
+    )
+
+
 def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_change(main_window):
     calls: list[None] = []
     main_window._sim_controller.parallel_batch_pool_settings_changed = lambda: calls.append(None)
@@ -691,8 +722,8 @@ def test_new_project_inherits_user_preferences_not_factory_defaults(main_window,
     assert main_window._num_points_spinbox.value() == 200
 
 
-def test_legacy_load_falls_back_to_user_preferences(main_window):
-    """A .kin file missing a key falls back to user preferences, not factory defaults."""
+def test_legacy_load_missing_simulation_keys_resets_to_schema_defaults(main_window):
+    """A .kin file missing simulation keys resets them to schema defaults."""
     settings = main_window._settings
     settings.clear()
     settings.setValue("simulation/solver", "BDF")
@@ -704,8 +735,8 @@ def test_legacy_load_falls_back_to_user_preferences(main_window):
     minimal_payload = {"mechanism": "A -> B ; k1=1"}
     main_window._apply_project_payload(minimal_payload)
 
-    assert main_window._initial_solver == "BDF"
-    assert main_window._temperature_spinbox.value() == pytest.approx(350.0)
+    assert main_window._initial_solver == PROJECT_DEFAULTS["solver"]
+    assert main_window._temperature_spinbox.value() == pytest.approx(PROJECT_DEFAULTS["temperature_K"])
 
 
 def test_document_load_does_not_contaminate_user_preferences(main_window):

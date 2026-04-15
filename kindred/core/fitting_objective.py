@@ -17,6 +17,7 @@ import numpy as np
 from kindred.core.cache import cache_simulation, fingerprint_simulation_request
 from kindred.core.exceptions import FittingCancelled, FitSimulationError, SimulationCancelled
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
+from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
 from kindred.core.simulation_preparation import (
     PreparedFittingObjectiveContext,
     prepare_fitting_objective_context,
@@ -49,7 +50,7 @@ def build_fitting_objective(
     solver: str = DEFAULT_SOLVER_NAME,
     rtol: float = 1e-6,
     atol: float = 1e-12,
-    wegscheider_cyclicity_enabled: bool = False,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     prepare_func: Callable[..., object] | None = None,
     prepare_context_func: Callable[..., PreparedFittingObjectiveContext] | None = None,
     solve_policy_factory: Callable[[PreparedFittingObjectiveContext], Callable[[object, np.ndarray], "SimulationOutput"]] | None = None,

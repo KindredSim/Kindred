@@ -10,6 +10,12 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING
 
+from kindred.core.runtime_defaults import (
+    LIMIT_BLAS_THREADS_PER_WORKER_DEFAULT,
+    MAX_PARALLEL_BATCH_WORKERS_DEFAULT,
+    USE_SPARSE_JACOBIAN_DEFAULT,
+    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+)
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
@@ -35,10 +41,10 @@ PROJECT_DEFAULTS: dict[str, object] = {
     "solver": DEFAULT_SOLVER_NAME,
     "rtol": 1e-6,
     "atol": 1e-12,
-    "use_sparse_jacobian": False,
-    "wegscheider_cyclicity_enabled": False,
-    "max_parallel_batch_workers": 12,
-    "limit_blas_threads_per_worker": True,
+    "use_sparse_jacobian": USE_SPARSE_JACOBIAN_DEFAULT,
+    "wegscheider_cyclicity_enabled": WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+    "max_parallel_batch_workers": MAX_PARALLEL_BATCH_WORKERS_DEFAULT,
+    "limit_blas_threads_per_worker": LIMIT_BLAS_THREADS_PER_WORKER_DEFAULT,
     "temperature_K": 298.15,
     "simulation_time": "10.0",
     "num_points": 100,
@@ -46,7 +52,7 @@ PROJECT_DEFAULTS: dict[str, object] = {
     "fitting_max_nfev": 1000,
     "fitting_ftol": 1e-10,
     "fitting_xtol": 1e-10,
-    "fitting_use_parallel": False,
+    "fitting_parallel_enabled": False,
     "fitting_use_seed": True,
     "fitting_seed": 42,
     "fitting_solver": FITTING_DEFAULT_SOLVER,
@@ -70,7 +76,7 @@ QSETTINGS_KEY_MAP: dict[str, str] = {
     "fitting_max_nfev": "fitting/max_nfev",
     "fitting_ftol": "fitting/ftol",
     "fitting_xtol": "fitting/xtol",
-    "fitting_use_parallel": "fitting/use_parallel",
+    "fitting_parallel_enabled": "fitting/parallel_enabled",
     "fitting_use_seed": "fitting/use_seed",
     "fitting_seed": "fitting/seed",
     "fitting_solver": "fitting/solver",

@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from kindred.core.simulator.dsl import extract_parameters_from_dsl
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +251,10 @@ class DatasetManager:
             mech = parse_dsl_to_mechanism(cleaned, initials={})
             if isinstance(getattr(mech, "metadata", None), dict):
                 mech.metadata["wegscheider_cyclicity_enabled"] = bool(
-                    cfg_dict.get("wegscheider_cyclicity_enabled", False)
+                    cfg_dict.get(
+                        "wegscheider_cyclicity_enabled",
+                        PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+                    )
                 )
             _ = apply_parameter_algebra_to_mechanism(cleaned, mechanism=mech, require_mutable=False)
             constrained_meta = (getattr(mech, "metadata", {}) or {}).get("constrained_params") or {}
@@ -449,7 +453,12 @@ class DatasetManager:
 
         cfg = solver_cfg or {}
         solver_key = {
-            "wegscheider_cyclicity_enabled": bool(cfg.get("wegscheider_cyclicity_enabled", False)),
+            "wegscheider_cyclicity_enabled": bool(
+                cfg.get(
+                    "wegscheider_cyclicity_enabled",
+                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+                )
+            ),
         }
         payload = json.dumps(
             {"mechanism": str(cleaned_mechanism), "solver": solver_key},
@@ -557,7 +566,12 @@ class DatasetManager:
             logger.warning("Solver normalization: %s (requested=%r)", solver_warning, solver_label)
         rtol = float(solver_settings.get("rtol") or 1e-6)
         atol = float(solver_settings.get("atol") or 1e-12)
-        wegscheider_enabled = bool(solver_settings.get("wegscheider_cyclicity_enabled", False))
+        wegscheider_enabled = bool(
+            solver_settings.get(
+                "wegscheider_cyclicity_enabled",
+                PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+            )
+        )
         solver_settings.setdefault("solver_label", str(solver_label))
         solver_settings["solver"] = str(solver_name)
         solver_settings["solver_warning"] = str(solver_warning) if solver_warning else None

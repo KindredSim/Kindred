@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import re
 from typing import Mapping
 
+from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
+
 
 _DEFAULT_TEMPERATURE_K = 298.15
 _VALID_CONSTRAINT_REASONS = frozenset({"algebra", "wegscheider"})
@@ -79,8 +81,13 @@ def _context_temperature_K(context: Mapping[str, object] | None) -> float:
 
 def _context_wegscheider_enabled(context: Mapping[str, object] | None) -> bool:
     if not isinstance(context, Mapping):
-        return False
-    return bool(context.get("wegscheider_cyclicity_enabled", False))
+        return bool(WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT)
+    return bool(
+        context.get(
+            "wegscheider_cyclicity_enabled",
+            WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+        )
+    )
 
 
 def _extract_top_level_scalar_assignments(source_text: str) -> tuple[str, dict[str, float]]:

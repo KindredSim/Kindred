@@ -36,8 +36,10 @@ from typing import Dict, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACHE_CAP_DEFAULT
 from kindred.core.validation import try_parse_int
 from kindred.gui.ports import SimulationCacheControlsPort, SimulationCacheOpResult
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,9 @@ __all__ = ["SolverSettingsDialog"]
 
 
 _SOLVERS = ["Radau", "BDF"]
+_DEFAULT_RESULT_CACHE_CAP = int(RESULT_CACHE_CAP_DEFAULT)
+_DEFAULT_PREVIEW_CACHE_CAP = int(PREVIEW_CACHE_CAP_DEFAULT)
+_MIN_MAX_PARALLEL_WORKERS_SPIN_MAX = 256
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
@@ -118,12 +123,12 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         solver_section_layout.addLayout(row)
 
         self._sparse_checkbox = QtWidgets.QCheckBox("Use sparse Jacobian (Radau/BDF only)")
-        self._sparse_checkbox.setChecked(False)
+        self._sparse_checkbox.setChecked(bool(PROJECT_DEFAULTS["use_sparse_jacobian"]))
         self._sparse_checkbox.setToolTip("Use sparse matrix format for the Jacobian. Faster for large mechanisms.")
         solver_section_layout.addWidget(self._sparse_checkbox)
 
         self._wegscheider_checkbox = QtWidgets.QCheckBox("Thermodynamic cyclicity (Wegscheider)")
-        self._wegscheider_checkbox.setChecked(False)
+        self._wegscheider_checkbox.setChecked(bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]))
         self._wegscheider_checkbox.setToolTip("Enforce detailed balance by deriving some reverse rates from thermodynamic constraints.")
         solver_section_layout.addWidget(self._wegscheider_checkbox)
         self._wegscheider_help = QtWidgets.QLabel(
@@ -134,8 +139,11 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         solver_section_layout.addWidget(self._wegscheider_help)
 
         self._max_parallel_workers_spin = QtWidgets.QSpinBox(self)
-        self._max_parallel_workers_spin.setRange(1, 256)
-        self._max_parallel_workers_spin.setValue(12)
+        self._max_parallel_workers_spin.setRange(1, _MIN_MAX_PARALLEL_WORKERS_SPIN_MAX)
+        self._ensure_parallel_worker_spin_capacity(
+            int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+        )
+        self._max_parallel_workers_spin.setValue(int(PROJECT_DEFAULTS["max_parallel_batch_workers"]))
         self._max_parallel_workers_spin.setMaximumWidth(max_input_width)
         self._max_parallel_workers_spin.setMinimumWidth(80)
         self._max_parallel_workers_spin.setToolTip("Number of sets to simulate simultaneously.")
@@ -146,7 +154,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         solver_section_layout.addLayout(row)
 
         self._limit_blas_checkbox = QtWidgets.QCheckBox("Limit BLAS threads per worker (recommended)")
-        self._limit_blas_checkbox.setChecked(True)
+        self._limit_blas_checkbox.setChecked(bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]))
         self._limit_blas_checkbox.setToolTip("Restrict each worker to one BLAS thread to prevent CPU oversubscription.")
         solver_section_layout.addWidget(self._limit_blas_checkbox)
 
@@ -215,7 +223,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
 
         self._spin_result_cache_cap = QtWidgets.QSpinBox(self)
         self._spin_result_cache_cap.setRange(0, 1_000_000_000)
-        self._spin_result_cache_cap.setValue(100)
+        self._spin_result_cache_cap.setValue(_DEFAULT_RESULT_CACHE_CAP)
         self._spin_result_cache_cap.setMaximumWidth(max_input_width)
         self._spin_result_cache_cap.setToolTip("Maximum number of full simulation results to keep in memory.")
         row = QtWidgets.QHBoxLayout()
@@ -226,7 +234,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
 
         self._spin_preview_cache_cap = QtWidgets.QSpinBox(self)
         self._spin_preview_cache_cap.setRange(0, 1_000_000_000)
-        self._spin_preview_cache_cap.setValue(3)
+        self._spin_preview_cache_cap.setValue(_DEFAULT_PREVIEW_CACHE_CAP)
         self._spin_preview_cache_cap.setMaximumWidth(max_input_width)
         self._spin_preview_cache_cap.setToolTip("Maximum number of slider preview results to keep in memory.")
         row = QtWidgets.QHBoxLayout()
@@ -477,16 +485,22 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         cfg.setdefault("solver", str(DEFAULT_SOLVER_NAME))
         cfg.setdefault("rtol", 1e-6)
         cfg.setdefault("atol", 1e-12)
-        cfg.setdefault("use_sparse_jacobian", False)
-        cfg.setdefault("wegscheider_cyclicity_enabled", False)
-        cfg.setdefault("max_parallel_batch_workers", 12)
-        cfg.setdefault("limit_blas_threads_per_worker", True)
+        cfg.setdefault("use_sparse_jacobian", bool(PROJECT_DEFAULTS["use_sparse_jacobian"]))
+        cfg.setdefault(
+            "wegscheider_cyclicity_enabled",
+            bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
+        )
+        cfg.setdefault("max_parallel_batch_workers", int(PROJECT_DEFAULTS["max_parallel_batch_workers"]))
+        cfg.setdefault(
+            "limit_blas_threads_per_worker",
+            bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
+        )
         cfg.setdefault("slider_preview_solver", "BDF")
         cfg.setdefault("slider_preview_points", 100)
         cfg.setdefault("parameter_preview_debounce_ms", 80)
         cfg.setdefault("equilibrium_preview_debounce_ms", 150)
-        cfg.setdefault("result_cache_cap", None)
-        cfg.setdefault("preview_cache_cap", None)
+        cfg.setdefault("result_cache_cap", _DEFAULT_RESULT_CACHE_CAP)
+        cfg.setdefault("preview_cache_cap", _DEFAULT_PREVIEW_CACHE_CAP)
         solver_name, _warning = normalize_solver_name(cfg.get("solver", DEFAULT_SOLVER_NAME))
         self._combo_solver.setCurrentText(solver_name)
 
@@ -496,11 +510,14 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self._sparse_checkbox.setChecked(_coerce_bool(cfg.get("use_sparse_jacobian")))
         self._wegscheider_checkbox.setChecked(_coerce_bool(cfg.get("wegscheider_cyclicity_enabled")))
         try:
-            workers = int(cfg.get("max_parallel_batch_workers", 12))
+            workers = int(cfg.get("max_parallel_batch_workers", int(PROJECT_DEFAULTS["max_parallel_batch_workers"])))
         except Exception:
-            workers = 12
+            workers = int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+        self._ensure_parallel_worker_spin_capacity(workers)
         self._max_parallel_workers_spin.setValue(max(1, workers))
-        self._limit_blas_checkbox.setChecked(_coerce_bool(cfg.get("limit_blas_threads_per_worker", True)))
+        self._limit_blas_checkbox.setChecked(
+            _coerce_bool(cfg.get("limit_blas_threads_per_worker", bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])))
+        )
         slider_solver_name, _warning = normalize_solver_name(cfg.get("slider_preview_solver", DEFAULT_SOLVER_NAME))
         self._combo_slider_preview_solver.setCurrentText(slider_solver_name)
         try:
@@ -523,8 +540,12 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         preview_cap = cfg.get("preview_cache_cap")
         if isinstance(result_cap, int) and result_cap >= 0:
             self._spin_result_cache_cap.setValue(int(result_cap))
+        else:
+            self._spin_result_cache_cap.setValue(_DEFAULT_RESULT_CACHE_CAP)
         if isinstance(preview_cap, int) and preview_cap >= 0:
             self._spin_preview_cache_cap.setValue(int(preview_cap))
+        else:
+            self._spin_preview_cache_cap.setValue(_DEFAULT_PREVIEW_CACHE_CAP)
 
         # Align spinboxes with controller state if available (covers persisted settings).
         caps = self._cache_caps_from_controller()
@@ -537,6 +558,12 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             if p_ok:
                 self._spin_preview_cache_cap.setValue(int(p_parsed))
         self._refresh_cache_status()
+
+    def _ensure_parallel_worker_spin_capacity(self, workers: int) -> None:
+        bounded_workers = max(1, int(workers))
+        maximum = max(_MIN_MAX_PARALLEL_WORKERS_SPIN_MAX, bounded_workers)
+        if self._max_parallel_workers_spin.maximum() != maximum:
+            self._max_parallel_workers_spin.setMaximum(maximum)
 
     def _on_accept(self) -> None:
         try:

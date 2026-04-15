@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from kindred.core.lru_cache import LRUCache
+from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACHE_CAP_DEFAULT
 
 
 @dataclass
@@ -15,8 +16,8 @@ class BatchSimulationCache:
     shared by GUI-facing controllers without living in the GUI layer.
     """
 
-    result_cache_cap: int = 100
-    preview_cache_cap: int = 3
+    result_cache_cap: int = RESULT_CACHE_CAP_DEFAULT
+    preview_cache_cap: int = PREVIEW_CACHE_CAP_DEFAULT
     result_cache: LRUCache[str, Dict[str, Any]] = field(init=False)
     preview_cache: LRUCache[str, Dict[str, Any]] = field(init=False)
 

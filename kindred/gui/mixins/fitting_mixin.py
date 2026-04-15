@@ -27,6 +27,7 @@ from kindred.core.simulator.dsl_text_update import (
 )
 from kindred.gui.diagnostics import record_best_effort_failure as record_gui_best_effort_failure
 from kindred.gui.mixins.ports import FittingMixinPorts
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,6 @@ _FITTING_KEY_TO_SHORT: dict[str, str] = {
     "fitting_max_nfev": "max_nfev",
     "fitting_ftol": "ftol",
     "fitting_xtol": "xtol",
-    "fitting_use_parallel": "use_parallel",
     "fitting_use_seed": "use_seed",
     "fitting_seed": "seed",
     "fitting_solver": "solver",
@@ -292,7 +292,10 @@ class FittingMixin:
         return {
             "temperature_K": float(ports.temperature_getter()),
             "wegscheider_cyclicity_enabled": bool(
-                dict(solver_settings or {}).get("wegscheider_cyclicity_enabled", False)
+                dict(solver_settings or {}).get(
+                    "wegscheider_cyclicity_enabled",
+                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+                )
             ),
         }
 
@@ -535,10 +538,6 @@ class FittingMixin:
         _xtol_val = setup_scientific_validator(xtol_edit)
         algo_layout.addRow("xtol:", xtol_edit)
 
-        use_parallel_check = QtWidgets.QCheckBox("Parallel multi-start (DE only)")
-        use_parallel_check.setChecked(bool(defaults.get("use_parallel", False)))
-        algo_layout.addRow(use_parallel_check)
-
         use_seed_check = QtWidgets.QCheckBox("Use fixed random seed")
         use_seed_check.setChecked(bool(defaults.get("use_seed", True)))
         seed_spin = QtWidgets.QSpinBox()
@@ -582,7 +581,6 @@ class FittingMixin:
                 "fitting_max_nfev": int(max_nfev_spin.value()),
                 "fitting_ftol": max(safe_float_parse(ftol_edit.text(), 1e-10), 1e-15),
                 "fitting_xtol": max(safe_float_parse(xtol_edit.text(), 1e-10), 1e-15),
-                "fitting_use_parallel": bool(use_parallel_check.isChecked()),
                 "fitting_use_seed": bool(use_seed_check.isChecked()),
                 "fitting_seed": int(seed_spin.value()),
                 "fitting_solver": solver_combo.currentText(),

@@ -713,15 +713,21 @@ def test_new_project_discard_clears_state(controller_and_mw):
     mw.set_status_text.assert_called_once_with("New project")
 
 
-def test_new_project_payload_contains_project_only_keys_and_omits_dual_persisted(controller_and_mw):
-    """new_project() sends project-only keys and omits dual-persisted ones.
-
-    Dual-persisted keys are intentionally stripped so _apply_project_payload
-    falls through to user preferences instead of factory defaults.
-    """
-    from kindred.gui.project_schema import PROJECT_DEFAULTS, QSETTINGS_KEY_MAP
+def test_new_project_payload_uses_explicit_user_preference_payload(controller_and_mw):
+    """new_project() sends a complete payload with user preferences resolved."""
+    from kindred.gui.project_schema import PROJECT_DEFAULTS
 
     controller, mw = controller_and_mw
+    preference_values = {
+        "solver": "Radau",
+        "use_sparse_jacobian": False,
+        "max_parallel_batch_workers": 7,
+        "limit_blas_threads_per_worker": False,
+        "fitting_parallel_enabled": True,
+    }
+    mw.config_controller.get_user_preference.side_effect = (
+        lambda key: preference_values.get(key, PROJECT_DEFAULTS[key])
+    )
     with patch.object(
         QtWidgets.QMessageBox, "question",
         return_value=QtWidgets.QMessageBox.StandardButton.Discard,
@@ -731,15 +737,44 @@ def test_new_project_payload_contains_project_only_keys_and_omits_dual_persisted
     mw.apply_project_payload.assert_called_once()
     payload = mw.apply_project_payload.call_args[0][0]
 
-    # Project-only keys must be present with factory defaults
-    project_only_keys = set(PROJECT_DEFAULTS.keys()) - set(QSETTINGS_KEY_MAP.keys())
-    for key in project_only_keys:
-        assert key in payload, f"Project-only key {key!r} missing from new_project payload"
-        assert payload[key] == PROJECT_DEFAULTS[key]
+    assert set(payload.keys()) == set(PROJECT_DEFAULTS.keys())
+    assert payload["mechanism"] == PROJECT_DEFAULTS["mechanism"]
+    assert payload["solver"] == "Radau"
+    assert payload["use_sparse_jacobian"] is False
+    assert payload["max_parallel_batch_workers"] == 7
+    assert payload["limit_blas_threads_per_worker"] is False
+    assert payload["fitting_parallel_enabled"] is True
 
-    # Dual-persisted keys must be absent (fall through to user preferences)
-    for key in QSETTINGS_KEY_MAP:
-        assert key not in payload, f"Dual-persisted key {key!r} should not be in new_project payload"
+
+def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and_mw):
+    controller, mw = controller_and_mw
+    mw.config_controller.get_user_preference.side_effect = lambda key: {
+        "solver": "Radau",
+        "use_sparse_jacobian": False,
+        "max_parallel_batch_workers": 9,
+        "limit_blas_threads_per_worker": False,
+        "fitting_parallel_enabled": True,
+    }.get(key)
+    mw._settings.value.side_effect = lambda key, default=None, type=None: {
+        "simulation/solver": "BDF",
+        "simulation/use_sparse_jacobian": True,
+        "simulation/max_parallel_batch_workers": 3,
+        "simulation/limit_blas_threads_per_worker": True,
+        "fitting/parallel_enabled": False,
+    }.get(key, default)
+
+    with patch.object(
+        QtWidgets.QMessageBox, "question",
+        return_value=QtWidgets.QMessageBox.StandardButton.Discard,
+    ):
+        controller.new_project()
+
+    payload = mw.apply_project_payload.call_args[0][0]
+    assert payload["solver"] == "Radau"
+    assert payload["use_sparse_jacobian"] is False
+    assert payload["max_parallel_batch_workers"] == 9
+    assert payload["limit_blas_threads_per_worker"] is False
+    assert payload["fitting_parallel_enabled"] is True
 
 
 def test_new_project_save_then_clear(controller_and_mw):

@@ -26,6 +26,7 @@ from kindred.gui.fitting.batch_mapping import (
     unique_batch_set_name,
 )
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 if TYPE_CHECKING:
     from kindred.gui.controllers.dataset_manager import DatasetFitSettings
@@ -395,7 +396,12 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
 
     grid_points = max(2, int(context.num_points_getter()), int(max_len))
     solver_settings = dict(context.get_solver_settings() or {})
-    wegscheider_enabled = bool(solver_settings.get("wegscheider_cyclicity_enabled", False))
+    wegscheider_enabled = bool(
+        solver_settings.get(
+            "wegscheider_cyclicity_enabled",
+            PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+        )
+    )
     param_names = [str(entry.get("name")) for entry in (parameter_defs or []) if entry.get("name")]
 
     simulation_func = None
@@ -409,7 +415,9 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             solver=str(solver_settings.get("solver") or FITTING_DEFAULT_SOLVER),
             rtol=float(solver_settings.get("rtol") or 1e-6),
             atol=float(solver_settings.get("atol") or 1e-12),
-            use_sparse_jacobian=bool(solver_settings.get("use_sparse_jacobian")),
+            use_sparse_jacobian=bool(
+                solver_settings.get("use_sparse_jacobian", PROJECT_DEFAULTS["use_sparse_jacobian"])
+            ),
             wegscheider_cyclicity_enabled=bool(wegscheider_enabled),
             initial_prefix=initial_prefix,
         )
@@ -438,8 +446,11 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         current_solver_settings.setdefault("solver", FITTING_DEFAULT_SOLVER)
         current_solver_settings.setdefault("rtol", 1e-6)
         current_solver_settings.setdefault("atol", 1e-12)
-        current_solver_settings.setdefault("use_sparse_jacobian", False)
-        current_solver_settings.setdefault("wegscheider_cyclicity_enabled", False)
+        current_solver_settings.setdefault("use_sparse_jacobian", bool(PROJECT_DEFAULTS["use_sparse_jacobian"]))
+        current_solver_settings.setdefault(
+            "wegscheider_cyclicity_enabled",
+            bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
+        )
 
         solver_label = str(solver or current_solver_settings.get("solver") or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_value, _solver_warning = normalize_solver_name(solver_label)
@@ -455,7 +466,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
             rtol=rtol_value,
             atol=atol_value,
             use_sparse_jacobian=bool(current_solver_settings.get("use_sparse_jacobian")),
-            wegscheider_cyclicity_enabled=bool(current_solver_settings.get("wegscheider_cyclicity_enabled", False)),
+            wegscheider_cyclicity_enabled=bool(current_solver_settings.get("wegscheider_cyclicity_enabled")),
             initial_prefix=initial_prefix,
         )
         return SerialFittingEvaluator(fit_context)

@@ -12,6 +12,8 @@ import math
 import re
 from typing import Callable, Mapping, Tuple
 
+from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
+
 from .step_constraint_authority import (
     StepConstraintAuthorityAnalysis,
     StepConstraintAuthorityError,
@@ -111,9 +113,14 @@ def _normalized_step_constraint_context_values(context: Mapping[str, object] | N
             temperature_K = float(context.get("temperature_K", temperature_K))
         except (TypeError, ValueError):
             temperature_K = 298.15
-        wegscheider_enabled = bool(context.get("wegscheider_cyclicity_enabled", False))
+        wegscheider_enabled = bool(
+            context.get(
+                "wegscheider_cyclicity_enabled",
+                WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+            )
+        )
     else:
-        wegscheider_enabled = False
+        wegscheider_enabled = bool(WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT)
     return float(temperature_K), bool(wegscheider_enabled)
 
 

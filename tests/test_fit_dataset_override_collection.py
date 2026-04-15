@@ -34,7 +34,6 @@ def test_build_global_fit_run_stamp_accepts_typed_dataset_overrides():
             "method": "trf",
             "max_nfev": 10,
             "seed": 42,
-            "use_parallel": False,
             "parallel_starts": 1,
         },
         mechanism_text="rxn: A -> B; k1=0.2",

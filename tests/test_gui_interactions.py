@@ -1,5 +1,7 @@
 import pytest
 
+from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 
 
@@ -97,3 +99,23 @@ def test_solver_settings_dialog_unknown_boolean_strings_stay_disabled(qt_app):
     assert dialog._sparse_checkbox.isChecked() is False
     assert dialog._wegscheider_checkbox.isChecked() is False
     assert dialog._limit_blas_checkbox.isChecked() is False
+
+
+def test_solver_settings_dialog_factory_defaults_match_schema_and_cache_defaults(qt_app):
+    dialog = SolverSettingsDialog()
+
+    assert dialog._sparse_checkbox.isChecked() is bool(PROJECT_DEFAULTS["use_sparse_jacobian"])
+    assert dialog._wegscheider_checkbox.isChecked() is bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"])
+    assert dialog._max_parallel_workers_spin.value() == int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+    assert dialog._limit_blas_checkbox.isChecked() is bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])
+    assert dialog._spin_result_cache_cap.value() == int(BatchSimulationCache.result_cache_cap)
+    assert dialog._spin_preview_cache_cap.value() == int(BatchSimulationCache.preview_cache_cap)
+
+
+def test_solver_settings_dialog_preserves_worker_count_above_256(qt_app):
+    dialog = SolverSettingsDialog()
+
+    dialog.set_settings({"max_parallel_batch_workers": 400})
+
+    assert dialog._max_parallel_workers_spin.maximum() >= 400
+    assert dialog._max_parallel_workers_spin.value() == 400

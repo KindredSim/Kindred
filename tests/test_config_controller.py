@@ -2,7 +2,9 @@ import pytest
 from PySide6 import QtCore, QtGui, QtWidgets
 from shiboken6 import isValid
 
+from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.gui.main_window import MainWindow
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 pytestmark = [pytest.mark.gui]
 
@@ -760,18 +762,38 @@ def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, cap
     settings.setValue("simulation/preview_cache_cap", "bad-preview")
     settings.sync()
 
-    default_result_cap = int(main_window.simulation_controller.batch_cache.result_cache.max_entries())
-    default_preview_cap = int(main_window.simulation_controller.batch_cache.preview_cache.max_entries())
+    default_result_cap = int(BatchSimulationCache.result_cache_cap)
+    default_preview_cap = int(BatchSimulationCache.preview_cache_cap)
 
     with caplog.at_level("WARNING"):
         main_window.config_controller.load_settings()
 
-    assert main_window.simulation_controller.parallel_batch.max_parallel_workers == 12
+    assert (
+        main_window.simulation_controller.parallel_batch.max_parallel_workers
+        == PROJECT_DEFAULTS["max_parallel_batch_workers"]
+    )
     assert int(main_window.simulation_controller.batch_cache.result_cache.max_entries()) == default_result_cap
     assert int(main_window.simulation_controller.batch_cache.preview_cache.max_entries()) == default_preview_cap
     assert "simulation/max_parallel_batch_workers='not-an-int'" in caplog.text
     assert "simulation/result_cache_cap='bad-cap'" in caplog.text
     assert "simulation/preview_cache_cap='bad-preview'" in caplog.text
+
+
+def test_load_settings_empty_settings_uses_factory_cache_caps(main_window):
+    settings = main_window._settings
+    settings.clear()
+    settings.sync()
+
+    main_window.simulation_controller.batch_cache.set_caps(result_cap=17, preview_cap=19)
+
+    main_window.config_controller.load_settings()
+
+    assert int(main_window.simulation_controller.batch_cache.result_cache.max_entries()) == int(
+        BatchSimulationCache.result_cache_cap
+    )
+    assert int(main_window.simulation_controller.batch_cache.preview_cache.max_entries()) == int(
+        BatchSimulationCache.preview_cache_cap
+    )
 
 
 def test_load_settings_invalid_tolerances_preserve_active_values(main_window, caplog):

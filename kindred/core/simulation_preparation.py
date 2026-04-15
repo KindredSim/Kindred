@@ -26,6 +26,10 @@ from kindred.core.mechanism_metadata import (
 )
 from kindred.core.simulation_series_payload import SimulationSeriesPayload
 from kindred.core.temperature import TemperatureScheduleProtocol, coerce_temperature_schedule
+from kindred.core.runtime_defaults import (
+    USE_SPARSE_JACOBIAN_DEFAULT,
+    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+)
 from kindred.core.simulator.solvers import (
     DEFAULT_SOLVER_NAME,
     SimulationRequest,
@@ -202,9 +206,14 @@ class PreparedSimulationMetadata:
             solver_warning=str(meta.get("solver_warning")) if meta.get("solver_warning") else None,
             rtol=float(meta.get("rtol") or 0.0),
             atol=float(meta.get("atol") or 0.0),
-            use_sparse_jacobian=bool(meta.get("use_sparse_jacobian", False)),
+            use_sparse_jacobian=bool(
+                meta.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
+            ),
             wegscheider_cyclicity_enabled=bool(
-                meta.get(MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED, False)
+                meta.get(
+                    MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
+                    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+                )
             ),
             initial_prefix=str(meta.get("initial_prefix") or ""),
         )
@@ -622,11 +631,16 @@ def prepare_simulation_worker_run(
             rtol=(solver_config or {}).get("rtol", 1e-6),
             atol=(solver_config or {}).get("atol", 1e-12),
             grid=(solver_config or {}).get("grid", {"N": 100}) or {"N": 100},
-            use_sparse_jacobian=bool((solver_config or {}).get("use_sparse_jacobian")),
+            use_sparse_jacobian=bool(
+                (solver_config or {}).get(
+                    "use_sparse_jacobian",
+                    USE_SPARSE_JACOBIAN_DEFAULT,
+                )
+            ),
             wegscheider_cyclicity_enabled=bool(
                 (solver_config or {}).get(
                     MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
-                    False,
+                    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
                 )
             ),
         )
@@ -1123,7 +1137,7 @@ def prepare_bound_mechanism(
     temperature_K: float = 298.15,
     initials: Optional[Dict[str, float]] = None,
     use_advanced_dsl: bool = True,
-    wegscheider_cyclicity_enabled: bool = False,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 ) -> BoundMechanism:
     """
     Parse the DSL once, bind selected parameters, and compile the RHS.
@@ -1258,7 +1272,7 @@ def prepare_fitting_objective_context(
     solver: str = DEFAULT_SOLVER_NAME,
     rtol: float = 1e-6,
     atol: float = 1e-12,
-    wegscheider_cyclicity_enabled: bool = False,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     prepare_func: Callable[..., object] | None = None,
 ) -> PreparedFittingObjectiveContext:
     from kindred.core.algebra.simulation_series import compile_algebra_observables
@@ -1270,7 +1284,7 @@ def prepare_fitting_objective_context(
             rtol=rtol,
             atol=atol,
             grid={"N": int(np.asarray(t_exp, dtype=float).reshape(-1).size)},
-            use_sparse_jacobian=False,
+            use_sparse_jacobian=USE_SPARSE_JACOBIAN_DEFAULT,
             wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         )
     except Exception as exc:
@@ -1371,8 +1385,8 @@ def build_prepared_simulation_func(
     solver: str = DEFAULT_SOLVER_NAME,
     rtol: float = 1e-6,
     atol: float = 1e-12,
-    use_sparse_jacobian: bool = False,
-    wegscheider_cyclicity_enabled: bool = False,
+    use_sparse_jacobian: bool = USE_SPARSE_JACOBIAN_DEFAULT,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     initial_prefix: str = "init:",
 ) -> Callable[[Dict[str, float]], SimulationSeriesPayload]:
     from kindred.core.algebra.simulation_series import (

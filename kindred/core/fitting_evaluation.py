@@ -20,6 +20,10 @@ import numpy as np
 
 from kindred.core.exceptions import ErrorContext, FitSimulationError, FittingCancelled, SimulationCancelled
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
+from kindred.core.runtime_defaults import (
+    USE_SPARSE_JACOBIAN_DEFAULT,
+    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+)
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
@@ -365,8 +369,8 @@ def prepare_fitting_execution_context(
     solver: str = DEFAULT_SOLVER_NAME,
     rtol: float = 1e-6,
     atol: float = 1e-12,
-    use_sparse_jacobian: bool = False,
-    wegscheider_cyclicity_enabled: bool = False,
+    use_sparse_jacobian: bool = USE_SPARSE_JACOBIAN_DEFAULT,
+    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     initial_prefix: str = "init:",
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for serial fitting evaluation."""

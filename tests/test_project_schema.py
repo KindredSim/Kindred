@@ -1,4 +1,6 @@
 """Tests for kindred.gui.project_schema — single source of truth for project defaults."""
+import os
+
 import pytest
 
 
@@ -21,7 +23,7 @@ EXPECTED_KEYS = {
     "fitting_max_nfev",
     "fitting_ftol",
     "fitting_xtol",
-    "fitting_use_parallel",
+    "fitting_parallel_enabled",
     "fitting_use_seed",
     "fitting_seed",
     "fitting_solver",
@@ -79,6 +81,13 @@ class TestProjectDefaults:
 
         assert PROJECT_DEFAULTS["solver"] == DEFAULT_SOLVER_NAME
 
+    def test_performance_defaults_match_expected_values(self):
+        from kindred.gui.project_schema import PROJECT_DEFAULTS
+
+        assert PROJECT_DEFAULTS["use_sparse_jacobian"] is True
+        assert PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"] is True
+        assert PROJECT_DEFAULTS["max_parallel_batch_workers"] == max(1, (os.cpu_count() or 1) - 1)
+
 
 EXPECTED_DUAL_PERSISTED_KEYS = {
     "solver",
@@ -95,7 +104,7 @@ EXPECTED_DUAL_PERSISTED_KEYS = {
     "fitting_max_nfev",
     "fitting_ftol",
     "fitting_xtol",
-    "fitting_use_parallel",
+    "fitting_parallel_enabled",
     "fitting_use_seed",
     "fitting_seed",
     "fitting_solver",

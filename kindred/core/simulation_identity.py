@@ -5,6 +5,11 @@ import hashlib
 import json
 from typing import Any, Mapping, Optional, Sequence
 
+from kindred.core.runtime_defaults import (
+    USE_SPARSE_JACOBIAN_DEFAULT,
+    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+)
+
 __all__ = [
     "SimulationIdentity",
     "SimulationScopeIdentity",
@@ -46,8 +51,15 @@ class SimulationSolverIdentity:
             atol=_try_float(config.get("atol", 1e-12), 1e-12),
             grid_n=int((grid.get("N") or 0) if isinstance(grid, Mapping) else 0),
             temperature_K=_try_float(config.get("temperature_K", 298.15), 298.15),
-            use_sparse_jacobian=bool(config.get("use_sparse_jacobian")),
-            wegscheider_cyclicity_enabled=bool(config.get("wegscheider_cyclicity_enabled")),
+            use_sparse_jacobian=bool(
+                config.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
+            ),
+            wegscheider_cyclicity_enabled=bool(
+                config.get(
+                    "wegscheider_cyclicity_enabled",
+                    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+                )
+            ),
         )
 
     @classmethod
@@ -58,8 +70,18 @@ class SimulationSolverIdentity:
             atol=_try_float((payload or {}).get("atol", 1e-12), 1e-12),
             grid_n=int((payload or {}).get("grid_n") or 0),
             temperature_K=_try_float((payload or {}).get("temperature_K", 298.15), 298.15),
-            use_sparse_jacobian=bool((payload or {}).get("use_sparse_jacobian")),
-            wegscheider_cyclicity_enabled=bool((payload or {}).get("wegscheider_cyclicity_enabled")),
+            use_sparse_jacobian=bool(
+                (payload or {}).get(
+                    "use_sparse_jacobian",
+                    USE_SPARSE_JACOBIAN_DEFAULT,
+                )
+            ),
+            wegscheider_cyclicity_enabled=bool(
+                (payload or {}).get(
+                    "wegscheider_cyclicity_enabled",
+                    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+                )
+            ),
         )
 
     def to_payload(self) -> dict[str, Any]:

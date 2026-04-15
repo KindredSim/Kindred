@@ -149,6 +149,9 @@ def test_slider_changes_use_precompiled_rhs(main_window, monkeypatch):
         make_simulation_worker_stub(on_init=_on_init, payload_factory=_payload, emit_progress=(100, "done")),
     )
 
+    main_window._use_sparse_jacobian = False
+    main_window._wegscheider_cyclicity_enabled = False
+
     # Use a DSL without `initial:` lines to avoid the init-migration path
     # rewriting the mechanism text mid-run and invalidating the slider cache.
     main_window._mechanism_editor._reactions_text.setPlainText(

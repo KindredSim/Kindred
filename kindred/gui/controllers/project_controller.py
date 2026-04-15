@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from kindred.gui.project_schema import get_default_project_payload, QSETTINGS_KEY_MAP
+from kindred.gui.project_schema import QSETTINGS_KEY_MAP, get_default_project_payload
 from kindred.gui.utils import BusyCursor
 from kindred.gui.widgets.export_dialog import ExportDialog
 
@@ -156,12 +156,11 @@ class ProjectController(QtCore.QObject):
             if not self.save_project():
                 return
 
-        empty_payload = get_default_project_payload()
-        # Strip dual-persisted keys so _apply_project_payload falls through
-        # to user preferences for them instead of using factory defaults.
+        payload = get_default_project_payload()
+        get_user_preference = self.mw.config_controller.get_user_preference
         for key in QSETTINGS_KEY_MAP:
-            empty_payload.pop(key, None)
-        applied = self._apply_project_payload(empty_payload, record_undo=False)
+            payload[key] = get_user_preference(key)
+        applied = self._apply_project_payload(payload, record_undo=False)
         if not applied:
             return
         self._clear_app_undo_history()
