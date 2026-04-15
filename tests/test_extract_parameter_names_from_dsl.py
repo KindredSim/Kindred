@@ -21,7 +21,6 @@ def test_extract_parameter_names_from_dsl_extracts_algebra_param_and_observable_
         [
             "reaction: A -> B; k=1.0",
             "reaction: B -> C; k=2.0",
-            "# Algebra",
             "param k1 = 4*k2",
             "let obs = 3.0",
             "x = 1.0",

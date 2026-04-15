@@ -36,6 +36,11 @@ from typing import Dict, List, Optional, Tuple, cast, TYPE_CHECKING
 import re
 
 from ..units import UnitsModel
+from .algebra_section import (
+    is_bare_assignment_algebra_line,
+    is_let_algebra_line,
+    is_param_algebra_line,
+)
 from .dsl_types import StepPreview
 from .errors import (
     DSLError,
@@ -429,8 +434,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     initials_from_dsl: Dict[str, float] = {}
     notes: List[str] = []
 
-    in_algebra_section = False
-
     # Parse temperature schedule if present
     from ..temperature_dsl import parse_temperature_schedule
 
@@ -444,20 +447,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
         lower = line.lower()
-
-        # Check for algebra section marker
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
-            continue
-
-        # Check for other section markers (exit algebra section)
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-
-        # Collect algebra lines
-        if in_algebra_section and line and not line.startswith("#"):
-            algebra_lines.append(line)
-            continue
 
         if not line or line.startswith("#"):
             continue
@@ -562,6 +551,14 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 raise DSLError(str(exc), line_number=line_no, line_content=raw) from exc
             continue
 
+        if is_let_algebra_line(raw):
+            algebra_lines.append(raw)
+            continue
+
+        if is_param_algebra_line(raw):
+            algebra_lines.append(raw)
+            continue
+
         # reaction: line
         if lower.startswith("reaction:"):
             _, rest = line.split(":", 1)
@@ -607,6 +604,10 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     line_content=raw,
                 )
             )
+            continue
+
+        if is_bare_assignment_algebra_line(raw):
+            algebra_lines.append(raw)
             continue
 
         raise DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)

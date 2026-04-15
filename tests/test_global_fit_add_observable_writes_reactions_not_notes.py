@@ -10,7 +10,7 @@ pytestmark = [pytest.mark.gui]
 def test_global_fit_add_observable_appends_to_reactions_algebra_not_notes(monkeypatch, qt_app):
     """
     Regression: Adding an algebraic observable from Global Fit must append into the
-    Reactions DSL `# Algebra` section (creating one if missing), not into the GUI
+    Reactions DSL text without creating a `# Algebra` header and not into the GUI
     Notes tab.
     """
     from kindred.gui.fitting.window import FittingWindow
@@ -76,7 +76,7 @@ def test_global_fit_add_observable_appends_to_reactions_algebra_not_notes(monkey
         )
 
         assert called["reactions_set"] >= 1
-        assert "# Algebra" in reactions_text
+        assert "# Algebra" not in reactions_text
         assert "param scale = 1.0" in reactions_text
         assert "let signal = scale * [A]" in reactions_text
         assert "should_not_change" in notes_text

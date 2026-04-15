@@ -5,6 +5,7 @@ import re
 from typing import List, Sequence, Set, Tuple
 
 from kindred.core.algebra.symbols import SymbolTable
+from kindred.core.simulator.algebra_section import is_algebra_line
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
@@ -119,20 +120,12 @@ def strip_inline_comment(line: str) -> str:
 
 def collect_algebra_section_lines(dsl_text: str) -> List[Tuple[int, str]]:
     """
-    Return (line_number, raw_line) entries for lines inside the '# Algebra' section,
-    excluding the '# Algebra' header itself.
+    Return (line_number, raw_line) entries for algebra lines anywhere in the DSL text.
     """
-    lines = dsl_text.splitlines()
     out: List[Tuple[int, str]] = []
-    in_algebra = False
-    for ln, raw in enumerate(lines, start=1):
+    for ln, raw in enumerate(dsl_text.splitlines(), start=1):
         stripped = raw.strip()
-        if stripped.lower().startswith("# algebra"):
-            in_algebra = True
-            continue
-        if stripped.lower().startswith("# ") and in_algebra and not stripped.lower().startswith("# algebra"):
-            in_algebra = False
-        if in_algebra:
+        if stripped and not stripped.startswith("#") and is_algebra_line(raw):
             out.append((ln, raw.rstrip("\n")))
     return out
 

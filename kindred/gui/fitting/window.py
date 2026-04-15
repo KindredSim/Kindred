@@ -1584,7 +1584,7 @@ class FittingWindow(QtWidgets.QDialog):
             if persist_observable:
                 to_add.append(f"let {obs_name} = {obs_expr}")
             if to_add:
-                updated_reactions_text = upsert_lines_into_algebra_section(reactions_text, to_add, header="# Algebra")
+                updated_reactions_text = upsert_lines_into_algebra_section(reactions_text, to_add)
         if updated_reactions_text != reactions_text:
             try:
                 self._reactions_text_setter(updated_reactions_text)

@@ -443,7 +443,7 @@ def test_build_fit_project_apply_plan_ignores_stale_fit_constraint_metadata_when
 def test_build_fit_project_apply_plan_preserves_scalar_backed_current_text_step_constraint(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha",
+        mechanism_text="param alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha",
         authoritative_params={"alpha": 2.0, "Keq1": 2.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -917,7 +917,7 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
         mechanism_text="\n".join(
             [
                 "alpha = 1.0",
-                "a = nan",
+                "param a = nan",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
@@ -949,7 +949,7 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
             "alpha = 2",
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",

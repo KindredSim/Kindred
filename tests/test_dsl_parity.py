@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from kindred.core.simulator.dsl import parse_and_preview, parse_dsl_to_mechanism
+from kindred.core.simulator.errors import DSLError
+from kindred.core.simulator.dsl_parse import _parse_dsl_ir
 
 
 DSL_CASES = [
@@ -131,3 +133,65 @@ def test_invalid_dsl_errors_align():
         parse_dsl_to_mechanism(bad, initials={})
 
     assert type(exc_preview.value) is type(exc_mech.value)
+
+
+def test_interleaved_algebra_lines_parse_without_header():
+    dsl = "\n".join(
+        [
+            "A + B -> C ; k=1.0",
+            "let atotal = [A] + [C] + [D]",
+            "C -> D ; k=0.5",
+            "param scale = 2.0",
+            "D -> E ; k=0.1",
+        ]
+    )
+
+    ir = _parse_dsl_ir(dsl)
+    mech = parse_dsl_to_mechanism(dsl, initials={})
+
+    assert len(ir.steps) == 3
+    assert ir.algebra_lines == [
+        "let atotal = [A] + [C] + [D]",
+        "param scale = 2.0",
+    ]
+    assert len(mech.reactions) == 3
+    assert len(mech.equilibria) == 0
+
+
+def test_algebra_header_is_plain_comment_and_does_not_swallow_following_reactions():
+    dsl = "\n".join(
+        [
+            "# algebra",
+            "let atotal = [A] + [C] + [D]",
+            "A -> B ; k=1.0",
+            "B -> C ; k=2.0",
+        ]
+    )
+
+    ir = _parse_dsl_ir(dsl)
+    mech = parse_dsl_to_mechanism(dsl, initials={})
+
+    assert len(ir.steps) == 2
+    assert ir.algebra_lines == ["let atotal = [A] + [C] + [D]"]
+    assert len(mech.reactions) == 2
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "let = 5",
+        "param = 5",
+        "let 123invalid = 5",
+        "let baseline = {",
+    ],
+)
+def test_malformed_interleaved_algebra_lines_are_rejected(bad_line):
+    dsl = "\n".join(
+        [
+            "reaction: A -> B ; k=1.0",
+            bad_line,
+        ]
+    )
+
+    with pytest.raises(DSLError):
+        _parse_dsl_ir(dsl)

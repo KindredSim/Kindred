@@ -406,6 +406,41 @@ def test_scalar_param_slider_commit_uses_authoritative_parameter_precision(main_
     assert "param a = 1e+06" not in reactions_text
 
 
+def test_scalar_param_slider_updates_existing_param_without_header(main_window, monkeypatch):
+    from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
+    from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "param a = 5  # base scalar",
+                "param kf1 = a*k2",
+            ]
+        )
+        + "\n"
+    )
+    main_window._mechanism_editor._notes_text.setPlainText("keep this note\n")
+    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    main_window.set_variable_metadata({"a": {"type": "scalar"}})
+
+    main_window._commit_slider_value("a", 0.331131)
+
+    reactions_text = main_window._mechanism_editor._reactions_text.toPlainText()
+    assert "# Algebra" not in reactions_text
+    assert reactions_text.count("param a =") == 1
+    assert "# base scalar" in reactions_text
+    assert main_window._mechanism_editor._notes_text.toPlainText() == "keep this note\n"
+
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        main_window._get_mechanism_text(),
+        mechanism_namespace=build_flat_compat_namespace({"k2", "kf1"}),
+    )
+    a_statements = [stmt for stmt in spec.param_statements if stmt.name == "a"]
+    assert len(a_statements) == 1
+    assert float(a_statements[0].expr_src) == pytest.approx(0.331131)
+
+
 def test_slider_release_does_not_commit_dsl_in_override_mode(main_window, qtbot, monkeypatch):
     """
     Override mode: releasing a slider must not rewrite the DSL automatically.

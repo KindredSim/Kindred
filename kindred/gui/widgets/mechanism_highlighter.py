@@ -8,6 +8,8 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui
 
+from kindred.core.simulator.algebra_section import is_algebra_line
+
 __all__ = ["MechanismHighlighter"]
 
 
@@ -28,8 +30,6 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Example:
         highlighter = MechanismHighlighter(text_edit.document())
     """
-
-    _ALGEBRA_BLOCK_STATE = 1
 
     def __init__(self, parent: Optional[QtCore.QObject] = None):
         """
@@ -150,14 +150,6 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         # 8. Comments (applied last — highest effective priority)
         self.rules.append((re.compile(r'#[^\n]*'), 'comment', True))
 
-    @staticmethod
-    def _is_algebra_header(stripped: str) -> bool:
-        return stripped.lower().startswith("# algebra")
-
-    @classmethod
-    def _is_section_boundary(cls, stripped: str) -> bool:
-        return stripped.lower().startswith("# ") and not cls._is_algebra_header(stripped)
-
     def highlightBlock(self, text: str):
         """
         Highlight a block of text.
@@ -169,17 +161,12 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         text : str
             Text to highlight
         """
-        stripped = text.strip()
-        previous_state = self.previousBlockState()
-        starts_algebra = self._is_algebra_header(stripped)
-        ends_algebra = previous_state == self._ALGEBRA_BLOCK_STATE and self._is_section_boundary(stripped)
-        in_algebra_body = previous_state == self._ALGEBRA_BLOCK_STATE and not starts_algebra and not ends_algebra
-        next_state = self._ALGEBRA_BLOCK_STATE if (starts_algebra or in_algebra_body) else 0
-        self.setCurrentBlockState(next_state)
+        algebra_line = is_algebra_line(text)
+        self.setCurrentBlockState(0)
 
         # Apply all rules in order
         for pattern, format_name, applies_in_algebra in self.rules:
-            if in_algebra_body and not applies_in_algebra:
+            if algebra_line and not applies_in_algebra:
                 continue
             format_obj = self.formats[format_name]
 

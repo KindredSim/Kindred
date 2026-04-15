@@ -2400,6 +2400,7 @@ class MainWindow(
         from kindred.core.batch_initial_conditions import (
             strip_named_reaction_dsl_initial_concentration_sets,
         )
+        from kindred.core.simulator.algebra_section import is_algebra_line
 
         text = self._mechanism_editor._reactions_text.toPlainText()
         if not text.strip():
@@ -2411,22 +2412,15 @@ class MainWindow(
             logger.warning("Failed to preprocess DSL for species registry: %s", exc, exc_info=True)
             return [], f"DSL parse error: {exc}"
 
-        algebra_guard = False
         invalid_line: Optional[str] = None
         for raw in parse_text.splitlines():
             stripped = raw.strip()
             if not stripped:
                 continue
             lower = stripped.lower()
-            if lower.startswith("# algebra"):
-                algebra_guard = True
-                continue
             if stripped.startswith("#"):
-                if algebra_guard:
-                    algebra_guard = False
                 continue
-            if algebra_guard:
-                # Allow arbitrary algebra expressions
+            if is_algebra_line(raw):
                 continue
             if lower.startswith(
                 (
@@ -7274,22 +7268,18 @@ class MainWindow(
         return "\n".join(lines)
 
     def _updated_reactions_text_with_scalar_param(self, reactions_text: str, name: str, value: float) -> str:
+        from kindred.core.simulator.algebra_section import (
+            is_param_algebra_line,
+            upsert_lines_into_algebra_section,
+        )
+
         formatted_value = format_authoritative_parameter_value(value)
         reactions_lines = str(reactions_text or "").splitlines()
 
         updated = False
-        in_algebra = False
         for i, raw in enumerate(reactions_lines):
             stripped = raw.strip()
-            lower = stripped.lower()
-            if lower.startswith("# algebra"):
-                in_algebra = True
-                continue
-            if lower.startswith("# ") and in_algebra and not lower.startswith("# algebra"):
-                in_algebra = False
-            if not in_algebra:
-                continue
-            if not stripped or stripped.startswith("#"):
+            if not stripped or stripped.startswith("#") or not is_param_algebra_line(raw):
                 continue
             before_comment, sep, comment = raw.partition("#")
             code = before_comment.strip()
@@ -7308,13 +7298,9 @@ class MainWindow(
 
         if updated:
             return "\n".join(reactions_lines).rstrip("\n") + "\n"
-
-        from kindred.core.simulator.algebra_section import upsert_lines_into_algebra_section
-
         return upsert_lines_into_algebra_section(
             "\n".join(reactions_lines).rstrip("\n") + "\n",
             [f"param {name} = {formatted_value}"],
-            header="# Algebra",
         )
 
     def _apply_scalar_param_overrides_to_reactions_text(
@@ -7333,7 +7319,7 @@ class MainWindow(
 
     def _update_scalar_param_in_algebra(self, name: str, value: float) -> None:
         """
-        Update `param <name> = ...` inside the Reactions DSL `# Algebra` section.
+        Update `param <name> = ...` inside the Reactions DSL text.
 
         Notes are persisted separately and are never parsed or injected into the DSL.
         """
@@ -7348,7 +7334,7 @@ class MainWindow(
             self._set_text_with_optional_undo(
                 reactions_widget,
                 new_text,
-                f"Update param {name} in # Algebra",
+                f"Update param {name} in Reactions DSL",
                 True,
             )
         else:

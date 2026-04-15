@@ -241,7 +241,7 @@ def test_analyze_step_parameter_update_blocks_plain_k_target_for_current_text_co
 
 def test_analyze_step_parameter_update_blocks_explicit_k_target_for_current_text_scalar_backed_constraint():
     outcome = analyze_step_parameter_update(
-        "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha",
+        "param alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha",
         "Keq1",
         8.0,
         authoritative_current_value=2.0,
@@ -254,7 +254,7 @@ def test_analyze_step_parameter_update_blocks_explicit_k_target_for_current_text
     assert outcome.semantic_value_change is False
     assert outcome.would_change_text is False
     assert outcome.canonicalization_only_change is False
-    assert outcome.updated_text == "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha"
+    assert outcome.updated_text == "param alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = alpha"
     assert outcome.warning_reason == "target_unwritable"
 
 
@@ -428,7 +428,7 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
 def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_other_step_uses_nonfinite_scalar():
     source_text = "\n".join(
         [
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -454,7 +454,7 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
     assert outcome.canonicalization_only_change is False
     assert outcome.updated_text == "\n".join(
         [
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -671,7 +671,7 @@ def test_build_current_text_step_analysis_context_scopes_nonfinite_scalar_failur
     context = dsl_text_update.build_current_text_step_analysis_context(
         "\n".join(
             [
-                "a = nan",
+                "param a = nan",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
@@ -686,13 +686,13 @@ def test_build_current_text_step_analysis_context_scopes_nonfinite_scalar_failur
     assert 1 not in context.step_constraint_analysis.step_analysis_errors
     assert context.step_constraint_analysis.step_analysis_errors[2].stage == "build_parameter_algebra_evaluation_model"
     assert "a" in context.step_constraint_analysis.step_analysis_errors[2].message
-    assert "non-finite" in context.step_constraint_analysis.step_analysis_errors[2].message.lower()
+    assert "invalid parameter algebra assignment" in context.step_constraint_analysis.step_analysis_errors[2].message.lower()
 
 
 def test_analyze_step_parameter_update_scopes_nonfinite_current_text_scalar_failure_per_step():
     source_text = "\n".join(
         [
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -720,7 +720,7 @@ def test_analyze_step_parameter_update_scopes_nonfinite_current_text_scalar_fail
     assert unaffected.warning_reason is None
     assert unaffected.updated_text == "\n".join(
         [
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -980,7 +980,7 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
     source_text = "\n".join(
         [
             "alpha = 1.0",
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -998,7 +998,7 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
     assert analysis.updated_text == "\n".join(
         [
             "alpha = 2",
-            "a = nan",
+            "param a = nan",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",

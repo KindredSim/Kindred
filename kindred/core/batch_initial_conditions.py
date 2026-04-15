@@ -134,19 +134,6 @@ def _match_unsupported_named_initial_set_header(line: str) -> str | None:
     return name
 
 
-def _is_inside_algebra_section(lines: Sequence[str], *, line_idx: int) -> bool:
-    in_algebra = False
-    for raw in lines[: int(line_idx)]:
-        stripped = str(raw or "").strip()
-        lower = stripped.lower()
-        if lower.startswith("# algebra"):
-            in_algebra = True
-            continue
-        if lower.startswith("# ") and in_algebra and not lower.startswith("# algebra"):
-            in_algebra = False
-    return in_algebra
-
-
 def _parse_named_initial_concentration_block(
     lines: Sequence[str],
     *,
@@ -167,9 +154,7 @@ def _parse_named_initial_concentration_block(
             continue
         if block_stripped == "}":
             if not saw_initial_assignment:
-                if not _is_inside_algebra_section(lines, line_idx=start_idx):
-                    return set_name, block_seed, cursor
-                return None
+                return set_name, block_seed, cursor
             return set_name, block_seed, cursor
         if block_stripped.startswith("[") and "=" in block_stripped:
             block_seed.update(_extract_initials_from_bracket_line(block_stripped))

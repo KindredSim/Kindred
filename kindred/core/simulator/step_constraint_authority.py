@@ -5,6 +5,7 @@ import re
 from typing import Mapping
 
 from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
+from kindred.core.simulator.algebra_section import is_algebra_line
 
 
 _DEFAULT_TEMPERATURE_K = 298.15
@@ -93,18 +94,10 @@ def _context_wegscheider_enabled(context: Mapping[str, object] | None) -> bool:
 def _extract_top_level_scalar_assignments(source_text: str) -> tuple[str, dict[str, float]]:
     sanitized_lines: list[str] = []
     scalar_values: dict[str, float] = {}
-    in_algebra_section = False
 
     for raw_line in str(source_text or "").splitlines():
         stripped = raw_line.strip()
-        lower = stripped.lower()
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
-            sanitized_lines.append(raw_line)
-            continue
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-        if in_algebra_section or not stripped or stripped.startswith("#"):
+        if not stripped or stripped.startswith("#") or is_algebra_line(raw_line):
             sanitized_lines.append(raw_line)
             continue
         match = _TOP_LEVEL_SCALAR_ASSIGNMENT_RE.match(raw_line)
@@ -140,16 +133,9 @@ def _seed_scalar_params_into_mechanism(mechanism: object, scalar_values: Mapping
 
 
 def _text_has_potential_step_constraints(source_text: str) -> bool:
-    in_algebra_section = False
     for raw_line in str(source_text or "").splitlines():
         stripped = raw_line.strip()
-        lower = stripped.lower()
-        if lower.startswith("# algebra"):
-            in_algebra_section = True
-            continue
-        if lower.startswith("# ") and in_algebra_section and not lower.startswith("# algebra"):
-            in_algebra_section = False
-        if not in_algebra_section or not stripped or stripped.startswith("#"):
+        if not stripped or stripped.startswith("#"):
             continue
         code = raw_line.split("#", 1)[0].strip()
         if _ALGEBRA_STEP_PARAM_ASSIGNMENT_RE.match(code):

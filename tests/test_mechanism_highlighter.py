@@ -121,22 +121,25 @@ def test_removed_energy_term_not_highlighted(doc_and_hl, term):
 @pytest.mark.parametrize("term", ["k=", "kf=", "kr=", "K="])
 def test_valid_rate_pattern_highlighted(doc_and_hl, term):
     doc, hl = doc_and_hl
-    doc.setPlainText(term)
-    assert _color_at(doc, hl, 0) == RATE
+    text = f"reaction: A -> B ; {term}1"
+    doc.setPlainText(text)
+    assert _color_at(doc, hl, text.index(term)) == RATE
 
 
 @pytest.mark.parametrize("term", ["Keq=", "K_eq=", "kEQ=", "KF=", "Kr="])
 def test_equilibrium_alias_and_case_insensitive_rate_patterns_highlighted(doc_and_hl, term):
     doc, hl = doc_and_hl
-    doc.setPlainText(term)
-    assert _color_at(doc, hl, 0) == RATE
+    text = f"equilibrium: A <-> B ; {term}2"
+    doc.setPlainText(text)
+    assert _color_at(doc, hl, text.index(term)) == RATE
 
 
 @pytest.mark.parametrize("term", ["kappa=", "\u03ba="])
 def test_new_rate_pattern_highlighted(doc_and_hl, term):
     doc, hl = doc_and_hl
-    doc.setPlainText(term)
-    assert _color_at(doc, hl, 0) == RATE
+    text = f"reaction: A -> B ; {term}1"
+    doc.setPlainText(text)
+    assert _color_at(doc, hl, text.index(term)) == RATE
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +283,20 @@ def test_mechanism_rate_highlighting_resumes_after_algebra_section_boundary(doc_
 
     resumed_pos = text.rindex("Keq=")
     assert _color_at(doc, hl, resumed_pos) == RATE
+
+
+def test_interleaved_algebra_line_suppresses_rate_highlighting_without_section_header(doc_and_hl):
+    doc, hl = doc_and_hl
+    text = "\n".join(
+        [
+            "param K = 1",
+            "equilibrium: A <-> B ; Keq=2",
+        ]
+    )
+    doc.setPlainText(text)
+
+    algebra_pos = text.index("param K") + len("param ")
+    assert _color_at(doc, hl, algebra_pos) != RATE
+
+    reaction_pos = text.rindex("Keq=")
+    assert _color_at(doc, hl, reaction_pos) == RATE

@@ -95,7 +95,6 @@ def test_scan_private_validation_reversible_step_uses_kf_namespace():
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(
             [
-                "# Algebra",
                 "param K2 = 5",
             ]
         ),
