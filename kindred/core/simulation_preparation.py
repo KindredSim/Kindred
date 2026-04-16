@@ -455,7 +455,7 @@ def _fit_simulation_error_from_preparation_error(
 
 def _validated_prepared_worker_payload(
     prepared_payload: Mapping[str, Any],
-) -> tuple[Any, Callable[..., np.ndarray], list[str], np.ndarray, object, Any]:
+) -> tuple[Any, Callable[..., np.ndarray] | None, list[str], np.ndarray, object, Any]:
     try:
         version = int(prepared_payload.get("version", 1))
     except Exception as exc:
@@ -475,14 +475,7 @@ def _validated_prepared_worker_payload(
         except KeyError as exc:
             raise _prepared_payload_failure(f"Missing prepared payload field: {exc.args[0]}") from exc
     else:
-        try:
-            from kindred.core.ode_builder import build_ode_rhs_from_mechanism
-
-            rhs = build_ode_rhs_from_mechanism(mechanism)
-        except Exception as exc:
-            raise _prepared_payload_failure(
-                f"Unable to rebuild RHS from structured prepared payload: {exc}"
-            ) from exc
+        rhs = None
 
     species_source = prepared_payload.get("species_names")
     if species_source is None:
@@ -648,7 +641,7 @@ def prepare_simulation_worker_run(
         raise SimulationPreparationError("solver_config", str(exc)) from exc
 
     mechanism: Any
-    rhs: Callable[..., np.ndarray]
+    rhs: Callable[..., np.ndarray] | None
     species_names: List[str]
     y0: np.ndarray
     temperature_schedule_override: object = _MISSING
@@ -680,7 +673,6 @@ def prepare_simulation_worker_run(
     else:
         from kindred.core.units import UnitsModel
         from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-        from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 
         temperature_K = float(
             (solver_config or {}).get(MechanismMetadataKeys.TEMPERATURE_K, 298.15)
@@ -691,13 +683,9 @@ def prepare_simulation_worker_run(
         except Exception as exc:
             raise SimulationPreparationError("parse", str(exc)) from exc
 
-        try:
-            rhs = build_ode_rhs_from_mechanism(mechanism)
-        except Exception as exc:
-            raise SimulationPreparationError("ode_build", str(exc)) from exc
-
         species_names = list(getattr(mechanism, "species_names")())
         y0 = np.array([mechanism.species[sp].initial_conc for sp in species_names], dtype=float)
+        rhs = None
         require_mutable = False
 
     meta = getattr(mechanism, "metadata", None)
@@ -737,6 +725,14 @@ def prepare_simulation_worker_run(
                 )
     except Exception as exc:
         raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
+
+    if rhs is None:
+        try:
+            from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+
+            rhs = build_ode_rhs_from_mechanism(mechanism)
+        except Exception as exc:
+            raise SimulationPreparationError("ode_build", str(exc)) from exc
 
     try:
         prepared_context = _build_prepared_run_context(

@@ -514,11 +514,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
                 strip_named_reaction_dsl_initial_concentration_sets,
             )
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_algebra import (
+                apply_parameter_algebra_to_mechanism,
+                parameter_algebra_spec_from_mechanism,
+            )
 
             parse_text = strip_named_reaction_dsl_initial_concentration_sets(text)
 
             # Parse with empty initials (will be populated from DSL)
             mechanism = parse_dsl_to_mechanism(parse_text, initials={})
+            _ = apply_parameter_algebra_to_mechanism(
+                parse_text,
+                mechanism=mechanism,
+                require_mutable=False,
+            )
 
             # Success - show green check
             n_reactions = len(mechanism.reactions)
@@ -526,6 +535,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             n_species = len(mechanism.species)
 
             msg = f"✓ Valid: {n_species} species, {n_reactions} reactions, {n_equilibria} equilibria"
+            spec = parameter_algebra_spec_from_mechanism(mechanism)
+            for warning in getattr(spec, "override_warnings", ()) or ():
+                msg += f"\nWarning: {warning.message}"
             self._set_validation_state("valid", msg)
 
         except Exception as e:

@@ -56,6 +56,14 @@ class ParameterAlgebraNamespace:
 
 
 @dataclass(frozen=True)
+class ParameterOverrideWarning:
+    param_name: str
+    inline_name: str
+    step_index: int
+    message: str
+
+
+@dataclass(frozen=True)
 class ParameterAlgebraSpec:
     """
     Parsed `param` statements from mechanism DSL text.
@@ -73,6 +81,7 @@ class ParameterAlgebraSpec:
     observable_names: Set[str]
     mechanism_namespace: MechanismParameterNamespace
     scalar_input_names: Set[str] = field(default_factory=set)
+    override_warnings: Tuple[ParameterOverrideWarning, ...] = field(default_factory=tuple)
 
     @property
     def mechanism_param_names(self) -> Set[str]:

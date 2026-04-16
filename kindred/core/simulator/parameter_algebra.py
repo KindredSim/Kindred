@@ -28,6 +28,7 @@ from kindred.core.simulator.parameter_algebra_eval import (
 from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraSpec,
     ParameterAssignment,
+    ParameterOverrideWarning,
     extract_parameter_assignments_from_algebra_lines,
     extract_parameter_assignments_from_dsl_text,
     extract_observable_names_from_algebra_lines,
@@ -51,6 +52,7 @@ _WEGSCHEIDER_TOL = 1e-10
 _PUBLIC_REEXPORTS = (
     ParameterAssignment,
     ParameterAlgebraSpec,
+    ParameterOverrideWarning,
     extract_parameter_assignments_from_algebra_lines,
     extract_parameter_assignments_from_dsl_text,
     extract_observable_names_from_algebra_lines,
@@ -424,12 +426,67 @@ def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebra
     return spec if isinstance(spec, ParameterAlgebraSpec) else None
 
 
+def _parameter_override_warnings_for_spec(
+    spec: ParameterAlgebraSpec,
+    *,
+    mechanism: object,
+) -> tuple[ParameterOverrideWarning, ...]:
+    warnings: list[ParameterOverrideWarning] = []
+    rxns = getattr(mechanism, "reactions", []) or []
+    eqs = getattr(mechanism, "equilibria", []) or []
+
+    for stmt in spec.param_statements:
+        target = lookup_step_param_target(mechanism, stmt.name)
+        if target is None:
+            continue
+        kind, index, role, entry = target
+        step_index = int(entry.get("step_index", 0) or 0)
+        inline_name: str | None = None
+
+        if kind == "reaction" and role == "k":
+            if not (0 <= index < len(rxns)):
+                continue
+            overrides = getattr(rxns[index], "overrides", {}) or {}
+            has_energy_model_override = overrides.get("model") in {"Arrhenius", "Eyring"} and any(
+                overrides.get(key) is not None
+                for key in ("A", "Ea", "Ea_J_per_mol", "dG_act_J_per_mol")
+            )
+            if not has_energy_model_override:
+                inline_name = "k"
+        elif kind == "equilibrium":
+            if not (0 <= index < len(eqs)):
+                continue
+            if role == "kf" and bool(entry.get("user_provided_kf")):
+                inline_name = "kf"
+            elif role == "kr" and bool(entry.get("user_provided_kr")):
+                inline_name = "kr"
+            elif role == "Keq" and bool(entry.get("has_Keq_param")):
+                inline_name = "Keq"
+
+        if inline_name is None:
+            continue
+        warnings.append(
+            ParameterOverrideWarning(
+                param_name=str(stmt.name),
+                inline_name=str(inline_name),
+                step_index=int(step_index),
+                message=f"param {stmt.name} overrides inline {inline_name} on step {step_index}",
+            )
+        )
+
+    return tuple(warnings)
+
+
 def apply_parameter_algebra_spec_to_mechanism(
     spec: ParameterAlgebraSpec,
     *,
     mechanism: object,
     require_mutable: bool,
 ) -> Dict[str, float]:
+    spec = replace(
+        spec,
+        override_warnings=_parameter_override_warnings_for_spec(spec, mechanism=mechanism),
+    )
     meta = getattr(mechanism, "metadata", None)
     if isinstance(meta, dict):
         meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec

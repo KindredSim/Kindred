@@ -10,6 +10,7 @@ from kindred.core.simulator.parameter_algebra import (
     evaluate_parameter_algebra,
     mechanism_parameter_namespace,
     parse_parameter_algebra_spec_from_dsl_text,
+    parameter_algebra_spec_from_mechanism,
     solver_parameter_units_from_mechanism,
 )
 from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
@@ -22,6 +23,14 @@ def _base_mech(dsl_text: str):
 
 def _compat_namespace(names: set[str]):
     return build_flat_compat_namespace(names)
+
+
+def _override_warning_messages(dsl_text: str) -> list[str]:
+    mech = _base_mech(dsl_text)
+    apply_parameter_algebra_to_mechanism(dsl_text, mechanism=mech, require_mutable=False)
+    spec = parameter_algebra_spec_from_mechanism(mech)
+    assert spec is not None
+    return [warning.message for warning in spec.override_warnings]
 
 
 def test_parameter_algebra_recomputes_on_base_change():
@@ -169,6 +178,106 @@ def test_param_expression_cannot_reference_let_observable():
     msg = str(exc.value)
     assert "observable" in msg.lower()
     assert "param a" in msg.lower()
+
+
+def test_parameter_override_warning_absent_without_param_algebra():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == []
+
+
+def test_parameter_override_warning_absent_for_non_conflicting_scalar_param():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "init: A=1.0, B=0.0",
+            "",
+            "# Algebra",
+            "param a = 5",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == []
+
+
+def test_parameter_override_warning_reports_equilibrium_kr_override():
+    dsl = "\n".join(
+        [
+            "reaction: A <-> B ; kf=1.0, kr=0.01",
+            "init: A=1.0, B=0.0",
+            "",
+            "# Algebra",
+            "param a = 5",
+            "param kr1 = a*kf1",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == ["param kr1 overrides inline kr on step 1"]
+
+
+def test_parameter_override_warning_reports_equilibrium_kf_override():
+    dsl = "\n".join(
+        [
+            "reaction: A <-> B ; kf=1.0, kr=0.01",
+            "init: A=1.0, B=0.0",
+            "",
+            "# Algebra",
+            "param kf1 = 4*kr1",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == ["param kf1 overrides inline kf on step 1"]
+
+
+def test_parameter_override_warning_reports_irreversible_step_override():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "reaction: B -> C; k=2.0",
+            "init: A=1.0, B=0.0, C=0.0",
+            "",
+            "# Algebra",
+            "param k2 = 3*k1",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == ["param k2 overrides inline k on step 2"]
+
+
+def test_parameter_override_warning_skips_keq_derived_reverse_rate():
+    dsl = "\n".join(
+        [
+            "reaction: A <-> B ; kf=6, Keq=3",
+            "init: A=1.0, B=0.0",
+            "",
+            "# Algebra",
+            "param kr1 = 2",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == []
+
+
+def test_parameter_override_warning_skips_energy_model_reaction():
+    dsl = "\n".join(
+        [
+            "energy=kJ/mol",
+            "T=298.15",
+            "reaction: A -> B; Ea=55, A=1e12",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "",
+            "# Algebra",
+            "param k1 = 2",
+        ]
+    )
+
+    assert _override_warning_messages(dsl) == []
 
 
 def test_cycle_detection_across_named_params():

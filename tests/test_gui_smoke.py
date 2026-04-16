@@ -206,6 +206,48 @@ def test_mechanism_editor_validation_rejects_unsupported_let_named_set_blocks(ma
     assert "let baseline = {" in label
 
 
+def test_mechanism_editor_validation_shows_and_clears_param_override_warning(main_window):
+    editor = main_window._mechanism_editor
+    editor._reactions_text.setPlainText(
+        "\n".join(
+            [
+                "reaction: A <-> B ; kf=1.0, kr=0.01",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "",
+                "# Algebra",
+                "param a = 5",
+                "param kr1 = a*kf1",
+            ]
+        )
+    )
+
+    editor._validate_dsl()
+
+    label = editor._validation_label.text()
+    assert label.startswith("✓ Valid:")
+    assert "Warning: param kr1 overrides inline kr on step 1" in label
+
+    editor._reactions_text.setPlainText(
+        "\n".join(
+            [
+                "reaction: A <-> B ; kf=1.0, kr=0.01",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "",
+                "# Algebra",
+                "param a = 5",
+            ]
+        )
+    )
+
+    editor._validate_dsl()
+
+    label = editor._validation_label.text()
+    assert label.startswith("✓ Valid:")
+    assert "Warning:" not in label
+
+
 def test_validation_label_wraps_long_errors(main_window):
     label = main_window._mechanism_editor._validation_label
     size_policy = label.sizePolicy()
