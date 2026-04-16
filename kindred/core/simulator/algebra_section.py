@@ -68,6 +68,9 @@ def is_bare_assignment_algebra_line(line: str) -> bool:
     match = _ASSIGN_RE.match(code)
     if match is None:
         return False
+    rhs = code[match.end():].lstrip()
+    if rhs.startswith("{"):
+        return False
     return str(match.group(1) or "").lower() not in _NON_ALGEBRA_ASSIGNMENT_PREFIXES
 
 

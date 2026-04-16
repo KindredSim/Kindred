@@ -129,3 +129,12 @@ def test_bare_assignment_classifier_rejects_prefixed_dsl_assignments():
     assert is_bare_assignment_algebra_line("equilibrium = nope") is False
     assert is_bare_assignment_algebra_line("state = nope") is False
     assert is_bare_assignment_algebra_line("conversion = 1 - [A]/[A]_0") is True
+
+
+def test_bare_assignment_classifier_rejects_brace_block_rhs():
+    assert is_bare_assignment_algebra_line("config = {") is False
+    assert is_bare_assignment_algebra_line("result = { [A] = 1.0 }") is False
+
+
+def test_bare_assignment_classifier_accepts_non_brace_rhs():
+    assert is_bare_assignment_algebra_line("config = 1.0") is True

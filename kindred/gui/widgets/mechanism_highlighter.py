@@ -20,7 +20,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Highlights:
     - Keywords (reaction, equilibrium, time, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
-    - Operators (->, =>, <->, <=>, <-, +) - red bold
+    - Operators (->, =>, <->, <=>, +) - red bold
     - Rate constants (k=, kf=, kr=, K=, kappa=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
     - Comments (#...) - gray italic
@@ -56,7 +56,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         species_format.setForeground(QtGui.QColor(70, 130, 180))  # Steel blue
         self.formats['species'] = species_format
 
-        # Operators (->, <->, <-, =)
+        # Operators (->, =>, <->, <=>, +)
         operator_format = QtGui.QTextCharFormat()
         operator_format.setForeground(QtGui.QColor(220, 20, 60))  # Crimson red
         operator_format.setFontWeight(QtGui.QFont.Bold)
@@ -131,23 +131,27 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         keyword_pattern = r'\b(' + '|'.join(keywords) + r')\b'
         self.rules.append((re.compile(keyword_pattern, re.IGNORECASE), 'keyword', False))
 
-        # 6. Operators (->, =>, <->, <=>, <-, +)
+        # 6. Algebra keywords (param, let)
+        algebra_keywords = ['param', 'let']
+        algebra_keyword_pattern = r'\b(' + '|'.join(algebra_keywords) + r')\b'
+        self.rules.append((re.compile(algebra_keyword_pattern, re.IGNORECASE), 'keyword', True))
+
+        # 7. Operators (->, =>, <->, <=>, +)
         # Applied after rate/energy so arrow `=` is not consumed by `A=` patterns.
         operators = [
             r'<=>',  # Reversible (alternate)
             r'<->',  # Reversible
             r'=>',   # Forward (alternate)
             r'->',   # Forward
-            r'<-',   # Backward (rare)
             r'\+',   # Addition (in reactions)
         ]
         for op in operators:
             self.rules.append((re.compile(op), 'operator', True))
 
-        # 7. Initial conditions ([Species] = value)
+        # 8. Initial conditions ([Species] = value)
         self.rules.append((re.compile(r'\[[A-Za-z_][A-Za-z0-9_]*\]\s*='), 'initial', True))
 
-        # 8. Comments (applied last — highest effective priority)
+        # 9. Comments (applied last — highest effective priority)
         self.rules.append((re.compile(r'#[^\n]*'), 'comment', True))
 
     def highlightBlock(self, text: str):

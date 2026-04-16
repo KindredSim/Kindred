@@ -34,6 +34,19 @@ def _color_at(doc: QtGui.QTextDocument, hl: MechanismHighlighter, pos: int):
     return None
 
 
+def _font_weight_at(doc: QtGui.QTextDocument, hl: MechanismHighlighter, pos: int):
+    """Return font weight at document position *pos*, or None."""
+    hl.rehighlight()
+    block = doc.findBlock(pos)
+    if not block.isValid():
+        return None
+    local = pos - block.position()
+    for fr in block.layout().formats():
+        if fr.start <= local < fr.start + fr.length:
+            return fr.format.fontWeight()
+    return None
+
+
 @pytest.fixture
 def doc_and_hl(qt_app):
     doc = QtGui.QTextDocument()
@@ -59,6 +72,27 @@ def test_time_keyword_highlighted(doc_and_hl):
     doc, hl = doc_and_hl
     doc.setPlainText("time")
     assert _color_at(doc, hl, 0) == KEYWORD
+
+
+@pytest.mark.parametrize("text", [
+    "param scale = 2.0",
+    "let total = [A] + [B]",
+])
+def test_algebra_keyword_highlighted_on_algebra_line(doc_and_hl, text):
+    doc, hl = doc_and_hl
+    doc.setPlainText(text)
+    assert _color_at(doc, hl, 0) == KEYWORD
+    assert _font_weight_at(doc, hl, 0) == QtGui.QFont.Bold
+
+
+def test_mechanism_keyword_remains_suppressed_on_algebra_line(doc_and_hl):
+    doc, hl = doc_and_hl
+    text = "param reaction = 1"
+    doc.setPlainText(text)
+    assert _color_at(doc, hl, 0) == KEYWORD
+    assert _font_weight_at(doc, hl, 0) == QtGui.QFont.Bold
+    reaction_pos = text.index("reaction")
+    assert _color_at(doc, hl, reaction_pos) != KEYWORD
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +246,14 @@ def test_fat_arrow_operator_highlighted(doc_and_hl):
     doc.setPlainText(text)
     arrow_pos = text.index("=>")
     assert _color_at(doc, hl, arrow_pos) == OPERATOR
+
+
+def test_backward_arrow_is_not_highlighted_as_operator(doc_and_hl):
+    doc, hl = doc_and_hl
+    text = "A <- B"
+    doc.setPlainText(text)
+    arrow_pos = text.index("<-")
+    assert _color_at(doc, hl, arrow_pos) != OPERATOR
 
 
 def test_initial_condition_highlighted(doc_and_hl):
