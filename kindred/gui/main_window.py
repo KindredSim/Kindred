@@ -37,7 +37,6 @@ from kindred.gui.project_schema import (
     FITTING_DEFAULTS_KEYS,
     PROJECT_DEFAULTS,
     PROJECT_SCHEMA_VERSION,
-    get_default_project_payload,
 )
 
 if TYPE_CHECKING:
@@ -3818,29 +3817,28 @@ class MainWindow(
                 state_editor.clear()
         self._on_programmatic_mechanism_load()
 
-        resolved_payload = get_default_project_payload()
-        resolved_payload.update(data)
-        solver_value = resolved_payload['solver']
-        rtol_value = resolved_payload['rtol']
-        atol_value = resolved_payload['atol']
+        _pref = self.config_controller.get_user_preference
+        solver_value = data.get('solver', _pref('solver'))
+        rtol_value = data.get('rtol', _pref('rtol'))
+        atol_value = data.get('atol', _pref('atol'))
 
         self._use_sparse_jacobian = bool(
-            resolved_payload['use_sparse_jacobian']
+            data.get('use_sparse_jacobian', _pref('use_sparse_jacobian'))
         )
         self._wegscheider_cyclicity_enabled = bool(
-            resolved_payload['wegscheider_cyclicity_enabled']
+            data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
         )
         previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
         previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
             self._sim_controller.parallel_batch.max_parallel_workers = min(
                 int(MAX_PARALLEL_WORKERS_CEILING),
-                max(1, int(resolved_payload['max_parallel_batch_workers'])),
+                max(1, int(data.get('max_parallel_batch_workers', _pref('max_parallel_batch_workers')))),
             )
         except Exception:
             self._sim_controller.parallel_batch.max_parallel_workers = int(PROJECT_DEFAULTS['max_parallel_batch_workers'])
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
-            resolved_payload['limit_blas_threads_per_worker']
+            data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
         if (
             previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
@@ -3854,19 +3852,19 @@ class MainWindow(
                 data['use_advanced_dsl'],
             )
         self._temperature_spinbox.setValue(
-            resolved_payload['temperature_K']
+            data.get('temperature_K', _pref('temperature_K'))
         )
         # Update stash when project loads while T= override is active.
         if getattr(self, "_temperature_dsl_override_active", False):
-            self._pre_dsl_temperature = resolved_payload['temperature_K']
-        sim_time = resolved_payload['simulation_time']
+            self._pre_dsl_temperature = data.get('temperature_K', _pref('temperature_K'))
+        sim_time = data.get('simulation_time', _pref('simulation_time'))
         if isinstance(sim_time, (int, float)):
             sim_time_text = f"{float(sim_time):g}"
         else:
             sim_time_text = str(sim_time)
         self._sim_time_spinbox.setText(sim_time_text)
         self._num_points_spinbox.setValue(
-            int(resolved_payload['num_points'])
+            int(data.get('num_points', _pref('num_points')))
         )
 
         self._apply_solver_runtime_state(
