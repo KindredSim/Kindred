@@ -100,7 +100,7 @@ def evaluate_compiled_algebra_series_for_simulation(
     initials: Dict[str, float],
     temperature_K: Optional[float] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
-    """Evaluate a compiled Algebra block against simulation outputs."""
+    """Evaluate compiled algebra declarations against simulation outputs."""
     species_names = set(species_series.keys())
     symtab = build_algebra_symbol_table(mechanism)
     if temperature_K is not None:
@@ -227,7 +227,8 @@ def evaluate_algebra_series_for_simulation_with_errors(
     initials: Dict[str, float],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """
-    Best-effort evaluation of mechanism algebra block (if present) against time series arrays.
+    Best-effort evaluation of compiled algebra declarations extracted from the
+    mechanism DSL against time series arrays.
 
     Returns (series, scalars, errors). This does not raise for per-observable evaluation errors.
     """
@@ -264,7 +265,8 @@ def evaluate_algebra_series_for_simulation(
     initials: Dict[str, float],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
     """
-    Evaluate mechanism algebra block (if present) against time series arrays.
+    Evaluate compiled algebra declarations extracted from the mechanism DSL
+    against time series arrays.
 
     Returns
     -------

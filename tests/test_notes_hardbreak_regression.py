@@ -11,8 +11,8 @@ def test_notes_text_is_not_injected_into_mechanism_dsl(main_window):
     Regression for the Notes hard-break:
 
     The GUI Notes tab must never be parsed/injected/concatenated into the mechanism
-    DSL used for simulation/fitting. Algebraic content must come only from `# Algebra`
-    inside the Reactions DSL text.
+    DSL used for simulation/fitting. Algebraic content must come only from the
+    Reactions DSL text.
     """
     reactions = "\n".join(
         [
@@ -39,4 +39,3 @@ def test_notes_text_is_not_injected_into_mechanism_dsl(main_window):
     full_dsl = str(main_window._get_mechanism_text() or "")
     assert "param injected" not in full_dsl
     assert "let bogus" not in full_dsl
-

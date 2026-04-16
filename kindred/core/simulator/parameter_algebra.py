@@ -1,7 +1,7 @@
 """
 Parameter algebra for rate/equilibrium constants.
 
-This adds an explicit, unambiguous syntax in the Algebra section:
+This adds an explicit, unambiguous syntax in mechanism DSL text:
 
     param k1 = 4*k2
 

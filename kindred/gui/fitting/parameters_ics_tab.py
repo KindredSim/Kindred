@@ -157,7 +157,7 @@ class _AddFittableParameterDialog(QtWidgets.QDialog):
         self._observable_tab = QtWidgets.QWidget(self._tabs)
         observable_layout = QtWidgets.QVBoxLayout(self._observable_tab)
         header_row = QtWidgets.QHBoxLayout()
-        header_row.addWidget(QtWidgets.QLabel("Select an existing algebraic observable from # Algebra:"))
+        header_row.addWidget(QtWidgets.QLabel("Select an existing algebraic observable from the Reactions text:"))
         header_row.addStretch(1)
         self._define_new_button = QtWidgets.QPushButton("Define new…", self._observable_tab)
         header_row.addWidget(self._define_new_button)
@@ -170,7 +170,7 @@ class _AddFittableParameterDialog(QtWidgets.QDialog):
         observable_layout.addWidget(self._observable_combo)
 
         self._no_observables_label = QtWidgets.QLabel(
-            "No algebraic observables found in # Algebra. Use 'Define new…' to add one.",
+            "No algebraic observables found in the Reactions text. Use 'Define new…' to add one.",
             self._observable_tab,
         )
         self._no_observables_label.setWordWrap(True)

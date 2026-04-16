@@ -1502,7 +1502,7 @@ class FittingWindow(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Add Observable",
-                f"Observable '{obs_name}' was not found in # Algebra. Use ‘Define new…’ to add it.",
+                f"Observable '{obs_name}' was not found in the Reactions text. Use ‘Define new…’ to add it.",
             )
             return False
         if persist_observable and obs_name in existing_observables:

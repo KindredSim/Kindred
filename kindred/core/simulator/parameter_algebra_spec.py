@@ -58,7 +58,7 @@ class ParameterAlgebraNamespace:
 @dataclass(frozen=True)
 class ParameterAlgebraSpec:
     """
-    Parsed `param` statements from an Algebra section.
+    Parsed `param` statements from mechanism DSL text.
 
     Semantics
     ---------

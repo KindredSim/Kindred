@@ -9,7 +9,9 @@ and parser-facing error reporting used by the Algebra DSL.
 Scope of this module
 --------------------
 - Tokenize source into a deterministic stream with locations.
-- Parse `# Algebra` header then { let IDENT = expr NEWLINE }.
+- Parse the internal synthetic source format: `# Algebra` header then
+  { let IDENT = expr NEWLINE }. External mechanism DSL algebra declarations
+  are normalized into this format before reaching this parser.
 - Build a typed AST with nodes:
     Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init"|"T0")
 - Enforce precedence and right-associative power (** and ^).
@@ -579,7 +581,8 @@ def _eval_static(node: ExprNode) -> Tuple[float, bool]:
 
 def parse_algebra(src: str) -> AlgebraBlock:
     """
-    Parse an algebra block string and return AlgebraBlock with AST and static_values.
+    Parse an internal synthetic algebra source string and return AlgebraBlock
+    with AST and static_values.
 
     Raises Algebra* errors with E-series codes and caret spans for diagnostics.
     """

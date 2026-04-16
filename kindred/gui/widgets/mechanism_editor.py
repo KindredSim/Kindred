@@ -40,7 +40,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     Mechanism editor with Reactions and Notes tabs.
 
     Features:
-    - Reactions tab: DSL text editor (includes `# Algebra` sections for algebraic content)
+    - Reactions tab: DSL text editor for reactions, algebra declarations, and computational-mode content
     - Notes tab: persisted free-form text (never parsed or injected)
 
     Advanced features (Species Registry and State Network) are accessible via Edit menu.
@@ -296,11 +296,27 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "temp_step: t=[0,50,100], T=[298,320]\n"
             "temp_response: t=[0,50,100], T=[298,320], tau=10\n"
             "\n"
-            "<b>Algebra and Observables (# algebra)</b>\n"
-            "Use 'param name = expr' for static kinetic parameters (e.g., param k2 = k1 * 2).\n"
-            "Use 'let name = expr' for observables using species data (e.g., let total = [A] + [B]_0).\n"
-            "Math ops: +, -, *, /, ^, min(), max(), exp(), ln(), sin(), piecewise logic, and constants (R, T, N_A).\n"
-            "*Note: Bracketed species [A] can ONLY be used in 'let', never in 'param'.*\n"
+            "<b>Algebra Declarations and Observables</b>\n"
+            "Write algebra declarations directly in the Reactions text. They may appear before, after, or between reaction lines.\n"
+            "param name = expr      Scalar solver parameter. Use for rate constants, energies, and other fittable inputs.\n"
+            "let name = expr        Algebraic observable. Use for derived quantities to plot or fit against data.\n"
+            "name = expr            Shorthand for 'let name = expr'. Bare assignment declares an observable, not a scalar seed.\n"
+            "Bracketed species like [A] and [A]_0 are valid in observables, not in param declarations.\n"
+            "'observable' is not a keyword. Use let or bare assignment for observables.\n"
+            "\n"
+            "<b>Built-in Functions</b>\n"
+            "Math: sqrt(x), ln(x), log10(x), log1p(x), exp(x), expm1(x), pow(x, y), abs(x)\n"
+            "Trigonometry: sin(x), cos(x), tan(x)\n"
+            "Aggregation: min(...), max(...)\n"
+            "Special: erf(x), heaviside(x), clip(x, lo, hi), ifelse(cond, a, b)\n"
+            "\n"
+            "<b>Protected Constants</b>\n"
+            "k_B   Boltzmann constant (read-only)\n"
+            "h     Planck constant (read-only)\n"
+            "N_A   Avogadro constant (read-only)\n"
+            "R     Gas constant in J/mol/K (read-only)\n"
+            "Rkcal Gas constant in kcal/mol/K (read-only)\n"
+            "T     Current temperature in K from the mechanism T directive (read-only)\n"
             "\n"
             "<b>Computational Mode (# === Computational Mode ===)</b>\n"
             "Define advanced species thermodynamics (e.g., comp: species A G=-100).\n"
@@ -308,19 +324,28 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "\n"
             "Note: Kindred normalizes all energies internally to J/mol.\n"
             "\n"
-            "<b>Example</b>\n"
+            "<b>Examples</b>\n"
+            "Grouped declarations:\n"
             "reaction: 2A + B =&gt; C ; kf=1e5\n"
             "equilibrium: C &lt;=&gt; D ; K=2.5 ; kf=10.0\n"
             "reaction: C + E -&gt; F ; k=0.5\n"
             "reaction: A -&gt; A_Side ; kf=0.01\n"
             "\n"
-            "# algebra\n"
             "param scale = 2.0\n"
             "param k_base = 1.5e3\n"
             "param k_derived = k_base * scale\n"
-            "\n"
             "let total_A = [A] + [A_Side]\n"
-            "let conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
+            "conversion = 1.0 - ([A] / max([A]_0, 1e-18))\n"
+            "\n"
+            "Interleaved declarations:\n"
+            "reaction: A -&gt; B ; k=1.0\n"
+            "param scale = 2.0\n"
+            "reaction: B -&gt; C ; k=0.5\n"
+            "yield_C = [C] / max([A]_0, 1e-18)\n"
+            "equilibrium: C &lt;=&gt; D ; K=2.5 ; kf=10.0\n"
+            "let total_CD = [C] + [D]\n"
+            "\n"
+            "Reaction arrows: -&gt; for irreversible, &lt;-&gt; or &lt;=&gt; for reversible. &lt;- is not accepted.\n"
             "\n"
             "# === Computational Mode ===\n"
             "comp: species C G=-450.12</pre>"
@@ -345,7 +370,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._notes_text.setPlaceholderText(
             "Free-form notes about this mechanism.\n\n"
             "Important: algebraic scalars and algebraic observables must be defined in the\n"
-            "Reactions editor inside a '# Algebra' section. Notes are never parsed or injected."
+            "Reactions text. Notes are never parsed or injected."
         )
         self._notes_text.setFont(QtGui.QFont("Courier New", 10))
         self._notes_text.setUndoRedoEnabled(True)

@@ -7,10 +7,10 @@ import pytest
 pytestmark = [pytest.mark.gui]
 
 
-def test_global_fit_observable_dropdown_reads_from_reactions_dsl_algebra_block(qt_app, monkeypatch):
+def test_global_fit_observable_dropdown_reads_from_reactions_dsl_declarations(qt_app, monkeypatch):
     """
-    Regression: Global Fit must detect algebraic observables from the current Reactions
-    DSL `# Algebra` section, not from the GUI Notes tab.
+    Regression: Global Fit must detect algebraic observables from the current
+    Reactions DSL declarations, not from the GUI Notes tab.
     """
     from PySide6 import QtWidgets
 

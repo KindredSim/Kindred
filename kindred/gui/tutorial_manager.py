@@ -145,7 +145,7 @@ class TutorialManager:
                         "Rate constants on reaction lines must be numeric values:<br>"
                         "<code>k=1.5</code>, <code>kf=1e5</code>, <code>kr=0.002</code><br><br>"
                         "Symbolic relationships between rates are handled separately "
-                        "in the <code># Algebra</code> block."
+                        "with <code>param</code> declarations in the Reactions text."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",
@@ -173,10 +173,10 @@ class TutorialManager:
                     arrow_direction="left",
                 ),
                 TutorialStep(
-                    title="The Algebra block",
+                    title="Algebra declarations",
                     instruction=(
-                        "Add a <code># Algebra</code> section for derived parameters "
-                        "and observables:<br>"
+                        "Add <code>param</code> and <code>let</code> declarations in the "
+                        "Reactions text for derived parameters and observables:<br>"
                         "<code>param scale = 2.0</code> (adjustable parameter)<br>"
                         "<code>param k2 = k1 * scale</code> (derived constraint)<br>"
                         "<code>let total = [A] + [B]</code> (observable)"

@@ -340,9 +340,9 @@ def test_apply_overrides_to_text_reads_metadata_once_per_call(main_window, monke
 
 def test_scalar_param_slider_updates_existing_param_in_reactions_algebra(main_window, monkeypatch):
     """
-    Regression: scalar slider commits must update an existing `param a = ...` definition
-    under a `# Algebra` block embedded in the Reactions editor, instead of appending a
-    second `param a = ...` line into the Notes tab (which is never parsed).
+    Regression: scalar slider commits must update an existing `param a = ...`
+    definition in the Reactions editor, instead of appending a second
+    `param a = ...` line into the Notes tab (which is never parsed).
     """
     from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
 
@@ -1892,7 +1892,7 @@ def test_K_implied_derived_rate_updates_without_param_block(main_window):
             ]
         )
     )
-    # No `param ...` statements; only post-solve algebra inside the Reactions `# Algebra` block.
+    # No `param ...` statements; only post-solve algebra declarations in the Reactions text.
     main_window._extract_and_populate_variables()
 
     sliders = main_window._mechanism_editor._variable_sliders

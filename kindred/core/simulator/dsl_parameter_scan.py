@@ -168,7 +168,7 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
 
     This function extracts parameter names from:
     1. Reaction parameter definitions (k, kf, kr, A, Ea, dG_act, etc.)
-    2. Algebra section variable definitions in the `# Algebra` section:
+    2. Algebra declaration lines in the mechanism DSL:
        - `param name = ...` (solver/parameter-algebra)
        - `let name = ...` and `name = ...` (observables)
     """
