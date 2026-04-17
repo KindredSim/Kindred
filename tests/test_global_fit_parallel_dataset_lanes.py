@@ -1145,6 +1145,49 @@ def test_fitting_process_pool_constructor_raises_fitting_cancelled_when_cancella
         )
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_constructor_uses_nonblocking_cancel_helper_during_startup() -> None:
+    """Use a 5.0s join budget to prove startup does not hang on a pause-blocking callable."""
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pause_event = threading.Event()
+    pause_event.clear()
+    budget_s = 5.0
+    result: dict[str, object] = {"pool": None, "error": None}
+
+    def cancellation_check() -> bool:
+        pause_event.wait()
+        return False
+
+    cancellation_check._kindred_nonblocking_cancelled = lambda: False
+
+    def construct_pool() -> None:
+        try:
+            result["pool"] = FittingProcessPool(
+                _make_serial_evaluator().to_process_payload(),
+                max_workers=1,
+                cancellation_check=cancellation_check,
+            )
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=construct_pool, name="startup-cancel-helper-test")
+    thread.start()
+    thread.join(timeout=budget_s)
+    completed_within_budget = not thread.is_alive()
+    pause_event.set()
+    thread.join(timeout=budget_s)
+
+    pool = result["pool"]
+    try:
+        assert completed_within_budget is True
+        assert result["error"] is None
+        assert isinstance(pool, FittingProcessPool)
+    finally:
+        if isinstance(pool, FittingProcessPool):
+            pool.shutdown(force_terminate=False)
+
+
 def test_fitting_process_pool_submit_raises_fitting_cancelled_after_shutdown_starts() -> None:
     from kindred.core.exceptions import FittingCancelled
     from kindred.core.fitting_process_pool import FittingProcessPool

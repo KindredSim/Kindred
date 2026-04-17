@@ -551,9 +551,17 @@ class FittingProcessPool:
         cancelled = bool(self._startup_cancelled)
         if not cancelled:
             cancellation_check = getattr(self, "_cancellation_check", None)
-            if cancellation_check is not None and bool(cancellation_check()):
-                self._startup_cancelled = True
-                cancelled = True
+            if cancellation_check is not None:
+                # Prefer the callable's _kindred_nonblocking_cancelled helper so
+                # startup treats pause as "not cancelled, proceed" until readiness.
+                cancel_requested = getattr(
+                    cancellation_check,
+                    "_kindred_nonblocking_cancelled",
+                    cancellation_check,
+                )
+                if bool(cancel_requested()):
+                    self._startup_cancelled = True
+                    cancelled = True
         if not cancelled:
             return
         from kindred.core.exceptions import FittingCancelled
