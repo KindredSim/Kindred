@@ -1,14 +1,47 @@
+"""Fitting process-pool wrapper with cancellation, termination, and shutdown reporting.
+
+This module wraps :class:`concurrent.futures.ProcessPoolExecutor` for fitting dataset
+evaluation. The wrapper layers fitting-specific worker initialization, cooperative
+cancel propagation, best-effort process termination, and shutdown observability on top
+of the stdlib executor.
+
+The cancellation model has four layers:
+
+1. ``multiprocessing.Manager().Event()`` is passed into each worker process and polled
+   by the worker evaluator. This is cooperative cancellation for work that has already
+   started. It does not preempt a worker between poll sites.
+2. ``ProcessPoolExecutor.shutdown(cancel_futures=True)`` is used during pool shutdown to
+   cancel executor-managed futures that have not started yet. It does not stop a worker
+   that is already running.
+3. The pool snapshots ``ProcessPoolExecutor._processes`` and calls ``terminate()`` on
+   the known children as a best-effort escalation path. This depends on CPython private
+   API and is therefore a documented, bounded limitation rather than a stdlib-guaranteed
+   contract.
+4. The dispatch layer also calls ``Future.cancel()`` on queued dataset futures before
+   shutdown. This is queued-only cancellation at the call-site boundary and does not
+   replace the cooperative worker event or forced termination path.
+
+The pool is intended to be used as a context manager so shutdown ownership stays with
+the call site that creates it. Direct construction plus an explicit ``shutdown()`` call
+is also supported.
+"""
+
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
+import logging
 import multiprocessing as mp
 import os
 import pickle
 import threading
+import weakref
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
-from contextlib import suppress
 from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+
+logger = logging.getLogger(__name__)
 
 BLAS_THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
@@ -20,10 +53,14 @@ BLAS_THREAD_ENV_VARS = (
 
 _WORKER_EVALUATOR: Any = None
 _WORKER_CANCEL_EVENT: Any = None
+_ACTIVE_POOL_REGISTRY_LOCK = threading.Lock()
+_ACTIVE_POOLS_BY_OWNER_THREAD: dict[int, weakref.WeakSet["FittingProcessPool"]] = {}
 
 __all__ = [
     "BLAS_THREAD_ENV_VARS",
     "FittingProcessPool",
+    "ShutdownOutcome",
+    "ShutdownStatus",
     "apply_worker_blas_limits",
     "initialize_fitting_worker",
     "run_fitting_evaluation_task",
@@ -31,6 +68,55 @@ __all__ = [
 
 _PREWARM_POLL_SECONDS = 0.05
 _PROCESS_SNAPSHOT_ATTEMPTS = 3
+
+
+class ShutdownStatus(str, Enum):
+    GRACEFUL_COMPLETION = "graceful_completion"
+    GRACEFUL_WITH_ERRORS = "graceful_with_errors"
+    FORCED_TERMINATION_CLEAN = "forced_termination_clean"
+    FORCED_TERMINATION_WITH_ERRORS = "forced_termination_with_errors"
+    NEVER_STARTED = "never_started"
+
+
+@dataclass(frozen=True)
+class ShutdownOutcome:
+    """Observed result of one pool shutdown attempt.
+
+    ``status`` records whether shutdown was graceful, forced, error-bearing, or invoked
+    before pool startup reached prewarm.
+    ``executor_shutdown_error`` stores the exception raised by
+    ``ProcessPoolExecutor.shutdown(...)``, if any.
+    ``manager_shutdown_error`` stores the exception raised by ``manager.shutdown()``,
+    if any.
+    ``termination_errors`` stores best-effort ``proc.terminate()`` failures, labeled by
+    worker PID when available or by iteration index when no PID was readable.
+    ``cancel_event_error`` stores the exception raised while setting the cooperative
+    cancel event, if that boundary failed.
+    ``final_worker_process_count`` records how many worker processes were present in the
+    last executor-process snapshot taken during this shutdown call.
+    ``final_snapshot_nonempty`` records whether that last snapshot returned one or more
+    processes. Snapshot failures during forced termination are surfaced through
+    ``termination_errors`` with a ``snapshot`` label.
+    """
+
+    status: ShutdownStatus
+    executor_shutdown_error: BaseException | None = None
+    manager_shutdown_error: BaseException | None = None
+    termination_errors: tuple[tuple[str, BaseException], ...] = ()
+    cancel_event_error: BaseException | None = None
+    final_worker_process_count: int = 0
+    final_snapshot_nonempty: bool = False
+
+    @property
+    def has_errors(self) -> bool:
+        return any(
+            (
+                self.executor_shutdown_error is not None,
+                self.manager_shutdown_error is not None,
+                self.cancel_event_error is not None,
+                bool(self.termination_errors),
+            )
+        )
 
 
 def apply_worker_blas_limits(*, enabled: bool, environ: MutableMapping[str, str] | None = None) -> None:
@@ -195,13 +281,34 @@ def run_fitting_evaluation_task(item: Any) -> dict[str, Any]:
 
 
 class FittingProcessPool:
+    """Process-backed fitting evaluator pool with cooperative and forced shutdown paths.
+
+    Lifecycle:
+    construction validates and pickles the evaluator payload, builds the manager event
+    and executor, then prewarms all workers before returning. Submission runs through the
+    executor under the pool lock. ``cancel()`` is idempotent, sets the cooperative cancel
+    event, and terminates known workers only when startup is still in prewarm. ``shutdown()``
+    is idempotent, returns a ``ShutdownOutcome``, and escalates to best-effort child
+    termination when ``force_terminate=True``.
+
+    Context-manager protocol:
+    ``__enter__`` returns the fully prewarmed pool. ``__exit__`` always calls
+    ``shutdown(force_terminate=exc_type is not None)`` and never suppresses the original
+    exception.
+
+    ``cancel()`` is safe to call repeatedly after ``__enter__`` returns. ``worker_pids()``
+    returns a lock-synchronized snapshot of currently known worker PIDs taken from the
+    executor's internal process registry and returns ``()`` after shutdown clears the
+    executor reference.
+    """
+
     def __init__(
         self,
         evaluator_payload: Mapping[str, Any],
         *,
         max_workers: int,
         limit_blas_threads: bool = True,
-        publish_callback: Optional[Callable[[Optional["FittingProcessPool"]], None]] = None,
+        cancellation_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         requested_workers = min(
             int(MAX_PARALLEL_WORKERS_CEILING),
@@ -216,14 +323,21 @@ class FittingProcessPool:
         self._executor = None
         self._closed = False
         self._max_workers = requested_workers
+        self._owner_thread_ident = threading.get_ident()
         self._startup_cancelled = False
+        self._cancellation_check = cancellation_check
         self._prewarm_in_progress = False
+        self._prewarm_started = False
+        self._entered = False
         self._shutdown_in_progress = False
+        self._last_shutdown_outcome: ShutdownOutcome | None = None
+        self._pending_out_of_band_cancel_event_error: BaseException | None = None
+        self._pending_out_of_band_termination_errors: list[tuple[str, BaseException]] = []
+        self._pending_out_of_band_final_worker_process_count = 0
+        self._pending_out_of_band_final_snapshot_nonempty = False
         self._state_lock = threading.Lock()
-        published = False
-        if publish_callback is not None:
-            publish_callback(self)
-            published = True
+        self._shutdown_condition = threading.Condition(self._state_lock)
+        self._register_active_pool()
         try:
             self._raise_if_startup_cancelled()
             self._manager = ctx.Manager()
@@ -238,40 +352,84 @@ class FittingProcessPool:
             )
             self._raise_if_startup_cancelled()
         except Exception:
-            with suppress(Exception):
-                self.shutdown(force_terminate=True)
-            if published and publish_callback is not None:
-                with suppress(Exception):
-                    publish_callback(None)
+            outcome = self.shutdown(force_terminate=True)
+            if outcome.has_errors:
+                self._log_shutdown_outcome_errors(outcome, context="pool construction cleanup")
             raise
         try:
+            self._prewarm_started = True
             self._prewarm()
         except Exception:
-            self.shutdown(force_terminate=True)
-            if published and publish_callback is not None:
-                with suppress(Exception):
-                    publish_callback(None)
+            outcome = self.shutdown(force_terminate=True)
+            if outcome.has_errors:
+                self._log_shutdown_outcome_errors(outcome, context="pool prewarm cleanup")
             raise
 
     @property
     def max_workers(self) -> int:
         return int(self._max_workers)
 
+    def __enter__(self) -> "FittingProcessPool":
+        with self._state_lock:
+            if bool(getattr(self, "_entered", False)):
+                raise RuntimeError("Fitting process pool context manager is not re-entrant.")
+            if (
+                getattr(self, "_manager", None) is None
+                or getattr(self, "_cancel_event", None) is None
+                or getattr(self, "_executor", None) is None
+                or bool(getattr(self, "_prewarm_in_progress", False))
+            ):
+                raise RuntimeError("Fitting process pool is not fully initialized.")
+            self._entered = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            try:
+                outcome = self.shutdown(force_terminate=exc_type is not None)
+            except Exception as exc:
+                logger.warning("pool context-manager exit: shutdown raised unexpectedly.", exc_info=exc)
+                if exc_type is None:
+                    raise
+                return None
+            if outcome.has_errors:
+                self._log_shutdown_outcome_errors(outcome, context="pool context-manager exit")
+            return None
+        finally:
+            with self._state_lock:
+                self._entered = False
+
     def submit(self, item: Any):
+        """Submit one dataset-evaluation item to the executor.
+
+        Thread-safe via the pool state lock. Raises ``FittingCancelled`` when shutdown or
+        startup cancellation has already begun. Raises ``RuntimeError`` if the executor
+        was never initialized.
+        """
         return self._submit_executor(run_fitting_evaluation_task, item)
 
     def cancel(self) -> None:
-        self._startup_cancelled = True
-        terminate_target = ()
-        with self._state_lock:
-            cancel_event = self._cancel_event
-            if self._prewarm_in_progress and not self._closed:
-                terminate_target = self._snapshot_processes_locked(self._executor)
-        with suppress(Exception):
-            if cancel_event is not None:
+        """Request cooperative cancellation and prewarm-time worker termination.
+
+        Thread-safe and idempotent. The method sets the cooperative cancel event for
+        running workers and, while prewarm is still in progress, best-effort terminates
+        workers discovered in the executor snapshot. Failures to set the cancel event or
+        terminate workers are logged at DEBUG and do not raise.
+        """
+        cancel_event, terminate_target, _snapshot_attempted = self._prepare_cancel()
+        if cancel_event is not None:
+            try:
                 cancel_event.set()
+            except Exception as exc:
+                logger.debug("Failed to set fitting process-pool cancel event during cancel().", exc_info=exc)
         if terminate_target:
-            self._terminate_processes_best_effort(terminate_target)
+            termination_errors = self._terminate_processes_best_effort(terminate_target)
+            for label, exc in termination_errors:
+                logger.debug(
+                    "Failed to terminate fitting worker %s during cancel().",
+                    label,
+                    exc_info=exc,
+                )
 
     def _snapshot_processes_locked(self, executor: Any) -> tuple[Any, ...]:
         if executor is None:
@@ -288,6 +446,12 @@ class FittingProcessPool:
         return ()
 
     def worker_pids(self) -> tuple[int, ...]:
+        """Return a lock-synchronized snapshot of currently known worker PIDs.
+
+        Thread-safe via the pool state lock. The snapshot is derived from the executor's
+        internal process registry. If the executor reference has already been cleared, or
+        if the registry snapshot is empty, this method returns ``()``.
+        """
         with self._state_lock:
             process_snapshot = self._snapshot_processes_locked(self._executor)
             if not process_snapshot:
@@ -299,51 +463,137 @@ class FittingProcessPool:
                 pids.append(int(pid))
         return tuple(sorted(set(pids)))
 
-    def shutdown(self, *, force_terminate: bool) -> None:
-        self.cancel()
-        execute_shutdown = False
-        executor = None
-        manager = None
-        terminate_target = ()
-        with self._state_lock:
-            if self._closed and self._executor is None and self._manager is None:
-                return
-            executor = self._executor
-            manager = self._manager
-            if self._shutdown_in_progress:
-                if bool(force_terminate) and executor is not None:
-                    terminate_target = self._snapshot_processes_locked(executor)
-            else:
-                self._shutdown_in_progress = True
-                execute_shutdown = True
-                if bool(force_terminate) and executor is not None:
-                    terminate_target = self._snapshot_processes_locked(executor)
-        if not execute_shutdown:
-            if terminate_target:
-                self._terminate_processes_best_effort(terminate_target)
-            return
+    def shutdown(self, *, force_terminate: bool) -> ShutdownOutcome:
+        """Shut down the pool and report what the shutdown path observed.
+
+        Thread-safe and idempotent. ``force_terminate=True`` keeps executor shutdown
+        non-blocking and best-effort terminates workers from the final process snapshot.
+        ``force_terminate=False`` performs graceful executor shutdown and relies on the
+        cooperative cancel event plus queued-future cancellation. The returned
+        ``ShutdownOutcome`` records shutdown-boundary exceptions without raising them.
+        """
+        cancel_event, cancel_terminate_target, cancel_snapshot_attempted = self._prepare_cancel()
+        cancel_event_error: BaseException | None = None
+        if cancel_event is not None:
+            try:
+                cancel_event.set()
+            except Exception as exc:
+                cancel_event_error = exc
+        shutdown_condition = self._ensure_shutdown_condition()
+        never_started = not bool(getattr(self, "_prewarm_started", False))
+        force_escalated = False
+        while True:
+            need_force_escalation = False
+            closed_outcome: ShutdownOutcome | None = None
+            with shutdown_condition:
+                last_shutdown_outcome = getattr(self, "_last_shutdown_outcome", None)
+                if self._closed and self._executor is None and self._manager is None:
+                    closed_outcome = (
+                        last_shutdown_outcome
+                        if last_shutdown_outcome is not None
+                        else ShutdownOutcome(status=ShutdownStatus.NEVER_STARTED)
+                    )
+                elif not self._shutdown_in_progress:
+                    self._shutdown_in_progress = True
+                    executor = self._executor
+                    manager = self._manager
+                    break
+                elif bool(force_terminate) and not force_escalated:
+                    need_force_escalation = True
+                    force_escalated = True
+                else:
+                    shutdown_condition.wait()
+            if closed_outcome is not None:
+                return self._merge_out_of_band_shutdown_observations(
+                    closed_outcome,
+                    force_terminate=bool(force_terminate),
+                )
+            if need_force_escalation:
+                escalated_outcome = self._force_shutdown_out_of_band()
+                if escalated_outcome is not None:
+                    return self._merge_out_of_band_shutdown_observations(
+                        escalated_outcome,
+                        force_terminate=True,
+                    )
+
+        executor_shutdown_error: BaseException | None = None
+        manager_shutdown_error: BaseException | None = None
+        termination_errors: tuple[tuple[str, BaseException], ...] = ()
+        initial_terminate_target = ()
+        initial_snapshot_error: BaseException | None = None
+        if bool(force_terminate) and executor is not None:
+            with self._state_lock:
+                initial_terminate_target, initial_snapshot_error = self._snapshot_processes_observed_locked(executor)
+        elif cancel_snapshot_attempted:
+            initial_terminate_target = tuple(cancel_terminate_target)
+
+        final_snapshot = tuple(initial_terminate_target)
+        final_snapshot_error: BaseException | None = initial_snapshot_error
         try:
             if executor is not None:
                 try:
                     executor.shutdown(wait=not bool(force_terminate), cancel_futures=True)
-                except TypeError:
-                    with suppress(Exception):
-                        executor.shutdown(wait=not bool(force_terminate))
+                except Exception as exc:
+                    executor_shutdown_error = exc
         finally:
-            if terminate_target:
-                self._terminate_processes_best_effort(terminate_target)
-            with suppress(Exception):
-                if manager is not None:
-                    manager.shutdown()
+            if initial_terminate_target:
+                termination_errors = self._terminate_processes_best_effort(initial_terminate_target)
             with self._state_lock:
+                if bool(force_terminate):
+                    final_snapshot, final_snapshot_error = self._snapshot_processes_observed_locked(executor)
+                else:
+                    final_snapshot = self._snapshot_processes_locked(executor)
+                    final_snapshot_error = None
+            if final_snapshot_error is not None:
+                termination_errors = tuple(termination_errors) + (("snapshot", final_snapshot_error),)
+            if manager is not None:
+                try:
+                    manager.shutdown()
+                except Exception as exc:
+                    manager_shutdown_error = exc
+            shutdown_status = self._resolve_shutdown_status(
+                force_terminate=bool(force_terminate),
+                never_started=never_started,
+                has_errors=bool(
+                    executor_shutdown_error is not None
+                    or manager_shutdown_error is not None
+                    or cancel_event_error is not None
+                    or termination_errors
+                ),
+            )
+            outcome = ShutdownOutcome(
+                status=shutdown_status,
+                executor_shutdown_error=executor_shutdown_error,
+                manager_shutdown_error=manager_shutdown_error,
+                termination_errors=termination_errors,
+                cancel_event_error=cancel_event_error,
+                final_worker_process_count=len(tuple(final_snapshot)),
+                final_snapshot_nonempty=bool(final_snapshot),
+            )
+            outcome = self._merge_out_of_band_shutdown_observations(
+                outcome,
+                force_terminate=bool(force_terminate),
+            )
+            with shutdown_condition:
                 if self._executor is executor:
                     self._executor = None
                 if self._manager is manager:
                     self._manager = None
                 self._closed = True
                 self._shutdown_in_progress = False
+                self._last_shutdown_outcome = outcome
+                shutdown_condition.notify_all()
+            self._unregister_active_pool()
+            return outcome
 
     def _prewarm(self) -> None:
+        """Start all workers and wait until each initializer has run.
+
+        This method is not thread-safe and is intended to run only during construction.
+        It polls ``_raise_if_startup_cancelled()`` between timed waits so construction-time
+        cancellation can abort startup quickly. Raises ``FittingCancelled`` when startup
+        cancellation is requested, or propagates executor and initializer failures.
+        """
         if self._executor is None:
             raise RuntimeError("Fitting process pool is not initialized.")
         with self._state_lock:
@@ -363,17 +613,31 @@ class FittingProcessPool:
                 self._prewarm_in_progress = False
 
     def _raise_if_startup_cancelled(self) -> None:
-        if not self._startup_cancelled:
+        cancelled = bool(self._startup_cancelled)
+        if not cancelled:
+            cancellation_check = getattr(self, "_cancellation_check", None)
+            if cancellation_check is not None and bool(cancellation_check()):
+                self._startup_cancelled = True
+                cancelled = True
+        if not cancelled:
             return
         from kindred.core.exceptions import FittingCancelled
 
         raise FittingCancelled()
 
     def _submit_executor(self, fn: Callable[..., Any], *args: Any):
+        """Submit raw executor work under the pool lock.
+
+        Thread-safe via the pool state lock. Raises ``FittingCancelled`` if shutdown is
+        already in progress or startup cancellation has been requested. Raises
+        ``RuntimeError`` if the executor reference is missing. Propagates executor submit
+        errors unless shutdown state changed concurrently, in which case they are coerced
+        to ``FittingCancelled``.
+        """
         from kindred.core.exceptions import FittingCancelled
 
         with self._state_lock:
-            if self._closed or self._shutdown_in_progress:
+            if self._closed or self._shutdown_in_progress or self._startup_cancelled:
                 raise FittingCancelled()
             executor = self._executor
             if executor is None:
@@ -385,8 +649,259 @@ class FittingProcessPool:
                     raise FittingCancelled() from exc
                 raise
 
-    def _terminate_processes_best_effort(self, processes: tuple[Any, ...]) -> None:
-        for proc in tuple(processes):
-            with suppress(Exception):
+    def _prepare_cancel(self) -> tuple[Any, tuple[Any, ...], bool]:
+        self._startup_cancelled = True
+        terminate_target = ()
+        snapshot_attempted = False
+        with self._state_lock:
+            cancel_event = self._cancel_event
+            if self._prewarm_in_progress and not self._closed:
+                snapshot_attempted = True
+                terminate_target = self._snapshot_processes_locked(self._executor)
+        return cancel_event, terminate_target, snapshot_attempted
+
+    @classmethod
+    def force_shutdown_registered_pools_for_owner_thread(
+        cls,
+        owner_thread_ident: int | None,
+    ) -> tuple[ShutdownOutcome, ...]:
+        if not isinstance(owner_thread_ident, int):
+            return ()
+        with _ACTIVE_POOL_REGISTRY_LOCK:
+            pools = tuple(_ACTIVE_POOLS_BY_OWNER_THREAD.get(owner_thread_ident, ()))
+        outcomes: list[ShutdownOutcome] = []
+        for pool in pools:
+            outcome = pool._force_shutdown_out_of_band()
+            if outcome is not None:
+                outcomes.append(outcome)
+        return tuple(outcomes)
+
+    def _force_shutdown_out_of_band(self) -> ShutdownOutcome | None:
+        shutdown_condition = self._ensure_shutdown_condition()
+        with shutdown_condition:
+            if self._closed and self._executor is None and self._manager is None:
+                return self._last_shutdown_outcome
+            if not self._shutdown_in_progress:
+                do_full_shutdown = True
+            else:
+                do_full_shutdown = False
+                executor = self._executor
+        if do_full_shutdown:
+            return self.shutdown(force_terminate=True)
+
+        cancel_event, terminate_target, _snapshot_attempted = self._prepare_cancel()
+        cancel_event_error: BaseException | None = None
+        if cancel_event is not None:
+            try:
+                cancel_event.set()
+            except Exception as exc:
+                cancel_event_error = exc
+        termination_errors: tuple[tuple[str, BaseException], ...] = ()
+        final_snapshot = ()
+        partial_shutdown_error: BaseException | None = RuntimeError(
+            "Executor shutdown was already in progress; out-of-band forced termination did not observe executor or manager shutdown."
+        )
+        snapshot_error: BaseException | None = None
+        with self._state_lock:
+            final_snapshot, snapshot_error = self._snapshot_processes_observed_locked(executor)
+        if final_snapshot:
+            termination_errors = self._terminate_processes_best_effort(final_snapshot)
+        if snapshot_error is not None:
+            termination_errors = tuple(termination_errors) + (("snapshot", snapshot_error),)
+        termination_errors = tuple(termination_errors) + (("concurrent_shutdown", partial_shutdown_error),)
+        outcome = ShutdownOutcome(
+            status=self._resolve_shutdown_status(
+                force_terminate=True,
+                never_started=not bool(getattr(self, "_prewarm_started", False)),
+                has_errors=bool(cancel_event_error is not None or termination_errors),
+            ),
+            termination_errors=termination_errors,
+            cancel_event_error=cancel_event_error,
+            final_worker_process_count=len(tuple(final_snapshot)),
+            final_snapshot_nonempty=bool(final_snapshot),
+        )
+        self._record_out_of_band_shutdown_observations(outcome)
+        return outcome
+
+    def _ensure_shutdown_condition(self) -> threading.Condition:
+        condition = getattr(self, "_shutdown_condition", None)
+        if condition is not None:
+            return condition
+        state_lock = getattr(self, "_state_lock", None)
+        if state_lock is None:
+            state_lock = threading.Lock()
+            self._state_lock = state_lock
+        condition = threading.Condition(state_lock)
+        self._shutdown_condition = condition
+        return condition
+
+    @staticmethod
+    def _resolve_shutdown_status(*, force_terminate: bool, never_started: bool, has_errors: bool) -> ShutdownStatus:
+        if force_terminate:
+            if has_errors:
+                return ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+            if never_started:
+                return ShutdownStatus.NEVER_STARTED
+            return ShutdownStatus.FORCED_TERMINATION_CLEAN
+        if has_errors:
+            return ShutdownStatus.GRACEFUL_WITH_ERRORS
+        if never_started:
+            return ShutdownStatus.NEVER_STARTED
+        return ShutdownStatus.GRACEFUL_COMPLETION
+
+    def _record_out_of_band_shutdown_observations(self, outcome: ShutdownOutcome) -> None:
+        with self._state_lock:
+            if not hasattr(self, "_pending_out_of_band_termination_errors"):
+                self._pending_out_of_band_termination_errors = []
+            if not hasattr(self, "_pending_out_of_band_cancel_event_error"):
+                self._pending_out_of_band_cancel_event_error = None
+            if not hasattr(self, "_pending_out_of_band_final_worker_process_count"):
+                self._pending_out_of_band_final_worker_process_count = 0
+            if not hasattr(self, "_pending_out_of_band_final_snapshot_nonempty"):
+                self._pending_out_of_band_final_snapshot_nonempty = False
+            if outcome.cancel_event_error is not None and self._pending_out_of_band_cancel_event_error is None:
+                self._pending_out_of_band_cancel_event_error = outcome.cancel_event_error
+            self._pending_out_of_band_termination_errors.extend(tuple(outcome.termination_errors))
+            self._pending_out_of_band_final_worker_process_count = max(
+                int(self._pending_out_of_band_final_worker_process_count),
+                int(outcome.final_worker_process_count),
+            )
+            self._pending_out_of_band_final_snapshot_nonempty = bool(
+                self._pending_out_of_band_final_snapshot_nonempty or outcome.final_snapshot_nonempty
+            )
+
+    def _merge_out_of_band_shutdown_observations(
+        self,
+        outcome: ShutdownOutcome,
+        *,
+        force_terminate: bool,
+    ) -> ShutdownOutcome:
+        with self._state_lock:
+            pending_cancel_event_error = getattr(self, "_pending_out_of_band_cancel_event_error", None)
+            pending_termination_errors = tuple(getattr(self, "_pending_out_of_band_termination_errors", []))
+            pending_final_worker_process_count = int(
+                getattr(self, "_pending_out_of_band_final_worker_process_count", 0)
+            )
+            pending_final_snapshot_nonempty = bool(
+                getattr(self, "_pending_out_of_band_final_snapshot_nonempty", False)
+            )
+            self._pending_out_of_band_cancel_event_error = None
+            self._pending_out_of_band_termination_errors = []
+            self._pending_out_of_band_final_worker_process_count = 0
+            self._pending_out_of_band_final_snapshot_nonempty = False
+        if pending_cancel_event_error is None and not pending_termination_errors:
+            return outcome
+
+        termination_errors = tuple(outcome.termination_errors)
+        for item in pending_termination_errors:
+            if item not in termination_errors:
+                termination_errors = termination_errors + (item,)
+        cancel_event_error = outcome.cancel_event_error or pending_cancel_event_error
+        merged_has_errors = bool(
+            outcome.executor_shutdown_error is not None
+            or outcome.manager_shutdown_error is not None
+            or cancel_event_error is not None
+            or termination_errors
+        )
+        merged_never_started = (
+            outcome.status is ShutdownStatus.NEVER_STARTED
+            and not merged_has_errors
+        )
+        return ShutdownOutcome(
+            status=self._resolve_shutdown_status(
+                force_terminate=bool(force_terminate) or outcome.status in {
+                    ShutdownStatus.FORCED_TERMINATION_CLEAN,
+                    ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS,
+                },
+                never_started=merged_never_started,
+                has_errors=merged_has_errors,
+            ),
+            executor_shutdown_error=outcome.executor_shutdown_error,
+            manager_shutdown_error=outcome.manager_shutdown_error,
+            termination_errors=termination_errors,
+            cancel_event_error=cancel_event_error,
+            final_worker_process_count=max(
+                int(outcome.final_worker_process_count),
+                pending_final_worker_process_count,
+            ),
+            final_snapshot_nonempty=bool(
+                outcome.final_snapshot_nonempty or pending_final_snapshot_nonempty
+            ),
+        )
+
+    def _snapshot_processes_observed_locked(self, executor: Any) -> tuple[tuple[Any, ...], BaseException | None]:
+        snapshot = self._snapshot_processes_locked(executor)
+        if snapshot:
+            return tuple(snapshot), None
+        if executor is None:
+            return (), None
+        processes = getattr(executor, "_processes", None)
+        if not isinstance(processes, dict):
+            return (), RuntimeError("Fitting worker process registry is unavailable on the executor.")
+        try:
+            if len(processes) <= 0:
+                return (), None
+        except Exception:
+            return (), RuntimeError("Failed to inspect fitting worker process registry size.")
+        return (), RuntimeError("Failed to snapshot fitting worker processes from the executor registry.")
+
+    def _register_active_pool(self) -> None:
+        owner_thread_ident = getattr(self, "_owner_thread_ident", None)
+        if not isinstance(owner_thread_ident, int):
+            return
+        with _ACTIVE_POOL_REGISTRY_LOCK:
+            pools = _ACTIVE_POOLS_BY_OWNER_THREAD.get(owner_thread_ident)
+            if pools is None:
+                pools = weakref.WeakSet()
+                _ACTIVE_POOLS_BY_OWNER_THREAD[owner_thread_ident] = pools
+            pools.add(self)
+
+    def _unregister_active_pool(self) -> None:
+        owner_thread_ident = getattr(self, "_owner_thread_ident", None)
+        if not isinstance(owner_thread_ident, int):
+            return
+        with _ACTIVE_POOL_REGISTRY_LOCK:
+            pools = _ACTIVE_POOLS_BY_OWNER_THREAD.get(owner_thread_ident)
+            if pools is None:
+                return
+            pools.discard(self)
+            if not pools:
+                _ACTIVE_POOLS_BY_OWNER_THREAD.pop(owner_thread_ident, None)
+
+    @staticmethod
+    def _log_shutdown_outcome_errors(outcome: ShutdownOutcome, *, context: str) -> None:
+        if outcome.cancel_event_error is not None:
+            logger.warning(
+                "%s: failed to set fitting process-pool cancel event.",
+                context,
+                exc_info=outcome.cancel_event_error,
+            )
+        if outcome.executor_shutdown_error is not None:
+            logger.warning(
+                "%s: executor shutdown reported an error.",
+                context,
+                exc_info=outcome.executor_shutdown_error,
+            )
+        if outcome.manager_shutdown_error is not None:
+            logger.warning(
+                "%s: manager shutdown reported an error.",
+                context,
+                exc_info=outcome.manager_shutdown_error,
+            )
+        for label, exc in outcome.termination_errors:
+            logger.warning("%s: failed to terminate fitting worker %s.", context, label, exc_info=exc)
+
+    def _terminate_processes_best_effort(self, processes: tuple[Any, ...]) -> tuple[tuple[str, BaseException], ...]:
+        errors: list[tuple[str, BaseException]] = []
+        for index, proc in enumerate(tuple(processes)):
+            try:
                 if proc is not None and hasattr(proc, "is_alive") and proc.is_alive():
                     proc.terminate()
+            except Exception as exc:
+                pid = getattr(proc, "pid", None)
+                if isinstance(pid, int) and pid > 0:
+                    label = f"pid={pid}"
+                else:
+                    label = f"index={index}"
+                errors.append((label, exc))
+        return tuple(errors)

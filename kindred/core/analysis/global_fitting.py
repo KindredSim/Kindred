@@ -17,7 +17,7 @@ import operator
 import pickle
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
-from contextlib import suppress
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -718,6 +718,9 @@ def _dataset_evaluation_from_process_payload(
 
 def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
     for future in futures:
+        # Best-effort queued-only cancellation; running tasks are aborted through the
+        # proxy cancellation event set by process_pool.cancel() and forced termination
+        # during shutdown.
         future.cancel()
 
 
@@ -742,6 +745,8 @@ def _run_parallel_dataset_lane_batch(
     batch_aborted = False
 
     def abort_active_batch() -> None:
+        # Abort has three pieces: mark the lane as internally aborted, cancel queued
+        # futures best-effort, then trigger cooperative cancellation in the process pool.
         nonlocal batch_aborted
         if batch_aborted:
             return
@@ -1552,7 +1557,6 @@ def fit_global(
     progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     dataset_overrides: Optional[List[object]] = None,
-    process_pool_callback: Optional[Callable[[Optional[FittingProcessPool]], None]] = None,
 ) -> GlobalFitResult:
     """
     Fit single mechanism to multiple experimental datasets simultaneously.
@@ -1700,50 +1704,35 @@ def fit_global(
 
     ctx = ObjectiveContext()
     fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator)
-    process_pool: Optional[FittingProcessPool] = None
+    process_pool_context = nullcontext(None)
     process_payload = None
-    try:
-        if bool(parallel_enabled) and type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
-            try:
-                process_payload = fit_evaluator.to_process_payload()
-            except (pickle.PicklingError, TypeError) as exc:
-                logger.warning(
-                    "Fitting evaluator payload is not process-picklable; using serial evaluation: %s",
-                    exc,
-                )
-            if process_payload is not None:
-                requested_max_workers = _coerce_parallel_worker_count(
-                    max_parallel_workers,
-                    setting_name="max_parallel_workers",
-                )
-                process_pool = FittingProcessPool(
-                    process_payload,
-                    max_workers=min(len(payloads), requested_max_workers),
-                    limit_blas_threads=_coerce_parallel_blas_flag(
-                        limit_blas_threads,
-                        setting_name="limit_blas_threads",
-                    ),
-                    publish_callback=process_pool_callback,
-                )
-    except Exception:
-        if process_pool is not None:
-            process_pool.shutdown(force_terminate=True)
-        raise
+    if bool(parallel_enabled) and type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
+        try:
+            process_payload = fit_evaluator.to_process_payload()
+        except (pickle.PicklingError, TypeError) as exc:
+            logger.warning(
+                "Fitting evaluator payload is not process-picklable; using serial evaluation: %s",
+                exc,
+            )
+        if process_payload is not None:
+            requested_max_workers = _coerce_parallel_worker_count(
+                max_parallel_workers,
+                setting_name="max_parallel_workers",
+            )
+            process_pool_context = FittingProcessPool(
+                process_payload,
+                max_workers=min(len(payloads), requested_max_workers),
+                limit_blas_threads=_coerce_parallel_blas_flag(
+                    limit_blas_threads,
+                    setting_name="limit_blas_threads",
+                ),
+                cancellation_check=cancellation_check,
+            )
 
-    objective_impl = _GlobalFitObjective(
-        fit_evaluator=fit_evaluator,
-        payloads=payloads,
-        shared_params=shared_params,
-        dataset_params=dataset_params_map,
-        weights=weights_norm,
-        layout=layout,
-        penalty_value=penalty_value,
-        ctx=ctx,
-        progress_callback=progress_callback,
-        cancellation_check=cancellation_check,
-        process_pool=process_pool,
-    )
-    objective_wrapper = ObjectiveWrapper(objective_impl, ctx)
+    objective_impl: Optional[_GlobalFitObjective] = None
+    fit_parameters_completed = False
+    result_to_return: Optional[GlobalFitResult] = None
+    shutdown_outcome = None
 
     def _failed_result(message: str, *, failed_params: Optional[Dict[str, float]] = None) -> GlobalFitResult:
         shared_snapshot = dict(shared_params)
@@ -1791,116 +1780,134 @@ def fit_global(
             residual_series={},
         )
 
-    objective_residuals: Optional[np.ndarray] = None
-
-    def _shutdown_process_pool(*, force_terminate: bool) -> None:
-        if process_pool is None:
-            return
-        process_pool.shutdown(force_terminate=force_terminate)
-
     try:
-        de_penalty = None
-        if method_key == "de":
-            de_penalty = float((float(penalty_value) ** 2) * float(max(1, objective_total_points)))
+        with process_pool_context as process_pool:
+            objective_impl = _GlobalFitObjective(
+                fit_evaluator=fit_evaluator,
+                payloads=payloads,
+                shared_params=shared_params,
+                dataset_params=dataset_params_map,
+                weights=weights_norm,
+                layout=layout,
+                penalty_value=penalty_value,
+                ctx=ctx,
+                progress_callback=progress_callback,
+                cancellation_check=cancellation_check,
+                process_pool=process_pool,
+            )
+            objective_wrapper = ObjectiveWrapper(objective_impl, ctx)
 
-        fit_result = fit_parameters(
-            objective_wrapper,
-            layout.initial_params(),
-            bounds=layout.bounds_dict(),
-            method=method_key,
-            progress_callback=None,
-            max_nfev=max_nfev,
-            seed=seed,
-            ftol=ftol,
-            xtol=xtol,
-            cancellation_check=cancellation_check,
-            de_penalty=de_penalty,
-        )
+            de_penalty = None
+            if method_key == "de":
+                de_penalty = float((float(penalty_value) ** 2) * float(max(1, objective_total_points)))
 
-        opt_param_keys = layout.opt_param_keys()
-        x_opt = np.asarray([fit_result.parameters[key] for key in opt_param_keys], dtype=float)
-        success = bool(fit_result.success)
-        message = str(fit_result.message)
-        nfev = int(fit_result.nfev)
-        covariance = fit_result.covariance
-        objective_residuals = np.asarray(fit_result.residuals, dtype=float).reshape(-1)
+            fit_result = fit_parameters(
+                objective_wrapper,
+                layout.initial_params(),
+                bounds=layout.bounds_dict(),
+                method=method_key,
+                progress_callback=None,
+                max_nfev=max_nfev,
+                seed=seed,
+                ftol=ftol,
+                xtol=xtol,
+                cancellation_check=cancellation_check,
+                de_penalty=de_penalty,
+            )
+            fit_parameters_completed = True
 
-        if getattr(objective_wrapper, "last_error", None) is not None:
-            ds_tag = None
-            prov = getattr(objective_wrapper, "last_error_provenance", None)
-            if isinstance(prov, dict):
-                ds_tag = prov.get("dataset")
-            message = f"{message} | last_error_dataset={ds_tag}: {objective_wrapper.last_error}"
+            opt_param_keys = layout.opt_param_keys()
+            x_opt = np.asarray([fit_result.parameters[key] for key in opt_param_keys], dtype=float)
+            success = bool(fit_result.success)
+            message = str(fit_result.message)
+            nfev = int(fit_result.nfev)
+            covariance = fit_result.covariance
+            objective_residuals = np.asarray(fit_result.residuals, dtype=float).reshape(-1)
 
+            if getattr(objective_wrapper, "last_error", None) is not None:
+                ds_tag = None
+                prov = getattr(objective_wrapper, "last_error_provenance", None)
+                if isinstance(prov, dict):
+                    ds_tag = prov.get("dataset")
+                message = f"{message} | last_error_dataset={ds_tag}: {objective_wrapper.last_error}"
+
+            fitted_params = layout.shared_param_dict_from_vector(x_opt)
+
+            combined_dataset_params: Dict[str, Dict[str, float]] = {
+                payload.dataset_id: dict(dataset_params_map.get(payload.dataset_id, {})) for payload in payloads
+            }
+            for (ds_id, param_name) in layout.dataset_var_order:
+                combined_dataset_params.setdefault(ds_id, {})
+                idx = layout.dataset_var_index[ds_id][param_name]
+                val = float(x_opt[idx])
+                if layout.dataset_var_log10.get((ds_id, param_name)):
+                    combined_dataset_params[ds_id][param_name] = float(10.0 ** val)
+                else:
+                    combined_dataset_params[ds_id][param_name] = val
+
+            uncertainties = None
+            if covariance is not None:
+                try:
+                    std_devs = np.sqrt(np.diag(covariance))
+                    uncertainties = {}
+                    for i, name in enumerate(layout.param_names):
+                        if i >= int(std_devs.size):
+                            break
+                        std = float(std_devs[i])
+                        if layout.shared_log10.get(name):
+                            x_val = float(fitted_params.get(name, float("nan")))
+                            uncertainties[name] = float(np.log(10.0) * x_val * std)
+                        else:
+                            uncertainties[name] = std
+                except Exception as exc:
+                    logger.debug("Failed to calculate uncertainties: %s", exc)
+
+            result_to_return = _assemble_global_fit_result(
+                fit_evaluator=fit_evaluator,
+                payloads=payloads,
+                layout=layout,
+                fitted_params=fitted_params,
+                combined_dataset_params=combined_dataset_params,
+                weights=weights_norm,
+                penalty_value=penalty_value,
+                cancellation_check=cancellation_check,
+                success=success,
+                message=message,
+                nfev=nfev,
+                covariance=covariance,
+                objective_residuals=objective_residuals,
+                uncertainties=uncertainties,
+                process_pool=process_pool,
+            )
+        shutdown_outcome = getattr(process_pool, "_last_shutdown_outcome", None) if process_pool is not None else None
+        if shutdown_outcome is not None and bool(getattr(shutdown_outcome, "has_errors", False)):
+            shutdown_error_parts = [f"status={shutdown_outcome.status.value}"]
+            if shutdown_outcome.cancel_event_error is not None:
+                shutdown_error_parts.append(f"cancel_event={shutdown_outcome.cancel_event_error}")
+            if shutdown_outcome.executor_shutdown_error is not None:
+                shutdown_error_parts.append(f"executor={shutdown_outcome.executor_shutdown_error}")
+            if shutdown_outcome.manager_shutdown_error is not None:
+                shutdown_error_parts.append(f"manager={shutdown_outcome.manager_shutdown_error}")
+            if shutdown_outcome.termination_errors:
+                labels = ", ".join(label for label, _exc in shutdown_outcome.termination_errors)
+                shutdown_error_parts.append(f"termination={labels}")
+            raise RuntimeError(
+                "Fitting process-pool shutdown reported errors: " + "; ".join(shutdown_error_parts)
+            )
+        if result_to_return is None:
+            raise RuntimeError("Global fitting did not produce a result.")
+        return result_to_return
     except FittingCancelled:
-        _shutdown_process_pool(force_terminate=True)
         raise
     except FitSimulationError as exc:
+        if fit_parameters_completed:
+            raise
         logger.error("Global fitting failed: %s", exc, exc_info=False)
-        _shutdown_process_pool(force_terminate=True)
         return _failed_result(str(exc), failed_params=exc.failed_params)
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)) or "cancelled" in str(exc).lower():
-            _shutdown_process_pool(force_terminate=True)
             raise FittingCancelled() from exc
+        if fit_parameters_completed:
+            raise
         logger.error("Global fitting failed: %s", exc, exc_info=True)
-        _shutdown_process_pool(force_terminate=True)
         return _failed_result(f"Fitting failed: {exc}")
-
-    try:
-        fitted_params = layout.shared_param_dict_from_vector(x_opt)
-
-        combined_dataset_params: Dict[str, Dict[str, float]] = {
-            payload.dataset_id: dict(dataset_params_map.get(payload.dataset_id, {})) for payload in payloads
-        }
-        for (ds_id, param_name) in layout.dataset_var_order:
-            combined_dataset_params.setdefault(ds_id, {})
-            idx = layout.dataset_var_index[ds_id][param_name]
-            val = float(x_opt[idx])
-            if layout.dataset_var_log10.get((ds_id, param_name)):
-                combined_dataset_params[ds_id][param_name] = float(10.0 ** val)
-            else:
-                combined_dataset_params[ds_id][param_name] = val
-
-        uncertainties = None
-        if covariance is not None:
-            try:
-                std_devs = np.sqrt(np.diag(covariance))
-                uncertainties = {}
-                for i, name in enumerate(layout.param_names):
-                    if i >= int(std_devs.size):
-                        break
-                    std = float(std_devs[i])
-                    if layout.shared_log10.get(name):
-                        x_val = float(fitted_params.get(name, float("nan")))
-                        uncertainties[name] = float(np.log(10.0) * x_val * std)
-                    else:
-                        uncertainties[name] = std
-            except Exception as exc:
-                logger.debug("Failed to calculate uncertainties: %s", exc)
-
-        return _assemble_global_fit_result(
-            fit_evaluator=fit_evaluator,
-            payloads=payloads,
-            layout=layout,
-            fitted_params=fitted_params,
-            combined_dataset_params=combined_dataset_params,
-            weights=weights_norm,
-            penalty_value=penalty_value,
-            cancellation_check=cancellation_check,
-            success=success,
-            message=message,
-            nfev=nfev,
-            covariance=covariance,
-            objective_residuals=objective_residuals,
-            uncertainties=uncertainties,
-            process_pool=process_pool,
-        )
-    except Exception:
-        _shutdown_process_pool(force_terminate=True)
-        raise
-    finally:
-        _shutdown_process_pool(force_terminate=False)
-        if process_pool_callback is not None:
-            with suppress(Exception):
-                process_pool_callback(None)

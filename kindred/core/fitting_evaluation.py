@@ -718,6 +718,22 @@ class SerialFittingEvaluator:
         )
 
     def _ensure_prepared(self) -> None:
+        """Prepare the evaluator's simulation state exactly once for the current owner.
+
+        This method is idempotent: the fast path at the top is a plain attribute check
+        against ``self._prepared_run``.
+
+        The current call graph gives this method a single owner at a time. It runs in
+        the worker-process initializer before any task dispatch in process-pool workers,
+        and from ``evaluate_series_with_parameter_origins()`` on either the fit-worker
+        QThread or a process-pool worker thread, where the evaluator instance is not
+        shared across threads.
+
+        The method is not thread-safe. If multiple threads ever shared one evaluator
+        instance, they could both pass the idempotency check and both execute the
+        mutations that follow. No lock is added here because the current call graph does
+        not create concurrent callers.
+        """
         if self._prepared_run is not None:
             return
         self._raise_if_cancel_requested()

@@ -63,13 +63,13 @@ class FitWorkerStopPolicy:
             return bool(wait_failed)
 
     def terminate_if_needed(self, worker: QtCore.QThread, *, timeout_ms: int, context: str) -> bool:
-        if hasattr(worker, "force_shutdown_active_process_pool"):
+        if hasattr(worker, "prepare_for_forced_termination"):
             try:
-                worker.force_shutdown_active_process_pool()
+                worker.prepare_for_forced_termination()
             except Exception as exc:
-                self._record_failure(f"{context}.force_shutdown_active_process_pool")
+                self._record_failure(f"{context}.prepare_for_forced_termination")
                 logger.debug(
-                    "Failed to force shutdown process pool during %s: %s",
+                    "Failed to prepare worker for forced termination during %s: %s",
                     context,
                     exc,
                     exc_info=True,

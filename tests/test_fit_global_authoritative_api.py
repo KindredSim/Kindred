@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.resources
+import inspect
 
 import numpy as np
 import pytest
@@ -14,6 +15,17 @@ def test_fit_global_authoritative_api_module_exports_core_contract() -> None:
     assert hasattr(api, "fit_global")
     assert hasattr(api, "GlobalFitResult")
     assert hasattr(api, "DatasetFitInfo")
+
+
+@pytest.mark.unit
+def test_fit_global_authoritative_api_signature_matches_current_core_surface() -> None:
+    from kindred.core.api.fitting import fit_global
+
+    signature = inspect.signature(fit_global)
+
+    assert "process_pool_callback" not in signature.parameters
+    assert "dataset_overrides" in signature.parameters
+    assert all(param.kind is not inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
 
 
 @pytest.mark.unit

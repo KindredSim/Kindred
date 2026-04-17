@@ -95,12 +95,43 @@ def _sleeping_worker_task(_item) -> dict[str, object]:
     }
 
 
+def _cancel_aware_worker_task(_item) -> dict[str, object]:
+    import kindred.core.fitting_process_pool as fitting_process_pool
+    from kindred.core.exceptions import FittingCancelled
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        cancel_event = getattr(fitting_process_pool, "_WORKER_CANCEL_EVENT", None)
+        if cancel_event is not None and bool(cancel_event.is_set()):
+            raise FittingCancelled("cancel event observed inside process worker")
+        time.sleep(0.05)
+    raise AssertionError("cancel-aware worker task should observe cancellation before timing out")
+
+
 def _pid_exists(pid: int) -> bool:
     try:
         os.kill(int(pid), 0)
     except OSError:
         return False
     return True
+
+
+def _signal_shutdown_completion(pool, outcome) -> None:
+    with pool._shutdown_condition:
+        pool._closed = True
+        pool._shutdown_in_progress = False
+        pool._executor = None
+        pool._manager = None
+        pool._last_shutdown_outcome = outcome
+        pool._shutdown_condition.notify_all()
+
+
+def _pool_registered_for_owner_thread(pool) -> bool:
+    import kindred.core.fitting_process_pool as fitting_process_pool
+
+    with fitting_process_pool._ACTIVE_POOL_REGISTRY_LOCK:
+        pools = tuple(fitting_process_pool._ACTIVE_POOLS_BY_OWNER_THREAD.get(pool._owner_thread_ident, ()))
+    return pool in pools
 
 
 class _EvaluateOnlyNoClone:
@@ -385,7 +416,7 @@ def test_fitting_process_pool_force_shutdown_terminates_running_worker_process(m
 
 
 def test_fitting_process_pool_shutdown_sets_cancel_event_before_executor_shutdown() -> None:
-    from kindred.core.fitting_process_pool import FittingProcessPool
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
 
     calls = []
 
@@ -407,21 +438,29 @@ def test_fitting_process_pool_shutdown_sets_cancel_event_before_executor_shutdow
     pool._manager = _FakeManager()
     pool._closed = False
     pool._prewarm_in_progress = False
+    pool._prewarm_started = True
     pool._shutdown_in_progress = False
     pool._startup_cancelled = False
     pool._state_lock = threading.Lock()
 
-    pool.shutdown(force_terminate=False)
+    outcome = pool.shutdown(force_terminate=False)
 
     assert calls == [
         "event.set",
         ("executor.shutdown", True, True),
         "manager.shutdown",
     ]
+    assert outcome.status is ShutdownStatus.GRACEFUL_COMPLETION
+    assert outcome.cancel_event_error is None
+    assert outcome.executor_shutdown_error is None
+    assert outcome.manager_shutdown_error is None
+    assert outcome.termination_errors == ()
+    assert outcome.final_worker_process_count == 0
+    assert outcome.final_snapshot_nonempty is False
 
 
 def test_fitting_process_pool_shutdown_cleans_partial_construction_even_when_closed() -> None:
-    from kindred.core.fitting_process_pool import FittingProcessPool
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
 
     calls = []
 
@@ -443,17 +482,508 @@ def test_fitting_process_pool_shutdown_cleans_partial_construction_even_when_clo
     pool._manager = _FakeManager()
     pool._closed = True
     pool._prewarm_in_progress = False
+    pool._prewarm_started = True
     pool._startup_cancelled = False
     pool._shutdown_in_progress = False
     pool._state_lock = threading.Lock()
 
-    pool.shutdown(force_terminate=True)
+    outcome = pool.shutdown(force_terminate=True)
 
     assert calls == [
         "event.set",
         ("executor.shutdown", False, True),
         "manager.shutdown",
     ]
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert any(label == "snapshot" for label, _exc in outcome.termination_errors)
+    assert outcome.cancel_event_error is None
+    assert outcome.executor_shutdown_error is None
+    assert outcome.manager_shutdown_error is None
+
+
+def test_fitting_process_pool_context_manager_returns_pool_and_gracefully_shuts_down(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
+
+    calls = []
+    pool = object.__new__(FittingProcessPool)
+    pool._manager = object()
+    pool._cancel_event = object()
+    pool._executor = object()
+    pool._prewarm_in_progress = False
+    pool._entered = False
+    pool._state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        FittingProcessPool,
+        "shutdown",
+        lambda self, *, force_terminate: calls.append(bool(force_terminate))
+        or ShutdownOutcome(status=ShutdownStatus.GRACEFUL_COMPLETION),
+    )
+
+    with pool as entered:
+        assert entered is pool
+
+    assert calls == [False]
+
+
+def test_fitting_process_pool_context_manager_force_shuts_down_on_exception(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
+
+    calls = []
+    pool = object.__new__(FittingProcessPool)
+    pool._manager = object()
+    pool._cancel_event = object()
+    pool._executor = object()
+    pool._prewarm_in_progress = False
+    pool._entered = False
+    pool._state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        FittingProcessPool,
+        "shutdown",
+        lambda self, *, force_terminate: calls.append(bool(force_terminate))
+        or ShutdownOutcome(status=ShutdownStatus.FORCED_TERMINATION_CLEAN),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with pool:
+            raise RuntimeError("boom")
+
+    assert calls == [True]
+
+
+def test_fitting_process_pool_context_manager_preserves_body_exception_when_shutdown_raises(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = object.__new__(FittingProcessPool)
+    pool._manager = object()
+    pool._cancel_event = object()
+    pool._executor = object()
+    pool._prewarm_in_progress = False
+    pool._entered = False
+    pool._state_lock = threading.Lock()
+
+    def fake_shutdown(self, *, force_terminate):
+        raise RuntimeError(f"shutdown boom force={force_terminate}")
+
+    monkeypatch.setattr(FittingProcessPool, "shutdown", fake_shutdown)
+
+    with pytest.raises(ValueError, match="inner boom"):
+        with pool:
+            raise ValueError("inner boom")
+
+
+def test_fitting_process_pool_context_manager_raises_shutdown_failure_on_clean_exit(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = object.__new__(FittingProcessPool)
+    pool._manager = object()
+    pool._cancel_event = object()
+    pool._executor = object()
+    pool._prewarm_in_progress = False
+    pool._entered = False
+    pool._state_lock = threading.Lock()
+
+    def fake_shutdown(self, *, force_terminate):
+        raise RuntimeError(f"shutdown boom force={force_terminate}")
+
+    monkeypatch.setattr(FittingProcessPool, "shutdown", fake_shutdown)
+
+    with pytest.raises(RuntimeError, match="shutdown boom force=False"):
+        with pool:
+            pass
+
+
+def test_fitting_process_pool_context_manager_reentry_is_rejected() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
+
+    pool = object.__new__(FittingProcessPool)
+    pool._manager = object()
+    pool._cancel_event = object()
+    pool._executor = object()
+    pool._prewarm_in_progress = False
+    pool._entered = False
+    pool._state_lock = threading.Lock()
+
+    def fake_shutdown(*, force_terminate):
+        return ShutdownOutcome(status=ShutdownStatus.GRACEFUL_COMPLETION)
+
+    pool.shutdown = fake_shutdown
+
+    with pytest.raises(RuntimeError, match="not re-entrant"):
+        with pool:
+            pool.__enter__()
+
+
+def test_fitting_process_pool_force_shutdown_reports_manager_shutdown_error() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {}
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            raise RuntimeError("manager shutdown failed")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+
+    outcome = pool.shutdown(force_terminate=True)
+
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert isinstance(outcome.manager_shutdown_error, RuntimeError)
+    assert "manager shutdown failed" in str(outcome.manager_shutdown_error)
+
+
+def test_fitting_process_pool_force_shutdown_reports_process_termination_error() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeProcess:
+        pid = 4321
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            raise OSError("terminate failed")
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {4321: _FakeProcess()}
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+
+    outcome = pool.shutdown(force_terminate=True)
+
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert outcome.final_worker_process_count == 1
+    assert outcome.final_snapshot_nonempty is True
+    assert len(outcome.termination_errors) == 1
+    assert outcome.termination_errors[0][0] == "pid=4321"
+    assert isinstance(outcome.termination_errors[0][1], OSError)
+
+
+def test_fitting_process_pool_force_shutdown_reports_snapshot_failure_as_error() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
+
+    class _BrokenProcesses(dict):
+        def values(self):
+            raise RuntimeError("snapshot failed")
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = _BrokenProcesses({1: object()})
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool.shutdown(force_terminate=True)
+
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert outcome.final_worker_process_count == 0
+    assert outcome.final_snapshot_nonempty is False
+    assert any(label == "snapshot" for label, _exc in outcome.termination_errors)
+
+
+def test_fitting_process_pool_force_shutdown_reports_unavailable_registry_as_error() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = object()
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool.shutdown(force_terminate=True)
+
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert outcome.final_worker_process_count == 0
+    assert outcome.final_snapshot_nonempty is False
+    assert any(label == "snapshot" for label, _exc in outcome.termination_errors)
+
+
+def test_fitting_process_pool_shutdown_waits_for_in_progress_shutdown_outcome() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = object()
+    pool._manager = object()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    expected_outcome = ShutdownOutcome(
+        status=ShutdownStatus.GRACEFUL_COMPLETION,
+        final_worker_process_count=0,
+        final_snapshot_nonempty=False,
+    )
+
+    def complete_shutdown() -> None:
+        time.sleep(0.05)
+        _signal_shutdown_completion(pool, expected_outcome)
+
+    thread = threading.Thread(target=complete_shutdown)
+    thread.start()
+    try:
+        outcome = pool.shutdown(force_terminate=False)
+    finally:
+        thread.join(timeout=1.0)
+
+    assert outcome is expected_outcome
+
+
+def test_fitting_process_pool_force_shutdown_returns_escalated_outcome_without_waiting(
+    monkeypatch,
+) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = object()
+    pool._manager = object()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    calls = []
+    escalated_outcome = ShutdownOutcome(
+        status=ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS,
+        termination_errors=(("concurrent_shutdown", RuntimeError("forced escalation observed errors")),),
+        final_worker_process_count=3,
+        final_snapshot_nonempty=True,
+    )
+    release_shutdown = threading.Event()
+
+    def fake_force_shutdown(self):
+        calls.append("force_shutdown")
+        self._record_out_of_band_shutdown_observations(escalated_outcome)
+        return escalated_outcome
+
+    monkeypatch.setattr(FittingProcessPool, "_force_shutdown_out_of_band", fake_force_shutdown)
+
+    def complete_shutdown() -> None:
+        release_shutdown.wait(timeout=1.0)
+        _signal_shutdown_completion(pool, ShutdownOutcome(status=ShutdownStatus.GRACEFUL_COMPLETION))
+
+    thread = threading.Thread(target=complete_shutdown)
+    thread.start()
+    try:
+        outcome = pool.shutdown(force_terminate=True)
+    finally:
+        release_shutdown.set()
+        thread.join(timeout=1.0)
+
+    assert calls == ["force_shutdown"]
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert any(label == "concurrent_shutdown" for label, _exc in outcome.termination_errors)
+    assert outcome.final_worker_process_count == 3
+    assert outcome.final_snapshot_nonempty is True
+
+
+def test_fitting_process_pool_shutdown_reports_errors_when_never_started_cleanup_fails() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        _processes = {}
+
+        def shutdown(self, *, wait, cancel_futures):
+            raise RuntimeError("executor boom")
+
+    class _FakeManager:
+        def shutdown(self):
+            raise RuntimeError("manager boom")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = False
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool.shutdown(force_terminate=True)
+
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
+    assert isinstance(outcome.executor_shutdown_error, RuntimeError)
+    assert isinstance(outcome.manager_shutdown_error, RuntimeError)
+
+
+def test_fitting_process_pool_force_shutdown_registered_pools_uses_full_shutdown_when_idle(
+    monkeypatch,
+) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
+
+    pool = object.__new__(FittingProcessPool)
+    pool._owner_thread_ident = 1234
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._closed = False
+    pool._shutdown_in_progress = False
+    pool._executor = object()
+    pool._manager = object()
+
+    expected = ShutdownOutcome(status=ShutdownStatus.FORCED_TERMINATION_CLEAN)
+    calls = []
+
+    def fake_shutdown(self, *, force_terminate):
+        calls.append(bool(force_terminate))
+        return expected
+
+    monkeypatch.setattr(FittingProcessPool, "shutdown", fake_shutdown)
+
+    pool._register_active_pool()
+    try:
+        outcomes = FittingProcessPool.force_shutdown_registered_pools_for_owner_thread(1234)
+    finally:
+        pool._unregister_active_pool()
+
+    assert calls == [True]
+    assert outcomes == (expected,)
+
+
+def test_fitting_process_pool_registers_before_prewarm(monkeypatch) -> None:
+    import kindred.core.fitting_process_pool as fitting_process_pool
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeManager:
+        def Event(self):
+            return object()
+
+        def shutdown(self):
+            return None
+
+    class _FakeContext:
+        def Manager(self):
+            return _FakeManager()
+
+    class _FakeExecutor:
+        def __init__(self, **_kwargs):
+            self._processes = {}
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    seen = []
+
+    def fake_prewarm(self):
+        seen.append(_pool_registered_for_owner_thread(self))
+
+    monkeypatch.setattr(fitting_process_pool.mp, "get_context", lambda _name: _FakeContext())
+    monkeypatch.setattr(fitting_process_pool, "ProcessPoolExecutor", _FakeExecutor)
+    monkeypatch.setattr(FittingProcessPool, "_prewarm", fake_prewarm)
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    try:
+        assert seen == [True]
+    finally:
+        pool.shutdown(force_terminate=False)
 
 
 def test_fitting_process_pool_submit_holds_lock_during_executor_submit() -> None:
@@ -494,6 +1024,26 @@ def test_fitting_process_pool_submit_holds_lock_during_executor_submit() -> None
 
     assert future.result() == "payload"
     assert lock.held is False
+
+
+def test_fitting_process_pool_submit_rejects_startup_cancelled_state() -> None:
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeExecutor:
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("submit should not reach the executor after startup cancellation")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._shutdown_in_progress = False
+    pool._startup_cancelled = True
+    pool._executor = _FakeExecutor()
+    pool._state_lock = threading.Lock()
+
+    with pytest.raises(FittingCancelled):
+        pool.submit("payload")
 
 
 def test_fitting_process_pool_prewarm_polls_startup_cancel() -> None:
@@ -542,6 +1092,18 @@ def test_fitting_process_pool_prewarm_polls_startup_cancel() -> None:
 
     assert future.calls == 1
     assert pool._cancel_event.set_calls == 1
+
+
+def test_fitting_process_pool_constructor_raises_fitting_cancelled_when_cancellation_check_is_true() -> None:
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    with pytest.raises(FittingCancelled):
+        FittingProcessPool(
+            _make_serial_evaluator().to_process_payload(),
+            max_workers=1,
+            cancellation_check=lambda: True,
+        )
 
 
 def test_fitting_process_pool_submit_raises_fitting_cancelled_after_shutdown_starts() -> None:
@@ -602,7 +1164,7 @@ def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypat
     monkeypatch.setattr(
         FittingProcessPool,
         "_terminate_processes_best_effort",
-        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))) or (),
     )
 
     pool.cancel()
@@ -654,7 +1216,7 @@ def test_fitting_process_pool_cancel_still_terminates_after_transient_process_sn
     monkeypatch.setattr(
         FittingProcessPool,
         "_terminate_processes_best_effort",
-        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))) or (),
     )
 
     pool.cancel()
@@ -666,7 +1228,9 @@ def test_fitting_process_pool_cancel_still_terminates_after_transient_process_sn
     assert pool._startup_cancelled is True
 
 
-def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_is_in_progress(monkeypatch) -> None:
+def test_fitting_process_pool_out_of_band_force_shutdown_terminates_while_shutdown_is_in_progress(
+    monkeypatch,
+) -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
     calls = []
@@ -685,17 +1249,19 @@ def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_i
     pool._manager = None
     pool._closed = False
     pool._prewarm_in_progress = False
+    pool._prewarm_started = True
     pool._startup_cancelled = False
     pool._shutdown_in_progress = True
     pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
 
     monkeypatch.setattr(
         FittingProcessPool,
         "_terminate_processes_best_effort",
-        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))) or (),
     )
 
-    pool.shutdown(force_terminate=True)
+    pool._force_shutdown_out_of_band()
 
     assert calls == [
         "event.set",
@@ -745,17 +1311,22 @@ def test_fitting_process_pool_force_shutdown_still_terminates_after_transient_pr
     pool._manager = _FakeManager()
     pool._closed = False
     pool._prewarm_in_progress = False
+    pool._prewarm_started = True
     pool._startup_cancelled = False
     pool._shutdown_in_progress = shutdown_in_progress
     pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
 
     monkeypatch.setattr(
         FittingProcessPool,
         "_terminate_processes_best_effort",
-        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))) or (),
     )
 
-    pool.shutdown(force_terminate=True)
+    if shutdown_in_progress:
+        pool._force_shutdown_out_of_band()
+    else:
+        pool.shutdown(force_terminate=True)
 
     if shutdown_in_progress:
         assert calls == [
@@ -769,31 +1340,6 @@ def test_fitting_process_pool_force_shutdown_still_terminates_after_transient_pr
             ("terminate_target_len", 1),
             "manager.shutdown",
         ]
-
-
-@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
-def test_fitting_process_pool_publishes_handle_before_prewarm(monkeypatch) -> None:
-    from kindred.core.fitting_process_pool import FittingProcessPool
-
-    published = {}
-    original_prewarm = FittingProcessPool._prewarm
-
-    def tracking_prewarm(self):
-        assert published["pool"] is self
-        return original_prewarm(self)
-
-    monkeypatch.setattr(FittingProcessPool, "_prewarm", tracking_prewarm)
-
-    pool = FittingProcessPool(
-        _make_serial_evaluator().to_process_payload(),
-        max_workers=1,
-        publish_callback=lambda process_pool: published.setdefault("pool", process_pool),
-    )
-
-    try:
-        assert published["pool"] is pool
-    finally:
-        pool.shutdown(force_terminate=False)
 
 
 @pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
@@ -915,15 +1461,21 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
     pools = []
 
     class _FakeProcessPool:
-        def __init__(self, evaluator_payload, *, max_workers, limit_blas_threads, publish_callback=None):
+        def __init__(self, evaluator_payload, *, max_workers, limit_blas_threads, cancellation_check=None):
             self._evaluator = SerialFittingEvaluator.from_process_payload(evaluator_payload)
             self.max_workers = int(max_workers)
             self.limit_blas_threads = bool(limit_blas_threads)
+            self.cancellation_check = cancellation_check
             self.submit_count = 0
             self.shutdown_calls = []
             pools.append(self)
-            if publish_callback is not None:
-                publish_callback(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.shutdown(force_terminate=exc_type is not None)
+            return None
 
         def submit(self, item):
             from kindred.core.fitting_evaluation import evaluate_fitting_series
@@ -973,6 +1525,9 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
     monkeypatch.setattr(global_fitting, "FittingProcessPool", _FakeProcessPool)
     monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
 
+    def cancellation_check() -> bool:
+        return False
+
     result = global_fitting.fit_global(
         _make_serial_evaluator(),
         [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
@@ -983,6 +1538,7 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
         parallel_enabled=True,
         max_parallel_workers=9,
         limit_blas_threads=False,
+        cancellation_check=cancellation_check,
     )
 
     assert result.success is True
@@ -990,7 +1546,58 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
     assert pools[0].max_workers == 2
     assert pools[0].limit_blas_threads is False
     assert pools[0].submit_count == 2
+    assert pools[0].cancellation_check is cancellation_check
     assert pools[0].shutdown_calls == [False]
+
+
+def test_fit_global_raises_when_process_pool_shutdown_reports_errors(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+    from kindred.core.fitting_process_pool import ShutdownOutcome, ShutdownStatus
+
+    class _FakeProcessPool:
+        def __init__(self, *_args, **_kwargs):
+            self._last_shutdown_outcome = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._last_shutdown_outcome = ShutdownOutcome(
+                status=ShutdownStatus.GRACEFUL_WITH_ERRORS,
+                manager_shutdown_error=RuntimeError("manager shutdown failed"),
+            )
+            return None
+
+    def fake_fit_parameters(_objective, initial_params, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    monkeypatch.setattr(global_fitting, "FittingProcessPool", _FakeProcessPool)
+    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
+    monkeypatch.setattr(global_fitting, "_assemble_global_fit_result", lambda **_kwargs: object())
+
+    with pytest.raises(RuntimeError, match="shutdown reported errors"):
+        global_fitting.fit_global(
+            _make_serial_evaluator(),
+            [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
+            {"k1": 1.0},
+            dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
+            method="trf",
+            max_nfev=1,
+            parallel_enabled=True,
+            max_parallel_workers=2,
+            limit_blas_threads=True,
+        )
 
 
 def test_fit_global_parallel_disabled_by_default_stays_in_process(monkeypatch) -> None:
@@ -1106,7 +1713,6 @@ def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_p
     monkeypatch.setattr(global_fitting, "FittingProcessPool", fail_if_called)
     monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
 
-    callback_values = []
     result = global_fitting.fit_global(
         evaluator,
         [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
@@ -1117,100 +1723,10 @@ def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_p
         parallel_enabled=True,
         max_parallel_workers=5,
         limit_blas_threads=True,
-        process_pool_callback=lambda pool: callback_values.append(pool),
     )
 
     assert result.success is True
-    assert callback_values == [None]
     assert "pickl" in caplog.text.lower()
-
-
-def test_fit_global_ignores_cleanup_process_pool_callback_error(monkeypatch) -> None:
-    from kindred.core.analysis import global_fitting
-    from kindred.core.fitting_evaluation import SerialFittingEvaluator
-    from kindred.core.fitting_optimization import FitResult
-
-    pools = []
-    callback_values = []
-
-    class _FakeProcessPool:
-        def __init__(self, evaluator_payload, *, max_workers, limit_blas_threads, publish_callback=None):
-            self._evaluator = SerialFittingEvaluator.from_process_payload(evaluator_payload)
-            self.max_workers = int(max_workers)
-            self.limit_blas_threads = bool(limit_blas_threads)
-            self.shutdown_calls = []
-            pools.append(self)
-            if publish_callback is not None:
-                publish_callback(self)
-
-        def submit(self, item):
-            from kindred.core.fitting_evaluation import evaluate_fitting_series
-
-            future = Future()
-            future.set_result(
-                {
-                    "index": int(item.index),
-                    "dataset_id": str(item.payload.dataset_id),
-                    "worker_pid": os.getpid(),
-                    "ok": True,
-                    "series_payload": evaluate_fitting_series(
-                        self._evaluator,
-                        item.full_params,
-                        origins=item.parameter_origins,
-                        failed_params=item.failed_param_snapshot,
-                    ),
-                    "error": None,
-                    "error_provenance": None,
-                    "final_error_message": None,
-                }
-            )
-            return future
-
-        def cancel(self) -> None:
-            return None
-
-        def shutdown(self, *, force_terminate: bool) -> None:
-            if self.shutdown_calls:
-                return
-            self.shutdown_calls.append(bool(force_terminate))
-
-    def fake_fit_parameters(_objective, initial_params, **_kwargs):
-        return FitResult(
-            success=True,
-            parameters=dict(initial_params),
-            uncertainties=None,
-            chi_squared=0.0,
-            r_squared=1.0,
-            residuals=np.zeros(4, dtype=float),
-            nfev=1,
-            message="ok",
-            covariance=None,
-        )
-
-    def process_pool_callback(pool):
-        callback_values.append(pool)
-        if pool is None:
-            raise RuntimeError("cleanup callback failed")
-
-    monkeypatch.setattr(global_fitting, "FittingProcessPool", _FakeProcessPool)
-    monkeypatch.setattr(global_fitting, "fit_parameters", fake_fit_parameters)
-
-    result = global_fitting.fit_global(
-        _make_serial_evaluator(),
-        [_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
-        {"k1": 1.0},
-        dataset_params={"ds1": {"init:A": 1.0}, "ds2": {"init:A": 10.0}},
-        method="trf",
-        max_nfev=1,
-        parallel_enabled=True,
-        max_parallel_workers=4,
-        limit_blas_threads=True,
-        process_pool_callback=process_pool_callback,
-    )
-
-    assert result.success is True
-    assert callback_values == [pools[0], None]
-    assert pools[0].shutdown_calls == [False]
 
 
 def test_fit_global_single_dataset_serial_fitting_evaluator_stays_in_process(monkeypatch) -> None:
@@ -1334,29 +1850,63 @@ def test_fit_global_serial_fitting_evaluator_subclass_stays_in_process(monkeypat
     assert result.success is True
 
 
-def test_global_fit_worker_retro_cancels_process_pool_when_handle_arrives_late() -> None:
+@pytest.mark.gui
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_global_fit_worker_cancel_reaches_process_pool_via_cancellation_check(monkeypatch, qtbot) -> None:
+    import kindred.core.fitting_process_pool as fitting_process_pool
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_process_pool import FittingProcessPool
     from kindred.gui.fitting.worker import GlobalFitWorker
 
+    monkeypatch.setattr(fitting_process_pool, "run_fitting_evaluation_task", _cancel_aware_worker_task)
+
+    submitted = threading.Event()
+    pool_cancelled = threading.Event()
+
+    def fake_fit_global(_fit_evaluator, _datasets, _shared_params, *, cancellation_check, **_kwargs):
+        with FittingProcessPool(
+            _make_serial_evaluator().to_process_payload(),
+            max_workers=1,
+            cancellation_check=cancellation_check,
+        ) as process_pool:
+            future = process_pool.submit(_dataset_input(0, "ds1", 1.0))
+            submitted.set()
+            while True:
+                if cancellation_check():
+                    pool_cancelled.set()
+                    process_pool.cancel()
+                try:
+                    future.result(timeout=0.05)
+                except FutureTimeoutError:
+                    continue
+                except FittingCancelled:
+                    raise
+                raise AssertionError("cancel-aware process worker should not finish successfully")
+
     worker = GlobalFitWorker(
-        datasets=[_raw_dataset("ds1", [0.0, 0.0])],
+        datasets=[_raw_dataset("ds1", [0.0, 0.0]), _raw_dataset("ds2", [0.0, 0.0])],
         shared_params={"k1": 1.0},
-        fit_evaluator=lambda _params: {"t": np.asarray([0.0, 1.0]), "species": {"A": np.asarray([0.0, 0.0])}},
-        fit_func=lambda *_args, **_kwargs: None,
-        max_nfev=1,
+        fit_evaluator=_make_serial_evaluator(),
+        fit_func=fake_fit_global,
+        max_nfev=5,
+        parallel_enabled=True,
+        max_parallel_workers=1,
+        limit_blas_threads=True,
     )
 
-    class _FakeProcessPool:
-        def __init__(self):
-            self.cancel_calls = 0
+    with qtbot.waitSignal(worker.error, timeout=8000) as blocker:
+        worker.start()
+        qtbot.waitUntil(submitted.is_set, timeout=4000)
+        worker.cancel()
 
-        def cancel(self):
-            self.cancel_calls += 1
+    worker.wait(2000)
 
-    pool = _FakeProcessPool()
-    worker.cancel()
-    worker._set_active_process_pool(pool)
-
-    assert pool.cancel_calls == 1
+    payload = blocker.args[0]
+    assert pool_cancelled.is_set() is True
+    assert payload["kind"] == "cancelled"
+    assert payload["message"] == "Fit cancelled by user"
 
 
 @pytest.mark.parametrize(
@@ -1424,13 +1974,19 @@ def test_fit_global_process_pool_shutdown_on_post_optimizer_error(monkeypatch) -
     pools = []
 
     class _FakeProcessPool:
-        def __init__(self, _evaluator_payload, *, max_workers, limit_blas_threads, publish_callback=None):
+        def __init__(self, _evaluator_payload, *, max_workers, limit_blas_threads, cancellation_check=None):
             self.max_workers = int(max_workers)
             self.limit_blas_threads = bool(limit_blas_threads)
+            self.cancellation_check = cancellation_check
             self.shutdown_calls = []
             pools.append(self)
-            if publish_callback is not None:
-                publish_callback(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.shutdown(force_terminate=exc_type is not None)
+            return None
 
         def submit(self, item):
             raise AssertionError(f"submit should not be reached for {item.payload.dataset_id}")
