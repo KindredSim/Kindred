@@ -614,6 +614,45 @@ def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypat
     assert pool._startup_cancelled is True
 
 
+def test_fitting_process_pool_cancel_ignores_process_snapshot_race_during_prewarm(monkeypatch) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    calls = []
+
+    class _MutatingProcesses(dict):
+        def values(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    class _FakeEvent:
+        def set(self):
+            calls.append("event.set")
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = _MutatingProcesses({1: object()})
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = None
+    pool._closed = False
+    pool._prewarm_in_progress = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = False
+    pool._state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        FittingProcessPool,
+        "_terminate_processes_best_effort",
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
+    )
+
+    pool.cancel()
+
+    assert calls == ["event.set"]
+    assert pool._startup_cancelled is True
+
+
 def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_is_in_progress(monkeypatch) -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
@@ -649,6 +688,62 @@ def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_i
         "event.set",
         ("terminate_target_len", 1),
     ]
+
+
+@pytest.mark.parametrize("shutdown_in_progress", [False, True])
+def test_fitting_process_pool_force_shutdown_ignores_process_snapshot_race(
+    monkeypatch,
+    shutdown_in_progress: bool,
+) -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    calls = []
+
+    class _MutatingProcesses(dict):
+        def values(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    class _FakeEvent:
+        def set(self):
+            calls.append("event.set")
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = _MutatingProcesses({1: object()})
+
+        def shutdown(self, *, wait, cancel_futures):
+            calls.append(("executor.shutdown", bool(wait), bool(cancel_futures)))
+
+    class _FakeManager:
+        def shutdown(self):
+            calls.append("manager.shutdown")
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = shutdown_in_progress
+    pool._state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        FittingProcessPool,
+        "_terminate_processes_best_effort",
+        lambda self, processes: calls.append(("terminate_target_len", len(tuple(processes)))),
+    )
+
+    pool.shutdown(force_terminate=True)
+
+    if shutdown_in_progress:
+        assert calls == ["event.set"]
+    else:
+        assert calls == [
+            "event.set",
+            ("executor.shutdown", False, True),
+            "manager.shutdown",
+        ]
 
 
 @pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)

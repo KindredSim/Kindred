@@ -265,26 +265,28 @@ class FittingProcessPool:
         with self._state_lock:
             cancel_event = self._cancel_event
             if self._prewarm_in_progress and not self._closed:
-                processes = getattr(self._executor, "_processes", None)
-                if isinstance(processes, dict):
-                    terminate_target = tuple(processes.values())
+                terminate_target = self._snapshot_processes_locked(self._executor)
         with suppress(Exception):
             if cancel_event is not None:
                 cancel_event.set()
         if terminate_target:
             self._terminate_processes_best_effort(terminate_target)
 
+    def _snapshot_processes_locked(self, executor: Any) -> tuple[Any, ...]:
+        if executor is None:
+            return ()
+        processes = getattr(executor, "_processes", None)
+        if not isinstance(processes, dict):
+            return ()
+        try:
+            return tuple(processes.values())
+        except RuntimeError:
+            return ()
+
     def worker_pids(self) -> tuple[int, ...]:
         with self._state_lock:
-            executor = self._executor
-            if executor is None:
-                return ()
-            processes = getattr(executor, "_processes", None)
-            if not isinstance(processes, dict):
-                return ()
-            try:
-                process_snapshot = tuple(processes.values())
-            except RuntimeError:
+            process_snapshot = self._snapshot_processes_locked(self._executor)
+            if not process_snapshot:
                 return ()
         pids = []
         for proc in process_snapshot:
@@ -306,16 +308,12 @@ class FittingProcessPool:
             manager = self._manager
             if self._shutdown_in_progress:
                 if bool(force_terminate) and executor is not None:
-                    processes = getattr(executor, "_processes", None)
-                    if isinstance(processes, dict):
-                        terminate_target = tuple(processes.values())
+                    terminate_target = self._snapshot_processes_locked(executor)
             else:
                 self._shutdown_in_progress = True
                 execute_shutdown = True
                 if bool(force_terminate) and executor is not None:
-                    processes = getattr(executor, "_processes", None)
-                    if isinstance(processes, dict):
-                        terminate_target = tuple(processes.values())
+                    terminate_target = self._snapshot_processes_locked(executor)
         if not execute_shutdown:
             if terminate_target:
                 self._terminate_processes_best_effort(terminate_target)
