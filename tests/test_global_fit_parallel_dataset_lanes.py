@@ -614,14 +614,24 @@ def test_fitting_process_pool_cancel_terminates_workers_during_prewarm(monkeypat
     assert pool._startup_cancelled is True
 
 
-def test_fitting_process_pool_cancel_ignores_process_snapshot_race_during_prewarm(monkeypatch) -> None:
+def test_fitting_process_pool_cancel_still_terminates_after_transient_process_snapshot_race(
+    monkeypatch,
+) -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
     calls = []
 
-    class _MutatingProcesses(dict):
+    class _TransientlyMutatingProcesses(dict):
+        def __init__(self, initial):
+            super().__init__(initial)
+            self._values_calls = 0
+
         def values(self):
-            raise RuntimeError("dictionary changed size during iteration")
+            if self._values_calls == 0:
+                self._values_calls += 1
+                raise RuntimeError("dictionary changed size during iteration")
+            self._values_calls += 1
+            return super().values()
 
     class _FakeEvent:
         def set(self):
@@ -629,7 +639,7 @@ def test_fitting_process_pool_cancel_ignores_process_snapshot_race_during_prewar
 
     class _FakeExecutor:
         def __init__(self):
-            self._processes = _MutatingProcesses({1: object()})
+            self._processes = _TransientlyMutatingProcesses({1: object()})
 
     pool = object.__new__(FittingProcessPool)
     pool._cancel_event = _FakeEvent()
@@ -649,7 +659,10 @@ def test_fitting_process_pool_cancel_ignores_process_snapshot_race_during_prewar
 
     pool.cancel()
 
-    assert calls == ["event.set"]
+    assert calls == [
+        "event.set",
+        ("terminate_target_len", 1),
+    ]
     assert pool._startup_cancelled is True
 
 
@@ -691,7 +704,7 @@ def test_fitting_process_pool_force_shutdown_escalates_while_graceful_shutdown_i
 
 
 @pytest.mark.parametrize("shutdown_in_progress", [False, True])
-def test_fitting_process_pool_force_shutdown_ignores_process_snapshot_race(
+def test_fitting_process_pool_force_shutdown_still_terminates_after_transient_process_snapshot_race(
     monkeypatch,
     shutdown_in_progress: bool,
 ) -> None:
@@ -699,9 +712,17 @@ def test_fitting_process_pool_force_shutdown_ignores_process_snapshot_race(
 
     calls = []
 
-    class _MutatingProcesses(dict):
+    class _TransientlyMutatingProcesses(dict):
+        def __init__(self, initial):
+            super().__init__(initial)
+            self._values_calls = 0
+
         def values(self):
-            raise RuntimeError("dictionary changed size during iteration")
+            if self._values_calls == 0:
+                self._values_calls += 1
+                raise RuntimeError("dictionary changed size during iteration")
+            self._values_calls += 1
+            return super().values()
 
     class _FakeEvent:
         def set(self):
@@ -709,7 +730,7 @@ def test_fitting_process_pool_force_shutdown_ignores_process_snapshot_race(
 
     class _FakeExecutor:
         def __init__(self):
-            self._processes = _MutatingProcesses({1: object()})
+            self._processes = _TransientlyMutatingProcesses({1: object()})
 
         def shutdown(self, *, wait, cancel_futures):
             calls.append(("executor.shutdown", bool(wait), bool(cancel_futures)))
@@ -737,11 +758,15 @@ def test_fitting_process_pool_force_shutdown_ignores_process_snapshot_race(
     pool.shutdown(force_terminate=True)
 
     if shutdown_in_progress:
-        assert calls == ["event.set"]
+        assert calls == [
+            "event.set",
+            ("terminate_target_len", 1),
+        ]
     else:
         assert calls == [
             "event.set",
             ("executor.shutdown", False, True),
+            ("terminate_target_len", 1),
             "manager.shutdown",
         ]
 

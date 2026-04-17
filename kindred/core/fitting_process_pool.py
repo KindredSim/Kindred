@@ -30,6 +30,7 @@ __all__ = [
 ]
 
 _PREWARM_POLL_SECONDS = 0.05
+_PROCESS_SNAPSHOT_ATTEMPTS = 3
 
 
 def apply_worker_blas_limits(*, enabled: bool, environ: MutableMapping[str, str] | None = None) -> None:
@@ -278,10 +279,13 @@ class FittingProcessPool:
         processes = getattr(executor, "_processes", None)
         if not isinstance(processes, dict):
             return ()
-        try:
-            return tuple(processes.values())
-        except RuntimeError:
-            return ()
+        attempts = max(1, int(_PROCESS_SNAPSHOT_ATTEMPTS))
+        for _ in range(attempts):
+            try:
+                return tuple(processes.values())
+            except RuntimeError:
+                continue
+        return ()
 
     def worker_pids(self) -> tuple[int, ...]:
         with self._state_lock:
