@@ -275,11 +275,16 @@ class FittingProcessPool:
             self._terminate_processes_best_effort(terminate_target)
 
     def worker_pids(self) -> tuple[int, ...]:
-        processes = getattr(self._executor, "_processes", None)
-        if not isinstance(processes, dict):
-            return ()
+        with self._state_lock:
+            executor = self._executor
+            if executor is None:
+                return ()
+            processes = getattr(executor, "_processes", None)
+            if not isinstance(processes, dict):
+                return ()
+            process_snapshot = tuple(processes.values())
         pids = []
-        for proc in processes.values():
+        for proc in process_snapshot:
             pid = getattr(proc, "pid", None)
             if isinstance(pid, int) and pid > 0:
                 pids.append(int(pid))

@@ -152,6 +152,50 @@ def test_fitting_process_pool_worker_pids_are_spawned_processes() -> None:
     assert {int(payload["worker_pid"]) for payload in payloads}.issubset(set(worker_pids))
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_worker_pids_are_empty_after_shutdown_returns() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+
+    assert pool.worker_pids()
+
+    pool.shutdown(force_terminate=False)
+
+    assert pool.worker_pids() == ()
+
+
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_worker_pids_do_not_raise_during_concurrent_shutdown() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    started = threading.Event()
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def read_worker_pids() -> None:
+        started.set()
+        while not stop.is_set():
+            try:
+                pool.worker_pids()
+            except BaseException as exc:  # pragma: no cover - failure path only
+                errors.append(exc)
+                stop.set()
+                return
+
+    reader = threading.Thread(target=read_worker_pids)
+    reader.start()
+    started.wait(timeout=5.0)
+    try:
+        pool.shutdown(force_terminate=False)
+    finally:
+        stop.set()
+        reader.join(timeout=5.0)
+
+    assert errors == []
+
+
 def test_fitting_process_pool_initializer_limits_blas_threads_before_prepare(monkeypatch) -> None:
     import kindred.core.fitting_evaluation as fitting_evaluation
     from kindred.core.fitting_process_pool import initialize_fitting_worker
