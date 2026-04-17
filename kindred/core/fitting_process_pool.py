@@ -331,10 +331,6 @@ class FittingProcessPool:
         self._entered = False
         self._shutdown_in_progress = False
         self._last_shutdown_outcome: ShutdownOutcome | None = None
-        self._pending_out_of_band_cancel_event_error: BaseException | None = None
-        self._pending_out_of_band_termination_errors: list[tuple[str, BaseException]] = []
-        self._pending_out_of_band_final_worker_process_count = 0
-        self._pending_out_of_band_final_snapshot_nonempty = False
         self._state_lock = threading.Lock()
         self._shutdown_condition = threading.Condition(self._state_lock)
         self._register_active_pool()
@@ -487,7 +483,7 @@ class FittingProcessPool:
             closed_outcome: ShutdownOutcome | None = None
             with shutdown_condition:
                 last_shutdown_outcome = getattr(self, "_last_shutdown_outcome", None)
-                if self._closed and self._executor is None and self._manager is None:
+                if self._closed:
                     closed_outcome = (
                         last_shutdown_outcome
                         if last_shutdown_outcome is not None
@@ -495,8 +491,6 @@ class FittingProcessPool:
                     )
                 elif not self._shutdown_in_progress:
                     self._shutdown_in_progress = True
-                    executor = self._executor
-                    manager = self._manager
                     break
                 elif bool(force_terminate) and not force_escalated:
                     need_force_escalation = True
@@ -504,87 +498,28 @@ class FittingProcessPool:
                 else:
                     shutdown_condition.wait()
             if closed_outcome is not None:
-                return self._merge_out_of_band_shutdown_observations(
-                    closed_outcome,
-                    force_terminate=bool(force_terminate),
-                )
+                return closed_outcome
             if need_force_escalation:
                 escalated_outcome = self._force_shutdown_out_of_band()
                 if escalated_outcome is not None:
-                    return self._merge_out_of_band_shutdown_observations(
-                        escalated_outcome,
-                        force_terminate=True,
-                    )
+                    return escalated_outcome
 
-        executor_shutdown_error: BaseException | None = None
-        manager_shutdown_error: BaseException | None = None
-        termination_errors: tuple[tuple[str, BaseException], ...] = ()
-        initial_terminate_target = ()
-        initial_snapshot_error: BaseException | None = None
-        if bool(force_terminate) and executor is not None:
-            with self._state_lock:
-                initial_terminate_target, initial_snapshot_error = self._snapshot_processes_observed_locked(executor)
-        elif cancel_snapshot_attempted:
-            initial_terminate_target = tuple(cancel_terminate_target)
-
-        final_snapshot = tuple(initial_terminate_target)
-        final_snapshot_error: BaseException | None = initial_snapshot_error
-        try:
-            if executor is not None:
-                try:
-                    executor.shutdown(wait=not bool(force_terminate), cancel_futures=True)
-                except Exception as exc:
-                    executor_shutdown_error = exc
-        finally:
-            if initial_terminate_target:
-                termination_errors = self._terminate_processes_best_effort(initial_terminate_target)
-            with self._state_lock:
-                if bool(force_terminate):
-                    final_snapshot, final_snapshot_error = self._snapshot_processes_observed_locked(executor)
-                else:
-                    final_snapshot = self._snapshot_processes_locked(executor)
-                    final_snapshot_error = None
-            if final_snapshot_error is not None:
-                termination_errors = tuple(termination_errors) + (("snapshot", final_snapshot_error),)
-            if manager is not None:
-                try:
-                    manager.shutdown()
-                except Exception as exc:
-                    manager_shutdown_error = exc
-            shutdown_status = self._resolve_shutdown_status(
+        with shutdown_condition:
+            if self._closed:
+                last_shutdown_outcome = getattr(self, "_last_shutdown_outcome", None)
+                return (
+                    last_shutdown_outcome
+                    if last_shutdown_outcome is not None
+                    else ShutdownOutcome(status=ShutdownStatus.NEVER_STARTED)
+                )
+            terminate_target = tuple(cancel_terminate_target) if cancel_snapshot_attempted else ()
+            return self._complete_shutdown_locked(
+                shutdown_condition=shutdown_condition,
                 force_terminate=bool(force_terminate),
                 never_started=never_started,
-                has_errors=bool(
-                    executor_shutdown_error is not None
-                    or manager_shutdown_error is not None
-                    or cancel_event_error is not None
-                    or termination_errors
-                ),
-            )
-            outcome = ShutdownOutcome(
-                status=shutdown_status,
-                executor_shutdown_error=executor_shutdown_error,
-                manager_shutdown_error=manager_shutdown_error,
-                termination_errors=termination_errors,
                 cancel_event_error=cancel_event_error,
-                final_worker_process_count=len(tuple(final_snapshot)),
-                final_snapshot_nonempty=bool(final_snapshot),
+                terminate_target=terminate_target,
             )
-            outcome = self._merge_out_of_band_shutdown_observations(
-                outcome,
-                force_terminate=bool(force_terminate),
-            )
-            with shutdown_condition:
-                if self._executor is executor:
-                    self._executor = None
-                if self._manager is manager:
-                    self._manager = None
-                self._closed = True
-                self._shutdown_in_progress = False
-                self._last_shutdown_outcome = outcome
-                shutdown_condition.notify_all()
-            self._unregister_active_pool()
-            return outcome
 
     def _prewarm(self) -> None:
         """Start all workers and wait until each initializer has run.
@@ -678,17 +613,6 @@ class FittingProcessPool:
 
     def _force_shutdown_out_of_band(self) -> ShutdownOutcome | None:
         shutdown_condition = self._ensure_shutdown_condition()
-        with shutdown_condition:
-            if self._closed and self._executor is None and self._manager is None:
-                return self._last_shutdown_outcome
-            if not self._shutdown_in_progress:
-                do_full_shutdown = True
-            else:
-                do_full_shutdown = False
-                executor = self._executor
-        if do_full_shutdown:
-            return self.shutdown(force_terminate=True)
-
         cancel_event, terminate_target, _snapshot_attempted = self._prepare_cancel()
         cancel_event_error: BaseException | None = None
         if cancel_event is not None:
@@ -696,32 +620,28 @@ class FittingProcessPool:
                 cancel_event.set()
             except Exception as exc:
                 cancel_event_error = exc
-        termination_errors: tuple[tuple[str, BaseException], ...] = ()
-        final_snapshot = ()
-        partial_shutdown_error: BaseException | None = RuntimeError(
-            "Executor shutdown was already in progress; out-of-band forced termination did not observe executor or manager shutdown."
-        )
-        snapshot_error: BaseException | None = None
-        with self._state_lock:
+        with shutdown_condition:
+            if self._closed:
+                return self._last_shutdown_outcome
+            if not self._shutdown_in_progress:
+                self._shutdown_in_progress = True
+            executor = self._executor
             final_snapshot, snapshot_error = self._snapshot_processes_observed_locked(executor)
-        if final_snapshot:
-            termination_errors = self._terminate_processes_best_effort(final_snapshot)
-        if snapshot_error is not None:
-            termination_errors = tuple(termination_errors) + (("snapshot", snapshot_error),)
-        termination_errors = tuple(termination_errors) + (("concurrent_shutdown", partial_shutdown_error),)
-        outcome = ShutdownOutcome(
-            status=self._resolve_shutdown_status(
+            termination_errors: tuple[tuple[str, BaseException], ...] = ()
+            if final_snapshot:
+                termination_errors = self._terminate_processes_best_effort(final_snapshot)
+            if self._closed:
+                return self._last_shutdown_outcome
+            return self._complete_shutdown_locked(
+                shutdown_condition=shutdown_condition,
                 force_terminate=True,
                 never_started=not bool(getattr(self, "_prewarm_started", False)),
-                has_errors=bool(cancel_event_error is not None or termination_errors),
-            ),
-            termination_errors=termination_errors,
-            cancel_event_error=cancel_event_error,
-            final_worker_process_count=len(tuple(final_snapshot)),
-            final_snapshot_nonempty=bool(final_snapshot),
-        )
-        self._record_out_of_band_shutdown_observations(outcome)
-        return outcome
+                cancel_event_error=cancel_event_error,
+                terminate_target=tuple(final_snapshot),
+                termination_errors=termination_errors,
+                snapshot_error=snapshot_error,
+                terminate_target_already_handled=True,
+            )
 
     def _ensure_shutdown_condition(self) -> threading.Condition:
         condition = getattr(self, "_shutdown_condition", None)
@@ -749,85 +669,80 @@ class FittingProcessPool:
             return ShutdownStatus.NEVER_STARTED
         return ShutdownStatus.GRACEFUL_COMPLETION
 
-    def _record_out_of_band_shutdown_observations(self, outcome: ShutdownOutcome) -> None:
-        with self._state_lock:
-            if not hasattr(self, "_pending_out_of_band_termination_errors"):
-                self._pending_out_of_band_termination_errors = []
-            if not hasattr(self, "_pending_out_of_band_cancel_event_error"):
-                self._pending_out_of_band_cancel_event_error = None
-            if not hasattr(self, "_pending_out_of_band_final_worker_process_count"):
-                self._pending_out_of_band_final_worker_process_count = 0
-            if not hasattr(self, "_pending_out_of_band_final_snapshot_nonempty"):
-                self._pending_out_of_band_final_snapshot_nonempty = False
-            if outcome.cancel_event_error is not None and self._pending_out_of_band_cancel_event_error is None:
-                self._pending_out_of_band_cancel_event_error = outcome.cancel_event_error
-            self._pending_out_of_band_termination_errors.extend(tuple(outcome.termination_errors))
-            self._pending_out_of_band_final_worker_process_count = max(
-                int(self._pending_out_of_band_final_worker_process_count),
-                int(outcome.final_worker_process_count),
-            )
-            self._pending_out_of_band_final_snapshot_nonempty = bool(
-                self._pending_out_of_band_final_snapshot_nonempty or outcome.final_snapshot_nonempty
-            )
-
-    def _merge_out_of_band_shutdown_observations(
+    def _complete_shutdown_locked(
         self,
-        outcome: ShutdownOutcome,
         *,
+        shutdown_condition: threading.Condition,
         force_terminate: bool,
+        never_started: bool,
+        cancel_event_error: BaseException | None,
+        terminate_target: tuple[Any, ...] = (),
+        termination_errors: tuple[tuple[str, BaseException], ...] = (),
+        snapshot_error: BaseException | None = None,
+        terminate_target_already_handled: bool = False,
     ) -> ShutdownOutcome:
-        with self._state_lock:
-            pending_cancel_event_error = getattr(self, "_pending_out_of_band_cancel_event_error", None)
-            pending_termination_errors = tuple(getattr(self, "_pending_out_of_band_termination_errors", []))
-            pending_final_worker_process_count = int(
-                getattr(self, "_pending_out_of_band_final_worker_process_count", 0)
-            )
-            pending_final_snapshot_nonempty = bool(
-                getattr(self, "_pending_out_of_band_final_snapshot_nonempty", False)
-            )
-            self._pending_out_of_band_cancel_event_error = None
-            self._pending_out_of_band_termination_errors = []
-            self._pending_out_of_band_final_worker_process_count = 0
-            self._pending_out_of_band_final_snapshot_nonempty = False
-        if pending_cancel_event_error is None and not pending_termination_errors:
-            return outcome
+        executor = self._executor
+        manager = self._manager
+        executor_shutdown_error: BaseException | None = None
+        manager_shutdown_error: BaseException | None = None
+        resolved_termination_errors = tuple(termination_errors)
+        if force_terminate and not terminate_target:
+            terminate_target, snapshot_error = self._snapshot_processes_observed_locked(executor)
+        if snapshot_error is not None:
+            resolved_termination_errors = tuple(resolved_termination_errors) + (("snapshot", snapshot_error),)
 
-        termination_errors = tuple(outcome.termination_errors)
-        for item in pending_termination_errors:
-            if item not in termination_errors:
-                termination_errors = termination_errors + (item,)
-        cancel_event_error = outcome.cancel_event_error or pending_cancel_event_error
-        merged_has_errors = bool(
-            outcome.executor_shutdown_error is not None
-            or outcome.manager_shutdown_error is not None
-            or cancel_event_error is not None
-            or termination_errors
-        )
-        merged_never_started = (
-            outcome.status is ShutdownStatus.NEVER_STARTED
-            and not merged_has_errors
-        )
-        return ShutdownOutcome(
+        final_snapshot = tuple(terminate_target)
+        final_snapshot_error: BaseException | None = snapshot_error
+        try:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=not bool(force_terminate), cancel_futures=True)
+                except Exception as exc:
+                    executor_shutdown_error = exc
+        finally:
+            if terminate_target and not terminate_target_already_handled:
+                resolved_termination_errors = tuple(resolved_termination_errors) + self._terminate_processes_best_effort(
+                    terminate_target
+                )
+            if bool(force_terminate):
+                final_snapshot, final_snapshot_error = self._snapshot_processes_observed_locked(executor)
+            else:
+                final_snapshot = self._snapshot_processes_locked(executor)
+                final_snapshot_error = None
+            if final_snapshot_error is not None:
+                resolved_termination_errors = tuple(resolved_termination_errors) + (("snapshot", final_snapshot_error),)
+            if manager is not None:
+                try:
+                    manager.shutdown()
+                except Exception as exc:
+                    manager_shutdown_error = exc
+
+        outcome = ShutdownOutcome(
             status=self._resolve_shutdown_status(
-                force_terminate=bool(force_terminate) or outcome.status in {
-                    ShutdownStatus.FORCED_TERMINATION_CLEAN,
-                    ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS,
-                },
-                never_started=merged_never_started,
-                has_errors=merged_has_errors,
+                force_terminate=bool(force_terminate),
+                never_started=bool(never_started),
+                has_errors=bool(
+                    executor_shutdown_error is not None
+                    or manager_shutdown_error is not None
+                    or cancel_event_error is not None
+                    or resolved_termination_errors
+                ),
             ),
-            executor_shutdown_error=outcome.executor_shutdown_error,
-            manager_shutdown_error=outcome.manager_shutdown_error,
-            termination_errors=termination_errors,
+            executor_shutdown_error=executor_shutdown_error,
+            manager_shutdown_error=manager_shutdown_error,
+            termination_errors=resolved_termination_errors,
             cancel_event_error=cancel_event_error,
-            final_worker_process_count=max(
-                int(outcome.final_worker_process_count),
-                pending_final_worker_process_count,
-            ),
-            final_snapshot_nonempty=bool(
-                outcome.final_snapshot_nonempty or pending_final_snapshot_nonempty
-            ),
+            final_worker_process_count=len(tuple(final_snapshot)),
+            final_snapshot_nonempty=bool(final_snapshot),
         )
+        self._executor = None
+        self._manager = None
+        self._closed = True
+        self._shutdown_in_progress = False
+        self._last_shutdown_outcome = outcome
+        shutdown_condition.notify_all()
+        self._unregister_active_pool()
+        return outcome
 
     def _snapshot_processes_observed_locked(self, executor: Any) -> tuple[tuple[Any, ...], BaseException | None]:
         snapshot = self._snapshot_processes_locked(executor)

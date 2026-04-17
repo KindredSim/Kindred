@@ -116,6 +116,11 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+def _manager_process_alive(manager) -> bool:
+    process = getattr(manager, "_process", None)
+    return bool(process is not None and process.is_alive())
+
+
 def _signal_shutdown_completion(pool, outcome) -> None:
     with pool._shutdown_condition:
         pool._closed = True
@@ -132,6 +137,59 @@ def _pool_registered_for_owner_thread(pool) -> bool:
     with fitting_process_pool._ACTIVE_POOL_REGISTRY_LOCK:
         pools = tuple(fitting_process_pool._ACTIVE_POOLS_BY_OWNER_THREAD.get(pool._owner_thread_ident, ()))
     return pool in pools
+
+
+def _force_shutdown_registered_pool(pool):
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    outcomes = FittingProcessPool.force_shutdown_registered_pools_for_owner_thread(pool._owner_thread_ident)
+    assert len(outcomes) == 1
+    return outcomes[0]
+
+
+def _cleanup_pool_after_test(pool, *, fallback_outcome=None) -> None:
+    ensure_shutdown_condition = getattr(pool, "_ensure_shutdown_condition", None)
+    if callable(ensure_shutdown_condition):
+        shutdown_condition = ensure_shutdown_condition()
+    else:
+        shutdown_condition = getattr(pool, "_shutdown_condition", None)
+    executor = getattr(pool, "_executor", None)
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    manager = getattr(pool, "_manager", None)
+    if manager is not None:
+        try:
+            manager.shutdown()
+        except Exception:
+            pass
+    if shutdown_condition is not None:
+        with shutdown_condition:
+            if getattr(pool, "_last_shutdown_outcome", None) is None and fallback_outcome is not None:
+                pool._last_shutdown_outcome = fallback_outcome
+            pool._executor = None
+            pool._manager = None
+            pool._closed = True
+            pool._shutdown_in_progress = False
+            shutdown_condition.notify_all()
+    else:
+        state_lock = getattr(pool, "_state_lock", None)
+        if state_lock is not None:
+            with state_lock:
+                if getattr(pool, "_last_shutdown_outcome", None) is None and fallback_outcome is not None:
+                    pool._last_shutdown_outcome = fallback_outcome
+                pool._executor = None
+                pool._manager = None
+                pool._closed = True
+                pool._shutdown_in_progress = False
+    unregister = getattr(pool, "_unregister_active_pool", None)
+    if callable(unregister):
+        try:
+            unregister()
+        except Exception:
+            pass
 
 
 class _EvaluateOnlyNoClone:
@@ -459,46 +517,30 @@ def test_fitting_process_pool_shutdown_sets_cancel_event_before_executor_shutdow
     assert outcome.final_snapshot_nonempty is False
 
 
-def test_fitting_process_pool_shutdown_cleans_partial_construction_even_when_closed() -> None:
-    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
-
-    calls = []
-
-    class _FakeEvent:
-        def set(self):
-            calls.append("event.set")
-
-    class _FakeExecutor:
-        def shutdown(self, *, wait, cancel_futures):
-            calls.append(("executor.shutdown", bool(wait), bool(cancel_futures)))
-
-    class _FakeManager:
-        def shutdown(self):
-            calls.append("manager.shutdown")
+def test_fitting_process_pool_shutdown_returns_stored_outcome_when_already_closed() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownOutcome, ShutdownStatus
 
     pool = object.__new__(FittingProcessPool)
-    pool._cancel_event = _FakeEvent()
-    pool._executor = _FakeExecutor()
-    pool._manager = _FakeManager()
+    expected = ShutdownOutcome(
+        status=ShutdownStatus.FORCED_TERMINATION_CLEAN,
+        final_worker_process_count=0,
+        final_snapshot_nonempty=False,
+    )
+    pool._cancel_event = object()
+    pool._executor = None
+    pool._manager = None
     pool._closed = True
     pool._prewarm_in_progress = False
     pool._prewarm_started = True
     pool._startup_cancelled = False
     pool._shutdown_in_progress = False
     pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = expected
 
     outcome = pool.shutdown(force_terminate=True)
 
-    assert calls == [
-        "event.set",
-        ("executor.shutdown", False, True),
-        "manager.shutdown",
-    ]
-    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
-    assert any(label == "snapshot" for label, _exc in outcome.termination_errors)
-    assert outcome.cancel_event_error is None
-    assert outcome.executor_shutdown_error is None
-    assert outcome.manager_shutdown_error is None
+    assert outcome is expected
 
 
 def test_fitting_process_pool_context_manager_returns_pool_and_gracefully_shuts_down(monkeypatch) -> None:
@@ -845,8 +887,7 @@ def test_fitting_process_pool_force_shutdown_returns_escalated_outcome_without_w
 
     calls = []
     escalated_outcome = ShutdownOutcome(
-        status=ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS,
-        termination_errors=(("concurrent_shutdown", RuntimeError("forced escalation observed errors")),),
+        status=ShutdownStatus.FORCED_TERMINATION_CLEAN,
         final_worker_process_count=3,
         final_snapshot_nonempty=True,
     )
@@ -854,7 +895,6 @@ def test_fitting_process_pool_force_shutdown_returns_escalated_outcome_without_w
 
     def fake_force_shutdown(self):
         calls.append("force_shutdown")
-        self._record_out_of_band_shutdown_observations(escalated_outcome)
         return escalated_outcome
 
     monkeypatch.setattr(FittingProcessPool, "_force_shutdown_out_of_band", fake_force_shutdown)
@@ -872,8 +912,7 @@ def test_fitting_process_pool_force_shutdown_returns_escalated_outcome_without_w
         thread.join(timeout=1.0)
 
     assert calls == ["force_shutdown"]
-    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS
-    assert any(label == "concurrent_shutdown" for label, _exc in outcome.termination_errors)
+    assert outcome.status is ShutdownStatus.FORCED_TERMINATION_CLEAN
     assert outcome.final_worker_process_count == 3
     assert outcome.final_snapshot_nonempty is True
 
@@ -932,11 +971,11 @@ def test_fitting_process_pool_force_shutdown_registered_pools_uses_full_shutdown
     expected = ShutdownOutcome(status=ShutdownStatus.FORCED_TERMINATION_CLEAN)
     calls = []
 
-    def fake_shutdown(self, *, force_terminate):
-        calls.append(bool(force_terminate))
+    def fake_force_shutdown(self):
+        calls.append("forced")
         return expected
 
-    monkeypatch.setattr(FittingProcessPool, "shutdown", fake_shutdown)
+    monkeypatch.setattr(FittingProcessPool, "_force_shutdown_out_of_band", fake_force_shutdown)
 
     pool._register_active_pool()
     try:
@@ -944,7 +983,7 @@ def test_fitting_process_pool_force_shutdown_registered_pools_uses_full_shutdown
     finally:
         pool._unregister_active_pool()
 
-    assert calls == [True]
+    assert calls == ["forced"]
     assert outcomes == (expected,)
 
 
@@ -1269,6 +1308,287 @@ def test_fitting_process_pool_out_of_band_force_shutdown_terminates_while_shutdo
     ]
 
 
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_out_of_band_force_shutdown_terminates_manager_process_when_shutdown_is_in_progress() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    manager = pool._manager
+    outcome = None
+    try:
+        assert _manager_process_alive(manager) is True
+        with pool._state_lock:
+            pool._shutdown_in_progress = True
+        outcome = _force_shutdown_registered_pool(pool)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and _manager_process_alive(manager):
+            time.sleep(0.05)
+        assert _manager_process_alive(manager) is False
+    finally:
+        _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+
+
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_out_of_band_force_shutdown_unregisters_pool_when_shutdown_is_in_progress() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    outcome = None
+    try:
+        assert _pool_registered_for_owner_thread(pool) is True
+        with pool._state_lock:
+            pool._shutdown_in_progress = True
+        outcome = _force_shutdown_registered_pool(pool)
+        assert _pool_registered_for_owner_thread(pool) is False
+    finally:
+        _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+
+
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_out_of_band_force_shutdown_leaves_pool_terminal_when_shutdown_is_in_progress() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    outcome = None
+    try:
+        with pool._state_lock:
+            pool._shutdown_in_progress = True
+        outcome = _force_shutdown_registered_pool(pool)
+        assert pool._closed is True
+        assert pool._shutdown_in_progress is False
+        assert pool._executor is None
+        assert pool._manager is None
+        assert pool._last_shutdown_outcome is outcome
+    finally:
+        _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+
+
+@pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
+def test_fitting_process_pool_later_graceful_shutdown_returns_race_winner_without_hanging() -> None:
+    """Use a 1.0 s join budget to detect a hang without turning this into a performance test."""
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
+    outcome = None
+    wait_result: dict[str, object] = {}
+    waiter = None
+    try:
+        with pool._state_lock:
+            pool._shutdown_in_progress = True
+        outcome = _force_shutdown_registered_pool(pool)
+
+        def wait_for_shutdown() -> None:
+            wait_result["outcome"] = pool.shutdown(force_terminate=False)
+
+        waiter = threading.Thread(target=wait_for_shutdown)
+        waiter.start()
+        waiter.join(timeout=1.0)
+
+        assert waiter.is_alive() is False
+        assert wait_result["outcome"] is outcome
+    finally:
+        if waiter is not None and waiter.is_alive():
+            _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+            waiter.join(timeout=1.0)
+        _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+
+
+def test_fitting_process_pool_out_of_band_force_shutdown_has_no_synthetic_concurrent_shutdown_marker() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {1: object()}
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool._force_shutdown_out_of_band()
+
+    assert all(label != "concurrent_shutdown" for label, _exc in outcome.termination_errors)
+
+
+def test_fitting_process_pool_out_of_band_force_shutdown_reports_real_errors_only() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeProcess:
+        pid = 4321
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            raise OSError("terminate failed")
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {4321: _FakeProcess()}
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool._force_shutdown_out_of_band()
+
+    assert any(label == "pid=4321" for label, _exc in outcome.termination_errors)
+    assert all(label != "concurrent_shutdown" for label, _exc in outcome.termination_errors)
+
+
+def test_fitting_process_pool_later_graceful_shutdown_preserves_forced_status_after_race_winner() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool, ShutdownStatus
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {1: object()}
+
+        def shutdown(self, *, wait, cancel_futures):
+            return None
+
+    class _FakeManager:
+        def shutdown(self):
+            return None
+
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = _FakeExecutor()
+    pool._manager = _FakeManager()
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool._force_shutdown_out_of_band()
+    later_result: dict[str, object] = {}
+
+    def call_graceful_shutdown() -> None:
+        later_result["outcome"] = pool.shutdown(force_terminate=False)
+
+    waiter = threading.Thread(target=call_graceful_shutdown)
+    waiter.start()
+    waiter.join(timeout=1.0)
+
+    try:
+        assert waiter.is_alive() is False
+        assert later_result["outcome"] is outcome
+        assert later_result["outcome"].status in {
+            ShutdownStatus.FORCED_TERMINATION_CLEAN,
+            ShutdownStatus.FORCED_TERMINATION_WITH_ERRORS,
+        }
+    finally:
+        if waiter.is_alive():
+            _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+            waiter.join(timeout=1.0)
+        _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+
+
+def test_fitting_process_pool_shutdown_cleanup_runs_exactly_once_after_out_of_band_race_winner() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _FakeEvent:
+        def set(self):
+            return None
+
+    class _FakeExecutor:
+        def __init__(self):
+            self._processes = {1: object()}
+            self.shutdown_calls = []
+
+        def shutdown(self, *, wait, cancel_futures):
+            self.shutdown_calls.append((bool(wait), bool(cancel_futures)))
+
+    class _FakeManager:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    executor = _FakeExecutor()
+    manager = _FakeManager()
+    pool = object.__new__(FittingProcessPool)
+    pool._cancel_event = _FakeEvent()
+    pool._executor = executor
+    pool._manager = manager
+    pool._closed = False
+    pool._prewarm_in_progress = False
+    pool._prewarm_started = True
+    pool._startup_cancelled = False
+    pool._shutdown_in_progress = True
+    pool._state_lock = threading.Lock()
+    pool._shutdown_condition = threading.Condition(pool._state_lock)
+    pool._last_shutdown_outcome = None
+
+    outcome = pool._force_shutdown_out_of_band()
+    later_result: dict[str, object] = {}
+
+    def call_graceful_shutdown() -> None:
+        later_result["outcome"] = pool.shutdown(force_terminate=False)
+
+    waiter = threading.Thread(target=call_graceful_shutdown)
+    waiter.start()
+    waiter.join(timeout=1.0)
+
+    try:
+        assert waiter.is_alive() is False
+        assert later_result["outcome"] is outcome
+        assert executor.shutdown_calls == [(False, True)]
+        assert manager.shutdown_calls == 1
+    finally:
+        if waiter.is_alive():
+            _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+            waiter.join(timeout=1.0)
+        _cleanup_pool_after_test(pool, fallback_outcome=outcome)
+
+
 @pytest.mark.parametrize("shutdown_in_progress", [False, True])
 def test_fitting_process_pool_force_shutdown_still_terminates_after_transient_process_snapshot_race(
     monkeypatch,
@@ -1332,6 +1652,8 @@ def test_fitting_process_pool_force_shutdown_still_terminates_after_transient_pr
         assert calls == [
             "event.set",
             ("terminate_target_len", 1),
+            ("executor.shutdown", False, True),
+            "manager.shutdown",
         ]
     else:
         assert calls == [
