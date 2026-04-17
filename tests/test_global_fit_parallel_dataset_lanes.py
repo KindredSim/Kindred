@@ -165,17 +165,40 @@ def test_fitting_process_pool_worker_pids_are_empty_after_shutdown_returns() -> 
     assert pool.worker_pids() == ()
 
 
+def test_fitting_process_pool_worker_pids_return_empty_on_process_snapshot_race() -> None:
+    from kindred.core.fitting_process_pool import FittingProcessPool
+
+    class _MutatingProcesses(dict):
+        def values(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    class _FakeExecutor:
+        def __init__(self) -> None:
+            self._processes = _MutatingProcesses({1: object()})
+
+    pool = object.__new__(FittingProcessPool)
+    pool._state_lock = threading.Lock()
+    pool._executor = _FakeExecutor()
+
+    assert pool.worker_pids() == ()
+
+
 @pytest.mark.skipif(not CAN_CREATE_PROCESS_POOL, reason=PROCESS_POOL_SKIP_REASON)
-def test_fitting_process_pool_worker_pids_do_not_raise_during_concurrent_shutdown() -> None:
+@pytest.mark.parametrize("force_terminate", [False, True])
+def test_fitting_process_pool_worker_pids_do_not_raise_during_concurrent_shutdown(
+    force_terminate: bool,
+) -> None:
     from kindred.core.fitting_process_pool import FittingProcessPool
 
     pool = FittingProcessPool(_make_serial_evaluator().to_process_payload(), max_workers=1)
     started = threading.Event()
     stop = threading.Event()
     errors: list[BaseException] = []
+    call_count = 0
+    call_count_lock = threading.Lock()
 
     def read_worker_pids() -> None:
-        started.set()
+        nonlocal call_count
         while not stop.is_set():
             try:
                 pool.worker_pids()
@@ -183,16 +206,21 @@ def test_fitting_process_pool_worker_pids_do_not_raise_during_concurrent_shutdow
                 errors.append(exc)
                 stop.set()
                 return
+            with call_count_lock:
+                call_count += 1
+                started.set()
 
     reader = threading.Thread(target=read_worker_pids)
     reader.start()
-    started.wait(timeout=5.0)
+    assert started.wait(timeout=5.0)
     try:
-        pool.shutdown(force_terminate=False)
+        pool.shutdown(force_terminate=force_terminate)
     finally:
         stop.set()
         reader.join(timeout=5.0)
 
+    assert not reader.is_alive()
+    assert call_count > 0
     assert errors == []
 
 

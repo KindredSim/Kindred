@@ -282,7 +282,10 @@ class FittingProcessPool:
             processes = getattr(executor, "_processes", None)
             if not isinstance(processes, dict):
                 return ()
-            process_snapshot = tuple(processes.values())
+            try:
+                process_snapshot = tuple(processes.values())
+            except RuntimeError:
+                return ()
         pids = []
         for proc in process_snapshot:
             pid = getattr(proc, "pid", None)
