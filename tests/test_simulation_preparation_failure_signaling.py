@@ -339,6 +339,24 @@ def test_simulation_failure_user_message_formats_prepared_payload_stage() -> Non
     )
 
 
+def test_simulation_failure_user_message_ignores_stack_trace_in_main_text() -> None:
+    from kindred.core.simulation_failure import (
+        build_simulation_failure,
+        simulation_failure_user_message,
+    )
+
+    payload = build_simulation_failure(
+        "preparation_error",
+        "worker payload is invalid",
+        details={"stage": "prepared_payload"},
+        context={"stack_trace": "Traceback line 1\nTraceback line 2"},
+    )
+
+    assert simulation_failure_user_message(payload) == (
+        "Prepared simulation payload invalid:\n\nworker payload is invalid"
+    )
+
+
 def test_heaviside_rejects_non_numeric_argument_with_explicit_error() -> None:
     from kindred.core.algebra.symbols import heaviside
 

@@ -1765,6 +1765,113 @@ def test_global_fit_objective_process_pool_matches_serial_reference() -> None:
     np.testing.assert_allclose(residuals, expected)
 
 
+def test_marshal_exception_round_trip_populates_stack_trace_for_direct_fit_simulation_error() -> None:
+    from kindred.core.analysis.global_fitting import _error_from_process_payload
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_process_pool import _marshal_exception
+
+    def _raise_direct_fit_error() -> None:
+        def _explode_value_error() -> None:
+            raise ValueError("direct branch sentinel")
+
+        try:
+            _explode_value_error()
+        except ValueError as exc:
+            raise FitSimulationError("direct branch fit failure") from exc
+
+    try:
+        _raise_direct_fit_error()
+    except FitSimulationError as exc:
+        payload = _marshal_exception(exc)
+
+    reconstructed = _error_from_process_payload(payload, failed_params=None)
+
+    assert isinstance(reconstructed, FitSimulationError)
+    assert reconstructed.context is not None
+    assert reconstructed.context.stack_trace
+    assert "_explode_value_error" in reconstructed.context.stack_trace
+    assert "ValueError: direct branch sentinel" in reconstructed.context.stack_trace
+
+
+def test_marshal_exception_rejects_fit_simulation_error_without_traceback() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_process_pool import _marshal_exception
+
+    with pytest.raises(RuntimeError, match="caught exception with traceback"):
+        _marshal_exception(FitSimulationError("unraised fit failure"))
+
+
+def test_run_fitting_evaluation_task_round_trip_preserves_original_frames_for_wrapped_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kindred.core.analysis.global_fitting import _error_from_process_payload
+    from kindred.core.exceptions import FitSimulationError
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    import kindred.core.fitting_process_pool as fitting_process_pool
+
+    def _explode_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("wrap branch sentinel")
+
+    monkeypatch.setattr(fitting_process_pool, "_WORKER_EVALUATOR", object())
+    monkeypatch.setattr(fitting_process_pool, "_worker_cancel_requested", lambda: False)
+    monkeypatch.setattr(fitting_process_pool, "_WORKER_CANCEL_EVENT", None)
+    monkeypatch.setattr(fitting_evaluation, "evaluate_fitting_series", _explode_runtime_error)
+
+    payload = fitting_process_pool.run_fitting_evaluation_task(_dataset_input(0, "wrap-dataset", 1.25))
+    reconstructed = _error_from_process_payload(
+        payload["error"],
+        failed_params=payload["error"].get("failed_params"),
+    )
+
+    assert isinstance(reconstructed, FitSimulationError)
+    assert reconstructed.context is not None
+    assert reconstructed.context.stack_trace
+    assert payload["ok"] is False
+    assert "_explode_runtime_error" in reconstructed.context.stack_trace
+    assert "RuntimeError: wrap branch sentinel" in reconstructed.context.stack_trace
+    assert reconstructed.failed_params == {"init:A": 1.25}
+
+
+def test_marshal_exception_round_trip_preserves_existing_context_fields_when_adding_stack_trace() -> None:
+    from kindred.core.analysis.global_fitting import _error_from_process_payload
+    from kindred.core.exceptions import ErrorContext, FitSimulationError
+    from kindred.core.fitting_process_pool import _marshal_exception
+
+    try:
+        raise FitSimulationError(
+            "context-preserving fit failure",
+            context=ErrorContext(line=5, col=3, line_text="foo"),
+        )
+    except FitSimulationError as exc:
+        payload = _marshal_exception(exc)
+
+    reconstructed = _error_from_process_payload(payload, failed_params=None)
+
+    assert isinstance(reconstructed, FitSimulationError)
+    assert reconstructed.context is not None
+    assert reconstructed.context.line == 5
+    assert reconstructed.context.col == 3
+    assert reconstructed.context.line_text == "foo"
+    assert reconstructed.context.stack_trace
+    assert "context-preserving fit failure" in reconstructed.context.stack_trace
+
+
+def test_marshal_exception_round_trip_leaves_fitting_cancelled_without_stack_trace() -> None:
+    from kindred.core.analysis.global_fitting import _error_from_process_payload
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_process_pool import _marshal_exception
+
+    try:
+        raise FittingCancelled("cancel branch sentinel")
+    except FittingCancelled as exc:
+        payload = _marshal_exception(exc)
+
+    reconstructed = _error_from_process_payload(payload, failed_params=None)
+
+    assert isinstance(reconstructed, FittingCancelled)
+    assert reconstructed.context is None or reconstructed.context.stack_trace is None
+
+
 def test_evaluate_dataset_simulations_process_pool_cancels_on_fatal_result() -> None:
     from kindred.core.analysis.global_fitting import _dataset_evaluation_is_fatal, _evaluate_dataset_simulations
 

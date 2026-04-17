@@ -3010,11 +3010,22 @@ class FittingWindow(QtWidgets.QDialog):
             self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._set_running_state(False)
         payload = coerce_simulation_failure(error)
+        context = payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
+        stack_trace = str(context.get("stack_trace") or "")
+        has_stack_trace = bool(stack_trace.strip())
         message = simulation_failure_user_message(payload)
         if message:
             logger.warning("Fitting worker reported error: %s", payload)
+        if has_stack_trace:
+            logger.warning("%s", stack_trace)
         if message and self.isVisible() and not self._closing:
-            QtWidgets.QMessageBox.warning(self, "Fitting", message)
+            dialog = QtWidgets.QMessageBox(self)
+            dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            dialog.setWindowTitle("Fitting")
+            dialog.setText(message)
+            dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+            dialog.setDetailedText(stack_trace if has_stack_trace else "")
+            dialog.exec()
         self._status_label.setText(message or "Fit error")
 
     # ------------------------------------------------------------------

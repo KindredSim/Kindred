@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 import numpy as np
 import shiboken6
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
 from kindred.gui.fitting.window import FittingWindow
@@ -737,8 +737,9 @@ def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
         window._pending_best_timer.start()
 
         states: list[tuple[bool, object, object]] = []
+        captured = {"details": None}
 
-        def _capture_dialog(*_args, **_kwargs):
+        def _capture_warning(*_args, **_kwargs):
             states.append(
                 (
                     window._pending_best_timer.isActive(),
@@ -746,13 +747,80 @@ def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
                     window._pending_best_worker,
                 )
             )
-            return None
+            captured["details"] = None
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
 
-        monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.warning", _capture_dialog)
+        def _capture_exec(self):
+            states.append(
+                (
+                    window._pending_best_timer.isActive(),
+                    window._pending_best_payload,
+                    window._pending_best_worker,
+                )
+            )
+            captured["details"] = self.detailedText()
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
 
         window._on_worker_error({"kind": "fitting_error", "message": "boom"}, worker=worker)
 
         assert states == [(False, None, None)]
+        assert captured["details"] == ""
+    finally:
+        window.close()
+
+
+def test_worker_error_logs_traceback_and_populates_dialog_details(qt_app, monkeypatch, caplog):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        worker = _SignalWorker()
+        worker._running = False
+        window._worker = worker
+        dialogs: list[dict[str, object]] = []
+
+        def _unexpected_warning(*_args, **_kwargs):
+            raise AssertionError("worker errors should use an instance-based warning dialog")
+
+        def _capture_exec(self):
+            dialogs.append(
+                {
+                    "text": self.text(),
+                    "details": self.detailedText(),
+                    "title": self.windowTitle(),
+                    "icon": self.icon(),
+                }
+            )
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_unexpected_warning))
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        stack_trace = "Traceback line 1\nTraceback line 2"
+        with caplog.at_level("WARNING", logger="kindred.gui.fitting.window"):
+            window._on_worker_error(
+                {
+                    "kind": "fitting_error",
+                    "message": "boom",
+                    "context": {"stack_trace": stack_trace},
+                },
+                worker=worker,
+            )
+
+        assert dialogs == [
+            {
+                "text": "boom",
+                "details": stack_trace,
+                "title": "Fitting",
+                "icon": QtWidgets.QMessageBox.Icon.Warning,
+            }
+        ]
+        messages = [record.getMessage() for record in caplog.records if record.name == "kindred.gui.fitting.window"]
+        assert any(message.startswith("Fitting worker reported error:") for message in messages)
+        assert stack_trace in messages
     finally:
         window.close()
 

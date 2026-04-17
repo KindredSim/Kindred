@@ -35,6 +35,7 @@ import multiprocessing as mp
 import os
 import pickle
 import threading
+import traceback
 import weakref
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Mapping, MutableMapping, Optional
@@ -175,6 +176,33 @@ def _serialize_error_context(context: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _format_marshaled_stack_trace(exc: BaseException) -> Optional[str]:
+    if exc.__traceback__ is None:
+        raise RuntimeError("FitSimulationError must be marshaled from a caught exception with traceback.")
+    stack_trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    if not stack_trace.strip():
+        raise RuntimeError("FitSimulationError traceback formatting produced empty output.")
+    return stack_trace
+
+
+def _error_context_with_marshaled_stack_trace(exc: BaseException) -> Any:
+    from kindred.core.exceptions import ErrorContext
+
+    context = getattr(exc, "context", None)
+    stack_trace = _format_marshaled_stack_trace(exc)
+    if stack_trace is None:
+        return context
+    if context is None:
+        return ErrorContext(stack_trace=stack_trace)
+    return ErrorContext(
+        line=getattr(context, "line", None),
+        col=getattr(context, "col", None),
+        line_text=getattr(context, "line_text", None),
+        file_path=getattr(context, "file_path", None),
+        stack_trace=stack_trace,
+    )
+
+
 def _marshal_exception(exc: BaseException) -> dict[str, Any]:
     from kindred.core.exceptions import FitSimulationError, FittingCancelled, SimulationCancelled
 
@@ -185,7 +213,7 @@ def _marshal_exception(exc: BaseException) -> dict[str, Any]:
             "code": getattr(exc, "code", None),
             "details": dict(getattr(exc, "details", None) or {}),
             "failed_params": dict(getattr(exc, "failed_params", None) or {}),
-            "context": _serialize_error_context(getattr(exc, "context", None)),
+            "context": _serialize_error_context(_error_context_with_marshaled_stack_trace(exc)),
         }
     if isinstance(exc, FittingCancelled):
         return {
@@ -264,20 +292,22 @@ def run_fitting_evaluation_task(item: Any) -> dict[str, Any]:
             "final_error_message": str(exc),
         }
     except Exception as exc:
-        wrapped = FitSimulationError(
-            f"Simulation failed for dataset '{dataset_id}': {exc}",
-            failed_params=dict(getattr(item, "failed_param_snapshot", {}) or {}) or None,
-        )
-        return {
-            "index": int(getattr(item, "index")),
-            "dataset_id": dataset_id,
-            "worker_pid": int(os.getpid()),
-            "ok": False,
-            "series_payload": None,
-            "error": _marshal_exception(wrapped),
-            "error_provenance": {"dataset": dataset_id},
-            "final_error_message": str(wrapped),
-        }
+        try:
+            raise FitSimulationError(
+                f"Simulation failed for dataset '{dataset_id}': {exc}",
+                failed_params=dict(getattr(item, "failed_param_snapshot", {}) or {}) or None,
+            ) from exc
+        except FitSimulationError as wrapped:
+            return {
+                "index": int(getattr(item, "index")),
+                "dataset_id": dataset_id,
+                "worker_pid": int(os.getpid()),
+                "ok": False,
+                "series_payload": None,
+                "error": _marshal_exception(wrapped),
+                "error_provenance": {"dataset": dataset_id},
+                "final_error_message": str(wrapped),
+            }
 
 
 class FittingProcessPool:
