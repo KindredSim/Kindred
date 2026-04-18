@@ -113,7 +113,11 @@ def test_global_fit_penalty_on_nonfinite_dataset():
     assert result.objective_residuals is not None
     assert result.objective_residuals.shape == (expected_len,)
     assert np.all(np.isfinite(result.objective_residuals))
-    assert "last_error_dataset" in result.message.lower()
+    assert result.error_diagnostics is not None
+    details = result.error_diagnostics.get("details") if isinstance(result.error_diagnostics, dict) else None
+    assert isinstance(details, dict)
+    assert details.get("last_error_dataset") == "bad"
+    assert "last_error_dataset" not in result.message.lower()
 
 
 @pytest.mark.unit

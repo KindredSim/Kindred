@@ -9,6 +9,7 @@ import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.simulation_failure import build_simulation_failure
 from kindred.gui.fitting.window import FittingWindow
 
 pytestmark = pytest.mark.gui
@@ -574,8 +575,11 @@ def test_consecutive_fit_dispatch_cycles_leave_clean_state(qt_app, monkeypatch):
             return None
 
     monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
-    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "exec",
+        lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+    )
 
     window = _build_window()
     try:
@@ -644,7 +648,11 @@ def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeyp
             return None
 
     monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
-    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "exec",
+        lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+    )
 
     window = _build_window()
     try:
@@ -705,7 +713,7 @@ def test_completion_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
 
         states: list[tuple[bool, object, object]] = []
 
-        def _capture_dialog(*_args, **_kwargs):
+        def _capture_exec(self):
             states.append(
                 (
                     window._pending_best_timer.isActive(),
@@ -713,9 +721,9 @@ def test_completion_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
                     window._pending_best_worker,
                 )
             )
-            return None
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
 
-        monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", _capture_dialog)
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
 
         window._handle_global_fit_complete({"result": _build_success_result()}, worker=worker)
 
@@ -821,6 +829,181 @@ def test_worker_error_logs_traceback_and_populates_dialog_details(qt_app, monkey
         messages = [record.getMessage() for record in caplog.records if record.name == "kindred.gui.fitting.window"]
         assert any(message.startswith("Fitting worker reported error:") for message in messages)
         assert stack_trace in messages
+    finally:
+        window.close()
+
+
+def test_completion_dialog_uses_instance_message_box_with_error_diagnostics_details(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_success_result()
+        result.error_diagnostics = build_simulation_failure(
+            kind="simulation_error",
+            message="top-level boom",
+            context={"stack_trace": "top-level trace"},
+        )
+        dialogs: list[dict[str, object]] = []
+
+        def _unexpected_information(*_args, **_kwargs):
+            raise AssertionError("completion dialog should use an instance-based message box")
+
+        def _unexpected_warning(*_args, **_kwargs):
+            raise AssertionError("completion dialog should use an instance-based message box")
+
+        def _capture_exec(self):
+            dialogs.append(
+                {
+                    "title": self.windowTitle(),
+                    "text": self.text(),
+                    "details": self.detailedText(),
+                    "icon": self.icon(),
+                }
+            )
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "information", staticmethod(_unexpected_information))
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_unexpected_warning))
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == [
+            {
+                "title": "Optimization Complete",
+                "text": mock.ANY,
+                "details": "top-level trace",
+                "icon": QtWidgets.QMessageBox.Icon.Information,
+            }
+        ]
+    finally:
+        window.close()
+
+
+def test_completion_dialog_hides_detail_pane_when_no_detail_text_exists(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        dialogs: list[str] = []
+
+        def _capture_exec(self):
+            dialogs.append(self.detailedText())
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "information",
+            staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected static dialog"))),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected static dialog"))),
+        )
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": _build_success_result()})
+
+        assert dialogs == [""]
+    finally:
+        window.close()
+
+
+def test_completion_dialog_aggregates_per_dataset_details(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window._dataset_entries.append(
+            {
+                "id": "ds2",
+                "label": "Dataset 2",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        )
+        window.show()
+        qt_app.processEvents()
+        result = _build_success_result()
+        result.dataset_errors = {
+            "ds1": build_simulation_failure(
+                kind="simulation_error",
+                message="first",
+                context={"stack_trace": "trace one"},
+            ),
+            "ds2": build_simulation_failure(
+                kind="simulation_error",
+                message="second",
+                context={"stack_trace": "trace two"},
+            ),
+        }
+        dialogs: list[str] = []
+
+        def _capture_exec(self):
+            dialogs.append(self.detailedText())
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "information",
+            staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected static dialog"))),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected static dialog"))),
+        )
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs
+        detail_text = dialogs[0]
+        assert "Dataset 1" in detail_text
+        assert "trace one" in detail_text
+        assert "Dataset 2" in detail_text
+        assert "trace two" in detail_text
+        assert "\n\n---\n\n" in detail_text
+    finally:
+        window.close()
+
+
+def test_completion_dialog_logs_detail_text_once_when_present(qt_app, monkeypatch, caplog):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_success_result()
+        result.error_diagnostics = build_simulation_failure(
+            kind="simulation_error",
+            message="top-level boom",
+            context={"stack_trace": "logged trace"},
+        )
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "information",
+            staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected static dialog"))),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            staticmethod(lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected static dialog"))),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        with caplog.at_level("WARNING", logger="kindred.gui.fitting.window"):
+            window._handle_global_fit_complete({"result": result})
+
+        messages = [record.getMessage() for record in caplog.records if record.name == "kindred.gui.fitting.window"]
+        assert messages.count("logged trace") == 1
     finally:
         window.close()
 

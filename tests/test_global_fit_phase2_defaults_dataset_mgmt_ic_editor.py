@@ -39,6 +39,23 @@ def _latest_fit_window(main_window):
     return windows[-1]
 
 
+def _patch_message_box_exec(monkeypatch, *, info_calls: list[str] | None = None) -> None:
+    from PySide6 import QtWidgets
+
+    def _fake_exec(self):
+        if info_calls is not None and self.icon() == QtWidgets.QMessageBox.Icon.Information:
+            info_calls.append("shown")
+        return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+    def _fake_information(*_args, **_kwargs):
+        if info_calls is not None:
+            info_calls.append("shown")
+        return QtWidgets.QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _fake_exec)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", _fake_information)
+
+
 def _show_only_batch_set(main_window, *, row: int, qt_app) -> tuple[str, str]:
     model = main_window._batch_model
     table = main_window._batch_table
@@ -380,11 +397,7 @@ def test_global_fit_apply_to_project_parameters_only_resyncs_main_window_immedia
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -444,11 +457,7 @@ def test_global_fit_apply_to_project_initial_conditions_updates_batch_store_auth
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -505,11 +514,7 @@ def test_global_fit_apply_to_project_parameters_scope_guards_dirty_slider_transa
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch)
 
     prompt_actions: list[str] = []
     programmatic_calls: list[str] = []
@@ -577,11 +582,7 @@ def test_global_fit_apply_to_project_parameter_noop_skips_slider_guard(main_wind
     setter_calls: list[str] = []
     refresh_calls: list[str] = []
 
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
 
     def _prompt(action_text: str, concentration_rows=None):
         prompt_actions.append(str(action_text))
@@ -665,11 +666,7 @@ def test_global_fit_apply_to_project_stale_authority_already_current_parameter_s
     setter_calls: list[str] = []
     refresh_calls: list[str] = []
 
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
 
     def _prompt(action_text: str, concentration_rows=None):
         prompt_actions.append(str(action_text))
@@ -746,11 +743,7 @@ def test_global_fit_apply_to_project_parameter_change_beyond_authoritative_preci
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 1000000.1234567, "min": 0.01, "max": 10000000.0}],
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch)
 
     prompt_actions: list[str] = []
     programmatic_calls: list[str] = []
@@ -816,11 +809,7 @@ def test_global_fit_apply_to_project_signed_zero_parameter_noop_skips_slider_gua
     prompt_actions: list[str] = []
     setter_calls: list[str] = []
 
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
 
     def _prompt(action_text: str, concentration_rows=None):
         prompt_actions.append(str(action_text))
@@ -888,11 +877,7 @@ def test_global_fit_apply_to_project_step_parameter_signed_zero_floor_still_guar
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "kf1", "value": 0.0, "min": 1e-12, "max": 10.0}],
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch)
 
     prompt_actions: list[str] = []
     programmatic_calls: list[str] = []
@@ -968,11 +953,7 @@ def test_global_fit_apply_to_project_missing_step_parameter_warns_instead_of_rep
         lambda _parent, title, text, *args, **kwargs: warning_calls.append((str(title), str(text)))
         or QtWidgets.QMessageBox.StandardButton.Ok,
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
     monkeypatch.setattr(
         main_window,
         "_prompt_slider_transaction_invalidation",
@@ -1057,11 +1038,7 @@ def test_global_fit_apply_to_project_unwritable_derived_step_parameter_warns_ins
         lambda _parent, title, text, *args, **kwargs: warning_calls.append((str(title), str(text)))
         or QtWidgets.QMessageBox.StandardButton.Ok,
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
     monkeypatch.setattr(
         main_window,
         "_prompt_slider_transaction_invalidation",
@@ -1145,11 +1122,7 @@ def test_global_fit_apply_to_project_step_canonicalization_only_rewrite_skips_gu
         lambda _parent, title, text, *args, **kwargs: warning_calls.append((str(title), str(text)))
         or QtWidgets.QMessageBox.StandardButton.Ok,
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
     monkeypatch.setattr(
         main_window,
         "_prompt_slider_transaction_invalidation",
@@ -1217,11 +1190,7 @@ def test_global_fit_apply_to_project_step_warning_allows_valid_parameter_and_ic_
         lambda _parent, title, text, *args, **kwargs: warning_calls.append((str(title), str(text)))
         or QtWidgets.QMessageBox.StandardButton.Ok,
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
     monkeypatch.setattr(
         main_window,
         "_prompt_slider_transaction_invalidation",
@@ -1281,11 +1250,7 @@ def test_global_fit_apply_to_project_initial_conditions_invalidates_stale_cached
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *args, **kwargs: QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1356,11 +1321,7 @@ def test_global_fit_apply_to_project_initial_condition_noop_preserves_cached_dis
     )
 
     info_calls: list[str] = []
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1454,11 +1415,7 @@ def test_global_fit_apply_to_project_initial_condition_settings_sync_without_can
     )
 
     info_calls: list[str] = []
-    monkeypatch.setattr(
-        QtWidgets.QMessageBox,
-        "information",
-        lambda *_args, **_kwargs: info_calls.append("shown") or QtWidgets.QMessageBox.StandardButton.Ok,
-    )
+    _patch_message_box_exec(monkeypatch, info_calls=info_calls)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)

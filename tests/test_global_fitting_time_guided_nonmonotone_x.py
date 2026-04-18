@@ -142,4 +142,4 @@ def test_global_fitting_monotone_only_rejects_nonmonotone_x(monkeypatch) -> None
 
     residuals = np.asarray(result.objective_residuals, dtype=float).reshape(-1)
     assert float(np.max(np.abs(residuals))) > 1e5
-    assert "monotone" in str(result.message).lower()
+    assert any("monotone" in message.lower() for message in result.dataset_error_messages.values())

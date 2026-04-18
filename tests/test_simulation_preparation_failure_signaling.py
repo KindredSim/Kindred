@@ -5,6 +5,47 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from kindred.core.exceptions import ErrorContext, FitSimulationError
+from kindred.core.simulation_failure import (
+    build_simulation_failure,
+    simulation_failure_detail_text,
+)
+
+
+def test_simulation_failure_detail_text_returns_empty_string_without_context() -> None:
+    payload = build_simulation_failure(kind="simulation_error", message="boom")
+
+    assert simulation_failure_detail_text(payload) == ""
+
+
+def test_simulation_failure_detail_text_returns_empty_string_without_stack_trace_key() -> None:
+    payload = build_simulation_failure(
+        kind="simulation_error",
+        message="boom",
+        context={"line": 4},
+    )
+
+    assert simulation_failure_detail_text(payload) == ""
+
+
+def test_simulation_failure_detail_text_returns_stripped_stack_trace() -> None:
+    payload = build_simulation_failure(
+        kind="simulation_error",
+        message="boom",
+        context={"stack_trace": "  line 1\nline 2  \n"},
+    )
+
+    assert simulation_failure_detail_text(payload) == "line 1\nline 2"
+
+
+def test_simulation_failure_detail_text_accepts_exception_objects() -> None:
+    exc = FitSimulationError(
+        "boom",
+        context=ErrorContext(stack_trace="  Traceback line 1\nTraceback line 2  "),
+    )
+
+    assert simulation_failure_detail_text(exc) == "Traceback line 1\nTraceback line 2"
+
 
 def test_simulation_preparation_error_carries_stage_metadata() -> None:
     from kindred.core.simulation_preparation import SimulationPreparationError

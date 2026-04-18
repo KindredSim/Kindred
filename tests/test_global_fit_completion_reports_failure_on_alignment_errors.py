@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from kindred.core.simulation_failure import build_simulation_failure
+
 
 pytestmark = [pytest.mark.gui]
 
@@ -64,7 +66,11 @@ def test_completion_dialog_spec_reports_failure_when_chi2_nonfinite_or_errors(qt
             nfev=1,
             message="fake",
         )
-        setattr(result, "dataset_errors", {"ds1": "outside model range"})
+        setattr(
+            result,
+            "dataset_errors",
+            {"ds1": build_simulation_failure(kind="simulation_error", message="outside model range")},
+        )
 
         severity, title, text = window._global_fit_completion_dialog_spec(result)
         assert severity == "fail"

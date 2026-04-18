@@ -51,6 +51,7 @@ from kindred.core.simulation_preparation import (
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
+    simulation_failure_detail_text,
     simulation_failure_user_message,
 )
 from kindred.gui.fitting.run_stamp import (
@@ -2607,6 +2608,20 @@ class FittingWindow(QtWidgets.QDialog):
             info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
             for info in (result.dataset_info or [])
         }
+        detail_sections: list[str] = []
+        if getattr(result, "error_diagnostics", None) is not None:
+            detail_text = simulation_failure_detail_text(result.error_diagnostics)
+            if detail_text:
+                detail_sections.append(detail_text)
+        for ds_id, payload in (result.dataset_errors or {}).items():
+            detail_text = simulation_failure_detail_text(payload)
+            if not detail_text:
+                continue
+            label = self._dataset_label_for_id(str(ds_id))
+            detail_sections.append(f"{label}\n{detail_text}")
+        combined_detail = "\n\n---\n\n".join(detail_sections)
+        if combined_detail:
+            logger.warning("%s", combined_detail)
         failure_message = str(result.message or "Unknown error")
         if severity == "ok":
             status = "Global fit complete"
@@ -2621,14 +2636,21 @@ class FittingWindow(QtWidgets.QDialog):
         self._set_running_state(False)
         if self.isVisible() and not self._closing:
             if severity == "ok":
-                QtWidgets.QMessageBox.information(self, title, text)
+                icon = QtWidgets.QMessageBox.Icon.Information
             else:
-                QtWidgets.QMessageBox.warning(self, title, text)
+                icon = QtWidgets.QMessageBox.Icon.Warning
+            dialog = QtWidgets.QMessageBox(self)
+            dialog.setIcon(icon)
+            dialog.setWindowTitle(title)
+            dialog.setText(text)
+            dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+            dialog.setDetailedText(combined_detail)
+            dialog.exec()
 
     def _global_fit_completion_dialog_spec(self, result: GlobalFitResult) -> tuple[str, str, str]:
         """Return (severity, title, text) for the completion dialog."""
         chi_sq = float(getattr(result, "global_chi_squared", float("nan")))
-        dataset_errors = getattr(result, "dataset_errors", None)
+        dataset_errors = getattr(result, "dataset_error_messages", None)
         errors = dict(dataset_errors) if isinstance(dataset_errors, dict) else {}
         dataset_warnings = getattr(result, "dataset_warnings", None)
         warnings = dict(dataset_warnings) if isinstance(dataset_warnings, dict) else {}
@@ -3010,9 +3032,8 @@ class FittingWindow(QtWidgets.QDialog):
             self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
         self._set_running_state(False)
         payload = coerce_simulation_failure(error)
-        context = payload.get("context") if isinstance(payload.get("context"), Mapping) else {}
-        stack_trace = str(context.get("stack_trace") or "")
-        has_stack_trace = bool(stack_trace.strip())
+        stack_trace = simulation_failure_detail_text(payload)
+        has_stack_trace = bool(stack_trace)
         message = simulation_failure_user_message(payload)
         if message:
             logger.warning("Fitting worker reported error: %s", payload)

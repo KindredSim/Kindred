@@ -131,6 +131,14 @@ def simulation_failure_user_message(value: object) -> str:
     return message or "Simulation failed"
 
 
+def simulation_failure_detail_text(value: object) -> str:
+    payload = coerce_simulation_failure(value)
+    context = payload.get("context") if isinstance(payload.get("context"), Mapping) else None
+    if not isinstance(context, Mapping):
+        return ""
+    return str(context.get("stack_trace") or "").strip()
+
+
 def serialize_algebra_error(error: object, *, name: Optional[str] = None) -> Dict[str, Any]:
     context = serialize_error_context(getattr(error, "context", None))
     if context is None:

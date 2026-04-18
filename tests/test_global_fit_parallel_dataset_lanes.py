@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 
 from tests.conftest import CAN_CREATE_PROCESS_POOL, PROCESS_POOL_SKIP_REASON
+from kindred.core.exceptions import ErrorContext, FitSimulationError
+from kindred.core.simulation_failure import build_simulation_failure
 
 
 def _payload(dataset_id: str, y_values) -> object:
@@ -1791,6 +1793,262 @@ def test_marshal_exception_round_trip_populates_stack_trace_for_direct_fit_simul
     assert reconstructed.context.stack_trace
     assert "_explode_value_error" in reconstructed.context.stack_trace
     assert "ValueError: direct branch sentinel" in reconstructed.context.stack_trace
+
+
+def test_dataset_simulation_generic_wrap_preserves_context() -> None:
+    import kindred.core.analysis.global_fitting as global_fitting
+
+    class _ContextCarrierError(RuntimeError):
+        def __init__(self):
+            super().__init__("generic simulation failure")
+            self.context = ErrorContext(line=7, col=3, line_text="A -> B", stack_trace="sim traceback")
+            self.details = {"origin": "generic-sim"}
+            self.failed_params = {"ds1::init:A": 1.25}
+
+    item = _dataset_input(0, "ds1", 1.25)
+
+    def _raise_generic(*_args, **_kwargs):
+        raise _ContextCarrierError()
+
+    original = global_fitting.evaluate_fitting_series
+    global_fitting.evaluate_fitting_series = _raise_generic
+    try:
+        evaluation = global_fitting._evaluate_dataset_simulation(object(), item)
+    finally:
+        global_fitting.evaluate_fitting_series = original
+
+    assert isinstance(evaluation.error, FitSimulationError)
+    assert evaluation.error.context is not None
+    assert evaluation.error.context.line == 7
+    assert evaluation.error.context.col == 3
+    assert evaluation.error.context.line_text == "A -> B"
+    assert evaluation.error.context.stack_trace == "sim traceback"
+    assert evaluation.error.details["origin"] == "generic-sim"
+    assert evaluation.error.failed_params == {"ds1::init:A": 1.25}
+
+
+def test_objective_simulation_error_rewrap_preserves_context() -> None:
+    import kindred.core.analysis.global_fitting as global_fitting
+    from kindred.core.objective import ObjectiveContext
+
+    class _ObjectiveCarrierError(RuntimeError):
+        def __init__(self):
+            super().__init__("evaluation error")
+            self.context = ErrorContext(line=9, col=4, line_text="k1=bad", stack_trace="objective traceback")
+            self.details = {"origin": "objective-sim"}
+
+    payloads = [_payload("ds1", [0.0, 0.0])]
+    layout = global_fitting._build_parameter_layout(
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_variable_params={},
+        bounds=None,
+        log10_params=None,
+    )
+    ctx = ObjectiveContext()
+    objective = global_fitting._GlobalFitObjective(
+        fit_evaluator=object(),
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.25}},
+        weights={"ds1": 1.0},
+        layout=layout,
+        penalty_value=1e6,
+        ctx=ctx,
+        progress_callback=None,
+        cancellation_check=None,
+        process_pool=None,
+    )
+    evaluation = global_fitting._DatasetSimulationEvaluation(
+        index=0,
+        sim_time=None,
+        sim_species={},
+        error=_ObjectiveCarrierError(),
+        error_provenance={"dataset": "ds1"},
+        final_error_message="evaluation error",
+    )
+
+    original = global_fitting._evaluate_dataset_simulations
+    global_fitting._evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
+    try:
+        residuals = objective(layout.x0.copy())
+    finally:
+        global_fitting._evaluate_dataset_simulations = original
+
+    assert residuals.size
+    assert isinstance(ctx.last_error, FitSimulationError)
+    assert ctx.last_error.context is not None
+    assert ctx.last_error.context.line == 9
+    assert ctx.last_error.context.col == 4
+    assert ctx.last_error.context.line_text == "k1=bad"
+    assert ctx.last_error.context.stack_trace == "objective traceback"
+    assert ctx.last_error.details["origin"] == "objective-sim"
+
+
+def test_objective_alignment_rewrap_preserves_context() -> None:
+    import kindred.core.analysis.global_fitting as global_fitting
+    from kindred.core.objective import ObjectiveContext
+
+    payloads = [_payload("ds1", [0.0, 0.0])]
+    layout = global_fitting._build_parameter_layout(
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_variable_params={},
+        bounds=None,
+        log10_params=None,
+    )
+    ctx = ObjectiveContext()
+    objective = global_fitting._GlobalFitObjective(
+        fit_evaluator=object(),
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.25}},
+        weights={"ds1": 1.0},
+        layout=layout,
+        penalty_value=1e6,
+        ctx=ctx,
+        progress_callback=None,
+        cancellation_check=None,
+        process_pool=None,
+    )
+    evaluation = global_fitting._DatasetSimulationEvaluation(
+        index=0,
+        sim_time=np.asarray([0.0, 1.0], dtype=float),
+        sim_species={"A": np.asarray([0.0, 0.0], dtype=float)},
+    )
+    exc = FitSimulationError(
+        "alignment failure",
+        context=ErrorContext(line=11, col=2, line_text="align", stack_trace="alignment traceback"),
+        details={"origin": "alignment"},
+    )
+
+    original_evaluate = global_fitting._evaluate_dataset_simulations
+    original_align = global_fitting._align_series
+    global_fitting._evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
+    global_fitting._align_series = lambda *_args, **_kwargs: (_ for _ in ()).throw(exc)
+    try:
+        residuals = objective(layout.x0.copy())
+    finally:
+        global_fitting._evaluate_dataset_simulations = original_evaluate
+        global_fitting._align_series = original_align
+
+    assert residuals.size
+    assert isinstance(ctx.last_error, FitSimulationError)
+    assert ctx.last_error.context is not None
+    assert ctx.last_error.context.line == 11
+    assert ctx.last_error.context.col == 2
+    assert ctx.last_error.context.line_text == "align"
+    assert ctx.last_error.context.stack_trace == "alignment traceback"
+    assert ctx.last_error.details["origin"] == "alignment"
+
+
+def test_objective_alignment_generic_wrap_preserves_context() -> None:
+    import kindred.core.analysis.global_fitting as global_fitting
+    from kindred.core.objective import ObjectiveContext
+
+    class _AlignmentGenericError(RuntimeError):
+        def __init__(self):
+            super().__init__("alignment runtime failure")
+            self.context = ErrorContext(line=13, col=6, line_text="align generic", stack_trace="generic traceback")
+            self.details = {"origin": "alignment-generic"}
+
+    payloads = [_payload("ds1", [0.0, 0.0])]
+    layout = global_fitting._build_parameter_layout(
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_variable_params={},
+        bounds=None,
+        log10_params=None,
+    )
+    ctx = ObjectiveContext()
+    objective = global_fitting._GlobalFitObjective(
+        fit_evaluator=object(),
+        payloads=payloads,
+        shared_params={"k1": 1.0},
+        dataset_params={"ds1": {"init:A": 1.25}},
+        weights={"ds1": 1.0},
+        layout=layout,
+        penalty_value=1e6,
+        ctx=ctx,
+        progress_callback=None,
+        cancellation_check=None,
+        process_pool=None,
+    )
+    evaluation = global_fitting._DatasetSimulationEvaluation(
+        index=0,
+        sim_time=np.asarray([0.0, 1.0], dtype=float),
+        sim_species={"A": np.asarray([0.0, 0.0], dtype=float)},
+    )
+
+    original_evaluate = global_fitting._evaluate_dataset_simulations
+    original_align = global_fitting._align_series
+    global_fitting._evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
+    global_fitting._align_series = lambda *_args, **_kwargs: (_ for _ in ()).throw(_AlignmentGenericError())
+    try:
+        residuals = objective(layout.x0.copy())
+    finally:
+        global_fitting._evaluate_dataset_simulations = original_evaluate
+        global_fitting._align_series = original_align
+
+    assert residuals.size
+    assert isinstance(ctx.last_error, FitSimulationError)
+    assert ctx.last_error.context is not None
+    assert ctx.last_error.context.line == 13
+    assert ctx.last_error.context.col == 6
+    assert ctx.last_error.context.line_text == "align generic"
+    assert ctx.last_error.context.stack_trace == "generic traceback"
+    assert ctx.last_error.details["origin"] == "alignment-generic"
+
+
+def test_global_fit_result_dataset_error_messages_returns_message_view() -> None:
+    from kindred.core.analysis.global_fitting import GlobalFitResult
+
+    result = GlobalFitResult(
+        success=False,
+        shared_params={"k1": 1.0},
+        dataset_params={"ds1": {}},
+        uncertainties=None,
+        global_chi_squared=1.0,
+        global_r_squared=0.0,
+        dataset_info=[],
+        nfev=1,
+        message="failed",
+        dataset_errors={
+            "ds1": build_simulation_failure(kind="simulation_error", message="first message"),
+            "ds2": build_simulation_failure(kind="preparation_error", message="second message"),
+        },
+    )
+
+    assert result.dataset_error_messages == {
+        "ds1": "first message",
+        "ds2": "Simulation preparation failed:\n\nsecond message",
+    }
+    assert result.dataset_errors["ds1"]["message"] == "first message"
+    assert result.dataset_errors["ds2"]["message"] == "second message"
+
+
+def test_fit_global_routes_last_error_to_error_diagnostics_without_message_suffix() -> None:
+    from kindred.core.api.fitting import fit_global
+
+    datasets = [_raw_dataset("ds1", [0.0, 0.0, 0.0, 0.0])]
+    t = np.asarray(datasets[0]["t"], dtype=float)
+
+    def _sim(_params):
+        return {"t": t, "A": np.array([0.0, np.nan, 0.0, 0.0])}
+
+    result = fit_global(
+        _sim,
+        datasets,
+        shared_params={"k": 0.1},
+        method="trf",
+        max_nfev=10,
+    )
+
+    assert result.error_diagnostics is not None
+    details = result.error_diagnostics.get("details") if isinstance(result.error_diagnostics, dict) else None
+    assert isinstance(details, dict)
+    assert details.get("last_error_dataset") == "ds1"
+    assert "last_error_dataset" not in result.message.lower()
 
 
 def test_marshal_exception_rejects_fit_simulation_error_without_traceback() -> None:

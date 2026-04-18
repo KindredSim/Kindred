@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.simulation_failure import build_simulation_failure
 
 
 pytestmark = [pytest.mark.gui]
@@ -46,7 +47,14 @@ def _make_result(
         message="Optimization terminated successfully.",
     )
     if dataset_errors is not None:
-        result.dataset_errors = dict(dataset_errors)
+        result.dataset_errors = {
+            str(ds_id): (
+                dict(value)
+                if isinstance(value, dict)
+                else build_simulation_failure(kind="simulation_error", message=str(value))
+            )
+            for ds_id, value in dict(dataset_errors).items()
+        }
     return result
 
 

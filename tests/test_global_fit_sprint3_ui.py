@@ -71,11 +71,11 @@ def test_fit_completion_shows_success_popup(qt_app, monkeypatch):
     window = _make_window()
     calls = []
 
-    def _fake_information(parent, title, text, *args, **kwargs):
-        calls.append((str(title), str(text)))
-        return QtWidgets.QMessageBox.StandardButton.Ok
+    def _fake_exec(self):
+        calls.append((str(self.windowTitle()), str(self.text())))
+        return int(QtWidgets.QMessageBox.StandardButton.Ok)
 
-    monkeypatch.setattr(QtWidgets.QMessageBox, "information", _fake_information)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _fake_exec)
     try:
         window.show()
         qt_app.processEvents()
