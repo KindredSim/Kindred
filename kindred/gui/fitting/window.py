@@ -2608,20 +2608,19 @@ class FittingWindow(QtWidgets.QDialog):
             info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
             for info in (result.dataset_info or [])
         }
-        detail_sections: list[str] = []
-        if getattr(result, "error_diagnostics", None) is not None:
-            detail_text = simulation_failure_detail_text(result.error_diagnostics)
-            if detail_text:
-                detail_sections.append(detail_text)
-        for ds_id, payload in (result.dataset_errors or {}).items():
-            detail_text = simulation_failure_detail_text(payload)
+        completion = getattr(result, "completion", None)
+        rendered_detail_sections: list[str] = []
+        for section in list(getattr(completion, "detail_sections", None) or []):
+            detail_text = simulation_failure_detail_text(getattr(section, "failure", None))
             if not detail_text:
                 continue
-            label = self._dataset_label_for_id(str(ds_id))
-            detail_sections.append(f"{label}\n{detail_text}")
-        combined_detail = "\n\n---\n\n".join(detail_sections)
-        if combined_detail:
-            logger.warning("%s", combined_detail)
+            dataset_id = getattr(section, "dataset_id", None)
+            if dataset_id is None:
+                rendered_detail_sections.append(detail_text)
+                continue
+            label = self._dataset_label_for_id(str(dataset_id))
+            rendered_detail_sections.append(f"{label}\n{detail_text}")
+        combined_detail = "\n\n---\n\n".join(rendered_detail_sections)
         failure_message = str(result.message or "Unknown error")
         if severity == "ok":
             status = "Global fit complete"
@@ -2631,6 +2630,8 @@ class FittingWindow(QtWidgets.QDialog):
         else:
             status = f"Global fit failed: {failure_message}"
             logger.warning("Global fit failed: %s", failure_message)
+        if combined_detail:
+            logger.warning("%s", combined_detail)
 
         self._status_label.setText(status)
         self._set_running_state(False)
@@ -2650,23 +2651,28 @@ class FittingWindow(QtWidgets.QDialog):
     def _global_fit_completion_dialog_spec(self, result: GlobalFitResult) -> tuple[str, str, str]:
         """Return (severity, title, text) for the completion dialog."""
         chi_sq = float(getattr(result, "global_chi_squared", float("nan")))
-        dataset_errors = getattr(result, "dataset_error_messages", None)
-        errors = dict(dataset_errors) if isinstance(dataset_errors, dict) else {}
-        dataset_warnings = getattr(result, "dataset_warnings", None)
-        warnings = dict(dataset_warnings) if isinstance(dataset_warnings, dict) else {}
+        completion = getattr(result, "completion", None)
+        status = str(getattr(completion, "status", "ok"))
+        dataset_failures = dict(getattr(completion, "dataset_failures", None) or {})
+        warnings = dict(getattr(completion, "dataset_warnings", None) or {})
+        optimizer_diagnostic = getattr(completion, "optimizer_diagnostic", None)
+        nonfinite_chi = bool(getattr(completion, "nonfinite_metrics", not bool(np.isfinite(chi_sq))))
+        converged = bool(getattr(completion, "optimizer_converged", True))
 
-        nonfinite_chi = not bool(np.isfinite(chi_sq))
-        converged = bool(getattr(result, "success", False))
-
-        if errors or nonfinite_chi:
+        if status == "fail":
             lines: List[str] = []
-            if errors:
-                for ds_id, msg in sorted(errors.items(), key=lambda kv: str(kv[0])):
+            if dataset_failures:
+                for ds_id, diagnostic in sorted(dataset_failures.items(), key=lambda kv: str(kv[0])):
                     label = self._dataset_label_for_id(str(ds_id))
+                    msg = simulation_failure_user_message(getattr(diagnostic, "failure", diagnostic))
                     first_line = str(msg).strip().splitlines()[0] if str(msg).strip() else "Unknown error"
                     lines.append(f"- {label}: {first_line}")
+            elif optimizer_diagnostic is not None:
+                msg = simulation_failure_user_message(getattr(optimizer_diagnostic, "failure", optimizer_diagnostic))
+                first_line = str(msg).strip().splitlines()[0] if str(msg).strip() else "Global fit failed"
+                lines.append(f"- {first_line}")
             else:
-                lines.append("- (No dataset error details provided)")
+                lines.append("- Global fit failed before replay completed.")
 
             if nonfinite_chi:
                 lines.append("")
@@ -2682,6 +2688,11 @@ class FittingWindow(QtWidgets.QDialog):
         warn_lines: List[str] = []
         if not converged:
             warn_lines.append("- Optimizer did not report convergence; results may be suboptimal.")
+        if status == "warn" and optimizer_diagnostic is not None:
+            msg = simulation_failure_user_message(getattr(optimizer_diagnostic, "failure", optimizer_diagnostic))
+            first_line = str(msg).strip().splitlines()[0] if str(msg).strip() else ""
+            if first_line:
+                warn_lines.append(f"- {first_line}")
         if warnings:
             for ds_id, msg in sorted(warnings.items(), key=lambda kv: str(kv[0])):
                 label = self._dataset_label_for_id(str(ds_id))

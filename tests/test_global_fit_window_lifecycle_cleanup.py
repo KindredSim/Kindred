@@ -9,6 +9,7 @@ import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.fitting_completion import FitDetailSection, FitDiagnostic, GlobalFitCompletion
 from kindred.core.simulation_failure import build_simulation_failure
 from kindred.gui.fitting.window import FittingWindow
 
@@ -24,10 +25,61 @@ def _process_deferred_deletes(iterations: int = 5) -> None:
         QtCore.QCoreApplication.processEvents()
 
 
+def _build_completion(
+    *,
+    status: str,
+    optimizer_converged: bool | None = None,
+    nonfinite_metrics: bool = False,
+    optimizer_diagnostic: FitDiagnostic | None = None,
+    dataset_failures: dict[str, FitDiagnostic] | None = None,
+    dataset_warnings: dict[str, str] | None = None,
+    detail_sections: list[FitDetailSection] | None = None,
+) -> GlobalFitCompletion:
+    if optimizer_converged is None:
+        optimizer_converged = status == "ok"
+    return GlobalFitCompletion(
+        status=status,
+        optimizer_converged=optimizer_converged,
+        nonfinite_metrics=nonfinite_metrics,
+        optimizer_diagnostic=optimizer_diagnostic,
+        dataset_failures=dataset_failures or {},
+        dataset_warnings=dataset_warnings or {},
+        detail_sections=detail_sections or [],
+    )
+
+
+def _make_diagnostic(
+    *,
+    phase: str,
+    dataset_id: str | None = None,
+    message: str,
+    stack_trace: str | None = None,
+) -> FitDiagnostic:
+    return FitDiagnostic(
+        phase=phase,
+        dataset_id=dataset_id,
+        failure=build_simulation_failure(
+            kind="simulation_error",
+            message=message,
+            context={"stack_trace": stack_trace} if stack_trace is not None else None,
+        ),
+    )
+
+
+def _make_detail_section(*, dataset_id: str | None = None, message: str, stack_trace: str) -> FitDetailSection:
+    return FitDetailSection(
+        dataset_id=dataset_id,
+        failure=build_simulation_failure(
+            kind="simulation_error",
+            message=message,
+            context={"stack_trace": stack_trace},
+        ),
+    )
+
+
 def _build_success_result(*, dataset_id: str = "ds1", param_name: str = "k", value: float = 1.0) -> GlobalFitResult:
     model = np.asarray([1.0, 0.8, 0.6], dtype=float)
     return GlobalFitResult(
-        success=True,
         shared_params={str(param_name): float(value)},
         dataset_params={str(dataset_id): {}},
         uncertainties=None,
@@ -47,11 +99,30 @@ def _build_success_result(*, dataset_id: str = "ds1", param_name: str = "k", val
         ],
         nfev=1,
         message="ok",
+        completion=_build_completion(status="ok", optimizer_converged=True),
         covariance=None,
         objective_residuals=np.asarray([0.0], dtype=float),
         model_series={str(dataset_id): {"A": model}},
         residual_series={str(dataset_id): {"A": np.asarray([0.0, 0.0, 0.0], dtype=float)}},
     )
+
+
+def _build_completion_result(
+    *,
+    status: str,
+    optimizer_converged: bool | None = None,
+    dataset_id: str = "ds1",
+    param_name: str = "k",
+    value: float = 1.0,
+    message: str | None = None,
+) -> GlobalFitResult:
+    result = _build_success_result(dataset_id=dataset_id, param_name=param_name, value=value)
+    result.message = str(message or ("ok" if status == "ok" else "failed"))
+    result.completion = _build_completion(
+        status=status,
+        optimizer_converged=optimizer_converged,
+    )
+    return result
 
 
 def _build_window() -> FittingWindow:
@@ -141,7 +212,6 @@ def test_global_fit_window_deletes_worker_after_run(qt_app, qtbot):
         assert callable(progress)
         progress(1, 1.0, dict(shared_params))
         return GlobalFitResult(
-            success=True,
             shared_params=dict(shared_params),
             dataset_params={str(datasets[0]["id"]): {}},
             uncertainties=None,
@@ -161,6 +231,7 @@ def test_global_fit_window_deletes_worker_after_run(qt_app, qtbot):
             ],
             nfev=1,
             message="ok",
+            completion=_build_completion(status="ok", optimizer_converged=True),
             covariance=None,
             objective_residuals=np.asarray([0.0], dtype=float),
             model_series={str(datasets[0]["id"]): {"A": y_axis}},
@@ -839,10 +910,14 @@ def test_completion_dialog_uses_instance_message_box_with_error_diagnostics_deta
         window.show()
         qt_app.processEvents()
         result = _build_success_result()
-        result.error_diagnostics = build_simulation_failure(
-            kind="simulation_error",
-            message="top-level boom",
-            context={"stack_trace": "top-level trace"},
+        result.completion = _build_completion(
+            status="ok",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                message="top-level boom",
+                stack_trace="top-level trace",
+            ),
         )
         dialogs: list[dict[str, object]] = []
 
@@ -873,7 +948,7 @@ def test_completion_dialog_uses_instance_message_box_with_error_diagnostics_deta
             {
                 "title": "Optimization Complete",
                 "text": mock.ANY,
-                "details": "top-level trace",
+                "details": "",
                 "icon": QtWidgets.QMessageBox.Icon.Information,
             }
         ]
@@ -927,19 +1002,19 @@ def test_completion_dialog_aggregates_per_dataset_details(qt_app, monkeypatch):
         )
         window.show()
         qt_app.processEvents()
-        result = _build_success_result()
-        result.dataset_errors = {
-            "ds1": build_simulation_failure(
-                kind="simulation_error",
-                message="first",
-                context={"stack_trace": "trace one"},
-            ),
-            "ds2": build_simulation_failure(
-                kind="simulation_error",
-                message="second",
-                context={"stack_trace": "trace two"},
-            ),
-        }
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            dataset_failures={
+                "ds1": _make_diagnostic(phase="final_replay", dataset_id="ds1", message="first", stack_trace="trace one"),
+                "ds2": _make_diagnostic(phase="final_replay", dataset_id="ds2", message="second", stack_trace="trace two"),
+            },
+            detail_sections=[
+                _make_detail_section(dataset_id="ds1", message="first", stack_trace="trace one"),
+                _make_detail_section(dataset_id="ds2", message="second", stack_trace="trace two"),
+            ],
+        )
         dialogs: list[str] = []
 
         def _capture_exec(self):
@@ -966,21 +1041,26 @@ def test_completion_dialog_aggregates_per_dataset_details(qt_app, monkeypatch):
         assert "trace one" in detail_text
         assert "Dataset 2" in detail_text
         assert "trace two" in detail_text
+        assert "suppressed top trace" not in detail_text
         assert "\n\n---\n\n" in detail_text
     finally:
         window.close()
 
 
-def test_completion_dialog_logs_detail_text_once_when_present(qt_app, monkeypatch, caplog):
+def test_completion_dialog_does_not_log_suppressed_top_level_detail_text_on_success(qt_app, monkeypatch, caplog):
     window = _build_window()
     try:
         window.show()
         qt_app.processEvents()
         result = _build_success_result()
-        result.error_diagnostics = build_simulation_failure(
-            kind="simulation_error",
-            message="top-level boom",
-            context={"stack_trace": "logged trace"},
+        result.completion = _build_completion(
+            status="ok",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                message="top-level boom",
+                stack_trace="logged trace",
+            ),
         )
 
         monkeypatch.setattr(
@@ -1003,7 +1083,332 @@ def test_completion_dialog_logs_detail_text_once_when_present(qt_app, monkeypatc
             window._handle_global_fit_complete({"result": result})
 
         messages = [record.getMessage() for record in caplog.records if record.name == "kindred.gui.fitting.window"]
-        assert messages.count("logged trace") == 1
+        assert "logged trace" not in messages
+    finally:
+        window.close()
+
+
+def test_successful_completion_suppresses_top_level_error_diagnostics_logging_and_details(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_success_result()
+        result.completion = _build_completion(
+            status="ok",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                dataset_id="ds1",
+                message="transient probe failure",
+                stack_trace="success trace",
+            ),
+        )
+
+        warning_mock = mock.Mock()
+        dialogs: list[str] = []
+
+        def _capture_exec(self):
+            dialogs.append(self.detailedText())
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr("kindred.gui.fitting.window.logger.warning", warning_mock)
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        assert result.completion.optimizer_diagnostic is not None
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == [""]
+        warning_mock.assert_not_called()
+        assert result.completion.optimizer_diagnostic is not None
+    finally:
+        window.close()
+
+
+def test_warning_completion_labels_top_level_error_diagnostics_when_dataset_error_entry_missing(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window._dataset_entries.append(
+            {
+                "id": "ds_x",
+                "label": "Dataset X",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        )
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="warn", optimizer_converged=False)
+        result.completion = _build_completion(
+            status="warn",
+            optimizer_converged=False,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                dataset_id="ds_x",
+                message="orphan failure",
+                stack_trace="orphan trace",
+            ),
+            detail_sections=[
+                _make_detail_section(dataset_id="ds_x", message="orphan failure", stack_trace="orphan trace"),
+            ],
+        )
+        dialogs: list[dict[str, str]] = []
+
+        def _capture_exec(self):
+            dialogs.append({"title": self.windowTitle(), "details": self.detailedText()})
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == [
+            {
+                "title": "Optimization Complete (Warnings)",
+                "details": "Dataset X\norphan trace",
+            }
+        ]
+    finally:
+        window.close()
+
+
+def test_warning_completion_surfaces_optimizer_diagnostic_message_in_dialog_body(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="warn", optimizer_converged=False)
+        result.completion = _build_completion(
+            status="warn",
+            optimizer_converged=False,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                dataset_id="ds1",
+                message="optimizer step rejected",
+            ),
+        )
+        dialogs: list[dict[str, str]] = []
+
+        def _capture_exec(self):
+            dialogs.append(
+                {
+                    "title": self.windowTitle(),
+                    "text": self.text(),
+                    "details": self.detailedText(),
+                }
+            )
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == [
+            {
+                "title": "Optimization Complete (Warnings)",
+                "text": (
+                    "Final Chi-Squared (\u03c7\u00b2): 1\n\n"
+                    "Fitted Parameters:\n"
+                    "  k = 1\n\n"
+                    "Warnings:\n"
+                    "- Optimizer did not report convergence; results may be suboptimal.\n"
+                    "- optimizer step rejected"
+                ),
+                "details": "",
+            }
+        ]
+    finally:
+        window.close()
+
+
+def test_failed_completion_keeps_top_level_trace_when_matching_dataset_error_has_no_detail(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                dataset_id="ds1",
+                message="top-level failure",
+                stack_trace="top trace",
+            ),
+            dataset_failures={
+                "ds1": _make_diagnostic(phase="final_replay", dataset_id="ds1", message="dataset message only"),
+            },
+            detail_sections=[
+                _make_detail_section(dataset_id="ds1", message="top-level failure", stack_trace="top trace"),
+            ],
+        )
+        dialogs: list[str] = []
+
+        def _capture_exec(self):
+            dialogs.append(self.detailedText())
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == ["Dataset 1\ntop trace"]
+    finally:
+        window.close()
+
+
+def test_failed_completion_keeps_distinct_top_level_trace_for_same_dataset(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                dataset_id="ghost_ds",
+                message="optimizer-time failure",
+                stack_trace="TOP TRACE",
+            ),
+            dataset_failures={
+                "ghost_ds": _make_diagnostic(
+                    phase="final_replay",
+                    dataset_id="ghost_ds",
+                    message="per-dataset failure",
+                    stack_trace="DATASET TRACE",
+                ),
+            },
+            detail_sections=[
+                _make_detail_section(dataset_id="ghost_ds", message="optimizer-time failure", stack_trace="TOP TRACE"),
+                _make_detail_section(dataset_id="ghost_ds", message="per-dataset failure", stack_trace="DATASET TRACE"),
+            ],
+        )
+        dialogs: list[dict[str, object]] = []
+
+        def _capture_exec(self):
+            dialogs.append(
+                {
+                    "title": self.windowTitle(),
+                    "text": self.text(),
+                    "details": self.detailedText(),
+                }
+            )
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == [
+            {
+                "title": "Global Fit Failed",
+                "text": mock.ANY,
+                "details": "ghost_ds\nTOP TRACE\n\n---\n\nghost_ds\nDATASET TRACE",
+            }
+        ]
+    finally:
+        window.close()
+
+
+def test_failed_completion_suppresses_duplicate_top_level_dataset_trace(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window._dataset_entries.append(
+            {
+                "id": "ds_x",
+                "label": "Dataset X",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        )
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="optimizer",
+                dataset_id="ds_x",
+                message="duplicate failure",
+                stack_trace="duplicate trace",
+            ),
+            dataset_failures={
+                "ds_x": _make_diagnostic(
+                    phase="final_replay",
+                    dataset_id="ds_x",
+                    message="duplicate failure",
+                    stack_trace="duplicate trace",
+                ),
+            },
+            detail_sections=[
+                _make_detail_section(dataset_id="ds_x", message="duplicate failure", stack_trace="duplicate trace"),
+            ],
+        )
+        dialogs: list[str] = []
+
+        def _capture_exec(self):
+            dialogs.append(self.detailedText())
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == ["Dataset X\nduplicate trace"]
+    finally:
+        window.close()
+
+
+def test_warning_completion_keeps_unlabeled_top_level_trace_without_dataset_tag(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="warn", optimizer_converged=False)
+        result.completion = _build_completion(
+            status="warn",
+            optimizer_converged=False,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="fatal",
+                message="fatal failure",
+                stack_trace="fatal trace",
+            ),
+            detail_sections=[
+                _make_detail_section(message="fatal failure", stack_trace="fatal trace"),
+            ],
+        )
+        warning_mock = mock.Mock()
+        dialogs: list[dict[str, str]] = []
+
+        def _capture_exec(self):
+            dialogs.append({"title": self.windowTitle(), "details": self.detailedText()})
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr("kindred.gui.fitting.window.logger.warning", warning_mock)
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == [
+            {
+                "title": "Optimization Complete (Warnings)",
+                "details": "fatal trace",
+            }
+        ]
+        assert warning_mock.call_args_list == [
+            mock.call("Global fit completed with warnings: %s", "failed"),
+            mock.call("%s", "fatal trace"),
+        ]
     finally:
         window.close()
 
