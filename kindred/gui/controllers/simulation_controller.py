@@ -29,6 +29,7 @@ from kindred.core.simulation_identity import (
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     is_cancelled_failure,
+    simulation_failure_detail_text,
     simulation_failure_user_message,
 )
 from kindred.core.simulation_preparation import BoundMechanism, SimulationExecutionRequest
@@ -3892,6 +3893,7 @@ class SimulationController(QtCore.QObject):
     ):
         error_payload = coerce_simulation_failure(error_msg)
         error_text = simulation_failure_user_message(error_payload)
+        error_detail_text = simulation_failure_detail_text(error_payload)
         cancelled = is_cancelled_failure(error_payload)
         active_run_id = int(getattr(self, "_active_run_id", 0))
         if run_id is not None and int(run_id) != active_run_id:
@@ -3983,9 +3985,12 @@ class SimulationController(QtCore.QObject):
         self._clear_shutdown_request_after_close_cleanup()
 
         if not cancelled:
+            if error_detail_text:
+                logger.warning("%s", error_detail_text)
             self.ui.dialogs.message_box_critical(
                 "Simulation Error",
                 f"Simulation failed:\n\n{error_text}",
+                details=error_detail_text or None,
             )
             self.ui.run_ui.set_status_text("Simulation failed")
         else:

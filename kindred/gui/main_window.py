@@ -3956,10 +3956,16 @@ class MainWindow(
         QtWidgets.QMessageBox.warning(self, str(title), str(message))
 
     def message_box_critical(self, title: str, message: str, *, details: Optional[str] = None) -> None:
-        full_message = str(message)
-        if details:
-            full_message = f"{full_message}\n\nDetails:\n{details}"
-        QtWidgets.QMessageBox.critical(self, str(title), full_message)
+        if not details:
+            QtWidgets.QMessageBox.critical(self, str(title), str(message))
+            return
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+        dialog.setWindowTitle(str(title))
+        dialog.setText(str(message))
+        dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
+        dialog.setDetailedText(str(details))
+        dialog.exec()
 
     def main_plot(self) -> object:
         return self._plot_tabs._main_plot

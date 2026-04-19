@@ -6670,6 +6670,47 @@ def test_on_simulation_error_non_cancelled_explicit_requeues_preserved_pending_s
 
 
 @pytest.mark.unit
+def test_on_simulation_error_surfaces_stack_trace_as_dialog_details_and_log(
+    caplog, mw: _FakeMainWindow, controller: SimulationController
+):
+    critical = MagicMock()
+    mw.message_box_critical = critical
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True, "request_id": 5}
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+
+    stack_trace = "Traceback line 1\nTraceback line 2"
+
+    with caplog.at_level("WARNING", logger="kindred.gui.controllers.simulation_controller"):
+        controller._on_simulation_error(
+            {
+                "kind": "simulation_error",
+                "message": "solver blew up",
+                "context": {"stack_trace": stack_trace},
+            },
+            run_id=3,
+            fast_mode=True,
+            request_id=5,
+        )
+
+    critical.assert_called_once_with(
+        "Simulation Error",
+        "Simulation failed:\n\nsolver blew up",
+        details=stack_trace,
+    )
+    assert "Traceback" not in critical.call_args.args[1]
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Simulation error surfaced to UI: solver blew up" in messages
+    assert stack_trace in messages
+    assert mw._status_label.text == "Simulation failed"
+    assert mw._sim_progress.value == 0
+    assert mw._run_btn.isEnabled() is True
+    assert mw._stop_btn.isEnabled() is False
+
+
+@pytest.mark.unit
 def test_consume_parallel_batch_future_error_payload_calls_on_error(controller: SimulationController):
     fut: Future = Future()
     fut.set_result(
