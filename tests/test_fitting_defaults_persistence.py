@@ -14,13 +14,12 @@ pytestmark = [pytest.mark.gui]
 
 
 def test_all_fitting_keys_in_project_defaults_and_qsettings_key_map():
-    """All 10 fitting keys exist in both PROJECT_DEFAULTS and QSETTINGS_KEY_MAP."""
+    """All fitting keys exist in both PROJECT_DEFAULTS and QSETTINGS_KEY_MAP."""
     expected_keys = {
         "fitting_method",
         "fitting_max_nfev",
         "fitting_ftol",
         "fitting_xtol",
-        "fitting_parallel_enabled",
         "fitting_use_seed",
         "fitting_seed",
         "fitting_solver",
@@ -56,13 +55,12 @@ def test_three_tier_precedence_user_pref_overrides_factory(qt_app):
 
 
 def test_round_trip_kin_save_load(main_window):
-    """Serialize project, load it back, verify all 10 fitting defaults survive."""
+    """Serialize project, load it back, verify all fitting defaults survive."""
     main_window._fitting_defaults = {
         "fitting_method": "trf",
         "fitting_max_nfev": 500,
         "fitting_ftol": 1e-8,
         "fitting_xtol": 1e-8,
-        "fitting_parallel_enabled": True,
         "fitting_use_seed": False,
         "fitting_seed": 99,
         "fitting_solver": "Radau",
@@ -174,7 +172,6 @@ def test_fitting_defaults_dialog_updates_dialog_managed_keys(qt_app, monkeypatch
             "fitting_max_nfev",
             "fitting_ftol",
             "fitting_xtol",
-            "fitting_parallel_enabled",
             "fitting_use_seed",
             "fitting_seed",
             "fitting_solver",
@@ -217,12 +214,6 @@ def test_fitting_key_to_short_matches_fitting_defaults_keys():
     from kindred.gui.mixins.fitting_mixin import _FITTING_KEY_TO_SHORT
 
     assert set(_FITTING_KEY_TO_SHORT.keys()) == set(FITTING_DEFAULTS_KEYS)
-
-
-def test_parallel_enabled_factory_default_flows_into_session_defaults(main_window):
-    session = main_window._get_fitting_session_defaults()
-    assert PROJECT_DEFAULTS["fitting_parallel_enabled"] is False
-    assert session["parallel_enabled"] is False
 
 
 def test_session_defaults_reads_fitting_defaults_not_user_prefs(main_window):
@@ -393,15 +384,20 @@ def test_document_override_preserved_after_dialog_change(main_window):
 
 def test_partial_document_load_stores_only_present_keys(main_window):
     """Loading a document with only some fitting keys must store only those
-    keys, while _get_fitting_session_defaults still returns all 10 short keys."""
-    # Build a payload that has only 3 of the 10 fitting keys
+    keys, while _get_fitting_session_defaults still returns all short keys."""
+    # Build a payload that has only 3 fitting keys
     payload = main_window._serialize_project_state()
     payload["fitting_method"] = "dogbox"
     payload["fitting_max_nfev"] = 500
     payload["fitting_solver"] = "Radau"
-    # Ensure the other 7 are absent
-    for key in ("fitting_ftol", "fitting_xtol", "fitting_parallel_enabled",
-                "fitting_use_seed", "fitting_seed", "fitting_rtol", "fitting_atol"):
+    for key in (
+        "fitting_ftol",
+        "fitting_xtol",
+        "fitting_use_seed",
+        "fitting_seed",
+        "fitting_rtol",
+        "fitting_atol",
+    ):
         payload.pop(key, None)
 
     main_window._apply_project_payload(payload, record_undo=False)
@@ -410,7 +406,6 @@ def test_partial_document_load_stores_only_present_keys(main_window):
     assert "fitting_max_nfev" in main_window._fitting_defaults
     assert "fitting_solver" in main_window._fitting_defaults
     assert "fitting_ftol" not in main_window._fitting_defaults
-    assert "fitting_parallel_enabled" not in main_window._fitting_defaults
 
     session = main_window._get_fitting_session_defaults()
     from kindred.gui.mixins.fitting_mixin import _FITTING_KEY_TO_SHORT
@@ -420,7 +415,7 @@ def test_partial_document_load_stores_only_present_keys(main_window):
 
 def test_save_load_round_trip_preserves_sparsity(main_window):
     """Saving a project with 3 document overrides and reloading must not
-    inflate _fitting_defaults to all 10 keys."""
+    inflate _fitting_defaults to all fitting keys."""
     main_window._fitting_defaults = {
         "fitting_method": "dogbox",
         "fitting_solver": "Radau",
@@ -442,7 +437,7 @@ def test_save_load_round_trip_preserves_sparsity(main_window):
         "fitting_method", "fitting_solver", "fitting_seed",
     }
 
-    # Session defaults must still return all 10 short keys
+    # Session defaults must still return all short keys
     session = main_window._get_fitting_session_defaults()
     assert session["method"] == "dogbox"
     assert session["solver"] == "Radau"

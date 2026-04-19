@@ -15,7 +15,6 @@ except NotImplementedError:
 import pytest
 
 logger = logging.getLogger(__name__)
-PROCESS_POOL_SKIP_REASON = "sandbox blocks multiprocessing semaphore creation"
 
 def _disable_qdarktheme() -> None:
     # Neuter qdarktheme before any test or fixture constructs a MainWindow.
@@ -35,21 +34,6 @@ if sys.platform.startswith("linux") and multiprocessing is not None:
     except RuntimeError:
         # Start method already set; ignore.
         pass
-
-
-def _can_create_process_pool() -> bool:
-    if multiprocessing is None:
-        return False
-    try:
-        spawn_context = multiprocessing.get_context("spawn")
-        spawn_context.Semaphore(1)
-    except (PermissionError, OSError) as exc:
-        logger.debug("Spawn-context semaphore probe failed: %s", exc, exc_info=True)
-        return False
-    return True
-
-
-CAN_CREATE_PROCESS_POOL = _can_create_process_pool()
 
 
 @pytest.fixture(scope="session")

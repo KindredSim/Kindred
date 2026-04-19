@@ -8,7 +8,6 @@ the fitting window UI implementation.
 from __future__ import annotations
 
 import logging
-import operator
 import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, TypedDict
@@ -69,24 +68,6 @@ class GlobalFitBestUpdatedPayloadV1(TypedDict):
     dataset_stats: Any
 
 
-def _coerce_parallel_worker_count(value: object, *, setting_name: str) -> int:
-    if isinstance(value, bool):
-        raise TypeError(f"{setting_name} must be an integer.")
-    try:
-        worker_count = operator.index(value)
-    except TypeError as exc:
-        raise TypeError(f"{setting_name} must be an integer.") from exc
-    if worker_count < 1:
-        raise ValueError(f"{setting_name} must be at least 1.")
-    return int(worker_count)
-
-
-def _coerce_parallel_blas_flag(value: object, *, setting_name: str) -> bool:
-    if type(value) is not bool:
-        raise TypeError(f"{setting_name} must be a boolean.")
-    return bool(value)
-
-
 class GlobalFitWorker(QtCore.QThread):
     """Worker that drives multi-dataset fitting via an injected fitter."""
 
@@ -109,9 +90,6 @@ class GlobalFitWorker(QtCore.QThread):
         max_nfev: int = 1000,
         ftol: float = 1e-10,
         xtol: float = 1e-10,
-        parallel_enabled: bool = False,
-        max_parallel_workers: int = 1,
-        limit_blas_threads: bool = True,
         seed: Optional[int] = None,
         log10_params: Optional[Dict[str, bool]] = None,
         fit_evaluator: Optional[object] = None,
@@ -159,19 +137,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._max_nfev = max(1, int(max_nfev))
         self._ftol = float(ftol)
         self._xtol = float(xtol)
-        self._parallel_enabled = bool(parallel_enabled)
-        if self._parallel_enabled:
-            self._max_parallel_workers = _coerce_parallel_worker_count(
-                max_parallel_workers,
-                setting_name="max_parallel_workers",
-            )
-            self._limit_blas_threads = _coerce_parallel_blas_flag(
-                limit_blas_threads,
-                setting_name="limit_blas_threads",
-            )
-        else:
-            self._max_parallel_workers = 1
-            self._limit_blas_threads = True
         self._seed = seed
         self._log10_params = {str(k): bool(v) for k, v in (log10_params or {}).items()}
         self._fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator) if fit_evaluator is not None else None
@@ -323,9 +288,6 @@ class GlobalFitWorker(QtCore.QThread):
             max_nfev=self._max_nfev,
             ftol=self._ftol,
             xtol=self._xtol,
-            parallel_enabled=self._parallel_enabled,
-            max_parallel_workers=self._max_parallel_workers,
-            limit_blas_threads=self._limit_blas_threads,
             seed=self._seed,
             log10_params=self._log10_params,
             progress_callback=progress_callback,
@@ -337,17 +299,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._flush_pending_best()
         self.progress.emit(100, "Fit complete")
         return self._build_finished_payload(result)
-
-    def prepare_for_forced_termination(self) -> None:
-        from kindred.core.fitting_process_pool import FittingProcessPool
-
-        outcomes = FittingProcessPool.force_shutdown_registered_pools_for_owner_thread(self._run_thread_ident)
-        for outcome in outcomes:
-            if outcome.has_errors:
-                FittingProcessPool._log_shutdown_outcome_errors(
-                    outcome,
-                    context="forced fit-worker teardown",
-                )
 
     def _build_finished_payload(self, result: "GlobalFitResult") -> GlobalFitFinishedPayloadV1:
         return {

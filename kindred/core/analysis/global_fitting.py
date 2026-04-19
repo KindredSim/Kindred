@@ -13,11 +13,6 @@ from __future__ import annotations
 
 import logging
 import math
-import operator
-import pickle
-import time
-from concurrent.futures import FIRST_COMPLETED, Future, wait
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -36,7 +31,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
-from kindred.core.exceptions import ErrorContext, FittingCancelled, FitSimulationError, SimulationCancelled
+from kindred.core.exceptions import FittingCancelled, FitSimulationError, SimulationCancelled
 from kindred.core.fitting_completion import (
     FitDiagnostic,
     FitDetailSection,
@@ -47,11 +42,9 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-    SerialFittingEvaluator,
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
-from kindred.core.fitting_process_pool import FittingProcessPool
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.simulation_failure import (
     SimulationFailure,
@@ -76,24 +69,6 @@ __all__ = [
 ]
 
 
-def _coerce_parallel_worker_count(value: object, *, setting_name: str) -> int:
-    if isinstance(value, bool):
-        raise TypeError(f"{setting_name} must be an integer.")
-    try:
-        worker_count = operator.index(value)
-    except TypeError as exc:
-        raise TypeError(f"{setting_name} must be an integer.") from exc
-    if worker_count < 1:
-        raise ValueError(f"{setting_name} must be at least 1.")
-    return int(worker_count)
-
-
-def _coerce_parallel_blas_flag(value: object, *, setting_name: str) -> bool:
-    if type(value) is not bool:
-        raise TypeError(f"{setting_name} must be a boolean.")
-    return bool(value)
-
-
 def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
     if cancellation_check is not None and cancellation_check():
         raise FittingCancelled()
@@ -105,57 +80,6 @@ def _raise_if_fitting_cancel_requested(cancellation_check: Optional[Callable[[],
     cancel_requested = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
     if bool(cancel_requested()):
         raise FittingCancelled()
-
-
-class _DatasetLaneCancellation:
-    def __init__(self, cancellation_check: Optional[Callable[[], bool]]) -> None:
-        self._cancellation_check = cancellation_check
-        self._internal_abort = False
-
-    def request_internal_abort(self) -> None:
-        self._internal_abort = True
-
-    def internal_abort_requested(self) -> bool:
-        return bool(self._internal_abort)
-
-    def _kindred_nonblocking_cancelled(self) -> bool:
-        if self._internal_abort:
-            return True
-        if self._cancellation_check is None:
-            return False
-        cancel_requested = getattr(
-            self._cancellation_check,
-            "_kindred_nonblocking_cancelled",
-            self._cancellation_check,
-        )
-        return bool(cancel_requested())
-
-    def __call__(self) -> bool:
-        return self._kindred_nonblocking_cancelled()
-
-    def raise_if_cancel_requested(self) -> None:
-        if self._kindred_nonblocking_cancelled():
-            raise FittingCancelled()
-
-    def submission_paused_requested(self) -> bool:
-        pause_requested = getattr(self._cancellation_check, "_kindred_nonblocking_paused", None)
-        if not callable(pause_requested):
-            self.raise_if_cancel_requested()
-            return False
-        self.raise_if_cancel_requested()
-        return bool(pause_requested())
-
-    def wait_if_submission_paused(self) -> None:
-        if not self.submission_paused_requested():
-            return
-        wait_for_resume = getattr(self._cancellation_check, "_kindred_wait_for_resume", None)
-        while self.submission_paused_requested():
-            self.raise_if_cancel_requested()
-            if callable(wait_for_resume):
-                wait_for_resume(0.05)
-            else:
-                time.sleep(0.01)
-        self.raise_if_cancel_requested()
 
 @dataclass
 class DatasetFitInfo:
@@ -792,7 +716,6 @@ def _evaluate_dataset_simulation(
     item: _ObjectiveDatasetInput,
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
-    lane_cancellation: Optional[_DatasetLaneCancellation] = None,
 ) -> _DatasetSimulationEvaluation:
     ds_id = item.payload.dataset_id
     try:
@@ -842,205 +765,20 @@ def _evaluate_dataset_simulation(
             final_error_message=str(exc),
         )
 
-
-def _error_context_from_process_payload(payload: Optional[Dict[str, Any]]) -> Optional[ErrorContext]:
-    if not isinstance(payload, dict):
-        return None
-    context = ErrorContext(
-        line=payload.get("line"),
-        col=payload.get("col"),
-        line_text=payload.get("line_text"),
-        file_path=payload.get("file_path"),
-        stack_trace=payload.get("stack_trace"),
-    )
-    if (
-        context.line is None
-        and context.col is None
-        and context.line_text is None
-        and context.file_path is None
-        and context.stack_trace is None
-    ):
-        return None
-    return context
-
-
-def _error_from_process_payload(
-    payload: Optional[Dict[str, Any]],
-    *,
-    failed_params: Optional[Dict[str, float]],
-) -> BaseException:
-    if not isinstance(payload, dict):
-        return RuntimeError("Missing process worker error payload.")
-    kind = str(payload.get("kind") or "generic")
-    message = str(payload.get("message") or "Fitting worker failed.")
-    code = payload.get("code")
-    details = dict(payload.get("details") or {})
-    context = _error_context_from_process_payload(payload.get("context"))
-    if kind == "fit_simulation":
-        marshalled_failed_params = dict(payload.get("failed_params") or {})
-        return FitSimulationError(
-            message,
-            failed_params=marshalled_failed_params or dict(failed_params or {}) or None,
-            code=code,
-            details=details,
-            context=context,
-        )
-    if kind == "fitting_cancelled":
-        return FittingCancelled(message, code=code, details=details, context=context)
-    if kind == "simulation_cancelled":
-        return SimulationCancelled(message, code=code, details=details, context=context)
-    return RuntimeError(message)
-
-
-def _dataset_evaluation_from_process_payload(
-    payload: Dict[str, Any],
-    item: _ObjectiveDatasetInput,
-) -> _DatasetSimulationEvaluation:
-    if bool(payload.get("ok")):
-        sim_time, sim_species = _extract_simulation_payload(payload.get("series_payload"))
-        return _DatasetSimulationEvaluation(
-            index=int(payload.get("index", item.index)),
-            sim_time=sim_time,
-            sim_species=sim_species,
-        )
-    error = _error_from_process_payload(
-        payload.get("error"),
-        failed_params=item.failed_param_snapshot,
-    )
-    return _DatasetSimulationEvaluation(
-        index=int(payload.get("index", item.index)),
-        sim_time=None,
-        sim_species={},
-        error=error,
-        error_provenance=dict(payload.get("error_provenance") or {"dataset": item.payload.dataset_id}),
-        final_error_message=str(payload.get("final_error_message") or error),
-    )
-
-
-def _cancel_pending_dataset_evaluations(futures: Sequence[Future]) -> None:
-    for future in futures:
-        # Best-effort queued-only cancellation; running tasks are aborted through the
-        # proxy cancellation event set by process_pool.cancel() and forced termination
-        # during shutdown.
-        future.cancel()
-
-
-def _run_parallel_dataset_lane_batch(
-    items: Sequence[_ObjectiveDatasetInput],
-    *,
-    max_workers: int,
-    lane_cancellation: _DatasetLaneCancellation,
-    stop_on_fatal: bool,
-    submit_item: Callable[[int, _ObjectiveDatasetInput], Future],
-    resolve_result: Callable[[Future, _ObjectiveDatasetInput], _DatasetSimulationEvaluation],
-    abort_backend: Callable[[], None],
-    wait_timeout: Optional[float] = None,
-    should_suppress_exception: Optional[Callable[[Exception], bool]] = None,
-) -> List[_DatasetSimulationEvaluation]:
-    results: List[Optional[_DatasetSimulationEvaluation]] = [None] * len(items)
-    future_to_index: Dict[Future, int] = {}
-    future_to_slot: Dict[Future, int] = {}
-    available_slots: List[int] = list(range(max_workers))
-    next_pos = 0
-    stop_submitting = False
-    batch_aborted = False
-
-    def abort_active_batch() -> None:
-        # Abort has three pieces: mark the lane as internally aborted, cancel queued
-        # futures best-effort, then trigger cooperative cancellation in the process pool.
-        nonlocal batch_aborted
-        if batch_aborted:
-            return
-        batch_aborted = True
-        lane_cancellation.request_internal_abort()
-        _cancel_pending_dataset_evaluations(tuple(future_to_index))
-        abort_backend()
-
-    def submit_next_dataset_lane(slot: int) -> None:
-        nonlocal next_pos
-        lane_cancellation.wait_if_submission_paused()
-        pos = next_pos
-        future = submit_item(int(slot), items[pos])
-        future_to_index[future] = pos
-        future_to_slot[future] = int(slot)
-        next_pos += 1
-
-    try:
-        while next_pos < len(items) and available_slots:
-            submit_next_dataset_lane(available_slots.pop(0))
-
-        while future_to_index:
-            lane_cancellation.raise_if_cancel_requested()
-            if wait_timeout is None:
-                done, _pending = wait(tuple(future_to_index), return_when=FIRST_COMPLETED)
-            else:
-                done, _pending = wait(tuple(future_to_index), timeout=wait_timeout, return_when=FIRST_COMPLETED)
-            if not done:
-                continue
-            for future in done:
-                pos = future_to_index.pop(future)
-                slot = future_to_slot.pop(future)
-                available_slots.append(int(slot))
-                if future.cancelled():
-                    continue
-                try:
-                    result = resolve_result(future, items[pos])
-                    results[pos] = result
-                    lane_cancellation.raise_if_cancel_requested()
-                except Exception as exc:
-                    if should_suppress_exception is not None and should_suppress_exception(exc):
-                        continue
-                    abort_active_batch()
-                    raise
-                if stop_on_fatal and _dataset_evaluation_is_fatal(result):
-                    stop_submitting = True
-                    abort_active_batch()
-                    future_to_index.clear()
-                    future_to_slot.clear()
-                    break
-            available_slots.sort()
-            while not stop_submitting and next_pos < len(items) and available_slots:
-                if lane_cancellation.submission_paused_requested() and future_to_index:
-                    break
-                submit_next_dataset_lane(available_slots.pop(0))
-    except FittingCancelled:
-        abort_active_batch()
-        raise
-    except Exception:
-        abort_active_batch()
-        raise
-
-    return [result for result in results if result is not None]
-
-
 def _evaluate_dataset_simulations(
     fit_evaluator,
     items: Sequence[_ObjectiveDatasetInput],
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     stop_on_fatal: bool = True,
-    process_pool: Optional[FittingProcessPool] = None,
 ) -> List[_DatasetSimulationEvaluation]:
     if not items:
         return []
-    if process_pool is None or len(items) == 1:
-        return _evaluate_dataset_simulations_serial(
-            fit_evaluator,
-            items,
-            cancellation_check=cancellation_check,
-            stop_on_fatal=stop_on_fatal,
-        )
-
-    lane_cancellation = _DatasetLaneCancellation(cancellation_check)
-    return _run_parallel_dataset_lane_batch(
+    return _evaluate_dataset_simulations_serial(
+        fit_evaluator,
         items,
-        max_workers=min(len(items), process_pool.max_workers),
-        lane_cancellation=lane_cancellation,
+        cancellation_check=cancellation_check,
         stop_on_fatal=stop_on_fatal,
-        submit_item=lambda _slot, item: process_pool.submit(item),
-        resolve_result=lambda future, item: _dataset_evaluation_from_process_payload(future.result(), item),
-        abort_backend=process_pool.cancel,
-        wait_timeout=0.05,
     )
 
 
@@ -1079,7 +817,6 @@ class _GlobalFitObjective:
         ctx: ObjectiveContext,
         progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]],
         cancellation_check: Optional[Callable[[], bool]],
-        process_pool: Optional[FittingProcessPool] = None,
     ) -> None:
         self._fit_evaluator = fit_evaluator
         self._payloads = payloads
@@ -1091,7 +828,6 @@ class _GlobalFitObjective:
         self._ctx = ctx
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
-        self._process_pool = process_pool
 
         self._iteration = 0
         self._best_cost = float("inf")
@@ -1184,7 +920,6 @@ class _GlobalFitObjective:
                 self._fit_evaluator,
                 dataset_inputs,
                 cancellation_check=self._cancellation_check,
-                process_pool=self._process_pool,
             )
         }
 
@@ -1447,7 +1182,6 @@ def _assemble_global_fit_result(
     objective_residuals: Optional[np.ndarray],
     uncertainties: Optional[Dict[str, float]],
     optimizer_diagnostic: Optional[FitDiagnostic] = None,
-    process_pool: Optional[FittingProcessPool] = None,
 ) -> GlobalFitResult:
     dataset_info = []
     total_ss_res = 0.0
@@ -1499,7 +1233,6 @@ def _assemble_global_fit_result(
             dataset_inputs,
             cancellation_check=cancellation_check,
             stop_on_fatal=False,
-            process_pool=process_pool,
         )
     }
 
@@ -1846,9 +1579,6 @@ def fit_global(
     max_nfev: int = 1000,
     ftol: float = 1e-10,
     xtol: float = 1e-10,
-    parallel_enabled: bool = False,
-    max_parallel_workers: int = 1,
-    limit_blas_threads: bool = True,
     seed: Optional[int] = None,
     log10_params: Optional[Dict[str, bool]] = None,
     progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]] = None,
@@ -1891,12 +1621,6 @@ def fit_global(
         Optimization method ('trf', 'dogbox', 'lm', 'de')
     max_nfev : int
         Maximum number of function evaluations
-    parallel_enabled : bool
-        When True, allow process-pool dataset evaluation if all other pool gates pass.
-    max_parallel_workers : int
-        Upper bound for dataset-evaluation process workers when parallel fitting is enabled.
-    limit_blas_threads : bool
-        Whether each fitting worker process should limit BLAS threads.
     seed : int, optional
         Random seed for differential evolution (reproducibility).
     log10_params : dict, optional
@@ -2001,35 +1725,10 @@ def fit_global(
 
     ctx = ObjectiveContext()
     fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator)
-    process_pool_context = nullcontext(None)
-    process_payload = None
-    if bool(parallel_enabled) and type(fit_evaluator) is SerialFittingEvaluator and len(payloads) > 1:
-        try:
-            process_payload = fit_evaluator.to_process_payload()
-        except (pickle.PicklingError, TypeError) as exc:
-            logger.warning(
-                "Fitting evaluator payload is not process-picklable; using serial evaluation: %s",
-                exc,
-            )
-        if process_payload is not None:
-            requested_max_workers = _coerce_parallel_worker_count(
-                max_parallel_workers,
-                setting_name="max_parallel_workers",
-            )
-            process_pool_context = FittingProcessPool(
-                process_payload,
-                max_workers=min(len(payloads), requested_max_workers),
-                limit_blas_threads=_coerce_parallel_blas_flag(
-                    limit_blas_threads,
-                    setting_name="limit_blas_threads",
-                ),
-                cancellation_check=cancellation_check,
-            )
 
     objective_impl: Optional[_GlobalFitObjective] = None
     fit_parameters_completed = False
     result_to_return: Optional[GlobalFitResult] = None
-    shutdown_outcome = None
 
     def _failed_result(
         message: str,
@@ -2099,126 +1798,108 @@ def fit_global(
         )
 
     try:
-        with process_pool_context as process_pool:
-            objective_impl = _GlobalFitObjective(
-                fit_evaluator=fit_evaluator,
-                payloads=payloads,
-                shared_params=shared_params,
-                dataset_params=dataset_params_map,
-                weights=weights_norm,
-                layout=layout,
-                penalty_value=penalty_value,
-                ctx=ctx,
-                progress_callback=progress_callback,
-                cancellation_check=cancellation_check,
-                process_pool=process_pool,
-            )
-            objective_wrapper = ObjectiveWrapper(objective_impl, ctx)
+        objective_impl = _GlobalFitObjective(
+            fit_evaluator=fit_evaluator,
+            payloads=payloads,
+            shared_params=shared_params,
+            dataset_params=dataset_params_map,
+            weights=weights_norm,
+            layout=layout,
+            penalty_value=penalty_value,
+            ctx=ctx,
+            progress_callback=progress_callback,
+            cancellation_check=cancellation_check,
+        )
+        objective_wrapper = ObjectiveWrapper(objective_impl, ctx)
 
-            de_penalty = None
-            if method_key == "de":
-                de_penalty = float((float(penalty_value) ** 2) * float(max(1, objective_total_points)))
+        de_penalty = None
+        if method_key == "de":
+            de_penalty = float((float(penalty_value) ** 2) * float(max(1, objective_total_points)))
 
-            fit_result = fit_parameters(
-                objective_wrapper,
-                layout.initial_params(),
-                bounds=layout.bounds_dict(),
-                method=method_key,
-                progress_callback=None,
-                max_nfev=max_nfev,
-                seed=seed,
-                ftol=ftol,
-                xtol=xtol,
-                cancellation_check=cancellation_check,
-                de_penalty=de_penalty,
-            )
-            fit_parameters_completed = True
+        fit_result = fit_parameters(
+            objective_wrapper,
+            layout.initial_params(),
+            bounds=layout.bounds_dict(),
+            method=method_key,
+            progress_callback=None,
+            max_nfev=max_nfev,
+            seed=seed,
+            ftol=ftol,
+            xtol=xtol,
+            cancellation_check=cancellation_check,
+            de_penalty=de_penalty,
+        )
+        fit_parameters_completed = True
 
-            opt_param_keys = layout.opt_param_keys()
-            x_opt = np.asarray([fit_result.parameters[key] for key in opt_param_keys], dtype=float)
-            success = bool(fit_result.success)
-            message = str(fit_result.message)
-            nfev = int(fit_result.nfev)
-            covariance = fit_result.covariance
-            objective_residuals = np.asarray(fit_result.residuals, dtype=float).reshape(-1)
-            optimizer_diagnostic: Optional[FitDiagnostic] = None
+        opt_param_keys = layout.opt_param_keys()
+        x_opt = np.asarray([fit_result.parameters[key] for key in opt_param_keys], dtype=float)
+        success = bool(fit_result.success)
+        message = str(fit_result.message)
+        nfev = int(fit_result.nfev)
+        covariance = fit_result.covariance
+        objective_residuals = np.asarray(fit_result.residuals, dtype=float).reshape(-1)
+        optimizer_diagnostic: Optional[FitDiagnostic] = None
 
-            if getattr(objective_wrapper, "last_error", None) is not None:
-                ds_tag = None
-                prov = getattr(objective_wrapper, "last_error_provenance", None)
-                if isinstance(prov, dict):
-                    ds_tag = prov.get("dataset")
-                if optimizer_diagnostic is None:
-                    optimizer_diagnostic = _build_fit_diagnostic_from_exception(
-                        objective_wrapper.last_error,
-                        phase="optimizer",
-                        dataset_id=str(ds_tag) if ds_tag is not None else None,
-                    )
+        if getattr(objective_wrapper, "last_error", None) is not None:
+            ds_tag = None
+            prov = getattr(objective_wrapper, "last_error_provenance", None)
+            if isinstance(prov, dict):
+                ds_tag = prov.get("dataset")
+            if optimizer_diagnostic is None:
+                optimizer_diagnostic = _build_fit_diagnostic_from_exception(
+                    objective_wrapper.last_error,
+                    phase="optimizer",
+                    dataset_id=str(ds_tag) if ds_tag is not None else None,
+                )
 
-            fitted_params = layout.shared_param_dict_from_vector(x_opt)
+        fitted_params = layout.shared_param_dict_from_vector(x_opt)
 
-            combined_dataset_params: Dict[str, Dict[str, float]] = {
-                payload.dataset_id: dict(dataset_params_map.get(payload.dataset_id, {})) for payload in payloads
-            }
-            for (ds_id, param_name) in layout.dataset_var_order:
-                combined_dataset_params.setdefault(ds_id, {})
-                idx = layout.dataset_var_index[ds_id][param_name]
-                val = float(x_opt[idx])
-                if layout.dataset_var_log10.get((ds_id, param_name)):
-                    combined_dataset_params[ds_id][param_name] = float(10.0 ** val)
-                else:
-                    combined_dataset_params[ds_id][param_name] = val
+        combined_dataset_params: Dict[str, Dict[str, float]] = {
+            payload.dataset_id: dict(dataset_params_map.get(payload.dataset_id, {})) for payload in payloads
+        }
+        for (ds_id, param_name) in layout.dataset_var_order:
+            combined_dataset_params.setdefault(ds_id, {})
+            idx = layout.dataset_var_index[ds_id][param_name]
+            val = float(x_opt[idx])
+            if layout.dataset_var_log10.get((ds_id, param_name)):
+                combined_dataset_params[ds_id][param_name] = float(10.0 ** val)
+            else:
+                combined_dataset_params[ds_id][param_name] = val
 
-            uncertainties = None
-            if covariance is not None:
-                try:
-                    std_devs = np.sqrt(np.diag(covariance))
-                    uncertainties = {}
-                    for i, name in enumerate(layout.param_names):
-                        if i >= int(std_devs.size):
-                            break
-                        std = float(std_devs[i])
-                        if layout.shared_log10.get(name):
-                            x_val = float(fitted_params.get(name, float("nan")))
-                            uncertainties[name] = float(np.log(10.0) * x_val * std)
-                        else:
-                            uncertainties[name] = std
-                except Exception as exc:
-                    logger.debug("Failed to calculate uncertainties: %s", exc)
+        uncertainties = None
+        if covariance is not None:
+            try:
+                std_devs = np.sqrt(np.diag(covariance))
+                uncertainties = {}
+                for i, name in enumerate(layout.param_names):
+                    if i >= int(std_devs.size):
+                        break
+                    std = float(std_devs[i])
+                    if layout.shared_log10.get(name):
+                        x_val = float(fitted_params.get(name, float("nan")))
+                        uncertainties[name] = float(np.log(10.0) * x_val * std)
+                    else:
+                        uncertainties[name] = std
+            except Exception as exc:
+                logger.debug("Failed to calculate uncertainties: %s", exc)
 
-            result_to_return = _assemble_global_fit_result(
-                fit_evaluator=fit_evaluator,
-                payloads=payloads,
-                layout=layout,
-                fitted_params=fitted_params,
-                combined_dataset_params=combined_dataset_params,
-                weights=weights_norm,
-                penalty_value=penalty_value,
-                cancellation_check=cancellation_check,
-                success=success,
-                message=message,
-                nfev=nfev,
-                covariance=covariance,
-                objective_residuals=objective_residuals,
-                uncertainties=uncertainties,
-                optimizer_diagnostic=optimizer_diagnostic,
-                process_pool=process_pool,
-            )
-        shutdown_outcome = getattr(process_pool, "_last_shutdown_outcome", None) if process_pool is not None else None
-        if shutdown_outcome is not None and bool(getattr(shutdown_outcome, "has_errors", False)):
-            shutdown_error_parts = [f"status={shutdown_outcome.status.value}"]
-            if shutdown_outcome.cancel_event_error is not None:
-                shutdown_error_parts.append(f"cancel_event={shutdown_outcome.cancel_event_error}")
-            if shutdown_outcome.executor_shutdown_error is not None:
-                shutdown_error_parts.append(f"executor={shutdown_outcome.executor_shutdown_error}")
-            if shutdown_outcome.manager_shutdown_error is not None:
-                shutdown_error_parts.append(f"manager={shutdown_outcome.manager_shutdown_error}")
-            if shutdown_outcome.termination_errors:
-                labels = ", ".join(label for label, _exc in shutdown_outcome.termination_errors)
-                shutdown_error_parts.append(f"termination={labels}")
-            raise RuntimeError(
-                "Fitting process-pool shutdown reported errors: " + "; ".join(shutdown_error_parts)
-            )
+        result_to_return = _assemble_global_fit_result(
+            fit_evaluator=fit_evaluator,
+            payloads=payloads,
+            layout=layout,
+            fitted_params=fitted_params,
+            combined_dataset_params=combined_dataset_params,
+            weights=weights_norm,
+            penalty_value=penalty_value,
+            cancellation_check=cancellation_check,
+            success=success,
+            message=message,
+            nfev=nfev,
+            covariance=covariance,
+            objective_residuals=objective_residuals,
+            uncertainties=uncertainties,
+            optimizer_diagnostic=optimizer_diagnostic,
+        )
         if result_to_return is None:
             raise RuntimeError("Global fitting did not produce a result.")
         return result_to_return

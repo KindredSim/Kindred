@@ -37,7 +37,6 @@ _FITTING_KEY_TO_SHORT: dict[str, str] = {
     "fitting_max_nfev": "max_nfev",
     "fitting_ftol": "ftol",
     "fitting_xtol": "xtol",
-    "fitting_parallel_enabled": "parallel_enabled",
     "fitting_use_seed": "use_seed",
     "fitting_seed": "seed",
     "fitting_solver": "solver",
@@ -531,10 +530,6 @@ class FittingMixin:
         max_nfev_spin.setValue(int(defaults.get("max_nfev", 1000)))
         algo_layout.addRow("Max evaluations:", max_nfev_spin)
 
-        parallel_enabled_check = QtWidgets.QCheckBox("Enable parallel fitting")
-        parallel_enabled_check.setChecked(bool(defaults.get("parallel_enabled", False)))
-        algo_layout.addRow(parallel_enabled_check)
-
         ftol_edit = QtWidgets.QLineEdit(str(defaults.get("ftol", "1e-10")))
         _ftol_val = setup_scientific_validator(ftol_edit)
         algo_layout.addRow("ftol:", ftol_edit)
@@ -586,7 +581,6 @@ class FittingMixin:
                 "fitting_max_nfev": int(max_nfev_spin.value()),
                 "fitting_ftol": max(safe_float_parse(ftol_edit.text(), 1e-10), 1e-15),
                 "fitting_xtol": max(safe_float_parse(xtol_edit.text(), 1e-10), 1e-15),
-                "fitting_parallel_enabled": bool(parallel_enabled_check.isChecked()),
                 "fitting_use_seed": bool(use_seed_check.isChecked()),
                 "fitting_seed": int(seed_spin.value()),
                 "fitting_solver": solver_combo.currentText(),

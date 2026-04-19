@@ -6,7 +6,6 @@ from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
 class _StuckWorker:
     def __init__(self) -> None:
         self.cancel_called = False
-        self.prepare_for_forced_termination_called = False
         self.request_interruption_called = False
         self.quit_called = False
         self.terminate_called = False
@@ -15,9 +14,6 @@ class _StuckWorker:
 
     def cancel(self) -> None:
         self.cancel_called = True
-
-    def prepare_for_forced_termination(self) -> None:
-        self.prepare_for_forced_termination_called = True
 
     def requestInterruption(self) -> None:
         self.request_interruption_called = True
@@ -44,7 +40,6 @@ def test_fit_worker_stop_policy_escalates_to_terminate_after_timeout():
     outcome = policy.stop_worker(worker, timeout_ms=2000, context="hard_teardown")
 
     assert worker.cancel_called is True
-    assert worker.prepare_for_forced_termination_called is True
     assert worker.wait_calls == [2000, 2000]
     assert worker.terminate_called is True
     assert outcome.used_terminate is True

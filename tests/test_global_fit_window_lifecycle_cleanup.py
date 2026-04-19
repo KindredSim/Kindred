@@ -352,7 +352,6 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
     class _StuckWorker:
         def __init__(self):
             self.cancel_called = False
-            self.prepare_for_forced_termination_called = False
             self.terminate_called = False
             self.wait_calls = []
             self.deleted = False
@@ -364,9 +363,6 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
 
         def cancel(self):
             self.cancel_called = True
-
-        def prepare_for_forced_termination(self):
-            self.prepare_for_forced_termination_called = True
 
         def wait(self, msecs: int | None = None):
             self.wait_calls.append(msecs)
@@ -385,7 +381,6 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
     window.closeEvent(event)
 
     assert stuck.cancel_called is True
-    assert stuck.prepare_for_forced_termination_called is True
     assert stuck.wait_calls and int(stuck.wait_calls[0]) == 2000
     assert stuck.terminate_called is True
     assert stuck.deleted is False

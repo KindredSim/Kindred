@@ -759,7 +759,6 @@ def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and
         "simulation/use_sparse_jacobian": True,
         "simulation/max_parallel_batch_workers": 3,
         "simulation/limit_blas_threads_per_worker": True,
-        "fitting/parallel_enabled": False,
     }.get(key, default)
 
     with patch.object(

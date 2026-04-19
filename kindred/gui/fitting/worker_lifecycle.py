@@ -63,17 +63,6 @@ class FitWorkerStopPolicy:
             return bool(wait_failed)
 
     def terminate_if_needed(self, worker: QtCore.QThread, *, timeout_ms: int, context: str) -> bool:
-        if hasattr(worker, "prepare_for_forced_termination"):
-            try:
-                worker.prepare_for_forced_termination()
-            except Exception as exc:
-                self._record_failure(f"{context}.prepare_for_forced_termination")
-                logger.debug(
-                    "Failed to prepare worker for forced termination during %s: %s",
-                    context,
-                    exc,
-                    exc_info=True,
-                )
         try:
             worker.terminate()
         except Exception as exc:

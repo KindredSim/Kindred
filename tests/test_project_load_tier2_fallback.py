@@ -38,7 +38,6 @@ _FITTING_PREF_VALUES = {
     "fitting_max_nfev": 5000,
     "fitting_ftol": 1e-7,
     "fitting_xtol": 2e-7,
-    "fitting_parallel_enabled": True,
     "fitting_use_seed": False,
     "fitting_seed": 99,
     "fitting_solver": "Radau",
