@@ -9,6 +9,7 @@ This module provides:
 """
 
 import logging
+import traceback
 import numpy as np
 from typing import Any, Dict, Optional
 from PySide6 import QtCore
@@ -27,6 +28,26 @@ from kindred.core.simulation_result_payload import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _formatted_exception_stack_trace(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+
+
+def _failure_payload_with_stack_trace(payload: dict[str, Any], *, exc: BaseException) -> dict[str, Any]:
+    context = payload.get("context")
+    if isinstance(context, dict) and str(context.get("stack_trace") or "").strip():
+        return payload
+
+    stack_trace = _formatted_exception_stack_trace(exc)
+    if not stack_trace:
+        return payload
+
+    enriched_payload = dict(payload)
+    enriched_context = dict(context) if isinstance(context, dict) else {}
+    enriched_context["stack_trace"] = stack_trace
+    enriched_payload["context"] = enriched_context
+    return enriched_payload
 
 
 class SimulationWorker(QtCore.QThread):
@@ -151,10 +172,13 @@ class SimulationWorker(QtCore.QThread):
         except SimulationPreparationError as exc:
             logger.error("Simulation preparation failed (%s): %s", exc.stage, exc, exc_info=True)
             self.error.emit(
-                simulation_failure_from_exception(
-                    exc,
-                    kind="preparation_error",
-                    details={"stage": str(exc.stage or "unknown")},
+                _failure_payload_with_stack_trace(
+                    simulation_failure_from_exception(
+                        exc,
+                        kind="preparation_error",
+                        details={"stage": str(exc.stage or "unknown")},
+                    ),
+                    exc=exc,
                 )
             )
             return None
@@ -339,11 +363,21 @@ class SimulationWorker(QtCore.QThread):
                 return
             except KindredError as exc:
                 logger.error("Simulation failed (%s): %s", exc.code, exc, exc_info=True)
-                self.error.emit(simulation_failure_from_exception(exc))
+                self.error.emit(
+                    _failure_payload_with_stack_trace(
+                        simulation_failure_from_exception(exc),
+                        exc=exc,
+                    )
+                )
                 return
             except Exception as exc:
                 logger.error("Simulation failed: %s", exc, exc_info=True)
-                self.error.emit(simulation_failure_from_exception(exc))
+                self.error.emit(
+                    _failure_payload_with_stack_trace(
+                        simulation_failure_from_exception(exc),
+                        exc=exc,
+                    )
+                )
                 return
 
             if self._cancelled:
@@ -381,10 +415,13 @@ class SimulationWorker(QtCore.QThread):
         except Exception as e:
             logger.error("Unexpected error in simulation worker during %s: %s", stage, e, exc_info=True)
             self.error.emit(
-                simulation_failure_from_exception(
-                    e,
-                    kind="worker_internal_error",
-                    details={"stage": stage},
+                _failure_payload_with_stack_trace(
+                    simulation_failure_from_exception(
+                        e,
+                        kind="worker_internal_error",
+                        details={"stage": stage},
+                    ),
+                    exc=e,
                 )
             )
 

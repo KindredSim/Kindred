@@ -75,6 +75,38 @@ def test_simulation_worker_surfaces_solver_failure(monkeypatch, qtbot):
     assert isinstance(error_payload, dict)
     assert error_payload["kind"] == "simulation_error"
     assert error_payload["message"] == "solver blew up"
+    assert isinstance(error_payload.get("context"), dict)
+    assert "RuntimeError: solver blew up" in str(error_payload["context"].get("stack_trace") or "")
+
+
+def test_simulation_worker_preparation_failure_populates_stack_trace(monkeypatch, qtbot):
+    """Preparation failures should carry stage metadata and traceback detail."""
+    mechanism = "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0"
+
+    monkeypatch.setattr(
+        "kindred.core.simulator.parameter_algebra.apply_parameter_algebra_to_mechanism",
+        lambda *_args, **_kwargs: None,
+    )
+
+    worker = SimulationWorker(
+        mechanism,
+        {"A": 1.0, "B": 0.0},
+        (0.0, 0.5),
+        {"solver": "BDF", "rtol": "bad", "grid": {"N": 10}},
+    )
+
+    with qtbot.waitSignal(worker.error, timeout=3000) as blocker:
+        worker.start()
+
+    worker.wait(1000)
+    error_payload = blocker.args[0]
+    assert isinstance(error_payload, dict)
+    assert error_payload["kind"] == "preparation_error"
+    assert error_payload["details"]["stage"] == "solver_config"
+    assert isinstance(error_payload.get("context"), dict)
+    stack_trace = str(error_payload["context"].get("stack_trace") or "")
+    assert "SimulationPreparationError" in stack_trace
+    assert "could not convert string to float: 'bad'" in stack_trace
 
 
 def test_simulation_worker_cancellation_wires_scipy_terminal_event(monkeypatch, qtbot):

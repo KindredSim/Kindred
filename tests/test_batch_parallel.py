@@ -186,6 +186,8 @@ def test_run_batch_simulation_task_returns_structured_error_payload_on_solver_fa
     assert isinstance(payload.get("error"), dict)
     assert payload["error"]["kind"] == "simulation_error"
     assert payload["error"]["message"] == "solver blew up"
+    assert isinstance(payload["error"].get("context"), dict)
+    assert "RuntimeError: solver blew up" in str(payload["error"]["context"].get("stack_trace") or "")
 
 
 def test_run_batch_simulation_task_uses_shared_preparation_failure_payload_for_invalid_solver_config():
@@ -202,6 +204,10 @@ def test_run_batch_simulation_task_uses_shared_preparation_failure_payload_for_i
     assert payload["success"] is False
     assert payload["error"]["kind"] == "preparation_error"
     assert payload["error"]["details"]["stage"] == "solver_config"
+    assert isinstance(payload["error"].get("context"), dict)
+    stack_trace = str(payload["error"]["context"].get("stack_trace") or "")
+    assert "SimulationPreparationError" in stack_trace
+    assert "could not convert string to float: 'bad'" in stack_trace
 
 
 def test_compute_effective_batch_workers_caps_requested_workers_at_shared_ceiling(monkeypatch):

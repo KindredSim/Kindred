@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import traceback
 from collections import OrderedDict
 from typing import Any, Dict, Mapping, MutableMapping, Tuple
 
@@ -26,6 +27,26 @@ from kindred.core.runtime_defaults import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _formatted_exception_stack_trace(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+
+
+def _failure_payload_with_stack_trace(payload: dict[str, Any], *, exc: BaseException) -> dict[str, Any]:
+    context = payload.get("context")
+    if isinstance(context, dict) and str(context.get("stack_trace") or "").strip():
+        return payload
+
+    stack_trace = _formatted_exception_stack_trace(exc)
+    if not stack_trace:
+        return payload
+
+    enriched_payload = dict(payload)
+    enriched_context = dict(context) if isinstance(context, dict) else {}
+    enriched_context["stack_trace"] = stack_trace
+    enriched_payload["context"] = enriched_context
+    return enriched_payload
 
 __all__ = [
     "BLAS_THREAD_ENV_VARS",
@@ -362,11 +383,14 @@ def run_batch_simulation_task(task: Mapping[str, Any]) -> Dict[str, Any]:
                 "run_id": int(task.get("run_id") or 0),
                 "set_id": str(task.get("set_id") or ""),
                 "set_name": str(task.get("set_name") or ""),
-                "error": build_simulation_failure(
-                    "preparation_error",
-                    str(exc),
-                    details={"stage": str(exc.stage or "unknown")},
-                    exc_type=exc.__class__.__name__,
+                "error": _failure_payload_with_stack_trace(
+                    build_simulation_failure(
+                        "preparation_error",
+                        str(exc),
+                        details={"stage": str(exc.stage or "unknown")},
+                        exc_type=exc.__class__.__name__,
+                    ),
+                    exc=exc,
                 ),
             }
         return {
@@ -374,5 +398,8 @@ def run_batch_simulation_task(task: Mapping[str, Any]) -> Dict[str, Any]:
             "run_id": int(task.get("run_id") or 0),
             "set_id": str(task.get("set_id") or ""),
             "set_name": str(task.get("set_name") or ""),
-            "error": simulation_failure_from_exception(exc),
+            "error": _failure_payload_with_stack_trace(
+                simulation_failure_from_exception(exc),
+                exc=exc,
+            ),
         }
