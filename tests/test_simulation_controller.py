@@ -4,6 +4,7 @@ from contextlib import suppress
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import SimpleQueue
+import warnings
 from typing import Any, Callable, Optional
 from unittest.mock import MagicMock, call
 
@@ -833,6 +834,194 @@ def test_cleanup_worker_safely_defers_qthread_deletion_until_finished(controller
     assert worker._delete_later_called is False
     assert worker.deleteLater in worker.finished._handlers
     assert send_called["n"] == 0
+
+
+@pytest.mark.unit
+def test_release_current_simulation_worker_skips_unregistered_qt_signal_disconnect_warning(
+    controller: SimulationController,
+):
+    worker = _QtSignalWorker(running=True)
+    controller._simulation_worker = worker
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        controller._release_current_simulation_worker()
+
+    warning_messages = [str(item.message) for item in recorded]
+    assert not [message for message in warning_messages if "Failed to disconnect" in message]
+    assert controller._simulation_worker is None
+    assert controller._retained_simulation_workers == [worker]
+
+
+@pytest.mark.unit
+def test_cleanup_worker_safely_disconnects_registered_qt_signal_handlers_without_warning(
+    controller: SimulationController,
+    monkeypatch,
+):
+    worker = _QtSignalWorker(running=False)
+    progress = MagicMock()
+    complete = MagicMock()
+    error = MagicMock()
+    controller.on_simulation_progress = progress
+    controller.on_simulation_complete = complete
+    controller.on_simulation_error = error
+    monkeypatch.setattr(controller, "_delete_worker_if_stopped", MagicMock())
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=7,
+        fast_mode=False,
+        request_id=11,
+        set_name="set1",
+        set_id="id1",
+        cache_key="ck",
+    )
+
+    worker.progress.emit(10, "running")
+    worker.result_ready.emit({"payload": True})
+    worker.error.emit({"kind": "failure"})
+
+    assert progress.call_count == 1
+    assert complete.call_count == 1
+    assert error.call_count == 1
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        controller._cleanup_worker_safely(worker, "simulation worker")
+
+    warning_messages = [str(item.message) for item in recorded]
+    assert not [message for message in warning_messages if "Failed to disconnect" in message]
+    assert getattr(worker, "_kindred_controller_worker_signal_handlers", ()) == ()
+    controller._delete_worker_if_stopped.assert_called_once_with(worker, "simulation worker")
+
+    worker.progress.emit(20, "after")
+    worker.result_ready.emit({"payload": False})
+    worker.error.emit({"kind": "ignored"})
+
+    assert progress.call_count == 1
+    assert complete.call_count == 1
+    assert error.call_count == 1
+
+
+@pytest.mark.unit
+def test_disconnect_simulation_worker_application_signals_preserves_failed_runtime_disconnects(
+    controller: SimulationController,
+):
+    class _Signal:
+        def __init__(self, *, raise_runtimeerror: bool = False) -> None:
+            self.raise_runtimeerror = bool(raise_runtimeerror)
+            self.handlers: list[Callable[..., Any]] = []
+
+        def connect(self, handler: Callable[..., Any]) -> None:
+            self.handlers.append(handler)
+
+        def disconnect(self, handler: Callable[..., Any]) -> None:
+            if self.raise_runtimeerror:
+                raise RuntimeError("disconnect failed")
+            self.handlers.remove(handler)
+
+        def emit(self, *args: Any) -> None:
+            for handler in tuple(self.handlers):
+                handler(*args)
+
+    class _Worker:
+        def __init__(self) -> None:
+            self.progress = _Signal(raise_runtimeerror=True)
+            self.result_ready = _Signal()
+            self.error = _Signal()
+
+    worker = _Worker()
+    progress = MagicMock()
+    complete = MagicMock()
+    error = MagicMock()
+    controller.on_simulation_progress = progress
+    controller.on_simulation_complete = complete
+    controller.on_simulation_error = error
+    controller._record_nonfatal_exception = MagicMock()
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=7,
+        fast_mode=False,
+        request_id=11,
+        set_name="set1",
+        set_id="id1",
+        cache_key="ck",
+    )
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        controller._disconnect_simulation_worker_application_signals(worker)
+
+    remaining = getattr(worker, "_kindred_controller_worker_signal_handlers", ())
+    assert len(remaining) == 1
+    assert remaining[0][0] == "progress"
+    controller._record_nonfatal_exception.assert_called_once()
+
+    warning_messages = [str(item.message) for item in recorded]
+    assert not [message for message in warning_messages if "Failed to disconnect" in message]
+
+    worker.progress.emit(20, "done")
+    worker.result_ready.emit({"payload": False})
+    worker.error.emit({"kind": "ignored"})
+
+    assert progress.call_count == 1
+    assert complete.call_count == 0
+    assert error.call_count == 0
+
+
+@pytest.mark.unit
+def test_connect_simulation_worker_application_signals_preserves_tracked_disconnect_failures_on_reconnect(
+    controller: SimulationController,
+):
+    class _Signal:
+        def __init__(self, *, raise_runtimeerror: bool = False) -> None:
+            self.raise_runtimeerror = bool(raise_runtimeerror)
+            self.handlers: list[Callable[..., Any]] = []
+
+        def connect(self, handler: Callable[..., Any]) -> None:
+            self.handlers.append(handler)
+
+        def disconnect(self, handler: Callable[..., Any]) -> None:
+            if self.raise_runtimeerror:
+                raise RuntimeError("disconnect failed")
+            self.handlers.remove(handler)
+
+    class _Worker:
+        def __init__(self) -> None:
+            self.progress = _Signal(raise_runtimeerror=True)
+            self.result_ready = _Signal()
+            self.error = _Signal()
+
+    worker = _Worker()
+    controller._record_nonfatal_exception = MagicMock()
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=7,
+        fast_mode=False,
+        request_id=11,
+        set_name="set1",
+        set_id="id1",
+        cache_key="ck",
+    )
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=8,
+        fast_mode=False,
+        request_id=12,
+        set_name="set2",
+        set_id="id2",
+        cache_key="ck2",
+    )
+
+    connections = getattr(worker, "_kindred_controller_worker_signal_handlers", ())
+    names = [signal_name for signal_name, _handler in connections]
+    assert names.count("progress") == 2
+    assert names.count("result_ready") == 1
+    assert names.count("error") == 1
+    controller._record_nonfatal_exception.assert_called_once()
 
 
 @pytest.mark.unit

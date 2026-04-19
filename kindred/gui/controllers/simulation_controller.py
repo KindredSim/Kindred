@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["SimulationController"]
 
+_WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR = "_kindred_controller_worker_signal_handlers"
+
 
 def _try_float(value: object) -> Optional[float]:
     try:
@@ -924,14 +926,7 @@ class SimulationController(QtCore.QObject):
         )
 
         if should_disconnect_application_signals:
-            # Disconnect SimulationWorker application-level signals safely. Do
-            # not disconnect native QThread completion signals used for
-            # lifecycle hooks.
-            for signal_name in ("progress", "result_ready", "error"):
-                if hasattr(worker, signal_name):
-                    signal = getattr(worker, signal_name)
-                    with suppress(TypeError):
-                        signal.disconnect()
+            self._disconnect_simulation_worker_application_signals(worker)
 
         if still_running:
             finished_signal = None
@@ -969,6 +964,66 @@ class SimulationController(QtCore.QObject):
         self._cleanup_worker_safely(worker, "simulation worker", retain_if_running=True)
         if getattr(self, "_simulation_worker", None) is worker:
             self._simulation_worker = None
+
+    def _connect_simulation_worker_application_signals(
+        self,
+        worker,
+        *,
+        run_id: int,
+        fast_mode: bool,
+        request_id: int,
+        set_name: str,
+        set_id: str,
+        cache_key: str,
+    ) -> None:
+        if worker is None:
+            return
+        self._disconnect_simulation_worker_application_signals(worker)
+        connected_handlers = list(getattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, ()) or ())
+        progress_handler = self.on_simulation_progress
+
+        def result_handler(payload, _rid=run_id, _fast=bool(fast_mode), _req=int(request_id), _set=set_name, _sid=set_id, _key=cache_key):
+            return self.on_simulation_complete(
+                payload, run_id=_rid, fast_mode=_fast, request_id=_req, batch_set=_set, batch_set_id=_sid, cache_key=_key
+            )
+
+        def error_handler(msg, _rid=run_id, _fast=bool(fast_mode), _req=int(request_id), _set=set_name, _sid=set_id, _key=cache_key):
+            return self.on_simulation_error(
+                msg, run_id=_rid, fast_mode=_fast, request_id=_req, batch_set=_set, batch_set_id=_sid, cache_key=_key
+            )
+
+        for signal_name, handler in (
+            ("progress", progress_handler),
+            ("result_ready", result_handler),
+            ("error", error_handler),
+        ):
+            signal = getattr(worker, signal_name, None)
+            if signal is None or not hasattr(signal, "connect"):
+                continue
+            signal.connect(handler)
+            connected_handlers.append((signal_name, handler))
+        setattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, tuple(connected_handlers))
+
+    def _disconnect_simulation_worker_application_signals(self, worker) -> None:
+        if worker is None:
+            return
+        connections = tuple(getattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, ()) or ())
+        remaining_connections: list[tuple[str, Any]] = []
+        for signal_name, handler in connections:
+            signal = getattr(worker, signal_name, None)
+            if signal is None or not hasattr(signal, "disconnect"):
+                continue
+            try:
+                signal.disconnect(handler)
+            except TypeError:
+                continue
+            except RuntimeError as exc:
+                remaining_connections.append((signal_name, handler))
+                self._record_nonfatal_exception(
+                    f"Failed to disconnect tracked simulation worker {signal_name} handler",
+                    exc,
+                )
+        setattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, tuple(remaining_connections))
 
     def _effective_batch_worker_count(self, num_sets: int) -> int:
         return int(
@@ -2328,16 +2383,14 @@ class SimulationController(QtCore.QObject):
         if isinstance(execution_request, dict):
             self._simulation_worker._execution_request = dict(execution_request)  # type: ignore[attr-defined]
 
-        self._simulation_worker.progress.connect(self.on_simulation_progress)
-        self._simulation_worker.result_ready.connect(
-            lambda payload, _rid=run_id, _fast=bool(fast_mode), _req=int(request_id), _set=set_name, _sid=set_id, _key=cache_key: self.on_simulation_complete(
-                payload, run_id=_rid, fast_mode=_fast, request_id=_req, batch_set=_set, batch_set_id=_sid, cache_key=_key
-            )
-        )
-        self._simulation_worker.error.connect(
-            lambda msg, _rid=run_id, _fast=bool(fast_mode), _req=int(request_id), _set=set_name, _sid=set_id, _key=cache_key: self.on_simulation_error(
-                msg, run_id=_rid, fast_mode=_fast, request_id=_req, batch_set=_set, batch_set_id=_sid, cache_key=_key
-            )
+        self._connect_simulation_worker_application_signals(
+            self._simulation_worker,
+            run_id=int(run_id),
+            fast_mode=bool(fast_mode),
+            request_id=int(request_id),
+            set_name=str(set_name),
+            set_id=str(set_id),
+            cache_key=str(cache_key),
         )
 
         total = len(queue_ids)

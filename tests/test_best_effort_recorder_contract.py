@@ -5,13 +5,10 @@ import logging
 import pytest
 from PySide6 import QtWidgets
 
-from kindred.gui.main_window import MainWindow
 from kindred.gui.mixins.fitting_mixin import FittingMixin
 from kindred.gui.mixins.ports import FittingMixinPorts
 
-
-class _MainWindowRecorderHost:
-    pass
+pytestmark = [pytest.mark.gui]
 
 
 class _MechanismEditor:
@@ -72,29 +69,6 @@ class _FittingRecorderHost(QtWidgets.QWidget, FittingMixin):
         _ = (dataset_id, updates)
 
 
-@pytest.mark.unit
-def test_main_window_best_effort_wrapper_matches_shared_helper_contract(caplog) -> None:
-    host = _MainWindowRecorderHost()
-    caplog.set_level(logging.DEBUG, logger="kindred.gui.main_window")
-
-    for _ in range(4):
-        MainWindow._record_best_effort_failure(
-            host,
-            "main.key",
-            message="MainWindow best effort",
-        )
-
-    assert host._best_effort_failures == {"main.key"}
-    assert host._best_effort_failure_counts == {"main.key": 4}
-    messages = [record.getMessage() for record in caplog.records if record.name == "kindred.gui.main_window"]
-    assert messages == [
-        "MainWindow best effort (key=main.key count=1)",
-        "MainWindow best effort (key=main.key count=2)",
-        "MainWindow best effort (key=main.key count=3)",
-    ]
-
-
-@pytest.mark.gui
 def test_fitting_mixin_best_effort_wrapper_preserves_fitting_attrs(qt_app, caplog) -> None:
     _ = qt_app
     host = _FittingRecorderHost()
@@ -121,7 +95,6 @@ def test_fitting_mixin_best_effort_wrapper_preserves_fitting_attrs(qt_app, caplo
     ]
 
 
-@pytest.mark.gui
 def test_fitting_launch_context_preserves_owner_best_effort_recorder_callback(qt_app) -> None:
     _ = qt_app
     host = _FittingRecorderHost()

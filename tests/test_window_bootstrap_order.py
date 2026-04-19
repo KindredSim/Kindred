@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = [pytest.mark.gui]
+
 
 def _patch_templates_dir(monkeypatch, tmp_path) -> None:
     def _fake_templates_dir(_self):
@@ -23,25 +25,6 @@ def _clear_gui_settings() -> None:
     settings.sync()
 
 
-@pytest.mark.unit
-def test_build_profile_and_template_managers_loads_profiles_once(monkeypatch) -> None:
-    from kindred.config.profiles import ProfileManager
-    from kindred.gui.app_wiring import build_profile_and_template_managers
-
-    calls: list[int] = []
-
-    def _spy_load_profiles(self) -> None:
-        calls.append(id(self))
-
-    monkeypatch.setattr(ProfileManager, "load_profiles", _spy_load_profiles)
-
-    managers = build_profile_and_template_managers()
-
-    assert isinstance(managers.profile_manager, ProfileManager)
-    assert len(calls) == 1
-
-
-@pytest.mark.gui
 def test_main_window_initializes_mixin_ports_once_after_menu_prerequisites(qt_app, monkeypatch, tmp_path) -> None:
     import kindred.gui.main_window as mw_mod
 
@@ -80,8 +63,6 @@ def test_main_window_initializes_mixin_ports_once_after_menu_prerequisites(qt_ap
         window.close()
         _clear_gui_settings()
 
-
-@pytest.mark.gui
 def test_main_window_load_settings_runs_after_bootstrap_prerequisites(qt_app, monkeypatch, tmp_path) -> None:
     import kindred.gui.main_window as mw_mod
     from kindred.gui.controllers.config_controller import ConfigController

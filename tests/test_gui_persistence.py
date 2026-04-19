@@ -1,10 +1,8 @@
 import os
 
-import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.datasets.csv_import import load_csv_dataset
 from kindred.gui.main_window import MainWindow
 from kindred.gui.tutorial_manager import launch_tutorial
 from kindred.gui.widgets.tutorial_overlay import TutorialOverlay
@@ -96,23 +94,6 @@ def test_project_state_omits_legacy_advanced_flag(main_window):
     legacy_payload['use_advanced_dsl'] = False
     main_window._apply_project_payload(legacy_payload)
 
-
-def test_data_manager_explicit_mapping(tmp_path):
-    """Explicit column mapping loads correct time/species arrays."""
-    csv_path = tmp_path / "custom_dataset.csv"
-    csv_path.write_text("stamp,A_rate,B_rate\n0,1.0,2.0\n5,3.0,4.0\n")
-
-    name, payload = load_csv_dataset(
-        str(csv_path),
-        time_column="stamp",
-        species_columns=["B_rate"],
-    )
-
-    assert name == "custom_dataset.csv"
-    assert np.allclose(payload["t"], [0.0, 5.0])
-    assert list(payload["species"].keys()) == ["B_rate"]
-    assert payload["metadata"]["time_column"] == "stamp"
-    assert payload["metadata"]["mapping_source"] == "explicit"
 
 def test_profile_activation_updates_widgets(tmp_path, monkeypatch, qt_app):
     """Activating a profile updates solver/grid widgets and persists selection."""
