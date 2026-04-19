@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from kindred.core.fitting_completion import FitDiagnostic, GlobalFitCompletion
 from kindred.core.simulation_failure import build_simulation_failure
 
 
@@ -45,7 +46,6 @@ def test_completion_dialog_spec_reports_failure_when_chi2_nonfinite_or_errors(qt
         qt_app.processEvents()
 
         result = GlobalFitResult(
-            success=True,
             shared_params={"k1": 0.2},
             dataset_params={},
             uncertainties=None,
@@ -65,11 +65,18 @@ def test_completion_dialog_spec_reports_failure_when_chi2_nonfinite_or_errors(qt
             ],
             nfev=1,
             message="fake",
-        )
-        setattr(
-            result,
-            "dataset_errors",
-            {"ds1": build_simulation_failure(kind="simulation_error", message="outside model range")},
+            completion=GlobalFitCompletion(
+                status="fail",
+                optimizer_converged=True,
+                nonfinite_metrics=True,
+                dataset_failures={
+                    "ds1": FitDiagnostic(
+                        phase="final_replay",
+                        dataset_id="ds1",
+                        failure=build_simulation_failure(kind="simulation_error", message="outside model range"),
+                    )
+                },
+            ),
         )
 
         severity, title, text = window._global_fit_completion_dialog_spec(result)
@@ -79,7 +86,6 @@ def test_completion_dialog_spec_reports_failure_when_chi2_nonfinite_or_errors(qt
         assert "outside model range" in text.lower()
 
         result2 = GlobalFitResult(
-            success=True,
             shared_params={"k1": 0.2},
             dataset_params={},
             uncertainties=None,
@@ -88,8 +94,12 @@ def test_completion_dialog_spec_reports_failure_when_chi2_nonfinite_or_errors(qt
             dataset_info=[],
             nfev=1,
             message="fake",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
         )
-        setattr(result2, "dataset_errors", {})
         severity2, title2, text2 = window._global_fit_completion_dialog_spec(result2)
         assert severity2 == "ok"
         assert "complete" in title2.lower()

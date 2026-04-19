@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from kindred.core.fitting_completion import GlobalFitCompletion
 
 pytestmark = [pytest.mark.gui]
 
@@ -43,7 +44,6 @@ def test_completion_dialog_spec_warns_when_alignment_has_approximations(qt_app):
         qt_app.processEvents()
 
         result = GlobalFitResult(
-            success=True,
             shared_params={"k1": 0.2},
             dataset_params={},
             uncertainties=None,
@@ -63,9 +63,13 @@ def test_completion_dialog_spec_warns_when_alignment_has_approximations(qt_app):
             ],
             nfev=1,
             message="fake",
+            completion=GlobalFitCompletion(
+                status="warn",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+                dataset_warnings={"ds1": "X alignment required approximations"},
+            ),
         )
-        setattr(result, "dataset_errors", {})
-        setattr(result, "dataset_warnings", {"ds1": "X alignment required approximations"})
 
         severity, title, text = window._global_fit_completion_dialog_spec(result)
         assert severity == "warn"

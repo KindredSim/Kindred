@@ -73,7 +73,7 @@ def test_parametric_x_alignment_failure_yields_finite_penalty_and_failed_result(
     assert float(np.max(np.abs(residuals))) > 1.0
 
     assert np.isfinite(float(result.global_chi_squared))
-    assert result.success is True
-    assert getattr(result, "dataset_errors", {}) == {}
-    warnings = getattr(result, "dataset_warnings", {}) or {}
+    assert result.completion.status == "warn"
+    assert dict(result.completion.dataset_failures) == {}
+    warnings = dict(result.completion.dataset_warnings)
     assert "ds1" in warnings

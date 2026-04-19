@@ -81,10 +81,10 @@ def test_global_fit_parametric_x_penalized_mapping_produces_warnings_not_errors(
     )
 
     assert bool(np.isfinite(float(result.global_chi_squared)))
-    assert getattr(result, "dataset_errors", {}) == {}
+    assert dict(result.completion.dataset_failures) == {}
 
-    warnings = getattr(result, "dataset_warnings", None)
-    assert isinstance(warnings, dict) and warnings, "Expected alignment warnings when crossings are impossible."
+    warnings = dict(result.completion.dataset_warnings)
+    assert warnings, "Expected alignment warnings when crossings are impossible."
     assert "ds1" in warnings
 
     residuals = np.asarray(result.objective_residuals, dtype=float).reshape(-1)

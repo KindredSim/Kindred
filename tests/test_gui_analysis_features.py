@@ -13,6 +13,7 @@ from kindred.core.analysis.global_fitting import (  # noqa: E402  # reason: guar
     DatasetFitInfo,
     GlobalFitResult,
 )
+from kindred.core.fitting_completion import GlobalFitCompletion  # noqa: E402  # reason: guarded by pytest.importorskip("scipy")
 
 
 @pytest.fixture(scope="session")
@@ -61,7 +62,6 @@ def test_global_fit_handler_invokes_backend(monkeypatch, analysis_window):
     panel._datasets["exp2.csv"] = dataset
 
     _ = GlobalFitResult(
-        success=True,
         shared_params={"k": 0.21},
         dataset_params={},
         uncertainties=None,
@@ -81,6 +81,11 @@ def test_global_fit_handler_invokes_backend(monkeypatch, analysis_window):
         ],
         nfev=12,
         message="ok",
+        completion=GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=False,
+        ),
         covariance=None,
     )
 
@@ -400,7 +405,6 @@ def test_fitting_window_applies_dataset_initial_updates(qapp):
     )
 
     result = GlobalFitResult(
-        success=True,
         shared_params={"k": 0.25},
         dataset_params={"ds1": {"init:A": 0.6}, "ds2": {"init:A": 1.6}},
         uncertainties=None,
@@ -430,6 +434,11 @@ def test_fitting_window_applies_dataset_initial_updates(qapp):
         ],
         nfev=10,
         message="ok",
+        completion=GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=False,
+        ),
         covariance=None,
         objective_residuals=np.zeros(10),
         model_series={

@@ -169,22 +169,39 @@ class DatasetManager:
         ordered_dataset_ids = dataset_ids if dataset_ids is not None else model_series.keys()
         updated = False
         for dataset_id in ordered_dataset_ids:
+            dataset_name = str(dataset_id)
+            ds_entry = self._dataset_views.get(dataset_name)
             model_map = model_series.get(dataset_id, {})
             if not model_map:
+                if ds_entry is None:
+                    continue
+                self._clear_fit_result_view(ds_entry)
+                self._update_dataset_plot(dataset_name)
+                updated = True
                 continue
-            ds_entry = self._ensure_dataset_view_entry(str(dataset_id))
             if ds_entry is None:
-                continue
+                ds_entry = self._ensure_dataset_view_entry(dataset_name)
+                if ds_entry is None:
+                    continue
             self._apply_fit_result_view(
                 ds_entry,
                 model_map,
-                dataset_stats=(dataset_stats or {}).get(str(dataset_id)),
+                dataset_stats=(dataset_stats or {}).get(dataset_name),
             )
-            self._update_dataset_plot(str(dataset_id))
+            self._update_dataset_plot(dataset_name)
             updated = True
 
         if updated:
             self._refresh_dataset_grid()
+
+    @staticmethod
+    def _clear_fit_result_view(entry: Dict[str, Any]) -> None:
+        entry["visible_species"] = None
+        entry["model_x"] = None
+        entry["model_y"] = None
+        entry["model_series"] = None
+        entry["chi_squared"] = None
+        entry["r_squared"] = None
 
     def datasets_mapped_to_batch_sets(
         self, *, set_ids: Sequence[str], set_names: Sequence[str]

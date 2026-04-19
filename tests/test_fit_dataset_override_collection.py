@@ -7,6 +7,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     FitDatasetVariableParamSpec,
 )
 from kindred.core.analysis.global_fitting import GlobalFitResult
+from kindred.core.fitting_completion import GlobalFitCompletion
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp
 
@@ -53,7 +54,6 @@ def test_global_fit_worker_accepts_typed_dataset_overrides():
         captured["dataset_params"] = kwargs.get("dataset_params")
         captured["dataset_variable_params"] = kwargs.get("dataset_variable_params")
         return GlobalFitResult(
-            success=True,
             shared_params={"k": 0.2},
             dataset_params={"ds1": {"init:A": 1.0, "init:B": 0.2}},
             uncertainties=None,
@@ -62,6 +62,11 @@ def test_global_fit_worker_accepts_typed_dataset_overrides():
             dataset_info=[],
             nfev=1,
             message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
             model_series={"ds1": {}},
             residual_series={"ds1": {}},
         )

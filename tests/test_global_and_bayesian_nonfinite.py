@@ -113,10 +113,10 @@ def test_global_fit_penalty_on_nonfinite_dataset():
     assert result.objective_residuals is not None
     assert result.objective_residuals.shape == (expected_len,)
     assert np.all(np.isfinite(result.objective_residuals))
-    assert result.error_diagnostics is not None
-    details = result.error_diagnostics.get("details") if isinstance(result.error_diagnostics, dict) else None
-    assert isinstance(details, dict)
-    assert details.get("last_error_dataset") == "bad"
+    diagnostic = result.completion.optimizer_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.dataset_id == "bad"
+    assert diagnostic.phase == "optimizer"
     assert "last_error_dataset" not in result.message.lower()
 
 
@@ -384,7 +384,7 @@ def test_fit_global_shared_serial_evaluator_survives_nonfinite_least_squares_pro
 
     assert np.allclose(seen["nonfinite_residuals"], np.full(2, 1e6, dtype=float))
     assert np.all(np.isfinite(seen["finite_residuals"]))
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert result.message == "ok"
     assert result.objective_residuals is not None
     assert np.all(np.isfinite(result.objective_residuals))
@@ -455,7 +455,7 @@ def test_fit_global_shared_serial_evaluator_fails_on_nonfinite_dataset_override(
         max_nfev=5,
     )
 
-    assert result.success is False
+    assert result.completion.status == "fail"
     assert "non-finite parameter value" in result.message.lower()
     assert result.objective_residuals is not None
     assert result.objective_residuals.size == 0
@@ -501,7 +501,7 @@ def test_fit_global_shared_serial_evaluator_ignores_nonfinite_unconsumed_dataset
         max_nfev=5,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert result.message == "ok"
     assert result.objective_residuals is not None
     assert np.all(np.isfinite(result.objective_residuals))

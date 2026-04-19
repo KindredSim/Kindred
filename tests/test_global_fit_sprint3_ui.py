@@ -4,6 +4,7 @@ import pytest
 from PySide6 import QtWidgets
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.fitting_completion import GlobalFitCompletion
 from kindred.gui.fitting.window import FittingWindow
 
 
@@ -16,7 +17,6 @@ def _make_success_result(*, chi_sq: float = 1.234) -> GlobalFitResult:
     model = np.linspace(1.0, 0.4, t.size)
     residual = model - y
     return GlobalFitResult(
-        success=True,
         shared_params={"k1": 1.23},
         dataset_params={"ds1": {"init:A": 2.0}},
         uncertainties=None,
@@ -36,6 +36,11 @@ def _make_success_result(*, chi_sq: float = 1.234) -> GlobalFitResult:
         ],
         nfev=10,
         message="ok",
+        completion=GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=not bool(np.isfinite(float(chi_sq))),
+        ),
         covariance=None,
         objective_residuals=residual.copy(),
         model_series={"ds1": {"A": model.copy()}},

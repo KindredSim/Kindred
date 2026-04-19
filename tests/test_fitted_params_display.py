@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.fitting_completion import FitDiagnostic, GlobalFitCompletion
 from kindred.core.simulation_failure import build_simulation_failure
 
 
@@ -24,8 +25,40 @@ def _make_result(
     dataset_errors=None,
 ):
     """Build a minimal GlobalFitResult with the given parameters."""
+    dataset_failures = {}
+    if dataset_errors is not None:
+        dataset_failures = {
+            str(ds_id): FitDiagnostic(
+                phase="final_replay",
+                dataset_id=str(ds_id),
+                failure=(
+                    dict(value)
+                    if isinstance(value, dict)
+                    else build_simulation_failure(kind="simulation_error", message=str(value))
+                ),
+            )
+            for ds_id, value in dict(dataset_errors).items()
+        }
+    if dataset_failures:
+        completion = GlobalFitCompletion(
+            status="fail",
+            optimizer_converged=bool(success),
+            nonfinite_metrics=not bool(np.isfinite(float(chi_squared))),
+            dataset_failures=dataset_failures,
+        )
+    elif success:
+        completion = GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=not bool(np.isfinite(float(chi_squared))),
+        )
+    else:
+        completion = GlobalFitCompletion(
+            status="warn",
+            optimizer_converged=False,
+            nonfinite_metrics=not bool(np.isfinite(float(chi_squared))),
+        )
     result = GlobalFitResult(
-        success=success,
         shared_params=shared_params or {},
         dataset_params=dataset_params or {},
         uncertainties=None,
@@ -45,16 +78,8 @@ def _make_result(
         ],
         nfev=42,
         message="Optimization terminated successfully.",
+        completion=completion,
     )
-    if dataset_errors is not None:
-        result.dataset_errors = {
-            str(ds_id): (
-                dict(value)
-                if isinstance(value, dict)
-                else build_simulation_failure(kind="simulation_error", message=str(value))
-            )
-            for ds_id, value in dict(dataset_errors).items()
-        }
     return result
 
 

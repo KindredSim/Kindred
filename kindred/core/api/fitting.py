@@ -13,8 +13,22 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+    from kindred.core.fitting_completion import (
+        FitDetailSection,
+        FitDiagnostic,
+        FitDiagnosticRemediation,
+        GlobalFitCompletion,
+    )
 
-__all__ = ["fit_global", "GlobalFitResult", "DatasetFitInfo"]
+__all__ = [
+    "fit_global",
+    "GlobalFitResult",
+    "DatasetFitInfo",
+    "GlobalFitCompletion",
+    "FitDiagnostic",
+    "FitDiagnosticRemediation",
+    "FitDetailSection",
+]
 
 
 def fit_global(
@@ -68,6 +82,20 @@ def __getattr__(name: str):
         from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
 
         return {"GlobalFitResult": GlobalFitResult, "DatasetFitInfo": DatasetFitInfo}[name]
+    if name in {"GlobalFitCompletion", "FitDiagnostic", "FitDiagnosticRemediation", "FitDetailSection"}:
+        from kindred.core.fitting_completion import (
+            FitDetailSection,
+            FitDiagnostic,
+            FitDiagnosticRemediation,
+            GlobalFitCompletion,
+        )
+
+        return {
+            "GlobalFitCompletion": GlobalFitCompletion,
+            "FitDiagnostic": FitDiagnostic,
+            "FitDiagnosticRemediation": FitDiagnosticRemediation,
+            "FitDetailSection": FitDetailSection,
+        }[name]
     raise AttributeError(name)
 
 

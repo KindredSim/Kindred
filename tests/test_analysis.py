@@ -49,7 +49,7 @@ class TestGlobalFitting:
         result = fit_global(simulate, datasets, shared_params, bounds=bounds, max_nfev=500)
 
         assert isinstance(result, GlobalFitResult)
-        assert result.success
+        assert result.completion.status == 'ok'
         assert 0.45 < result.shared_params['k'] < 0.55  # Close to true value 0.5
         assert result.global_r_squared > 0.9
         assert len(result.dataset_info) == 2
@@ -90,7 +90,7 @@ class TestGlobalFitting:
             max_nfev=500
         )
 
-        assert result.success
+        assert result.completion.status == 'ok'
         assert 0.4 < result.shared_params['k'] < 0.6
 
     def test_global_fit_differential_evolution(self):
@@ -115,7 +115,7 @@ class TestGlobalFitting:
             seed=7,
         )
 
-        assert result.success
+        assert result.completion.status == 'ok'
         assert 0.4 < result.shared_params['k'] < 0.5
         assert result.objective_residuals is not None
 
@@ -202,7 +202,7 @@ class TestGlobalFitting:
             dataset_variable_params=dataset_variable_params,
         )
 
-        assert result.success
+        assert result.completion.status == 'ok'
         assert pytest.approx(result.shared_params['k'], rel=1e-2) == 0.4
         assert pytest.approx(result.dataset_params['ds1']['init:A'], rel=1e-2) == 1.0
         assert pytest.approx(result.dataset_params['ds2']['init:A'], rel=1e-2) == 2.0
@@ -238,7 +238,7 @@ class TestGlobalFitting:
             max_nfev=200,
         )
 
-        assert result.success
+        assert result.completion.status == 'ok'
         assert pytest.approx(result.shared_params['k'], rel=1e-2) == true_k
         assert result.dataset_info[0].n_points == t_dataset.size * 2
         assert result.dataset_info[0].residuals.shape[0] == t_dataset.size * 2
@@ -269,7 +269,7 @@ class TestGlobalFitting:
             max_nfev=200,
         )
 
-        assert result.success
+        assert result.completion.status == 'ok'
         assert pytest.approx(result.shared_params['k'], rel=1e-2) == true_k
         info_map = {info.dataset_id: info for info in result.dataset_info}
         assert info_map['fit_A'].n_points == t_axis.size
@@ -350,7 +350,7 @@ class TestGlobalFitting:
             method=method,
             max_nfev=200,
         )
-        assert result.success
+        assert result.completion.status == 'ok'
 
 
 class TestCaching:
@@ -517,4 +517,4 @@ class TestEdgeCases:
         result = fit_global(broken_simulate, datasets, {'k': 1.0}, max_nfev=10)
 
         # Should handle gracefully
-        assert not result.success or result.global_chi_squared == np.inf
+        assert result.completion.status == 'fail' or result.global_chi_squared == np.inf

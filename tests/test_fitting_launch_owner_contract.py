@@ -431,7 +431,7 @@ def test_fitting_package_launch_owner_routes_multi_dataset_gui_fit_to_process_po
         qtbot.waitUntil(lambda: eager_window._last_result is not None, timeout=5000)
         result = eager_window._last_result
 
-        assert result.success is True
+        assert result.completion.status == "ok"
         assert state["objective_calls"] == 2
         assert len(selection["ids"]) == 2
         assert captured["worker_fit_evaluator"] is fit_evaluator

@@ -10,6 +10,8 @@ import pytest
 
 from tests.conftest import CAN_CREATE_PROCESS_POOL, PROCESS_POOL_SKIP_REASON
 from kindred.core.exceptions import ErrorContext, FitSimulationError
+from kindred.core.fitting_completion import FitDetailSection, FitDiagnostic, GlobalFitCompletion
+from kindred.core.fitting_optimization import FitResult
 from kindred.core.simulation_failure import build_simulation_failure
 
 
@@ -1795,17 +1797,17 @@ def test_marshal_exception_round_trip_populates_stack_trace_for_direct_fit_simul
     assert "ValueError: direct branch sentinel" in reconstructed.context.stack_trace
 
 
-def test_dataset_simulation_generic_wrap_preserves_context() -> None:
+def test_dataset_simulation_generic_wrap_prefers_inner_snapshot_when_sources_disagree_and_preserves_context() -> None:
     import kindred.core.analysis.global_fitting as global_fitting
 
     class _ContextCarrierError(RuntimeError):
         def __init__(self):
             super().__init__("generic simulation failure")
             self.context = ErrorContext(line=7, col=3, line_text="A -> B", stack_trace="sim traceback")
-            self.details = {"origin": "generic-sim"}
+            self.details = {"origin": "generic-sim", "parameters": {"ds1::init:A": 9.99}}
             self.failed_params = {"ds1::init:A": 1.25}
 
-    item = _dataset_input(0, "ds1", 1.25)
+    item = _dataset_input(0, "ds1", 2.0)
 
     def _raise_generic(*_args, **_kwargs):
         raise _ContextCarrierError()
@@ -1824,7 +1826,51 @@ def test_dataset_simulation_generic_wrap_preserves_context() -> None:
     assert evaluation.error.context.line_text == "A -> B"
     assert evaluation.error.context.stack_trace == "sim traceback"
     assert evaluation.error.details["origin"] == "generic-sim"
+    assert item.failed_param_snapshot == {"init:A": 2.0}
     assert evaluation.error.failed_params == {"ds1::init:A": 1.25}
+    assert "parameters" not in evaluation.error.details
+
+
+def test_fit_global_serial_generic_wrap_uses_outer_candidate_snapshot_when_inner_snapshot_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kindred.core.analysis.global_fitting as global_fitting
+
+    def _fake_fit_parameters(*_args, **_kwargs) -> FitResult:
+        return FitResult(
+            success=True,
+            parameters={"k": 0.75, "ds1::init:A": 1.25},
+            uncertainties=None,
+            chi_squared=1.0,
+            r_squared=0.0,
+            residuals=np.asarray([0.0], dtype=float),
+            nfev=1,
+            message="ok",
+            covariance=None,
+        )
+
+    def _raise_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("generic simulation failure without snapshot")
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
+    monkeypatch.setattr(global_fitting, "evaluate_fitting_series", _raise_runtime_error)
+
+    result = global_fitting.fit_global(
+        lambda _params: {"t": np.asarray([0.0, 1.0], dtype=float), "A": np.asarray([1.0, 1.0], dtype=float)},
+        datasets=[_raw_dataset("ds1", [1.0, 0.8])],
+        shared_params={"k": 0.2},
+        dataset_variable_params={
+            "ds1": {"init:A": {"initial": 0.3, "min": 0.1, "max": 3.0}},
+        },
+        max_nfev=1,
+    )
+
+    assert result.completion.status == "fail"
+    assert result.completion.dataset_failures["ds1"].parameter_snapshot == {
+        "k": pytest.approx(0.75),
+        "ds1::init:A": pytest.approx(1.25),
+    }
+    assert "parameters" not in result.completion.dataset_failures["ds1"].failure.get("details", {})
 
 
 def test_objective_simulation_error_rewrap_preserves_context() -> None:
@@ -2000,11 +2046,10 @@ def test_objective_alignment_generic_wrap_preserves_context() -> None:
     assert ctx.last_error.details["origin"] == "alignment-generic"
 
 
-def test_global_fit_result_dataset_error_messages_returns_message_view() -> None:
+def test_global_fit_result_completion_keeps_dataset_failures_without_message_view_duplication() -> None:
     from kindred.core.analysis.global_fitting import GlobalFitResult
 
     result = GlobalFitResult(
-        success=False,
         shared_params={"k1": 1.0},
         dataset_params={"ds1": {}},
         uncertainties=None,
@@ -2013,21 +2058,41 @@ def test_global_fit_result_dataset_error_messages_returns_message_view() -> None
         dataset_info=[],
         nfev=1,
         message="failed",
-        dataset_errors={
-            "ds1": build_simulation_failure(kind="simulation_error", message="first message"),
-            "ds2": build_simulation_failure(kind="preparation_error", message="second message"),
-        },
+        completion=GlobalFitCompletion(
+            status="fail",
+            optimizer_converged=True,
+            nonfinite_metrics=False,
+            dataset_failures={
+                "ds1": FitDiagnostic(
+                    phase="final_replay",
+                    dataset_id="ds1",
+                    failure=build_simulation_failure(kind="simulation_error", message="first message"),
+                ),
+                "ds2": FitDiagnostic(
+                    phase="final_replay",
+                    dataset_id="ds2",
+                    failure=build_simulation_failure(kind="preparation_error", message="second message"),
+                ),
+            },
+            detail_sections=[
+                FitDetailSection(
+                    dataset_id="ds1",
+                    failure=build_simulation_failure(kind="simulation_error", message="first message"),
+                ),
+                FitDetailSection(
+                    dataset_id="ds2",
+                    failure=build_simulation_failure(kind="preparation_error", message="second message"),
+                ),
+            ],
+        ),
     )
 
-    assert result.dataset_error_messages == {
-        "ds1": "first message",
-        "ds2": "Simulation preparation failed:\n\nsecond message",
-    }
-    assert result.dataset_errors["ds1"]["message"] == "first message"
-    assert result.dataset_errors["ds2"]["message"] == "second message"
+    assert result.completion.dataset_failures["ds1"].failure["message"] == "first message"
+    assert result.completion.dataset_failures["ds2"].failure["message"] == "second message"
+    assert not hasattr(result, "dataset_error_messages")
 
 
-def test_fit_global_routes_last_error_to_error_diagnostics_without_message_suffix() -> None:
+def test_fit_global_routes_last_error_to_optimizer_diagnostic_without_message_suffix() -> None:
     from kindred.core.api.fitting import fit_global
 
     datasets = [_raw_dataset("ds1", [0.0, 0.0, 0.0, 0.0])]
@@ -2044,10 +2109,10 @@ def test_fit_global_routes_last_error_to_error_diagnostics_without_message_suffi
         max_nfev=10,
     )
 
-    assert result.error_diagnostics is not None
-    details = result.error_diagnostics.get("details") if isinstance(result.error_diagnostics, dict) else None
-    assert isinstance(details, dict)
-    assert details.get("last_error_dataset") == "ds1"
+    assert result.completion.optimizer_diagnostic is not None
+    assert result.completion.optimizer_diagnostic.dataset_id == "ds1"
+    assert result.completion.optimizer_diagnostic.remediation == "generic_retry"
+    assert "parameters" not in result.completion.optimizer_diagnostic.failure.get("details", {})
     assert "last_error_dataset" not in result.message.lower()
 
 
@@ -2271,7 +2336,7 @@ def test_fit_global_uses_process_pool_for_multi_dataset_serial_fitting_evaluator
         cancellation_check=cancellation_check,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert len(pools) == 1
     assert pools[0].max_workers == 2
     assert pools[0].limit_blas_threads is False
@@ -2362,7 +2427,7 @@ def test_fit_global_parallel_disabled_by_default_stays_in_process(monkeypatch) -
         max_nfev=1,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
 
 
 def test_fit_global_parallel_disabled_explicitly_stays_in_process(monkeypatch) -> None:
@@ -2400,7 +2465,7 @@ def test_fit_global_parallel_disabled_explicitly_stays_in_process(monkeypatch) -
         limit_blas_threads=True,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
 
 
 def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_process(monkeypatch, caplog) -> None:
@@ -2455,7 +2520,7 @@ def test_fit_global_serial_fitting_evaluator_with_unpicklable_payload_stays_in_p
         limit_blas_threads=True,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert "pickl" in caplog.text.lower()
 
 
@@ -2494,7 +2559,7 @@ def test_fit_global_single_dataset_serial_fitting_evaluator_stays_in_process(mon
         limit_blas_threads=True,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
 
 
 def test_fit_global_custom_evaluator_stays_in_process(monkeypatch) -> None:
@@ -2534,7 +2599,7 @@ def test_fit_global_custom_evaluator_stays_in_process(monkeypatch) -> None:
         limit_blas_threads=True,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert state["base_calls"] == 2
 
 
@@ -2577,7 +2642,7 @@ def test_fit_global_serial_fitting_evaluator_subclass_stays_in_process(monkeypat
         limit_blas_threads=True,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
 
 
 @pytest.mark.gui

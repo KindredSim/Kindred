@@ -84,7 +84,7 @@ def test_global_fit_targets_algebra_observable_series_shared_scalar(monkeypatch)
     datasets = [{"id": "ds1", "t": t_exp, "y": y_exp, "species": "signal"}]
 
     result = fit_global(prepared, datasets, {"a": 2.0}, method="lm", max_nfev=2)
-    assert result.success
+    assert result.completion.status == "ok"
     assert result.objective_residuals is not None
     assert np.all(np.isfinite(result.objective_residuals))
 
@@ -146,6 +146,6 @@ def test_global_fit_targets_algebra_observable_series_per_dataset_scalar(monkeyp
         method="lm",
         max_nfev=2,
     )
-    assert result.success
+    assert result.completion.status == "ok"
     assert result.objective_residuals is not None
     assert np.all(np.isfinite(result.objective_residuals))

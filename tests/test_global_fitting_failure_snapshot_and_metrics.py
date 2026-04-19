@@ -6,13 +6,21 @@ import pytest
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.global_fitting import (
     _build_parameter_layout,
+    _build_completion_detail_sections,
+    _completion_result_message,
     _GlobalFitObjective,
     _normalize_weights,
     fit_global,
 )
+from kindred.core.fitting_completion import FitDiagnostic, GlobalFitCompletion
 from kindred.core.fitting_evaluation import CallableFittingEvaluator
 from kindred.core.objective import ObjectiveContext
 from kindred.core.exceptions import FitSimulationError
+from kindred.core.simulation_failure import build_simulation_failure
+from kindred.core.simulation_preparation import (
+    SimulationPreparationError,
+    _fit_simulation_error_from_preparation_error,
+)
 
 
 pytestmark = [pytest.mark.unit]
@@ -82,10 +90,270 @@ def test_failed_result_preserves_namespaced_dataset_variable_params(monkeypatch)
         max_nfev=1,
     )
 
-    assert result.success is False
+    assert result.completion.status == "fail"
     assert result.shared_params["k"] == pytest.approx(0.75)
     assert result.dataset_params["ds1"]["init:A"] == pytest.approx(1.25)
     assert result.dataset_params["ds2"]["init:A"] == pytest.approx(2.5)
+
+
+def test_failed_result_preserves_preparation_failure_semantics_and_remediation(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+
+    def _fake_fit_parameters(*_args, **_kwargs):
+        raise _fit_simulation_error_from_preparation_error(
+            SimulationPreparationError("parameter_algebra", "undefined symbol k_total")
+        )
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        lambda _params: {"t": np.asarray([0.0, 1.0], dtype=float), "A": np.asarray([1.0, 1.0], dtype=float)},
+        datasets=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0], dtype=float), "y": np.asarray([1.0, 0.8], dtype=float), "species": "A"},
+        ],
+        shared_params={"k": 0.2},
+        max_nfev=1,
+    )
+
+    assert result.completion.status == "fail"
+    assert result.completion.nonfinite_metrics is False
+    assert result.completion.optimizer_diagnostic is not None
+    assert result.completion.optimizer_diagnostic.failure["kind"] == "preparation_error"
+    assert result.completion.optimizer_diagnostic.failure["details"]["stage"] == "parameter_algebra"
+    assert result.completion.optimizer_diagnostic.remediation == "preparation"
+
+
+def test_global_fit_fail_message_overrides_optimizer_success_text_when_final_replay_fails() -> None:
+    t = np.linspace(0.0, 1.0, 4, dtype=float)
+
+    def _sim(_params):
+        return {"t": t, "A": np.asarray([0.0, np.nan, 0.0, 0.0], dtype=float)}
+
+    result = fit_global(
+        _sim,
+        datasets=[
+            {"id": "ds1", "t": t.copy(), "y": np.zeros_like(t), "species": "A"},
+        ],
+        shared_params={"k": 0.1},
+        method="trf",
+        max_nfev=10,
+    )
+
+    assert result.completion.status == "fail"
+    assert result.message != "Optimization terminated successfully."
+    assert "failed" in result.message.lower()
+
+
+def test_transient_optimizer_error_does_not_leave_false_warn_completion(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    def _fake_fit_parameters(objective_func, initial_params, **_kwargs):
+        objective_func(np.asarray([float("nan")], dtype=float))
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="Optimization terminated successfully.",
+            covariance=None,
+        )
+
+    def _sim(params):
+        t = np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float)
+        k = float(params["k"])
+        if not np.isfinite(k):
+            return {"t": t, "A": np.asarray([0.0, np.nan, 0.0, 0.0], dtype=float)}
+        return {"t": t, "A": np.zeros_like(t)}
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _sim,
+        datasets=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float), "y": np.zeros(4, dtype=float), "species": "A"},
+        ],
+        shared_params={"k": 0.1},
+        method="trf",
+        max_nfev=3,
+    )
+
+    assert result.completion.status == "ok"
+    assert result.completion.optimizer_diagnostic is None
+    assert result.message == "Optimization terminated successfully."
+
+
+def test_warn_message_is_not_success_like_when_warning_source_is_real(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    def _fake_fit_parameters(objective_func, initial_params, **_kwargs):
+        objective_func(np.asarray([float("nan")], dtype=float))
+        return FitResult(
+            success=False,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(4, dtype=float),
+            nfev=1,
+            message="Optimization terminated successfully.",
+            covariance=None,
+        )
+
+    def _sim(params):
+        t = np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float)
+        k = float(params["k"])
+        if not np.isfinite(k):
+            return {"t": t, "A": np.asarray([0.0, np.nan, 0.0, 0.0], dtype=float)}
+        return {"t": t, "A": np.zeros_like(t)}
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
+
+    result = global_fitting.fit_global(
+        _sim,
+        datasets=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float), "y": np.zeros(4, dtype=float), "species": "A"},
+        ],
+        shared_params={"k": 0.1},
+        method="trf",
+        max_nfev=3,
+    )
+
+    assert result.completion.status == "warn"
+    assert result.completion.optimizer_diagnostic is not None
+    assert result.message != "Optimization terminated successfully."
+    assert "warning" in result.message.lower()
+
+
+def test_transient_optimizer_error_does_not_leak_into_real_warning_completion(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    def _fake_fit_parameters(objective_func, initial_params, **_kwargs):
+        objective_func(np.asarray([float("nan")], dtype=float))
+        return FitResult(
+            success=True,
+            parameters=dict(initial_params),
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(6, dtype=float),
+            nfev=1,
+            message="Optimization terminated successfully.",
+            covariance=None,
+        )
+
+    def _sim(params):
+        t_sim = np.linspace(0.0, 1.0, 101, dtype=float)
+        k = float(params["k"])
+        if not np.isfinite(k):
+            return {"t": t_sim, "species": {"X": t_sim.copy(), "Y": np.full_like(t_sim, np.nan)}}
+        return {"t": t_sim, "species": {"X": t_sim.copy(), "Y": np.zeros_like(t_sim)}}
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
+
+    t_obs = np.linspace(0.0, 1.0, 6, dtype=float)
+    x_obs = np.full_like(t_obs, 10.0, dtype=float)
+    result = global_fitting.fit_global(
+        _sim,
+        datasets=[
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": np.zeros((1, t_obs.size), dtype=float),
+                "species": ["Y"],
+                "x_name": "X",
+                "x_obs": x_obs.copy(),
+                "x_mapping_mode": "auto",
+            }
+        ],
+        shared_params={"k": 0.1},
+        method="trf",
+        max_nfev=3,
+    )
+
+    assert result.completion.status == "warn"
+    assert result.completion.optimizer_diagnostic is None
+    assert result.completion.dataset_warnings
+    assert "warning" in result.message.lower()
+    assert "non-finite parameter value" not in result.message.lower()
+
+
+def test_build_completion_detail_sections_keeps_top_level_failure_without_stack_trace_when_dataset_failures_exist() -> None:
+    sections = _build_completion_detail_sections(
+        status="fail",
+        optimizer_diagnostic=FitDiagnostic(
+            phase="fatal",
+            dataset_id=None,
+            failure=build_simulation_failure(kind="simulation_error", message="top-level process-pool failure"),
+            remediation="generic_retry",
+        ),
+        dataset_failures={
+            "ds1": FitDiagnostic(
+                phase="final_replay",
+                dataset_id="ds1",
+                failure=build_simulation_failure(kind="simulation_error", message="dataset replay failed"),
+                remediation="generic_retry",
+            )
+        },
+    )
+
+    assert len(sections) == 1
+    assert sections[0].dataset_id is None
+    assert sections[0].failure["message"] == "top-level process-pool failure"
+
+
+def test_nonfinite_metrics_message_takes_precedence_over_stale_optimizer_diagnostic() -> None:
+    diagnostic = FitDiagnostic(
+        phase="optimizer",
+        dataset_id="ds1",
+        failure=build_simulation_failure(kind="simulation_error", message="stale alignment warning"),
+    )
+    completion = GlobalFitCompletion(
+        status="fail",
+        optimizer_converged=True,
+        nonfinite_metrics=True,
+        optimizer_diagnostic=diagnostic,
+        dataset_failures={},
+        dataset_warnings={},
+        detail_sections=[],
+    )
+
+    message = _completion_result_message(
+        base_message="Optimization terminated successfully.",
+        completion=completion,
+        optimizer_diagnostic=diagnostic,
+        dataset_failures={},
+        dataset_warnings={},
+    )
+
+    assert message == "Final χ² is non-finite; results are invalid."
+
+
+def test_warn_message_preserves_non_success_optimizer_termination_reason() -> None:
+    completion = GlobalFitCompletion(
+        status="warn",
+        optimizer_converged=False,
+        nonfinite_metrics=False,
+        optimizer_diagnostic=None,
+        dataset_failures={},
+        dataset_warnings={},
+        detail_sections=[],
+    )
+
+    message = _completion_result_message(
+        base_message="Maximum number of function evaluations exceeded.",
+        completion=completion,
+        optimizer_diagnostic=None,
+        dataset_failures={},
+        dataset_warnings={},
+    )
+
+    assert message == "Global fit completed with warnings: Maximum number of function evaluations exceeded."
 
 
 def test_global_chi_squared_uses_full_objective_residuals_for_parametric_x_penalties(monkeypatch) -> None:

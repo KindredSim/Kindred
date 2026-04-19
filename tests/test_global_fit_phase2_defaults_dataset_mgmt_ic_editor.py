@@ -142,11 +142,11 @@ def _ic_table_species(window) -> list[str]:
 
 def _make_fit_result(*, k_value: float, dataset_initials: dict[str, dict[str, float]]):
     from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+    from kindred.core.fitting_completion import GlobalFitCompletion
 
     model = np.linspace(1.0, 0.4, 6)
     residual = np.linspace(0.0, -0.1, 6)
     return GlobalFitResult(
-        success=True,
         shared_params={"k1": float(k_value)},
         dataset_params={str(dataset_id): {str(name): float(value) for name, value in values.items()} for dataset_id, values in dataset_initials.items()},
         uncertainties=None,
@@ -176,6 +176,11 @@ def _make_fit_result(*, k_value: float, dataset_initials: dict[str, dict[str, fl
         ],
         nfev=10,
         message="ok",
+        completion=GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=False,
+        ),
         covariance=None,
         objective_residuals=np.concatenate([residual.copy(), residual.copy()]),
         model_series={
@@ -191,11 +196,11 @@ def _make_fit_result(*, k_value: float, dataset_initials: dict[str, dict[str, fl
 
 def _make_shared_param_fit_result(*, param_name: str, param_value: float, dataset_initials: dict[str, dict[str, float]]):
     from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+    from kindred.core.fitting_completion import GlobalFitCompletion
 
     model = np.linspace(1.0, 0.4, 6)
     residual = np.linspace(0.0, -0.1, 6)
     return GlobalFitResult(
-        success=True,
         shared_params={str(param_name): float(param_value)},
         dataset_params={str(dataset_id): {str(name): float(value) for name, value in values.items()} for dataset_id, values in dataset_initials.items()},
         uncertainties=None,
@@ -225,6 +230,11 @@ def _make_shared_param_fit_result(*, param_name: str, param_value: float, datase
         ],
         nfev=10,
         message="ok",
+        completion=GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=False,
+        ),
         covariance=None,
         objective_residuals=np.concatenate([residual.copy(), residual.copy()]),
         model_series={

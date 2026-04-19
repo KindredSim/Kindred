@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from kindred.core.simulation_failure import simulation_failure_user_message
 
 
 pytestmark = [pytest.mark.unit]
@@ -142,4 +143,13 @@ def test_global_fitting_monotone_only_rejects_nonmonotone_x(monkeypatch) -> None
 
     residuals = np.asarray(result.objective_residuals, dtype=float).reshape(-1)
     assert float(np.max(np.abs(residuals))) > 1e5
-    assert any("monotone" in message.lower() for message in result.dataset_error_messages.values())
+    assert result.completion.status == "fail"
+    messages = [
+        simulation_failure_user_message(diagnostic.failure).lower()
+        for diagnostic in result.completion.dataset_failures.values()
+    ]
+    assert any("monotone" in message for message in messages)
+    assert {
+        diagnostic.remediation
+        for diagnostic in result.completion.dataset_failures.values()
+    } == {"x_axis_mapping"}

@@ -19,7 +19,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -37,6 +37,11 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     split_fit_dataset_parameter_overrides,
 )
 from kindred.core.exceptions import ErrorContext, FittingCancelled, FitSimulationError, SimulationCancelled
+from kindred.core.fitting_completion import (
+    FitDiagnostic,
+    FitDetailSection,
+    GlobalFitCompletion,
+)
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
@@ -51,7 +56,9 @@ from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.simulation_failure import (
     SimulationFailure,
     build_simulation_failure,
+    coerce_simulation_failure,
     simulation_failure_from_exception,
+    simulation_failure_detail_text,
     simulation_failure_user_message,
 )
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
@@ -62,6 +69,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "GlobalFitResult",
     "DatasetFitInfo",
+    "GlobalFitCompletion",
+    "FitDiagnostic",
+    "FitDetailSection",
     "fit_global",
 ]
 
@@ -167,8 +177,6 @@ class GlobalFitResult:
 
     Attributes
     ----------
-    success : bool
-        Whether optimization converged successfully
     shared_params : dict
         Optimized shared parameters {name: value}
     dataset_params : dict
@@ -188,7 +196,6 @@ class GlobalFitResult:
     covariance : np.ndarray, optional
         Covariance matrix of all parameters
     """
-    success: bool
     shared_params: Dict[str, float]
     dataset_params: Dict[str, Dict[str, float]]
     uncertainties: Optional[Dict[str, float]]
@@ -197,23 +204,195 @@ class GlobalFitResult:
     dataset_info: List[DatasetFitInfo]
     nfev: int
     message: str
-    error_diagnostics: Optional[SimulationFailure] = None
+    completion: GlobalFitCompletion
     covariance: Optional[np.ndarray] = None
     objective_residuals: Optional[np.ndarray] = None
     model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     residual_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     plot_model_x: Dict[str, np.ndarray] = field(default_factory=dict)
     plot_model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    dataset_errors: Dict[str, SimulationFailure] = field(default_factory=dict)
-    dataset_warnings: Dict[str, str] = field(default_factory=dict)
     alignment_report: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
-    @property
-    def dataset_error_messages(self) -> Dict[str, str]:
-        return {
-            str(ds_id): simulation_failure_user_message(payload)
-            for ds_id, payload in self.dataset_errors.items()
-        }
+    def __post_init__(self) -> None:
+        if not isinstance(self.completion, GlobalFitCompletion):
+            raise TypeError("GlobalFitResult.completion must be a GlobalFitCompletion")
+
+
+def _coerce_fit_failure_payload(value: object) -> SimulationFailure:
+    payload = dict(coerce_simulation_failure(value))
+    details = dict(payload.get("details") or {})
+    details.pop("parameters", None)
+    payload["details"] = details
+    return payload
+
+
+def _coerce_parameter_snapshot(snapshot: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    if not snapshot:
+        return None
+    return {str(name): float(value) for name, value in dict(snapshot).items()}
+
+
+def _compact_failure_message(failure: SimulationFailure) -> str:
+    raw_message = simulation_failure_user_message(failure)
+    return " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
+
+
+def _build_fit_diagnostic_from_failure(
+    failure: object,
+    *,
+    phase: str,
+    dataset_id: Optional[str] = None,
+    parameter_snapshot: Optional[Dict[str, float]] = None,
+) -> FitDiagnostic:
+    coerced_failure = _coerce_fit_failure_payload(failure)
+    return FitDiagnostic(
+        phase=phase,
+        dataset_id=dataset_id,
+        failure=coerced_failure,
+        parameter_snapshot=_coerce_parameter_snapshot(parameter_snapshot),
+    )
+
+
+def _embedded_fit_failure_payload(exc: BaseException) -> Optional[SimulationFailure]:
+    details = getattr(exc, "details", None)
+    embedded = details.get("failure") if isinstance(details, Mapping) else None
+    if not (isinstance(embedded, Mapping) and "kind" in embedded and "message" in embedded):
+        return None
+    return _coerce_fit_failure_payload(embedded)
+
+
+def _build_fit_diagnostic_from_exception(
+    exc: BaseException,
+    *,
+    phase: str,
+    dataset_id: Optional[str] = None,
+    parameter_snapshot: Optional[Dict[str, float]] = None,
+    message_override: Optional[str] = None,
+) -> FitDiagnostic:
+    chosen_snapshot = getattr(exc, "failed_params", None)
+    if not chosen_snapshot:
+        chosen_snapshot = parameter_snapshot
+    failure = _embedded_fit_failure_payload(exc)
+    if failure is None:
+        failure = _coerce_fit_failure_payload(simulation_failure_from_exception(exc))
+    if message_override is not None and str(message_override).strip():
+        failure["message"] = str(message_override)
+    return FitDiagnostic(
+        phase=phase,
+        dataset_id=dataset_id,
+        failure=failure,
+        parameter_snapshot=_coerce_parameter_snapshot(chosen_snapshot),
+    )
+
+
+def _build_completion_detail_sections(
+    *,
+    status: str,
+    optimizer_diagnostic: Optional[FitDiagnostic],
+    dataset_failures: Dict[str, FitDiagnostic],
+) -> List[FitDetailSection]:
+    if status == "ok":
+        return []
+
+    sections: List[FitDetailSection] = []
+    if optimizer_diagnostic is not None:
+        optimizer_detail = simulation_failure_detail_text(optimizer_diagnostic.failure)
+        optimizer_summary = _compact_failure_message(optimizer_diagnostic.failure)
+        matching_detail = ""
+        matching_summary = ""
+        if optimizer_diagnostic.dataset_id is not None:
+            matching = dataset_failures.get(str(optimizer_diagnostic.dataset_id))
+            if matching is not None:
+                matching_detail = simulation_failure_detail_text(matching.failure)
+                matching_summary = _compact_failure_message(matching.failure)
+        if (optimizer_detail and optimizer_detail != matching_detail) or (
+            (not optimizer_detail) and optimizer_summary and optimizer_summary != matching_summary
+        ):
+            sections.append(
+                FitDetailSection(
+                    dataset_id=optimizer_diagnostic.dataset_id,
+                    failure=optimizer_diagnostic.failure,
+                )
+            )
+
+    for ds_id, diagnostic in sorted(dataset_failures.items(), key=lambda kv: str(kv[0])):
+        if simulation_failure_detail_text(diagnostic.failure):
+            sections.append(
+                FitDetailSection(
+                    dataset_id=str(ds_id),
+                    failure=diagnostic.failure,
+                )
+            )
+    return sections
+
+
+def _completion_result_message(
+    *,
+    base_message: str,
+    completion: GlobalFitCompletion,
+    optimizer_diagnostic: Optional[FitDiagnostic],
+    dataset_failures: Dict[str, FitDiagnostic],
+    dataset_warnings: Dict[str, str],
+) -> str:
+    if completion.status == "ok":
+        return str(base_message)
+    if completion.status == "warn":
+        warning_parts: list[str] = []
+        if not completion.optimizer_converged:
+            fallback = str(base_message or "").strip()
+            if fallback and "success" not in fallback.lower():
+                warning_parts.append(fallback)
+            else:
+                warning_parts.append("optimizer did not report convergence")
+        if optimizer_diagnostic is not None:
+            detail = _compact_failure_message(optimizer_diagnostic.failure)
+            if detail:
+                warning_parts.append(detail)
+        for ds_id, message in sorted(dataset_warnings.items(), key=lambda kv: str(kv[0])):
+            compact_message = " ".join(part.strip() for part in str(message).splitlines() if part.strip())
+            if compact_message:
+                warning_parts.append(f"dataset '{ds_id}': {compact_message}")
+        if warning_parts:
+            return "Global fit completed with warnings: " + "; ".join(warning_parts)
+        fallback = str(base_message or "").strip()
+        if fallback and "success" not in fallback.lower():
+            return fallback
+        return "Global fit completed with warnings."
+    if dataset_failures:
+        dataset_ids = sorted(str(ds_id) for ds_id in dataset_failures)
+        if len(dataset_ids) == 1:
+            dataset_id = dataset_ids[0]
+            detail = _compact_failure_message(dataset_failures[dataset_id].failure)
+            if detail:
+                return f"Global fit failed for dataset '{dataset_id}': {detail}"
+            return f"Global fit failed for dataset '{dataset_id}'."
+        return f"Global fit failed for datasets: {', '.join(dataset_ids)}."
+    if completion.nonfinite_metrics:
+        return "Final χ² is non-finite; results are invalid."
+    if optimizer_diagnostic is not None:
+        detail = _compact_failure_message(optimizer_diagnostic.failure)
+        if detail:
+            return f"Global fit failed: {detail}"
+    fallback = str(base_message or "").strip()
+    if fallback:
+        return fallback
+    return "Global fit failed."
+
+
+def _ensure_failure_diagnostic(
+    diagnostic: Optional[FitDiagnostic],
+    *,
+    message: str,
+) -> FitDiagnostic:
+    if diagnostic is not None:
+        return diagnostic
+    return _build_fit_diagnostic_from_failure(
+        build_simulation_failure(
+            kind="simulation_error",
+            message=message,
+        ),
+        phase="fatal",
+    )
 
 
 def _normalize_input_datasets(datasets: List[object]) -> List[object]:
@@ -643,14 +822,20 @@ def _evaluate_dataset_simulation(
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)):
             raise FittingCancelled() from exc
+        preferred_failed_params = getattr(exc, "failed_params", None)
+        if not preferred_failed_params:
+            preferred_failed_params = item.failed_param_snapshot
+        error_details = dict(getattr(exc, "details", None) or {})
+        if preferred_failed_params:
+            error_details.pop("parameters", None)
         return _DatasetSimulationEvaluation(
             index=int(item.index),
             sim_time=None,
             sim_species={},
             error=FitSimulationError(
                 f"Simulation failed for dataset '{ds_id}': {exc}",
-                failed_params=getattr(exc, "failed_params", None),
-                details=dict(getattr(exc, "details", None) or {}),
+                failed_params=preferred_failed_params,
+                details=error_details,
                 context=getattr(exc, "context", None),
             ),
             error_provenance={"dataset": ds_id},
@@ -1261,7 +1446,7 @@ def _assemble_global_fit_result(
     covariance: Optional[np.ndarray],
     objective_residuals: Optional[np.ndarray],
     uncertainties: Optional[Dict[str, float]],
-    error_diagnostics: Optional[SimulationFailure] = None,
+    optimizer_diagnostic: Optional[FitDiagnostic] = None,
     process_pool: Optional[FittingProcessPool] = None,
 ) -> GlobalFitResult:
     dataset_info = []
@@ -1272,7 +1457,7 @@ def _assemble_global_fit_result(
     residual_series_map: Dict[str, Dict[str, np.ndarray]] = {}
     plot_model_x_map: Dict[str, np.ndarray] = {}
     plot_model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
-    final_dataset_errors: Dict[str, SimulationFailure] = {}
+    final_dataset_failures: Dict[str, FitDiagnostic] = {}
     final_dataset_warnings: Dict[str, str] = {}
     alignment_report: Dict[str, Dict[str, float]] = {}
 
@@ -1337,18 +1522,31 @@ def _assemble_global_fit_result(
             raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
         if evaluation.error is not None:
             exc = evaluation.error
-            if ds_id not in final_dataset_errors:
+            if ds_id not in final_dataset_failures:
                 if evaluation.error is not None:
-                    payload = simulation_failure_from_exception(evaluation.error)
                     final_error_message = str(evaluation.final_error_message or "")
-                    if final_error_message.strip() and final_error_message != str(exc):
-                        payload["message"] = final_error_message
-                else:
-                    payload = build_simulation_failure(
-                        kind="simulation_error",
-                        message=str(evaluation.final_error_message or ""),
+                    diagnostic = _build_fit_diagnostic_from_exception(
+                        evaluation.error,
+                        phase="final_replay",
+                        dataset_id=ds_id,
+                        parameter_snapshot=failed_param_snapshot,
+                        message_override=(
+                            final_error_message
+                            if final_error_message.strip() and final_error_message != str(exc)
+                            else None
+                        ),
                     )
-                final_dataset_errors[ds_id] = payload
+                else:
+                    diagnostic = _build_fit_diagnostic_from_failure(
+                        build_simulation_failure(
+                            kind="simulation_error",
+                            message=str(evaluation.final_error_message or ""),
+                        ),
+                        phase="final_replay",
+                        dataset_id=ds_id,
+                        parameter_snapshot=failed_param_snapshot,
+                    )
+                final_dataset_failures[ds_id] = diagnostic
         else:
             sim_time = evaluation.sim_time
             sim_species = evaluation.sim_species
@@ -1383,10 +1581,15 @@ def _assemble_global_fit_result(
             penalty_block = np.full_like(y_exp, penalty_value, dtype=float)
 
             if not (isinstance(sim_species, dict) and species_name in sim_species):
-                if ds_id not in final_dataset_errors:
-                    final_dataset_errors[ds_id] = build_simulation_failure(
-                        kind="simulation_error",
-                        message=f"Species '{species_name}' missing in simulation result.",
+                if ds_id not in final_dataset_failures:
+                    final_dataset_failures[ds_id] = _build_fit_diagnostic_from_failure(
+                        build_simulation_failure(
+                            kind="simulation_error",
+                            message=f"Species '{species_name}' missing in simulation result.",
+                        ),
+                        phase="final_replay",
+                        dataset_id=ds_id,
+                        parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
                 residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
@@ -1396,8 +1599,13 @@ def _assemble_global_fit_result(
                 y_sim_time = _align_series(sim_species[species_name], sim_time, t_exp)
                 model_series_map.setdefault(ds_id, {})[species_name] = y_sim_time
             except Exception as exc:
-                if ds_id not in final_dataset_errors:
-                    final_dataset_errors[ds_id] = simulation_failure_from_exception(exc)
+                if ds_id not in final_dataset_failures:
+                    final_dataset_failures[ds_id] = _build_fit_diagnostic_from_exception(
+                        exc,
+                        phase="final_replay",
+                        dataset_id=ds_id,
+                        parameter_snapshot=failed_param_snapshot,
+                    )
                 residual_blocks.append(penalty_block)
                 residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
                 continue
@@ -1433,17 +1641,27 @@ def _assemble_global_fit_result(
                         need_dx_penalty=False,
                     )
             except Exception as exc:
-                if ds_id not in final_dataset_errors:
-                    final_dataset_errors[ds_id] = simulation_failure_from_exception(exc)
+                if ds_id not in final_dataset_failures:
+                    final_dataset_failures[ds_id] = _build_fit_diagnostic_from_exception(
+                        exc,
+                        phase="final_replay",
+                        dataset_id=ds_id,
+                        parameter_snapshot=failed_param_snapshot,
+                    )
                 residual_blocks.append(penalty_block)
                 residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
                 continue
 
             if not np.all(np.isfinite(y_sim_resid)):
-                if ds_id not in final_dataset_errors:
-                    final_dataset_errors[ds_id] = build_simulation_failure(
-                        kind="simulation_error",
-                        message=f"Non-finite aligned series for dataset '{ds_id}', species '{species_name}'.",
+                if ds_id not in final_dataset_failures:
+                    final_dataset_failures[ds_id] = _build_fit_diagnostic_from_failure(
+                        build_simulation_failure(
+                            kind="simulation_error",
+                            message=f"Non-finite aligned series for dataset '{ds_id}', species '{species_name}'.",
+                        ),
+                        phase="final_replay",
+                        dataset_id=ds_id,
+                        parameter_snapshot=failed_param_snapshot,
                     )
                 residual_blocks.append(penalty_block)
                 residual_series_map.setdefault(ds_id, {})[species_name] = penalty_block
@@ -1536,27 +1754,67 @@ def _assemble_global_fit_result(
     metrics_finite = bool(
         np.isfinite(global_ss_res) and np.isfinite(global_r_squared) and np.isfinite(global_chi_squared)
     )
-    if final_dataset_errors or not metrics_finite:
-        success = False
-        if final_dataset_errors:
-            failed_labels = ", ".join(sorted(final_dataset_errors.keys()))
-            message = f"{message} | alignment_failed={failed_labels}"
-        if not metrics_finite:
-            message = f"{message} | nonfinite_metrics"
+    optimizer_converged = bool(success)
+    completion_optimizer_diagnostic = optimizer_diagnostic
+    if (
+        optimizer_converged
+        and metrics_finite
+        and not final_dataset_failures
+    ):
+        completion_optimizer_diagnostic = None
+    if final_dataset_failures or not metrics_finite:
+        completion_status = "fail"
+    elif (not optimizer_converged) or final_dataset_warnings or completion_optimizer_diagnostic is not None:
+        completion_status = "warn"
+    else:
+        completion_status = "ok"
 
-    if success:
+    if completion_status == "ok":
+        completion_optimizer_diagnostic = None
+        completion_detail_sections: List[FitDetailSection] = []
+    else:
+        if completion_status == "fail" and (not metrics_finite) and not final_dataset_failures:
+            completion_optimizer_diagnostic = _ensure_failure_diagnostic(
+                completion_optimizer_diagnostic,
+                message="Final χ² is non-finite; results are invalid.",
+            )
+        completion_detail_sections = _build_completion_detail_sections(
+            status=completion_status,
+            optimizer_diagnostic=completion_optimizer_diagnostic,
+            dataset_failures=dict(final_dataset_failures),
+        )
+
+    completion = GlobalFitCompletion(
+        status=completion_status,
+        optimizer_converged=optimizer_converged,
+        nonfinite_metrics=not metrics_finite,
+        optimizer_diagnostic=completion_optimizer_diagnostic,
+        dataset_failures=dict(final_dataset_failures),
+        dataset_warnings=dict(final_dataset_warnings),
+        detail_sections=completion_detail_sections,
+    )
+    completion_message = _completion_result_message(
+        base_message=message,
+        completion=completion,
+        optimizer_diagnostic=completion_optimizer_diagnostic,
+        dataset_failures=dict(final_dataset_failures),
+        dataset_warnings=dict(final_dataset_warnings),
+    )
+
+    if completion.status == "ok":
         logger.info("Global fit complete: R²=%.4f, χ²=%.4e", global_r_squared, global_chi_squared)
+    elif completion.status == "warn":
+        logger.warning("Global fit complete with warnings: %s", completion_message)
     else:
         logger.warning(
             "Global fit failed: χ²=%.4e datasets_failed=%s",
             global_chi_squared,
-            ",".join(sorted(final_dataset_errors.keys())),
+            ",".join(sorted(final_dataset_failures.keys())),
         )
     for info in dataset_info:
         logger.debug("  %s: R²=%.4f, RMSE=%.4e", info.dataset_id, info.r_squared, info.rmse)
 
     return GlobalFitResult(
-        success=success,
         shared_params=fitted_params,
         dataset_params=combined_dataset_params,
         uncertainties=uncertainties,
@@ -1564,16 +1822,14 @@ def _assemble_global_fit_result(
         global_r_squared=global_r_squared,
         dataset_info=dataset_info,
         nfev=nfev,
-        message=message,
-        error_diagnostics=error_diagnostics,
+        message=completion_message,
+        completion=completion,
         covariance=covariance,
         objective_residuals=objective_residuals.copy() if objective_residuals is not None else None,
         model_series=model_series_map,
         residual_series=residual_series_map,
         plot_model_x=plot_model_x_map,
         plot_model_series=plot_model_series_map,
-        dataset_errors=dict(final_dataset_errors),
-        dataset_warnings=dict(final_dataset_warnings),
         alignment_report=dict(alignment_report),
     )
 
@@ -1779,7 +2035,7 @@ def fit_global(
         message: str,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-        error_diagnostics: Optional[SimulationFailure] = None,
+        optimizer_diagnostic: Optional[FitDiagnostic] = None,
     ) -> GlobalFitResult:
         shared_snapshot = dict(shared_params)
         dataset_snapshot: Dict[str, Dict[str, float]] = {
@@ -1810,8 +2066,11 @@ def fit_global(
                     dataset_snapshot.setdefault(owner_ds_id, {})
                     dataset_snapshot[owner_ds_id][name] = float(value)
 
+        completion_optimizer_diagnostic = _ensure_failure_diagnostic(
+            optimizer_diagnostic,
+            message=str(message or "Global fit failed before replay completed."),
+        )
         return GlobalFitResult(
-            success=False,
             shared_params=shared_snapshot,
             dataset_params=dataset_snapshot,
             uncertainties=None,
@@ -1820,7 +2079,19 @@ def fit_global(
             dataset_info=[],
             nfev=int(getattr(objective_impl, "_iteration", 0)),
             message=message,
-            error_diagnostics=error_diagnostics,
+            completion=GlobalFitCompletion(
+                status="fail",
+                optimizer_converged=False,
+                nonfinite_metrics=False,
+                optimizer_diagnostic=completion_optimizer_diagnostic,
+                dataset_failures={},
+                dataset_warnings={},
+                detail_sections=_build_completion_detail_sections(
+                    status="fail",
+                    optimizer_diagnostic=completion_optimizer_diagnostic,
+                    dataset_failures={},
+                ),
+            ),
             covariance=None,
             objective_residuals=None,
             model_series={},
@@ -1870,17 +2141,18 @@ def fit_global(
             nfev = int(fit_result.nfev)
             covariance = fit_result.covariance
             objective_residuals = np.asarray(fit_result.residuals, dtype=float).reshape(-1)
-            error_diagnostics: Optional[SimulationFailure] = None
+            optimizer_diagnostic: Optional[FitDiagnostic] = None
 
             if getattr(objective_wrapper, "last_error", None) is not None:
                 ds_tag = None
                 prov = getattr(objective_wrapper, "last_error_provenance", None)
                 if isinstance(prov, dict):
                     ds_tag = prov.get("dataset")
-                if error_diagnostics is None:
-                    error_diagnostics = simulation_failure_from_exception(
+                if optimizer_diagnostic is None:
+                    optimizer_diagnostic = _build_fit_diagnostic_from_exception(
                         objective_wrapper.last_error,
-                        details={"last_error_dataset": ds_tag},
+                        phase="optimizer",
+                        dataset_id=str(ds_tag) if ds_tag is not None else None,
                     )
 
             fitted_params = layout.shared_param_dict_from_vector(x_opt)
@@ -1929,7 +2201,7 @@ def fit_global(
                 covariance=covariance,
                 objective_residuals=objective_residuals,
                 uncertainties=uncertainties,
-                error_diagnostics=error_diagnostics,
+                optimizer_diagnostic=optimizer_diagnostic,
                 process_pool=process_pool,
             )
         shutdown_outcome = getattr(process_pool, "_last_shutdown_outcome", None) if process_pool is not None else None
@@ -1959,7 +2231,11 @@ def fit_global(
         return _failed_result(
             str(exc),
             failed_params=exc.failed_params,
-            error_diagnostics=simulation_failure_from_exception(exc),
+            optimizer_diagnostic=_build_fit_diagnostic_from_exception(
+                exc,
+                phase="fatal",
+                parameter_snapshot=exc.failed_params,
+            ),
         )
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)) or "cancelled" in str(exc).lower():
@@ -1969,5 +2245,8 @@ def fit_global(
         logger.error("Global fitting failed: %s", exc, exc_info=True)
         return _failed_result(
             f"Fitting failed: {exc}",
-            error_diagnostics=simulation_failure_from_exception(exc),
+            optimizer_diagnostic=_build_fit_diagnostic_from_exception(
+                exc,
+                phase="fatal",
+            ),
         )

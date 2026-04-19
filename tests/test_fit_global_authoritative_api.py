@@ -29,6 +29,23 @@ def test_fit_global_authoritative_api_signature_matches_current_core_surface() -
 
 
 @pytest.mark.unit
+def test_global_fit_result_requires_explicit_completion_contract() -> None:
+    from kindred.core.api.fitting import GlobalFitResult
+
+    with pytest.raises(TypeError):
+        GlobalFitResult(
+            shared_params={},
+            dataset_params={},
+            uncertainties=None,
+            global_chi_squared=0.0,
+            global_r_squared=1.0,
+            dataset_info=[],
+            nfev=1,
+            message="ok",
+        )
+
+
+@pytest.mark.unit
 def test_gui_global_fit_code_imports_from_core_api_not_gui_shim() -> None:
     targets = (
         ("kindred.gui.fitting", "window.py"),
@@ -67,7 +84,7 @@ def test_authoritative_fit_global_api_accepts_shared_fitting_evaluator_contract(
         max_nfev=2,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
 
 
 @pytest.mark.unit
@@ -95,7 +112,7 @@ def test_authoritative_fit_global_api_accepts_raw_callable_evaluator() -> None:
         max_nfev=2,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
 
 
 @pytest.mark.unit

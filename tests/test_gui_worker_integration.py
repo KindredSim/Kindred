@@ -255,7 +255,7 @@ def test_global_fit_worker_smoke(monkeypatch, qtbot):
     worker.wait(2000)
     payload = blocker.args[0]
     result = payload["result"]
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert np.isfinite(result.global_chi_squared)
     assert "k" in result.shared_params
     assert 0.05 < result.shared_params["k"] < 0.6

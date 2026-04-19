@@ -43,6 +43,7 @@ def test_fit_global_accepts_typed_dataset_specs() -> None:
 def test_global_fit_worker_accepts_typed_dataset_specs() -> None:
     from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
+    from kindred.core.fitting_completion import GlobalFitCompletion
     from kindred.gui.fitting.worker import GlobalFitWorker
 
     captured: dict[str, object] = {}
@@ -51,7 +52,6 @@ def test_global_fit_worker_accepts_typed_dataset_specs() -> None:
     def fake_fit_global(_simulate, datasets, _shared_params, **_kwargs):
         captured["datasets"] = datasets
         return GlobalFitResult(
-            success=True,
             shared_params={"k": 1.0},
             dataset_params={"ds1": {}},
             uncertainties=None,
@@ -71,6 +71,11 @@ def test_global_fit_worker_accepts_typed_dataset_specs() -> None:
             ],
             nfev=1,
             message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
             covariance=None,
             objective_residuals=np.zeros(1, dtype=float),
             model_series={"ds1": {}},

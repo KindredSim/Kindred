@@ -171,7 +171,7 @@ def test_fit_global_passes_scalar_diff_step_for_lm(monkeypatch):
         xtol=1e-8,
     )
 
-    assert result.success is True
+    assert result.completion.status == "ok"
     assert np.isscalar(captured["diff_step"])
     assert not isinstance(captured["diff_step"], np.ndarray)
     assert float(captured["diff_step"]) > 0.0

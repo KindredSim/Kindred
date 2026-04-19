@@ -9,6 +9,7 @@ from PySide6 import QtCore, QtWidgets
 import kindred.gui.fitting.worker as fit_worker_module
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.fitting_completion import GlobalFitCompletion
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.worker import GlobalFitWorker
 
@@ -100,7 +101,6 @@ def _make_final_result(entries: list[dict]) -> GlobalFitResult:
             )
         )
     return GlobalFitResult(
-        success=True,
         shared_params={"k1": 1.5},
         dataset_params={str(entry["id"]): {} for entry in entries},
         uncertainties=None,
@@ -109,6 +109,11 @@ def _make_final_result(entries: list[dict]) -> GlobalFitResult:
         dataset_info=dataset_info,
         nfev=11,
         message="ok",
+        completion=GlobalFitCompletion(
+            status="ok",
+            optimizer_converged=True,
+            nonfinite_metrics=False,
+        ),
         objective_residuals=np.concatenate(objective_blocks) if objective_blocks else np.asarray([], dtype=float),
         model_series=model_series,
         plot_model_x=plot_model_x,
@@ -1073,7 +1078,6 @@ def test_pending_rebuild_fires_on_fit_complete(qt_app):
         window._worker = None
         window.hide()
         result = GlobalFitResult(
-            success=True,
             shared_params={"k1": 1.0},
             dataset_params={},
             uncertainties=None,
@@ -1098,6 +1102,11 @@ def test_pending_rebuild_fires_on_fit_complete(qt_app):
             },
             objective_residuals=np.zeros(10),
             message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
         )
         window._handle_global_fit_complete({"result": result})
         qt_app.processEvents()
@@ -1137,7 +1146,6 @@ def test_pending_rebuild_uses_current_dataset_state(qt_app):
         window._worker = None
         window.hide()
         result = GlobalFitResult(
-            success=True,
             shared_params={"k1": 1.0},
             dataset_params={},
             uncertainties=None,
@@ -1162,6 +1170,11 @@ def test_pending_rebuild_uses_current_dataset_state(qt_app):
             },
             objective_residuals=np.zeros(15),
             message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
         )
         window._handle_global_fit_complete({"result": result})
         qt_app.processEvents()

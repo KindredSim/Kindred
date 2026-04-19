@@ -291,8 +291,6 @@ class FitSimulationError(FittingError):
     def __init__(self, message: str, *, failed_params: Optional[Dict[str, float]] = None, **kwargs):
         kwargs.setdefault("code", "E404")
         details = dict(kwargs.pop("details", {}) or {})
-        if failed_params:
-            details.setdefault("parameters", failed_params)
         super().__init__(message, details=details, **kwargs)
         self.failed_params = failed_params
 

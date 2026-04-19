@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+from kindred.core.fitting_completion import GlobalFitCompletion
 from kindred.gui.fitting.worker import GlobalFitWorker
 
 
@@ -20,7 +21,6 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
         progress(4, 9.0, {"k": 0.9})
         progress(5, 8.0, {"k": 0.8})
         return GlobalFitResult(
-            success=True,
             shared_params={"k": 0.8},
             dataset_params={"ds": {}},
             uncertainties=None,
@@ -40,6 +40,11 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
             ],
             nfev=5,
             message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
             covariance=None,
             objective_residuals=np.array([0.0]),
             model_series={"ds": {}},

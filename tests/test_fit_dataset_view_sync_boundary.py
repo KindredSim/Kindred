@@ -194,6 +194,62 @@ def test_dataset_manager_sync_fit_result_views_uses_plot_tabs_public_sync_contra
     assert grid_entry["r_squared"] == pytest.approx(0.75)
 
 
+@pytest.mark.unit
+def test_dataset_manager_sync_fit_result_views_clears_stale_fit_state_for_targeted_dataset_without_model_series() -> None:
+    t = np.linspace(0.0, 1.0, 4)
+    dataset = {
+        "t": t,
+        "species": {
+            "A": np.asarray([1.0, 0.7, 0.4, 0.2]),
+            "B": np.asarray([0.2, 0.3, 0.5, 0.8]),
+        },
+    }
+    plot_tabs = _FakePlotTabs()
+    manager = DatasetManager(plot_tabs=plot_tabs, dataset_resolver=lambda name: dataset if name == "ds1" else None)
+
+    manager.sync_fit_result_views(
+        {"ds1": {"B": np.asarray([0.25, 0.35, 0.55, 0.75])}},
+        dataset_stats={"ds1": {"chi_squared": 2.5, "r_squared": 0.75}},
+        dataset_ids=["ds1"],
+    )
+    manager.sync_fit_result_views({}, dataset_stats={}, dataset_ids=["ds1"])
+
+    entry = manager._dataset_views["ds1"]
+    assert entry["visible_species"] is None
+    assert entry["model_x"] is None
+    assert entry["model_y"] is None
+    assert entry["model_series"] is None
+    assert entry["chi_squared"] is None
+    assert entry["r_squared"] is None
+
+    grid_entry = plot_tabs.grid.datasets[0]
+    assert set((grid_entry["all_species"] or {}).keys()) == {"A", "B"}
+    assert grid_entry["model_series"] is None
+    assert grid_entry["chi_squared"] is None
+    assert grid_entry["r_squared"] is None
+
+
+@pytest.mark.unit
+def test_dataset_manager_sync_fit_result_views_does_not_create_view_when_clearing_missing_target() -> None:
+    t = np.linspace(0.0, 1.0, 4)
+    dataset = {
+        "t": t,
+        "species": {
+            "A": np.asarray([1.0, 0.7, 0.4, 0.2]),
+            "B": np.asarray([0.2, 0.3, 0.5, 0.8]),
+        },
+    }
+    plot_tabs = _FakePlotTabs()
+    manager = DatasetManager(plot_tabs=plot_tabs, dataset_resolver=lambda name: dataset if name == "ds1" else None)
+
+    manager.sync_fit_result_views({}, dataset_stats={}, dataset_ids=["ds1"])
+
+    assert manager._dataset_views == {}
+    assert plot_tabs.tab_panels == {}
+    assert plot_tabs.tab_sync_calls == []
+    assert plot_tabs.grid.datasets == []
+
+
 @pytest.mark.gui
 def test_plot_tabs_public_sync_seams_reuse_tab_and_preserve_grid_plot_items(qt_app) -> None:
     plot_tabs = PlotTabsWidget()
@@ -292,6 +348,60 @@ def test_fitting_window_delegates_global_fit_result_updates_to_dataset_manager(q
         result = SimpleNamespace(
             model_series={"ds1": {"A": np.asarray([1.0, 0.8, 0.6, 0.4, 0.2])}},
             dataset_info=[SimpleNamespace(dataset_id="ds1", chi_squared=0.5, r_squared=0.97)],
+        )
+
+        window._update_dataset_views_from_global(result)
+
+        assert len(manager.calls) == 1
+        assert manager.calls[0]["model_series"] is result.model_series
+        assert manager.calls[0]["dataset_stats"] == {"ds1": {"chi_squared": 0.5, "r_squared": 0.97}}
+        assert manager.calls[0]["dataset_ids"] == ["ds1"]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.gui
+def test_fitting_window_targets_dataset_manager_updates_only_for_result_datasets(qt_app) -> None:
+    manager = _RecordingDatasetManager()
+    t = np.linspace(0.0, 1.0, 5)
+    y_a = np.linspace(1.0, 0.5, t.size)
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "ds1",
+                "t": t.copy(),
+                "species_data": {"A": y_a.copy()},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+            {
+                "id": "ds2",
+                "label": "ds2",
+                "t": t.copy(),
+                "species_data": {"A": y_a.copy()},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": False,
+            },
+        ],
+        dataset_manager=manager,
+        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": y_a.copy()}},
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
+            {"id": "ds2", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
+        ],
+        dataset_weights={"ds1": 1.0, "ds2": 1.0},
+    )
+    try:
+        result = SimpleNamespace(
+            model_series={"ds1": {"A": np.asarray([1.0, 0.8, 0.6, 0.4, 0.2])}},
+            dataset_info=[SimpleNamespace(dataset_id="ds1", chi_squared=0.5, r_squared=0.97)],
+            completion=None,
         )
 
         window._update_dataset_views_from_global(result)

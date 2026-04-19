@@ -11,7 +11,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
 from kindred.core.fitting_completion import FitDetailSection, FitDiagnostic, GlobalFitCompletion
 from kindred.core.simulation_failure import build_simulation_failure
-from kindred.gui.fitting.window import FittingWindow
+from kindred.gui.controllers.dataset_manager import DatasetManager
+from kindred.gui.fitting.window import FittingWindow, _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS
 
 pytestmark = pytest.mark.gui
 
@@ -54,15 +55,20 @@ def _make_diagnostic(
     dataset_id: str | None = None,
     message: str,
     stack_trace: str | None = None,
+    remediation: str | None = None,
+    failure_kind: str = "simulation_error",
+    details: dict[str, object] | None = None,
 ) -> FitDiagnostic:
     return FitDiagnostic(
         phase=phase,
         dataset_id=dataset_id,
         failure=build_simulation_failure(
-            kind="simulation_error",
+            kind=failure_kind,
             message=message,
             context={"stack_trace": stack_trace} if stack_trace is not None else None,
+            details=details,
         ),
+        remediation=remediation,
     )
 
 
@@ -118,34 +124,73 @@ def _build_completion_result(
 ) -> GlobalFitResult:
     result = _build_success_result(dataset_id=dataset_id, param_name=param_name, value=value)
     result.message = str(message or ("ok" if status == "ok" else "failed"))
-    result.completion = _build_completion(
-        status=status,
-        optimizer_converged=optimizer_converged,
-    )
+    completion_kwargs: dict[str, object] = {
+        "status": status,
+        "optimizer_converged": optimizer_converged,
+    }
+    if status == "fail":
+        completion_kwargs["optimizer_diagnostic"] = _make_diagnostic(
+            phase="fatal",
+            message=str(message or "failed"),
+            remediation="generic_retry",
+        )
+    result.completion = _build_completion(**completion_kwargs)
     return result
 
 
-def _build_window() -> FittingWindow:
-    dataset_entries = [
-        {
-            "id": "ds1",
-            "label": "Dataset 1",
-            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
-            "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
-            "selected_species": ["A"],
-            "weight": 1.0,
-            "include": True,
-        }
-    ]
-    dataset_payloads = [{"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}]
+def _build_window(
+    *,
+    dataset_entries: list[dict[str, object]] | None = None,
+    dataset_payloads: list[dict[str, object]] | None = None,
+) -> FittingWindow:
+    if dataset_entries is None:
+        dataset_entries = [
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ]
+    if dataset_payloads is None:
+        dataset_payloads = [
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ]
     return FittingWindow(
         mode="global",
         parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
-        dataset_entries=dataset_entries,
-        dataset_payloads=dataset_payloads,
+        dataset_entries=list(dataset_entries),
+        dataset_payloads=list(dataset_payloads),
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": np.asarray([0.0, 1.0, 2.0]), "species": {"A": np.asarray([1.0, 0.8, 0.6])}},
     )
+
+
+class _DatasetPanelSignal:
+    def connect(self, _callback) -> None:
+        return None
+
+
+class _DatasetPanel:
+    def __init__(self) -> None:
+        self.simulateRequested = _DatasetPanelSignal()
+
+
+class _DatasetPlotTabs:
+    def __init__(self) -> None:
+        self.grid_payload = []
+
+    def sync_dataset_tab(self, _name: str, **_dataset_payload):
+        return _DatasetPanel()
+
+    def sync_dataset_grid(self, dataset_entries) -> None:
+        self.grid_payload = list(dataset_entries)
+
+    def remove_dataset_tab(self, _name: str) -> None:
+        return None
 
 
 class _SignalWorker(QtCore.QObject):
@@ -910,15 +955,6 @@ def test_completion_dialog_uses_instance_message_box_with_error_diagnostics_deta
         window.show()
         qt_app.processEvents()
         result = _build_success_result()
-        result.completion = _build_completion(
-            status="ok",
-            optimizer_converged=True,
-            optimizer_diagnostic=_make_diagnostic(
-                phase="optimizer",
-                message="top-level boom",
-                stack_trace="top-level trace",
-            ),
-        )
         dialogs: list[dict[str, object]] = []
 
         def _unexpected_information(*_args, **_kwargs):
@@ -1053,15 +1089,6 @@ def test_completion_dialog_does_not_log_suppressed_top_level_detail_text_on_succ
         window.show()
         qt_app.processEvents()
         result = _build_success_result()
-        result.completion = _build_completion(
-            status="ok",
-            optimizer_converged=True,
-            optimizer_diagnostic=_make_diagnostic(
-                phase="optimizer",
-                message="top-level boom",
-                stack_trace="logged trace",
-            ),
-        )
 
         monkeypatch.setattr(
             QtWidgets.QMessageBox,
@@ -1083,7 +1110,7 @@ def test_completion_dialog_does_not_log_suppressed_top_level_detail_text_on_succ
             window._handle_global_fit_complete({"result": result})
 
         messages = [record.getMessage() for record in caplog.records if record.name == "kindred.gui.fitting.window"]
-        assert "logged trace" not in messages
+        assert not messages
     finally:
         window.close()
 
@@ -1094,16 +1121,6 @@ def test_successful_completion_suppresses_top_level_error_diagnostics_logging_an
         window.show()
         qt_app.processEvents()
         result = _build_success_result()
-        result.completion = _build_completion(
-            status="ok",
-            optimizer_converged=True,
-            optimizer_diagnostic=_make_diagnostic(
-                phase="optimizer",
-                dataset_id="ds1",
-                message="transient probe failure",
-                stack_trace="success trace",
-            ),
-        )
 
         warning_mock = mock.Mock()
         dialogs: list[str] = []
@@ -1115,12 +1132,10 @@ def test_successful_completion_suppresses_top_level_error_diagnostics_logging_an
         monkeypatch.setattr("kindred.gui.fitting.window.logger.warning", warning_mock)
         monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
 
-        assert result.completion.optimizer_diagnostic is not None
         window._handle_global_fit_complete({"result": result})
 
         assert dialogs == [""]
         warning_mock.assert_not_called()
-        assert result.completion.optimizer_diagnostic is not None
     finally:
         window.close()
 
@@ -1220,6 +1235,762 @@ def test_warning_completion_surfaces_optimizer_diagnostic_message_in_dialog_body
                 "details": "",
             }
         ]
+    finally:
+        window.close()
+
+
+def test_failed_completion_preparation_fatal_uses_preparation_remediation_not_x_axis(qt_app):
+    window = _build_window()
+    try:
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=False,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="fatal",
+                message="undefined symbol k_total",
+                remediation="preparation",
+                failure_kind="preparation_error",
+                details={"stage": "parameter_algebra"},
+            ),
+        )
+
+        severity, title, text = window._global_fit_completion_dialog_spec(result)
+
+        assert severity == "fail"
+        assert title == "Global Fit Failed"
+        assert "parameter algebra failed" in text.lower()
+        assert "fix the preparation or parameter algebra error" in text.lower()
+        assert "adjust t_min/t_max" not in text.lower()
+    finally:
+        window.close()
+
+
+def test_failed_completion_alignment_failure_keeps_x_axis_remediation(qt_app):
+    window = _build_window()
+    try:
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            dataset_failures={
+                "ds1": _make_diagnostic(
+                    phase="final_replay",
+                    dataset_id="ds1",
+                    message="Dataset 'ds1': observed X values fall outside model range. Adjust t_min/t_max.",
+                    remediation="x_axis_mapping",
+                ),
+            },
+        )
+
+        severity, _title, text = window._global_fit_completion_dialog_spec(result)
+
+        assert severity == "fail"
+        assert "adjust t_min/t_max" in text.lower()
+        assert "fix x axis / mapping" in text.lower()
+    finally:
+        window.close()
+
+
+def test_failed_completion_nonfinite_metrics_shows_nonfinite_message_not_x_axis(qt_app):
+    window = _build_window()
+    try:
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            nonfinite_metrics=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="fatal",
+                message="Final χ² is non-finite; results are invalid.",
+                remediation="nonfinite_metrics",
+            ),
+        )
+
+        severity, _title, text = window._global_fit_completion_dialog_spec(result)
+
+        assert severity == "fail"
+        assert "final χ² is non-finite; results are invalid." in text.lower()
+        assert "inspect the fit objective and inputs for non-finite values" in text.lower()
+        assert "fix x axis / mapping" not in text.lower()
+    finally:
+        window.close()
+
+
+def test_failed_completion_dataset_failures_own_fail_body_summary_when_top_level_exists(qt_app):
+    window = _build_window()
+    try:
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="fatal",
+                message="top-level process-pool failure",
+                remediation="generic_retry",
+                stack_trace="top trace",
+            ),
+            dataset_failures={
+                "ds1": _make_diagnostic(
+                    phase="final_replay",
+                    dataset_id="ds1",
+                    message="dataset replay failed",
+                    remediation="generic_retry",
+                ),
+            },
+            detail_sections=[
+                _make_detail_section(message="top-level process-pool failure", stack_trace="top trace"),
+            ],
+        )
+
+        severity, _title, text = window._global_fit_completion_dialog_spec(result)
+
+        assert severity == "fail"
+        assert "- Dataset 1: dataset replay failed" in text
+        assert "top-level process-pool failure" not in text
+    finally:
+        window.close()
+
+
+def test_failed_completion_does_not_leave_project_apply_scopes_enabled(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert window._params_ics_tab.get_last_fit_params() == {}
+        assert window._available_project_apply_scopes() == set()
+        assert not window._apply_to_project_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_failed_completion_keeps_user_edited_value_cells_after_clearing_fit_authority(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._params_ics_tab.set_last_fit_params({"k": 0.5})
+        parameter_state = window._params_ics_tab.get_parameter_state()
+        parameter_state[0]["value"] = 1.7
+        parameter_state[0]["last_fit"] = 0.5
+        window._params_ics_tab.set_parameter_state(parameter_state)
+        window._params_ics_tab._populate_parameter_table()
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        result = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        result.model_series = {}
+        result.dataset_info = []
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert window._params_ics_tab.get_last_fit_params() == {}
+        assert window._params_ics_tab._param_table.item(0, 3).text() == "1.7"
+        assert window._params_ics_tab.get_parameter_state()[0]["last_fit"] is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_restores_pre_run_value_cells_after_live_best_update(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._pre_run_parameter_state = window._params_ics_tab.get_parameter_state()
+        window._params_ics_tab.push_best_update({"k": 0.9}, {})
+        assert window._params_ics_tab._param_table.item(0, 3).text() == "0.9"
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        result = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        result.model_series = {}
+        result.dataset_info = []
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert window._params_ics_tab.get_last_fit_params() == {}
+        assert window._params_ics_tab._param_table.item(0, 3).text() == "1"
+        assert window._params_ics_tab.get_parameter_state()[0]["last_fit"] is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_restores_pre_run_staged_dataset_params(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._params_ics_tab.set_staged_dataset_params({"ds1": {"init:A": 2.5}})
+        window._pre_run_parameter_state = window._params_ics_tab.get_parameter_state()
+        window._pre_run_staged_dataset_params = window._params_ics_tab.get_staged_dataset_params()
+        window._params_ics_tab.push_best_update({"k": 0.9}, {"ds1": {"init:A": 0.4}})
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        result = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        result.model_series = {}
+        result.dataset_info = []
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert window._params_ics_tab.get_staged_dataset_params() == {"ds1": {"init:A": 2.5}}
+        assert window._staged_initial_condition_parameters() == {"ds1": {"init:A": 2.5}}
+        assert _PROJECT_APPLY_SCOPE_INITIAL_CONDITIONS in window._available_project_apply_scopes()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_parameter_rows(qt_app, monkeypatch):
+    old_mechanism = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    refreshed_mechanism = "\n".join(
+        [
+            "reaction: A -> C; k=0.4",
+            "initial: A=1.0",
+            "initial: C=0.0",
+        ]
+    )
+
+    class _PreparedEvaluator:
+        def __init__(self, mechanism_text: str, param_names: list[str], *, solver: str, rtol: float, atol: float) -> None:
+            self.prepared_metadata = {
+                "version": 1,
+                "mechanism_text_sha256": FittingWindow._mechanism_text_sha256(mechanism_text),
+                "mechanism_text_len": len(mechanism_text),
+                "param_names": list(param_names),
+                "t_end": 2.0,
+                "num_points": 3,
+                "temperature_K": 298.15,
+                "solver_requested": solver,
+                "solver_normalized": solver,
+                "solver_warning": None,
+                "rtol": float(rtol),
+                "atol": float(atol),
+                "use_sparse_jacobian": False,
+                "wegscheider_cyclicity_enabled": False,
+                "initial_prefix": "init:",
+            }
+
+        def __call__(self, _params):
+            return {
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+            }
+
+        def with_fixed_params(self, _fixed_params):
+            return self
+
+    class _DatasetManagerStub:
+        @staticmethod
+        def scan_mechanism_parameters(mechanism_text: str) -> list[dict[str, object]]:
+            if "A -> C" in str(mechanism_text):
+                return [{"name": "k2", "value": 0.4, "min": 0.0, "max": 1.0}]
+            return [{"name": "k1", "value": 0.2, "min": 0.0, "max": 1.0}]
+
+        @staticmethod
+        def sync_fit_result_views(_model_series, *, dataset_stats=None, dataset_ids=None) -> None:
+            return None
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k1", "value": 0.2, "min": 0.0, "max": 1.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        dataset_manager=_DatasetManagerStub(),
+        simulation_func=_PreparedEvaluator(old_mechanism, ["k1"], solver="BDF", rtol=1e-6, atol=1e-12),
+        simulation_builder=lambda mechanism_text, param_names, *, solver, rtol, atol: _PreparedEvaluator(
+            mechanism_text,
+            list(param_names),
+            solver=solver,
+            rtol=rtol,
+            atol=atol,
+        ),
+        mechanism_text_getter=lambda: refreshed_mechanism,
+        reactions_text_getter=lambda: refreshed_mechanism,
+    )
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k1"]
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *_args, **_kwargs: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+        monkeypatch.setattr(
+            window,
+            "_start_global_fit_worker",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("launch boom")),
+        )
+
+        config = window._params_ics_tab._collect_parameter_config()
+        assert config is not None
+        selection = window._collect_dataset_selection()
+
+        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+
+        parameter_names = [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()]
+        assert parameter_names == ["k2"]
+        assert window._params_ics_tab._param_table.item(0, 2).text() == "k2"
+        assert window._params_ics_tab.get_parameter_state()[0]["last_fit"] is None
+        assert window._params_ics_tab.get_mechanism_species() == ["A", "C"]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_clears_dataset_manager_fit_state_after_prior_success(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        dataset_entry = window._dataset_entries[0]
+        dataset = {
+            "t": np.asarray(dataset_entry["t"], dtype=float),
+            "species": {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(dataset_entry["species_data"]).items()
+            },
+        }
+        plot_tabs = _DatasetPlotTabs()
+        window._dataset_manager = DatasetManager(
+            plot_tabs=plot_tabs,
+            dataset_resolver=lambda name: dataset if name == "ds1" else None,
+        )
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._handle_global_fit_complete({"result": _build_success_result()})
+        ds_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds_view["model_series"] is not None
+        assert ds_view["chi_squared"] == pytest.approx(1.0)
+
+        window._active_fit_dataset_ids = ["ds1"]
+        failed = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        failed.model_series = {}
+        failed.dataset_info = []
+
+        window._handle_global_fit_complete({"result": failed})
+
+        ds_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds_view["model_series"] is None
+        assert ds_view["model_x"] is None
+        assert ds_view["model_y"] is None
+        assert ds_view["chi_squared"] is None
+        assert ds_view["r_squared"] is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_clears_results_summary_state_after_prior_success(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._run_results_tab.set_run_stamp({"solver": "BDF"}, "hash123", "hash123")
+        window._results_summary_button.setEnabled(True)
+        assert window._results_summary_button.isEnabled()
+        assert window._run_results_tab._last_run_stamp == {"solver": "BDF"}
+
+        failed = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        failed.model_series = {}
+        failed.dataset_info = []
+
+        window._handle_global_fit_complete({"result": failed})
+
+        assert not window._results_summary_button.isEnabled()
+        assert window._run_results_tab._last_run_stamp == {}
+        assert window._run_results_tab._last_run_stamp_hash == ""
+        assert window._run_results_tab._last_run_stamp_short == ""
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        dataset_entry = window._dataset_entries[0]
+        dataset = {
+            "t": np.asarray(dataset_entry["t"], dtype=float),
+            "species": {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(dataset_entry["species_data"]).items()
+            },
+        }
+        plot_tabs = _DatasetPlotTabs()
+        window._dataset_manager = DatasetManager(
+            plot_tabs=plot_tabs,
+            dataset_resolver=lambda name: dataset if name == "ds1" else None,
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+        window._handle_global_fit_complete({"result": _build_success_result()})
+
+        monkeypatch.setattr(
+            window._params_ics_tab,
+            "_collect_parameter_config",
+            lambda: {
+                "parameters": {"k": 1.0},
+                "bounds": {"k": (0.0, 2.0)},
+                "fixed_params": {},
+                "method": "trf",
+                "max_nfev": 2,
+                "seed": None,
+                "log10_params": {},
+            },
+        )
+        monkeypatch.setattr(
+            window,
+            "_collect_dataset_selection",
+            lambda: {
+                "rows": [{"id": "ds1", "label": "Dataset 1", "species": "A", "include": True, "weight": 1.0}],
+                "ids": ["ds1"],
+            },
+        )
+        monkeypatch.setattr(window._params_ics_tab, "collect_integration_settings", lambda: ("BDF", 1e-6, 1e-12))
+        monkeypatch.setattr(window, "_datasets_payloads_for_run", lambda _ids: None)
+
+        window._start_fit()
+
+        ds_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds_view["model_series"] is None
+        assert ds_view["chi_squared"] is None
+        assert window._available_project_apply_scopes() == set()
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_start_global_fit_unavailable_callback_clears_prior_dataset_manager_fit_state(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        dataset_entry = window._dataset_entries[0]
+        dataset = {
+            "t": np.asarray(dataset_entry["t"], dtype=float),
+            "species": {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(dataset_entry["species_data"]).items()
+            },
+        }
+        plot_tabs = _DatasetPlotTabs()
+        window._dataset_manager = DatasetManager(
+            plot_tabs=plot_tabs,
+            dataset_resolver=lambda name: dataset if name == "ds1" else None,
+        )
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *_args, **_kwargs: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._handle_global_fit_complete({"result": _build_success_result()})
+        ds_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds_view["model_series"] is not None
+        assert ds_view["chi_squared"] == pytest.approx(1.0)
+
+        window._simulation_func = None
+        window._simulation_builder = None
+
+        config = window._params_ics_tab._collect_parameter_config()
+        assert config is not None
+        selection = window._collect_dataset_selection()
+
+        window._start_global_fit(config, selection)
+
+        ds_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds_view["model_series"] is None
+        assert ds_view["model_x"] is None
+        assert ds_view["model_y"] is None
+        assert ds_view["chi_squared"] is None
+        assert ds_view["r_squared"] is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_clears_only_active_run_dataset_fit_state_even_with_partial_failed_result(
+    qt_app, monkeypatch
+):
+    dataset_entries = [
+        {
+            "id": "ds1",
+            "label": "Dataset 1",
+            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+            "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+            "selected_species": ["A"],
+            "weight": 1.0,
+            "include": True,
+        },
+        {
+            "id": "ds2",
+            "label": "Dataset 2",
+            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+            "species_data": {"A": np.asarray([0.9, 0.7, 0.5], dtype=float)},
+            "selected_species": ["A"],
+            "weight": 1.0,
+            "include": False,
+        },
+    ]
+    dataset_payloads = [
+        {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"},
+        {"id": "ds2", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([0.9, 0.7, 0.5]), "species": "A"},
+    ]
+    window = _build_window(dataset_entries=dataset_entries, dataset_payloads=dataset_payloads)
+    try:
+        window.show()
+        qt_app.processEvents()
+        datasets = {
+            "ds1": {"t": np.asarray([0.0, 1.0, 2.0], dtype=float), "species": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)}},
+            "ds2": {"t": np.asarray([0.0, 1.0, 2.0], dtype=float), "species": {"A": np.asarray([0.9, 0.7, 0.5], dtype=float)}},
+        }
+        plot_tabs = _DatasetPlotTabs()
+        window._dataset_manager = DatasetManager(
+            plot_tabs=plot_tabs,
+            dataset_resolver=lambda name: datasets.get(str(name)),
+        )
+        window._dataset_manager.sync_fit_result_views(
+            {
+                "ds1": {"A": np.asarray([0.95, 0.75, 0.55], dtype=float)},
+                "ds2": {"A": np.asarray([0.85, 0.65, 0.45], dtype=float)},
+            },
+            dataset_stats={
+                "ds1": {"chi_squared": 1.0, "r_squared": 0.9},
+                "ds2": {"chi_squared": 2.0, "r_squared": 0.8},
+            },
+            dataset_ids=["ds1", "ds2"],
+        )
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._active_fit_dataset_ids = ["ds1"]
+        failed = _build_completion_result(
+            status="fail",
+            dataset_id="ds1",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        failed.model_series = {"ds1": {"A": np.asarray([0.5, 0.4, 0.3], dtype=float)}}
+        failed.dataset_info = [
+            DatasetFitInfo(
+                dataset_id="ds1",
+                r_squared=0.12,
+                chi_squared=9.9,
+                rmse=1.0,
+                mae=1.0,
+                residuals=np.asarray([1.0], dtype=float),
+                n_points=1,
+                weight=1.0,
+            )
+        ]
+
+        window._handle_global_fit_complete({"result": failed})
+
+        ds1_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds1_view["model_series"] is None
+        assert ds1_view["chi_squared"] is None
+        assert ds1_view["r_squared"] is None
+        assert window._run_results_tab._latest_model_series_by_dataset == {}
+        assert window._run_results_tab._last_stats == {}
+
+        ds2_view = window._dataset_manager._dataset_views["ds2"]
+        assert ds2_view["model_series"] is not None
+        assert ds2_view["chi_squared"] == pytest.approx(2.0)
+        assert ds2_view["r_squared"] == pytest.approx(0.8)
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_worker_error_clears_active_run_fit_state_after_prior_success(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        dataset_entry = window._dataset_entries[0]
+        dataset = {
+            "t": np.asarray(dataset_entry["t"], dtype=float),
+            "species": {
+                str(name): np.asarray(values, dtype=float)
+                for name, values in dict(dataset_entry["species_data"]).items()
+            },
+        }
+        plot_tabs = _DatasetPlotTabs()
+        window._dataset_manager = DatasetManager(
+            plot_tabs=plot_tabs,
+            dataset_resolver=lambda name: dataset if name == "ds1" else None,
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+        window._handle_global_fit_complete({"result": _build_success_result()})
+        window._params_ics_tab.set_last_fit_params({"k": 0.5})
+        window._active_fit_dataset_ids = ["ds1"]
+
+        worker = _SignalWorker()
+        worker._running = False
+        window._worker = worker
+
+        window._on_worker_error({"kind": "fitting_error", "message": "boom"}, worker=worker)
+
+        ds_view = window._dataset_manager._dataset_views["ds1"]
+        assert ds_view["model_series"] is None
+        assert ds_view["chi_squared"] is None
+        assert ds_view["r_squared"] is None
+        assert window._params_ics_tab.get_last_fit_params() == {}
+        assert window._available_project_apply_scopes() == set()
+        assert window._run_results_tab._latest_model_series_by_dataset == {}
+        assert window._run_results_tab._last_stats == {}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_keeps_top_level_message_in_details_without_stack_trace(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(status="fail", message="failed")
+        result.completion = _build_completion(
+            status="fail",
+            optimizer_converged=True,
+            optimizer_diagnostic=_make_diagnostic(
+                phase="fatal",
+                message="top-level process-pool failure",
+                remediation="generic_retry",
+            ),
+            dataset_failures={
+                "ds1": _make_diagnostic(
+                    phase="final_replay",
+                    dataset_id="ds1",
+                    message="dataset replay failed",
+                    remediation="generic_retry",
+                ),
+            },
+            detail_sections=[
+                FitDetailSection(
+                    dataset_id=None,
+                    failure=build_simulation_failure(
+                        kind="simulation_error",
+                        message="top-level process-pool failure",
+                    ),
+                )
+            ],
+        )
+        dialogs: list[str] = []
+
+        def _capture_exec(self):
+            dialogs.append(self.detailedText())
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert dialogs == ["top-level process-pool failure"]
     finally:
         window.close()
 

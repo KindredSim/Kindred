@@ -40,7 +40,7 @@ def test_fit_global_accepts_typed_dataset_overrides() -> None:
         dataset_overrides=overrides,
     )
 
-    assert result.success
+    assert result.completion.status == "ok"
     assert pytest.approx(result.shared_params["k"], rel=1e-2) == 0.4
     assert pytest.approx(result.dataset_params["ds1"]["init:A"], rel=1e-2) == 1.0
     assert pytest.approx(result.dataset_params["ds2"]["init:A"], rel=1e-2) == 2.0

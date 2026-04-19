@@ -25,7 +25,7 @@ def test_fit_global_log10_shared_param_converts_bounds_and_values():
         max_nfev=200,
     )
 
-    assert result.success
+    assert result.completion.status == "ok"
     assert pytest.approx(result.shared_params["k"], rel=2e-2) == true_k
 
 
@@ -46,4 +46,3 @@ def test_fit_global_log10_rejects_non_positive_bounds():
             log10_params={"k": True},
             max_nfev=10,
         )
-
