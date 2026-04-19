@@ -1711,12 +1711,8 @@ class FittingWindow(QtWidgets.QDialog):
         if self._pre_run_parameter_state is None or self._pre_run_staged_dataset_params is None:
             self._capture_failed_fit_restore_baseline()
         if self._simulation_func is None and not callable(getattr(self, "_simulation_builder", None)):
-            QtWidgets.QMessageBox.warning(self, "Global Fit", "Simulation callback is unavailable.")
             self._clear_failed_run_visual_state()
-            self._active_fit_dataset_ids = []
-            self._pre_run_parameter_state = None
-            self._pre_run_staged_dataset_params = None
-            self._set_running_state(False)
+            QtWidgets.QMessageBox.warning(self, "Global Fit", "Simulation callback is unavailable.")
             return
         self._species_table.flush_visible_weight_edits()
 
@@ -1745,53 +1741,33 @@ class FittingWindow(QtWidgets.QDialog):
                 self._params_ics_tab.rebuild_for_mechanism(mechanism_text, list(self._dataset_entries))
                 self._capture_failed_fit_restore_baseline()
             except DatasetManagerError as exc:
-                QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
                 self._clear_failed_run_visual_state()
-                self._active_fit_dataset_ids = []
-                self._pre_run_parameter_state = None
-                self._pre_run_staged_dataset_params = None
-                self._set_running_state(False)
+                QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
                 return
             except Exception as exc:
                 logger.exception("Failed to refresh fit-window state before running fit.")
+                self._clear_failed_run_visual_state()
                 QtWidgets.QMessageBox.critical(
                     self,
                     "Simulation Error",
                     f"Failed to refresh fit-window state:\n{exc}",
                 )
-                self._clear_failed_run_visual_state()
-                self._active_fit_dataset_ids = []
-                self._pre_run_parameter_state = None
-                self._pre_run_staged_dataset_params = None
-                self._set_running_state(False)
                 return
             config = self._params_ics_tab._collect_parameter_config()
             if not config:
                 self._clear_failed_run_visual_state()
-                self._active_fit_dataset_ids = []
-                self._pre_run_parameter_state = None
-                self._pre_run_staged_dataset_params = None
-                self._set_running_state(False)
                 return
             self._capture_failed_fit_restore_baseline()
 
         datasets = self._datasets_payloads_for_run(selected_ids)
         if datasets is None:
             self._clear_failed_run_visual_state()
-            self._active_fit_dataset_ids = []
-            self._pre_run_parameter_state = None
-            self._pre_run_staged_dataset_params = None
-            self._set_running_state(False)
             return
         try:
             dataset_specs = coerce_fit_dataset_specs(datasets)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Global Fit", f"Dataset payload preparation failed:\n{exc}")
             self._clear_failed_run_visual_state()
-            self._active_fit_dataset_ids = []
-            self._pre_run_parameter_state = None
-            self._pre_run_staged_dataset_params = None
-            self._set_running_state(False)
+            QtWidgets.QMessageBox.warning(self, "Global Fit", f"Dataset payload preparation failed:\n{exc}")
             return
 
         weights = self._weights_for_run(dataset_selection)
@@ -1806,10 +1782,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
         if not ok:
             self._clear_failed_run_visual_state()
-            self._active_fit_dataset_ids = []
-            self._pre_run_parameter_state = None
-            self._pre_run_staged_dataset_params = None
-            self._set_running_state(False)
             return
 
         staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
@@ -1854,11 +1826,7 @@ class FittingWindow(QtWidgets.QDialog):
             )
         except Exception as exc:
             self._clear_failed_run_visual_state()
-            self._active_fit_dataset_ids = []
-            self._pre_run_parameter_state = None
-            self._pre_run_staged_dataset_params = None
             logger.exception("Failed to start fit worker.")
-            self._set_running_state(False)
             QtWidgets.QMessageBox.warning(self, "Global Fit", f"Failed to start fit:\n{exc}")
             return
 
@@ -2634,42 +2602,42 @@ class FittingWindow(QtWidgets.QDialog):
             return
         self._last_result = result
         self._best_cost = None
+        severity, title, text = self._global_fit_completion_dialog_spec(result)
         if self._results_rebuild_pending:
             self._results_rebuild_pending = False
-            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-        severity, title, text = self._global_fit_completion_dialog_spec(result)
+            if severity != "fail":
+                self._run_results_tab.rebuild_subtabs(
+                    self._dataset_entries,
+                    self._results_fit_targets_by_dataset(),
+                )
         if severity == "fail":
-            self._clear_failed_fit_apply_state()
-            self._clear_failed_dataset_manager_fit_state(self._active_or_result_dataset_ids(result))
+            self._clear_failed_run_visual_state(result)
         else:
             self._params_ics_tab.push_fit_results(
                 dict(result.shared_params),
                 {k: dict(v) for k, v in (result.dataset_params or {}).items()},
             )
         if severity == "fail":
-            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-            self._clear_results_summary_state()
+            pass
         else:
             self._run_results_tab.push_final_result(result, self._dataset_entries)
             self._update_dataset_views_from_global(result)
         if severity == "fail":
-            self._run_results_tab.clear_fitted_params()
-            self._update_statistics({})
+            pass
         else:
             self._update_statistics(self._build_global_stats(result))
         self._refresh_project_apply_controls(prefer_broadest=True)
         if severity == "fail":
-            self._latest_model_series = {}
-            self._latest_dataset_stats = {}
+            pass
         else:
             self._latest_model_series = {k: dict(v) for k, v in (result.model_series or {}).items()}
             self._latest_dataset_stats = {
                 info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
                 for info in (result.dataset_info or [])
             }
-        self._active_fit_dataset_ids = []
-        self._pre_run_parameter_state = None
-        self._pre_run_staged_dataset_params = None
+            self._active_fit_dataset_ids = []
+            self._pre_run_parameter_state = None
+            self._pre_run_staged_dataset_params = None
         completion = getattr(result, "completion", None)
         rendered_detail_sections: list[str] = []
         if completion is not None:
@@ -2707,7 +2675,8 @@ class FittingWindow(QtWidgets.QDialog):
             logger.warning("%s", combined_detail)
 
         self._status_label.setText(status)
-        self._set_running_state(False)
+        if severity != "fail":
+            self._set_running_state(False)
         if self.isVisible() and not self._closing:
             if severity == "ok":
                 icon = QtWidgets.QMessageBox.Icon.Information
@@ -2736,25 +2705,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._pre_run_staged_dataset_params = self._params_ics_tab.get_staged_dataset_params()
 
     def _clear_failed_fit_apply_state(self) -> None:
-        self._params_ics_tab.set_last_fit_params({})
-        if isinstance(self._pre_run_staged_dataset_params, dict):
-            self._params_ics_tab.set_staged_dataset_params(self._pre_run_staged_dataset_params)
-        else:
-            self._params_ics_tab.set_staged_dataset_params({})
-        restored_state = self._pre_run_parameter_state
-        if isinstance(restored_state, list):
-            parameter_state = [dict(entry) for entry in restored_state if isinstance(entry, dict)]
-        else:
-            parameter_state = getattr(self._params_ics_tab, "_parameter_state", None)
-            if isinstance(parameter_state, list):
-                parameter_state = [dict(entry) for entry in parameter_state if isinstance(entry, dict)]
-        if isinstance(parameter_state, list):
-            for entry in parameter_state:
-                entry["last_fit"] = None
-            self._params_ics_tab.set_parameter_state(parameter_state)
-        populate_table = getattr(self._params_ics_tab, "_populate_parameter_table", None)
-        if callable(populate_table):
-            populate_table()
+        self._params_ics_tab._restore_failed_fit_state(
+            self._pre_run_parameter_state,
+            self._pre_run_staged_dataset_params,
+        )
 
     def _result_dataset_ids(self, result: Optional[GlobalFitResult]) -> List[str]:
         if result is None:
@@ -2798,20 +2752,26 @@ class FittingWindow(QtWidgets.QDialog):
             return
         self._dataset_manager.sync_fit_result_views({}, dataset_stats={}, dataset_ids=normalized_ids)
 
-    def _clear_results_summary_state(self) -> None:
-        self._run_results_tab.set_run_stamp({}, "", "")
+    def _disable_results_summary_button(self) -> None:
         self._results_summary_button.setEnabled(False)
 
     def _clear_failed_run_visual_state(self, result: Optional[GlobalFitResult] = None) -> None:
         self._clear_failed_fit_apply_state()
         self._clear_failed_dataset_manager_fit_state(self._active_or_result_dataset_ids(result))
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-        self._clear_results_summary_state()
-        self._run_results_tab.clear_fitted_params()
-        self._run_results_tab.update_statistics({})
+        self._run_results_tab._clear_failed_run_state(
+            self._dataset_entries,
+            self._results_fit_targets_by_dataset(),
+        )
+        self._disable_results_summary_button()
         self._refresh_project_apply_controls(prefer_broadest=True)
         self._latest_model_series = {}
         self._latest_dataset_stats = {}
+        self._latest_plot_model_series = {}
+        self._latest_plot_model_x = {}
+        self._active_fit_dataset_ids = []
+        self._pre_run_parameter_state = None
+        self._pre_run_staged_dataset_params = None
+        self._set_running_state(False)
 
     def _failure_summary_lines(self, diagnostic: Any, *, label: str | None = None) -> list[str]:
         raw_message = simulation_failure_user_message(diagnostic.failure)
@@ -3208,18 +3168,7 @@ class FittingWindow(QtWidgets.QDialog):
             return
         if self._results_rebuild_pending:
             self._results_rebuild_pending = False
-            self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-        self._clear_failed_fit_apply_state()
-        self._clear_failed_dataset_manager_fit_state(self._active_or_result_dataset_ids())
-        self._run_results_tab.rebuild_subtabs(self._dataset_entries, self._results_fit_targets_by_dataset())
-        self._clear_results_summary_state()
-        self._run_results_tab.clear_fitted_params()
-        self._run_results_tab.update_statistics({})
-        self._refresh_project_apply_controls(prefer_broadest=True)
-        self._active_fit_dataset_ids = []
-        self._pre_run_parameter_state = None
-        self._pre_run_staged_dataset_params = None
-        self._set_running_state(False)
+        self._clear_failed_run_visual_state()
         payload = coerce_simulation_failure(error)
         stack_trace = simulation_failure_detail_text(payload)
         has_stack_trace = bool(stack_trace)

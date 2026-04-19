@@ -406,6 +406,16 @@ class RunResultsTab(QtWidgets.QWidget):
         self._last_fitted_params = {}
         self._last_dataset_fitted_params = {}
 
+    def _clear_failed_run_state(
+        self,
+        dataset_entries: Sequence[Dict[str, Any]],
+        fit_targets_by_dataset: Dict[str, Sequence[str]],
+    ) -> None:
+        # Clearing the run stamp is the authoritative reset for summary, tracker,
+        # cached model payloads, and any open summary dialog state.
+        self.set_run_stamp({}, "", "")
+        self.rebuild_subtabs(dataset_entries, fit_targets_by_dataset)
+
     def _dataset_label_for_id(self, dataset_id: str) -> str:
         ds_id = str(dataset_id or "").strip()
         for entry in self._dataset_entries or []:

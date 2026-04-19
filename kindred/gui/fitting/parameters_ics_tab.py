@@ -1899,6 +1899,51 @@ class ParametersIcsTab(QtWidgets.QWidget):
     # Public API — state mutation from fit results
     # ------------------------------------------------------------------
 
+    def _restore_failed_fit_state(
+        self,
+        pre_run_parameter_state: Optional[List[Dict[str, Any]]],
+        pre_run_staged_dataset_params: Optional[Dict[str, Dict[str, float]]],
+    ) -> None:
+        self._last_fit_params = {}
+        has_parameter_baseline = isinstance(pre_run_parameter_state, list)
+        has_staged_baseline = isinstance(pre_run_staged_dataset_params, dict)
+        current_has_staged_params = bool(self._staged_dataset_params)
+        current_has_live_fit_values = any(
+            isinstance(entry, dict) and entry.get("last_fit") is not None
+            for entry in self._parameter_state
+        )
+
+        use_parameter_baseline = has_parameter_baseline and (
+            has_staged_baseline or not current_has_staged_params
+        )
+        use_staged_baseline = has_staged_baseline and (
+            has_parameter_baseline or not current_has_live_fit_values
+        )
+
+        if use_staged_baseline:
+            self._staged_dataset_params = {
+                str(ds_id): dict(param_map)
+                for ds_id, param_map in pre_run_staged_dataset_params.items()
+                if isinstance(param_map, dict)
+            }
+        else:
+            self._staged_dataset_params = {}
+
+        # Preserve the pre-existing failure-recovery fallback: if no baseline
+        # was captured, clear live fit markers from the current table state.
+        # Ignore a one-sided baseline only when the missing side still carries
+        # live staged/best-fit state that would produce a split restore.
+        if use_parameter_baseline:
+            parameter_state = [dict(entry) for entry in pre_run_parameter_state if isinstance(entry, dict)]
+        else:
+            parameter_state = [dict(entry) for entry in self._parameter_state if isinstance(entry, dict)]
+
+        for entry in parameter_state:
+            entry["last_fit"] = None
+
+        self._parameter_state = parameter_state
+        self._populate_parameter_table()
+
     def push_fit_results(
         self,
         shared_params: Dict[str, float],

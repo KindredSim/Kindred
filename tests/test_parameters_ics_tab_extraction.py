@@ -189,3 +189,200 @@ def test_ic_panel_apply_signal_round_trip(qt_app):
     finally:
         tab.close()
         qt_app.processEvents()
+
+
+def test_restore_failed_fit_state_restores_pre_run_values_and_clears_last_fit(qt_app):
+    tab = _make_tab(
+        entries=[{"id": "ds1", "label": "DS 1"}],
+        species=["A"],
+    )
+    try:
+        pre_run_state = [
+            {
+                "name": "k1",
+                "param_name": "k1",
+                "scope": "shared",
+                "dataset_id": "",
+                "fit": True,
+                "value": 1.25,
+                "last_fit": None,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+            {
+                "name": "init:A (DS 1)",
+                "param_name": "init:A",
+                "scope": "dataset",
+                "dataset_id": "ds1",
+                "fit": True,
+                "value": 2.0,
+                "last_fit": None,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+        ]
+        tab.set_parameter_state(pre_run_state)
+        tab.set_last_fit_params({"k1": 9.0})
+        tab.set_staged_dataset_params({"ds1": {"init:A": 9.0}})
+        tab.push_best_update({"k1": 4.0}, {"ds1": {"init:A": 5.0}})
+
+        tab._restore_failed_fit_state(pre_run_state, {"ds1": {"init:A": 2.0}})
+
+        restored_state = tab.get_parameter_state()
+        assert [row["value"] for row in restored_state] == [1.25, 2.0]
+        assert all(row["last_fit"] is None for row in restored_state)
+        assert tab.get_last_fit_params() == {}
+        assert tab.get_staged_dataset_params() == {"ds1": {"init:A": 2.0}}
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_restore_failed_fit_state_without_baseline_clears_live_fit_markers_only(qt_app):
+    tab = _make_tab(
+        entries=[{"id": "ds1", "label": "DS 1"}],
+        species=["A"],
+    )
+    try:
+        current_state = [
+            {
+                "name": "k1",
+                "param_name": "k1",
+                "scope": "shared",
+                "dataset_id": "",
+                "fit": True,
+                "value": 4.0,
+                "last_fit": 4.0,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+            {
+                "name": "init:A (DS 1)",
+                "param_name": "init:A",
+                "scope": "dataset",
+                "dataset_id": "ds1",
+                "fit": True,
+                "value": 5.0,
+                "last_fit": 5.0,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+        ]
+        tab.set_parameter_state(current_state)
+        tab.set_last_fit_params({"k1": 4.0})
+        tab.set_staged_dataset_params({"ds1": {"init:A": 5.0}})
+
+        tab._restore_failed_fit_state(None, None)
+
+        restored_state = tab.get_parameter_state()
+        assert [row["value"] for row in restored_state] == [4.0, 5.0]
+        assert all(row["last_fit"] is None for row in restored_state)
+        assert tab.get_last_fit_params() == {}
+        assert tab.get_staged_dataset_params() == {}
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_restore_failed_fit_state_ignores_partial_baseline_and_avoids_split_restore(qt_app):
+    tab = _make_tab(
+        entries=[{"id": "ds1", "label": "DS 1"}],
+        species=["A"],
+    )
+    try:
+        current_state = [
+            {
+                "name": "k1",
+                "param_name": "k1",
+                "scope": "shared",
+                "dataset_id": "",
+                "fit": True,
+                "value": 4.0,
+                "last_fit": 4.0,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+            {
+                "name": "init:A (DS 1)",
+                "param_name": "init:A",
+                "scope": "dataset",
+                "dataset_id": "ds1",
+                "fit": True,
+                "value": 5.0,
+                "last_fit": 5.0,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+        ]
+        tab.set_parameter_state(current_state)
+        tab.set_last_fit_params({"k1": 4.0})
+        tab.set_staged_dataset_params({"ds1": {"init:A": 5.0}})
+
+        tab._restore_failed_fit_state(None, {"ds1": {"init:A": 2.0}})
+
+        restored_state = tab.get_parameter_state()
+        assert [row["value"] for row in restored_state] == [4.0, 5.0]
+        assert all(row["last_fit"] is None for row in restored_state)
+        assert tab.get_last_fit_params() == {}
+        assert tab.get_staged_dataset_params() == {}
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_restore_failed_fit_state_ignores_parameter_only_baseline_when_staged_state_is_live(qt_app):
+    tab = _make_tab(
+        entries=[{"id": "ds1", "label": "DS 1"}],
+        species=["A"],
+    )
+    try:
+        pre_run_state = [
+            {
+                "name": "k1",
+                "param_name": "k1",
+                "scope": "shared",
+                "dataset_id": "",
+                "fit": True,
+                "value": 1.25,
+                "last_fit": None,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+            {
+                "name": "init:A (DS 1)",
+                "param_name": "init:A",
+                "scope": "dataset",
+                "dataset_id": "ds1",
+                "fit": True,
+                "value": 2.0,
+                "last_fit": None,
+                "min": 0.0,
+                "max": 10.0,
+                "log10": False,
+            },
+        ]
+        current_state = [
+            dict(pre_run_state[0], value=4.0, last_fit=4.0),
+            dict(pre_run_state[1], value=5.0, last_fit=5.0),
+        ]
+        tab.set_parameter_state(current_state)
+        tab.set_last_fit_params({"k1": 4.0})
+        tab.set_staged_dataset_params({"ds1": {"init:A": 5.0}})
+
+        tab._restore_failed_fit_state(pre_run_state, None)
+
+        restored_state = tab.get_parameter_state()
+        assert [row["value"] for row in restored_state] == [4.0, 5.0]
+        assert all(row["last_fit"] is None for row in restored_state)
+        assert tab.get_last_fit_params() == {}
+        assert tab.get_staged_dataset_params() == {}
+    finally:
+        tab.close()
+        qt_app.processEvents()

@@ -1690,6 +1690,77 @@ def test_failed_completion_clears_results_summary_state_after_prior_success(qt_a
         qt_app.processEvents()
 
 
+def test_failed_completion_with_pending_rebuild_uses_current_applied_targets(qt_app, monkeypatch):
+    dataset_entries = [
+        {
+            "id": "ds1",
+            "label": "Dataset 1",
+            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+            "species_data": {
+                "A": np.asarray([1.0, 0.8, 0.6], dtype=float),
+                "B": np.asarray([0.2, 0.3, 0.4], dtype=float),
+            },
+            "selected_species": ["A"],
+            "weight": 1.0,
+            "include": True,
+        }
+    ]
+    dataset_payloads = [
+        {
+            "id": "ds1",
+            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+            "y": np.asarray(
+                [
+                    [1.0, 0.8, 0.6],
+                    [0.2, 0.3, 0.4],
+                ],
+                dtype=float,
+            ),
+            "species": ["A", "B"],
+        }
+    ]
+    window = _build_window(dataset_entries=dataset_entries, dataset_payloads=dataset_payloads)
+    try:
+        window.show()
+        qt_app.processEvents()
+        assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["A"]
+
+        worker = _SignalWorker()
+        window._worker = worker
+        window._species_table._fit_targets_selection_applied["ds1"] = ["B"]
+        window._on_targets_applied()
+        qt_app.processEvents()
+        assert window._results_rebuild_pending is True
+
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window.hide()
+        window._worker = None
+        failed = _build_completion_result(
+            status="fail",
+            dataset_id="ds1",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        failed.model_series = {}
+        failed.dataset_info = []
+
+        window._handle_global_fit_complete({"result": failed})
+
+        assert window._results_rebuild_pending is False
+        assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["B"]
+        payload = window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]
+        assert payload["current_species"] == "B"
+        assert sorted(payload["all_species"].keys()) == ["B"]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, monkeypatch):
     window = _build_window()
     try:
@@ -1801,6 +1872,59 @@ def test_start_global_fit_unavailable_callback_clears_prior_dataset_manager_fit_
         assert ds_view["chi_squared"] is None
         assert ds_view["r_squared"] is None
     finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_start_global_fit_unavailable_callback_clears_open_results_summary_state(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        window._run_results_tab.set_run_stamp({"solver": "BDF"}, "hash123", "hash123")
+        window._run_results_tab.update_statistics({"Datasets": 1})
+        window._results_summary_button.setEnabled(True)
+        window._run_results_tab.open_results_summary_dialog()
+        qt_app.processEvents()
+        assert window._run_results_tab._stamp_dialog is not None
+        assert window._run_results_tab._stamp_dialog.isVisible()
+
+        refresh_calls: list[tuple] = []
+        original_refresh = window._run_results_tab._stamp_dialog.refresh
+
+        def tracking_refresh(*args, **kwargs):
+            refresh_calls.append((args, kwargs))
+            return original_refresh(*args, **kwargs)
+
+        monkeypatch.setattr(window._run_results_tab._stamp_dialog, "refresh", tracking_refresh)
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *_args, **_kwargs: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._simulation_func = None
+        window._simulation_builder = None
+
+        config = window._params_ics_tab._collect_parameter_config()
+        assert config is not None
+        selection = window._collect_dataset_selection()
+
+        window._start_global_fit(config, selection)
+
+        assert not window._results_summary_button.isEnabled()
+        assert window._run_results_tab._last_run_stamp == {}
+        assert refresh_calls
+        args, kwargs = refresh_calls[-1]
+        assert args[0] == {}
+        assert args[1] == ""
+        assert args[2] == ""
+        assert args[3] is None
+        assert kwargs["fitted_params"] is None
+        assert kwargs["dataset_fitted_params"] is None
+    finally:
+        if getattr(window._run_results_tab, "_stamp_dialog", None) is not None:
+            window._run_results_tab._stamp_dialog.close()
         window.close()
         qt_app.processEvents()
 
@@ -1943,6 +2067,68 @@ def test_worker_error_clears_active_run_fit_state_after_prior_success(qt_app, mo
         assert window._available_project_apply_scopes() == set()
         assert window._run_results_tab._latest_model_series_by_dataset == {}
         assert window._run_results_tab._last_stats == {}
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_completion_routes_through_failed_run_closeout_helper(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        result = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        calls: list[object] = []
+
+        monkeypatch.setattr(
+            window,
+            "_clear_failed_run_visual_state",
+            lambda current_result=None: calls.append(current_result),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        window._handle_global_fit_complete({"result": result})
+
+        assert calls == [result]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_worker_error_routes_through_failed_run_closeout_helper(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        calls: list[object] = []
+
+        monkeypatch.setattr(
+            window,
+            "_clear_failed_run_visual_state",
+            lambda current_result=None: calls.append(current_result),
+        )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "exec",
+            lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+
+        worker = _SignalWorker()
+        worker._running = False
+        window._worker = worker
+        window._active_fit_dataset_ids = ["ds1"]
+
+        window._on_worker_error({"kind": "fitting_error", "message": "boom"}, worker=worker)
+
+        assert calls == [None]
     finally:
         window.close()
         qt_app.processEvents()

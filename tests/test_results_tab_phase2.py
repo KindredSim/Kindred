@@ -267,6 +267,107 @@ def test_rebuild_subtabs_replaces_previous_dataset_count(qt_app):
         qt_app.processEvents()
 
 
+def test_clear_failed_run_state_clears_run_stamp_and_preserves_dataset_tabs(qt_app):
+    from kindred.gui.fitting.run_results_tab import RunResultsTab
+
+    entries = _make_dataset_entries(2)
+    tab = RunResultsTab(parent=None)
+    try:
+        tab.rebuild_subtabs(entries, _make_targets(entries))
+        tab.set_run_stamp({"solver": "BDF"}, "hash123", "hash123")
+        tab.update_statistics({"Datasets": 2})
+        tab.push_final_result(_make_final_result(entries), entries)
+
+        tab._clear_failed_run_state(entries, _make_targets(entries))
+
+        tab_bar = tab.findChild(QtWidgets.QTabBar, "global_fit_results_subtabs")
+        assert tab_bar is not None
+        assert tab_bar.count() == 3
+        assert tab._last_run_stamp == {}
+        assert tab._last_run_stamp_hash == ""
+        assert tab._last_run_stamp_short == ""
+        assert tab._last_stats == {}
+        assert tab._last_fitted_params == {}
+        assert tab._last_dataset_fitted_params == {}
+        assert set(tab._dataset_plot_views.keys()) == {"ds1", "ds2"}
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_clear_failed_run_state_refreshes_open_summary_dialog(qt_app, monkeypatch):
+    from kindred.gui.fitting.run_results_tab import RunResultsTab
+
+    entries = _make_dataset_entries(1)
+    tab = RunResultsTab(parent=None)
+    try:
+        tab.rebuild_subtabs(entries, _make_targets(entries))
+        tab.set_run_stamp({"solver": "BDF"}, "hash123", "hash123")
+        tab.update_statistics({"Datasets": 1})
+        tab.open_results_summary_dialog()
+        qt_app.processEvents()
+
+        refresh_calls: list[tuple] = []
+        original_refresh = tab._stamp_dialog.refresh
+
+        def tracking_refresh(*args, **kwargs):
+            refresh_calls.append((args, kwargs))
+            return original_refresh(*args, **kwargs)
+
+        monkeypatch.setattr(tab._stamp_dialog, "refresh", tracking_refresh)
+
+        tab._clear_failed_run_state(entries, _make_targets(entries))
+
+        assert refresh_calls
+        args, kwargs = refresh_calls[-1]
+        assert args[0] == {}
+        assert args[1] == ""
+        assert args[2] == ""
+        assert args[3] is None
+        assert kwargs["fitted_params"] is None
+        assert kwargs["dataset_fitted_params"] is None
+    finally:
+        if getattr(tab, "_stamp_dialog", None) is not None:
+            tab._stamp_dialog.close()
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_clear_failed_run_state_clears_cached_run_data_before_rebuild(qt_app, monkeypatch):
+    from kindred.gui.fitting.run_results_tab import RunResultsTab
+
+    entries = _make_dataset_entries(1)
+    tab = RunResultsTab(parent=None)
+    try:
+        tab.rebuild_subtabs(entries, _make_targets(entries))
+        tab.push_final_result(_make_final_result(entries), entries)
+
+        call_order: list[str] = []
+        original_set_run_stamp = tab.set_run_stamp
+        original_rebuild_subtabs = tab.rebuild_subtabs
+
+        def tracking_set_run_stamp(*args, **kwargs):
+            call_order.append("set_run_stamp")
+            return original_set_run_stamp(*args, **kwargs)
+
+        def tracking_rebuild_subtabs(*args, **kwargs):
+            call_order.append("rebuild_subtabs")
+            return original_rebuild_subtabs(*args, **kwargs)
+
+        monkeypatch.setattr(tab, "set_run_stamp", tracking_set_run_stamp)
+        monkeypatch.setattr(tab, "rebuild_subtabs", tracking_rebuild_subtabs)
+
+        tab._clear_failed_run_state(entries, _make_targets(entries))
+
+        assert call_order[:2] == ["set_run_stamp", "rebuild_subtabs"]
+        payload = tab._dataset_plot_views["ds1"]._datasets[0]
+        assert payload["model_series"] is None
+        assert payload["model_y"] is None
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
 def test_push_live_update_updates_tracker_and_subtab_payloads(qt_app):
     from kindred.gui.fitting.run_results_tab import RunResultsTab
 
@@ -1185,6 +1286,82 @@ def test_pending_rebuild_uses_current_dataset_state(qt_app):
         assert rebuilt_first["include"] is False, (
             "Deferred rebuild must use the current (post-toggle) dataset state"
         )
+    finally:
+        window._worker = None
+        window.close()
+        qt_app.processEvents()
+
+
+def test_pending_rebuild_on_success_uses_current_applied_targets(qt_app):
+    """Deferred successful completion must rebuild the results tab with current applied targets."""
+    t = np.linspace(0.0, 1.0, 5)
+    entries = [
+        {
+            "id": "ds1",
+            "label": "Dataset 1",
+            "t": t.copy(),
+            "species_data": {
+                "A": np.linspace(1.0, 0.5, t.size),
+                "B": np.linspace(0.2, 0.8, t.size),
+            },
+            "selected_species": ["A"],
+            "weight": 1.0,
+            "include": True,
+        }
+    ]
+    window = _make_window(entries)
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["A"]
+
+        window._worker = _FakeWorker()
+        window._species_table._fit_targets_selection_applied["ds1"] = ["B"]
+        window._on_targets_applied()
+        qt_app.processEvents()
+        assert window._results_rebuild_pending is True
+        assert window._results_fit_targets_by_dataset()["ds1"] == ["B"]
+
+        window._worker = None
+        window.hide()
+        result = GlobalFitResult(
+            shared_params={"k1": 1.0},
+            dataset_params={},
+            uncertainties=None,
+            global_chi_squared=0.01,
+            global_r_squared=0.99,
+            nfev=100,
+            dataset_info=[
+                DatasetFitInfo(
+                    dataset_id="ds1",
+                    chi_squared=0.01,
+                    r_squared=0.99,
+                    rmse=0.1,
+                    mae=0.05,
+                    n_points=5,
+                    residuals=np.zeros(5),
+                    weight=1.0,
+                )
+            ],
+            model_series={"ds1": {"B": np.zeros(5)}},
+            objective_residuals=np.zeros(5),
+            message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
+        )
+
+        window._handle_global_fit_complete({"result": result})
+        qt_app.processEvents()
+
+        assert window._results_rebuild_pending is False
+        assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["B"]
+        payload = window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]
+        assert payload["current_species"] == "B"
+        assert sorted(payload["all_species"].keys()) == ["B"]
     finally:
         window._worker = None
         window.close()
