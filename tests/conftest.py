@@ -15,8 +15,6 @@ except NotImplementedError:
 import pytest
 
 logger = logging.getLogger(__name__)
-_retired_main_window_host = None
-_retired_main_window = None
 
 def _disable_qdarktheme() -> None:
     # Neuter qdarktheme before any test or fixture constructs a MainWindow.
@@ -38,8 +36,26 @@ if sys.platform.startswith("linux") and multiprocessing is not None:
         pass
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _neutralize_pyqtgraph_connect_cleanup():
+    import pyqtgraph as pg
+
+    if not hasattr(pg, "_connectCleanup") or not callable(pg._connectCleanup):
+        pytest.fail("pyqtgraph._connectCleanup missing or not callable", pytrace=False)
+
+    monkeypatch = pytest.MonkeyPatch()
+    # Test-harness-only: exitCleanup=False was probed and found insufficient.
+    # Neutralize the aboutToQuit hookup before first GraphicsView construction,
+    # and do not move this private patch into product code.
+    monkeypatch.setattr(pg, "_connectCleanup", lambda: None)
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
+
+
 @pytest.fixture(scope="session")
-def qt_app():
+def qt_app(_neutralize_pyqtgraph_connect_cleanup):
     """Ensure a QApplication instance exists for GUI-driven tests."""
     _disable_qdarktheme()
     from PySide6 import QtCore, QtWidgets
@@ -111,142 +127,6 @@ def _patch_main_window_test_environment(
         lambda *args, **kwargs: None,
     )
 
-
-def _get_retired_main_window_host():
-    from PySide6 import QtWidgets
-
-    global _retired_main_window_host
-    if _retired_main_window_host is None:
-        host = QtWidgets.QWidget()
-        host.setObjectName("_retired_main_window_host")
-        host.hide()
-        _retired_main_window_host = host
-    return _retired_main_window_host
-
-
-def _qt_object_is_alive(obj) -> bool:
-    try:
-        from shiboken6 import isValid
-    except Exception:
-        return obj is not None
-
-    if obj is None:
-        return False
-    try:
-        return bool(isValid(obj))
-    except Exception:
-        return False
-
-
-def _close_tracked_qt_widgets(item) -> None:
-    widgets = getattr(item, "qt_widgets", None)
-    if not widgets:
-        return
-
-    for widget_ref, before_close_func in item.qt_widgets:
-        widget = widget_ref()
-        if widget is None:
-            continue
-        if before_close_func is not None:
-            before_close_func(widget)
-        widget.close()
-        if getattr(widget, "_kindred_skip_qtbot_delete", False):
-            continue
-        widget.deleteLater()
-    del item.qt_widgets
-
-
-def _retire_main_window(window) -> None:
-    from PySide6 import QtCore, QtWidgets
-
-    global _retired_main_window
-    app = QtWidgets.QApplication.instance()
-    assert app is not None
-
-    if _retired_main_window is not None:
-        if _qt_object_is_alive(_retired_main_window):
-            try:
-                _retired_main_window.deleteLater()
-            except Exception as exc:
-                logger.debug("Failed to delete previously retired MainWindow: %s", exc, exc_info=True)
-            for _ in range(30):
-                app.processEvents()
-            try:
-                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-            except Exception as exc:
-                logger.debug("Failed to drain deferred deletes for retired MainWindow: %s", exc, exc_info=True)
-            for _ in range(15):
-                app.processEvents()
-        _retired_main_window = None
-
-    if not _qt_object_is_alive(window):
-        return
-
-    for attr in (
-        "_update_parameter_table_from_sliders",
-        "_restore_maximized_state_if_needed",
-        "_recover_restored_floating_docks",
-    ):
-        try:
-            setattr(window, attr, lambda *args, **kwargs: None)
-        except Exception as exc:
-            logger.debug("Failed to neutralize retired MainWindow callback %s: %s", attr, exc, exc_info=True)
-
-    for timer in window.findChildren(QtCore.QTimer):
-        try:
-            timer.stop()
-        except Exception as exc:
-            logger.debug("Failed to stop retired MainWindow timer %r: %s", timer, exc, exc_info=True)
-
-    try:
-        central_widget = window.takeCentralWidget()
-    except Exception as exc:
-        central_widget = None
-        logger.debug("Failed to detach central widget from retired MainWindow: %s", exc, exc_info=True)
-    if central_widget is not None:
-        try:
-            central_widget.hide()
-            central_widget.setParent(None)
-            central_widget.deleteLater()
-        except Exception as exc:
-            logger.debug("Failed to delete retired MainWindow central widget: %s", exc, exc_info=True)
-
-    for dock_widget in list(window.findChildren(QtWidgets.QDockWidget)):
-        try:
-            window.removeDockWidget(dock_widget)
-        except Exception:
-            pass
-        try:
-            dock_widget.hide()
-            dock_widget.deleteLater()
-        except Exception as exc:
-            logger.debug("Failed to delete retired MainWindow dock widget %r: %s", dock_widget, exc, exc_info=True)
-
-    for child_type in (QtWidgets.QMenuBar, QtWidgets.QStatusBar):
-        for child in list(window.findChildren(child_type)):
-            if child.parent() is not window:
-                continue
-            try:
-                child.hide()
-                child.setParent(None)
-                child.deleteLater()
-            except Exception as exc:
-                logger.debug("Failed to detach retired MainWindow child %r: %s", child, exc, exc_info=True)
-
-    for _ in range(30):
-        app.processEvents()
-    try:
-        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-    except Exception as exc:
-        logger.debug("Failed to drain deferred deletes while retiring MainWindow shell: %s", exc, exc_info=True)
-    for _ in range(15):
-        app.processEvents()
-
-    window.setParent(_get_retired_main_window_host())
-    window.hide()
-    _retired_main_window = window
-
-
 def _cleanup_main_window(window) -> None:
     from PySide6 import QtCore, QtWidgets
 
@@ -299,9 +179,6 @@ def _cleanup_main_window(window) -> None:
         except Exception as exc:
             logger.debug("Failed to deleteLater stray widget %r during cleanup: %s", widget, exc, exc_info=True)
 
-    # Keep deferred-delete draining for stray widgets, but do not destroy the
-    # shared MainWindow itself here. Qt emits a deterministic timer warning on
-    # stderr when the shared test window is destroyed during test teardown.
     for _ in range(30):
         app.processEvents()
     try:
@@ -321,15 +198,19 @@ def _cleanup_main_window(window) -> None:
     for _ in range(15):
         app.processEvents()
 
-    # Retire the just-closed window under a hidden host so it no longer
-    # accumulates as a top-level widget between tests. The previously retired
-    # window is destroyed on the next cleanup pass, after it has spent a full
-    # test cycle quiescent.
-    if _qt_object_is_alive(window):
-        try:
-            _retire_main_window(window)
-        except Exception as exc:
-            raise AssertionError("Failed to retire MainWindow under hidden test host") from exc
+    try:
+        window.deleteLater()
+    except Exception as exc:
+        logger.debug("Failed to deleteLater MainWindow during test cleanup: %s", exc, exc_info=True)
+
+    for _ in range(15):
+        app.processEvents()
+    try:
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    except Exception as exc:
+        logger.debug("Failed to send deferred-delete events for MainWindow: %s", exc, exc_info=True)
+    for _ in range(10):
+        app.processEvents()
 
     # Break Python-side reference cycles so the C++ side can be collected.
     del window
@@ -346,26 +227,6 @@ def _cleanup_main_window(window) -> None:
     ]
     assert not extra_visible, f"Visible top-level widgets leaked: {extra_visible!r}"
 
-
-@pytest.fixture(autouse=True, scope="session")
-def _patch_qtbot_widget_teardown():
-    try:
-        import pytestqt.plugin
-        import pytestqt.qtbot
-    except Exception:
-        yield
-        return
-
-    original_plugin_close_widgets = pytestqt.plugin._close_widgets
-    original_qtbot_close_widgets = pytestqt.qtbot._close_widgets
-    pytestqt.plugin._close_widgets = _close_tracked_qt_widgets
-    pytestqt.qtbot._close_widgets = _close_tracked_qt_widgets
-    try:
-        yield
-    finally:
-        pytestqt.plugin._close_widgets = original_plugin_close_widgets
-        pytestqt.qtbot._close_widgets = original_qtbot_close_widgets
-
 @pytest.fixture
 def main_window(qt_app, monkeypatch, tmp_path):
     """
@@ -380,7 +241,6 @@ def main_window(qt_app, monkeypatch, tmp_path):
     _clear_test_qsettings()
     _patch_main_window_test_environment(monkeypatch, tmp_path)
     window = MainWindow()
-    window._kindred_skip_qtbot_delete = True
     try:
         yield window
     finally:
