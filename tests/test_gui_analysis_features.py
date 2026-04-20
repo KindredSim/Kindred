@@ -1,5 +1,3 @@
-import os
-
 import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
@@ -15,40 +13,16 @@ from kindred.core.analysis.global_fitting import (  # noqa: E402  # reason: guar
 )
 from kindred.core.fitting_completion import GlobalFitCompletion  # noqa: E402  # reason: guarded by pytest.importorskip("scipy")
 
-
-@pytest.fixture(scope="session")
-def qt_app():
-    """Ensure a QApplication exists for GUI-driven tests."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtCore.QStandardPaths.setTestModeEnabled(True)
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication([])
-    return app
-
-
 @pytest.fixture
-def analysis_window(qt_app, monkeypatch, tmp_path):
+def analysis_window(main_window):
     """Provide a MainWindow configured with a simple mechanism."""
-    def _fake_templates_dir(_self):
-        target = tmp_path / "templates"
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-
-    monkeypatch.setattr(
-        "kindred.config.templates.TemplateManager._get_templates_directory",
-        _fake_templates_dir,
-    )
-    monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
-    window = MainWindow()
     dsl = "\n".join([
         "reaction: A -> B; k=0.2",
         "initial: A=1.0",
         "initial: B=0.0",
     ])
-    window._mechanism_editor._reactions_text.setPlainText(dsl)
-    yield window
-    window.close()
+    main_window._mechanism_editor._reactions_text.setPlainText(dsl)
+    return main_window
 
 
 def test_global_fit_handler_invokes_backend(monkeypatch, analysis_window):

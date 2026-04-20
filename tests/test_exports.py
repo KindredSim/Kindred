@@ -1,22 +1,10 @@
-import os
 import numpy as np
 import pytest
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
-from kindred.gui.main_window import MainWindow
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
 pytestmark = pytest.mark.gui
-
-
-@pytest.fixture(scope="module")
-def qt_app():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtCore.QStandardPaths.setTestModeEnabled(True)
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication([])
-    return app
 
 
 @pytest.fixture(autouse=True)
@@ -28,25 +16,6 @@ def suppress_message_boxes(monkeypatch):
 
     for attr in ("information", "warning", "critical"):
         monkeypatch.setattr(QtWidgets.QMessageBox, attr, _silent)
-
-
-@pytest.fixture
-def main_window(qt_app, monkeypatch, tmp_path):
-    """Provide a MainWindow with filesystem use redirected to tmp_path."""
-
-    def _fake_templates_dir(_self):
-        target = tmp_path / "templates"
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-
-    monkeypatch.setattr(
-        "kindred.config.templates.TemplateManager._get_templates_directory",
-        _fake_templates_dir,
-    )
-    monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
-    window = MainWindow()
-    yield window
-    window.close()
 
 
 @pytest.fixture

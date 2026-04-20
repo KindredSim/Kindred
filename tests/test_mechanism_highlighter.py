@@ -51,7 +51,12 @@ def _font_weight_at(doc: QtGui.QTextDocument, hl: MechanismHighlighter, pos: int
 def doc_and_hl(qt_app):
     doc = QtGui.QTextDocument()
     hl = MechanismHighlighter(doc)
-    return doc, hl
+    try:
+        yield doc, hl
+    finally:
+        hl.setDocument(None)
+        hl.deleteLater()
+        doc.deleteLater()
 
 
 # ---------------------------------------------------------------------------

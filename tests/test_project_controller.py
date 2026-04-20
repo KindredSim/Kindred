@@ -2,7 +2,7 @@ import contextlib
 from types import SimpleNamespace
 
 import pytest
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 from unittest.mock import MagicMock, mock_open, patch
 
 from kindred.gui.controllers.project_controller import ProjectController
@@ -36,7 +36,28 @@ def controller_and_mw(qt_app):
     mw.setWindowTitle = MagicMock(name="SetWindowTitleMock")
     controller.mw = mw
 
-    return controller, mw
+    try:
+        yield controller, mw
+    finally:
+        dialog = getattr(controller, "_export_dialog", None)
+        app = QtWidgets.QApplication.instance()
+        with contextlib.suppress(RuntimeError, TypeError, AttributeError):
+            if dialog is not None and hasattr(dialog, "close"):
+                dialog.close()
+        with contextlib.suppress(RuntimeError, TypeError, AttributeError):
+            if dialog is not None and hasattr(dialog, "deleteLater"):
+                dialog.deleteLater()
+        with contextlib.suppress(RuntimeError, TypeError, AttributeError):
+            controller.deleteLater()
+        with contextlib.suppress(RuntimeError, TypeError, AttributeError):
+            parent.close()
+        with contextlib.suppress(RuntimeError, TypeError, AttributeError):
+            parent.deleteLater()
+        if app is not None:
+            with contextlib.suppress(RuntimeError, TypeError):
+                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+            for _ in range(5):
+                app.processEvents()
 
 
 def test_load_project_dialog_cancel_is_noop(controller_and_mw):
@@ -347,7 +368,6 @@ def test_export_data_scope_preference_failure_does_not_block(controller_and_mw):
         controller.export_data()
 
     dialog.open.assert_called_once()
-
 
 def test__warn_no_export_target_sets_status_and_shows_warning(controller_and_mw):
     controller, mw = controller_and_mw
