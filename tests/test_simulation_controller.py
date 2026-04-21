@@ -1414,7 +1414,12 @@ def test_stale_fast_completion_schedules_pending_slider_run(monkeypatch, mw: _Fa
     controller._pending_slider_simulation = True
 
     controller._active_run_id = 5
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 1,
+    }
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -1536,7 +1541,12 @@ def test_stale_fast_completion_without_pending_still_cleans_up_active_run(monkey
     controller._pending_slider_simulation = False
 
     controller._active_run_id = 11
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 1,
+    }
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -1730,7 +1740,12 @@ def test_invalidate_slider_preview_work_suppresses_stale_completion_ui_after_dis
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = int(rid)
     controller._active_run_id = 11
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 1,
+    }
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -1878,7 +1893,12 @@ def test_invalidate_slider_preview_work_suppresses_stale_error_ui_after_discard(
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = int(rid)
     controller._active_run_id = 11
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 1,
+    }
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -2062,7 +2082,12 @@ def test_stale_fast_error_without_pending_still_cleans_up_active_run(
     controller._pending_slider_simulation = False
 
     controller._active_run_id = 7
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 1,
+    }
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -2803,6 +2828,55 @@ def test_on_simulation_complete_coalesced_flush_keeps_valid_subset_after_dirty_r
     assert kwargs["selected_sets"] == ["id1", "id2"]
     assert kwargs["valid_set_ids"] == ("id1", "id2")
     assert kwargs["allow_fallback"] is False
+
+
+@pytest.mark.unit
+def test_on_simulation_complete_normalizes_scalar_context_ids_before_dirty_reset(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    controller._active_run_id = 7
+    controller._latest_sim_request_id = 11
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "keep_executor_alive": True,
+        "run_id": 7,
+        "request_id": 11,
+        "fast_mode": False,
+        "cache_key": "fresh-current-cache",
+        "queue_ids": "id1",
+        "queue_names": "set1",
+        "primary_set_id": "id1",
+        "total": 2,
+        "completed_set_ids": "id1",
+        "explicit_cache_valid_set_ids": ("id1", "id2"),
+        "pending_workspace_reset_set_ids": "id2",
+        "pending_dirty_reset_generation_by_set_id": {"id2": 1},
+    }
+    controller.batch_cache.active_cache_key = "fresh-current-cache"
+    controller.batch_cache.active_cache_valid_set_ids = ("id1", "id2")
+    mw._dirty_state_generations = {"id2": 1}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._batch_set_ids_for_scope.return_value = ["id1"]
+    mw._shown_batch_set_ids.return_value = ["id1", "id2"]
+    mw._batch_current_row.return_value = 0
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._display_cached_batch_selection.return_value = True
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=7,
+        fast_mode=False,
+        request_id=11,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="fresh-current-cache",
+    )
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["id2"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id2"])
+
 
 @pytest.mark.unit
 def test_queue_slider_plot_update_gates_by_request_and_run_ids(mw: _FakeMainWindow, controller: SimulationController):
@@ -4259,9 +4333,61 @@ def test_run_simulation_internal_baseline_explicit_run_leaves_overlay_cache_toke
     assert mw.preview_batch_cache_token.call_args_list == []
     controller._start_next_batch_simulation.assert_called_once()
 
-@pytest.mark.unit
 
 @pytest.mark.unit
+def test_run_simulation_internal_fast_mode_seeds_active_preview_scope_set_ids(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_store.set_names.return_value = ["set1", "set2"]
+    mw._batch_rows_for_scope.return_value = [0, 1]
+    mw._batch_set_id_for_row.side_effect = ["id1", "id2"]
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "preview-cache"
+    mw._mechanism_editor = _MechanismEditor()
+    mw._parse_sim_time_seconds.return_value = 10.0
+    mw.preview_batch_cache_token = MagicMock(side_effect=["preview:id1", "preview:id2"])
+    mw.preview_initials_for_row = MagicMock(side_effect=[{"A": 1.0}, {"A": 2.0}])
+
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        lambda text, default_set_name="set1": ({}, text),
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=True, request_id=1, batch_rows=[0, 1], reuse_parallel_executor=False)
+
+    assert isinstance(controller.batch_cache.active_preview_cache_key, str)
+    assert controller.batch_cache.active_preview_cache_key
+    assert controller.batch_cache.active_preview_scope_set_ids == ("id1", "id2")
+    controller._start_next_batch_simulation.assert_called_once()
+
 
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for_mechanism_payload(
@@ -5461,6 +5587,57 @@ def test_run_simulation_internal_invalid_t_end_reinvalidates_preserved_pending_i
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._start_next_batch_simulation.assert_not_called()
 
+
+@pytest.mark.unit
+def test_invalidate_preserved_pending_init_results_after_failed_run_honors_explicit_flag_without_context(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._batch_run_context = {}
+
+    controller._invalidate_preserved_pending_init_results_after_failed_run(
+        pending_init_applied=True,
+        ctx=None,
+    )
+
+    mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
+
+
+@pytest.mark.unit
+def test_completion_policy_context_from_raw_tolerates_non_integer_context_fields(
+    controller: SimulationController,
+):
+    controller._batch_run_context = {
+        "active": "false",
+        "fast_mode": "false",
+        "parallel": "false",
+        "keep_executor_alive": "false",
+        "request_id": float("inf"),
+        "run_id": float("-inf"),
+        "total": "bad-total",
+        "pos": "bad-pos",
+        "queue_ids": "id1",
+        "queue_names": "set1",
+        "pending_init_applied": "false",
+        "pending_dirty_reset_generation_by_set_id": {"id1": "bad-generation"},
+    }
+
+    ctx = controller._completion_policy_context_from_raw()
+
+    assert ctx is not None
+    assert ctx.active is False
+    assert ctx.fast_mode is False
+    assert ctx.parallel is False
+    assert ctx.keep_executor_alive is False
+    assert ctx.request_id is None
+    assert ctx.run_id is None
+    assert ctx.total == 0
+    assert ctx.pos == 0
+    assert ctx.queue_ids == ("id1",)
+    assert ctx.queue_names == ("set1",)
+    assert ctx.pending_init_applied is False
+    assert ctx.pending_dirty_reset_generation_by_set_id == {}
+
 @pytest.mark.unit
 def test_run_simulation_internal_no_mechanism_after_pending_init_migration_reinvalidates_preserved_results(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -5614,7 +5791,7 @@ def test_on_simulation_complete_updates_cache_and_marks_pending_init_applied(mon
         "queue_names": ["set1"],
         "queue_ids": ["id1"],
         "cache_key": "ck",
-        "pending_init_seed": {"A": 1.0},
+        "pending_init_seed": {"set1": {"A": 1.0}},
         "pending_init_rewrite": "reaction: A -> B; k=1",
         "pending_init_applied": False,
         "primary_set_id": "id1",

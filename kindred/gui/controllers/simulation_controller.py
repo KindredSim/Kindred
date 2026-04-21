@@ -34,6 +34,17 @@ from kindred.core.simulation_failure import (
 )
 from kindred.core.simulation_preparation import BoundMechanism, SimulationExecutionRequest
 from kindred.gui.controllers.cache_contracts import build_batch_cache_entry
+from kindred.gui.controllers.simulation_completion_policy import (
+    CacheAuthorityState,
+    CompletionPolicyContext,
+    DirtySetState,
+    PendingReplayDirective,
+    PendingReplayState,
+    PolicyStatePatch,
+    RunActivitySnapshot,
+    SimulationCompletionPolicy,
+    pending_initial_seed_for_set,
+)
 from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
@@ -63,23 +74,12 @@ def _try_float(value: object) -> Optional[float]:
     return float(out)
 
 
-def _pending_initial_seed_for_set(
-    pending_init_seed: object,
-    *,
-    set_name: str,
-) -> Dict[str, object]:
-    if not isinstance(pending_init_seed, Mapping) or not pending_init_seed:
-        return {}
+def _safe_int(value: object, *, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
 
-    nested_seed = pending_init_seed.get(str(set_name))
-    if isinstance(nested_seed, Mapping):
-        return {str(species): value for species, value in nested_seed.items()}
-
-    # Backward-compatibility for legacy tests/context payloads that still store a
-    # flat seed dict targeting the default set1 row.
-    if str(set_name) == "set1" and all(not isinstance(value, Mapping) for value in pending_init_seed.values()):
-        return {str(species): value for species, value in pending_init_seed.items()}
-    return {}
 
 def build_fallback_cache_key(
     mechanism_text: str = "",
@@ -221,6 +221,7 @@ class SimulationController(QtCore.QObject):
         self._shutdown_requested_for_close: bool = False
         self._discarded_slider_preview_generation_id: Optional[int] = None
         self._pool_eagerly_created: bool = False
+        self._completion_policy = SimulationCompletionPolicy()
 
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
@@ -370,23 +371,6 @@ class SimulationController(QtCore.QObject):
         if clear_plot_updates:
             self._clear_pending_preview_slider_plot_updates()
 
-    def _preserve_pending_slider_preview_replay_excluding(self, reset_set_ids: Sequence[str]) -> bool:
-        reset_set_id_set = {str(set_id) for set_id in (reset_set_ids or ()) if str(set_id)}
-        surviving_target_set_ids = [
-            str(set_id)
-            for set_id in self._pending_slider_target_set_ids
-            if str(set_id) and str(set_id) not in reset_set_id_set
-        ]
-        if not surviving_target_set_ids:
-            self.clear_pending_slider_preview_replay(clear_plot_updates=True)
-            return False
-        self.queue_pending_slider_preview_replay(
-            target_set_ids=surviving_target_set_ids,
-            request_id=None,
-        )
-        self._clear_pending_preview_slider_plot_updates()
-        return True
-
     @property
     def _pending_slider_plot_set_ids(self) -> Set[str]:
         return set(self._plot_coalescer.pending.set_ids)
@@ -478,6 +462,179 @@ class SimulationController(QtCore.QObject):
     @batch_run_context.setter
     def batch_run_context(self, value: Dict[str, Any]) -> None:
         self._batch_run_context = dict(value or {})
+
+    def _completion_policy_context_from_raw(
+        self,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[CompletionPolicyContext]:
+        ctx = context if isinstance(context, Mapping) else getattr(self, "_batch_run_context", {}) or {}
+        if not isinstance(ctx, Mapping):
+            return None
+        return CompletionPolicyContext(
+            active=ctx.get("active"),
+            request_id=ctx.get("request_id"),
+            run_id=ctx.get("run_id"),
+            fast_mode=ctx.get("fast_mode"),
+            parallel=ctx.get("parallel"),
+            keep_executor_alive=ctx.get("keep_executor_alive"),
+            queue_ids=ctx.get("queue_ids"),
+            queue_names=ctx.get("queue_names"),
+            total=ctx.get("total"),
+            pos=ctx.get("pos"),
+            primary_set_id=ctx.get("primary_set_id"),
+            completed_set_ids=ctx.get("completed_set_ids"),
+            pending_workspace_reset_set_ids=ctx.get("pending_workspace_reset_set_ids"),
+            pending_dirty_reset_generation_by_set_id=ctx.get("pending_dirty_reset_generation_by_set_id"),
+            pending_init_seed=ctx.get("pending_init_seed"),
+            pending_init_rewrite=ctx.get("pending_init_rewrite"),
+            pending_init_applied=ctx.get("pending_init_applied", False),
+            explicit_cache_preview_token=ctx.get("explicit_cache_preview_token"),
+            explicit_cache_preview_scope_set_ids=ctx.get("explicit_cache_preview_scope_set_ids"),
+            explicit_cache_valid_set_ids=ctx.get("explicit_cache_valid_set_ids"),
+            explicit_cache_invalidated_set_ids=ctx.get("explicit_cache_invalidated_set_ids"),
+            preview_scope_set_ids=ctx.get("preview_scope_set_ids"),
+        )
+
+    def _serialize_completion_policy_context(
+        self,
+        context: CompletionPolicyContext,
+        *,
+        base_context: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        raw = dict(base_context or getattr(self, "_batch_run_context", {}) or {})
+        raw["active"] = bool(context.active)
+        raw["request_id"] = context.request_id
+        raw["run_id"] = context.run_id
+        raw["fast_mode"] = bool(context.fast_mode)
+        raw["parallel"] = bool(context.parallel)
+        raw["keep_executor_alive"] = bool(context.keep_executor_alive)
+        raw["queue_ids"] = list(context.queue_ids)
+        raw["queue_names"] = list(context.queue_names)
+        raw["total"] = int(context.total)
+        raw["pos"] = int(context.pos)
+        raw["primary_set_id"] = context.primary_set_id
+        raw["completed_set_ids"] = list(context.completed_set_ids)
+        raw["pending_workspace_reset_set_ids"] = list(context.pending_workspace_reset_set_ids)
+        raw["pending_dirty_reset_generation_by_set_id"] = dict(context.pending_dirty_reset_generation_by_set_id)
+        raw["pending_init_seed"] = {
+            str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
+            for set_name, seed in context.pending_init_seed.items()
+        }
+        raw["pending_init_rewrite"] = context.pending_init_rewrite
+        raw["pending_init_applied"] = bool(context.pending_init_applied)
+        raw["explicit_cache_preview_token"] = context.explicit_cache_preview_token
+        raw["explicit_cache_preview_scope_set_ids"] = context.explicit_cache_preview_scope_set_ids
+        raw["explicit_cache_valid_set_ids"] = context.explicit_cache_valid_set_ids
+        raw["explicit_cache_invalidated_set_ids"] = context.explicit_cache_invalidated_set_ids
+        raw["preview_scope_set_ids"] = context.preview_scope_set_ids
+        return raw
+
+    def _completion_policy_activity_snapshot(self) -> RunActivitySnapshot:
+        worker = getattr(self, "_simulation_worker", None)
+        worker_running = bool(worker is not None and self._worker_is_running(worker))
+        return RunActivitySnapshot(
+            latest_request_id=int(getattr(self, "_latest_sim_request_id", 0)),
+            simulation_running=bool(getattr(self, "_simulation_running", False)),
+            slider_simulation_active=bool(getattr(self, "_slider_simulation_active", False)),
+            worker_running=worker_running,
+            worker_fast_mode=(
+                bool(getattr(worker, "_fast_mode", False))
+                if worker is not None
+                else None
+            ),
+            worker_request_id=(getattr(worker, "_request_id", None) if worker is not None else None),
+            discarded_slider_preview_generation_id=getattr(
+                self,
+                "_discarded_slider_preview_generation_id",
+                None,
+            ),
+        )
+
+    def _completion_policy_pending_replay_state(self) -> PendingReplayState:
+        return PendingReplayState(
+            active=bool(getattr(self, "_pending_slider_simulation", False)),
+            request_id=getattr(self, "_pending_slider_sim_request_id", None),
+            target_set_ids=tuple(getattr(self, "_pending_slider_target_set_ids", ()) or ()),
+        )
+
+    def _completion_policy_cache_state(self) -> CacheAuthorityState:
+        return CacheAuthorityState(
+            active_cache_key=self._batch_cache.active_cache_key,
+            active_cache_preview_token=self._batch_cache.active_cache_preview_token,
+            active_cache_preview_scope_set_ids=self._batch_cache.active_cache_preview_scope_set_ids,
+            active_cache_valid_set_ids=self._batch_cache.active_cache_valid_set_ids,
+            active_cache_invalidated_set_ids=self._batch_cache.active_cache_invalidated_set_ids,
+        )
+
+    def _apply_completion_policy_state_patch(
+        self,
+        patch,
+        *,
+        base_context: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[CompletionPolicyContext]:
+        updated_context = None
+        if patch.context is not None:
+            updated_context = patch.context
+            self._batch_run_context = self._serialize_completion_policy_context(
+                patch.context,
+                base_context=base_context,
+            )
+        if patch.pending_replay is not None:
+            directive: PendingReplayDirective = patch.pending_replay
+            if directive.action == "clear":
+                self.clear_pending_slider_preview_replay(clear_plot_updates=bool(directive.clear_plot_updates))
+            elif directive.action == "preserve":
+                self.queue_pending_slider_preview_replay(
+                    target_set_ids=directive.target_set_ids,
+                    request_id=None,
+                )
+                if directive.clear_plot_updates:
+                    self._clear_pending_preview_slider_plot_updates()
+            elif directive.action == "queue_fresh":
+                self.queue_pending_slider_preview_replay(
+                    target_set_ids=directive.target_set_ids,
+                    request_id=self._next_slider_preview_request_id(),
+                )
+            elif directive.action == "arm_existing":
+                target_set_ids = directive.target_set_ids or self._pending_slider_target_set_ids
+                self.queue_pending_slider_preview_replay(
+                    target_set_ids=target_set_ids,
+                    request_id=None,
+                    preserve_existing_request=bool(directive.preserve_existing_request),
+                )
+        if bool(getattr(patch, "clear_discarded_slider_preview_generation", False)):
+            self._discarded_slider_preview_generation_id = None
+        return updated_context
+
+    def _capture_dirty_state_by_set_id(
+        self,
+        set_ids: Sequence[str],
+    ) -> Dict[str, DirtySetState]:
+        state_by_set_id: Dict[str, DirtySetState] = {}
+        for set_id in (set_ids or ()):
+            set_id_s = str(set_id or "").strip()
+            if not set_id_s:
+                continue
+            is_dirty = False
+            generation = None
+            try:
+                is_dirty = bool(self.ui.slider.has_dirty_state_for_set(set_id_s))
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    f"Failed to inspect dirty-state ownership for {set_id_s}",
+                    exc,
+                )
+            if is_dirty:
+                try:
+                    generation = int(self.ui.slider.dirty_state_generation(set_id_s))
+                except Exception as exc:
+                    self._record_nonfatal_exception(
+                        f"Failed to inspect dirty-state generation for {set_id_s}",
+                        exc,
+                    )
+                    generation = None
+            state_by_set_id[set_id_s] = DirtySetState(is_dirty=is_dirty, generation=generation)
+        return state_by_set_id
 
     def _preview_batch_cache_token_for_cached_result(
         self,
@@ -814,52 +971,30 @@ class SimulationController(QtCore.QObject):
         return False
 
     def _has_active_explicit_simulation(self) -> bool:
-        ctx = getattr(self, "_batch_run_context", {}) or {}
-        if isinstance(ctx, dict) and ctx.get("active"):
-            return not bool(ctx.get("fast_mode"))
-        worker = getattr(self, "_simulation_worker", None)
-        if worker is not None and self._worker_is_running(worker):
-            return not bool(getattr(worker, "_fast_mode", False))
-        return bool(getattr(self, "_simulation_running", False)) and (not bool(getattr(self, "_slider_simulation_active", False)))
+        return self._completion_policy.has_active_explicit_simulation(
+            activity=self._completion_policy_activity_snapshot(),
+            context=self._completion_policy_context_from_raw(),
+        )
 
     def _has_active_fast_preview_in_flight(self) -> bool:
-        ctx = getattr(self, "_batch_run_context", {}) or {}
-        if isinstance(ctx, dict) and ctx.get("active") and bool(ctx.get("fast_mode")):
-            return True
-        worker = getattr(self, "_simulation_worker", None)
-        if worker is not None and self._worker_is_running(worker):
-            return bool(getattr(worker, "_fast_mode", False))
-        return bool(getattr(self, "_simulation_running", False)) and bool(getattr(self, "_slider_simulation_active", False))
+        return self._completion_policy.has_active_fast_preview_in_flight(
+            activity=self._completion_policy_activity_snapshot(),
+            context=self._completion_policy_context_from_raw(),
+        )
 
     def _stale_fast_request_still_owns_current_state(self, request_id: int) -> bool:
-        ctx = getattr(self, "_batch_run_context", {}) or {}
-        if isinstance(ctx, dict) and ctx.get("active"):
-            if not bool(ctx.get("fast_mode")):
-                return False
-            ctx_request_id = ctx.get("request_id")
-            if ctx_request_id is None:
-                return True
-            return int(ctx_request_id) == int(request_id)
-        worker = getattr(self, "_simulation_worker", None)
-        if worker is not None:
-            if not bool(getattr(worker, "_fast_mode", False)):
-                return False
-            worker_request_id = getattr(worker, "_request_id", None)
-            if worker_request_id is None:
-                return True
-            return int(worker_request_id) == int(request_id)
-        return bool(getattr(self, "_slider_simulation_active", False))
+        return self._completion_policy.stale_fast_request_still_owns_current_state(
+            activity=self._completion_policy_activity_snapshot(),
+            context=self._completion_policy_context_from_raw(),
+            request_id=int(request_id),
+        )
 
     def _preview_request_can_display(self, request_id: Optional[int]) -> bool:
-        if request_id is None:
-            return True
-        latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
-        if int(request_id) == latest_request_id:
-            return True
-        suppress_discard_ui = int(getattr(self, "_discarded_slider_preview_generation_id", 0) or 0) == latest_request_id
-        if suppress_discard_ui:
-            return False
-        return self._stale_fast_request_still_owns_current_state(int(request_id))
+        return self._completion_policy.preview_request_can_display(
+            activity=self._completion_policy_activity_snapshot(),
+            context=self._completion_policy_context_from_raw(),
+            request_id=request_id,
+        )
 
     def _prepare_simulation_shutdown_for_close(self) -> bool:
         seen_ids: set[int] = set()
@@ -1766,7 +1901,7 @@ class SimulationController(QtCore.QObject):
         include_preview_initials: bool,
     ) -> Dict[str, float]:
         initials_dict = self.ui.batch.batch_initials_for_row(int(row))
-        pending_seed_for_set = _pending_initial_seed_for_set(pending_init_seed, set_name=str(set_name))
+        pending_seed_for_set = pending_initial_seed_for_set(pending_init_seed, set_name=str(set_name))
         if pending_seed_for_set and (not bool(pending_init_applied)):
             for sp, val in pending_seed_for_set.items():
                 float_val = _try_float(val)
@@ -1783,9 +1918,11 @@ class SimulationController(QtCore.QObject):
         pending_init_applied: bool = False,
         ctx: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        if not bool(pending_init_applied):
-            pending_init_applied = bool(ctx.get("pending_init_applied", False)) if isinstance(ctx, Mapping) else False
-        if not bool(pending_init_applied):
+        policy_context = self._completion_policy_context_from_raw(ctx)
+        if bool(pending_init_applied) and policy_context is not None and (not policy_context.pending_init_applied):
+            policy_context = policy_context.evolve(pending_init_applied=True)
+        decision = self._completion_policy.resolve_pending_init_failure(policy_context)
+        if not decision.should_invalidate_preserved_results:
             return
         try:
             self.ui.mechanism_helpers.invalidate_pending_init_preserved_results_after_failed_run()
@@ -1794,34 +1931,18 @@ class SimulationController(QtCore.QObject):
                 "Failed to invalidate preserved pending-init results after explicit run failure",
                 exc,
             )
-        if isinstance(ctx, dict) and ctx.get("pending_init_applied", False):
-            updated_ctx = dict(ctx)
-            updated_ctx["pending_init_applied"] = False
-            self._batch_run_context = updated_ctx
-
-    def _requeue_preserved_pending_slider_replay_after_preflight_abort(self) -> None:
-        pending_target_set_ids = [str(set_id) for set_id in self._pending_slider_target_set_ids if str(set_id)]
-        if (not bool(self._pending_slider_simulation)) and (not pending_target_set_ids):
-            return
-        self.queue_pending_slider_preview_replay(
-            target_set_ids=pending_target_set_ids,
-            request_id=self._next_slider_preview_request_id(),
+        self._apply_completion_policy_state_patch(
+            decision.state_patch,
+            base_context=(ctx if isinstance(ctx, Mapping) else None),
         )
 
-    def _cancel_pending_slider_preview_replay_after_canonical_reset(self, reset_set_ids: Sequence[str]) -> None:
-        if self._preserve_pending_slider_preview_replay_excluding(reset_set_ids):
-            return
-        for stop_fn, timer_name in (
-            (self.ui.slider.stop_variable_update_timer, "_variable_update_timer"),
-            (self.ui.slider.stop_species_slider_update_timer, "_species_slider_update_timer"),
-        ):
-            try:
-                stop_fn()
-            except Exception as exc:
-                self._record_nonfatal_exception(
-                    f"Failed to stop debounce timer {str(timer_name)} after canonical explicit reset",
-                    exc,
-                )
+    def _requeue_preserved_pending_slider_replay_after_preflight_abort(self) -> None:
+        directive = self._completion_policy.resolve_preflight_abort_pending_replay(
+            pending_replay=self._completion_policy_pending_replay_state(),
+            explicit_run=True,
+        )
+        if directive is not None:
+            self._apply_completion_policy_state_patch(PolicyStatePatch(pending_replay=directive))
 
     def _request_mechanism_text_for_set(
         self,
@@ -2133,7 +2254,7 @@ class SimulationController(QtCore.QObject):
                 self._slider_simulation_active = False
                 self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
                 return
-            pending_seed_for_set = _pending_initial_seed_for_set(pending_seed, set_name=str(set_name))
+            pending_seed_for_set = pending_initial_seed_for_set(pending_seed, set_name=str(set_name))
             if pending_seed_for_set and (not pending_init_applied):
                 for sp, val in pending_seed_for_set.items():
                     float_val = _try_float(val)
@@ -2249,7 +2370,7 @@ class SimulationController(QtCore.QObject):
             self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
             return
         pending_seed = ctx.get("pending_init_seed") if isinstance(ctx, dict) else None
-        pending_seed_for_set = _pending_initial_seed_for_set(pending_seed, set_name=str(set_name))
+        pending_seed_for_set = pending_initial_seed_for_set(pending_seed, set_name=str(set_name))
         if pending_seed_for_set and (not bool(ctx.get("pending_init_applied", False))):
             for sp, val in pending_seed_for_set.items():
                 float_val = _try_float(val)
@@ -2824,7 +2945,6 @@ class SimulationController(QtCore.QObject):
             },
         )
         cache_key = self.ui.batch.batch_cache_key(scope_identity=scope_identity)
-        explicit_preview_scope_set_ids = None
         if bool(fast_mode):
             self._batch_cache.active_preview_cache_key = cache_key
         else:
@@ -2838,34 +2958,28 @@ class SimulationController(QtCore.QObject):
 
         self._release_current_simulation_worker()
 
-        explicit_valid_set_ids = tuple(str(set_id) for set_id in queue_ids) if queue_ids else None
+        run_start_cache_decision = self._completion_policy.build_run_start_cache_decision(
+            fast_mode=bool(fast_mode),
+            queue_ids=tuple(queue_ids),
+        )
+        explicit_valid_set_ids = run_start_cache_decision.explicit_cache_valid_set_ids
         if not bool(fast_mode):
             self._batch_cache.active_cache_preview_scope_set_ids = None
         if not bool(fast_mode):
             self._batch_cache.active_cache_valid_set_ids = explicit_valid_set_ids
-            self._batch_cache.active_cache_invalidated_set_ids = None
-        elif explicit_valid_set_ids:
-            self._batch_cache.active_preview_scope_set_ids = explicit_valid_set_ids
+            self._batch_cache.active_cache_invalidated_set_ids = (
+                run_start_cache_decision.explicit_cache_invalidated_set_ids
+            )
+        else:
+            self._batch_cache.active_preview_scope_set_ids = run_start_cache_decision.preview_scope_set_ids
         effective_workers = self._effective_batch_worker_count(len(queue_ids))
         parallel_mode = bool(effective_workers > 1 and len(queue_ids) > 1)
         retain_prepared_payloads_in_context = not (bool(parallel_mode) and not bool(fast_mode))
-        pending_dirty_reset_generation_by_set_id: Dict[str, int] = {}
-        if not bool(fast_mode):
-            for set_id in queue_ids:
-                set_id_s = str(set_id or "").strip()
-                if not set_id_s:
-                    continue
-                try:
-                    if not bool(self.ui.slider.has_dirty_state_for_set(set_id_s)):
-                        continue
-                    pending_dirty_reset_generation_by_set_id[set_id_s] = int(
-                        self.ui.slider.dirty_state_generation(set_id_s)
-                    )
-                except Exception as exc:
-                    self._record_nonfatal_exception(
-                        f"Failed to snapshot dirty-state generation for explicit run reset candidate {set_id_s}",
-                        exc,
-                    )
+        dirty_reset_tracking = self._completion_policy.capture_dirty_reset_tracking(
+            fast_mode=bool(fast_mode),
+            queue_ids=tuple(queue_ids),
+            dirty_state_by_set_id=self._capture_dirty_state_by_set_id(queue_ids),
+        )
         run_id = None
         if parallel_mode:
             self._run_sequence_id = int(getattr(self, "_run_sequence_id", 0)) + 1
@@ -2935,12 +3049,8 @@ class SimulationController(QtCore.QObject):
             "rows": list(batch_rows),
             "queue_ids": list(queue_ids),
             "queue_names": list(queue_names),
-            "pending_workspace_reset_set_ids": (
-                list(pending_dirty_reset_generation_by_set_id.keys()) if not bool(fast_mode) else []
-            ),
-            "pending_dirty_reset_generation_by_set_id": (
-                dict(pending_dirty_reset_generation_by_set_id) if not bool(fast_mode) else {}
-            ),
+            "pending_workspace_reset_set_ids": list(dirty_reset_tracking.pending_workspace_reset_set_ids),
+            "pending_dirty_reset_generation_by_set_id": dict(dirty_reset_tracking.pending_dirty_reset_generation_by_set_id),
             "pos": 0,
             "primary_set_id": primary,
             "total": len(queue_ids),
@@ -2954,10 +3064,10 @@ class SimulationController(QtCore.QObject):
             "pending_init_rewrite": pending_init_rewrite,
             "pending_init_applied": bool(pending_init_applied),
             "explicit_cache_preview_token": None,
-            "explicit_cache_preview_scope_set_ids": explicit_preview_scope_set_ids,
+            "explicit_cache_preview_scope_set_ids": run_start_cache_decision.explicit_preview_scope_set_ids,
             "explicit_cache_valid_set_ids": explicit_valid_set_ids,
-            "explicit_cache_invalidated_set_ids": None,
-            "preview_scope_set_ids": (tuple(str(set_id) for set_id in queue_ids) if bool(fast_mode) and queue_ids else None),
+            "explicit_cache_invalidated_set_ids": run_start_cache_decision.explicit_cache_invalidated_set_ids,
+            "preview_scope_set_ids": run_start_cache_decision.preview_scope_set_ids,
             "preview_batch_cache_token_by_set_id": dict(preview_batch_cache_token_by_set_id),
         }
 
@@ -3177,41 +3287,39 @@ class SimulationController(QtCore.QObject):
             )
             return
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        policy_context = self._completion_policy_context_from_raw(ctx)
         if request_id is not None and int(request_id) != latest_request_id and bool(fast_mode):
-            pending_request_id = getattr(self, "_pending_slider_sim_request_id", None)
-            should_schedule_pending = bool(getattr(self, "_pending_slider_simulation", False)) or (
-                pending_request_id is not None and int(pending_request_id) == latest_request_id
+            stale_fast_decision = self._completion_policy.resolve_superseded_fast_completion(
+                activity=self._completion_policy_activity_snapshot(),
+                context=policy_context,
+                request_id=int(request_id),
+                pending_replay=self._completion_policy_pending_replay_state(),
+                shutdown_requested=shutdown_requested,
             )
-            suppress_discard_ui = int(getattr(self, "_discarded_slider_preview_generation_id", 0) or 0) == latest_request_id
-            stale_fast_owns_current_state = self._stale_fast_request_still_owns_current_state(int(request_id))
-            display_current_preview = bool(stale_fast_owns_current_state) and (not bool(suppress_discard_ui))
             logger.debug(
-                "Active fast completion superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, suppress_discard_ui=%s, owns_current_state=%s, display_current_preview=%s)",
+                "Active fast completion superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, display_current_preview=%s, handoff_after_display=%s)",
                 request_id,
                 latest_request_id,
                 run_id,
-                bool(should_schedule_pending),
-                bool(suppress_discard_ui),
-                bool(stale_fast_owns_current_state),
-                bool(display_current_preview),
+                bool(stale_fast_decision.schedule_pending_preview_run),
+                bool(stale_fast_decision.display_current_preview),
+                bool(stale_fast_decision.defer_context_deactivation_until_after_display),
             )
 
-            if display_current_preview:
-                if should_schedule_pending:
-                    self._pending_slider_simulation = True
-                    ctx_check = getattr(self, "_batch_run_context", {}) or {}
-                    active_parallel_batch = bool(
-                        isinstance(ctx_check, dict) and ctx_check.get("active") and ctx_check.get("parallel")
-                    )
-                    if not active_parallel_batch:
-                        stale_fast_handoff_after_display = bool(stale_fast_owns_current_state)
+            if stale_fast_decision.display_current_preview:
+                self._apply_completion_policy_state_patch(stale_fast_decision.state_patch)
+                if stale_fast_decision.defer_context_deactivation_until_after_display:
+                    stale_fast_handoff_after_display = True
             else:
-                ctx = getattr(self, "_batch_run_context", {}) or {}
-                if stale_fast_owns_current_state:
-                    if isinstance(ctx, dict) and ctx.get("active"):
-                        ctx["active"] = False
-                        self._batch_run_context = dict(ctx)
+                updated_policy_context = self._apply_completion_policy_state_patch(
+                    stale_fast_decision.state_patch,
+                    base_context=ctx if isinstance(ctx, Mapping) else None,
+                )
+                if stale_fast_decision.deactivate_context_immediately:
+                    ctx = self._batch_run_context
 
+                if stale_fast_decision.deactivate_context_immediately:
                     self._release_current_simulation_worker()
 
                     keep_executor_alive = bool(isinstance(ctx, dict) and ctx.get("parallel") and ctx.get("keep_executor_alive"))
@@ -3244,12 +3352,11 @@ class SimulationController(QtCore.QObject):
                                 exc,
                             )
 
-                if should_schedule_pending and (not shutdown_requested):
+                if stale_fast_decision.schedule_pending_preview_run and (not stale_fast_decision.display_current_preview):
                     self._pending_slider_simulation = False
-                    self._discarded_slider_preview_generation_id = None
                     QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
                 else:
-                    if stale_fast_owns_current_state and (not bool(suppress_discard_ui)):
+                    if stale_fast_decision.reset_status_progress:
                         try:
                             self.ui.run_ui.set_status_text("Ready")
                             self.ui.run_ui.set_sim_progress_value(0)
@@ -3258,8 +3365,12 @@ class SimulationController(QtCore.QObject):
                                 "Failed to reset status/progress after superseded fast completion",
                                 exc,
                             )
-                    self._discarded_slider_preview_generation_id = None
-                    self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                    self._apply_completion_policy_state_patch(
+                        PolicyStatePatch(
+                            pending_replay=PendingReplayDirective.clear(clear_plot_updates=False),
+                            clear_discarded_slider_preview_generation=True,
+                        )
+                    )
                 self._clear_shutdown_request_after_close_cleanup()
                 return
 
@@ -3299,7 +3410,6 @@ class SimulationController(QtCore.QObject):
             mechanism_text = result.get("mechanism_text", self.ui.mechanism.get_mechanism_text())
             solver_config = result.get("solver_config", {})
 
-            ctx = getattr(self, "_batch_run_context", {}) or {}
             explicit_batch_coalescing = bool(
                 isinstance(ctx, dict)
                 and ctx.get("parallel")
@@ -3317,55 +3427,44 @@ class SimulationController(QtCore.QObject):
             if cache_key:
                 if is_preview:
                     self._batch_cache.active_preview_cache_key = cache_key
-                    preview_scope_ids = None
-                    if isinstance(ctx, dict):
-                        scope_ids = ctx.get("preview_scope_set_ids") or ()
-                        preview_scope_ids = tuple(str(set_id) for set_id in scope_ids) if scope_ids else None
+                    preview_scope_ids = (
+                        policy_context.preview_scope_set_ids
+                        if policy_context is not None and policy_context.preview_scope_set_ids
+                        else None
+                    )
                     self._batch_cache.active_preview_scope_set_ids = preview_scope_ids
                 else:
-                    preview_token = None
-                    preview_scope_set_ids = None
-                    valid_set_ids = None
-                    invalidated_set_ids = None
-                    has_valid_subset = False
-                    if isinstance(ctx, dict):
-                        token = ctx.get("explicit_cache_preview_token")
-                        preview_token = str(token) if token else None
-                        scope_ids = ctx.get("explicit_cache_preview_scope_set_ids") or ()
-                        preview_scope_set_ids = tuple(str(set_id) for set_id in scope_ids) if scope_ids else None
-                        if "explicit_cache_valid_set_ids" in ctx:
-                            has_valid_subset = True
-                            subset_ids = ctx.get("explicit_cache_valid_set_ids") or ()
-                            valid_set_ids = tuple(str(set_id) for set_id in subset_ids) if subset_ids else ()
-                            invalid_subset_ids = ctx.get("explicit_cache_invalidated_set_ids") or ()
-                            invalidated_set_ids = (
-                                tuple(str(set_id) for set_id in invalid_subset_ids)
-                                if invalid_subset_ids
-                                else ()
-                            )
-                        else:
-                            queue_ids = ctx.get("queue_ids") or ()
-                            valid_set_ids = tuple(str(set_id) for set_id in queue_ids) if queue_ids else None
-                    if has_valid_subset and valid_set_ids == ():
+                    cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
+                        context=policy_context or self._completion_policy_context_from_raw(ctx),
+                        cache_state=self._completion_policy_cache_state(),
+                        cache_key=cache_key,
+                    )
+                    if cache_reconciliation.clear_active_selection_state:
                         self._batch_cache.clear_active_selection_state()
                     else:
-                        self._batch_cache.active_cache_key = cache_key
-                        self._batch_cache.active_cache_preview_token = preview_token
-                        self._batch_cache.active_cache_preview_scope_set_ids = preview_scope_set_ids
-                        self._batch_cache.active_cache_valid_set_ids = valid_set_ids
+                        self._batch_cache.active_cache_key = cache_reconciliation.active_cache_key
+                        self._batch_cache.active_cache_preview_token = (
+                            cache_reconciliation.active_cache_preview_token
+                        )
+                        self._batch_cache.active_cache_preview_scope_set_ids = (
+                            cache_reconciliation.active_cache_preview_scope_set_ids
+                        )
+                        self._batch_cache.active_cache_valid_set_ids = cache_reconciliation.active_cache_valid_set_ids
                         self._batch_cache.active_cache_invalidated_set_ids = (
-                            invalidated_set_ids if has_valid_subset else None
+                            cache_reconciliation.active_cache_invalidated_set_ids
                         )
 
+            cache_reconciliation = None
             redraw_valid_set_ids = None
             has_redraw_subset = False
-            if isinstance(ctx, dict) and "explicit_cache_valid_set_ids" in ctx:
-                has_redraw_subset = True
-                subset_ids = ctx.get("explicit_cache_valid_set_ids") or ()
-                redraw_valid_set_ids = tuple(str(set_id) for set_id in subset_ids) if subset_ids else ()
-            elif self._batch_cache.active_cache_valid_set_ids is not None:
-                has_redraw_subset = True
-                redraw_valid_set_ids = tuple(str(set_id) for set_id in self._batch_cache.active_cache_valid_set_ids)
+            if not is_preview and policy_context is not None:
+                cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
+                    context=policy_context,
+                    cache_state=self._completion_policy_cache_state(),
+                    cache_key=cache_key,
+                )
+                redraw_valid_set_ids = cache_reconciliation.redraw_valid_set_ids
+                has_redraw_subset = bool(cache_reconciliation.has_redraw_subset)
 
             if (batch_set is None or batch_set_id is None) and isinstance(ctx, dict) and ctx.get("active"):
                 queue_names = list(ctx.get("queue_names") or [])
@@ -3422,35 +3521,17 @@ class SimulationController(QtCore.QObject):
                     mechanism_text=str(mechanism_text),
                     solver_config=solver_config,
                 )
-                if isinstance(ctx, dict) and cache_key:
-                    updated_ctx = dict(ctx)
-                    if str(self._batch_cache.active_cache_key or "") == str(cache_key):
-                        preview_scope_ids_after = self._batch_cache.active_cache_preview_scope_set_ids
-                        valid_set_ids_after = self._batch_cache.active_cache_valid_set_ids
-                        updated_ctx["explicit_cache_preview_token"] = self._batch_cache.active_cache_preview_token
-                        updated_ctx["explicit_cache_preview_scope_set_ids"] = (
-                            tuple(str(set_id) for set_id in preview_scope_ids_after)
-                            if preview_scope_ids_after is not None
-                            else None
-                        )
-                        updated_ctx["explicit_cache_valid_set_ids"] = (
-                            tuple(str(set_id) for set_id in valid_set_ids_after)
-                            if valid_set_ids_after is not None
-                            else None
-                        )
-                        invalidated_set_ids_after = self._batch_cache.active_cache_invalidated_set_ids
-                        updated_ctx["explicit_cache_invalidated_set_ids"] = (
-                            tuple(str(set_id) for set_id in invalidated_set_ids_after)
-                            if invalidated_set_ids_after is not None
-                            else None
-                        )
-                    else:
-                        updated_ctx["explicit_cache_preview_token"] = None
-                        updated_ctx["explicit_cache_preview_scope_set_ids"] = ()
-                        updated_ctx["explicit_cache_valid_set_ids"] = ()
-                        updated_ctx["explicit_cache_invalidated_set_ids"] = ()
-                    ctx = updated_ctx
-                    self._batch_run_context = updated_ctx
+                if policy_context is not None and cache_key:
+                    policy_context = self._completion_policy.build_context_update_from_cache_truth(
+                        context=policy_context,
+                        cache_state=self._completion_policy_cache_state(),
+                        cache_key=cache_key,
+                    )
+                    ctx = self._serialize_completion_policy_context(
+                        policy_context,
+                        base_context=ctx if isinstance(ctx, Mapping) else None,
+                    )
+                    self._batch_run_context = dict(ctx)
 
             series: Dict[str, Any] = {}
             for i, species_name in enumerate(species_names):
@@ -3503,38 +3584,33 @@ class SimulationController(QtCore.QObject):
                 )
                 cache_store.put(composite_key, payload)
 
-            if (not is_preview) and is_primary and isinstance(ctx, dict):
-                pending_seed = ctx.get("pending_init_seed")
-                pending_rewrite = ctx.get("pending_init_rewrite")
-                pending_applied = bool(ctx.get("pending_init_applied", False))
-                if (
-                    isinstance(pending_seed, dict)
-                    and pending_seed
-                    and isinstance(pending_rewrite, str)
-                    and pending_rewrite
-                    and not pending_applied
-                ):
-                    seed_for_ui: Dict[str, float] = {}
-                    for sp, val in _pending_initial_seed_for_set(
-                        pending_seed,
-                        set_name=str(batch_set),
-                    ).items():
-                        float_val = _try_float(val)
-                        if float_val is None:
-                            continue
-                        seed_for_ui[str(sp)] = float_val
+            if policy_context is not None:
+                pending_init_completion = self._completion_policy.resolve_pending_init_completion(
+                    context=policy_context,
+                    batch_set=batch_set,
+                    is_preview=bool(is_preview),
+                    is_primary=bool(is_primary),
+                )
+                if pending_init_completion.should_attempt_apply:
                     applied = False
                     try:
                         applied = bool(
                             self.ui.mechanism_helpers.apply_pending_init_migration(
-                                seed_sets={str(batch_set): dict(seed_for_ui)},
-                                rewrite=str(pending_rewrite),
+                                seed_sets={str(batch_set): dict(pending_init_completion.seed_for_ui)},
+                                rewrite=str(pending_init_completion.rewrite or ""),
                             )
                         )
                     except Exception:
                         applied = False
                     if applied:
-                        ctx["pending_init_applied"] = True
+                        policy_context = self._completion_policy.note_pending_init_apply_result(
+                            context=policy_context,
+                            applied=True,
+                        )
+                        ctx = self._serialize_completion_policy_context(
+                            policy_context,
+                            base_context=ctx if isinstance(ctx, Mapping) else None,
+                        )
                         self._batch_run_context = dict(ctx)
 
             displayed = False
@@ -3610,10 +3686,16 @@ class SimulationController(QtCore.QObject):
                 except Exception as exc:
                     self._record_nonfatal_exception("Failed to update results table after simulation completion", exc)
 
-            if (not is_preview) and is_primary and isinstance(ctx, dict) and bool(ctx.get("pending_init_applied", False)):
-                self.ui.mechanism_helpers.arm_pending_init_result_invalidation_guard(
-                    rewrite=str(ctx.get("pending_init_rewrite") or "")
+            if policy_context is not None:
+                pending_init_guard_rewrite = self._completion_policy.should_arm_pending_init_guard(
+                    context=policy_context,
+                    is_preview=bool(is_preview),
+                    is_primary=bool(is_primary),
                 )
+                if pending_init_guard_rewrite:
+                    self.ui.mechanism_helpers.arm_pending_init_result_invalidation_guard(
+                        rewrite=str(pending_init_guard_rewrite)
+                    )
 
             self._refresh_primary_result_controls(
                 mechanism=mechanism,
@@ -3727,22 +3809,22 @@ class SimulationController(QtCore.QObject):
                 self.ui.provenance.set_last_simulation_provenance(provenance)
 
             if isinstance(ctx, dict) and ctx.get("active"):
-                queue_ids = list(ctx.get("queue_ids") or [])
-                try:
-                    pos = int(ctx.get("pos", 0))
-                except Exception:
-                    pos = 0
-                try:
-                    total = int(ctx.get("total") or len(queue_ids) or 1)
-                except Exception:
-                    total = max(1, len(queue_ids))
+                policy_context = self._completion_policy_context_from_raw(ctx)
+                queue_ids = list(policy_context.queue_ids if policy_context is not None else (ctx.get("queue_ids") or []))
+                pos = int(policy_context.pos) if policy_context is not None else _safe_int(ctx.get("pos", 0), default=0)
+                total = (
+                    int(policy_context.total)
+                    if policy_context is not None
+                    else _safe_int(ctx.get("total"), default=max(1, len(queue_ids)))
+                )
+                total = max(1, total or len(queue_ids) or 1)
 
                 if stale_fast_handoff_after_display:
                     ctx["active"] = False
                     self._batch_run_context = dict(ctx)
                     batch_queue_done = True
-                elif bool(ctx.get("parallel")):
-                    completed_ids = {str(s) for s in (ctx.get("completed_set_ids") or []) if str(s)}
+                elif bool(policy_context.parallel if policy_context is not None else ctx.get("parallel")):
+                    completed_ids = set(policy_context.completed_set_ids if policy_context is not None else ())
                     if batch_set_id:
                         completed_ids.add(str(batch_set_id))
                     ctx["completed_set_ids"] = sorted(completed_ids)
@@ -3790,34 +3872,17 @@ class SimulationController(QtCore.QObject):
 
             if batch_queue_done:
                 if (not is_preview) and isinstance(ctx, dict):
-                    pending_workspace_reset_set_ids = [
-                        str(set_id) for set_id in (ctx.get("pending_workspace_reset_set_ids") or ()) if str(set_id)
-                    ]
-                    pending_dirty_reset_generation_by_set_id = {
-                        str(set_id): int(generation)
-                        for set_id, generation in dict(
-                            ctx.get("pending_dirty_reset_generation_by_set_id") or {}
-                        ).items()
-                        if str(set_id)
-                    }
-                    eligible_reset_set_ids: list[str] = []
-                    for set_id in pending_workspace_reset_set_ids:
-                        expected_generation = pending_dirty_reset_generation_by_set_id.get(str(set_id))
-                        if expected_generation is None:
-                            continue
-                        try:
-                            if not bool(self.ui.slider.has_dirty_state_for_set(str(set_id))):
-                                continue
-                            current_generation = int(self.ui.slider.dirty_state_generation(str(set_id)))
-                        except Exception as exc:
-                            self._record_nonfatal_exception(
-                                f"Failed to compare dirty-state generation for explicit reset candidate {set_id}",
-                                exc,
-                            )
-                            continue
-                        if current_generation != int(expected_generation):
-                            continue
-                        eligible_reset_set_ids.append(str(set_id))
+                    policy_context = self._completion_policy_context_from_raw(ctx)
+                    reset_target_set_ids = (
+                        tuple(policy_context.pending_workspace_reset_set_ids)
+                        if policy_context is not None
+                        else tuple(str(set_id) for set_id in (ctx.get("pending_workspace_reset_set_ids") or ()) if str(set_id))
+                    )
+                    dirty_reset_decision = self._completion_policy.resolve_explicit_dirty_reset(
+                        context=policy_context or self._completion_policy_context_from_raw(ctx),
+                        dirty_state_by_set_id=self._capture_dirty_state_by_set_id(reset_target_set_ids),
+                    )
+                    eligible_reset_set_ids = list(dirty_reset_decision.eligible_reset_set_ids)
                     workspaces_cleared = False
                     if eligible_reset_set_ids:
                         try:
@@ -3842,12 +3907,12 @@ class SimulationController(QtCore.QObject):
                                 "Failed to clear staged concentration overlays after canonical explicit run",
                                 exc,
                             )
-                    if pending_workspace_reset_set_ids or pending_dirty_reset_generation_by_set_id:
-                        updated_ctx = dict(ctx)
-                        updated_ctx["pending_workspace_reset_set_ids"] = []
-                        updated_ctx["pending_dirty_reset_generation_by_set_id"] = {}
-                        ctx = updated_ctx
-                        self._batch_run_context = updated_ctx
+                    policy_context = self._apply_completion_policy_state_patch(
+                        dirty_reset_decision.state_patch,
+                        base_context=ctx if isinstance(ctx, Mapping) else None,
+                    ) or policy_context
+                    if policy_context is not None:
+                        ctx = self._batch_run_context
                     if overlays_cleared:
                         try:
                             species_for_sync = (
@@ -3865,9 +3930,25 @@ class SimulationController(QtCore.QObject):
                                 exc,
                             )
                     if workspaces_cleared or overlays_cleared:
-                        self._cancel_pending_slider_preview_replay_after_canonical_reset(
-                            eligible_reset_set_ids
+                        pending_replay_directive = self._completion_policy.resolve_pending_replay_after_canonical_reset(
+                            pending_replay=self._completion_policy_pending_replay_state(),
+                            reset_set_ids=tuple(eligible_reset_set_ids),
                         )
+                        self._apply_completion_policy_state_patch(
+                            PolicyStatePatch(pending_replay=pending_replay_directive)
+                        )
+                        if pending_replay_directive.action == "clear":
+                            for stop_fn, timer_name in (
+                                (self.ui.slider.stop_variable_update_timer, "_variable_update_timer"),
+                                (self.ui.slider.stop_species_slider_update_timer, "_species_slider_update_timer"),
+                            ):
+                                try:
+                                    stop_fn()
+                                except Exception as exc:
+                                    self._record_nonfatal_exception(
+                                        f"Failed to stop debounce timer {str(timer_name)} after canonical explicit reset",
+                                        exc,
+                                    )
                     if eligible_reset_set_ids:
                         try:
                             self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
@@ -3958,29 +4039,30 @@ class SimulationController(QtCore.QObject):
             )
             return
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        policy_context = self._completion_policy_context_from_raw(ctx)
         if request_id is not None and int(request_id) != latest_request_id and bool(fast_mode):
-            pending_request_id = getattr(self, "_pending_slider_sim_request_id", None)
-            should_schedule_pending = bool(getattr(self, "_pending_slider_simulation", False)) or (
-                pending_request_id is not None and int(pending_request_id) == latest_request_id
+            stale_fast_decision = self._completion_policy.resolve_superseded_fast_error(
+                activity=self._completion_policy_activity_snapshot(),
+                context=policy_context,
+                request_id=int(request_id),
+                pending_replay=self._completion_policy_pending_replay_state(),
             )
-            suppress_discard_ui = int(getattr(self, "_discarded_slider_preview_generation_id", 0) or 0) == latest_request_id
-            stale_fast_owns_current_state = self._stale_fast_request_still_owns_current_state(int(request_id))
             logger.debug(
-                "Active fast error superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, suppress_discard_ui=%s, owns_current_state=%s): %s",
+                "Active fast error superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s): %s",
                 request_id,
                 latest_request_id,
                 run_id,
-                bool(should_schedule_pending),
-                bool(suppress_discard_ui),
-                bool(stale_fast_owns_current_state),
+                bool(stale_fast_decision.schedule_pending_preview_run),
                 error_text,
             )
 
-            ctx = getattr(self, "_batch_run_context", {}) or {}
-            if stale_fast_owns_current_state:
-                if isinstance(ctx, dict) and ctx.get("active"):
-                    ctx["active"] = False
-                    self._batch_run_context = dict(ctx)
+            self._apply_completion_policy_state_patch(
+                stale_fast_decision.state_patch,
+                base_context=ctx if isinstance(ctx, Mapping) else None,
+            )
+            ctx = self._batch_run_context
+            if stale_fast_decision.deactivate_context_immediately:
 
                 self._release_current_simulation_worker()
                 self._shutdown_batch_executor(force_terminate=False)
@@ -4010,12 +4092,11 @@ class SimulationController(QtCore.QObject):
                             exc,
                         )
 
-            if should_schedule_pending:
+            if stale_fast_decision.schedule_pending_preview_run:
                 self._pending_slider_simulation = False
-                self._discarded_slider_preview_generation_id = None
                 QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
             else:
-                if stale_fast_owns_current_state and (not bool(suppress_discard_ui)):
+                if stale_fast_decision.reset_status_progress:
                     try:
                         self.ui.run_ui.set_status_text("Ready")
                         self.ui.run_ui.set_sim_progress_value(0)
@@ -4024,12 +4105,15 @@ class SimulationController(QtCore.QObject):
                             "Failed to reset status/progress after superseded fast error",
                             exc,
                         )
-                self._discarded_slider_preview_generation_id = None
-                self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                self._apply_completion_policy_state_patch(
+                    PolicyStatePatch(
+                        pending_replay=PendingReplayDirective.clear(clear_plot_updates=False),
+                        clear_discarded_slider_preview_generation=True,
+                    )
+                )
             return
         logger.warning("Simulation error surfaced to UI: %s", error_text)
 
-        ctx = getattr(self, "_batch_run_context", {}) or {}
         if isinstance(ctx, dict) and ctx.get("active"):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
@@ -4072,19 +4156,22 @@ class SimulationController(QtCore.QObject):
                 self.ui.slider.stop_species_slider_update_timer()
                 QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
         else:
-            if (not bool(fast_mode)) and (
-                bool(self._pending_slider_simulation) or bool(self._pending_slider_target_set_ids)
-            ):
+            pending_replay_directive = self._completion_policy.resolve_explicit_error_pending_replay(
+                fast_mode=bool(fast_mode),
+                pending_replay=self._completion_policy_pending_replay_state(),
+            )
+            if pending_replay_directive.action == "queue_fresh":
                 logger.debug("Replaying pending slider update after explicit failure")
-                self.queue_pending_slider_preview_replay(
-                    target_set_ids=self._pending_slider_target_set_ids,
-                    request_id=self._next_slider_preview_request_id(),
+                self._apply_completion_policy_state_patch(
+                    PolicyStatePatch(pending_replay=pending_replay_directive)
                 )
                 self.ui.slider.stop_variable_update_timer()
                 self.ui.slider.stop_species_slider_update_timer()
                 QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
             else:
-                self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                self._apply_completion_policy_state_patch(
+                    PolicyStatePatch(pending_replay=pending_replay_directive)
+                )
 
         self._invalidate_preserved_pending_init_results_after_failed_run(
             ctx=ctx if isinstance(ctx, Mapping) else None,
