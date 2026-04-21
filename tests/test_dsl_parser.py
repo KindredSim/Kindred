@@ -22,6 +22,9 @@ from kindred.core.simulator.dsl import (
     _parse_standard_conc_directive,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 class TestBasicReactions:
     """Test basic reaction parsing."""

@@ -7,6 +7,9 @@ from kindred.core.algebra.parser import parse_algebra
 from kindred.core.algebra.symbol_table import build_algebra_symbol_table
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
+pytestmark = pytest.mark.integration
+
+
 
 def _context_from_mechanism(mech):
     t = np.linspace(0.0, 1.0, 5)

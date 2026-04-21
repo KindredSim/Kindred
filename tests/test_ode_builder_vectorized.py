@@ -2,6 +2,10 @@ import numpy as np
 
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def _build_reference_rhs(mechanism):

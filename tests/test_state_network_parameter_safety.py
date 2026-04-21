@@ -3,6 +3,9 @@ import pytest
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 
+pytestmark = pytest.mark.unit
+
+
 
 def _dsl_with_state_network() -> str:
     return "\n".join(

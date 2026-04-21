@@ -18,6 +18,9 @@ from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 from kindred.io.resources import get_all_example_specs, get_resource_text
 
+pytestmark = pytest.mark.integration
+
+
 
 class TestExampleParsing:
     """Test that all bundled preset mechanisms parse successfully."""

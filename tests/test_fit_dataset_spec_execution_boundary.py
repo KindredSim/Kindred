@@ -20,6 +20,7 @@ def _dataset_spec(dataset_id: str = "ds1"):
     )
 
 
+@pytest.mark.unit
 def test_fit_global_accepts_typed_dataset_specs() -> None:
     from kindred.core.analysis.global_fitting import fit_global
     from kindred.core.fitting_evaluation import CallableFittingEvaluator
@@ -40,6 +41,7 @@ def test_fit_global_accepts_typed_dataset_specs() -> None:
     assert "ds1" in result.dataset_params
 
 
+@pytest.mark.unit
 def test_global_fit_worker_accepts_typed_dataset_specs() -> None:
     from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec

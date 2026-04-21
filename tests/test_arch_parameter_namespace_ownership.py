@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib.resources
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_parameter_algebra_spec_and_eval_do_not_own_mechanism_name_resolution() -> None:

@@ -8,6 +8,10 @@ from kindred.core.datasets.csv_import import load_csv_dataset
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 BENCH_DIR = Path(__file__).resolve().parent.parent / "benchmarks" / "regression_suite"
 

@@ -3,6 +3,9 @@ import pytest
 from kindred.core.simulator.dsl import extract_parameter_names_from_dsl
 from kindred.core.simulator.errors import DSLError
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_extract_parameter_names_from_dsl_enforces_param_algebra_ambiguity_guard():
     dsl = "\n".join(

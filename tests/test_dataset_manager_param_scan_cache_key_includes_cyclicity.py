@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from kindred.gui.controllers.dataset_manager import DatasetManager
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_param_scan_cache_key_separates_wegscheider_cyclicity_mode():

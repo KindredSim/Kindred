@@ -11,6 +11,9 @@ from kindred.core.simulation_failure import (
     simulation_failure_detail_text,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_simulation_failure_detail_text_returns_empty_string_without_context() -> None:
     payload = build_simulation_failure(kind="simulation_error", message="boom")

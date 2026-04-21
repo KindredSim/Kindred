@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 class _StuckWorker:

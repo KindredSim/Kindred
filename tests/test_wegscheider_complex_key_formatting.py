@@ -1,4 +1,8 @@
 from kindred.core.simulator.wegscheider import complex_key
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_complex_key_does_not_strip_integer_trailing_zeros():

@@ -12,6 +12,9 @@ from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 @pytest.mark.parametrize(
     ("dsl", "expected"),

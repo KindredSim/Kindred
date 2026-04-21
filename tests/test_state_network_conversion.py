@@ -8,6 +8,9 @@ from kindred.core.simulator.state_network_converter import (
     convert_state_network_to_mechanism,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 def _make_unimolecular_network():
     net = StateNetwork()

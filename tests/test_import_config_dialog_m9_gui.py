@@ -7,11 +7,12 @@ import pytest
 from kindred.core.datasets.excel_import import list_sheets
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog
 
-pytestmark = [pytest.mark.gui, pytest.mark.integration]
+pytestmark = pytest.mark.gui
 
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "m9_test_datasets.xlsx"
 
 
+@pytest.mark.integration
 def test_import_config_dialog_with_m9_workbook(qapp) -> None:
     dialog = ImportConfigDialog(str(FIXTURE_PATH))
 

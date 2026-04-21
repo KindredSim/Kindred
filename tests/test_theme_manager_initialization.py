@@ -1,4 +1,8 @@
 from __future__ import annotations
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_theme_manager_apply_light_runs_on_first_call(monkeypatch) -> None:

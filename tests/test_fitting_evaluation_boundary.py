@@ -5,6 +5,9 @@ import pickle
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_prepare_fitting_execution_context_uses_serializable_execution_request_payload() -> None:
     from kindred.core.fitting_evaluation import prepare_fitting_execution_context

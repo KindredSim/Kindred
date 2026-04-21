@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import importlib.resources
 from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_gui_package_keeps_compat_indirection_out_of_gui_namespace() -> None:

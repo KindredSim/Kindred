@@ -7,6 +7,9 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 LEGACY_LOG_STRINGS = (
     "PyQtGraph not available - plotting features will be limited",

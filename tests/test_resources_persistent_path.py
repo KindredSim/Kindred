@@ -9,6 +9,10 @@ import zipfile
 from pathlib import Path
 
 from kindred import __version__ as kindred_version
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 
 def test_get_resource_path_persists_for_zipimport(tmp_path: Path, monkeypatch) -> None:

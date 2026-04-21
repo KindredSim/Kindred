@@ -6,6 +6,9 @@ from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.sparse_jacobian import HAS_SCIPY_SPARSE, build_sparse_jacobian, detect_sparsity_pattern
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 @pytest.mark.skipif(not HAS_SCIPY_SPARSE, reason="scipy.sparse is required")
 def test_sparse_jacobian_reuses_structure_and_mutates_in_place():

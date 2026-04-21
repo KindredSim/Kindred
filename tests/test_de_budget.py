@@ -9,6 +9,10 @@ import kindred.core.analysis.global_fitting as global_fitting
 import kindred.core.fitting_optimization as fitting_optimization
 from kindred.core.optimization_de import compute_de_popsize_maxiter
 from kindred.core.fitting_optimization import fit_parameters
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 @dataclass

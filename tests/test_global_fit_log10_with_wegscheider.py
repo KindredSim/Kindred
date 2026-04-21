@@ -5,6 +5,9 @@ from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 def _as_float(x):
     return float(x()) if callable(x) else float(x)

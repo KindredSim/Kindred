@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
+import pytest
+
+pytestmark = pytest.mark.gui
+
 
 
 class _StubbornSimulationWorker(QtCore.QObject):

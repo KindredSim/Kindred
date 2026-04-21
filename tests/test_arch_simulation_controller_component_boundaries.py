@@ -1,4 +1,8 @@
 from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = REPO_ROOT / "kindred" / "gui" / "controllers" / "simulation_controller.py"

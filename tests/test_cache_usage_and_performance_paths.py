@@ -14,6 +14,10 @@ from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 
 def _simple_mechanism():

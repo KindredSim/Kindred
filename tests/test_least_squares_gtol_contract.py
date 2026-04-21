@@ -9,6 +9,9 @@ from kindred.core.exceptions import FittingCancelled
 from kindred.core.fitting_evaluation import CallableFittingEvaluator
 from kindred.core.optimization_least_squares import build_least_squares_kwargs
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_build_least_squares_kwargs_enforces_gtol_equals_ftol():
     kwargs = build_least_squares_kwargs(ftol=1e-9, xtol=1e-8, max_nfev=10)

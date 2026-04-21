@@ -6,6 +6,9 @@ import pytest
 from kindred.core.results import integrate_ctc
 from kindred.core.time_grid import build_time_grid, is_uniform_time_grid
 
+pytestmark = pytest.mark.unit
+
+
 
 def _make_jitter_grid(delta: float) -> np.ndarray:
     dt = np.array([1.0, 1.0 + delta, 1.0, 1.0 - delta, 1.0], dtype=float)

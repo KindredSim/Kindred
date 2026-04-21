@@ -7,6 +7,9 @@ from kindred.core.simulator.parameter_namespace import build_flat_compat_namespa
 from kindred.core.simulator.parameter_algebra import mechanism_parameter_names
 from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
 
+pytestmark = pytest.mark.unit
+
+
 
 @pytest.mark.parametrize(
     ("name", "family"),

@@ -24,6 +24,7 @@ def _state_network_dsl(*, energy_directive: str | None, T: float, energies: dict
     return "\n".join(header + states)
 
 
+@pytest.mark.unit
 def test_energy_mode_parsing_exposes_temperature_and_default_energy_unit_and_K_relation():
     dsl = _state_network_dsl(
         energy_directive=None,
@@ -49,6 +50,7 @@ def test_energy_mode_parsing_exposes_temperature_and_default_energy_unit_and_K_r
     assert float(eq.Keq) == pytest.approx(expected_K, rel=1e-12)
 
 
+@pytest.mark.unit
 def test_energy_mode_kcal_matches_kj_after_conversion():
     T = 298.15
     dsl_kj = _state_network_dsl(

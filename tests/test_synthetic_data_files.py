@@ -7,6 +7,9 @@ import pytest
 
 from kindred.core.datasets.csv_import import load_csv_dataset
 
+pytestmark = pytest.mark.unit
+
+
 SYNTHETIC_DIR = Path(__file__).parent / "data" / "synthetic"
 GLOBAL_DIR = SYNTHETIC_DIR / "first_order_decay_global"
 COMPLEX_DIR = SYNTHETIC_DIR / "complex_mechanism_global"

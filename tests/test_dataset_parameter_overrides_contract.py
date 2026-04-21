@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 
+@pytest.mark.unit
 def test_fit_global_accepts_typed_dataset_overrides() -> None:
     from kindred.core.analysis.dataset_parameter_overrides import (
         FitDatasetParameterOverrides,
@@ -46,6 +47,7 @@ def test_fit_global_accepts_typed_dataset_overrides() -> None:
     assert pytest.approx(result.dataset_params["ds2"]["init:A"], rel=1e-2) == 2.0
 
 
+@pytest.mark.unit
 def test_run_stamp_accepts_typed_dataset_overrides() -> None:
     from kindred.core.analysis.dataset_parameter_overrides import (
         FitDatasetParameterOverrides,

@@ -16,6 +16,9 @@ import pytest
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 
+pytestmark = pytest.mark.unit
+
+
 
 class TestDSLEmptyAndWhitespace:
     """Test DSL parser handles empty and whitespace-only input."""

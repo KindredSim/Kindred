@@ -17,6 +17,9 @@ from kindred.core.cache import (
 )
 from kindred.core.mechanism import Mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 class TestGlobalFitting:
     """Test global fitting across multiple datasets."""

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib.resources
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_dsl_module_is_a_thin_facade_over_dsl_parse() -> None:

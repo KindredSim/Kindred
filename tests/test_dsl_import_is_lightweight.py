@@ -1,5 +1,9 @@
 import subprocess  # nosec B404 - controlled local interpreter invocation in test
 import sys
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 
 def test_importing_dsl_does_not_eagerly_import_builder_dependencies():

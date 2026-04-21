@@ -1,6 +1,10 @@
 from PySide6 import QtWidgets
 
 from kindred.gui.widgets.temperature_schedule_editor import TemperatureScheduleDialog
+import pytest
+
+pytestmark = pytest.mark.gui
+
 
 
 def test_temperature_schedule_editor_emits_temp_response_dsl_and_preview_contract(qtbot):

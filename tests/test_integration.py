@@ -38,6 +38,9 @@ from kindred.io.logging import (
     LazyMessage,
 )
 
+pytestmark = pytest.mark.integration
+
+
 logger = get_logger(__name__)
 
 

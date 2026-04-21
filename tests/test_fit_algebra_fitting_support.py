@@ -3,6 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 def _fake_solve_constant(request):
     from kindred.core.simulator.solvers import SimulationOutput

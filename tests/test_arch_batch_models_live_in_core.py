@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib.resources
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_qt_free_batch_models_live_in_core() -> None:

@@ -3,6 +3,9 @@ import pytest
 from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_prepared_mode_binds_equilibrium_derived_kr_when_K_is_explicit():
     dsl = "\n".join(

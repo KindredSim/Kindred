@@ -2,6 +2,9 @@ import math
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_sanitize_nonneg_finite_coerces_invalid_to_zero():
     from kindred.gui.species_sliders_logic import sanitize_nonneg_finite

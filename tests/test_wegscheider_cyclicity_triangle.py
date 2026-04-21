@@ -5,6 +5,9 @@ import pytest
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 def _as_float(x):
     return float(x()) if callable(x) else float(x)

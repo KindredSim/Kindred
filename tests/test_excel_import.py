@@ -7,6 +7,9 @@ from openpyxl import Workbook
 
 from kindred.core.datasets.csv_import import parse_csv_rows
 
+pytestmark = pytest.mark.unit
+
+
 
 def _save_workbook(path: Path, sheets: list[tuple[str, list[list[object]]]]) -> Path:
     workbook = Workbook()

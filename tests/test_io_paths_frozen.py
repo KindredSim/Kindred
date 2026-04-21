@@ -4,6 +4,10 @@ import sys
 from pathlib import Path
 
 from kindred.io import paths as kindred_paths
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_find_outputs_dir_respects_env_override(monkeypatch, tmp_path: Path) -> None:

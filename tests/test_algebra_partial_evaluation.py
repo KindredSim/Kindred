@@ -22,6 +22,7 @@ def _dsl_with_one_bad_observable() -> str:
     )
 
 
+@pytest.mark.unit
 def test_algebra_series_partial_eval_keeps_valid_observables():
     """
     Regression: one broken algebra line must not remove other valid observables.

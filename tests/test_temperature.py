@@ -19,6 +19,9 @@ from kindred.core.temperature_dsl import (
     TemperatureDSLError,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 class TestConstantTemperature:
     """Test constant temperature schedules."""

@@ -2,6 +2,9 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_try_parse_callable_finite_float_accepts_scalar_and_callable():
     from kindred.core.validation import try_parse_callable_finite_float

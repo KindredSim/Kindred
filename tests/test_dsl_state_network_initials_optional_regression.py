@@ -1,4 +1,8 @@
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_parse_dsl_to_mechanism_allows_state_network_with_no_initials_mapping():

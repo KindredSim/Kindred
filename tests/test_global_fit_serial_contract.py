@@ -10,6 +10,9 @@ from kindred.core.fitting_completion import FitDetailSection, FitDiagnostic, Glo
 from kindred.core.fitting_optimization import FitResult
 from kindred.core.simulation_failure import build_simulation_failure
 
+pytestmark = pytest.mark.unit
+
+
 
 def _payload(dataset_id: str, y_values) -> object:
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
@@ -50,21 +53,12 @@ def _dataset_input(index: int, dataset_id: str, init_a: float):
     )
 
 
-def test_serial_only_public_and_gui_contract(qt_app, monkeypatch) -> None:
-    from PySide6 import QtCore
-
+def test_serial_only_public_api_contract() -> None:
     from kindred.core.api.fitting import fit_global
-    from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
-    from kindred.gui.fitting.window import FittingWindow
-    from kindred.gui.fitting.worker import GlobalFitWorker
 
     api_signature = inspect.signature(fit_global)
-    worker_signature = inspect.signature(GlobalFitWorker)
-    window_signature = inspect.signature(FittingWindow)
     removed_names = {"parallel_enabled", "max_parallel_workers", "limit_blas_threads"}
     assert removed_names.isdisjoint(api_signature.parameters)
-    assert removed_names.isdisjoint(worker_signature.parameters)
-    assert "shared_solver_settings_getter" not in window_signature.parameters
 
     t = np.linspace(0.0, 1.0, 5)
 
@@ -84,85 +78,19 @@ def test_serial_only_public_and_gui_contract(qt_app, monkeypatch) -> None:
     assert result.completion.status == "ok"
     assert {info.dataset_id for info in result.dataset_info} == {"ds1", "ds2"}
 
-    with pytest.raises(TypeError, match="parallel_enabled"):
-        fit_global(
-            _sim,
-            [_raw_dataset("ds1", np.ones_like(t))],
-            shared_params={"k": 1.0},
-            parallel_enabled=True,
-        )
-
-    captured: dict[str, object] = {}
-
-    class _FakeWorker(QtCore.QObject):
-        progress = QtCore.Signal(int, str)
-        bestUpdated = QtCore.Signal(dict)
-        finished = QtCore.Signal(dict)
-        error = QtCore.Signal(object)
-
-        def __init__(self, datasets, shared_params, **kwargs):
-            super().__init__()
-            captured["datasets"] = list(datasets)
-            captured["shared_params"] = dict(shared_params)
-            captured["kwargs"] = dict(kwargs)
-
-        def start(self):
-            return None
-
-        def isRunning(self):
-            return False
-
-        def cancel(self):
-            return None
-
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
-
-    dataset_payloads = [
-        {"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]},
-    ]
-    window = FittingWindow(
-        mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.1, "max": 2.0}],
-        dataset_entries=[
-            {
-                "id": "ds1",
-                "label": "ds1",
-                "t": t.copy(),
-                "species_data": {"A": np.ones_like(t)},
-                "selected_species": ["A"],
-                "weight": 1.0,
-                "include": True,
-            }
-        ],
-        simulation_func=_sim,
-        dataset_payloads=dataset_payloads,
-        dataset_weights={"ds1": 1.0},
-    )
-    try:
-        assert not hasattr(window, "_parallel_fit_runtime_settings_for_run")
-        window._start_global_fit_worker(
-            datasets=coerce_fit_dataset_specs(dataset_payloads),
-            config={
-                "parameters": {"k": 1.0},
-                "max_nfev": 5,
-            },
-            dataset_overrides=[],
-            weights={"ds1": 1.0},
-            requested_solver="BDF",
-            requested_rtol=1e-6,
-            requested_atol=1e-12,
-            fit_evaluator=_sim,
-            stamp={},
-            stamp_hash="stamp-hash",
-            stamp_short="stamp",
-        )
-    finally:
-        window.close()
-
-    worker_kwargs = captured["kwargs"]
-    assert removed_names.isdisjoint(worker_kwargs)
-    assert "max_parallel_batch_workers" not in worker_kwargs
-    assert "limit_blas_threads_per_worker" not in worker_kwargs
+    for removed_name, removed_values in (
+        ("parallel_enabled", (True, False)),
+        ("max_parallel_workers", (0, 1, None)),
+        ("limit_blas_threads", (True, False)),
+    ):
+        for removed_value in removed_values:
+            with pytest.raises(TypeError, match=removed_name):
+                fit_global(
+                    _sim,
+                    [_raw_dataset("ds1", np.ones_like(t))],
+                    shared_params={"k": 1.0},
+                    **{removed_name: removed_value},
+                )
 
 
 def test_dataset_simulation_generic_wrap_prefers_inner_snapshot_when_sources_disagree_and_preserves_context() -> None:

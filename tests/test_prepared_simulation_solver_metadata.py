@@ -1,4 +1,8 @@
 from __future__ import annotations
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_build_prepared_simulation_meta_uses_typed_metadata_object() -> None:

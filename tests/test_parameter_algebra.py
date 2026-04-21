@@ -16,6 +16,9 @@ from kindred.core.simulator.parameter_algebra import (
 from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 from kindred.core.simulator.parameter_units import rate_constant_unit
 
+pytestmark = pytest.mark.unit
+
+
 
 def _base_mech(dsl_text: str):
     return parse_dsl_to_mechanism(dsl_text, initials={})

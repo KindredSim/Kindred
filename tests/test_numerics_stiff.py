@@ -7,6 +7,9 @@ from kindred.core.simulator import solvers
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 
+pytestmark = pytest.mark.integration
+
+
 
 def _robertson_rhs():
     dsl = "\n".join(

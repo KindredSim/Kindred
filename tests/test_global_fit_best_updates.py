@@ -5,6 +5,9 @@ from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
 from kindred.core.fitting_completion import GlobalFitCompletion
 from kindred.gui.fitting.worker import GlobalFitWorker
 
+pytestmark = pytest.mark.gui
+
+
 
 def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
     emitted = []

@@ -1,5 +1,9 @@
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_wegscheider_toggle_off_leaves_rates_unchanged():

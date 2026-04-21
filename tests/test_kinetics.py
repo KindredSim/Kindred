@@ -18,6 +18,9 @@ from kindred.core.simulator.kinetics import (
     rate_units,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 class TestEyringEquation:
     """Test Eyring equation calculations."""

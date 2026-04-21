@@ -4,6 +4,10 @@ import os
 import subprocess  # nosec B404 - controlled local interpreter invocation in test
 import sys
 import textwrap
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 
 def test_numpy_bottleneck_pyqtgraph_imports_cleanly() -> None:

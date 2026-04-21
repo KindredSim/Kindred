@@ -5,6 +5,9 @@ from kindred.core.simulator.dsl import parse_and_preview, parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import _parse_dsl_ir
 
+pytestmark = pytest.mark.unit
+
+
 
 DSL_CASES = [
     (

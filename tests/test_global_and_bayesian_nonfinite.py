@@ -22,6 +22,8 @@ import kindred.core.fitting_optimization as fitting_optimization
 from kindred.core.simulation_preparation import build_prepared_simulation_func
 from kindred.core.simulator.solvers import SimulationOutput
 
+pytestmark = pytest.mark.unit
+
 
 def _build_serial_fit_components():
     mechanism_text = "\n".join(

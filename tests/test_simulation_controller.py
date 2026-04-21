@@ -5792,6 +5792,7 @@ def test_run_simulation_internal_no_mechanism_after_pending_init_migration_reinv
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._start_next_batch_simulation.assert_not_called()
 
+@pytest.mark.unit
 def test_run_simulation_internal_invalid_initials_preserves_targeted_dirty_workspaces(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
@@ -6167,6 +6168,7 @@ def test_explicit_run_success_resyncs_focused_mechanism_controls_after_targeted_
 
     mw._sync_mechanism_controls_to_focused_batch_set.assert_called_once_with(use_workspace=True)
 
+@pytest.mark.unit
 def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_not_row(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):

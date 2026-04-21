@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_public_unit_display_tuples_use_ascii_micro_forms() -> None:
     from kindred.core.datasets.units import CONCENTRATION_UNIT_DISPLAY, TIME_UNIT_DISPLAY

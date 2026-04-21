@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib.resources
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_lazy_import_pressure_is_reduced_to_single_entrypoints() -> None:

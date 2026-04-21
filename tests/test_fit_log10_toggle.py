@@ -3,6 +3,9 @@ import pytest
 
 from kindred.core.analysis.global_fitting import fit_global
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_fit_global_log10_shared_param_converts_bounds_and_values():
     true_k = 0.7

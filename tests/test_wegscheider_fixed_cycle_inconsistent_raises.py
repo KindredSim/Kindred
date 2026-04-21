@@ -4,6 +4,9 @@ from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_wegscheider_inconsistent_fixed_cycle_raises_when_enabled():
     dsl = "\n".join(

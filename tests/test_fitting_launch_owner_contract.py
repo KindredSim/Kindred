@@ -373,6 +373,7 @@ def test_fitting_package_launch_owner_preserves_invalid_payload_results(main_win
     assert "invalid x_obs" in str(payload_results["ds1"].error)
 
 
+@pytest.mark.unit
 def test_fitting_launch_owner_module_does_not_import_fit_dialog() -> None:
     source = importlib.resources.files("kindred.gui.fitting").joinpath("launch.py").read_text(encoding="utf-8")
 

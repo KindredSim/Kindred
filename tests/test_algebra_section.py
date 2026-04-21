@@ -7,6 +7,10 @@ from kindred.core.simulator.algebra_section import (
     upsert_lines_into_algebra_section,
 )
 from kindred.core.simulator.step_constraint_authority import build_step_constraint_reasons_from_text
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_extract_algebra_section_text_collects_interleaved_algebra_lines_only():

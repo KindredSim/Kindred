@@ -11,6 +11,9 @@ import pytest
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism, parse_dsl, DSLError
 from kindred.core.simulator.dsl_parse import _KEY_ALIASES
 
+pytestmark = pytest.mark.unit
+
+
 
 # ---------------------------------------------------------------------------
 # Fix 1: Empty directives must raise DSLError, not KeyError or crash

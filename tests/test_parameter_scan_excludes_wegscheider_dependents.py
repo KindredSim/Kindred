@@ -1,4 +1,8 @@
 from kindred.gui.controllers.dataset_manager import DatasetManager
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_parameter_scan_excludes_wegscheider_derived_parameters():

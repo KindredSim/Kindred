@@ -15,6 +15,9 @@ from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 
+pytestmark = pytest.mark.integration
+
+
 
 def test_simulation_pipeline_handles_minimal_grid():
     """A simple mechanism should integrate correctly even with the smallest grid."""

@@ -5,6 +5,9 @@ import pytest
 
 from kindred.core.datasets.csv_import import parse_csv_rows, load_csv_dataset
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_parse_csv_skips_fully_empty_rows() -> None:
     rows = [

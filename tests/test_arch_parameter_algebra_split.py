@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import importlib.resources
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_parameter_algebra_module_uses_spec_and_eval_submodules() -> None:

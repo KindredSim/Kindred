@@ -1,6 +1,9 @@
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.gui
+
+
 
 def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkeypatch):
     """A second global run should seed dataset-variable initials from best-so-far without applying."""

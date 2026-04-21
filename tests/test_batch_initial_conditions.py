@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 
+@pytest.mark.unit
 def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
 
@@ -26,6 +27,7 @@ def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
     assert "Initial concentrations moved to Batch Initial Conditions table (set1)" in rewritten
 
 
+@pytest.mark.unit
 def test_migrate_initial_concentrations_is_one_time_seed_if_stub_present():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
 
@@ -41,6 +43,7 @@ def test_migrate_initial_concentrations_is_one_time_seed_if_stub_present():
     assert rewritten == stubbed
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_preserves_imported_names_and_rewrites_each_block():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -82,6 +85,7 @@ def test_migrate_named_initial_concentration_sets_preserves_imported_names_and_r
     assert "initial: A=2.5, B=0.5" not in stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_preserves_spaced_names_and_strips_block():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -115,6 +119,7 @@ def test_migrate_named_initial_concentration_sets_preserves_spaced_names_and_str
     assert "let x = 3" in stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_multiword_block_untouched():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -148,6 +153,7 @@ def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_multiword
     assert "[A] = 1.5" not in stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_imports_empty_named_blocks_but_leaves_empty_algebra_let_block():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -190,6 +196,7 @@ def test_migrate_named_initial_concentration_sets_imports_empty_named_blocks_but
     assert "\n}\n" in f"\n{stripped}\n"
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_merges_empty_default_named_block_with_legacy_initials():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -227,6 +234,7 @@ def test_migrate_named_initial_concentration_sets_merges_empty_default_named_blo
     assert "[B] = 0.5" not in stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_leaves_outside_algebra_let_and_param_blocks_untouched():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -266,6 +274,7 @@ def test_migrate_named_initial_concentration_sets_leaves_outside_algebra_let_and
     assert "let observable = [A]" in stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_does_not_harvest_inner_initials_from_unsupported_let_or_param_blocks():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -291,6 +300,7 @@ def test_migrate_named_initial_concentration_sets_does_not_harvest_inner_initial
     assert rewritten == reaction_text
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_does_not_harvest_nested_supported_block_inside_unsupported_outer_block():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -314,6 +324,7 @@ def test_migrate_named_initial_concentration_sets_does_not_harvest_nested_suppor
     assert rewritten == reaction_text
 
 
+@pytest.mark.unit
 def test_strip_named_initial_concentration_sets_skips_nested_blocks_inside_unsupported_outer_blocks():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -364,6 +375,7 @@ def test_strip_named_initial_concentration_sets_skips_nested_blocks_inside_unsup
     assert "[C] = 2.0" not in stripped
 
 
+@pytest.mark.unit
 def test_strip_reaction_dsl_initial_concentrations_preserves_unsupported_outer_blocks():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -429,6 +441,7 @@ def test_strip_reaction_dsl_initial_concentrations_preserves_unsupported_outer_b
     assert "[D] = 3.0" not in runtime_stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_does_not_insert_stub_when_nothing_was_imported():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -451,6 +464,7 @@ def test_migrate_named_initial_concentration_sets_does_not_insert_stub_when_noth
     assert rewritten == reaction_text
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_let_and_param_blocks_untouched():
     from kindred.core.batch_initial_conditions import (
         migrate_reaction_dsl_initial_concentration_sets,
@@ -487,6 +501,7 @@ def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_let_and_p
     assert "[A] = 2.5" not in stripped
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_imports_new_blocks_even_with_existing_stub():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 
@@ -510,6 +525,7 @@ def test_migrate_named_initial_concentration_sets_imports_new_blocks_even_with_e
     assert "Initial concentrations moved to Batch Initial Conditions table (randomname3)" in rewritten
 
 
+@pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_ignores_non_import_brace_blocks():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 
@@ -535,6 +551,7 @@ def test_migrate_named_initial_concentration_sets_ignores_non_import_brace_block
     assert "Initial concentrations moved to Batch Initial Conditions table (set-two)" in rewritten
 
 
+@pytest.mark.unit
 def test_batch_store_paste_refuses_when_out_of_bounds():
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
 
@@ -548,6 +565,7 @@ def test_batch_store_paste_refuses_when_out_of_bounds():
         store.apply_paste_block(start_row=1, start_col=2, text="1\t2")
 
 
+@pytest.mark.unit
 def test_batch_store_validation_reports_invalid_numeric_cells():
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
 
@@ -560,6 +578,7 @@ def test_batch_store_validation_reports_invalid_numeric_cells():
     assert (0, "A") in invalid
 
 
+@pytest.mark.unit
 def test_batch_store_shown_defaults_true_and_round_trips_serialization():
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
 
@@ -592,6 +611,7 @@ def test_batch_store_shown_defaults_true_and_round_trips_serialization():
     assert legacy_restored.is_shown(1) is True
 
 
+@pytest.mark.unit
 def test_run_scope_selected_defaults_to_first_row():
     from kindred.core.batch_initial_conditions import resolve_run_scope
 
@@ -599,6 +619,7 @@ def test_run_scope_selected_defaults_to_first_row():
     assert resolve_run_scope(selected_rows=[2, 0], total_rows=3, mode="selected") == [2, 0]
 
 
+@pytest.mark.unit
 def test_run_scope_selected_falls_back_to_focused_row_before_first_row():
     from kindred.core.batch_initial_conditions import resolve_run_scope
 
@@ -607,12 +628,14 @@ def test_run_scope_selected_falls_back_to_focused_row_before_first_row():
     assert resolve_run_scope(selected_rows=[1], total_rows=3, mode="selected", fallback_row=2) == [1]
 
 
+@pytest.mark.unit
 def test_run_scope_all_includes_every_row():
     from kindred.core.batch_initial_conditions import resolve_run_scope
 
     assert resolve_run_scope(selected_rows=[1], total_rows=3, mode="all") == [0, 1, 2]
 
 
+@pytest.mark.unit
 def test_dataset_base_label_strips_underscore_suffixes():
     from kindred.core.batch_initial_conditions import dataset_base_label
 
@@ -625,6 +648,7 @@ def test_dataset_base_label_strips_underscore_suffixes():
     assert dataset_base_label("dataset_01_1.csv") == "dataset_01"
 
 
+@pytest.mark.unit
 def test_seed_from_dataset_first_row_only_when_t0_within_tolerance():
     from kindred.core.batch_initial_conditions import seed_batch_set_from_dataset_first_row
 

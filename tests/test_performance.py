@@ -18,6 +18,9 @@ from kindred.core.sparse_jacobian import (
 from kindred.core.mechanism import Mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
+pytestmark = pytest.mark.unit
+
+
 
 BENCHMARK_REASON = "requires benchmark mechanism fixtures under benchmarks/mechanisms/*.txt"
 

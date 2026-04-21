@@ -1,6 +1,9 @@
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_normalize_fit_dataset_dicts_adds_default_id_without_mutating_input():
     from kindred.core.analysis.fit_dataset_payload import normalize_fit_dataset_dicts

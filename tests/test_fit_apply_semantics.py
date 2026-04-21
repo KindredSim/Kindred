@@ -12,6 +12,9 @@ from kindred.gui.mixins.fitting_mixin import FittingMixin
 from kindred.gui.mixins.ports import FittingMixinPorts
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
+pytestmark = pytest.mark.gui
+
+
 
 def _make_fit_result() -> GlobalFitResult:
     y = np.linspace(1.0, 0.5, 5)

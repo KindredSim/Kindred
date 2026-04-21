@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_compute_sampled_indices_evenly_spaced_includes_endpoints():

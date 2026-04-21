@@ -1,6 +1,10 @@
 import numpy as np
 
 from kindred.gui.widgets.grid_plot_view import GridPlotView
+import pytest
+
+pytestmark = pytest.mark.gui
+
 
 
 def test_grid_plot_view_renders_model_overlay_when_present(qt_app):

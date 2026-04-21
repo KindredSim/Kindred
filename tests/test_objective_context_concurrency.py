@@ -3,6 +3,10 @@ import threading
 import numpy as np
 
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_objective_context_is_thread_local():

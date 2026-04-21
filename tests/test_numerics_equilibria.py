@@ -3,6 +3,10 @@ import numpy as np
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 
 def test_reversible_equilibrium_reaches_expected_state():

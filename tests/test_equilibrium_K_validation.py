@@ -5,6 +5,9 @@ from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.step_indexing import canonical_parameter_names
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_equilibrium_kf_kr_K_inconsistent_raises_with_context():
     dsl = "\n".join(

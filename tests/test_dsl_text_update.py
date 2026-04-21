@@ -12,6 +12,9 @@ from kindred.core.simulator.dsl_text_update import (
     format_authoritative_parameter_value,
 )
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_apply_parameter_updates_to_dsl_text_reports_canonical_updater_errors():
     source = "reaction: A -> B; k=1.0"

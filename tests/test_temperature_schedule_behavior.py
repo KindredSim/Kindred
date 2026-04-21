@@ -4,6 +4,10 @@ from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 from kindred.core.temperature import TemperatureSchedule
+import pytest
+
+pytestmark = pytest.mark.integration
+
 
 
 ARRHENIUS_DSL = "\n".join(

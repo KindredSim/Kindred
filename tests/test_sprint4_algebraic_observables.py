@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_detect_unknown_scalar_identifiers_uses_algebra_ast():

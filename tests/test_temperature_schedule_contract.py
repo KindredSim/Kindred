@@ -6,6 +6,10 @@ from kindred.core.cache import fingerprint_simulation_request, generate_mechanis
 from kindred.core.mechanism import Mechanism
 from kindred.core.simulator.solvers import SimulationRequest
 from kindred.core.temperature import TemperatureSchedule, coerce_temperature_schedule
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 @dataclass(frozen=True, repr=False)

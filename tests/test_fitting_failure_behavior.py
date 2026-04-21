@@ -6,6 +6,9 @@ from kindred.core.fitting_objective import build_fitting_objective
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.simulator.solvers import SimulationOutput
 
+pytestmark = pytest.mark.unit
+
+
 
 MECHANISM = "\n".join(
     [

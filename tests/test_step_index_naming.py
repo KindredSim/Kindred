@@ -6,6 +6,9 @@ from kindred.core.simulator.step_indexing import canonical_parameter_names, get_
 from kindred.core.algebra.symbol_table import build_algebra_symbol_table
 from kindred.gui.parameter_enumeration import enumerate_step_parameters_for_gui
 
+pytestmark = pytest.mark.unit
+
+
 
 def test_canonical_step_names_mixed_mechanism_no_K_param():
     dsl = "\n".join(

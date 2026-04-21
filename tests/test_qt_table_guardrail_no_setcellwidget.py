@@ -1,5 +1,9 @@
 import re
 from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 
 def test_guardrail_no_setcellwidget_in_gui_sources():

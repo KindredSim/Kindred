@@ -1,4 +1,8 @@
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.gui
+
 
 
 def test_simulate_mechanism_includes_algebra_observables(main_window):

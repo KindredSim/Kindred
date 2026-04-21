@@ -109,6 +109,7 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
     assert counts["build_context"] == 1
 
 
+@pytest.mark.unit
 def test_prepared_global_fit_simulation_matches_parse_each_call(monkeypatch):
     """
     Numerical equivalence check: prepared (parse-once) simulation should match the
