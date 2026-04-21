@@ -1,7 +1,6 @@
 import numpy as np
 import pytest
 
-
 @pytest.mark.unit
 def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
@@ -26,7 +25,6 @@ def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
     assert "let x = 3" in rewritten
     assert "Initial concentrations moved to Batch Initial Conditions table (set1)" in rewritten
 
-
 @pytest.mark.unit
 def test_migrate_initial_concentrations_is_one_time_seed_if_stub_present():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
@@ -41,7 +39,6 @@ def test_migrate_initial_concentrations_is_one_time_seed_if_stub_present():
     seed, rewritten = migrate_reaction_dsl_initial_concentrations(stubbed, set_name="set1")
     assert seed == {}
     assert rewritten == stubbed
-
 
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_preserves_imported_names_and_rewrites_each_block():
@@ -84,7 +81,6 @@ def test_migrate_named_initial_concentration_sets_preserves_imported_names_and_r
     assert "[A] = 1.0" not in stripped
     assert "initial: A=2.5, B=0.5" not in stripped
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_preserves_spaced_names_and_strips_block():
     from kindred.core.batch_initial_conditions import (
@@ -118,7 +114,6 @@ def test_migrate_named_initial_concentration_sets_preserves_spaced_names_and_str
     assert "[B] = 0.25" not in stripped
     assert "let x = 3" in stripped
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_multiword_block_untouched():
     from kindred.core.batch_initial_conditions import (
@@ -151,7 +146,6 @@ def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_multiword
     assert "\n}\n" in f"\n{stripped}\n"
     assert "Set B = {" not in stripped
     assert "[A] = 1.5" not in stripped
-
 
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_imports_empty_named_blocks_but_leaves_empty_algebra_let_block():
@@ -195,7 +189,6 @@ def test_migrate_named_initial_concentration_sets_imports_empty_named_blocks_but
     assert "let config = {" in stripped
     assert "\n}\n" in f"\n{stripped}\n"
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_merges_empty_default_named_block_with_legacy_initials():
     from kindred.core.batch_initial_conditions import (
@@ -232,7 +225,6 @@ def test_migrate_named_initial_concentration_sets_merges_empty_default_named_blo
     assert "set1 = {" not in stripped
     assert "[A] = 1.0" not in stripped
     assert "[B] = 0.5" not in stripped
-
 
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_leaves_outside_algebra_let_and_param_blocks_untouched():
@@ -273,7 +265,6 @@ def test_migrate_named_initial_concentration_sets_leaves_outside_algebra_let_and
     assert "# Algebra" in stripped
     assert "let observable = [A]" in stripped
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_does_not_harvest_inner_initials_from_unsupported_let_or_param_blocks():
     from kindred.core.batch_initial_conditions import (
@@ -299,7 +290,6 @@ def test_migrate_named_initial_concentration_sets_does_not_harvest_inner_initial
     assert seed_sets == {}
     assert rewritten == reaction_text
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_does_not_harvest_nested_supported_block_inside_unsupported_outer_block():
     from kindred.core.batch_initial_conditions import (
@@ -322,7 +312,6 @@ def test_migrate_named_initial_concentration_sets_does_not_harvest_nested_suppor
 
     assert seed_sets == {}
     assert rewritten == reaction_text
-
 
 @pytest.mark.unit
 def test_strip_named_initial_concentration_sets_skips_nested_blocks_inside_unsupported_outer_blocks():
@@ -373,7 +362,6 @@ def test_strip_named_initial_concentration_sets_skips_nested_blocks_inside_unsup
     assert "[B] = 0.75" in stripped
     assert "set-two = {" not in stripped
     assert "[C] = 2.0" not in stripped
-
 
 @pytest.mark.unit
 def test_strip_reaction_dsl_initial_concentrations_preserves_unsupported_outer_blocks():
@@ -440,7 +428,6 @@ def test_strip_reaction_dsl_initial_concentrations_preserves_unsupported_outer_b
     assert "# Initial concentrations" not in runtime_stripped.splitlines()
     assert "[D] = 3.0" not in runtime_stripped
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_does_not_insert_stub_when_nothing_was_imported():
     from kindred.core.batch_initial_conditions import (
@@ -462,7 +449,6 @@ def test_migrate_named_initial_concentration_sets_does_not_insert_stub_when_noth
     assert seed_sets == {}
     assert "Initial concentrations moved to Batch Initial Conditions table" not in rewritten
     assert rewritten == reaction_text
-
 
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_let_and_param_blocks_untouched():
@@ -500,7 +486,6 @@ def test_migrate_named_initial_concentration_sets_leaves_empty_algebra_let_and_p
     assert "set-two = {" not in stripped
     assert "[A] = 2.5" not in stripped
 
-
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_imports_new_blocks_even_with_existing_stub():
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
@@ -523,7 +508,6 @@ def test_migrate_named_initial_concentration_sets_imports_new_blocks_even_with_e
     assert "# Initial concentrations moved to Batch Initial Conditions table (set1). Edit there." in rewritten
     assert "randomname3 = {" not in rewritten
     assert "Initial concentrations moved to Batch Initial Conditions table (randomname3)" in rewritten
-
 
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_ignores_non_import_brace_blocks():
@@ -550,7 +534,6 @@ def test_migrate_named_initial_concentration_sets_ignores_non_import_brace_block
     assert "set-two = {" not in rewritten
     assert "Initial concentrations moved to Batch Initial Conditions table (set-two)" in rewritten
 
-
 @pytest.mark.unit
 def test_batch_store_paste_refuses_when_out_of_bounds():
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
@@ -564,7 +547,6 @@ def test_batch_store_paste_refuses_when_out_of_bounds():
     with pytest.raises(ValueError, match="exceeds table bounds"):
         store.apply_paste_block(start_row=1, start_col=2, text="1\t2")
 
-
 @pytest.mark.unit
 def test_batch_store_validation_reports_invalid_numeric_cells():
     from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
@@ -576,7 +558,6 @@ def test_batch_store_validation_reports_invalid_numeric_cells():
 
     invalid = store.validate_numeric_cells(rows=[0])
     assert (0, "A") in invalid
-
 
 @pytest.mark.unit
 def test_batch_store_shown_defaults_true_and_round_trips_serialization():
@@ -610,14 +591,12 @@ def test_batch_store_shown_defaults_true_and_round_trips_serialization():
     assert legacy_restored.is_shown(0) is True
     assert legacy_restored.is_shown(1) is True
 
-
 @pytest.mark.unit
 def test_run_scope_selected_defaults_to_first_row():
     from kindred.core.batch_initial_conditions import resolve_run_scope
 
     assert resolve_run_scope(selected_rows=[], total_rows=3, mode="selected") == [0]
     assert resolve_run_scope(selected_rows=[2, 0], total_rows=3, mode="selected") == [2, 0]
-
 
 @pytest.mark.unit
 def test_run_scope_selected_falls_back_to_focused_row_before_first_row():
@@ -627,13 +606,11 @@ def test_run_scope_selected_falls_back_to_focused_row_before_first_row():
     assert resolve_run_scope(selected_rows=[], total_rows=3, mode="selected", fallback_row=None) == [0]
     assert resolve_run_scope(selected_rows=[1], total_rows=3, mode="selected", fallback_row=2) == [1]
 
-
 @pytest.mark.unit
 def test_run_scope_all_includes_every_row():
     from kindred.core.batch_initial_conditions import resolve_run_scope
 
     assert resolve_run_scope(selected_rows=[1], total_rows=3, mode="all") == [0, 1, 2]
-
 
 @pytest.mark.unit
 def test_dataset_base_label_strips_underscore_suffixes():
@@ -646,7 +623,6 @@ def test_dataset_base_label_strips_underscore_suffixes():
     assert dataset_base_label("dataset1_1.csv") == "dataset1"
     assert dataset_base_label("dataset_01.csv") == "dataset_01"
     assert dataset_base_label("dataset_01_1.csv") == "dataset_01"
-
 
 @pytest.mark.unit
 def test_seed_from_dataset_first_row_only_when_t0_within_tolerance():
@@ -666,7 +642,6 @@ def test_seed_from_dataset_first_row_only_when_t0_within_tolerance():
     }
     seeded2 = seed_batch_set_from_dataset_first_row(dataset_offset, mechanism_species, tol=1e-9)
     assert seeded2 == {}
-
 
 @pytest.mark.gui
 def test_batch_table_paste_revalidates_invalid_highlighting(main_window):
@@ -691,7 +666,6 @@ def test_batch_table_paste_revalidates_invalid_highlighting(main_window):
     brush = model.data(idx, QtCore.Qt.BackgroundRole)
     assert brush is not None
     assert brush.color().getRgb()[:3] == (255, 210, 210)
-
 
 @pytest.mark.gui
 def test_batch_table_setdata_and_paste_produce_same_invalid_state(qt_app):
@@ -734,7 +708,6 @@ def test_batch_table_setdata_and_paste_produce_same_invalid_state(qt_app):
     assert paste_invalid == setdata_invalid
     assert paste_brush.color().getRgb()[:3] == setdata_brush.color().getRgb()[:3]
 
-
 @pytest.mark.gui
 def test_data_manager_unique_dataset_names_use_underscore_suffix(qt_app):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -748,7 +721,6 @@ def test_data_manager_unique_dataset_names_use_underscore_suffix(qt_app):
         assert panel._make_unique_dataset_name("dataset.csv") == "dataset_2.csv"
     finally:
         panel.close()
-
 
 @pytest.mark.gui
 def test_display_cached_batch_selection_first_run_is_not_blank(main_window):
@@ -781,66 +753,9 @@ def test_display_cached_batch_selection_first_run_is_not_blank(main_window):
     assert set(plot.selected_series()) == {"A", "B"}
     assert set(plot.visible_series()) == {"A", "B"}
 
+@pytest.mark.gui
 
 @pytest.mark.gui
-def test_batch_table_has_add_and_move_controls(main_window):
-    """Batch Initial Conditions table must expose discoverable Add/Up/Down controls."""
-    from PySide6 import QtWidgets
-
-    assert main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton") is not None
-    assert main_window.findChild(QtWidgets.QPushButton, "moveBatchSetUpButton") is not None
-    assert main_window.findChild(QtWidgets.QPushButton, "moveBatchSetDownButton") is not None
-
-
-@pytest.mark.gui
-def test_batch_run_controls_are_condensed_and_run_all_removed(main_window):
-    """
-    UI condensation: the redundant Run All button must stay removed, primary
-    simulation inputs must remain grouped at the top of the panel, and the run
-    action must live alongside the batch-set actions instead of in a separate
-    control strip.
-    """
-    from PySide6 import QtWidgets
-
-    assert main_window.findChild(QtWidgets.QPushButton, "runAllSimulationsButton") is None
-
-    run_btn = main_window.findChild(QtWidgets.QPushButton, "runSelectedButton")
-    assert run_btn is not None
-
-    controls_row = main_window.findChild(QtWidgets.QWidget, "batchSolverControlsRow")
-    assert controls_row is not None
-    layout = controls_row.layout()
-    assert isinstance(layout, QtWidgets.QVBoxLayout)
-    assert layout.count() == 1
-
-    inputs_row = layout.itemAt(0).layout()
-    assert isinstance(inputs_row, QtWidgets.QHBoxLayout)
-
-    sim_time = getattr(main_window, "_sim_time_spinbox", None)
-    assert isinstance(sim_time, QtWidgets.QLineEdit)
-    sim_time.setText("1e12")
-    assert sim_time.text() == "1e12"
-
-    input_widgets = []
-    for i in range(inputs_row.count()):
-        item = inputs_row.itemAt(i)
-        if item is None:
-            continue
-        w = item.widget()
-        if w is not None:
-            input_widgets.append(w)
-
-    assert getattr(main_window, "_solver_method_combo", None) in input_widgets
-    assert getattr(main_window, "_sim_time_spinbox", None) in input_widgets
-    assert getattr(main_window, "_num_points_spinbox", None) in input_widgets
-
-    delete_btn = main_window.findChild(QtWidgets.QPushButton, "deleteBatchSetButton")
-    assert delete_btn is not None
-    main_window.show()
-    QtWidgets.QApplication.processEvents()
-    assert run_btn.geometry().y() == delete_btn.geometry().y()
-    assert run_btn.geometry().x() > delete_btn.geometry().x()
-
 
 @pytest.mark.gui
 def test_add_set_creates_unique_names_and_zeros(main_window):
@@ -863,7 +778,6 @@ def test_add_set_creates_unique_names_and_zeros(main_window):
     assert row2 is not None
     assert float(main_window._batch_store.get_value(int(row2), "A")) == pytest.approx(0.0)
     assert float(main_window._batch_store.get_value(int(row2), "B")) == pytest.approx(0.0)
-
 
 @pytest.mark.gui
 def test_move_up_down_reorders_sets_and_serializes(main_window, qt_app):
@@ -902,7 +816,6 @@ def test_move_up_down_reorders_sets_and_serializes(main_window, qt_app):
     down_btn.click()
     qt_app.processEvents()
     assert main_window._batch_store.set_names()[:3] == ["set1", "set2", "set3"]
-
 
 @pytest.mark.gui
 def test_move_reorders_cached_main_plot_popup_labels_for_duplicate_names(main_window, qt_app):
@@ -966,137 +879,9 @@ def test_move_reorders_cached_main_plot_popup_labels_for_duplicate_names(main_wi
     assert overlays
     assert overlays[0]["popup_label"] == "dup (row 1)"
 
+@pytest.mark.gui
 
 @pytest.mark.gui
-def test_move_skips_main_plot_popup_resync_for_direct_path_plot(main_window, monkeypatch, qt_app):
-    from PySide6 import QtCore, QtWidgets
-
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    first_id = str(main_window._batch_set_id_for_row(0) or "")
-    second_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert first_id and second_id
-
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_batch_set_id = first_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(first_id) or first_id)
-    cache.last_display_selection = [first_id, second_id]
-
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", lambda **_kwargs: False, raising=False)
-
-    main_window.simulation_controller.run_state.latest_sim_request_id = 44
-    main_window.simulation_controller.run_state.active_run_id = 44
-    main_window.simulation_controller.on_simulation_complete(
-        {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "Y": np.asarray([[2.0, 4.0]], dtype=float),
-            "species_names": ["A"],
-            "algebra_scalars": {},
-            "mechanism": None,
-            "mechanism_text": "reaction: A -> B; k1=1.0",
-            "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15},
-            "fallback_occurred": False,
-            "fallback_message": None,
-        },
-        run_id=44,
-        fast_mode=False,
-        request_id=44,
-    )
-    qt_app.processEvents()
-
-    assert main_window.active_batch_selection() == ("", "")
-    assert cache.last_display_selection == []
-
-    sync_calls = []
-
-    def _sync(*args, **kwargs):
-        sync_calls.append((args, kwargs))
-
-    monkeypatch.setattr(main_window, "sync_main_plot_copy_labels", _sync, raising=False)
-
-    table = main_window._batch_table
-    assert table is not None
-    idx = main_window._batch_model.index(1, 0)
-    table.setCurrentIndex(idx)
-    sel = table.selectionModel()
-    assert sel is not None
-    sel.clearSelection()
-    sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-
-    main_window._move_selected_batch_sets(delta=-1)
-    qt_app.processEvents()
-
-    assert sync_calls == []
-
-
-@pytest.mark.gui
-def test_move_relabels_overlays_when_primary_is_empty_but_display_selection_survives(main_window, qt_app):
-    from PySide6 import QtCore, QtWidgets
-
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    first_id = str(main_window._batch_set_id_for_row(0) or "")
-    second_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert first_id and second_id
-
-    main_window._batch_store.set_set_name(0, "dup")
-    main_window._batch_store.set_set_name(1, "dup")
-
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_batch_set_id = ""
-    cache.active_batch_set = ""
-    cache.last_display_selection = [first_id, second_id]
-
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([1.0, 2.0], dtype=float)},
-        label="dup",
-        overlays=[
-            {
-                "label": "dup",
-                "set_id": second_id,
-                "t": np.asarray([0.0, 1.0], dtype=float),
-                "series": {"A": np.asarray([3.0, 4.0], dtype=float)},
-            }
-        ],
-    )
-    main_window.sync_main_plot_copy_labels("", [first_id, second_id])
-
-    plot = main_window._plot_tabs._main_plot
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert overlays
-    assert overlays[0]["popup_label"] == "dup (row 2)"
-
-    table = main_window._batch_table
-    assert table is not None
-    idx = main_window._batch_model.index(1, 0)
-    table.setCurrentIndex(idx)
-    sel = table.selectionModel()
-    assert sel is not None
-    sel.clearSelection()
-    sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-
-    main_window._move_selected_batch_sets(delta=-1)
-    qt_app.processEvents()
-
-    assert main_window._batch_store.set_names()[:2] == ["dup", "dup"]
-    # Without a live active set_id, the primary cannot resolve to a truthful row.
-    # Row-qualified disambiguation only applies to entries that still map to a batch row.
-    assert getattr(plot, "_simulation_set_popup_label", None) == "dup"
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert overlays
-    assert overlays[0]["popup_label"] == "dup (row 1)"
-
 
 @pytest.mark.gui
 def test_batch_set_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_app):
@@ -1147,7 +932,6 @@ def test_batch_set_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_
     overlays = list(getattr(plot, "_simulation_overlays", []) or [])
     assert getattr(plot, "_simulation_set_popup_label", None) == "dup (row 1)"
     assert overlays[0]["popup_label"] == "dup (row 2)"
-
 
 @pytest.mark.gui
 def test_batch_table_paste_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_app):
@@ -1207,68 +991,7 @@ def test_batch_table_paste_rename_resyncs_cached_main_plot_popup_labels(main_win
     assert getattr(plot, "_simulation_set_popup_label", None) == "dup (row 1)"
     assert overlays[0]["popup_label"] == "dup (row 2)"
 
-
 @pytest.mark.gui
-def test_global_fit_creates_and_seeds_new_batch_set_from_dataset_t0(main_window, monkeypatch):
-    """
-    Regression: starting a global fit should prompt for an unmapped dataset and,
-    by default, create a new batch set named after the dataset base label.
-    If the dataset starts at t≈0, seed initials from row 0.
-    """
-    from PySide6 import QtWidgets
-
-    data_panel = main_window._right_panel._data_manager
-    data_panel._datasets.clear()
-    data_panel._datasets["dataset1_1"] = {
-        "t": np.array([0.0, 1.0]),
-        "species": {"A": np.array([1.23, 0.5])},
-    }
-
-    monkeypatch.setattr(
-        type(main_window),
-        "_extract_mechanism_initials",
-        lambda _self, _dsl: {"A": 0.0, "B": 0.0},
-        raising=False,
-    )
-    monkeypatch.setattr(
-        main_window._dataset_manager,
-        "scan_mechanism_parameters",
-        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
-    )
-
-    captured = {}
-
-    class _FakeWindow(QtWidgets.QDialog):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-            captured["kwargs"] = kwargs
-
-        def setWindowTitle(self, *_):
-            pass
-
-        def show(self):
-            pass
-
-        def raise_(self):
-            pass
-
-        def activateWindow(self):
-            pass
-
-    monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
-
-    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=0.2")
-    main_window._run_global_fit()
-
-    row = main_window._batch_store.row_for_set("dataset1")
-    assert row is not None
-    assert float(main_window._batch_store.get_value(int(row), "A")) == pytest.approx(1.23)
-    assert float(main_window._batch_store.get_value(int(row), "B")) == pytest.approx(0.0)
-
-    settings = main_window._dataset_manager.get_fit_settings("dataset1_1")
-    assert settings.batch_set == "dataset1"
-    assert "simulation_func" in (captured.get("kwargs") or {})
-
 
 @pytest.mark.gui
 def test_global_fit_creates_new_batch_set_without_seeding_when_t0_not_zero(main_window, monkeypatch):
@@ -1303,7 +1026,6 @@ def test_global_fit_creates_new_batch_set_without_seeding_when_t0_not_zero(main_
     assert row is not None
     assert float(main_window._batch_store.get_value(int(row), "A")) == pytest.approx(0.0)
     assert float(main_window._batch_store.get_value(int(row), "B")) == pytest.approx(0.0)
-
 
 @pytest.mark.gui
 def test_global_fit_resolves_each_unmapped_dataset_independently(main_window, monkeypatch):

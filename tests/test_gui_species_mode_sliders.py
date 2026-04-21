@@ -9,9 +9,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
 from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel
 
-
 pytestmark = [pytest.mark.gui]
-
 
 def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
     option = QtWidgets.QStyleOptionSlider()
@@ -23,7 +21,6 @@ def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
         slider,
     )
     return handle.center()
-
 
 def _set_batch_current_and_selected_rows(
     main_window,
@@ -47,14 +44,12 @@ def _set_batch_current_and_selected_rows(
         sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
     return sel
 
-
 def _select_batch_rows(main_window, rows: list[int]) -> QtCore.QItemSelectionModel:
     return _set_batch_current_and_selected_rows(
         main_window,
         current_row=int(rows[0]),
         selected_rows=list(rows),
     )
-
 
 def _species_slider_row(main_window, species: str):
     panel = main_window._mechanism_editor.species_sliders_widget()
@@ -63,13 +58,11 @@ def _species_slider_row(main_window, species: str):
     assert row is not None
     return row
 
-
 def _set_valid_preview_mechanism(main_window) -> None:
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
-
 
 def _column_for_header(model: QtCore.QAbstractItemModel, header: str) -> int:
     for column in range(model.columnCount()):
@@ -77,12 +70,10 @@ def _column_for_header(model: QtCore.QAbstractItemModel, header: str) -> int:
             return int(column)
     raise AssertionError(f"Missing column header {header!r}")
 
-
 def _table_cell_center(table: QtWidgets.QTableView, index: QtCore.QModelIndex) -> QtCore.QPoint:
     rect = table.visualRect(index).intersected(table.viewport().rect())
     assert rect.isValid()
     return rect.center()
-
 
 def _visual_headers(table: QtWidgets.QTableView, model: QtCore.QAbstractItemModel) -> list[str]:
     header = table.horizontalHeader()
@@ -90,7 +81,6 @@ def _visual_headers(table: QtWidgets.QTableView, model: QtCore.QAbstractItemMode
         str(model.headerData(header.logicalIndex(visual), QtCore.Qt.Horizontal, QtCore.Qt.DisplayRole) or "")
         for visual in range(model.columnCount())
     ]
-
 
 def _track_checkstate_set_data(model: QtCore.QAbstractItemModel, monkeypatch) -> list[tuple[int, int, int, object]]:
     original = model.setData
@@ -103,7 +93,6 @@ def _track_checkstate_set_data(model: QtCore.QAbstractItemModel, monkeypatch) ->
     monkeypatch.setattr(model, "setData", _tracked)
     return calls
 
-
 def _find_slider_visibility_action(main_window, entry_kind: str, name: str) -> QtGui.QAction:
     picker = main_window.findChild(QtWidgets.QToolButton, "sliderVisibilityPickerButton")
     assert picker is not None
@@ -115,14 +104,12 @@ def _find_slider_visibility_action(main_window, entry_kind: str, name: str) -> Q
             return action
     raise AssertionError(f"Missing visibility action for {(entry_kind, name)!r}")
 
-
 def _set_slider_visibility(main_window, entry_kind: str, name: str, *, visible: bool) -> None:
     action = _find_slider_visibility_action(main_window, entry_kind, name)
     if bool(action.isChecked()) != bool(visible):
         action.trigger()
         QtWidgets.QApplication.processEvents()
     assert bool(action.isChecked()) is bool(visible)
-
 
 def test_unified_surface_builds_species_sliders_and_syncs_with_batch_table(main_window, qtbot, monkeypatch):
     _set_valid_preview_mechanism(main_window)
@@ -200,7 +187,6 @@ def test_unified_surface_builds_species_sliders_and_syncs_with_batch_table(main_
     assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(4.0, rel=1e-6, abs=1e-9)
     assert float(main_window._batch_store.get_value(0, "B")) == pytest.approx(2.0, rel=1e-6, abs=1e-9)
 
-
 def test_unified_surface_refreshes_species_sliders_after_species_list_reset_without_selection_change(main_window, qtbot):
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
@@ -228,7 +214,6 @@ def test_unified_surface_refreshes_species_sliders_after_species_list_reset_with
     assert main_window.findChild(QtWidgets.QSlider, "speciesSlider_B") is None
     assert main_window.findChild(QtWidgets.QSlider, "speciesSlider_C") is not None
     assert table.currentIndex().isValid()
-
 
 def test_species_set_change_prunes_removed_species_overlays_and_clears_dirty_state(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A", "B"])
@@ -274,7 +259,6 @@ def test_species_set_change_prunes_removed_species_overlays_and_clears_dirty_sta
     assert main_window._preview_session.has_dirty_transaction() is False
     assert commit_btn.isEnabled() is False
     assert reset_btn.isEnabled() is False
-
 
 def test_species_set_change_clears_active_overlay_display_state_after_pruning(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A", "B"])
@@ -328,7 +312,6 @@ def test_species_set_change_clears_active_overlay_display_state_after_pruning(ma
     main_window._refresh_batch_display_from_focus_and_shown()
     QtWidgets.QApplication.processEvents()
     assert display_calls == []
-
 
 def test_species_set_change_clears_old_explicit_cache_even_when_unrelated_row_prune_preserves_active_overlay_scope(
     main_window, qtbot, monkeypatch
@@ -399,7 +382,6 @@ def test_species_set_change_clears_old_explicit_cache_even_when_unrelated_row_pr
     main_window._refresh_batch_display_from_focus_and_shown()
     QtWidgets.QApplication.processEvents()
     assert display_calls == []
-
 
 def test_species_set_change_preserves_fresh_explicit_cache_during_post_run_sync(
     main_window, qtbot, monkeypatch
@@ -472,7 +454,6 @@ def test_species_set_change_preserves_fresh_explicit_cache_during_post_run_sync(
     assert len(display_calls) == 1
     assert display_calls[0]["cache_key"] == "fresh-current-cache"
 
-
 def test_species_set_change_clears_fresh_explicit_cache_during_post_run_sync_when_active_token_changes(
     main_window, qtbot, monkeypatch
 ):
@@ -538,7 +519,6 @@ def test_species_set_change_clears_fresh_explicit_cache_during_post_run_sync_whe
     main_window._refresh_batch_display_from_focus_and_shown()
     QtWidgets.QApplication.processEvents()
     assert display_calls == []
-
 
 def test_species_set_change_narrows_active_valid_subset_after_partial_post_run_prune(
     main_window, qtbot, monkeypatch
@@ -606,7 +586,6 @@ def test_species_set_change_narrows_active_valid_subset_after_partial_post_run_p
     assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), np.asarray([0.0, 1.0], dtype=float))
     assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {}).get("A"), dtype=float), np.asarray([4.0, 3.5]))
 
-
 def test_hidden_species_state_does_not_leak_into_new_species_set(main_window, qtbot):
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
@@ -633,7 +612,6 @@ def test_hidden_species_state_does_not_leak_into_new_species_set(main_window, qt
     assert reloaded_slider_a.isVisible() is False
     action = _find_slider_visibility_action(main_window, "species", "A")
     assert action.isChecked() is False
-
 
 def test_species_set_change_cancels_queued_species_preview_after_pruning(main_window, qtbot, monkeypatch):
     _set_valid_preview_mechanism(main_window)
@@ -669,7 +647,6 @@ def test_species_set_change_cancels_queued_species_preview_after_pruning(main_wi
     qtbot.wait(120)
     QtWidgets.QApplication.processEvents()
     assert preview_runs == []
-
 
 def test_species_mode_slider_fans_out_to_all_selected_rows(main_window, qtbot, monkeypatch):
     _set_valid_preview_mechanism(main_window)
@@ -728,7 +705,6 @@ def test_species_mode_slider_fans_out_to_all_selected_rows(main_window, qtbot, m
 
     qtbot.waitUntil(lambda: calls["n"] >= 1, timeout=1500)
 
-
 def test_concentration_surface_shows_mixed_value_before_edit_for_multi_selection(main_window, qtbot, monkeypatch):
     _set_valid_preview_mechanism(main_window)
     main_window._batch_model.set_species(["A", "B"])
@@ -784,7 +760,6 @@ def test_concentration_surface_shows_mixed_value_before_edit_for_multi_selection
     assert float(staged_row_1["A"]) == pytest.approx(expected_a, rel=1e-6, abs=1e-9)
 
     qtbot.waitUntil(lambda: calls["n"] >= 1, timeout=1500)
-
 
 def test_target_checkbox_toggle_uses_model_path_and_does_not_move_focus_or_row_selection(
     main_window,
@@ -845,7 +820,6 @@ def test_target_checkbox_toggle_uses_model_path_and_does_not_move_focus_or_row_s
     assert [idx.row() for idx in table.selectionModel().selectedRows(0)] == selected_before
     assert str(main_window.focused_batch_set_id()) == str(main_window.batch_set_id_for_row(0) or "")
     assert main_window.slider_edit_target_set_ids() == [set0_id, set2_id]
-
 
 def test_show_checkbox_toggle_uses_model_path_and_does_not_move_focus_or_row_selection(
     main_window,
@@ -909,7 +883,6 @@ def test_show_checkbox_toggle_uses_model_path_and_does_not_move_focus_or_row_sel
     assert str(main_window.batch_set_id_for_row(1) or "") in main_window.shown_batch_set_ids()
     assert main_window.slider_edit_target_set_ids() == edit_targets_before
 
-
 def test_edit_checkbox_click_on_focused_row_toggles_explicit_membership_without_focus_side_effects(
     main_window,
     qtbot,
@@ -951,7 +924,6 @@ def test_edit_checkbox_click_on_focused_row_toggles_explicit_membership_without_
     assert main_window.slider_edit_target_set_ids() == []
     assert main_window._mechanism_editor._slider_edit_targets_label.text() == "Slider edit targets: set1"
 
-
 def test_show_checkbox_click_on_focused_row_is_rejected_without_focus_side_effects(main_window, qtbot):
     main_window._batch_model.set_species(["A"])
     model = main_window._batch_model
@@ -978,7 +950,6 @@ def test_show_checkbox_click_on_focused_row_is_rejected_without_focus_side_effec
     assert str(main_window.batch_set_id_for_row(0) or "") in main_window.shown_batch_set_ids()
     assert main_window.slider_edit_target_set_ids() == edit_targets_before
 
-
 def test_batch_table_visual_order_places_state_controls_before_set_name(main_window):
     main_window._batch_model.set_species(["A", "B"])
     table = main_window._batch_table
@@ -987,7 +958,6 @@ def test_batch_table_visual_order_places_state_controls_before_set_name(main_win
 
     assert _visual_headers(table, model)[:5] == ["Slider", "Show", "Set Name", "A (M)", "B (M)"]
     assert main_window._mechanism_editor._slider_edit_targets_label.text() == "Slider edit targets: set1"
-
 
 def test_focus_change_preserves_explicit_target_membership_without_accumulating_focus(main_window):
     main_window._batch_model.set_species(["A"])
@@ -1021,7 +991,6 @@ def test_focus_change_preserves_explicit_target_membership_without_accumulating_
         QtCore.Qt.CheckStateRole,
     ) == QtCore.Qt.Checked
     assert main_window._mechanism_editor._slider_edit_targets_label.text() == "Slider edit targets: set2 + 2 explicit"
-
 
 def test_focused_unchecked_target_row_shows_row_level_focus_marker_and_stages_only_effective_targets(main_window):
     _set_valid_preview_mechanism(main_window)
@@ -1070,7 +1039,6 @@ def test_focused_unchecked_target_row_shows_row_level_focus_marker_and_stages_on
     assert main_window._batch_model.data(focused_target_index, QtCore.Qt.DisplayRole) == ""
     assert main_window._batch_model.data(main_window._batch_model.index(0, target_column), QtCore.Qt.DisplayRole) == "focus"
     assert main_window._batch_model.data(explicit_target_index, QtCore.Qt.CheckStateRole) == QtCore.Qt.Checked
-
 
 def test_batch_selection_and_current_handlers_are_single_wired_on_startup(main_window, monkeypatch):
     main_window._batch_model.set_species(["A"])
@@ -1125,7 +1093,6 @@ def test_batch_selection_and_current_handlers_are_single_wired_on_startup(main_w
 
     assert table.currentIndex().row() == 1
     assert row_control_calls == ["controls"]
-
 
 def test_species_mode_slider_targets_explicit_edit_rows_not_selected_rows(main_window, qtbot, monkeypatch):
     _set_valid_preview_mechanism(main_window)
@@ -1185,112 +1152,6 @@ def test_species_mode_slider_targets_explicit_edit_rows_not_selected_rows(main_w
 
     qtbot.waitUntil(lambda: calls["n"] >= 1, timeout=1500)
 
-
-def test_species_mode_slider_stages_overlay_without_mutating_committed_batch_table_until_commit(
-    main_window,
-    qtbot,
-    monkeypatch,
-):
-    main_window._batch_model.set_species(["A", "B"])
-    model = main_window._batch_model
-
-    assert model.setData(model.index(0, 1), "1.0")
-    assert model.setData(model.index(0, 2), "2.0")
-
-    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
-
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
-
-    qtbot.addWidget(main_window)
-    main_window.show()
-
-    slider_a = main_window.findChild(QtWidgets.QSlider, "speciesSlider_A")
-    assert slider_a is not None
-
-    press_pos = _slider_handle_center(slider_a)
-    qtbot.mousePress(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    slider_a.setValue(5000)
-    qtbot.mouseRelease(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    QtWidgets.QApplication.processEvents()
-
-    staged = main_window._preview_session.preview_initials_for_row(0, main_window.batch_initials_for_row(0))
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-    assert float(staged["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-
-    commit_btn = main_window.findChild(QtWidgets.QPushButton, "commitSliderOverridesButton")
-    reset_btn = main_window.findChild(QtWidgets.QPushButton, "resetSliderOverridesButton")
-    assert commit_btn is not None
-    assert reset_btn is not None
-    assert commit_btn.isEnabled() is True
-    assert reset_btn.isEnabled() is True
-    qtbot.mouseClick(commit_btn, QtCore.Qt.LeftButton)
-    QtWidgets.QApplication.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-    assert commit_btn.isEnabled() is False
-    assert reset_btn.isEnabled() is False
-
-
-def test_species_mode_reset_discards_staged_overlays_without_committing_batch_table(
-    main_window,
-    qtbot,
-    monkeypatch,
-):
-    main_window._batch_model.set_species(["A", "B"])
-    model = main_window._batch_model
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    QtWidgets.QApplication.processEvents()
-
-    assert model.setData(model.index(0, 1), "1.0")
-    assert model.setData(model.index(0, 2), "2.0")
-    assert model.setData(model.index(1, 1), "0.25")
-    assert model.setData(model.index(1, 2), "0.75")
-
-    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
-    main_window.set_slider_edit_target_set_ids(
-        [
-            str(main_window.batch_set_id_for_row(0) or ""),
-            str(main_window.batch_set_id_for_row(1) or ""),
-        ]
-    )
-
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
-
-    qtbot.addWidget(main_window)
-    main_window.show()
-
-    slider_a = main_window.findChild(QtWidgets.QSlider, "speciesSlider_A")
-    assert slider_a is not None
-
-    press_pos = _slider_handle_center(slider_a)
-    qtbot.mousePress(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    slider_a.setValue(5000)
-    qtbot.mouseRelease(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    QtWidgets.QApplication.processEvents()
-
-    staged_row_0 = main_window._preview_session.preview_initials_for_row(0, main_window.batch_initials_for_row(0))
-    staged_row_1 = main_window._preview_session.preview_initials_for_row(1, main_window.batch_initials_for_row(1))
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-    assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(0.25, rel=1e-6, abs=1e-9)
-    assert float(staged_row_0["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-    assert float(staged_row_1["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-
-    reset_btn = main_window.findChild(QtWidgets.QPushButton, "resetSliderOverridesButton")
-    assert reset_btn is not None
-    qtbot.mouseClick(reset_btn, QtCore.Qt.LeftButton)
-    QtWidgets.QApplication.processEvents()
-
-    reset_row_0 = main_window._preview_session.preview_initials_for_row(0, main_window.batch_initials_for_row(0))
-    reset_row_1 = main_window._preview_session.preview_initials_for_row(1, main_window.batch_initials_for_row(1))
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-    assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(0.25, rel=1e-6, abs=1e-9)
-    assert float(reset_row_0["A"]) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-    assert float(reset_row_1["A"]) == pytest.approx(0.25, rel=1e-6, abs=1e-9)
-
-
 def test_concentration_surface_uses_focused_row_as_display_source_when_selection_diverges(
     main_window,
     qtbot,
@@ -1339,7 +1200,6 @@ def test_concentration_surface_uses_focused_row_as_display_source_when_selection
     assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(8.0, rel=1e-6, abs=1e-9)
     assert float(staged["A"]) == pytest.approx(10.0, rel=1e-6, abs=1e-9)
     qtbot.waitUntil(lambda: calls["n"] >= 1, timeout=1500)
-
 
 def test_species_mode_reset_restores_all_explicit_edit_targets_even_if_only_one_is_focused(
     main_window,
@@ -1406,55 +1266,6 @@ def test_species_mode_reset_restores_all_explicit_edit_targets_even_if_only_one_
     assert float(main_window._batch_store.get_value(1, "B")) == pytest.approx(0.75, rel=1e-6, abs=1e-9)
     qtbot.waitUntil(lambda: calls["n"] >= 2, timeout=1500)
 
-
-def test_species_mode_commit_rebases_reset_baseline_for_selected_rows(main_window, qtbot, monkeypatch):
-    main_window._batch_model.set_species(["A", "B"])
-    model = main_window._batch_model
-
-    assert model.setData(model.index(0, 1), "1.0")
-    assert model.setData(model.index(0, 2), "2.0")
-
-    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
-
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
-
-    qtbot.addWidget(main_window)
-    main_window.show()
-
-    slider_a = main_window.findChild(QtWidgets.QSlider, "speciesSlider_A")
-    assert slider_a is not None
-
-    press_pos = _slider_handle_center(slider_a)
-    qtbot.mousePress(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    slider_a.setValue(5000)
-    qtbot.mouseRelease(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    QtWidgets.QApplication.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-
-    commit_btn = main_window.findChild(QtWidgets.QPushButton, "commitSliderOverridesButton")
-    assert commit_btn is not None
-    qtbot.mouseClick(commit_btn, QtCore.Qt.LeftButton)
-    QtWidgets.QApplication.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-
-    qtbot.mousePress(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    slider_a.setValue(0)
-    qtbot.mouseRelease(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
-    QtWidgets.QApplication.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-
-    reset_btn = main_window.findChild(QtWidgets.QPushButton, "resetSliderOverridesButton")
-    assert reset_btn is not None
-    qtbot.mouseClick(reset_btn, QtCore.Qt.LeftButton)
-    QtWidgets.QApplication.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-    assert float(main_window._batch_store.get_value(0, "B")) == pytest.approx(2.0, rel=1e-6, abs=1e-9)
-
-
 def test_species_slider_queue_marks_pending_slider_simulation(main_window, qtbot):
     _set_valid_preview_mechanism(main_window)
     qtbot.addWidget(main_window)
@@ -1469,7 +1280,6 @@ def test_species_slider_queue_marks_pending_slider_simulation(main_window, qtbot
     assert timer is not None
     assert timer.isActive()
     timer.stop()
-
 
 def test_species_mode_rebinds_after_project_apply(main_window, qtbot):
     main_window._batch_model.set_species(["A", "B"])
@@ -1527,7 +1337,6 @@ def test_species_mode_rebinds_after_project_apply(main_window, qtbot):
     staged = main_window._preview_session.preview_initials_for_row(0, main_window.batch_initials_for_row(0))
     assert float(main_window._batch_store.get_value(0, "C")) == pytest.approx(3.0, rel=1e-6, abs=1e-9)
     assert float(staged["C"]) == pytest.approx(7.5, rel=1e-6, abs=1e-9)
-
 
 def test_project_apply_disconnects_stale_batch_semantics_signals(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A"])
@@ -1597,7 +1406,6 @@ def test_project_apply_disconnects_stale_batch_semantics_signals(main_window, qt
     assert current_model.set_row_shown(1, False) is True
     QtWidgets.QApplication.processEvents()
     assert refresh_calls == ["refresh"]
-
 
 def test_species_mode_attach_uses_unified_transaction_clear_for_reused_set_id(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A", "B"])
@@ -1669,7 +1477,6 @@ def test_species_mode_attach_uses_unified_transaction_clear_for_reused_set_id(ma
     assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(7.0, rel=1e-6, abs=1e-9)
     assert float(main_window._batch_store.get_value(0, "B")) == pytest.approx(1.5, rel=1e-6, abs=1e-9)
 
-
 def test_hiding_species_slider_preserves_hidden_staged_overlays_until_reset(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
@@ -1729,7 +1536,6 @@ def test_hiding_species_slider_preserves_hidden_staged_overlays_until_reset(main
     assert commit_btn.isEnabled() is False
     assert reset_btn.isEnabled() is False
 
-
 def test_batch_selection_change_with_hidden_overlay_does_not_prompt(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A", "B"])
     model = main_window._batch_model
@@ -1774,7 +1580,6 @@ def test_batch_selection_change_with_hidden_overlay_does_not_prompt(main_window,
     hidden = main_window._preview_session.preview_initials_for_row(0, main_window.batch_initials_for_row(0))
     assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
     assert float(hidden["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-
 
 def test_species_mode_reset_clears_overlay_derived_explicit_cache_selection_state(main_window, qtbot, monkeypatch):
     main_window._batch_model.set_species(["A", "B"])
@@ -1831,7 +1636,6 @@ def test_species_mode_reset_clears_overlay_derived_explicit_cache_selection_stat
     QtWidgets.QApplication.processEvents()
 
     assert display_calls == []
-
 
 def test_species_mode_reset_preserves_baseline_explicit_cache_selection_state_when_overlay_was_never_run(
     main_window, qtbot, monkeypatch
@@ -1892,7 +1696,6 @@ def test_species_mode_reset_preserves_baseline_explicit_cache_selection_state_wh
     assert len(display_calls) == 1
     assert display_calls[0]["cache_key"] == "baseline-explicit-cache"
 
-
 def test_species_mode_reset_clears_subset_scope_overlay_cache_even_with_unrelated_dirty_rows(
     main_window, qtbot, monkeypatch
 ):
@@ -1949,7 +1752,6 @@ def test_species_mode_reset_clears_subset_scope_overlay_cache_even_with_unrelate
     QtWidgets.QApplication.processEvents()
 
     assert display_calls == []
-
 
 def test_batch_table_auto_fit_on_model_reset_and_minimum_widths(main_window):
     """Auto-fit fires on modelReset (species change) and enforces floor widths."""

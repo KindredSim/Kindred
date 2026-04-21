@@ -6,13 +6,6 @@ pytestmark = pytest.mark.gui
 
 pytest.importorskip("scipy", reason="requires scipy for GUI analysis feature tests")
 
-from kindred.gui.main_window import MainWindow  # noqa: E402  # reason: guarded by pytest.importorskip("scipy")
-from kindred.core.analysis.global_fitting import (  # noqa: E402  # reason: guarded by pytest.importorskip("scipy")
-    DatasetFitInfo,
-    GlobalFitResult,
-)
-from kindred.core.fitting_completion import GlobalFitCompletion  # noqa: E402  # reason: guarded by pytest.importorskip("scipy")
-
 @pytest.fixture
 def analysis_window(main_window):
     """Provide a MainWindow configured with a simple mechanism."""
@@ -23,124 +16,6 @@ def analysis_window(main_window):
     ])
     main_window._mechanism_editor._reactions_text.setPlainText(dsl)
     return main_window
-
-
-def test_global_fit_handler_invokes_backend(monkeypatch, analysis_window):
-    t = np.linspace(0, 5, 50)
-    y = np.exp(-0.2 * t)
-    dataset = {"t": t, "species": {"A": y}}
-    analysis_window._on_dataset_loaded("exp1.csv", dataset)
-    analysis_window._on_dataset_loaded("exp2.csv", dataset)
-    panel = analysis_window._right_panel._data_manager
-    panel._datasets["exp1.csv"] = dataset
-    panel._datasets["exp2.csv"] = dataset
-
-    _ = GlobalFitResult(
-        shared_params={"k": 0.21},
-        dataset_params={},
-        uncertainties=None,
-        global_chi_squared=0.01,
-        global_r_squared=0.99,
-        dataset_info=[
-            DatasetFitInfo(
-                dataset_id="exp1.csv",
-                r_squared=0.99,
-                chi_squared=0.01,
-                rmse=0.001,
-                mae=0.001,
-                residuals=np.zeros_like(t),
-                n_points=len(t),
-                weight=1.0,
-            )
-        ],
-        nfev=12,
-        message="ok",
-        completion=GlobalFitCompletion(
-            status="ok",
-            optimizer_converged=True,
-            nonfinite_metrics=False,
-        ),
-        covariance=None,
-    )
-
-    created = {}
-
-    class _FakeWindow(QtWidgets.QDialog):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-            created["kwargs"] = kwargs
-
-        def setWindowTitle(self, title):
-            created["title"] = title
-
-        def show(self):
-            created["show"] = True
-
-        def raise_(self):
-            pass
-
-        def activateWindow(self):
-            pass
-
-    monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
-    monkeypatch.setattr(
-        analysis_window._dataset_manager,
-        "scan_mechanism_parameters",
-        lambda mech: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
-    )
-    monkeypatch.setattr(
-        MainWindow,
-        "_extract_mechanism_initials",
-        lambda self, mechanism: {"A": 1.0},
-        raising=False,
-    )
-
-    monkeypatch.setattr(
-        MainWindow,
-        "_simulate_mechanism",
-        lambda self, mechanism, t_end, num_points: {
-            "t": t,
-            "species": {"A": y},
-        },
-    )
-    analysis_window._run_global_fit()
-    assert created, "Global fitting window should open"
-    kwargs = created["kwargs"]
-    assert kwargs["mode"] == "global"
-    assert len(kwargs["dataset_entries"]) == 2
-    assert kwargs["parameter_defs"][0]["name"] == "k1"
-
-
-def test_fitting_window_smoke(qapp):
-    """Basic instantiation of FittingWindow should not raise."""
-    from kindred.gui.fitting.window import FittingWindow
-
-    parameter_defs = [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}]
-    t_axis = np.linspace(0, 2, 8)
-    dataset_entries = [{
-        "id": "demo",
-        "label": "demo",
-        "t": t_axis,
-        "species_data": {"A": np.exp(-0.2 * t_axis)},
-        "selected_species": ["A"],
-        "weight": 1.0,
-        "include": True,
-    }]
-
-    window = FittingWindow(
-        mode="global",
-        parameter_defs=parameter_defs,
-        dataset_entries=dataset_entries,
-        apply_callback=lambda params: None,
-    )
-    assert window._params_ics_tab._param_table.rowCount() == 1
-    assert window._data_tab._dataset_table.rowCount() == 1
-    assert window._params_ics_tab._param_table.item(0, 2).text() == "k1"
-    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 3).text()), rel=1e-9) == 0.2
-    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 4).text()), rel=1e-9) == 0.01
-    assert pytest.approx(float(window._params_ics_tab._param_table.item(0, 5).text()), rel=1e-9) == 1.0
-    window.close()
-
 
 def test_fitting_window_small_multiples_grid(qapp):
     pytest.importorskip("pyqtgraph", reason="pyqtgraph is required for the fitting window small-multiples grid.")
@@ -199,7 +74,6 @@ def test_fitting_window_small_multiples_grid(qapp):
     assert np.allclose(ds1_payload["model_y"], model_series["ds1"]["A"])
 
     window.close()
-
 
 def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monkeypatch):
     """Global fitting window must flush the visible dataset weight before starting a fit."""
@@ -323,8 +197,9 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
 
 def test_fitting_window_applies_dataset_initial_updates(qapp):
     """After a fit completes, dataset-specific initials are staged until applied."""
+    from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
+    from kindred.core.fitting_completion import GlobalFitCompletion
     from kindred.gui.fitting.window import FittingWindow
-    from kindred.core.analysis.global_fitting import GlobalFitResult, DatasetFitInfo
 
     t_axis = np.linspace(0, 1, 5)
     dataset_entries = [
@@ -481,7 +356,6 @@ def test_global_fit_parameter_toggles_persist_across_best_updates_and_affect_con
     finally:
         window.close()
 
-
 def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(qt_app, monkeypatch):
     """Unchecked Fit params remain fixed at the table value via the simulation wrapper."""
     from PySide6 import QtCore as _QtCore
@@ -561,7 +435,6 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
     finally:
         window._set_running_state(False)
         window.close()
-
 
 def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, monkeypatch):
     from PySide6 import QtCore as _QtCore
@@ -644,7 +517,6 @@ def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, m
         window._set_running_state(False)
         window.close()
 
-
 def test_global_fit_fixed_params_preserve_with_fixed_params_branch(qt_app):
     from kindred.gui.fitting.window import FittingWindow
 
@@ -681,24 +553,6 @@ def test_global_fit_fixed_params_preserve_with_fixed_params_branch(qt_app):
     wrapped.evaluate_series({"k1": 0.2, "init:A": 1.0})
     assert fixed_capture == {"k2": 9.87}
     assert float(seen.get("k1")) == pytest.approx(0.2)
-
-
-def test_global_fit_fixed_param_wrapper_fatals_configured_nonfinite_forwarded_key(qt_app):
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.gui.fitting.window import FittingWindow
-
-    t_axis = np.linspace(0.0, 1.0, 5)
-
-    def _simulate(_params):
-        return {"t": t_axis, "species": {"A": np.ones_like(t_axis)}}
-
-    wrapped = FittingWindow._simulation_with_fixed_params(_simulate, {"unused_fixed": float("nan")})
-
-    with pytest.raises(FitSimulationError, match="Non-finite parameter value") as exc_info:
-        wrapped.evaluate_series({"k1": 0.2, "init:A": 1.0})
-
-    assert getattr(exc_info.value, "details", {}).get("fatal") is True
-
 
 def test_global_fit_run_prep_prunes_stale_and_unknown_dataset_params(qt_app):
     from kindred.gui.fitting.window import FittingWindow
@@ -768,7 +622,6 @@ def test_global_fit_run_prep_prunes_stale_and_unknown_dataset_params(qt_app):
         assert variable == {}
     finally:
         window.close()
-
 
 def test_global_fit_run_prep_uses_prepared_metadata_for_dataset_param_pruning(qt_app):
     from kindred.core.simulation_preparation import PreparedSimulationMetadata

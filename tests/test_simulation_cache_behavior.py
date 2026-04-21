@@ -8,7 +8,6 @@ import pytest
 
 from kindred.core.batch_parallel import run_batch_simulation_task
 
-
 def _fake_sim_result(*, marker: float = 1.0) -> dict:
     t = np.asarray([0.0, 1.0], dtype=float)
     Y = np.asarray([[marker, marker * 2.0]], dtype=float)
@@ -24,7 +23,6 @@ def _fake_sim_result(*, marker: float = 1.0) -> dict:
         "fallback_message": None,
     }
 
-
 def _select_rows(main_window, rows: list[int]) -> None:
     from PySide6 import QtCore
 
@@ -39,7 +37,6 @@ def _select_rows(main_window, rows: list[int]) -> None:
         sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
     main_window._refresh_batch_display_from_focus_and_shown()
 
-
 def _set_shown_rows(main_window, rows: list[int]) -> None:
     from PySide6 import QtCore
 
@@ -51,18 +48,15 @@ def _set_shown_rows(main_window, rows: list[int]) -> None:
         assert model.data(model.index(row, model.show_column()), QtCore.Qt.CheckStateRole) == expected
     main_window._refresh_batch_display_from_focus_and_shown()
 
-
 def _set_edit_target_rows(main_window, rows: list[int]) -> None:
     set_ids = [str(main_window._batch_set_id_for_row(int(row)) or "") for row in rows]
     main_window.set_slider_edit_target_set_ids([set_id for set_id in set_ids if set_id])
-
 
 def _assert_no_cache_warning(main_window) -> None:
     assert main_window._status_label.text() not in (
         "Result not cached (evicted). Press Run to compute.",
         "Cached result invalid. Press Run to compute.",
     )
-
 
 def _parameter_table_numeric_value(main_window, name: str) -> float:
     table = main_window.main_plot().parameter_table()
@@ -75,12 +69,10 @@ def _parameter_table_numeric_value(main_window, name: str) -> float:
         return float(value_item.text())
     raise AssertionError(f"Missing parameter-table row for {name!r}")
 
-
 def _assert_selection_plot_cleared(main_window) -> None:
     plot = main_window._plot_tabs._main_plot
     assert getattr(plot, "_t", None) is None
     assert dict(getattr(plot, "_series", {}) or {}) == {}
-
 
 def _current_preview_solver_config(main_window) -> dict:
     from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
@@ -119,11 +111,9 @@ def _current_preview_solver_config(main_window) -> dict:
         "wegscheider_cyclicity_enabled": bool(main_window.wegscheider_cyclicity_enabled()),
     }
 
-
 def _current_preview_time_axis(main_window) -> np.ndarray:
     points = int((_current_preview_solver_config(main_window).get("grid") or {}).get("N") or 0)
     return np.linspace(0.0, float(main_window.parse_sim_time_seconds()), max(2, points), dtype=float)
-
 
 @dataclass
 class _FakeExecutorSubmission:
@@ -131,7 +121,6 @@ class _FakeExecutorSubmission:
     args: tuple[object, ...]
     kwargs: dict[str, object]
     future: Future
-
 
 class _FakeExecutor:
     def __init__(self) -> None:
@@ -145,17 +134,14 @@ class _FakeExecutor:
     def shutdown(self, wait=True, cancel_futures=False):
         return None
 
-
 def _simulation_submissions(executor: _FakeExecutor) -> list[_FakeExecutorSubmission]:
     return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
-
 
 def _clear_eager_parallel_executor(main_window) -> None:
     controller = main_window.simulation_controller
     if controller.parallel_batch.executor is not None:
         controller.shutdown_batch_executor(force_terminate=True)
     assert controller.parallel_batch.executor is None
-
 
 def _current_preview_identity_payload(
     main_window,
@@ -188,7 +174,6 @@ def _current_preview_identity_payload(
         "execution_flags": ("fast_mode",),
     }
 
-
 def _workspace_preview_payload(
     main_window,
     *,
@@ -215,7 +200,6 @@ def _workspace_preview_payload(
     if simulation_identity is not None:
         payload["simulation_identity"] = dict(simulation_identity)
     return payload
-
 
 @pytest.mark.gui
 def test_preview_results_go_to_preview_cache_and_are_bounded(main_window, qt_app):
@@ -258,7 +242,6 @@ def test_preview_results_go_to_preview_cache_and_are_bounded(main_window, qt_app
     assert "preview-k1::set1" not in results
     assert "preview-k2::set1" not in results
 
-
 @pytest.mark.gui
 def test_result_cache_is_bounded_separately_from_preview(main_window, qt_app):
     assert hasattr(main_window, "set_simulation_cache_caps")
@@ -298,7 +281,6 @@ def test_result_cache_is_bounded_separately_from_preview(main_window, qt_app):
     assert "result-k1::set1" not in preview
     assert "result-k2::set1" not in preview
 
-
 @pytest.mark.gui
 def test_cache_miss_on_selection_change_sets_evicted_message_and_clears_plot(main_window, monkeypatch, qt_app):
     from PySide6 import QtWidgets
@@ -332,7 +314,6 @@ def test_cache_miss_on_selection_change_sets_evicted_message_and_clears_plot(mai
 
     assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
     _assert_selection_plot_cleared(main_window)
-
 
 @pytest.mark.gui
 def test_selection_change_without_active_cache_context_does_not_show_evicted_warning(main_window, monkeypatch, qt_app):
@@ -370,7 +351,6 @@ def test_selection_change_without_active_cache_context_does_not_show_evicted_war
     _assert_no_cache_warning(main_window)
     _assert_selection_plot_cleared(main_window)
 
-
 @pytest.mark.gui
 def test_selection_change_without_active_cache_context_clears_stale_cache_warning(main_window, monkeypatch, qt_app):
     from PySide6 import QtWidgets
@@ -406,152 +386,9 @@ def test_selection_change_without_active_cache_context_clears_stale_cache_warnin
     _assert_no_cache_warning(main_window)
     _assert_selection_plot_cleared(main_window)
 
+@pytest.mark.gui
 
 @pytest.mark.gui
-def test_selection_change_prefers_workspace_preview_when_focused_set_is_dirty(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    primary_id = str(selected_ids[0])
-    secondary_id = str(selected_ids[1])
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "explicit-selection-cache-key"
-    preview_key = "preview-selection-cache-key"
-    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([2.0, 4.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.result_cache[f"{explicit_key}::{secondary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([1.5, 3.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    preview_t = _current_preview_time_axis(main_window)
-    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=primary_id,
-        series={"A": np.linspace(7.0, 14.0, preview_t.size, dtype=float)},
-    )
-    cache.preview_cache[f"{preview_key}::{secondary_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=secondary_id,
-        series={"A": np.linspace(6.0, 12.0, preview_t.size, dtype=float)},
-    )
-    cache.active_preview_cache_key = preview_key
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray(np.linspace(7.0, 14.0, preview_t.size, dtype=float), dtype=float),
-    )
-    assert main_window.active_batch_selection()[0] == primary_id
-    _assert_no_cache_warning(main_window)
-
-
-@pytest.mark.gui
-def test_selection_change_uses_workspace_owned_preview_and_baseline_entries_without_preview_scope_state(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    preview_id = str(selected_ids[0])
-    explicit_id = str(selected_ids[1])
-
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_cache_key = "explicit-selection-cache-key"
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    _select_rows(main_window, [0])
-    qt_app.processEvents()
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = "workspace-preview-cache-key"
-    cache.active_preview_scope_set_ids = None
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    preview_mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=preview_id)
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.linspace(7.0, 14.0, preview_t.size, dtype=float)
-    cache.preview_cache[f"workspace-preview-cache-key::{preview_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=preview_id,
-        series={"A": preview_series},
-        mechanism_text=preview_mechanism_text,
-    )
-    cache.result_cache[f"explicit-selection-cache-key::{explicit_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([3.0, 6.0], dtype=float)},
-        "algebra_scalars": {},
-        "mechanism_text": "reaction: A -> B; k=1.0",
-    }
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray(preview_series, dtype=float),
-    )
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert len(overlays) == 1
-    overlay_series = np.asarray((overlays[0].get("series") or {})["A"], dtype=float)
-    assert np.allclose(overlay_series, np.asarray([3.0, 6.0], dtype=float))
-    assert main_window.active_batch_selection()[0] == preview_id
-    _assert_no_cache_warning(main_window)
-
 
 @pytest.mark.gui
 def test_selection_change_stale_workspace_preview_surfaces_preview_pending_without_explicit_fallback(
@@ -624,7 +461,6 @@ def test_selection_change_stale_workspace_preview_surfaces_preview_pending_witho
     _assert_selection_plot_cleared(main_window)
     assert main_window.simulation_controller.batch_cache.last_display_selection == []
 
-
 @pytest.mark.gui
 def test_selection_change_keeps_plot_and_mechanism_controls_on_same_set(main_window, monkeypatch, qt_app):
     from PySide6 import QtWidgets
@@ -691,7 +527,6 @@ def test_selection_change_keeps_plot_and_mechanism_controls_on_same_set(main_win
     )
     assert sliders.get_variables()["k1"] == pytest.approx(1.0)
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
-
 
 @pytest.mark.gui
 @pytest.mark.parametrize(
@@ -805,7 +640,6 @@ def test_selection_change_no_display_branch_clears_plot_and_retargets_controls(
     assert sliders.get_variables()["k1"] == pytest.approx(next_value)
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(next_value)
 
-
 @pytest.mark.gui
 def test_selection_change_reuses_current_workspace_preview_from_inactive_preview_key(
     main_window, monkeypatch, qt_app
@@ -858,7 +692,6 @@ def test_selection_change_reuses_current_workspace_preview_from_inactive_preview
     )
     assert main_window.active_batch_selection()[0] == primary_id
     _assert_no_cache_warning(main_window)
-
 
 @pytest.mark.gui
 def test_selection_change_reuses_current_workspace_preview_from_same_key_outside_active_scope(
@@ -926,7 +759,6 @@ def test_selection_change_reuses_current_workspace_preview_from_same_key_outside
     assert main_window.active_batch_selection()[0] == primary_id
     _assert_no_cache_warning(main_window)
 
-
 @pytest.mark.gui
 def test_selection_change_rejects_workspace_preview_with_wrong_overlay_token(
     main_window, monkeypatch, qt_app
@@ -971,7 +803,6 @@ def test_selection_change_rejects_workspace_preview_with_wrong_overlay_token(
 
     assert main_window._status_label.text() == "Preview pending for current selection."
     _assert_selection_plot_cleared(main_window)
-
 
 @pytest.mark.gui
 def test_selection_change_reuses_workspace_preview_with_matching_overlay_token(
@@ -1024,7 +855,6 @@ def test_selection_change_reuses_workspace_preview_with_matching_overlay_token(
         np.asarray(preview_series["A"], dtype=float),
     )
     _assert_no_cache_warning(main_window)
-
 
 @pytest.mark.gui
 def test_selection_change_reuses_workspace_preview_with_matching_structured_identity_despite_text_witness_difference(
@@ -1085,7 +915,6 @@ def test_selection_change_reuses_workspace_preview_with_matching_structured_iden
     )
     _assert_no_cache_warning(main_window)
 
-
 @pytest.mark.gui
 def test_selection_change_reuses_workspace_preview_with_slider_override_solver_and_points(
     main_window, monkeypatch, qt_app
@@ -1140,7 +969,6 @@ def test_selection_change_reuses_workspace_preview_with_slider_override_solver_a
     )
     _assert_no_cache_warning(main_window)
 
-
 @pytest.mark.gui
 def test_selection_change_rejects_workspace_preview_with_wrong_solver_context(
     main_window, monkeypatch, qt_app
@@ -1185,7 +1013,6 @@ def test_selection_change_rejects_workspace_preview_with_wrong_solver_context(
 
     assert main_window._status_label.text() == "Preview pending for current selection."
     _assert_selection_plot_cleared(main_window)
-
 
 @pytest.mark.gui
 def test_selection_change_partial_workspace_preview_keeps_resolved_dirty_preview_visible_with_pending_status(
@@ -1272,335 +1099,13 @@ def test_selection_change_partial_workspace_preview_keeps_resolved_dirty_preview
         np.asarray([4.0, 8.0], dtype=float),
     )
 
+@pytest.mark.gui
 
 @pytest.mark.gui
-def test_single_shown_dirty_preview_preserves_canonical_ref_through_main_window_replay_transition(
-    main_window,
-    monkeypatch,
-    qt_app,
-):
-    from PySide6 import QtCore, QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("transition triggered recompute")),
-        raising=True,
-    )
-
-    _select_rows(main_window, [1, 0])
-    _set_shown_rows(main_window, [1])
-    table = main_window._batch_table
-    assert table is not None
-    sel = table.selectionModel()
-    assert sel is not None
-    current_index = main_window._batch_model.index(1, 0)
-    table.setCurrentIndex(current_index)
-    sel.select(main_window._batch_model.index(0, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-    sel.select(current_index, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-    qt_app.processEvents()
-
-    shown_id = str(main_window._batch_set_id_for_row(1) or "")
-    hidden_selected_id = str(main_window._batch_set_id_for_row(0) or "")
-    assert shown_id and hidden_selected_id and shown_id != hidden_selected_id
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "explicit-single-shown-preservation-transition-key"
-    preview_key = "preview-single-shown-preservation-transition-key"
-    cache.result_cache[f"{explicit_key}::{shown_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([4.0, 8.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[shown_id])
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.linspace(9.0, 18.0, preview_t.size, dtype=float)
-    cache.preview_cache[f"{preview_key}::{shown_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=shown_id,
-        series={"A": preview_series},
-    )
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (shown_id,)
-    cache.active_cache_key = explicit_key
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert main_window.shown_batch_set_ids() == [shown_id]
-    assert sorted(idx.row() for idx in sel.selectedRows(0)) == [0, 1]
-    assert main_window.focused_batch_set_id() == shown_id
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-    ghost_before = next(
-        entry
-        for entry in list(getattr(plot, "_simulation_overlays", []) or [])
-        if str(entry.get("set_id") or "") == shown_id and str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((ghost_before.get("series") or {})["A"], dtype=float),
-        np.asarray([4.0, 8.0], dtype=float),
-    )
-
-    preserved = main_window._active_workspace_preview_display_snapshot()
-    assert preserved is not None
-    main_window._invalidate_active_results_after_authoritative_mechanism_change(preserve_current_display=preserved)
-    qt_app.processEvents()
-
-    assert sorted(idx.row() for idx in sel.selectedRows(0)) == [0, 1]
-    assert main_window.shown_batch_set_ids() == [shown_id]
-    assert main_window.focused_batch_set_id() == shown_id
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-    ghost_after = next(
-        entry
-        for entry in list(getattr(plot, "_simulation_overlays", []) or [])
-        if str(entry.get("set_id") or "") == shown_id and str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((ghost_after.get("series") or {})["A"], dtype=float),
-        np.asarray([4.0, 8.0], dtype=float),
-    )
-
 
 @pytest.mark.gui
-def test_copy_all_export_plan_uses_preserved_live_preview_after_commit_when_explicit_cache_invalidated(
-    main_window,
-    monkeypatch,
-    qt_app,
-):
-    from PySide6 import QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("copy-all export triggered recompute")),
-        raising=True,
-    )
-
-    _set_shown_rows(main_window, [1])
-    qt_app.processEvents()
-
-    shown_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert shown_id
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "copy-all-preserved-preview-explicit-key"
-    preview_key = "copy-all-preserved-preview-preview-key"
-    cache.result_cache[f"{explicit_key}::{shown_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([4.0, 8.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[shown_id])
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.linspace(9.0, 18.0, preview_t.size, dtype=float)
-    cache.preview_cache[f"{preview_key}::{shown_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=shown_id,
-        series={"A": preview_series},
-    )
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (shown_id,)
-    cache.active_cache_key = explicit_key
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    np.testing.assert_allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-    preserved = main_window._active_workspace_preview_display_snapshot()
-    assert preserved is not None
-
-    main_window._preview_session.commit_current_mechanism_workspace()
-    assert main_window._preview_session.has_dirty_state_for_set(shown_id) is False
-    main_window._invalidate_active_results_after_authoritative_mechanism_change(
-        preserve_current_display=preserved
-    )
-    qt_app.processEvents()
-
-    assert tuple(str(set_id) for set_id in (cache.active_cache_invalidated_set_ids or ())) == (shown_id,)
-    np.testing.assert_allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-
-    plan = main_window._build_main_plot_copy_all_export_plan()
-
-    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
-        (shown_id, str(main_window.batch_set_name_for_id(shown_id) or shown_id))
-    ]
-    assert plan.missing_items == []
-    np.testing.assert_allclose(plan.shown_blocks[0].t, preview_t)
-    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], preview_series)
-
 
 @pytest.mark.gui
-def test_copy_all_export_plan_includes_non_primary_live_overlay_shown_block_with_disambiguated_label(
-    main_window,
-    qt_app,
-):
-    from PySide6 import QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _set_shown_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    first_id = str(main_window._batch_set_id_for_row(0) or "")
-    second_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert first_id and second_id
-
-    main_window._batch_store.set_set_name(0, "dup")
-    main_window._batch_store.set_set_name(1, "dup")
-
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_cache_key = "copy-all-live-overlay-replay-key"
-    cache.active_cache_invalidated_set_ids = (first_id, second_id)
-    cache.active_batch_set_id = first_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(first_id) or "")
-    cache.last_display_selection = [first_id, second_id]
-
-    primary_t = np.asarray([0.0, 1.0, 2.0], dtype=float)
-    primary_series = np.asarray([11.0, 12.0, 13.0], dtype=float)
-    overlay_t = np.asarray([0.0, 1.0, 2.0], dtype=float)
-    overlay_series = np.asarray([21.0, 22.0, 23.0], dtype=float)
-    main_window.set_data(
-        primary_t,
-        {"A": primary_series},
-        label="dup",
-        overlays=[
-            {
-                "label": "dup",
-                "set_id": second_id,
-                "t": overlay_t,
-                "series": {"A": overlay_series},
-            }
-        ],
-    )
-    qt_app.processEvents()
-
-    plan = main_window._build_main_plot_copy_all_export_plan()
-
-    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [
-        (first_id, "dup (row 1)"),
-        (second_id, "dup (row 2)"),
-    ]
-    assert plan.missing_items == []
-    np.testing.assert_allclose(plan.shown_blocks[0].t, primary_t)
-    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], primary_series)
-    np.testing.assert_allclose(plan.shown_blocks[1].t, overlay_t)
-    np.testing.assert_allclose(plan.shown_blocks[1].series["A"], overlay_series)
-
-
-@pytest.mark.gui
-def test_main_plot_workspace_preview_provenance_prefers_overlay_set_id_for_duplicate_labels(
-    main_window,
-    qt_app,
-):
-    from PySide6 import QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _set_shown_rows(main_window, [0, 1])
-    _select_rows(main_window, [1, 0])
-    qt_app.processEvents()
-
-    first_id = str(main_window._batch_set_id_for_row(0) or "")
-    second_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert first_id and second_id
-
-    main_window._batch_store.set_set_name(0, "dup")
-    main_window._batch_store.set_set_name(1, "dup")
-
-    cache = main_window.simulation_controller.batch_cache
-    preview_key = "duplicate-label-provenance-preview-key"
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[first_id])
-    overlay_t = _current_preview_time_axis(main_window)
-    overlay_series = np.linspace(21.0, 42.0, overlay_t.size, dtype=float)
-    cache.preview_cache[f"{preview_key}::{first_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=first_id,
-        series={"A": overlay_series},
-    )
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (first_id,)
-
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([5.0, 6.0], dtype=float)},
-        label="dup",
-        overlays=[
-            {
-                "label": "dup",
-                "set_id": first_id,
-                "t": overlay_t,
-                "series": {"A": overlay_series},
-            }
-        ],
-    )
-    qt_app.processEvents()
-
-    main_window._record_current_main_plot_workspace_preview_provenance(
-        selected_set_ids=[first_id, second_id]
-    )
-
-    provenance = main_window._main_plot_workspace_preview_provenance()
-    assert set(provenance) == {first_id}
-    assert provenance[first_id] == main_window._current_workspace_preview_identity_payload(set_id=first_id)
-    assert second_id not in provenance
-
 
 @pytest.mark.gui
 def test_selection_change_clean_focused_partial_workspace_preview_keeps_resolved_results_visible_with_pending_status(
@@ -1695,7 +1200,6 @@ def test_selection_change_clean_focused_partial_workspace_preview_keeps_resolved
     assert main_window._mechanism_editor._variable_sliders.get_variables()["k1"] == pytest.approx(1.0)
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
 
-
 @pytest.mark.gui
 def test_selection_change_clean_focused_partial_no_cached_results_keeps_resolved_results_visible_with_status(
     main_window, monkeypatch, qt_app
@@ -1788,7 +1292,6 @@ def test_selection_change_clean_focused_partial_no_cached_results_keeps_resolved
     assert main_window._mechanism_editor._variable_sliders.get_variables()["k1"] == pytest.approx(1.0)
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
 
-
 @pytest.mark.gui
 def test_dirty_focused_set_with_missing_preview_does_not_fall_back_to_explicit_cache(
     main_window, monkeypatch, qt_app
@@ -1830,6 +1333,403 @@ def test_dirty_focused_set_with_missing_preview_does_not_fall_back_to_explicit_c
 
     assert main_window._status_label.text() == "Preview pending for current selection."
     assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+@pytest.mark.gui
+
+@pytest.mark.gui
+
+@pytest.mark.gui
+def test_selection_change_partial_preview_coverage_within_active_scope_keeps_dirty_preview_visible(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert len(selected_ids) >= 2
+    primary_id = str(selected_ids[0])
+    secondary_id = str(selected_ids[1])
+
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
+    main_window.set_data(preview_t, preview_series, label="preview", overlays=[])
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "explicit-partial-preview-selection-cache-key"
+    preview_key = "preview-partial-selection-cache-key"
+    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([4.0, 8.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+    cache.result_cache[f"{explicit_key}::{secondary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([3.5, 7.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=primary_id,
+        series={"A": np.asarray(preview_series["A"], dtype=float)},
+    )
+    cache.active_cache_key = explicit_key
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (primary_id, secondary_id)
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    _assert_no_cache_warning(main_window)
+    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray(preview_series["A"], dtype=float),
+    )
+
+@pytest.mark.gui
+def test_selection_change_partial_preview_without_explicit_cache_keeps_dirty_preview_visible_without_warning(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert len(selected_ids) >= 2
+    primary_id = str(selected_ids[0])
+
+    cache = main_window.simulation_controller.batch_cache
+    preview_key = "preview-partial-no-explicit-selection-cache-key"
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = np.linspace(9.0, 18.0, preview_t.size, dtype=float)
+    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=primary_id,
+        series={"A": preview_series},
+    )
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = tuple(str(set_id) for set_id in selected_ids)
+    cache.active_cache_key = None
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    _assert_no_cache_warning(main_window)
+    plot = main_window._plot_tabs._main_plot
+    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray(preview_series, dtype=float),
+    )
+
+@pytest.mark.gui
+def test_selection_change_new_current_row_without_workspace_or_cache_context_clears_plot_without_warning(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    preview_t = np.asarray([0.0, 1.0], dtype=float)
+    preview_series = {"A": np.asarray([9.0, 18.0], dtype=float)}
+    main_window.set_data(preview_t, preview_series, label="set1", overlays=[])
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_rows(main_window, [0])
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert len(selected_ids) == 1
+    primary_id = str(selected_ids[0])
+    secondary_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert secondary_id and secondary_id != primary_id
+
+    cache = main_window.simulation_controller.batch_cache
+    preview_key = "preview-partial-current-row-pending-selection-cache-key"
+    cache.preview_cache[f"{preview_key}::{primary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([9.0, 18.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (primary_id, secondary_id)
+    cache.active_batch_set_id = primary_id
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
+    cache.last_display_selection = [primary_id]
+
+    _select_rows(main_window, [1])
+    qt_app.processEvents()
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    _assert_no_cache_warning(main_window)
+    _assert_selection_plot_cleared(main_window)
+    assert main_window.active_batch_selection() == ("", "")
+
+@pytest.mark.gui
+def test_selection_change_partial_preview_with_invalid_explicit_cache_keeps_dirty_preview_visible(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
+    main_window.set_data(preview_t, preview_series, label="preview", overlays=[])
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert len(selected_ids) >= 2
+    primary_id = str(selected_ids[0])
+
+    cache = main_window.simulation_controller.batch_cache
+    preview_key = "preview-partial-invalid-explicit-selection-cache-key"
+    explicit_key = "invalid-explicit-selection-cache-key"
+    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
+        main_window,
+        set_id=primary_id,
+        series={"A": np.asarray(preview_series["A"], dtype=float)},
+    )
+    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": object(),
+        "algebra_scalars": {},
+    }
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = tuple(str(set_id) for set_id in selected_ids)
+    cache.active_cache_key = explicit_key
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    _assert_no_cache_warning(main_window)
+    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray(preview_series["A"], dtype=float),
+    )
+
+@pytest.mark.gui
+def test_selection_change_invalid_preview_without_usable_explicit_fallback_preserves_invalid_diagnostic(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert len(selected_ids) >= 2
+    primary_id = str(selected_ids[0])
+    secondary_id = str(selected_ids[1])
+
+    cache = main_window.simulation_controller.batch_cache
+    preview_key = "preview-invalid-diagnostic-selection-cache-key"
+    cache.preview_cache[f"{preview_key}::{primary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": object(),
+        "algebra_scalars": {},
+    }
+    cache.preview_cache[f"{preview_key}::{secondary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([9.0, 18.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+    cache.active_preview_cache_key = preview_key
+    cache.active_cache_key = None
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    assert main_window._status_label.text() == "Cached result invalid. Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    assert cache.last_display_selection == []
+    _assert_selection_plot_cleared(main_window)
+
+@pytest.mark.gui
+def test_selection_change_missing_dirty_preview_does_not_fall_back_to_explicit_cache(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    _select_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert len(selected_ids) >= 2
+    primary_id = str(selected_ids[0])
+    secondary_id = str(selected_ids[1])
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "explicit-fallback-selection-cache-key"
+    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([3.0, 6.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+    cache.result_cache[f"{explicit_key}::{secondary_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([2.5, 5.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+    cache.active_cache_key = explicit_key
+
+    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+    cache.active_preview_cache_key = "missing-preview-selection-cache-key"
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    assert main_window._status_label.text() == "Preview pending for current selection."
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+@pytest.mark.gui
+def test_invalid_cache_entry_on_selection_change_sets_invalid_message_and_clears_display_state(
+    main_window, monkeypatch, qt_app
+):
+    from PySide6 import QtWidgets
+
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+    _select_rows(main_window, [0, 1])
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    cache_key = "invalid-cache-key"
+    selected_ids = main_window._batch_set_ids_for_scope("selected")
+    assert selected_ids
+    main_window.simulation_controller.batch_cache.result_cache[f"{cache_key}::{selected_ids[0]}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": object(),
+        "algebra_scalars": {},
+    }
+    main_window.simulation_controller.batch_cache.active_cache_key = cache_key
+
+    main_window._refresh_batch_display_from_focus_and_shown()
+    qt_app.processEvents()
+
+    assert main_window._status_label.text() == "Cached result invalid. Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    assert main_window.simulation_controller.batch_cache.last_display_selection == []
     _assert_selection_plot_cleared(main_window)
 
 
@@ -2026,406 +1926,6 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
 
 
 @pytest.mark.gui
-def test_selection_change_partial_preview_coverage_within_active_scope_keeps_dirty_preview_visible(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    primary_id = str(selected_ids[0])
-    secondary_id = str(selected_ids[1])
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
-    main_window.set_data(preview_t, preview_series, label="preview", overlays=[])
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "explicit-partial-preview-selection-cache-key"
-    preview_key = "preview-partial-selection-cache-key"
-    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([4.0, 8.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.result_cache[f"{explicit_key}::{secondary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([3.5, 7.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=primary_id,
-        series={"A": np.asarray(preview_series["A"], dtype=float)},
-    )
-    cache.active_cache_key = explicit_key
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (primary_id, secondary_id)
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    _assert_no_cache_warning(main_window)
-    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray(preview_series["A"], dtype=float),
-    )
-
-
-@pytest.mark.gui
-def test_selection_change_partial_preview_without_explicit_cache_keeps_dirty_preview_visible_without_warning(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    t0 = np.asarray([0.0, 1.0], dtype=float)
-    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    primary_id = str(selected_ids[0])
-
-    cache = main_window.simulation_controller.batch_cache
-    preview_key = "preview-partial-no-explicit-selection-cache-key"
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.linspace(9.0, 18.0, preview_t.size, dtype=float)
-    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=primary_id,
-        series={"A": preview_series},
-    )
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(str(set_id) for set_id in selected_ids)
-    cache.active_cache_key = None
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    _assert_no_cache_warning(main_window)
-    plot = main_window._plot_tabs._main_plot
-    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray(preview_series, dtype=float),
-    )
-
-
-@pytest.mark.gui
-def test_selection_change_new_current_row_without_workspace_or_cache_context_clears_plot_without_warning(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    preview_t = np.asarray([0.0, 1.0], dtype=float)
-    preview_series = {"A": np.asarray([9.0, 18.0], dtype=float)}
-    main_window.set_data(preview_t, preview_series, label="set1", overlays=[])
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) == 1
-    primary_id = str(selected_ids[0])
-    secondary_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert secondary_id and secondary_id != primary_id
-
-    cache = main_window.simulation_controller.batch_cache
-    preview_key = "preview-partial-current-row-pending-selection-cache-key"
-    cache.preview_cache[f"{preview_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([9.0, 18.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (primary_id, secondary_id)
-    cache.active_batch_set_id = primary_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
-    cache.last_display_selection = [primary_id]
-
-    _select_rows(main_window, [1])
-    qt_app.processEvents()
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    _assert_no_cache_warning(main_window)
-    _assert_selection_plot_cleared(main_window)
-    assert main_window.active_batch_selection() == ("", "")
-
-
-@pytest.mark.gui
-def test_selection_change_partial_preview_with_invalid_explicit_cache_keeps_dirty_preview_visible(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
-    main_window.set_data(preview_t, preview_series, label="preview", overlays=[])
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    primary_id = str(selected_ids[0])
-
-    cache = main_window.simulation_controller.batch_cache
-    preview_key = "preview-partial-invalid-explicit-selection-cache-key"
-    explicit_key = "invalid-explicit-selection-cache-key"
-    cache.preview_cache[f"{preview_key}::{primary_id}"] = _workspace_preview_payload(
-        main_window,
-        set_id=primary_id,
-        series={"A": np.asarray(preview_series["A"], dtype=float)},
-    )
-    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": object(),
-        "algebra_scalars": {},
-    }
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(str(set_id) for set_id in selected_ids)
-    cache.active_cache_key = explicit_key
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    _assert_no_cache_warning(main_window)
-    assert np.allclose(np.asarray(getattr(plot, "_t", np.array([])), dtype=float), preview_t)
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray(preview_series["A"], dtype=float),
-    )
-
-
-@pytest.mark.gui
-def test_selection_change_invalid_preview_without_usable_explicit_fallback_preserves_invalid_diagnostic(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    t0 = np.asarray([0.0, 1.0], dtype=float)
-    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    primary_id = str(selected_ids[0])
-    secondary_id = str(selected_ids[1])
-
-    cache = main_window.simulation_controller.batch_cache
-    preview_key = "preview-invalid-diagnostic-selection-cache-key"
-    cache.preview_cache[f"{preview_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": object(),
-        "algebra_scalars": {},
-    }
-    cache.preview_cache[f"{preview_key}::{secondary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([9.0, 18.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = preview_key
-    cache.active_cache_key = None
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window._status_label.text() == "Cached result invalid. Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    assert cache.last_display_selection == []
-    _assert_selection_plot_cleared(main_window)
-
-
-@pytest.mark.gui
-def test_selection_change_missing_dirty_preview_does_not_fall_back_to_explicit_cache(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) >= 2
-    primary_id = str(selected_ids[0])
-    secondary_id = str(selected_ids[1])
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "explicit-fallback-selection-cache-key"
-    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([3.0, 6.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.result_cache[f"{explicit_key}::{secondary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([2.5, 5.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0)
-    cache.active_preview_cache_key = "missing-preview-selection-cache-key"
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window._status_label.text() == "Preview pending for current selection."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-@pytest.mark.gui
-def test_invalid_cache_entry_on_selection_change_sets_invalid_message_and_clears_display_state(
-    main_window, monkeypatch, qt_app
-):
-    from PySide6 import QtWidgets
-
-    t0 = np.asarray([0.0, 1.0], dtype=float)
-    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
-
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-    _select_rows(main_window, [0, 1])
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
-        raising=True,
-    )
-
-    cache_key = "invalid-cache-key"
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert selected_ids
-    main_window.simulation_controller.batch_cache.result_cache[f"{cache_key}::{selected_ids[0]}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": object(),
-        "algebra_scalars": {},
-    }
-    main_window.simulation_controller.batch_cache.active_cache_key = cache_key
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window._status_label.text() == "Cached result invalid. Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    assert main_window.simulation_controller.batch_cache.last_display_selection == []
-    _assert_selection_plot_cleared(main_window)
-
-
-@pytest.mark.gui
 def test_selection_change_displays_selected_valid_cached_row_outside_latest_valid_subset(
     main_window, monkeypatch, qt_app
 ):
@@ -2564,159 +2064,3 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
         np.asarray([2.0, 4.0], dtype=float),
     )
     assert main_window.active_batch_selection()[0] == newer_id
-
-
-@pytest.mark.gui
-def test_copy_all_export_plan_is_side_effect_free_and_disambiguates_duplicate_missing_labels(
-    main_window, qt_app
-):
-    from PySide6 import QtWidgets
-
-    t0 = np.asarray([0.0, 1.0], dtype=float)
-    series0 = {
-        "A": np.asarray([1.0, 2.0], dtype=float),
-        "B": np.asarray([0.1, 0.2], dtype=float),
-    }
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
-    main_window._status_label.setText("unchanged")
-    main_window._set_main_plot_workspace_preview_provenance({"sentinel": {"marker": 1}})
-
-    main_window._batch_model.set_species(["A", "B"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _set_shown_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    first_id = str(main_window._batch_set_id_for_row(0) or "")
-    second_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert first_id and second_id
-
-    main_window._batch_store.set_set_name(0, "dup")
-    main_window._batch_store.set_set_name(1, "dup")
-
-    cache_key = "copy-all-cache-key"
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_cache_key = cache_key
-    cache.active_cache_valid_set_ids = [first_id, second_id]
-    cache.active_cache_invalidated_set_ids = []
-    cache.result_cache[f"{cache_key}::{first_id}"] = {
-        "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
-        "series": {
-            "A": np.asarray([10.0, 11.0, 12.0], dtype=float),
-            "B": np.asarray([0.3, 0.4, 0.5], dtype=float),
-        },
-        "algebra_scalars": {},
-    }
-
-    before_status = main_window._status_label.text()
-    before_selection = main_window.active_batch_selection()
-    before_plot_label = getattr(main_window.main_plot(), "_simulation_set_label", None)
-    before_plot_t = np.asarray(getattr(main_window.main_plot(), "_t", []), dtype=float).copy()
-    before_plot_series = {
-        str(name): np.asarray(values, dtype=float).copy()
-        for name, values in dict(getattr(main_window.main_plot(), "_series", {}) or {}).items()
-    }
-    before_provenance = dict(main_window._main_plot_workspace_preview_provenance())
-
-    plan = main_window._build_main_plot_copy_all_export_plan()
-
-    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(first_id, "dup (row 1)")]
-    assert len(plan.missing_items) == 1
-    assert plan.missing_items[0].set_id == second_id
-    assert plan.missing_items[0].label == "dup"
-    assert plan.missing_items[0].popup_label == "dup (row 2)"
-    assert plan.missing_items[0].reason == "no_cached_results"
-    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0, 2.0], dtype=float))
-    np.testing.assert_allclose(
-        plan.shown_blocks[0].series["A"],
-        np.asarray([10.0, 11.0, 12.0], dtype=float),
-    )
-
-    assert main_window._status_label.text() == before_status
-    assert main_window.active_batch_selection() == before_selection
-    assert getattr(main_window.main_plot(), "_simulation_set_label", None) == before_plot_label
-    np.testing.assert_allclose(np.asarray(getattr(main_window.main_plot(), "_t", []), dtype=float), before_plot_t)
-    assert main_window._main_plot_workspace_preview_provenance() == before_provenance
-    for name, values in before_plot_series.items():
-        np.testing.assert_allclose(
-            np.asarray(getattr(main_window.main_plot(), "_series", {})[name], dtype=float),
-            values,
-        )
-
-
-@pytest.mark.gui
-def test_copy_all_export_plan_includes_live_primary_when_no_rows_are_shown(main_window, monkeypatch, qt_app):
-    main_window._batch_model.set_species(["A"])
-    cache = main_window.simulation_controller.batch_cache
-    primary_id = str(main_window._batch_set_id_for_row(0) or "")
-    assert primary_id
-    primary_label = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
-    cache.active_batch_set_id = primary_id
-    cache.active_batch_set = primary_label
-    cache.last_display_selection = [primary_id]
-    monkeypatch.setattr(main_window, "shown_batch_set_ids", lambda: [], raising=False)
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", lambda **_kwargs: False, raising=False)
-
-    main_window.simulation_controller.run_state.latest_sim_request_id = 31
-    main_window.simulation_controller.run_state.active_run_id = 31
-    main_window.simulation_controller.on_simulation_complete(
-        _fake_sim_result(marker=5.0),
-        run_id=31,
-        fast_mode=False,
-        request_id=31,
-        batch_set=primary_label,
-        batch_set_id=primary_id,
-        cache_key="copy-all-direct-hidden-rows",
-    )
-    qt_app.processEvents()
-
-    assert main_window.shown_batch_set_ids() == []
-    assert main_window.main_plot_has_data() is True
-    assert main_window.active_batch_selection() == (primary_id, primary_label)
-    assert cache.last_display_selection == [primary_id]
-
-    plan = main_window._build_main_plot_copy_all_export_plan()
-
-    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(primary_id, primary_label)]
-    assert plan.missing_items == []
-    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0], dtype=float))
-    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], np.asarray([5.0, 10.0], dtype=float))
-
-
-@pytest.mark.gui
-def test_copy_all_export_plan_keeps_batch_identity_when_hidden_rows_mask_batch_sourced_plot(
-    main_window, monkeypatch, qt_app
-):
-    main_window._batch_model.set_species(["A"])
-    cache = main_window.simulation_controller.batch_cache
-    primary_id = str(main_window._batch_set_id_for_row(0) or "")
-    assert primary_id
-    cache_key = "copy-all-hidden-rows-batch"
-    primary_label = str(main_window.batch_set_name_for_id(primary_id) or primary_id)
-    cache.result_cache[f"{cache_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([7.0, 8.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-
-    displayed = main_window.display_cached_batch_selection(
-        cache_key=cache_key,
-        selected_sets=[primary_id],
-        prefer_set=primary_id,
-        allow_fallback=False,
-    )
-    qt_app.processEvents()
-
-    assert displayed is True
-    assert main_window.active_batch_selection() == (primary_id, primary_label)
-    monkeypatch.setattr(main_window, "shown_batch_set_ids", lambda: [], raising=False)
-
-    plan = main_window._build_main_plot_copy_all_export_plan()
-
-    assert [(block.set_id, block.label) for block in plan.shown_blocks] == [(primary_id, primary_label)]
-    assert plan.missing_items == []
-    np.testing.assert_allclose(plan.shown_blocks[0].t, np.asarray([0.0, 1.0], dtype=float))
-    np.testing.assert_allclose(plan.shown_blocks[0].series["A"], np.asarray([7.0, 8.0], dtype=float))

@@ -14,7 +14,6 @@ from tests.worker_stubs import make_simulation_worker_stub
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
 
-
 def _worker_payload(prepared, mechanism_text):
     t = np.linspace(0.0, 1.0, 4)
     y = np.vstack(
@@ -32,7 +31,6 @@ def _worker_payload(prepared, mechanism_text):
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
-
 def _find_slider_visibility_action(main_window, entry_kind: str, name: str):
     picker = main_window.findChild(QtWidgets.QToolButton, "sliderVisibilityPickerButton")
     assert picker is not None
@@ -44,7 +42,6 @@ def _find_slider_visibility_action(main_window, entry_kind: str, name: str):
             return action
     raise AssertionError(f"Missing visibility action for {(entry_kind, name)!r}")
 
-
 def _block_insert_dialog_import(monkeypatch: pytest.MonkeyPatch) -> None:
     real_import = builtins.__import__
 
@@ -55,14 +52,12 @@ def _block_insert_dialog_import(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
 
-
 def _set_slider_visibility(main_window, entry_kind: str, name: str, *, visible: bool) -> None:
     action = _find_slider_visibility_action(main_window, entry_kind, name)
     if bool(action.isChecked()) != bool(visible):
         action.trigger()
         QtWidgets.QApplication.processEvents()
     assert bool(action.isChecked()) is bool(visible)
-
 
 def _select_batch_rows(main_window, rows: list[int]) -> None:
     table = main_window._batch_table
@@ -76,7 +71,6 @@ def _select_batch_rows(main_window, rows: list[int]) -> None:
         sel.select(idx, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
     main_window._refresh_batch_display_from_focus_and_shown()
 
-
 def _set_shown_rows(main_window, rows: list[int]) -> None:
     model = main_window._batch_model
     shown_rows = {int(row) for row in rows}
@@ -86,11 +80,9 @@ def _set_shown_rows(main_window, rows: list[int]) -> None:
         assert model.data(model.index(row, model.show_column()), QtCore.Qt.CheckStateRole) == expected
     main_window._refresh_batch_display_from_focus_and_shown()
 
-
 def _set_edit_target_rows(main_window, rows: list[int]) -> None:
     set_ids = [str(main_window._batch_set_id_for_row(int(row)) or "") for row in rows]
     main_window.set_slider_edit_target_set_ids([set_id for set_id in set_ids if set_id])
-
 
 def _parameter_table_numeric_value(main_window, name: str) -> float:
     table = main_window.main_plot().parameter_table()
@@ -103,12 +95,10 @@ def _parameter_table_numeric_value(main_window, name: str) -> float:
         return float(value_item.text())
     raise AssertionError(f"Missing parameter-table row for {name!r}")
 
-
 def _assert_selection_plot_cleared(main_window) -> None:
     plot = main_window._plot_tabs._main_plot
     assert getattr(plot, "_t", None) is None
     assert dict(getattr(plot, "_series", {}) or {}) == {}
-
 
 def _current_preview_time_axis(main_window) -> np.ndarray:
     selected_ids = [str(set_id) for set_id in (main_window._batch_set_ids_for_scope("selected") or ()) if str(set_id)]
@@ -121,7 +111,6 @@ def _current_preview_time_axis(main_window) -> np.ndarray:
     )
     grid_n = int((solver_config.get("grid") or {}).get("N") or 0)
     return np.linspace(0.0, float(t_end), max(2, grid_n), dtype=float)
-
 
 def test_slider_changes_use_precompiled_rhs(main_window, monkeypatch):
     """Repeated slider runs should reuse a compiled mechanism instead of re-parsing."""
@@ -170,7 +159,6 @@ def test_slider_changes_use_precompiled_rhs(main_window, monkeypatch):
     assert len(prepared_payloads) == 2
     assert all(payload is not None for payload in prepared_payloads)
 
-
 def test_slider_binding_updates_across_changes(main_window, monkeypatch):
     """Slider-driven runs should reflect the latest parameter values without rebuilds."""
     monkeypatch.setattr(main_window, "_extract_and_populate_variables", lambda: None)
@@ -206,7 +194,6 @@ def test_slider_binding_updates_across_changes(main_window, monkeypatch):
         QtWidgets.QApplication.processEvents()
 
     assert seen_rates == [1.0, 0.45, 0.12]
-
 
 def test_slider_move_triggers_fresh_simulation(main_window, qtbot, monkeypatch):
     """Moving a slider should trigger a new simulation using the updated parameter."""
@@ -273,7 +260,6 @@ def test_slider_move_triggers_fresh_simulation(main_window, qtbot, monkeypatch):
     assert any("k=2" in text for text in started_with)
     assert seen_rates and seen_rates[0] == pytest.approx(expected_override)
 
-
 def test_slider_change_triggers_run(main_window, qtbot, monkeypatch):
     """End-to-end: slider move should schedule a fast simulation run."""
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -296,7 +282,6 @@ def test_slider_change_triggers_run(main_window, qtbot, monkeypatch):
     qtbot.waitUntil(lambda: len(calls) == 1, timeout=1000)
     assert calls == [True]
     assert main_window._mechanism_editor._reactions_text.toPlainText() == baseline_text
-
 
 def test_apply_overrides_to_text_reads_metadata_once_per_call(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -336,7 +321,6 @@ def test_apply_overrides_to_text_reads_metadata_once_per_call(main_window, monke
     assert metadata_calls == 1
     assert "k=3" in updated
     assert "k=4" in updated
-
 
 def test_scalar_param_slider_updates_existing_param_in_reactions_algebra(main_window, monkeypatch):
     """
@@ -384,7 +368,6 @@ def test_scalar_param_slider_updates_existing_param_in_reactions_algebra(main_wi
     assert len(a_statements) == 1
     assert float(a_statements[0].expr_src) == pytest.approx(0.331131)
 
-
 def test_scalar_param_slider_commit_uses_authoritative_parameter_precision(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -404,7 +387,6 @@ def test_scalar_param_slider_commit_uses_authoritative_parameter_precision(main_
     reactions_text = main_window._mechanism_editor._reactions_text.toPlainText()
     assert "param a = 1000000.1234567" in reactions_text
     assert "param a = 1e+06" not in reactions_text
-
 
 def test_scalar_param_slider_updates_existing_param_without_header(main_window, monkeypatch):
     from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
@@ -439,7 +421,6 @@ def test_scalar_param_slider_updates_existing_param_without_header(main_window, 
     a_statements = [stmt for stmt in spec.param_statements if stmt.name == "a"]
     assert len(a_statements) == 1
     assert float(a_statements[0].expr_src) == pytest.approx(0.331131)
-
 
 def test_slider_release_does_not_commit_dsl_in_override_mode(main_window, qtbot, monkeypatch):
     """
@@ -479,7 +460,6 @@ def test_slider_release_does_not_commit_dsl_in_override_mode(main_window, qtbot,
     assert commits == []
     assert main_window._mechanism_editor._reactions_text.toPlainText() == baseline_text
 
-
 def test_direct_commit_slider_value_materializes_authoritative_text_and_clears_workspace(
     main_window,
     monkeypatch,
@@ -509,7 +489,6 @@ def test_direct_commit_slider_value_materializes_authoritative_text_and_clears_w
     assert preview.slider_overrides() == {}
     assert main_window._mechanism_editor._variable_sliders.get_variables()["k1"] == pytest.approx(2.0)
     assert main_window.simulation_controller.run_state.pending_slider_simulation is False
-
 
 def test_direct_commit_slider_value_preserves_other_focused_workspace_overrides(
     main_window,
@@ -552,7 +531,6 @@ def test_direct_commit_slider_value_preserves_other_focused_workspace_overrides(
     }
     assert preview.local_mechanism_workspace(focused_set_id) == {}
     assert preview.has_local_mechanism_workspaces() is False
-
 
 def test_direct_scalar_commit_with_colliding_name_preserves_workspace_without_rewriting_state_network(
     main_window,
@@ -612,7 +590,6 @@ def test_direct_scalar_commit_with_colliding_name_preserves_workspace_without_re
     assert preview.local_mechanism_workspace(focused_set_id) == {}
     assert preview.has_local_mechanism_workspaces() is False
 
-
 def test_authoritative_mechanism_editor_write_undo_reverts_reactions_and_state_network_together(
     main_window,
 ):
@@ -655,7 +632,6 @@ def test_authoritative_mechanism_editor_write_undo_reverts_reactions_and_state_n
     assert main_window.mechanism_reactions_text_raw() == reactions_before
     assert main_window.mechanism_state_network_dsl_raw() == state_before
 
-
 def test_authoritative_mechanism_editor_write_undo_reverts_state_network_only_change(
     main_window,
 ):
@@ -696,13 +672,11 @@ def test_authoritative_mechanism_editor_write_undo_reverts_state_network_only_ch
     assert main_window.mechanism_reactions_text_raw() == reactions_text
     assert main_window.mechanism_state_network_dsl_raw() == state_before
 
-
 def test_slider_apply_button_shows_apply_text(main_window):
     """The slider confirmation button must display 'Apply' (not the former 'Commit')."""
     btn = main_window.findChild(QtWidgets.QPushButton, "commitSliderOverridesButton")
     assert btn is not None, "commitSliderOverridesButton not found"
     assert btn.text() == "Apply"
-
 
 def test_commit_and_reset_buttons_control_dsl_overrides(main_window, qtbot, monkeypatch):
     """
@@ -751,7 +725,6 @@ def test_commit_and_reset_buttons_control_dsl_overrides(main_window, qtbot, monk
     assert float(main_window.slider_overrides().get("k1", 0.0)) == pytest.approx(0.0)
     assert commit_btn.isEnabled() is False
     assert reset_btn.isEnabled() is False
-
 
 def test_commit_and_reset_preserve_mixed_visible_slider_selection(main_window, qtbot, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -825,7 +798,6 @@ def test_commit_and_reset_preserve_mixed_visible_slider_selection(main_window, q
     assert mech_slider.isVisible() is True
     assert species_slider.isVisible() is True
 
-
 def test_unified_slider_surface_picker_hides_dirty_mechanism_without_clearing_transaction(main_window, qtbot, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
@@ -884,7 +856,6 @@ def test_unified_slider_surface_picker_hides_dirty_mechanism_without_clearing_tr
     assert reset_btn.isEnabled() is True
     assert main_window._mechanism_editor._reactions_text.toPlainText() == baseline_text
 
-
 def test_hidden_mechanism_slider_does_not_leak_into_later_load_with_reused_name(
     main_window, qtbot, monkeypatch
 ):
@@ -933,7 +904,6 @@ def test_hidden_mechanism_slider_does_not_leak_into_later_load_with_reused_name(
     action = _find_slider_visibility_action(main_window, "mechanism", "k1")
     assert action.isChecked() is False
 
-
 def test_hidden_mechanism_slider_persists_across_same_universe_dsl_text_edit_completion_refresh(
     main_window, qtbot, monkeypatch
 ):
@@ -981,7 +951,6 @@ def test_hidden_mechanism_slider_persists_across_same_universe_dsl_text_edit_com
     assert sliders.variable_visible("k1") is False
     action = _find_slider_visibility_action(main_window, "mechanism", "k1")
     assert action.isChecked() is False
-
 
 def test_hidden_mechanism_slider_persists_across_same_universe_scalar_reorder_completion_refresh(
     main_window, qtbot, monkeypatch
@@ -1049,7 +1018,6 @@ def test_hidden_mechanism_slider_persists_across_same_universe_scalar_reorder_co
     action = _find_slider_visibility_action(main_window, "mechanism", "a")
     assert action.isChecked() is False
 
-
 def test_hidden_mechanism_slider_persists_across_primary_explicit_completion_repopulation(
     main_window, qtbot, monkeypatch
 ):
@@ -1094,7 +1062,6 @@ def test_hidden_mechanism_slider_persists_across_primary_explicit_completion_rep
     assert sliders.variable_visible("k1") is False
     action = _find_slider_visibility_action(main_window, "mechanism", "k1")
     assert action.isChecked() is False
-
 
 def test_hidden_mechanism_slider_persists_across_energy_mode_refresh_repopulation(
     main_window, qtbot, monkeypatch
@@ -1157,7 +1124,6 @@ def test_hidden_mechanism_slider_persists_across_energy_mode_refresh_repopulatio
     action = _find_slider_visibility_action(main_window, "mechanism", variable_name)
     assert action.isChecked() is False
 
-
 def test_template_load_dirty_slider_cancel_keeps_existing_mechanism_and_transaction(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
     main_window._extract_and_populate_variables()
@@ -1176,7 +1142,6 @@ def test_template_load_dirty_slider_cancel_keeps_existing_mechanism_and_transact
 
     assert main_window._mechanism_editor._reactions_text.toPlainText() == baseline_text
     assert main_window._preview_session.has_dirty_transaction() is True
-
 
 def test_template_load_dirty_slider_discard_does_not_trigger_stale_preview_run(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
@@ -1200,7 +1165,6 @@ def test_template_load_dirty_slider_discard_does_not_trigger_stale_preview_run(m
 
     assert slider_runs == []
     assert "k=5.0" in main_window._mechanism_editor._reactions_text.toPlainText()
-
 
 def test_template_load_dirty_slider_commit_records_post_commit_undo_baseline(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
@@ -1235,7 +1199,6 @@ def test_template_load_dirty_slider_commit_records_post_commit_undo_baseline(mai
     main_window._undo_stack.undo()
 
     assert "k=2" in main_window._mechanism_editor._reactions_text.toPlainText().replace(" ", "")
-
 
 def test_release_does_not_recompute_K_when_editing_kr_with_explicit_K(main_window, qtbot, monkeypatch):
     """
@@ -1280,7 +1243,6 @@ def test_release_does_not_recompute_K_when_editing_kr_with_explicit_K(main_windo
 
     # K must not change just because kr changed (kf is the derived rate in this case).
     assert float(sliders.get_variables().get("Keq1")) == pytest.approx(initial_K)
-
 
 def test_fast_worker_completion_never_reextracts_sliders(main_window, qtbot, monkeypatch):
     """
@@ -1330,7 +1292,6 @@ def test_fast_worker_completion_never_reextracts_sliders(main_window, qtbot, mon
     QtWidgets.QApplication.processEvents()
     assert called["extract"] == 0
 
-
 def test_slider_release_never_auto_commits_with_queued_changes(main_window, qtbot, monkeypatch):
     """
     Override mode: Qt can deliver queued valueChanged signals after sliderReleased.
@@ -1365,7 +1326,6 @@ def test_slider_release_never_auto_commits_with_queued_changes(main_window, qtbo
     main_window._on_variable_changed("kf1", 0.205)
     qtbot.waitUntil(lambda: not bool(getattr(preview, "_slider_release_in_progress", False)), timeout=1500)
     assert commits == []
-
 
 def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, monkeypatch):
     """If a slider target is missing from bindings, fall back to parsing updated DSL."""
@@ -1446,7 +1406,6 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
         dict(solver_configs[0] or {}),
     )
 
-
 def test_equilibrium_slider_does_not_synthesize_K_when_not_explicit(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -1471,7 +1430,6 @@ def test_equilibrium_slider_does_not_synthesize_K_when_not_explicit(main_window)
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
     assert "K=" not in updated
 
-
 def test_reset_slider_overrides_ends_live_drag(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
@@ -1491,7 +1449,6 @@ def test_reset_slider_overrides_ends_live_drag(main_window, monkeypatch):
     main_window._on_reset_slider_overrides_clicked()
     QtWidgets.QApplication.processEvents()
     assert bool(getattr(sliders, "_freeze_ranges", False)) is False
-
 
 def test_reset_slider_overrides_clears_pending_preview_request_without_forcing_replacement_rerun(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1515,7 +1472,6 @@ def test_reset_slider_overrides_clears_pending_preview_request_without_forcing_r
     assert reruns == []
     assert observed_request_ids == []
     assert main_window.simulation_controller.run_state.pending_slider_sim_request_id is None
-
 
 def test_reset_slider_overrides_clears_all_selected_parameter_workspaces(main_window, monkeypatch, qt_app):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1555,7 +1511,6 @@ def test_reset_slider_overrides_clears_all_selected_parameter_workspaces(main_wi
         assert main_window._preview_session.local_mechanism_workspace(set_id) == {}
         assert main_window._preview_session.effective_slider_values_for_set(set_id) == {"k1": pytest.approx(1.0)}
 
-
 def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_request_without_advancing_latest(
     main_window, qt_app
 ):
@@ -1585,7 +1540,6 @@ def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_re
     assert controller.run_state.pending_slider_sim_request_id == 6
     assert controller.run_state.latest_sim_request_id == 5
     main_window._preview_session.stop_variable_update_timer()
-
 
 def test_parameter_slider_change_after_invalidated_serial_fast_preview_reserves_future_request_without_advancing_latest(
     main_window, qt_app
@@ -1629,7 +1583,6 @@ def test_parameter_slider_change_after_invalidated_serial_fast_preview_reserves_
     worker._fast_mode = False
     main_window._preview_session.stop_variable_update_timer()
 
-
 def test_K_slider_update_writes_consistent_equilibrium_parameters(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -1658,7 +1611,6 @@ def test_K_slider_update_writes_consistent_equilibrium_parameters(main_window):
     # Derived rate must not be rewritten back into the DSL (let the parser derive it).
     assert "kr=" not in updated
 
-
 def test_step_index_parameter_write_uses_authoritative_parameter_precision(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -1676,7 +1628,6 @@ def test_step_index_parameter_write_uses_authoritative_parameter_precision(main_
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
     assert "k=1000000.1234567" in updated
     assert "k=1e+06" not in updated
-
 
 def test_K_slider_does_not_store_derived_rate_as_override(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1697,7 +1648,6 @@ def test_K_slider_does_not_store_derived_rate_as_override(main_window):
     # kr1 is derived/read-only for explicit-K equilibria (default policy), so it must
     # never be persisted into slider overrides (which later rewrite the DSL).
     assert "kr1" not in main_window.slider_overrides()
-
 
 def test_K_update_uses_current_text_owner_when_cached_metadata_is_stale(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1730,7 +1680,6 @@ def test_K_update_uses_current_text_owner_when_cached_metadata_is_stale(main_win
     assert "Keq=6" in updated
     assert "kr=2" in updated
     assert "kf=" not in updated
-
 
 def test_K_update_ignores_stale_cached_constraint_metadata_after_manual_text_edit(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1766,7 +1715,6 @@ def test_K_update_ignores_stale_cached_constraint_metadata_after_manual_text_edi
     assert "Keq=8" in updated
     assert "param Keq1 = 4" not in updated
 
-
 def test_K_update_keeps_current_text_constraint_when_unused_builtin_shadow_scalar_input_present(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -1787,7 +1735,6 @@ def test_K_update_keeps_current_text_constraint_when_unused_builtin_shadow_scala
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
     assert "K=8" not in updated
     assert "param Keq1 = 4" in updated
-
 
 def test_slider_label_stays_canonical_step_label_after_updates(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1812,7 +1759,6 @@ def test_slider_label_stays_canonical_step_label_after_updates(main_window):
     assert after["Keq1"]["label"].startswith("Step ")
     assert after["kf1"]["label"] == before["kf1"]["label"]
     assert after["Keq1"]["label"] == before["Keq1"]["label"]
-
 
 def test_K_slider_uses_longer_debounce_than_other_params(main_window, qtbot, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1843,7 +1789,6 @@ def test_K_slider_uses_longer_debounce_than_other_params(main_window, qtbot, mon
     long_ms = preview._variable_update_timer.interval()
 
     assert long_ms > short_ms
-
 
 def test_slider_preview_debounce_settings_drive_parameter_and_K_timers(main_window, qtbot, monkeypatch):
     main_window.settings_set_value("simulation/parameter_preview_debounce_ms", 25)
@@ -1877,7 +1822,6 @@ def test_slider_preview_debounce_settings_drive_parameter_and_K_timers(main_wind
     assert short_ms == 25
     assert long_ms == 60
 
-
 def test_K_implied_derived_rate_updates_without_param_block(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -1901,7 +1845,6 @@ def test_K_implied_derived_rate_updates_without_param_block(main_window):
     main_window._refresh_derived_parameters_display()
     after = sliders.get_variables()
     assert after["kr1"] == pytest.approx(kf / 20.0)
-
 
 def test_K_drag_uses_preview_t_end_and_release_uses_full_t_end(main_window, monkeypatch, qtbot):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1966,7 +1909,6 @@ def test_K_drag_uses_preview_t_end_and_release_uses_full_t_end(main_window, monk
     assert t_span_full[1] == pytest.approx(1000.0)
     assert int(cfg_full["grid"]["N"]) > 120
 
-
 def test_stale_slider_worker_completion_does_not_override_latest(main_window, monkeypatch, qtbot):
     """
     Latest-only slider scheduling should avoid worker churn, while still ensuring a
@@ -2026,7 +1968,6 @@ def test_stale_slider_worker_completion_does_not_override_latest(main_window, mo
     worker2.result_ready.emit(payload2)
     qtbot.waitUntil(lambda: "Simulation complete" in main_window._status_label.text(), timeout=1500)
 
-
 def test_variable_sliders_store_callbacks_as_partials(qtbot):
     from kindred.gui.widgets.variable_sliders import VariableSliders
 
@@ -2039,7 +1980,6 @@ def test_variable_sliders_store_callbacks_as_partials(qtbot):
     assert isinstance(callbacks["k1"]["valueChanged"], functools.partial)
     assert isinstance(callbacks["k1"]["sliderPressed"], functools.partial)
     assert isinstance(callbacks["k1"]["sliderReleased"], functools.partial)
-
 
 def test_simulation_worker_cleanup_does_not_wait():
     from kindred.gui.simulation_worker import SimulationWorker
@@ -2058,7 +1998,6 @@ def test_simulation_worker_cleanup_does_not_wait():
         {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     )
     worker.cleanup()
-
 
 def test_programmatic_load_clears_stale_parameter_sliders(main_window, monkeypatch):
     sliders = main_window._mechanism_editor._variable_sliders
@@ -2088,7 +2027,6 @@ def test_programmatic_load_clears_stale_parameter_sliders(main_window, monkeypat
     assert main_window._variable_runtime.slider_runtime_dirty() is True
     assert prompt_calls == ["prompt"]
 
-
 def test_preset_load_is_replace_only_and_does_not_import_insert_dialog(main_window, monkeypatch):
     from kindred.io.resources import get_preset_mechanism
 
@@ -2099,7 +2037,6 @@ def test_preset_load_is_replace_only_and_does_not_import_insert_dialog(main_wind
 
     assert main_window._mechanism_editor._reactions_text.toPlainText() == get_preset_mechanism("M1")
     assert "# ===== Appended:" not in main_window._mechanism_editor._reactions_text.toPlainText()
-
 
 def test_second_preset_load_is_replace_only_and_does_not_import_insert_dialog(main_window, monkeypatch):
     from kindred.io.resources import get_preset_mechanism
@@ -2132,69 +2069,6 @@ def test_second_preset_load_is_replace_only_and_does_not_import_insert_dialog(ma
     assert main_window._variable_runtime.slider_runtime_dirty() is True
     assert main_window._mechanism_editor._reactions_text.toPlainText() == get_preset_mechanism("M9")
     assert "# ===== Appended:" not in main_window._mechanism_editor._reactions_text.toPlainText()
-
-
-def test_selection_change_resyncs_mechanism_sliders_and_parameter_table(main_window, monkeypatch, qt_app):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
-
-    sliders = main_window._mechanism_editor._variable_sliders
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = main_window._batch_set_ids_for_scope("selected")
-    assert len(selected_ids) == 1
-    set0_id = str(selected_ids[0])
-    set1_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert set1_id and set1_id != set0_id
-    main_window.set_slider_edit_target_set_ids([set0_id])
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-selection-control-sync-cache-key"
-    cache.result_cache[f"{explicit_key}::{set0_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.result_cache[f"{explicit_key}::{set1_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([3.0, 6.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-
-    sliders.update_variable("k1", 2.0)
-    main_window._on_variable_changed("k1", 2.0)
-    main_window._preview_session.stop_variable_update_timer()
-    qt_app.processEvents()
-
-    assert sliders.get_variables()["k1"] == pytest.approx(2.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
-
-    _select_batch_rows(main_window, [1])
-    _set_shown_rows(main_window, [1])
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert main_window.slider_overrides() == {}
-    assert main_window.active_batch_selection()[0] == set1_id
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray([3.0, 6.0], dtype=float),
-    )
-    assert sliders.get_variables()["k1"] == pytest.approx(1.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
-
 
 def test_selection_change_without_display_retargets_next_slider_edit_to_focused_set(main_window, monkeypatch, qt_app):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -2262,7 +2136,6 @@ def test_selection_change_without_display_retargets_next_slider_edit_to_focused_
     assert sliders.get_variables()["k1"] == pytest.approx(1.5)
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.5)
 
-
 def test_multiselect_workspace_retains_staged_values_after_switching_to_fresh_set(main_window, monkeypatch, qt_app):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
@@ -2315,624 +2188,6 @@ def test_multiselect_workspace_retains_staged_values_after_switching_to_fresh_se
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
     assert preview.local_mechanism_workspace(set0_id) == {"k1": pytest.approx(2.0)}
     assert preview.local_mechanism_workspace(set1_id) == {"k1": pytest.approx(2.0)}
-
-
-def test_commit_slider_overrides_preserve_displayed_committed_preview_result(main_window, qt_app, monkeypatch):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0, 1])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-    third_set_id = str(main_window._batch_set_id_for_row(2) or "")
-    assert third_set_id and third_set_id not in selected_ids
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-commit-preserves-displayed-preview-cache-key"
-    all_cached_ids = selected_ids + [third_set_id]
-    for set_id in all_cached_ids:
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-    cache.active_batch_set_id = selected_ids[0]
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
-    cache.last_display_selection = list(selected_ids)
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=selected_ids)
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_key = "gui-slider-commit-preserves-displayed-preview-preview-key"
-    for set_id in selected_ids:
-        mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=str(set_id))
-        solver_config, _, preview_token = main_window._current_workspace_preview_context(
-            set_id=str(set_id),
-            mechanism_text=mechanism_text,
-        )
-        cache.preview_cache[f"{preview_key}::{set_id}"] = {
-            "t": preview_t,
-            "series": {"A": preview_series},
-            "algebra_scalars": {},
-            "mechanism_text": mechanism_text,
-            "solver_config": dict(solver_config),
-            "preview_batch_cache_token": str(preview_token or ""),
-        }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(selected_ids)
-
-    plot = main_window._plot_tabs._main_plot
-    main_window.set_data(
-        np.asarray(preview_t, dtype=float),
-        {"A": np.asarray(preview_series, dtype=float)},
-        label=selected_ids[0],
-        overlays=[],
-    )
-    assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), preview_series)
-
-    main_window._on_commit_slider_overrides_clicked()
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == tuple(all_cached_ids)
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection()[0] == selected_ids[0]
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-    assert main_window._preview_session.local_mechanism_workspace(selected_ids[0]) == {}
-    assert main_window._preview_session.has_local_mechanism_workspaces() is False
-
-    _select_batch_rows(main_window, [2])
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_commit_slider_overrides_clears_stale_multiselect_preview_overlays(main_window, qt_app, monkeypatch):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0, 1])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-commit-clears-stale-overlay-cache-key"
-    for set_id in selected_ids:
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-    cache.active_batch_set_id = selected_ids[0]
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
-    cache.last_display_selection = list(selected_ids)
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=selected_ids)
-
-    preview_t = _current_preview_time_axis(main_window)
-    primary_preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    overlay_preview_series = np.asarray(np.linspace(4.0, 8.0, preview_t.size, dtype=float))
-    preview_key = "gui-slider-commit-clears-stale-overlay-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=selected_ids[0])
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=selected_ids[0],
-        mechanism_text=mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{selected_ids[0]}"] = {
-        "t": preview_t,
-        "series": {"A": primary_preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(selected_ids)
-
-    plot = main_window._plot_tabs._main_plot
-    plot.set_statistics_results(
-        {
-            selected_ids[0]: {
-                "t": np.asarray(preview_t, dtype=float),
-                "series": {"A": np.asarray(primary_preview_series, dtype=float)},
-            },
-            selected_ids[1]: {
-                "t": np.asarray(preview_t, dtype=float),
-                "series": {"A": np.asarray(overlay_preview_series, dtype=float)},
-            },
-        },
-        prefer=selected_ids[0],
-    )
-    main_window.set_data(
-        np.asarray(preview_t, dtype=float),
-        {"A": np.asarray(primary_preview_series, dtype=float)},
-        label=selected_ids[0],
-        overlays=[{"label": selected_ids[1], "t": preview_t, "series": {"A": overlay_preview_series}}],
-    )
-    assert len(list(getattr(plot, "_simulation_overlays", []) or [])) == 1
-
-    main_window._on_commit_slider_overrides_clicked()
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == tuple(selected_ids)
-    assert main_window.active_batch_selection()[0] == selected_ids[0]
-    assert cache.last_display_selection == [selected_ids[0]]
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        primary_preview_series,
-    )
-    assert list(getattr(plot, "_simulation_overlays", []) or []) == []
-    assert plot._stats_result_selector.count() == 1
-    assert plot._stats_result_selector.itemText(0) == str(
-        main_window.batch_set_name_for_id(selected_ids[0]) or selected_ids[0]
-    )
-    assert main_window._preview_session.has_local_mechanism_workspaces() is False
-
-
-def test_commit_species_overlay_preview_preserves_displayed_preview_result(main_window, qt_app, monkeypatch):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    set_id = selected_ids[0]
-    main_window._mechanism_editor.set_slider_points_value(350)
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
-    assert main_window._preview_session.has_local_mechanism_workspace(set_id) is False
-    assert main_window._preview_session.has_staged_concentration_overlays() is True
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-species-commit-preserves-preview-cache-key"
-    cache.result_cache[f"{explicit_key}::{set_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (set_id,)
-    cache.active_batch_set_id = set_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(set_id) or "")
-    cache.last_display_selection = [set_id]
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_key = "gui-species-commit-preserves-preview-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=set_id,
-        mechanism_text=mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{set_id}"] = {
-        "t": preview_t,
-        "series": {"A": preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (set_id,)
-
-    plot = main_window._plot_tabs._main_plot
-    main_window.set_data(
-        np.asarray(preview_t, dtype=float),
-        {"A": np.asarray(preview_series, dtype=float)},
-        label=set_id,
-        overlays=[],
-    )
-
-    main_window._on_commit_slider_overrides_clicked()
-    qt_app.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-    assert main_window._preview_session.has_staged_concentration_overlays() is False
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection()[0] == set_id
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-
-
-def test_commit_species_overlay_preview_preserves_display_when_preview_cache_entry_missing(
-    main_window,
-    qt_app,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    set_id = selected_ids[0]
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.0, rel=1e-6, abs=1e-9)
-    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
-    assert main_window._preview_session.has_staged_concentration_overlays() is True
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-species-commit-preserves-preview-missing-cache-key"
-    cache.result_cache[f"{explicit_key}::{set_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (set_id,)
-    cache.active_batch_set_id = set_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(set_id) or "")
-    cache.last_display_selection = [set_id]
-    preview_key = "gui-species-commit-preserves-preview-missing-cache-entry-preview-key"
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (set_id,)
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=set_id,
-        mechanism_text=mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{set_id}"] = {
-        "t": preview_t,
-        "series": {"A": preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is not None
-    assert main_window.display_cached_batch_selection(
-        cache_key=preview_key,
-        selected_sets=[set_id],
-        cache_store=cache.preview_cache,
-        allow_fallback=False,
-    )
-    plot = main_window._plot_tabs._main_plot
-    cache.preview_cache.clear()
-    cache.active_preview_cache_key = "missing-preview-cache-entry"
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
-
-    main_window._on_commit_slider_overrides_clicked()
-    qt_app.processEvents()
-
-    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-    assert main_window._preview_session.has_staged_concentration_overlays() is False
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection()[0] == set_id
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        preview_series,
-    )
-
-
-def test_commit_multiselect_species_overlay_preview_preserves_secondary_dirty_overlay(
-    main_window,
-    qt_app,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
-    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "0.2")
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0, 1])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-    primary_set_id = selected_ids[0]
-    secondary_set_id = selected_ids[1]
-
-    assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=2.5) is True
-    assert main_window._preview_session.has_local_mechanism_workspace(primary_set_id) is False
-    assert main_window._preview_session.has_local_mechanism_workspace(secondary_set_id) is False
-    assert main_window._preview_session.has_staged_concentration_overlays() is True
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-species-multiselect-commit-preserves-preview-cache-key"
-    for set_id, series in (
-        (primary_set_id, np.asarray([7.0, 14.0], dtype=float)),
-        (secondary_set_id, np.asarray([3.0, 6.0], dtype=float)),
-    ):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": series},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-    cache.active_batch_set_id = primary_set_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(primary_set_id) or "")
-    cache.last_display_selection = list(selected_ids)
-
-    preview_t = _current_preview_time_axis(main_window)
-    primary_preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    secondary_preview_series = np.asarray(np.linspace(4.0, 8.0, preview_t.size, dtype=float))
-    preview_key = "gui-species-multiselect-commit-preserves-preview-preview-key"
-    for set_id, series in (
-        (primary_set_id, primary_preview_series),
-        (secondary_set_id, secondary_preview_series),
-    ):
-        mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-        solver_config, _, preview_token = main_window._current_workspace_preview_context(
-            set_id=set_id,
-            mechanism_text=mechanism_text,
-        )
-        cache.preview_cache[f"{preview_key}::{set_id}"] = {
-            "t": preview_t,
-            "series": {"A": series},
-            "algebra_scalars": {},
-            "mechanism_text": mechanism_text,
-            "solver_config": dict(solver_config),
-            "preview_batch_cache_token": str(preview_token or ""),
-        }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(selected_ids)
-
-    assert main_window.display_cached_batch_selection(
-        cache_key=preview_key,
-        selected_sets=selected_ids,
-        cache_store=cache.preview_cache,
-        allow_fallback=False,
-    )
-    cache.preview_cache.clear()
-    cache.active_preview_cache_key = "missing-multiselect-preview-cache-entry"
-    plot = main_window._plot_tabs._main_plot
-
-    main_window._on_commit_slider_overrides_clicked()
-    qt_app.processEvents()
-
-    assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
-    assert main_window._preview_session.has_staged_concentration_overlays() is False
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert cache.last_display_selection == selected_ids
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        np.asarray([7.0, 14.0], dtype=float),
-    )
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert len(overlays) == 2
-    secondary_preview_overlay = next(
-        entry
-        for entry in overlays
-        if str(entry.get("curve_role") or "") != "canonical_ghost"
-    )
-    assert secondary_preview_overlay["label"] == str(main_window.batch_set_name_for_id(secondary_set_id) or secondary_set_id)
-    assert np.allclose(
-        np.asarray((secondary_preview_overlay.get("series") or {})["A"], dtype=float),
-        secondary_preview_series,
-    )
-    assert str(secondary_preview_overlay.get("curve_role") or "") != "canonical_ghost"
-    secondary_canonical_ghost = next(
-        entry
-        for entry in overlays
-        if str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert secondary_canonical_ghost["label"] == str(main_window.batch_set_name_for_id(secondary_set_id) or secondary_set_id)
-    assert np.allclose(
-        np.asarray((secondary_canonical_ghost.get("series") or {})["A"], dtype=float),
-        np.asarray([3.0, 6.0], dtype=float),
-    )
-    assert plot._stats_result_selector.count() == 2
-
-
-def test_commit_multiselect_dirty_workspace_preview_preserves_secondary_dirty_overlay(
-    main_window,
-    qt_app,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0, 1])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-    primary_set_id = selected_ids[0]
-    secondary_set_id = selected_ids[1]
-
-    cache = main_window.simulation_controller.batch_cache
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[primary_set_id])
-    main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[secondary_set_id])
-
-    explicit_key = "gui-slider-multiselect-commit-preserves-secondary-dirty-workspace-overlay-explicit-key"
-    for set_id, series in (
-        (primary_set_id, np.asarray([7.0, 14.0], dtype=float)),
-        (secondary_set_id, np.asarray([3.0, 6.0], dtype=float)),
-    ):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": series},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-    cache.active_batch_set_id = primary_set_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(primary_set_id) or "")
-    cache.last_display_selection = list(selected_ids)
-
-    preview_t = _current_preview_time_axis(main_window)
-    primary_preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    secondary_preview_series = np.asarray(np.linspace(4.0, 8.0, preview_t.size, dtype=float))
-    preview_key = "gui-slider-multiselect-commit-preserves-secondary-dirty-workspace-overlay-preview-key"
-    for set_id, series in (
-        (primary_set_id, primary_preview_series),
-        (secondary_set_id, secondary_preview_series),
-    ):
-        mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-        solver_config, _, preview_token = main_window._current_workspace_preview_context(
-            set_id=set_id,
-            mechanism_text=mechanism_text,
-        )
-        cache.preview_cache[f"{preview_key}::{set_id}"] = {
-            "t": preview_t,
-            "series": {"A": series},
-            "algebra_scalars": {},
-            "mechanism_text": mechanism_text,
-            "solver_config": dict(solver_config),
-            "preview_batch_cache_token": str(preview_token or ""),
-        }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(selected_ids)
-
-    assert main_window.display_cached_batch_selection(
-        cache_key=preview_key,
-        selected_sets=selected_ids,
-        cache_store=cache.preview_cache,
-        allow_fallback=False,
-    )
-    cache.preview_cache.clear()
-    cache.active_preview_cache_key = "missing-multiselect-dirty-workspace-preview-cache-entry"
-
-    plot = main_window._plot_tabs._main_plot
-    main_window._on_commit_slider_overrides_clicked()
-    qt_app.processEvents()
-
-    assert main_window._preview_session.local_mechanism_workspace(primary_set_id) == {}
-    assert main_window._preview_session.local_mechanism_workspace(secondary_set_id) == {
-        "k1": pytest.approx(3.0)
-    }
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert cache.last_display_selection == selected_ids
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        primary_preview_series,
-    )
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert len(overlays) == 3
-    primary_canonical_ghost = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == primary_set_id and str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((primary_canonical_ghost.get("series") or {})["A"], dtype=float),
-        np.asarray([7.0, 14.0], dtype=float),
-    )
-    secondary_preview_overlay = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == secondary_set_id and str(entry.get("curve_role") or "") != "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((secondary_preview_overlay.get("series") or {})["A"], dtype=float),
-        secondary_preview_series,
-    )
-    secondary_canonical_ghost = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == secondary_set_id and str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((secondary_canonical_ghost.get("series") or {})["A"], dtype=float),
-        np.asarray([3.0, 6.0], dtype=float),
-    )
-
 
 def test_replayed_precommit_dirty_overlay_is_not_reaccepted_as_truthful_after_authoritative_change(
     main_window,
@@ -3066,7 +2321,6 @@ def test_replayed_precommit_dirty_overlay_is_not_reaccepted_as_truthful_after_au
     ) is False
     assert main_window._active_workspace_preview_display_snapshot() is None
 
-
 def test_commit_primary_dirty_preview_drops_stale_secondary_explicit_overlay(main_window, qt_app, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
@@ -3181,7 +2435,6 @@ def test_commit_primary_dirty_preview_drops_stale_secondary_explicit_overlay(mai
     assert plot._stats_result_selector.count() == 1
     assert plot._stats_result_selector.itemText(0) == primary_label
 
-
 def test_commit_dirty_workspace_does_not_preserve_stale_explicit_plot_without_truthful_preview(
     main_window,
     qt_app,
@@ -3242,7 +2495,6 @@ def test_commit_dirty_workspace_does_not_preserve_stale_explicit_plot_without_tr
     assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
     assert main_window.active_batch_selection() == ("", "")
     _assert_selection_plot_cleared(main_window)
-
 
 def test_commit_does_not_preserve_older_active_preview_when_dirty_state_has_advanced(
     main_window,
@@ -3318,7 +2570,6 @@ def test_commit_does_not_preserve_older_active_preview_when_dirty_state_has_adva
     assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
     assert main_window.active_batch_selection() == ("", "")
     _assert_selection_plot_cleared(main_window)
-
 
 def test_single_set_stale_preview_cache_display_returns_false_and_defers_to_preview_pending_fallback(
     main_window,
@@ -3405,7 +2656,6 @@ def test_single_set_stale_preview_cache_display_returns_false_and_defers_to_prev
     assert main_window._status_label.text() == "Preview pending for current selection."
     assert main_window.active_batch_selection() == ("", "")
     _assert_selection_plot_cleared(main_window)
-
 
 def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_advanced(
     main_window,
@@ -3504,379 +2754,6 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
     assert main_window.active_batch_selection() == ("", "")
     _assert_selection_plot_cleared(main_window)
 
-
-def test_run_selected_discards_targeted_dirty_workspace_and_uses_canonical_mechanism(
-    main_window,
-    qt_app,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    set_id = selected_ids[0]
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=selected_ids)
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "_start_next_batch_simulation",
-        lambda: None,
-        raising=True,
-    )
-
-    main_window.simulation_controller.run_simulation_internal(fast_mode=False)
-
-    ctx = dict(main_window.simulation_controller._batch_run_context or {})
-    full_dsl = str(ctx.get("full_dsl") or "")
-    mechanism_text_by_set_id = dict(ctx.get("mechanism_text_by_set_id") or {})
-
-    assert "k=1" in full_dsl
-    assert "k=2" not in full_dsl
-    assert "k=1" in str(mechanism_text_by_set_id.get(set_id) or "")
-    assert "k=2" not in str(mechanism_text_by_set_id.get(set_id) or "")
-    assert main_window._preview_session.local_mechanism_workspace(set_id) == {"k1": pytest.approx(2.0)}
-
-    result = {
-        "t": np.linspace(0.0, 1.0, 3),
-        "Y": np.asarray([[1.0, 0.5, 0.1], [0.0, 0.5, 0.9]], dtype=float),
-        "species_names": ["A", "B"],
-        "mechanism": None,
-        "mechanism_text": str(mechanism_text_by_set_id.get(set_id) or ""),
-        "solver_config": {"solver": "Radau", "temperature_K": 298.15},
-        "algebra_scalars": {},
-        "algebra_errors": [],
-        "fallback_occurred": False,
-        "fallback_message": None,
-    }
-    main_window.simulation_controller._on_simulation_complete(
-        result,
-        run_id=int(main_window.simulation_controller._active_run_id),
-        fast_mode=False,
-        request_id=int(ctx.get("request_id") or 0),
-        batch_set=str(main_window.batch_set_name_for_id(set_id) or ""),
-        batch_set_id=set_id,
-        cache_key=str(ctx.get("cache_key") or ""),
-    )
-
-    assert main_window._preview_session.local_mechanism_workspace(set_id) == {}
-
-
-def test_reselecting_dirty_set_restores_workspace_preview_over_explicit_cache(
-    main_window,
-    qt_app,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._mechanism_editor.set_slider_points_value(350)
-    main_window._batch_model.set_species(["A"])
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    set_id = selected_ids[0]
-
-    cache = main_window.simulation_controller.batch_cache
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[set_id])
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_key = "reselect-staged-workspace-preview-cache-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=set_id,
-        mechanism_text=mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{set_id}"] = {
-        "t": preview_t,
-        "series": {"A": preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (set_id,)
-
-    explicit_key = "reselect-explicit-canonical-cache-key"
-    explicit_t = np.asarray(np.linspace(0.0, 1.0, 100, dtype=float))
-    explicit_series = np.asarray(np.linspace(7.0, 14.0, explicit_t.size, dtype=float))
-    cache.result_cache[f"{explicit_key}::{set_id}"] = {
-        "t": explicit_t,
-        "series": {"A": explicit_series},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (set_id,)
-    outcome = main_window.results_controller.display_cached_batch_selection_outcome(
-        cache_key=explicit_key,
-        selected_sets=[set_id],
-        prefer_set=set_id,
-        allow_fallback=False,
-    )
-    assert outcome.displayed is True
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        explicit_series,
-    )
-
-    sel = main_window._batch_table.selectionModel()
-    assert sel is not None
-    sel.clearSelection()
-    qt_app.processEvents()
-
-    selection_display_lengths: list[int] = []
-    original_set_data = main_window.results_controller.set_data
-
-    def _recording_set_data(t, series, **kwargs):
-        selection_display_lengths.append(int(np.asarray(t, dtype=float).reshape(-1).size))
-        return original_set_data(t, series, **kwargs)
-
-    monkeypatch.setattr(main_window.results_controller, "set_data", _recording_set_data, raising=True)
-
-    _select_batch_rows(main_window, [0])
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    displayed_series = np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float)
-    assert main_window.active_batch_selection()[0] == set_id
-    assert selection_display_lengths
-    assert all(length == preview_t.size for length in selection_display_lengths)
-    assert np.allclose(displayed_series, preview_series)
-    assert displayed_series.size == preview_t.size
-    assert displayed_series.size != explicit_t.size
-
-
-def test_dirty_selection_without_truthful_preview_stays_preview_pending_and_does_not_split_display(
-    main_window,
-    qt_app,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    set_id = selected_ids[0]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "dirty-selection-without-truthful-preview-does-not-split-display-explicit-key"
-    explicit_t = np.asarray(np.linspace(0.0, 1.0, 100, dtype=float))
-    explicit_series = np.asarray(np.linspace(7.0, 14.0, explicit_t.size, dtype=float))
-    cache.result_cache[f"{explicit_key}::{set_id}"] = {
-        "t": explicit_t,
-        "series": {"A": explicit_series},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (set_id,)
-    cache.active_batch_set_id = set_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(set_id) or "")
-    cache.last_display_selection = [set_id]
-
-    main_window.set_data(
-        np.asarray(explicit_t, dtype=float),
-        {"A": np.asarray(explicit_series, dtype=float)},
-        label=str(main_window.batch_set_name_for_id(set_id) or set_id),
-        overlays=[],
-    )
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[set_id])
-    main_window._sync_mechanism_controls_to_focused_batch_set(use_workspace=True)
-    cache.active_preview_cache_key = "missing-dirty-selection-preview-key"
-    cache.active_preview_scope_set_ids = (set_id,)
-
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
-    assert main_window._status_label.text() == "Preview pending for current selection."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_multiselect_clean_focused_row_without_cached_result_does_not_display_other_set_preview(
-    main_window,
-    qt_app,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    set_a_id = str(main_window._batch_set_id_for_row(0) or "")
-    set_b_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert set_a_id
-    assert set_b_id
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[set_a_id])
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_key = "focused-clean-row-does-not-show-other-set-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_a_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=set_a_id,
-        mechanism_text=mechanism_text,
-    )
-    cache = main_window.simulation_controller.batch_cache
-    cache.preview_cache[f"{preview_key}::{set_a_id}"] = {
-        "t": preview_t,
-        "series": {"A": preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (set_a_id,)
-    cache.active_cache_key = None
-    cache.active_cache_valid_set_ids = None
-    cache.active_cache_invalidated_set_ids = None
-
-    table = main_window._batch_table
-    model = main_window._batch_model
-    assert table is not None
-    sel = table.selectionModel()
-    assert sel is not None
-    sel.clearSelection()
-    table.setCurrentIndex(model.index(1, 0))
-    sel.select(model.index(0, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-    sel.select(model.index(1, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    assert main_window.variable_slider_values()["k1"] == pytest.approx(1.0)
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_slider_preview_multiselect_shows_clean_canonical_and_dirty_canonical_ghost(
-    main_window,
-    qt_app,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    _select_batch_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-    dirty_primary_id = selected_ids[0]
-    clean_secondary_id = selected_ids[1]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "slider-preview-multiselect-canonical-ghost-explicit-key"
-    primary_canonical = np.asarray([7.0, 14.0], dtype=float)
-    secondary_canonical = np.asarray([3.0, 6.0], dtype=float)
-    for set_id, series in (
-        (dirty_primary_id, primary_canonical),
-        (clean_secondary_id, secondary_canonical),
-    ):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": series},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[dirty_primary_id])
-
-    preview_t = _current_preview_time_axis(main_window)
-    dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_key = "slider-preview-multiselect-canonical-ghost-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=dirty_primary_id,
-        mechanism_text=mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{dirty_primary_id}"] = {
-        "t": preview_t,
-        "series": {"A": dirty_preview},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(selected_ids)
-
-    controller = main_window.simulation_controller
-    controller._latest_sim_request_id = 1
-    controller._active_run_id = 2
-    controller._queue_slider_plot_update(
-        set_id=dirty_primary_id,
-        cache_key=preview_key,
-        request_id=1,
-        run_id=2,
-        slider_triggered=True,
-    )
-
-    main_window._status_label.setText("Preview pending for current selection.")
-    assert controller._flush_slider_plot_updates() is True
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert main_window.active_batch_selection()[0] == dirty_primary_id
-    assert main_window._status_label.text() == f"Loaded 1 species, {preview_t.size} timepoints"
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        dirty_preview,
-    )
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert len(overlays) == 2
-    clean_overlay = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == clean_secondary_id and str(entry.get("curve_role") or "") != "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((clean_overlay.get("series") or {})["A"], dtype=float),
-        secondary_canonical,
-    )
-    dirty_primary_ghost = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == dirty_primary_id and str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((dirty_primary_ghost.get("series") or {})["A"], dtype=float),
-        primary_canonical,
-    )
-
-
 def test_workspace_aware_preview_display_clears_stale_pending_status_after_success(
     main_window,
     qt_app,
@@ -3967,7 +2844,6 @@ def test_workspace_aware_preview_display_clears_stale_pending_status_after_succe
         and str(entry.get("curve_role") or "") == "canonical_ghost"
         for entry in overlays
     )
-
 
 @pytest.mark.parametrize(
     ("initial_status", "stage_missing_preview", "seed_missing_explicit", "expected_status"),
@@ -4070,112 +2946,6 @@ def test_workspace_aware_preview_partial_success_uses_current_selection_warning(
         np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
         dirty_preview,
     )
-
-
-def test_species_preview_multiselect_shows_clean_canonical_and_dirty_canonical_ghost(
-    main_window,
-    qt_app,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
-    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "0.2")
-
-    _select_batch_rows(main_window, [0, 1])
-    qt_app.processEvents()
-
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-    clean_primary_id = selected_ids[0]
-    dirty_secondary_id = selected_ids[1]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "species-preview-multiselect-canonical-ghost-explicit-key"
-    primary_canonical = np.asarray([7.0, 14.0], dtype=float)
-    secondary_canonical = np.asarray([3.0, 6.0], dtype=float)
-    for set_id, series in (
-        (clean_primary_id, primary_canonical),
-        (dirty_secondary_id, secondary_canonical),
-    ):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": series},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-
-    assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=2.5) is True
-
-    preview_t = _current_preview_time_axis(main_window)
-    dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_key = "species-preview-multiselect-canonical-ghost-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_secondary_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=dirty_secondary_id,
-        mechanism_text=mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{dirty_secondary_id}"] = {
-        "t": preview_t,
-        "series": {"A": dirty_preview},
-        "algebra_scalars": {},
-        "mechanism_text": mechanism_text,
-        "solver_config": dict(solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = tuple(selected_ids)
-
-    controller = main_window.simulation_controller
-    controller._latest_sim_request_id = 1
-    controller._active_run_id = 2
-    controller._queue_slider_plot_update(
-        set_id=dirty_secondary_id,
-        cache_key=preview_key,
-        request_id=1,
-        run_id=2,
-        slider_triggered=True,
-    )
-
-    assert controller._flush_slider_plot_updates() is True
-    qt_app.processEvents()
-
-    plot = main_window._plot_tabs._main_plot
-    assert main_window.active_batch_selection()[0] == clean_primary_id
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        primary_canonical,
-    )
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert len(overlays) == 2
-    dirty_overlay = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == dirty_secondary_id and str(entry.get("curve_role") or "") != "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((dirty_overlay.get("series") or {})["A"], dtype=float),
-        dirty_preview,
-    )
-    dirty_secondary_ghost = next(
-        entry
-        for entry in overlays
-        if str(entry.get("set_id") or "") == dirty_secondary_id and str(entry.get("curve_role") or "") == "canonical_ghost"
-    )
-    assert np.allclose(
-        np.asarray((dirty_secondary_ghost.get("series") or {})["A"], dtype=float),
-        secondary_canonical,
-    )
-
 
 def test_slider_preview_flush_uses_shown_rows_for_plot_membership_not_only_highlighted_selection(
     main_window,
@@ -4280,7 +3050,6 @@ def test_slider_preview_flush_uses_shown_rows_for_plot_membership_not_only_highl
         explicit_series_by_id[dirty_primary_id],
     )
 
-
 def test_slider_preview_single_shown_dirty_set_flush_displays_canonical_ref(
     main_window,
     qt_app,
@@ -4363,7 +3132,6 @@ def test_slider_preview_single_shown_dirty_set_flush_displays_canonical_ref(
         np.asarray((canonical_ghost.get("series") or {})["A"], dtype=float),
         explicit_series,
     )
-
 
 def test_slider_preview_multiselect_flush_uses_requested_preview_cache_key_for_ghosts(
     main_window,
@@ -4470,254 +3238,499 @@ def test_slider_preview_multiselect_flush_uses_requested_preview_cache_key_for_g
         primary_canonical,
     )
 
-
-def test_display_cached_multiselect_with_default_result_store_keeps_all_clean_selected_curves(
-    main_window,
-    qt_app,
-):
-    from PySide6 import QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
+def test_direct_mechanism_edit_invalidates_displayed_explicit_results(main_window, qt_app, monkeypatch):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
     main_window._extract_and_populate_variables()
     main_window._batch_model.set_species(["A"])
-
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
     assert add_btn is not None
     add_btn.click()
     qt_app.processEvents()
 
-    _select_batch_rows(main_window, [0, 1])
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("edit triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0])
     qt_app.processEvents()
     selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 2
-    primary_id, secondary_id = selected_ids
+    assert len(selected_ids) == 1
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert second_set_id and second_set_id != selected_ids[0]
 
     cache = main_window.simulation_controller.batch_cache
-    explicit_key = "display-cached-multiselect-default-result-store-key"
-    primary_series = np.asarray([1.0, 2.0], dtype=float)
-    secondary_series = np.asarray([3.0, 4.0], dtype=float)
-    cache.result_cache[f"{explicit_key}::{primary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": primary_series},
-        "algebra_scalars": {},
-    }
-    cache.result_cache[f"{explicit_key}::{secondary_id}"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": secondary_series},
-        "algebra_scalars": {},
-    }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = tuple(selected_ids)
-    cache.active_batch_set_id = primary_id
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(primary_id) or "")
-    cache.last_display_selection = list(selected_ids)
-
-    assert main_window.display_cached_batch_selection(
-        cache_key=explicit_key,
-        selected_sets=selected_ids,
-        prefer_set=primary_id,
-        cache_store=None,
-        allow_fallback=False,
-    )
-
-    plot = main_window._plot_tabs._main_plot
-    assert np.allclose(np.asarray(getattr(plot, "_t", None), dtype=float), np.asarray([0.0, 1.0], dtype=float))
-    assert np.allclose(
-        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
-        primary_series,
-    )
-    overlays = list(getattr(plot, "_simulation_overlays", []) or [])
-    assert len(overlays) == 1
-    secondary_overlay = overlays[0]
-    assert str(secondary_overlay.get("label") or "") == str(main_window.batch_set_name_for_id(secondary_id) or secondary_id)
-    assert np.allclose(
-        np.asarray((secondary_overlay.get("series") or {})["A"], dtype=float),
-        secondary_series,
-    )
-
-
-def test_run_selected_reselect_same_set_never_redraws_staged_workspace_preview(
-    main_window,
-    qtbot,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    _select_batch_rows(main_window, [0])
-    qtbot.waitUntil(lambda: len(main_window._batch_set_ids_for_scope("selected")) == 1, timeout=1000)
-    set_id = str(main_window._batch_set_ids_for_scope("selected")[0])
-    main_window._mechanism_editor.set_slider_points_value(350)
-
-    cache = main_window.simulation_controller.batch_cache
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[set_id])
-
-    preview_t = _current_preview_time_axis(main_window)
-    preview_key = "run-selected-reselect-preview-cache-key"
-    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
-    preview_mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    preview_solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=set_id,
-        mechanism_text=preview_mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{set_id}"] = {
-        "t": preview_t,
-        "series": {"A": preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": preview_mechanism_text,
-        "solver_config": dict(preview_solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (set_id,)
-
-    display_lengths: list[int] = []
-    original_set_data = main_window.results_controller.set_data
-
-    def _recording_set_data(t, series, **kwargs):
-        display_lengths.append(int(np.asarray(t, dtype=float).reshape(-1).size))
-        return original_set_data(t, series, **kwargs)
-
-    monkeypatch.setattr(main_window.results_controller, "set_data", _recording_set_data, raising=True)
-
-    def _payload(worker) -> dict:
-        t = np.asarray(np.linspace(0.0, 1.0, 100, dtype=float))
-        y = np.vstack(
-            [
-                np.asarray(np.linspace(1.0, 0.3, t.size), dtype=float),
-                np.asarray(np.linspace(0.0, 0.7, t.size), dtype=float),
-            ]
-        )
-        return {
-            "t": t,
-            "Y": y,
-            "species_names": ["A", "B"],
+    explicit_key = "gui-slider-direct-edit-invalidates-explicit-results-cache-key"
+    for set_id in (selected_ids[0], second_set_id):
+        cache.result_cache[f"{explicit_key}::{set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
             "algebra_scalars": {},
-            "algebra_errors": [],
-            "mechanism": None,
-            "mechanism_text": worker._mechanism_text,
-            "solver_config": dict(worker._solver_config),
-            "provenance": {},
-            "fallback_occurred": False,
-            "fallback_message": None,
         }
-
-    monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload, emit_progress=(100, "done")),
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
+    cache.active_batch_set_id = selected_ids[0]
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
+    cache.last_display_selection = list(selected_ids)
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([7.0, 14.0], dtype=float)},
+        label="baseline",
+        overlays=[],
     )
 
-    main_window.simulation_controller.run_simulation_internal(fast_mode=False)
-    qtbot.waitUntil(lambda: 100 in display_lengths, timeout=1000)
-    assert main_window._preview_session.local_mechanism_workspace(set_id) == {}
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    qt_app.processEvents()
 
-    display_lengths.clear()
-    sel = main_window._batch_table.selectionModel()
-    assert sel is not None
-    sel.clearSelection()
-    QtWidgets.QApplication.processEvents()
+    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
+    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
 
-    _select_batch_rows(main_window, [0])
-    qtbot.waitUntil(lambda: len(display_lengths) >= 1, timeout=1000)
-
-    assert display_lengths
-    assert 100 in display_lengths
-    assert int(preview_t.size) not in display_lengths
-
-
-def test_run_selected_clears_only_targeted_dirty_sets_and_preserves_other_dirty_preview(
-    main_window,
-    qtbot,
-    monkeypatch,
-):
-    from PySide6 import QtWidgets
-
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
+def test_programmatic_mechanism_load_invalidates_displayed_explicit_results(main_window, qt_app, monkeypatch):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
     main_window._extract_and_populate_variables()
     main_window._batch_model.set_species(["A"])
-
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
     assert add_btn is not None
     add_btn.click()
-    qtbot.wait(10)
-
-    _select_batch_rows(main_window, [0, 1])
-    qtbot.waitUntil(lambda: len(main_window._batch_set_ids_for_scope("selected")) == 2, timeout=1000)
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected")]
-    target_set_id = selected_ids[0]
-    other_set_id = selected_ids[1]
-
-    cache = main_window.simulation_controller.batch_cache
-    main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[target_set_id])
-    main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[other_set_id])
-
-    preview_t = _current_preview_time_axis(main_window)
-    other_preview_series = np.asarray(np.linspace(11.0, 22.0, preview_t.size, dtype=float))
-    preview_key = "run-selected-preserve-other-dirty-preview-key"
-    other_preview_mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=other_set_id)
-    preview_solver_config, _, preview_token = main_window._current_workspace_preview_context(
-        set_id=other_set_id,
-        mechanism_text=other_preview_mechanism_text,
-    )
-    cache.preview_cache[f"{preview_key}::{other_set_id}"] = {
-        "t": preview_t,
-        "series": {"A": other_preview_series},
-        "algebra_scalars": {},
-        "mechanism_text": other_preview_mechanism_text,
-        "solver_config": dict(preview_solver_config),
-        "preview_batch_cache_token": str(preview_token or ""),
-    }
-    cache.active_preview_cache_key = preview_key
-    cache.active_preview_scope_set_ids = (other_set_id,)
-
-    def _payload(worker) -> dict:
-        t = np.asarray(np.linspace(0.0, 1.0, 100, dtype=float))
-        y = np.vstack(
-            [
-                np.asarray(np.linspace(1.0, 0.3, t.size), dtype=float),
-                np.asarray(np.linspace(0.0, 0.7, t.size), dtype=float),
-            ]
-        )
-        return {
-            "t": t,
-            "Y": y,
-            "species_names": ["A", "B"],
-            "algebra_scalars": {},
-            "algebra_errors": [],
-            "mechanism": None,
-            "mechanism_text": worker._mechanism_text,
-            "solver_config": dict(worker._solver_config),
-            "provenance": {},
-            "fallback_occurred": False,
-            "fallback_message": None,
-        }
+    qt_app.processEvents()
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload, emit_progress=(100, "done")),
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("programmatic load triggered run")),
+        raising=True,
     )
 
     _select_batch_rows(main_window, [0])
-    qtbot.waitUntil(lambda: len(main_window._batch_set_ids_for_scope("selected")) == 1, timeout=1000)
-    main_window.simulation_controller.run_simulation_internal(fast_mode=False)
-    qtbot.waitUntil(lambda: main_window._preview_session.local_mechanism_workspace(target_set_id) == {}, timeout=1000)
+    qt_app.processEvents()
+    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(selected_ids) == 1
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert second_set_id and second_set_id != selected_ids[0]
 
-    assert main_window._preview_session.local_mechanism_workspace(target_set_id) == {}
-    assert main_window._preview_session.local_mechanism_workspace(other_set_id) == {
-        "k1": pytest.approx(3.0)
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "gui-slider-programmatic-load-invalidates-explicit-results-cache-key"
+    for set_id in (selected_ids[0], second_set_id):
+        cache.result_cache[f"{explicit_key}::{set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
+            "algebra_scalars": {},
+        }
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
+    cache.active_batch_set_id = selected_ids[0]
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
+    cache.last_display_selection = list(selected_ids)
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([7.0, 14.0], dtype=float)},
+        label="baseline",
+        overlays=[],
+    )
+
+    reactions_widget = main_window._mechanism_editor._reactions_text
+    reactions_widget.blockSignals(True)
+    try:
+        reactions_widget.setPlainText("reaction: A -> B; k=3.0\ninitial: A=1.0\ninitial: B=0.0")
+    finally:
+        reactions_widget.blockSignals(False)
+
+    main_window._on_programmatic_mechanism_load()
+    qt_app.processEvents()
+
+    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
+    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+def test_pending_init_migration_rewrite_does_not_invalidate_displayed_explicit_results(
+    main_window, qt_app, monkeypatch
+):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    qt_app.processEvents()
+
+    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+        main_window._mechanism_editor._reactions_text.toPlainText(),
+        set_name="set1",
+    )
+    assert seed == {"A": 1.0, "B": 0.0}
+    assert rewrite != main_window._mechanism_editor._reactions_text.toPlainText()
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = "gui-slider-pending-init-migration-preserves-display-cache-key"
+    cache.active_cache_valid_set_ids = ("set1",)
+    cache.active_batch_set_id = "set1"
+    cache.active_batch_set = "set1"
+    cache.last_display_selection = ["set1"]
+    cache.result_cache[f"{cache.active_cache_key}::set1"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
+        "algebra_scalars": {},
     }
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([7.0, 14.0], dtype=float)},
+        label="set1",
+        overlays=[],
+    )
 
-    _select_batch_rows(main_window, [1])
-    qtbot.waitUntil(lambda: main_window.active_batch_selection()[0] == other_set_id, timeout=1000)
+    original_set_text = main_window.set_mechanism_reactions_text_with_optional_undo
+
+    def _set_text_and_replay_invalidation(new_text: str, description: str, *, record_undo: bool) -> None:
+        original_set_text(new_text, description, record_undo=record_undo)
+        QtCore.QTimer.singleShot(0, main_window._on_authoritative_mechanism_input_changed)
+
+    monkeypatch.setattr(
+        main_window,
+        "set_mechanism_reactions_text_with_optional_undo",
+        _set_text_and_replay_invalidation,
+        raising=True,
+    )
+
+    assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
+
+    applied = main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite)
+    qt_app.processEvents()
+    qt_app.processEvents()
+
+    assert applied is True
+    assert cache.active_cache_invalidated_set_ids is None
+    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
+    assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
+    assert dict(getattr(main_window._plot_tabs._main_plot, "_series", {}) or {}) != {}
+
+def test_pending_init_failed_run_reinvalidates_preserved_result(main_window, qt_app, monkeypatch):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    qt_app.processEvents()
+
+    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+        main_window._mechanism_editor._reactions_text.toPlainText(),
+        set_name="set1",
+    )
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = "gui-slider-pending-init-failed-run-invalidates-preserved-result"
+    cache.active_cache_valid_set_ids = ("set1",)
+    cache.active_batch_set_id = "set1"
+    cache.active_batch_set = "set1"
+    cache.last_display_selection = ["set1"]
+    cache.result_cache[f"{cache.active_cache_key}::set1"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
+        "algebra_scalars": {},
+    }
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([7.0, 14.0], dtype=float)},
+        label="set1",
+        overlays=[],
+    )
+
+    original_set_text = main_window.set_mechanism_reactions_text_with_optional_undo
+
+    def _set_text_and_replay_invalidation(new_text: str, description: str, *, record_undo: bool) -> None:
+        original_set_text(new_text, description, record_undo=record_undo)
+        QtCore.QTimer.singleShot(0, main_window._on_authoritative_mechanism_input_changed)
+
+    monkeypatch.setattr(
+        main_window,
+        "set_mechanism_reactions_text_with_optional_undo",
+        _set_text_and_replay_invalidation,
+        raising=True,
+    )
+
+    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    qt_app.processEvents()
+    qt_app.processEvents()
+    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
+    assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
+
+    main_window.invalidate_pending_init_preserved_results_after_failed_run()
+    qt_app.processEvents()
+
+    assert cache.active_cache_invalidated_set_ids == ("set1",)
+    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+def test_pending_init_guard_does_not_suppress_next_real_mechanism_edit(
+    main_window, qt_app, monkeypatch
+):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("edit triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(selected_ids) == 1
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert second_set_id and second_set_id != selected_ids[0]
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "gui-slider-pending-init-guard-next-edit-invalidates-cache-key"
+    for set_id in (selected_ids[0], second_set_id):
+        cache.result_cache[f"{explicit_key}::{set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
+            "algebra_scalars": {},
+        }
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
+    cache.active_batch_set_id = selected_ids[0]
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
+    cache.last_display_selection = list(selected_ids)
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([7.0, 14.0], dtype=float)},
+        label="baseline",
+        overlays=[],
+    )
+
+    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+        main_window._mechanism_editor._reactions_text.toPlainText(),
+        set_name="set1",
+    )
+    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    main_window.arm_pending_init_result_invalidation_guard()
+    qt_app.processEvents()
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0"
+    )
+    qt_app.processEvents()
+
+    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
+    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+def test_pending_init_guard_does_not_suppress_next_real_state_network_edit(
+    main_window, qt_app, monkeypatch
+):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state-network edit triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(selected_ids) == 1
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert second_set_id and second_set_id != selected_ids[0]
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "gui-slider-pending-init-guard-state-network-edit-invalidates-cache-key"
+    for set_id in (selected_ids[0], second_set_id):
+        cache.result_cache[f"{explicit_key}::{set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
+            "algebra_scalars": {},
+        }
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
+    cache.active_batch_set_id = selected_ids[0]
+    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
+    cache.last_display_selection = list(selected_ids)
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([7.0, 14.0], dtype=float)},
+        label="baseline",
+        overlays=[],
+    )
+
+    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+        main_window._mechanism_editor._reactions_text.toPlainText(),
+        set_name="set1",
+    )
+    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    main_window.arm_pending_init_result_invalidation_guard()
+    qt_app.processEvents()
+
+    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(
+        "\n".join(
+            [
+                "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+                "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
+                "state: B, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+                "edge: A,TS1",
+                "edge: TS1,B",
+            ]
+        )
+    )
+    qt_app.processEvents()
+
+    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
+    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+def test_first_explicit_run_after_example_load_keeps_displayed_result(main_window, qt_app, monkeypatch):
+    from PySide6 import QtCore
+
+    class _AsyncWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        result_ready = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+
+        def __init__(
+            self,
+            mechanism_text,
+            initials,
+            t_span,
+            solver_config,
+            parent=None,
+            prepared=None,
+            include_mechanism_in_result_payload=True,
+        ):
+            super().__init__(parent)
+            self._running = False
+            self._mechanism_text = str(mechanism_text)
+            self._prepared = prepared
+            self._fast_mode = False
+
+        def start(self) -> None:
+            self._running = True
+
+            def _finish() -> None:
+                self.progress.emit(100, "done")
+                self.result_ready.emit(_worker_payload(self._prepared or {}, self._mechanism_text))
+                self._running = False
+
+            QtCore.QTimer.singleShot(0, _finish)
+
+        def cancel(self) -> None:
+            self._running = False
+
+        def isRunning(self) -> bool:
+            return bool(self._running)
+
+        def wait(self, *_args, **_kwargs) -> bool:
+            self._running = False
+            return True
+
+        def terminate(self) -> None:
+            self._running = False
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _AsyncWorker)
+
+    main_window._load_preset_mechanism("M1")
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    main_window.simulation_controller.run_simulation()
+    for _ in range(6):
+        qt_app.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
     plot = main_window._plot_tabs._main_plot
-    displayed_series = np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float)
-    assert np.allclose(displayed_series, other_preview_series)
-    assert displayed_series.size == preview_t.size
-    assert main_window._mechanism_editor._variable_sliders.get_variables()["k1"] == pytest.approx(3.0)
+    assert getattr(plot, "_t", None) is not None
+    assert dict(getattr(plot, "_series", {}) or {}) != {}
+    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
+
+def test_open_solver_settings_ok_without_changes_preserves_focused_slider_preview_state(
+    main_window, qt_app, monkeypatch
+):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+
+    focused_set_id = str(main_window._preview_session.focused_mechanism_workspace_set_id() or "").strip()
+    assert focused_set_id
+
+    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[focused_set_id])
+    main_window._sync_mechanism_controls_to_focused_batch_set()
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([3.0, 6.0], dtype=float)},
+        label=focused_set_id,
+        overlays=[],
+    )
+    plot = main_window._plot_tabs._main_plot
+    before_t = np.asarray(plot._t, dtype=float).copy()
+    before_series = np.asarray(plot._series["A"], dtype=float).copy()
+    assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
+
+    extract_calls: list[bool] = []
+    original_extract = main_window._extract_and_populate_variables
+
+    def _spy_extract_and_populate_variables(*, preserve_visibility: bool = False):
+        extract_calls.append(bool(preserve_visibility))
+        return original_extract(preserve_visibility=bool(preserve_visibility))
+
+    class _FakeDialog:
+        def __init__(self, _parent, *, cache_port=None):
+            self._settings = {}
+            self._cache_port = cache_port
+
+        def set_settings(self, settings):
+            self._settings = dict(settings or {})
+
+        def exec(self):
+            return True
+
+        def get_settings(self):
+            return dict(self._settings)
+
+    monkeypatch.setattr(
+        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
+        _FakeDialog,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_extract_and_populate_variables",
+        _spy_extract_and_populate_variables,
+        raising=True,
+    )
+
+    main_window._open_solver_settings()
+    qt_app.processEvents()
+
+    assert extract_calls == []
+    assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
+    assert np.array_equal(np.asarray(plot._t, dtype=float), before_t)
+    assert np.array_equal(np.asarray(plot._series["A"], dtype=float), before_series)
 
 
 def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_staged_overlays(
@@ -4846,637 +3859,3 @@ def test_run_selected_after_slider_gesture_does_not_replay_fast_preview(
 
     assert 100 in display_lengths
     assert 350 not in display_lengths
-
-
-def test_slider_preview_then_run_selected_then_reselect_same_set_stays_canonical_after_reset(
-    main_window,
-    qtbot,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._mechanism_editor.set_slider_points_value(350)
-    main_window._batch_model.set_species(["A"])
-
-    _select_batch_rows(main_window, [0])
-    qtbot.waitUntil(lambda: len(main_window._batch_set_ids_for_scope("selected")) == 1, timeout=1000)
-    set_id = str(main_window._batch_set_ids_for_scope("selected")[0])
-
-    display_lengths: list[int] = []
-    original_set_data = main_window.results_controller.set_data
-
-    def _recording_set_data(t, series, **kwargs):
-        display_lengths.append(int(np.asarray(t, dtype=float).reshape(-1).size))
-        return original_set_data(t, series, **kwargs)
-
-    monkeypatch.setattr(main_window.results_controller, "set_data", _recording_set_data, raising=True)
-
-    def _payload(worker) -> dict:
-        point_count = 350 if bool(getattr(worker, "_fast_mode", False)) else 100
-        t_end = 50.0 if bool(getattr(worker, "_fast_mode", False)) else 1.0
-        t = np.asarray(np.linspace(0.0, t_end, point_count, dtype=float))
-        y = np.vstack(
-            [
-                np.asarray(np.linspace(1.0, 0.3, t.size), dtype=float),
-                np.asarray(np.linspace(0.0, 0.7, t.size), dtype=float),
-            ]
-        )
-        return {
-            "t": t,
-            "Y": y,
-            "species_names": ["A", "B"],
-            "algebra_scalars": {},
-            "algebra_errors": [],
-            "mechanism": None,
-            "mechanism_text": worker._mechanism_text,
-            "solver_config": dict(worker._solver_config),
-            "provenance": {},
-            "fallback_occurred": False,
-            "fallback_message": None,
-        }
-
-    monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload, emit_progress=(100, "done")),
-    )
-
-    sliders = main_window._mechanism_editor._variable_sliders
-    sliders.update_variable("k1", 2.0)
-    main_window._on_variable_changed("k1", 2.0)
-    main_window.simulation_controller.run_simulation_from_slider()
-    qtbot.waitUntil(lambda: 350 in display_lengths, timeout=2000)
-
-    display_lengths.clear()
-    main_window.simulation_controller._run_simulation()
-    qtbot.waitUntil(lambda: 100 in display_lengths, timeout=1000)
-
-    display_lengths.clear()
-    sel = main_window._batch_table.selectionModel()
-    assert sel is not None
-    sel.clearSelection()
-    QtWidgets.QApplication.processEvents()
-
-    _select_batch_rows(main_window, [0])
-    qtbot.waitUntil(lambda: len(display_lengths) >= 1, timeout=1000)
-
-    assert display_lengths
-    assert 100 in display_lengths
-    assert 350 not in display_lengths
-    assert main_window._preview_session.local_mechanism_workspace(set_id) == {}
-    assert main_window.variable_slider_values()["k1"] == pytest.approx(1.0)
-
-
-def test_run_selected_success_immediately_resyncs_focused_controls_after_targeted_workspace_reset(
-    main_window,
-    qtbot,
-    monkeypatch,
-):
-    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-
-    _select_batch_rows(main_window, [0])
-    qtbot.waitUntil(lambda: len(main_window._batch_set_ids_for_scope("selected")) == 1, timeout=1000)
-    set_id = str(main_window._batch_set_ids_for_scope("selected")[0])
-
-    def _payload(worker) -> dict:
-        t = np.asarray(np.linspace(0.0, 1.0, 100, dtype=float))
-        y = np.vstack(
-            [
-                np.asarray(np.linspace(1.0, 0.3, t.size), dtype=float),
-                np.asarray(np.linspace(0.0, 0.7, t.size), dtype=float),
-            ]
-        )
-        return {
-            "t": t,
-            "Y": y,
-            "species_names": ["A", "B"],
-            "algebra_scalars": {},
-            "algebra_errors": [],
-            "mechanism": None,
-            "mechanism_text": worker._mechanism_text,
-            "solver_config": dict(worker._solver_config),
-            "provenance": {},
-            "fallback_occurred": False,
-            "fallback_message": None,
-        }
-
-    monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload, emit_progress=(100, "done")),
-    )
-
-    sliders = main_window._mechanism_editor._variable_sliders
-    sliders.update_variable("k1", 2.0)
-    main_window._on_variable_changed("k1", 2.0)
-    qtbot.waitUntil(lambda: main_window.variable_slider_values()["k1"] == pytest.approx(2.0), timeout=1000)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
-
-    main_window.simulation_controller.run_simulation_internal(fast_mode=False)
-    qtbot.waitUntil(lambda: main_window._preview_session.local_mechanism_workspace(set_id) == {}, timeout=1000)
-
-    assert main_window._preview_session.local_mechanism_workspace(set_id) == {}
-    assert main_window.variable_slider_values()["k1"] == pytest.approx(1.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
-
-
-def test_direct_mechanism_edit_invalidates_displayed_explicit_results(main_window, qt_app, monkeypatch):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("edit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert second_set_id and second_set_id != selected_ids[0]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-direct-edit-invalidates-explicit-results-cache-key"
-    for set_id in (selected_ids[0], second_set_id):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
-    cache.active_batch_set_id = selected_ids[0]
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
-    cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([7.0, 14.0], dtype=float)},
-        label="baseline",
-        overlays=[],
-    )
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_programmatic_mechanism_load_invalidates_displayed_explicit_results(main_window, qt_app, monkeypatch):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("programmatic load triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert second_set_id and second_set_id != selected_ids[0]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-programmatic-load-invalidates-explicit-results-cache-key"
-    for set_id in (selected_ids[0], second_set_id):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
-    cache.active_batch_set_id = selected_ids[0]
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
-    cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([7.0, 14.0], dtype=float)},
-        label="baseline",
-        overlays=[],
-    )
-
-    reactions_widget = main_window._mechanism_editor._reactions_text
-    reactions_widget.blockSignals(True)
-    try:
-        reactions_widget.setPlainText("reaction: A -> B; k=3.0\ninitial: A=1.0\ninitial: B=0.0")
-    finally:
-        reactions_widget.blockSignals(False)
-
-    main_window._on_programmatic_mechanism_load()
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_pending_init_migration_rewrite_does_not_invalidate_displayed_explicit_results(
-    main_window, qt_app, monkeypatch
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    qt_app.processEvents()
-
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
-        main_window._mechanism_editor._reactions_text.toPlainText(),
-        set_name="set1",
-    )
-    assert seed == {"A": 1.0, "B": 0.0}
-    assert rewrite != main_window._mechanism_editor._reactions_text.toPlainText()
-
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_cache_key = "gui-slider-pending-init-migration-preserves-display-cache-key"
-    cache.active_cache_valid_set_ids = ("set1",)
-    cache.active_batch_set_id = "set1"
-    cache.active_batch_set = "set1"
-    cache.last_display_selection = ["set1"]
-    cache.result_cache[f"{cache.active_cache_key}::set1"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([7.0, 14.0], dtype=float)},
-        label="set1",
-        overlays=[],
-    )
-
-    original_set_text = main_window.set_mechanism_reactions_text_with_optional_undo
-
-    def _set_text_and_replay_invalidation(new_text: str, description: str, *, record_undo: bool) -> None:
-        original_set_text(new_text, description, record_undo=record_undo)
-        QtCore.QTimer.singleShot(0, main_window._on_authoritative_mechanism_input_changed)
-
-    monkeypatch.setattr(
-        main_window,
-        "set_mechanism_reactions_text_with_optional_undo",
-        _set_text_and_replay_invalidation,
-        raising=True,
-    )
-
-    assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
-
-    applied = main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite)
-    qt_app.processEvents()
-    qt_app.processEvents()
-
-    assert applied is True
-    assert cache.active_cache_invalidated_set_ids is None
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
-    assert dict(getattr(main_window._plot_tabs._main_plot, "_series", {}) or {}) != {}
-
-
-def test_pending_init_failed_run_reinvalidates_preserved_result(main_window, qt_app, monkeypatch):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    qt_app.processEvents()
-
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
-        main_window._mechanism_editor._reactions_text.toPlainText(),
-        set_name="set1",
-    )
-    cache = main_window.simulation_controller.batch_cache
-    cache.active_cache_key = "gui-slider-pending-init-failed-run-invalidates-preserved-result"
-    cache.active_cache_valid_set_ids = ("set1",)
-    cache.active_batch_set_id = "set1"
-    cache.active_batch_set = "set1"
-    cache.last_display_selection = ["set1"]
-    cache.result_cache[f"{cache.active_cache_key}::set1"] = {
-        "t": np.asarray([0.0, 1.0], dtype=float),
-        "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-        "algebra_scalars": {},
-    }
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([7.0, 14.0], dtype=float)},
-        label="set1",
-        overlays=[],
-    )
-
-    original_set_text = main_window.set_mechanism_reactions_text_with_optional_undo
-
-    def _set_text_and_replay_invalidation(new_text: str, description: str, *, record_undo: bool) -> None:
-        original_set_text(new_text, description, record_undo=record_undo)
-        QtCore.QTimer.singleShot(0, main_window._on_authoritative_mechanism_input_changed)
-
-    monkeypatch.setattr(
-        main_window,
-        "set_mechanism_reactions_text_with_optional_undo",
-        _set_text_and_replay_invalidation,
-        raising=True,
-    )
-
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
-    qt_app.processEvents()
-    qt_app.processEvents()
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-    assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
-
-    main_window.invalidate_pending_init_preserved_results_after_failed_run()
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == ("set1",)
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_pending_init_guard_does_not_suppress_next_real_mechanism_edit(
-    main_window, qt_app, monkeypatch
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("edit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert second_set_id and second_set_id != selected_ids[0]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-pending-init-guard-next-edit-invalidates-cache-key"
-    for set_id in (selected_ids[0], second_set_id):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
-    cache.active_batch_set_id = selected_ids[0]
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
-    cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([7.0, 14.0], dtype=float)},
-        label="baseline",
-        overlays=[],
-    )
-
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
-        main_window._mechanism_editor._reactions_text.toPlainText(),
-        set_name="set1",
-    )
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
-    main_window.arm_pending_init_result_invalidation_guard()
-    qt_app.processEvents()
-
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=2.0"
-    )
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_pending_init_guard_does_not_suppress_next_real_state_network_edit(
-    main_window, qt_app, monkeypatch
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-    main_window._batch_model.set_species(["A"])
-    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
-    assert add_btn is not None
-    add_btn.click()
-    qt_app.processEvents()
-
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "run_simulation_internal",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state-network edit triggered run")),
-        raising=True,
-    )
-
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
-    assert len(selected_ids) == 1
-    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
-    assert second_set_id and second_set_id != selected_ids[0]
-
-    cache = main_window.simulation_controller.batch_cache
-    explicit_key = "gui-slider-pending-init-guard-state-network-edit-invalidates-cache-key"
-    for set_id in (selected_ids[0], second_set_id):
-        cache.result_cache[f"{explicit_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
-            "algebra_scalars": {},
-        }
-    cache.active_cache_key = explicit_key
-    cache.active_cache_valid_set_ids = (selected_ids[0], second_set_id)
-    cache.active_batch_set_id = selected_ids[0]
-    cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
-    cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([7.0, 14.0], dtype=float)},
-        label="baseline",
-        overlays=[],
-    )
-
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
-        main_window._mechanism_editor._reactions_text.toPlainText(),
-        set_name="set1",
-    )
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
-    main_window.arm_pending_init_result_invalidation_guard()
-    qt_app.processEvents()
-
-    main_window._mechanism_editor._state_network_editor.set_state_network_dsl(
-        "\n".join(
-            [
-                "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
-                "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
-                "state: B, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
-                "edge: A,TS1",
-                "edge: TS1,B",
-            ]
-        )
-    )
-    qt_app.processEvents()
-
-    assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert main_window.active_batch_selection() == ("", "")
-    _assert_selection_plot_cleared(main_window)
-
-
-def test_first_explicit_run_after_example_load_keeps_displayed_result(main_window, qt_app, monkeypatch):
-    from PySide6 import QtCore
-
-    class _AsyncWorker(QtCore.QObject):
-        progress = QtCore.Signal(int, str)
-        result_ready = QtCore.Signal(dict)
-        error = QtCore.Signal(str)
-
-        def __init__(
-            self,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent=None,
-            prepared=None,
-            include_mechanism_in_result_payload=True,
-        ):
-            super().__init__(parent)
-            self._running = False
-            self._mechanism_text = str(mechanism_text)
-            self._prepared = prepared
-            self._fast_mode = False
-
-        def start(self) -> None:
-            self._running = True
-
-            def _finish() -> None:
-                self.progress.emit(100, "done")
-                self.result_ready.emit(_worker_payload(self._prepared or {}, self._mechanism_text))
-                self._running = False
-
-            QtCore.QTimer.singleShot(0, _finish)
-
-        def cancel(self) -> None:
-            self._running = False
-
-        def isRunning(self) -> bool:
-            return bool(self._running)
-
-        def wait(self, *_args, **_kwargs) -> bool:
-            self._running = False
-            return True
-
-        def terminate(self) -> None:
-            self._running = False
-
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _AsyncWorker)
-
-    main_window._load_preset_mechanism("M1")
-    qt_app.processEvents()
-    _select_batch_rows(main_window, [0])
-    qt_app.processEvents()
-
-    main_window.simulation_controller.run_simulation()
-    for _ in range(6):
-        qt_app.processEvents()
-        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
-
-    plot = main_window._plot_tabs._main_plot
-    assert getattr(plot, "_t", None) is not None
-    assert dict(getattr(plot, "_series", {}) or {}) != {}
-    assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
-
-
-def test_open_solver_settings_ok_without_changes_preserves_focused_slider_preview_state(
-    main_window, qt_app, monkeypatch
-):
-    main_window._mechanism_editor._reactions_text.setPlainText(
-        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
-    )
-    main_window._extract_and_populate_variables()
-
-    focused_set_id = str(main_window._preview_session.focused_mechanism_workspace_set_id() or "").strip()
-    assert focused_set_id
-
-    main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[focused_set_id])
-    main_window._sync_mechanism_controls_to_focused_batch_set()
-    main_window.set_data(
-        np.asarray([0.0, 1.0], dtype=float),
-        {"A": np.asarray([3.0, 6.0], dtype=float)},
-        label=focused_set_id,
-        overlays=[],
-    )
-    plot = main_window._plot_tabs._main_plot
-    before_t = np.asarray(plot._t, dtype=float).copy()
-    before_series = np.asarray(plot._series["A"], dtype=float).copy()
-    assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
-
-    extract_calls: list[bool] = []
-    original_extract = main_window._extract_and_populate_variables
-
-    def _spy_extract_and_populate_variables(*, preserve_visibility: bool = False):
-        extract_calls.append(bool(preserve_visibility))
-        return original_extract(preserve_visibility=bool(preserve_visibility))
-
-    class _FakeDialog:
-        def __init__(self, _parent, *, cache_port=None):
-            self._settings = {}
-            self._cache_port = cache_port
-
-        def set_settings(self, settings):
-            self._settings = dict(settings or {})
-
-        def exec(self):
-            return True
-
-        def get_settings(self):
-            return dict(self._settings)
-
-    monkeypatch.setattr(
-        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
-        _FakeDialog,
-    )
-    monkeypatch.setattr(
-        main_window,
-        "_extract_and_populate_variables",
-        _spy_extract_and_populate_variables,
-        raising=True,
-    )
-
-    main_window._open_solver_settings()
-    qt_app.processEvents()
-
-    assert extract_calls == []
-    assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
-    assert np.array_equal(np.asarray(plot._t, dtype=float), before_t)
-    assert np.array_equal(np.asarray(plot._series["A"], dtype=float), before_series)

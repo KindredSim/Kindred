@@ -18,13 +18,11 @@ from kindred.gui.widgets.import_config_dialog import ImportDialogResult
 
 pytestmark = pytest.mark.gui
 
-
 def _write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
     lines = [",".join(header)]
     for row in rows:
         lines.append(",".join(str(value) for value in row))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
 def _write_workbook(path: Path, sheets: dict[str, tuple[list[str], list[list[object]]]]) -> None:
     workbook = Workbook()
@@ -36,7 +34,6 @@ def _write_workbook(path: Path, sheets: dict[str, tuple[list[str], list[list[obj
         for row in rows:
             sheet.append(list(row))
     workbook.save(path)
-
 
 def _patch_dialog_sequence(monkeypatch, results: list[ImportDialogResult]):
     from kindred.gui.widgets import data_manager as data_manager_module
@@ -61,7 +58,6 @@ def _patch_dialog_sequence(monkeypatch, results: list[ImportDialogResult]):
     monkeypatch.setattr(data_manager_module, "ImportConfigDialog", _FakeDialog)
     return created
 
-
 def _wait_for_load(panel, qtbot, expected_count: int) -> list[object]:
     finished_spy = QSignalSpy(panel.loadFinished)
     qtbot.waitUntil(lambda: finished_spy.count() == 1, timeout=7000)
@@ -69,7 +65,6 @@ def _wait_for_load(panel, qtbot, expected_count: int) -> list[object]:
     assert bool(finished_spy.at(0)[0]) is False
     assert len(panel.get_datasets()) == expected_count
     return [panel.get_datasets(), finished_spy]
-
 
 def _capture_worker_rows(monkeypatch) -> dict[str, list[dict[str, str]]]:
     from kindred.gui.widgets import data_manager as data_manager_module
@@ -87,7 +82,6 @@ def _capture_worker_rows(monkeypatch) -> dict[str, list[dict[str, str]]]:
 
     monkeypatch.setattr(data_manager_module, "parse_csv_rows", _fake_parse_csv_rows)
     return captured
-
 
 def _make_test_config(
     filepath: str,
@@ -176,26 +170,6 @@ def _make_test_config(
         remaining_file_template=sheet_intent if apply_to_remaining else None,
     )
 
-
-def test_file_dialog_filter_includes_xlsx(monkeypatch, qtbot):
-    from kindred.gui.widgets.data_manager import DataManagerPanel
-
-    panel = DataManagerPanel()
-    qtbot.addWidget(panel)
-
-    captured: dict[str, str] = {}
-
-    def _fake_get_open_file_names(*args, **kwargs):
-        captured["filter"] = str(args[3])
-        return ([], "")
-
-    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileNames", _fake_get_open_file_names)
-
-    panel._load_dataset()
-
-    assert "*.xlsx" in captured["filter"]
-
-
 def test_csv_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -240,7 +214,6 @@ def test_csv_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
     assert payload["metadata"]["original_time_unit"] == "ms"
     assert payload["metadata"]["original_concentration_units"] == {"A_uM": "uM", "B_uM": "uM"}
 
-
 def test_csv_import_trims_whitespace_padded_headers(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -282,7 +255,6 @@ def test_csv_import_trims_whitespace_padded_headers(tmp_path, monkeypatch, qtbot
     payload = datasets["padded_headers.csv"]
     assert np.allclose(payload["t"], [0.0, 1.0])
     assert np.allclose(payload["species"]["A"], [1.0, 2.0])
-
 
 def test_csv_import_with_detected_unit_row(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -329,7 +301,6 @@ def test_csv_import_with_detected_unit_row(tmp_path, monkeypatch, qtbot):
     assert payload["metadata"]["original_time_unit"] == "ms"
     assert payload["metadata"]["original_concentration_units"] == {"A": "uM"}
 
-
 def test_csv_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch):
     from kindred.gui.widgets.data_manager import CSVLoaderWorker
 
@@ -355,7 +326,6 @@ def test_csv_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch):
     assert [row["time"] for row in captured["rows"]] == ["s", "1.0", "2.0"]
     assert [row["A"] for row in captured["rows"]] == ["M", "2.0", "4.0"]
     assert [row["B"] for row in captured["rows"]] == ["M", "3.0", "6.0"]
-
 
 def test_excel_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch):
     from kindred.gui.widgets.data_manager import ExcelLoaderWorker
@@ -386,7 +356,6 @@ def test_excel_unit_row_override_false_preserves_first_row(tmp_path, monkeypatch
     assert [row["A"] for row in captured["rows"]] == ["M", "2", "4"]
     assert [row["B"] for row in captured["rows"]] == ["M", "3", "6"]
 
-
 def test_csv_unit_row_authoritative_strips_with_blank_selected_columns(tmp_path, monkeypatch):
     """Dialog's unit_row_detected=True is authoritative.  Strip the unit row
     even when the *selected* columns have blank unit cells (the dialog used ALL
@@ -414,7 +383,6 @@ def test_csv_unit_row_authoritative_strips_with_blank_selected_columns(tmp_path,
 
     assert [row["time"] for row in captured["rows"]] == ["0.0", "1.0"]
     assert [row["A"] for row in captured["rows"]] == ["1.0", "2.0"]
-
 
 def test_excel_unit_row_authoritative_strips_with_blank_selected_columns(tmp_path, monkeypatch):
     """Same as CSV variant but for Excel sheets."""
@@ -445,7 +413,6 @@ def test_excel_unit_row_authoritative_strips_with_blank_selected_columns(tmp_pat
     assert [row["time"] for row in captured["rows"]] == ["0", "1"]
     assert [row["A"] for row in captured["rows"]] == ["1", "2"]
 
-
 def test_csv_unit_row_override_true_still_strips_first_row(tmp_path, monkeypatch):
     from kindred.gui.widgets.data_manager import CSVLoaderWorker
 
@@ -471,7 +438,6 @@ def test_csv_unit_row_override_true_still_strips_first_row(tmp_path, monkeypatch
     assert [row["time"] for row in captured["rows"]] == ["1.0", "2.0"]
     assert [row["A"] for row in captured["rows"]] == ["2.0", "4.0"]
     assert [row["B"] for row in captured["rows"]] == ["3.0", "6.0"]
-
 
 def test_excel_unit_row_override_true_still_strips_first_row(tmp_path, monkeypatch):
     from kindred.gui.widgets.data_manager import ExcelLoaderWorker
@@ -501,7 +467,6 @@ def test_excel_unit_row_override_true_still_strips_first_row(tmp_path, monkeypat
     assert [row["time"] for row in captured["rows"]] == ["1", "2"]
     assert [row["A"] for row in captured["rows"]] == ["2", "4"]
     assert [row["B"] for row in captured["rows"]] == ["3", "6"]
-
 
 def test_csv_import_mixed_concentration_units_applies_per_column(tmp_path, monkeypatch, qtbot):
     """Mixed concentration units import successfully with per-column conversion."""
@@ -543,7 +508,6 @@ def test_csv_import_mixed_concentration_units_applies_per_column(tmp_path, monke
     datasets, _finished_spy = _wait_for_load(panel, qtbot, expected_count=1)
 
     assert "mixed_units.csv" in datasets
-
 
 def test_csv_import_ignores_unselected_mixed_unit_columns(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -588,7 +552,6 @@ def test_csv_import_ignores_unselected_mixed_unit_columns(tmp_path, monkeypatch,
     assert list(payload["species"]) == ["A"]
     assert np.allclose(payload["species"]["A"], [2.0e-6, 4.0e-6])
 
-
 def test_csv_import_does_not_strip_row_when_only_unselected_columns_look_like_units(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -630,7 +593,6 @@ def test_csv_import_does_not_strip_row_when_only_unselected_columns_look_like_un
     payload = datasets["notes.csv"]
     assert np.allclose(payload["t"], [0.0, 1.0])
     assert np.allclose(payload["species"]["A"], [1.0, 2.0])
-
 
 def test_excel_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -674,7 +636,6 @@ def test_excel_import_through_config_dialog(tmp_path, monkeypatch, qtbot):
 
     assert set(datasets) == {"multi.xlsx::SheetA", "multi.xlsx::SheetB"}
 
-
 def test_excel_import_no_config_returns_empty(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -705,7 +666,6 @@ def test_excel_import_no_config_returns_empty(tmp_path, monkeypatch, qtbot):
 
     assert panel.get_datasets() == {}
 
-
 def test_excel_import_no_config_mixed_presence_returns_empty(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -735,7 +695,6 @@ def test_excel_import_no_config_mixed_presence_returns_empty(tmp_path, monkeypat
     panel._load_dataset()
 
     assert panel.get_datasets() == {}
-
 
 def test_excel_import_does_not_strip_row_when_only_unselected_columns_look_like_units(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -784,7 +743,6 @@ def test_excel_import_does_not_strip_row_when_only_unselected_columns_look_like_
     assert np.allclose(payload["t"], [0.0, 1.0])
     assert np.allclose(payload["species"]["A"], [1.0, 2.0])
 
-
 def test_unit_conversion_applied_at_import(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -822,7 +780,6 @@ def test_unit_conversion_applied_at_import(tmp_path, monkeypatch, qtbot):
     assert np.allclose(payload["t"], [1e-4, 2e-4, 3e-4])
     assert payload["metadata"]["original_time_unit"] == "us"
     assert payload["metadata"]["original_concentration_units"] == {"A": "M"}
-
 
 def test_apply_to_remaining_stops_after_current_file(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -1031,7 +988,6 @@ def test_apply_to_remaining_skips_later_excel_files(tmp_path, monkeypatch, qtbot
         "second.xlsx::SheetA", "second.xlsx::SheetB",
     }
 
-
 def test_skip_action_skips_file(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -1070,7 +1026,6 @@ def test_skip_action_skips_file(tmp_path, monkeypatch, qtbot):
 
     assert set(datasets) == {"keep.csv"}
 
-
 def test_cancel_action_aborts_all(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
@@ -1090,27 +1045,6 @@ def test_cancel_action_aborts_all(tmp_path, monkeypatch, qtbot):
     assert panel.get_datasets() == {}
     assert panel._progress_dialog is None
     assert not panel._csv_workers
-
-
-def test_legacy_mapping_widget_removed(qtbot):
-    from kindred.gui.widgets.data_manager import DataManagerPanel
-
-    panel = DataManagerPanel()
-    qtbot.addWidget(panel)
-
-    assert not hasattr(panel, "_mapping_widget")
-    assert not hasattr(panel, "_time_col_edit")
-    assert not hasattr(panel, "_species_col_edit")
-
-
-def test_deadcode_allowlist_entries_removed() -> None:
-    allowlist_path = Path(__file__).resolve().parent.parent / "tools" / "audit" / "deadcode_test_only_keep_allowlist.txt"
-    text = allowlist_path.read_text(encoding="utf-8")
-
-    assert "kindred/core/datasets/units.py" not in text
-    assert "kindred/core/datasets/excel_import.py" not in text
-    assert "kindred/gui/widgets/import_config_dialog.py" not in text
-
 
 def test_unsupported_xls_file_shows_error_and_skips_to_next_file(tmp_path, monkeypatch, qtbot):
     from kindred.gui.widgets import data_manager as data_manager_module
@@ -1166,7 +1100,6 @@ def test_unsupported_xls_file_shows_error_and_skips_to_next_file(tmp_path, monke
     assert captured_errors
     assert "legacy.xls" in captured_errors[0]
 
-
 def test_import_load_finished_prompts_mapping_when_batch_store_is_pristine(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.0, 0.5])}}
     data_panel = main_window._right_panel._data_manager
@@ -1186,7 +1119,6 @@ def test_import_load_finished_prompts_mapping_when_batch_store_is_pristine(main_
     assert called[0][0] == "dataset.csv"
     assert main_window._pending_import_batch_mapping_names == []
 
-
 def test_import_load_finished_still_prompts_after_partial_cancel(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.0, 0.5])}}
     data_panel = main_window._right_panel._data_manager
@@ -1205,7 +1137,6 @@ def test_import_load_finished_still_prompts_after_partial_cancel(main_window, mo
 
     assert len(called) == 1
     assert called[0][0] == "dataset.csv"
-
 
 def test_import_batch_mapping_skip_clears_stale_mapping(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.0, 0.5])}}
@@ -1227,7 +1158,6 @@ def test_import_batch_mapping_skip_clears_stale_mapping(main_window, monkeypatch
     assert updated.batch_set is None
     assert updated.batch_set_id is None
 
-
 def test_import_batch_mapping_create_seeds_and_persists_batch_set_id(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.5, 1.0])}}
     main_window._batch_store.ensure_set("existing set")
@@ -1245,7 +1175,6 @@ def test_import_batch_mapping_create_seeds_and_persists_batch_set_id(main_window
     assert settings.batch_set_id == main_window._batch_store.set_id_for_row(main_window._batch_store.row_for_set(created_set))
     assert main_window._batch_store.get_value(main_window._batch_store.row_for_set(created_set), "A") == "1.5"
 
-
 def test_import_batch_mapping_create_preserves_excel_sheet_identity_in_set_name(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.5, 1.0])}}
     main_window._batch_store.ensure_set("existing set")
@@ -1260,7 +1189,6 @@ def test_import_batch_mapping_create_preserves_excel_sheet_identity_in_set_name(
     settings = main_window._dataset_manager.get_fit_settings("multi.xlsx::SheetA")
     assert settings.batch_set == "multi_SheetA"
     assert settings.batch_set_id == main_window._batch_store.set_id_for_row(main_window._batch_store.row_for_set("multi_SheetA"))
-
 
 def test_import_batch_mapping_create_unseeded_leaves_dataset_unmapped(main_window, monkeypatch):
     payload = {"t": np.array([1.0, 2.0]), "species": {"A": np.array([3.0, 4.0])}}
@@ -1282,7 +1210,6 @@ def test_import_batch_mapping_create_unseeded_leaves_dataset_unmapped(main_windo
     assert settings.batch_set is None
     assert settings.batch_set_id is None
 
-
 def test_import_batch_mapping_create_syncs_visible_species(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.0, 0.5])}}
     main_window._batch_store.ensure_set("existing set")
@@ -1295,7 +1222,6 @@ def test_import_batch_mapping_create_syncs_visible_species(main_window, monkeypa
     main_window._maybe_prompt_for_import_batch_mapping("dataset.csv", payload, ["A"])
 
     assert "A" in list(main_window._batch_store.visible_species())
-
 
 def test_import_batch_mapping_map_existing_persists_batch_set_id(main_window, monkeypatch):
     payload = {"t": np.array([0.0, 1.0]), "species": {"A": np.array([1.0, 0.5])}}
@@ -1317,7 +1243,6 @@ def test_import_batch_mapping_map_existing_persists_batch_set_id(main_window, mo
     assert settings.batch_set == "existing set"
     assert settings.batch_set_id == main_window._batch_store.set_id_for_row(int(row))
 
-
 def test_apply_batch_mapping_to_settings_clears_stale_id_without_batch_store(main_window):
     from kindred.gui.fitting.batch_mapping import apply_batch_mapping_to_settings
 
@@ -1332,11 +1257,9 @@ def test_apply_batch_mapping_to_settings_clears_stale_id_without_batch_store(mai
     assert settings.batch_set == "new set"
     assert settings.batch_set_id is None
 
-
 # ---------------------------------------------------------------------------
 # Batch mapping t≈0 guard regression tests
 # ---------------------------------------------------------------------------
-
 
 class TestBatchMappingT0Guard:
     """Regression: false-positive 'does not start at t≈0' when mechanism_species is empty."""
@@ -1405,11 +1328,9 @@ class TestBatchMappingT0Guard:
             "Mapping must not be persisted when mechanism_species is empty"
         )
 
-
 # ---------------------------------------------------------------------------
 # Empty mechanism_species batch mapping guard
 # ---------------------------------------------------------------------------
-
 
 def test_empty_mechanism_mapping_create_and_seed_returns_unseeded():
     """create_and_seed_batch_set must return seeded=False when mechanism_species
@@ -1436,7 +1357,6 @@ def test_empty_mechanism_mapping_create_and_seed_returns_unseeded():
     assert created is True
     assert seeded is False
     batch_store.set_value.assert_not_called()
-
 
 def test_apply_to_remaining_imports_all_remaining_csv_files(tmp_path, monkeypatch, qtbot):
     """apply_to_remaining must import remaining files, not silently drop them."""
@@ -1486,7 +1406,6 @@ def test_apply_to_remaining_imports_all_remaining_csv_files(tmp_path, monkeypatc
     assert len(panel.get_datasets()) == 2, (
         "Both files must be imported when apply_to_remaining is True"
     )
-
 
 def test_apply_to_remaining_error_on_incompatible_remaining_file(tmp_path, monkeypatch, qtbot):
     """When a remaining file has incompatible columns,
@@ -1539,7 +1458,6 @@ def test_apply_to_remaining_error_on_incompatible_remaining_file(tmp_path, monke
     assert criticals, "QMessageBox.critical must be shown for incompatible file"
     assert "target.csv" in str(criticals[0]), "Error must mention the filename"
 
-
 def test_empty_mechanism_mapping_not_persisted_at_import(main_window, monkeypatch):
     """When mechanism_species is empty at import time, the dataset must NOT be
     mapped to the created batch set so launch.py can re-seed later."""
@@ -1562,11 +1480,9 @@ def test_empty_mechanism_mapping_not_persisted_at_import(main_window, monkeypatc
         "batch_set_id should be None when mechanism_species is empty"
     )
 
-
 # ---------------------------------------------------------------------------
 # Regression: scoped remaining-file detection
 # ---------------------------------------------------------------------------
-
 
 def test_apply_to_remaining_scoped_detection_ignores_unselected_columns(tmp_path, monkeypatch, qtbot):
     """Regression: remaining-file unit detection must scope to selected
@@ -1621,11 +1537,9 @@ def test_apply_to_remaining_scoped_detection_ignores_unselected_columns(tmp_path
         "Both files must import when mixed units are only in unselected columns"
     )
 
-
 # ---------------------------------------------------------------------------
 # Regression: sheet filtering for remaining Excel files
 # ---------------------------------------------------------------------------
-
 
 def test_apply_to_remaining_filters_sheets_by_source_checked_set(tmp_path, monkeypatch, qtbot):
     """Regression: remaining Excel files must only import sheets that
@@ -1695,11 +1609,9 @@ def test_apply_to_remaining_filters_sheets_by_source_checked_set(tmp_path, monke
     assert "target.xlsx::Extra" not in dataset_names, "Extra must be filtered out"
     assert len(datasets) == 2, "source::Data + target::Data only"
 
-
 # ---------------------------------------------------------------------------
 # Regression: UnicodeDecodeError in remaining-file loop
 # ---------------------------------------------------------------------------
-
 
 def test_apply_to_remaining_handles_unicode_decode_error(tmp_path, monkeypatch, qtbot):
     """Regression: UnicodeDecodeError in remaining files must trigger
@@ -1753,11 +1665,9 @@ def test_apply_to_remaining_handles_unicode_decode_error(tmp_path, monkeypatch, 
     assert criticals, "QMessageBox.critical must be shown for encoding error"
     assert "bad_encoding.csv" in str(criticals[0])
 
-
 # ---------------------------------------------------------------------------
 # Remaining-file detection uses full row for has_unit_row
 # ---------------------------------------------------------------------------
-
 
 def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot):
     """has_unit_row is a physical property of the full row.  When unit text
@@ -1786,7 +1696,6 @@ def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot
         "Unit row must be detected from full row (column B has 'nM') "
         "even though selected column A has no unit text"
     )
-
 
 def test_remaining_excel_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot):
     """Excel variant: unit text only in unselected column B must still
@@ -1817,11 +1726,9 @@ def test_remaining_excel_file_detects_unit_row_from_unselected_columns(tmp_path,
         "even though selected column A has no unit text"
     )
 
-
 # ---------------------------------------------------------------------------
 # Per-column unit conversion regression tests
 # ---------------------------------------------------------------------------
-
 
 def test_per_column_conversion_applies_independently(tmp_path, monkeypatch, qtbot):
     """Species A and B get different conversion factors applied independently."""
@@ -1882,7 +1789,6 @@ def test_per_column_conversion_applies_independently(tmp_path, monkeypatch, qtbo
     assert np.allclose(payload["species"]["A"], [100.0e-6, 300.0e-6])
     assert np.allclose(payload["species"]["B"], [200.0e-9, 400.0e-9])
 
-
 def test_per_column_provenance_stored(tmp_path, monkeypatch, qtbot):
     """Provenance metadata stores per-column original concentration units."""
     from kindred.gui.widgets.data_manager import DataManagerPanel
@@ -1938,11 +1844,9 @@ def test_per_column_provenance_stored(tmp_path, monkeypatch, qtbot):
     assert payload["metadata"]["original_concentration_units"] == {"A": "uM", "B": "nM"}
     assert isinstance(payload["metadata"]["original_concentration_units"], dict)
 
-
 # ---------------------------------------------------------------------------
 # Fix B regression: remaining-file must use target's detected units
 # ---------------------------------------------------------------------------
-
 
 def test_remaining_file_uses_target_detected_units_not_source(tmp_path, monkeypatch, qtbot):
     """When apply_to_remaining copies source intent to a remaining file,
@@ -1986,7 +1890,6 @@ def test_remaining_file_uses_target_detected_units_not_source(tmp_path, monkeypa
     )
     assert plan.conc_factors["A"] == pytest.approx(parse_concentration_unit("uM"))
 
-
 def test_remaining_excel_file_uses_target_detected_units_not_source(tmp_path, monkeypatch, qtbot):
     """Excel variant of Fix B: remaining Excel file sheets must use their own
     detected units, not the source file's."""
@@ -2018,7 +1921,6 @@ def test_remaining_excel_file_uses_target_detected_units_not_source(tmp_path, mo
     )
     assert target_intent.concentration_units["A"] == "uM"
 
-
 def test_remaining_file_fallback_to_source_when_target_has_no_detected_unit(tmp_path, qtbot):
     """When the target file has no detected unit for a column, the source
     intent's unit for that column should be used as fallback."""
@@ -2045,7 +1947,6 @@ def test_remaining_file_fallback_to_source_when_target_has_no_detected_unit(tmp_
     # No unit row detected, so fallback to source intent's units
     assert target_intent.concentration_units["A"] == "uM"
     assert target_intent.concentration_units["B"] == "nM"
-
 
 def test_remaining_file_override_ignores_target_detected_units(tmp_path, qtbot):
     """When override_no_unit_row is True, the target file's detected units

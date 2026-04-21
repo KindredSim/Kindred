@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from queue import SimpleQueue
 import warnings
 from typing import Any, Callable, Optional
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -23,7 +23,6 @@ from kindred.gui.simulation_worker import SimulationWorker
 from kindred.gui.ports import SimulationUiPorts
 from tests.worker_stubs import make_stubborn_worker
 
-
 @dataclass
 class _FakeButton:
     enabled: bool = True
@@ -33,7 +32,6 @@ class _FakeButton:
 
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
-
 
 @dataclass
 class _FakeLabel:
@@ -45,7 +43,6 @@ class _FakeLabel:
     def repaint(self) -> None:
         return
 
-
 @dataclass
 class _FakeProgress:
     value: int = 0
@@ -56,7 +53,6 @@ class _FakeProgress:
     def repaint(self) -> None:
         return
 
-
 @dataclass
 class _FakeSpinBox:
     _value: float
@@ -66,7 +62,6 @@ class _FakeSpinBox:
 
     def setValue(self, value: float) -> None:
         self._value = float(value)
-
 
 class _FakeSignal:
     def __init__(self, *, disconnect_raises_typeerror: bool = False) -> None:
@@ -80,7 +75,6 @@ class _FakeSignal:
         if self._disconnect_raises_typeerror:
             raise TypeError("not connected")
         self._handlers.clear()
-
 
 class _FakeWorker(QtCore.QObject):
     def __init__(
@@ -117,7 +111,6 @@ class _FakeWorker(QtCore.QObject):
     def start(self) -> None:
         self._running = True
 
-
 class _QtSignalWorker(QtCore.QObject):
     finished = QtCore.Signal()
     progress = QtCore.Signal(int, str)
@@ -142,7 +135,6 @@ class _QtSignalWorker(QtCore.QObject):
         self.wait_calls.append(int(ms or 0))
         return False
 
-
 def _successful_result_payload() -> dict[str, Any]:
     return {
         "t": np.linspace(0.0, 1.0, 3),
@@ -156,7 +148,6 @@ def _successful_result_payload() -> dict[str, Any]:
         "fallback_occurred": False,
         "fallback_message": None,
     }
-
 
 class _FakeMainWindow(QtCore.QObject):
     def settings_set_value(self, key: str, value: object) -> None:
@@ -599,7 +590,6 @@ class _FakeMainWindow(QtCore.QObject):
     def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
         self._arm_pending_init_result_invalidation_guard(rewrite=rewrite)
 
-
 @pytest.fixture
 def mw(qt_app) -> _FakeMainWindow:
     _ = qt_app
@@ -724,7 +714,6 @@ def mw(qt_app) -> _FakeMainWindow:
 
     return window
 
-
 @pytest.fixture
 def controller(mw: _FakeMainWindow) -> SimulationController:
     ui = SimulationUiPorts(
@@ -753,7 +742,6 @@ def controller(mw: _FakeMainWindow) -> SimulationController:
             if timer is not None and timer.isActive():
                 timer.stop()
 
-
 @pytest.mark.unit
 def test_default_batch_executor_factory_is_injectable(monkeypatch):
     created = {}
@@ -774,7 +762,6 @@ def test_default_batch_executor_factory_is_injectable(monkeypatch):
     assert created["kwargs"]["max_workers"] == 3
     assert created["kwargs"]["mp_context"] == "ctx:spawn"
 
-
 @pytest.mark.unit
 def test_set_simulation_cache_caps_clamps_and_persists(mw: _FakeMainWindow, controller: SimulationController):
     result = controller.set_simulation_cache_caps(result_cap=-5, preview_cap="7", persist=True)
@@ -784,7 +771,6 @@ def test_set_simulation_cache_caps_clamps_and_persists(mw: _FakeMainWindow, cont
     assert controller.batch_cache.preview_cache.max_entries() == 7
     mw._settings.setValue.assert_any_call("simulation/result_cache_cap", 0)
     mw._settings.setValue.assert_any_call("simulation/preview_cache_cap", 7)
-
 
 @pytest.mark.unit
 def test_simulation_cache_stats_surfaces_failures(controller: SimulationController):
@@ -798,7 +784,6 @@ def test_simulation_cache_stats_surfaces_failures(controller: SimulationControll
     assert result.stats is None
     assert "Failed to read simulation cache status" in result.message
 
-
 @pytest.mark.unit
 def test_purge_simulation_result_cache_surfaces_failures(controller: SimulationController):
     controller.batch_cache.purge_result_cache = MagicMock(side_effect=RuntimeError("purge boom"))
@@ -809,14 +794,12 @@ def test_purge_simulation_result_cache_surfaces_failures(controller: SimulationC
     assert result.operation == "purge_result_cache"
     assert "Failed to clear simulation result cache" in result.message
 
-
 @pytest.mark.unit
 def test_cleanup_worker_safely_does_not_force_terminate(controller: SimulationController):
     worker = _FakeWorker(running=True, wait_returns=False, signal_disconnect_typeerror=True)
     controller._cleanup_worker_safely(worker, "test worker")
     assert worker._cancelled is True
     assert worker._terminated is False
-
 
 @pytest.mark.unit
 def test_cleanup_worker_safely_defers_qthread_deletion_until_finished(controller: SimulationController, monkeypatch):
@@ -835,7 +818,6 @@ def test_cleanup_worker_safely_defers_qthread_deletion_until_finished(controller
     assert worker.deleteLater in worker.finished._handlers
     assert send_called["n"] == 0
 
-
 @pytest.mark.unit
 def test_release_current_simulation_worker_skips_unregistered_qt_signal_disconnect_warning(
     controller: SimulationController,
@@ -851,7 +833,6 @@ def test_release_current_simulation_worker_skips_unregistered_qt_signal_disconne
     assert not [message for message in warning_messages if "Failed to disconnect" in message]
     assert controller._simulation_worker is None
     assert controller._retained_simulation_workers == [worker]
-
 
 @pytest.mark.unit
 def test_cleanup_worker_safely_disconnects_registered_qt_signal_handlers_without_warning(
@@ -901,7 +882,6 @@ def test_cleanup_worker_safely_disconnects_registered_qt_signal_handlers_without
     assert progress.call_count == 1
     assert complete.call_count == 1
     assert error.call_count == 1
-
 
 @pytest.mark.unit
 def test_disconnect_simulation_worker_application_signals_preserves_failed_runtime_disconnects(
@@ -969,7 +949,6 @@ def test_disconnect_simulation_worker_application_signals_preserves_failed_runti
     assert complete.call_count == 0
     assert error.call_count == 0
 
-
 @pytest.mark.unit
 def test_connect_simulation_worker_application_signals_preserves_tracked_disconnect_failures_on_reconnect(
     controller: SimulationController,
@@ -1023,7 +1002,6 @@ def test_connect_simulation_worker_application_signals_preserves_tracked_disconn
     assert names.count("error") == 1
     controller._record_nonfatal_exception.assert_called_once()
 
-
 @pytest.mark.unit
 def test_prepare_simulation_shutdown_for_close_keeps_window_recoverable_when_worker_errors_after_deferred_close(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -1069,7 +1047,6 @@ def test_prepare_simulation_shutdown_for_close_keeps_window_recoverable_when_wor
     assert mw._status_label.text == "Simulation cancelled by user"
     assert mw._sim_progress.value == 0
 
-
 @pytest.mark.unit
 def test_prepare_simulation_shutdown_for_close_ignores_deleted_retained_worker(controller: SimulationController):
     worker = QtCore.QThread(parent=controller)
@@ -1083,7 +1060,6 @@ def test_prepare_simulation_shutdown_for_close_ignores_deleted_retained_worker(c
     assert controller._shutdown_requested_for_close is False
     assert controller._retained_simulation_workers == []
 
-
 @pytest.mark.unit
 def test_release_current_simulation_worker_ignores_deleted_worker(controller: SimulationController):
     worker = QtCore.QThread(parent=controller)
@@ -1095,7 +1071,6 @@ def test_release_current_simulation_worker_ignores_deleted_worker(controller: Si
 
     assert controller._simulation_worker is None
     assert controller._retained_simulation_workers == []
-
 
 @pytest.mark.unit
 def test_run_simulation_from_slider_ignores_deleted_current_worker(
@@ -1118,7 +1093,6 @@ def test_run_simulation_from_slider_ignores_deleted_current_worker(
 
     assert controller._simulation_worker is None
     assert calls and calls[0]["fast_mode"] is True
-
 
 @pytest.mark.unit
 def test_deferred_close_successful_completion_does_not_schedule_next_serial_batch_run(
@@ -1171,7 +1145,6 @@ def test_deferred_close_successful_completion_does_not_schedule_next_serial_batc
     assert controller._simulation_worker is None
     assert worker not in controller._retained_simulation_workers
 
-
 @pytest.mark.unit
 def test_deferred_close_successful_completion_does_not_schedule_pending_slider_rerun_and_still_recovers_ui(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -1223,7 +1196,6 @@ def test_deferred_close_successful_completion_does_not_schedule_pending_slider_r
     assert mw._stop_btn.isEnabled() is False
     assert mw._sim_progress.value == 100
     assert mw._status_label.text == "Simulation complete: 2 species, 3 points"
-
 
 @pytest.mark.unit
 def test_deferred_close_error_recovery_restores_later_serial_batch_continuation(
@@ -1292,7 +1264,6 @@ def test_deferred_close_error_recovery_restores_later_serial_batch_continuation(
     assert scheduled == [controller._start_next_batch_simulation]
     assert controller._batch_run_context["active"] is True
     assert controller._batch_run_context["pos"] == 1
-
 
 @pytest.mark.unit
 def test_deferred_close_error_recovery_restores_later_pending_slider_rerun(
@@ -1363,11 +1334,9 @@ def test_deferred_close_error_recovery_restores_later_pending_slider_rerun(
     assert scheduled == [controller._run_simulation_from_slider]
     assert controller._pending_slider_simulation is False
 
-
 @pytest.mark.unit
 def test_simulation_worker_does_not_shadow_qthread_finished_signal():
     assert "finished" not in SimulationWorker.__dict__
-
 
 @pytest.mark.unit
 def test_shutdown_batch_executor_falls_back_on_typeerror_and_terminates_processes(
@@ -1383,7 +1352,6 @@ def test_shutdown_batch_executor_falls_back_on_typeerror_and_terminates_processe
     controller._batch_parallel.executor = executor
     controller._shutdown_batch_executor(force_terminate=True)
     assert proc.terminate.call_count == 1
-
 
 @pytest.mark.unit
 def test_slider_request_during_parallel_full_run_defers_without_force_terminate(
@@ -1418,7 +1386,6 @@ def test_slider_request_during_parallel_full_run_defers_without_force_terminate(
     assert controller._pending_slider_simulation is True
     controller._run_simulation_internal.assert_not_called()
 
-
 @pytest.mark.unit
 def test_slider_request_while_fast_worker_running_is_latest_only_and_does_not_cancel(
     mw: _FakeMainWindow, controller: SimulationController
@@ -1437,7 +1404,6 @@ def test_slider_request_while_fast_worker_running_is_latest_only_and_does_not_ca
     controller._run_simulation_from_slider()
     assert controller._pending_slider_simulation is True
     controller._run_simulation_internal.assert_not_called()
-
 
 @pytest.mark.unit
 def test_stale_fast_completion_schedules_pending_slider_run(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
@@ -1460,7 +1426,6 @@ def test_stale_fast_completion_schedules_pending_slider_run(monkeypatch, mw: _Fa
         request_id=int(rid_old),
     )
     assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
 def test_superseded_multiset_preview_completion_still_displays_current_result_before_replay(
@@ -1510,7 +1475,6 @@ def test_superseded_multiset_preview_completion_still_displays_current_result_be
 
     assert mw._display_cached_batch_selection.call_count == 1
     assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
 def test_superseded_multiset_preview_partial_completion_keeps_parallel_batch_active_until_full_batch_finishes(
@@ -1565,7 +1529,6 @@ def test_superseded_multiset_preview_partial_completion_keeps_parallel_batch_act
     assert controller._slider_simulation_active is True
     assert scheduled == []
 
-
 @pytest.mark.unit
 def test_stale_fast_completion_without_pending_still_cleans_up_active_run(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
     controller._latest_sim_request_id = 2
@@ -1597,7 +1560,6 @@ def test_stale_fast_completion_without_pending_still_cleans_up_active_run(monkey
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is None
     assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
 def test_on_simulation_complete_uses_base_species_count_for_algebra_status_without_mechanism(
@@ -1640,7 +1602,6 @@ def test_on_simulation_complete_uses_base_species_count_for_algebra_status_witho
     )
 
     assert mw._algebra_status_label.text == "Algebra: 1 ok, 1 error"
-
 
 @pytest.mark.unit
 def test_on_simulation_complete_prefers_payload_base_species_count_over_mechanism_for_algebra_status(
@@ -1688,7 +1649,6 @@ def test_on_simulation_complete_prefers_payload_base_species_count_over_mechanis
 
     assert mw._algebra_status_label.text == "Algebra: 1 ok, 1 error"
 
-
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_ui_active_when_full_run_still_in_flight(
     mw: _FakeMainWindow,
@@ -1718,7 +1678,6 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_ui_active_when_full_r
     assert mw._stop_btn.isEnabled() is True
     assert mw._status_label.text == "Running simulation..."
     assert mw._sim_progress.value == 57
-
 
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_supersedes_active_fast_parallel_batch(
@@ -1762,7 +1721,6 @@ def test_invalidate_slider_preview_work_supersedes_active_fast_parallel_batch(
     assert mw._status_label.text == "Ready"
     assert mw._sim_progress.value == 0
 
-
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_suppresses_stale_completion_ui_after_discard(
     monkeypatch,
@@ -1804,7 +1762,6 @@ def test_invalidate_slider_preview_work_suppresses_stale_completion_ui_after_dis
     assert mw._sim_progress.value == 0
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
-
 
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_completion(
@@ -1859,7 +1816,6 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_co
     assert mw._status_label.text == "Running simulation..."
     assert mw._sim_progress.value == 57
 
-
 @pytest.mark.unit
 def test_nonowning_stale_fast_completion_does_not_reset_explicit_run_status_progress(
     monkeypatch,
@@ -1913,7 +1869,6 @@ def test_nonowning_stale_fast_completion_does_not_reset_explicit_run_status_prog
     assert mw._status_label.text == "Running simulation..."
     assert mw._sim_progress.value == 57
 
-
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_suppresses_stale_error_ui_after_discard(
     monkeypatch,
@@ -1951,7 +1906,6 @@ def test_invalidate_slider_preview_work_suppresses_stale_error_ui_after_discard(
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
     message_box.assert_not_called()
-
 
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_error(
@@ -2004,7 +1958,6 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_er
     assert mw._sim_progress.value == 41
     message_box.assert_not_called()
 
-
 @pytest.mark.unit
 def test_invalidate_active_explicit_simulation_for_authoritative_change_cancels_run_and_ignores_old_completion(
     mw: _FakeMainWindow,
@@ -2048,7 +2001,6 @@ def test_invalidate_active_explicit_simulation_for_authoritative_change_cancels_
     )
 
     mw.set_data.assert_not_called()
-
 
 @pytest.mark.unit
 def test_nonowning_stale_fast_error_does_not_reset_explicit_run_status_progress(
@@ -2101,7 +2053,6 @@ def test_nonowning_stale_fast_error_does_not_reset_explicit_run_status_progress(
     assert mw._sim_progress.value == 41
     message_box.assert_not_called()
 
-
 @pytest.mark.unit
 def test_stale_fast_error_without_pending_still_cleans_up_active_run(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -2135,7 +2086,6 @@ def test_stale_fast_error_without_pending_still_cleans_up_active_run(
     assert scheduled == [controller._run_simulation_from_slider]
     message_box.assert_not_called()
 
-
 @pytest.mark.unit
 def test_slider_run_deferral_does_not_set_updating_status_when_no_new_run_starts(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2154,7 +2104,6 @@ def test_slider_run_deferral_does_not_set_updating_status_when_no_new_run_starts
     assert controller._pending_slider_simulation is True
     assert controller._simulation_running is False
     assert mw._status_label.text == "Ready"
-
 
 @pytest.mark.unit
 def test_slider_run_supersedes_active_fast_parallel_preview_for_newer_request(
@@ -2188,7 +2137,6 @@ def test_slider_run_supersedes_active_fast_parallel_preview_for_newer_request(
     assert controller.run_simulation_internal.call_args.kwargs["request_id"] == int(rid_new)
     assert controller.run_simulation_internal.call_args.kwargs["reuse_parallel_executor"] is True
 
-
 @pytest.mark.unit
 def test_slider_run_blocks_launch_while_retained_worker_is_still_running(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2216,7 +2164,6 @@ def test_slider_run_blocks_launch_while_retained_worker_is_still_running(
     assert mw._status_label.text == "Cancelling previous simulation..."
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
-
 
 @pytest.mark.unit
 def test_retained_worker_finish_replays_latest_pending_slider_request(
@@ -2263,7 +2210,6 @@ def test_retained_worker_finish_replays_latest_pending_slider_request(
     _, kwargs = controller.run_simulation_internal.call_args
     assert kwargs["fast_mode"] is True
 
-
 @pytest.mark.unit
 def test_retained_worker_finish_preserves_reserved_future_slider_request(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -2291,7 +2237,6 @@ def test_retained_worker_finish_preserves_reserved_future_slider_request(
     assert controller.has_running_owned_simulation_workers() is False
     assert controller._pending_slider_sim_request_id == 6
     assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
 def test_retained_worker_finish_cancels_species_timer_before_replay(
@@ -2349,7 +2294,6 @@ def test_retained_worker_finish_cancels_species_timer_before_replay(
     _fire_species_timeout_if_still_active()
     assert controller.run_simulation_internal.call_count == 1
 
-
 @pytest.mark.unit
 def test_supersede_parallel_batch_run_soft_cancels_futures_and_stops_timer(controller: SimulationController):
     timer = MagicMock()
@@ -2373,7 +2317,6 @@ def test_supersede_parallel_batch_run_soft_cancels_futures_and_stops_timer(contr
         "b": {"set_name": "B", "set_id": "b", "superseded": "1"}
     }
     timer.stop.assert_called()
-
 
 @pytest.mark.unit
 def test_superseded_parallel_batch_future_error_is_drained_deterministically(controller: SimulationController):
@@ -2412,7 +2355,6 @@ def test_superseded_parallel_batch_future_error_is_drained_deterministically(con
     assert controller._batch_parallel.superseded_future_map == {}
     assert controller._batch_parallel.superseded_future_meta == {}
     controller._record_nonfatal_exception.assert_called_once()
-
 
 @pytest.mark.unit
 def test_superseded_future_error_does_not_abort_active_run(controller: SimulationController):
@@ -2533,7 +2475,6 @@ def test_superseded_future_error_does_not_abort_active_run(controller: Simulatio
     assert controller.parallel_batch.executor is first
     assert [label for label, task in submitted if task.get("set_id") == "fresh"] == [first.label]
 
-
 @pytest.mark.unit
 def test_parallel_keep_executor_alive_completion_keeps_polling_until_superseded_future_drains(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2597,7 +2538,6 @@ def test_parallel_keep_executor_alive_completion_keeps_polling_until_superseded_
     controller._record_nonfatal_exception.assert_not_called()
     timer.stop.assert_called_once()
 
-
 @pytest.mark.unit
 def test_superseded_parallel_batch_future_error_payload_keeps_healthy_pool_alive(controller: SimulationController):
     class _SupersededFuture:
@@ -2642,7 +2582,6 @@ def test_superseded_parallel_batch_future_error_payload_keeps_healthy_pool_alive
     assert controller._pool_eagerly_created is True
     controller._record_nonfatal_exception.assert_called_once()
 
-
 @pytest.mark.unit
 def test_primary_explicit_completion_preserves_fresh_cache_during_post_run_species_sync(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2686,7 +2625,6 @@ def test_primary_explicit_completion_preserves_fresh_cache_during_post_run_speci
     mw._sync_batch_species_columns.assert_called_once_with(["A", "C"], preserve_active_cache=True)
     assert controller.batch_cache.active_cache_valid_set_ids == ("id1",)
 
-
 @pytest.mark.unit
 def test_on_simulation_complete_later_completion_does_not_widen_narrowed_valid_subset(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2727,7 +2665,6 @@ def test_on_simulation_complete_later_completion_does_not_widen_narrowed_valid_s
     assert controller.batch_cache.active_cache_preview_token == "narrow-preview-token"
     assert controller.batch_cache.active_cache_preview_scope_set_ids == ("id1",)
     assert controller.batch_cache.active_cache_valid_set_ids == ("id1",)
-
 
 @pytest.mark.unit
 def test_on_simulation_complete_redraw_falls_back_to_current_result_when_constrained_subset_draw_returns_false(
@@ -2773,7 +2710,6 @@ def test_on_simulation_complete_redraw_falls_back_to_current_result_when_constra
     mw.set_data.assert_called_once()
     assert mw.set_data.call_args.kwargs["label"] == "set2"
 
-
 @pytest.mark.unit
 def test_on_simulation_complete_coalesced_flush_uses_valid_subset_without_fallback(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2818,7 +2754,6 @@ def test_on_simulation_complete_coalesced_flush_uses_valid_subset_without_fallba
     kwargs = mw._display_cached_batch_selection.call_args.kwargs
     assert kwargs["valid_set_ids"] == ("id2",)
     assert kwargs["allow_fallback"] is False
-
 
 @pytest.mark.unit
 def test_on_simulation_complete_coalesced_flush_keeps_valid_subset_after_dirty_reset(
@@ -2869,7 +2804,6 @@ def test_on_simulation_complete_coalesced_flush_keeps_valid_subset_after_dirty_r
     assert kwargs["valid_set_ids"] == ("id1", "id2")
     assert kwargs["allow_fallback"] is False
 
-
 @pytest.mark.unit
 def test_queue_slider_plot_update_gates_by_request_and_run_ids(mw: _FakeMainWindow, controller: SimulationController):
     controller._latest_sim_request_id = 2
@@ -2906,7 +2840,6 @@ def test_queue_slider_plot_update_gates_by_request_and_run_ids(mw: _FakeMainWind
     assert controller._slider_plot_coalesce_timer.isActive()
     assert int(controller._slider_plot_coalesce_timer.interval()) >= 1
 
-
 @pytest.mark.unit
 def test_flush_slider_plot_updates_merges_pending_sets_and_calls_display(mw: _FakeMainWindow, controller: SimulationController):
     controller._latest_sim_request_id = 1
@@ -2929,7 +2862,6 @@ def test_flush_slider_plot_updates_merges_pending_sets_and_calls_display(mw: _Fa
     assert kwargs["prefer_set"] == "a"
     assert kwargs["selected_sets"] == ["a", "b"]
 
-
 @pytest.mark.unit
 def test_flush_slider_plot_updates_force_uses_cache_keys_when_no_selection(mw: _FakeMainWindow, controller: SimulationController):
     controller._latest_sim_request_id = 1
@@ -2951,7 +2883,6 @@ def test_flush_slider_plot_updates_force_uses_cache_keys_when_no_selection(mw: _
     _args, kwargs = mw._display_cached_batch_selection.call_args
     assert sorted(kwargs["selected_sets"]) == ["x", "y"]
 
-
 @pytest.mark.unit
 def test_flush_slider_plot_updates_uses_shown_sets_not_highlighted_selection(mw: _FakeMainWindow, controller: SimulationController):
     controller._latest_sim_request_id = 1
@@ -2972,7 +2903,6 @@ def test_flush_slider_plot_updates_uses_shown_sets_not_highlighted_selection(mw:
     assert ok is True
     _args, kwargs = mw._display_cached_batch_selection.call_args
     assert kwargs["selected_sets"] == ["shown-a", "dirty"]
-
 
 @pytest.mark.unit
 def test_consume_parallel_batch_future_success_calls_on_complete_and_clears_maps(mw: _FakeMainWindow, controller: SimulationController):
@@ -2997,7 +2927,6 @@ def test_consume_parallel_batch_future_success_calls_on_complete_and_clears_maps
     assert "sid" not in controller._batch_parallel.future_map
     assert "sid" not in controller._batch_parallel.future_meta
     controller._on_simulation_complete.assert_called_once()
-
 
 @pytest.mark.unit
 def test_consume_parallel_batch_future_on_complete_exception_reports_error_and_shutdown(
@@ -3027,7 +2956,6 @@ def test_consume_parallel_batch_future_on_complete_exception_reports_error_and_s
     controller._on_simulation_error.assert_called_once()
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
 
-
 @pytest.mark.unit
 def test_consume_parallel_batch_future_error_calls_on_error_and_shutdown(mw: _FakeMainWindow, controller: SimulationController):
     fut: Future = Future()
@@ -3051,7 +2979,6 @@ def test_consume_parallel_batch_future_error_calls_on_error_and_shutdown(mw: _Fa
     assert ok is False
     controller._on_simulation_error.assert_called_once()
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
-
 
 @pytest.mark.unit
 def test_consume_parallel_batch_future_exception_tears_down_pool_and_next_parallel_run_recreates_executor(
@@ -3159,7 +3086,6 @@ def test_consume_parallel_batch_future_exception_tears_down_pool_and_next_parall
     assert created[0] is not first
     assert [label for label, task in submitted if task.get("set_id") == "fresh"] == [created[0].label]
 
-
 @pytest.mark.unit
 def test_poll_parallel_batch_futures_consumes_callback_then_scan(controller: SimulationController):
     fut1: Future = Future()
@@ -3187,7 +3113,6 @@ def test_poll_parallel_batch_futures_consumes_callback_then_scan(controller: Sim
     sources = [kwargs["source"] for _args, kwargs in controller._consume_parallel_batch_future.call_args_list]
     assert sources == ["callback", "scan"]
 
-
 @pytest.mark.unit
 def test_poll_parallel_batch_futures_catches_unhandled_exceptions_and_shuts_down(mw: _FakeMainWindow, controller: SimulationController):
     fut1: Future = Future()
@@ -3212,7 +3137,6 @@ def test_poll_parallel_batch_futures_catches_unhandled_exceptions_and_shuts_down
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
     controller._on_simulation_error.assert_called_once()
 
-
 @pytest.mark.unit
 def test_flush_pending_slider_updates_for_run_stops_timers_and_finalizes(mw: _FakeMainWindow, controller: SimulationController):
     release_timer = MagicMock()
@@ -3235,7 +3159,6 @@ def test_flush_pending_slider_updates_for_run_stops_timers_and_finalizes(mw: _Fa
     assert controller._pending_slider_simulation is True
     assert mw._slider_triggered_simulation is False
 
-
 @pytest.mark.unit
 def test_flush_pending_slider_updates_for_run_stops_species_timer_and_preserves_replay_until_success(
     mw: _FakeMainWindow, controller: SimulationController
@@ -3255,7 +3178,6 @@ def test_flush_pending_slider_updates_for_run_stops_species_timer_and_preserves_
     assert controller._pending_slider_sim_request_id == 7
     assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id1",)
 
-
 @pytest.mark.unit
 def test_run_simulation_from_slider_discards_stale_request(mw: _FakeMainWindow, controller: SimulationController):
     controller._pending_slider_sim_request_id = 1
@@ -3264,7 +3186,6 @@ def test_run_simulation_from_slider_discards_stale_request(mw: _FakeMainWindow, 
     controller._run_simulation_from_slider()
     assert controller._pending_slider_simulation is False
     assert controller._pending_slider_sim_request_id is None
-
 
 @pytest.mark.unit
 def test_run_simulation_from_slider_promotes_reserved_future_request_to_latest(
@@ -3280,7 +3201,6 @@ def test_run_simulation_from_slider_promotes_reserved_future_request_to_latest(
     assert controller._latest_sim_request_id == 6
     controller.run_simulation_internal.assert_called_once()
     assert controller.run_simulation_internal.call_args.kwargs["request_id"] == 6
-
 
 @pytest.mark.unit
 def test_run_simulation_from_slider_uses_snapshotted_target_rows(
@@ -3304,7 +3224,6 @@ def test_run_simulation_from_slider_uses_snapshotted_target_rows(
     assert kwargs["request_id"] == int(rid)
     assert kwargs["batch_rows"] == [0, 1]
 
-
 @pytest.mark.unit
 def test_run_simulation_from_slider_ignores_stale_mechanism_snapshot_for_species_preview(
     mw: _FakeMainWindow, controller: SimulationController
@@ -3324,7 +3243,6 @@ def test_run_simulation_from_slider_ignores_stale_mechanism_snapshot_for_species
     controller.run_simulation_internal.assert_called_once()
     _, kwargs = controller.run_simulation_internal.call_args
     assert kwargs["batch_rows"] == [2]
-
 
 @pytest.mark.unit
 def test_run_simulation_from_slider_preflight_abort_clears_slider_triggered_flag(
@@ -3362,7 +3280,6 @@ def test_run_simulation_from_slider_preflight_abort_clears_slider_triggered_flag
 
     assert mw._slider_triggered_simulation is False
 
-
 @pytest.mark.unit
 def test_run_simulation_from_slider_defers_when_full_run_in_progress(mw: _FakeMainWindow, controller: SimulationController):
     mw._run_btn = _FakeButton(False)
@@ -3373,7 +3290,6 @@ def test_run_simulation_from_slider_defers_when_full_run_in_progress(mw: _FakeMa
 
     controller._run_simulation_from_slider()
     assert controller._pending_slider_simulation is True
-
 
 @pytest.mark.unit
 def test_cancel_active_run_for_restart_resets_ui_and_shuts_down(mw: _FakeMainWindow, controller: SimulationController):
@@ -3389,7 +3305,6 @@ def test_cancel_active_run_for_restart_resets_ui_and_shuts_down(mw: _FakeMainWin
     assert controller._simulation_running is False
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
-
 
 @pytest.mark.unit
 def test_run_simulation_blocks_restart_while_retained_worker_is_still_running(
@@ -3417,7 +3332,6 @@ def test_run_simulation_blocks_restart_while_retained_worker_is_still_running(
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
 
-
 @pytest.mark.unit
 def test_run_simulation_reuses_parallel_executor_for_explicit_multi_set_runs(
     mw: _FakeMainWindow, controller: SimulationController
@@ -3433,7 +3347,6 @@ def test_run_simulation_reuses_parallel_executor_for_explicit_multi_set_runs(
     assert kwargs["batch_rows"] == [0, 1]
     assert kwargs["reuse_parallel_executor"] is True
 
-
 @pytest.mark.unit
 def test_run_auto_locks_editor(mw: _FakeMainWindow, controller: SimulationController):
     mw._batch_rows_for_scope.return_value = [0]
@@ -3443,7 +3356,6 @@ def test_run_auto_locks_editor(mw: _FakeMainWindow, controller: SimulationContro
 
     assert mw._auto_lock_for_run_calls == 1
     controller.run_simulation_internal.assert_called_once()
-
 
 @pytest.mark.unit
 def test_run_aborts_if_mechanism_invalid_while_unlocked(mw: _FakeMainWindow, controller: SimulationController):
@@ -3456,7 +3368,6 @@ def test_run_aborts_if_mechanism_invalid_while_unlocked(mw: _FakeMainWindow, con
     assert mw._auto_lock_for_run_calls == 1
     controller.run_simulation_internal.assert_not_called()
     assert mw._status_label.text == "Cannot run: mechanism has errors. Fix and try again."
-
 
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_falls_back_to_serial_when_executor_factory_fails(
@@ -3478,7 +3389,6 @@ def test_start_parallel_batch_simulations_falls_back_to_serial_when_executor_fac
     controller._start_parallel_batch_simulations()
     assert controller._batch_run_context["parallel"] is False
     controller._start_next_batch_simulation.assert_called_once()
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
@@ -3556,7 +3466,6 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
     assert isinstance(ctx["pending_init_rewrite"], str) and ctx["pending_init_rewrite"]
     assert ctx["pending_init_applied"] is True
     controller._start_next_batch_simulation.assert_called_once()
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_initials(
@@ -3652,7 +3561,6 @@ def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_in
     assert rewritten.count(
         "Initial concentrations moved to Batch Initial Conditions table (set1). Edit there."
     ) == 2
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
@@ -3753,7 +3661,6 @@ def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
     assert execution_request_by_set_id["id2"]["initials"] == {"A": 5.5}
     assert created_runtimes[0] is not created_runtimes[1]
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_fast_mode_refreshes_runtime_after_multi_set_preview(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -3849,7 +3756,6 @@ def test_run_simulation_internal_fast_mode_refreshes_runtime_after_multi_set_pre
     # set's bindings.
     assert len(created_runtimes) == 3
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_fast_mode_marks_runtime_dirty_after_multi_set_loop(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -3942,7 +3848,6 @@ def test_run_simulation_internal_fast_mode_marks_runtime_dirty_after_multi_set_l
         "interaction would reuse the last set's bindings"
     )
 
-
 @pytest.mark.unit
 def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -4028,7 +3933,6 @@ def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
     assert isinstance(payload, dict)
     assert payload.get("preview_batch_cache_token") == "token:id1"
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_fast_mode_parallel_signatures_follow_preview_mechanism_text(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -4113,7 +4017,6 @@ def test_run_simulation_internal_fast_mode_parallel_signatures_follow_preview_me
     assert first_sig["id1"] != second_sig["id1"]
     assert first_sig["id2"] != second_sig["id2"]
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_when_bindings_cannot_apply(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -4169,7 +4072,6 @@ def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_w
 
     assert "param a = 2" in controller._batch_run_context["mechanism_text_by_set_id"]["id1"]
     mw._apply_parameter_overrides_to_dsl.assert_called()
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
@@ -4243,7 +4145,6 @@ def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
     assert mw.preview_batch_cache_token.call_args_list == []
     controller._start_next_batch_simulation.assert_called_once()
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_explicit_cache_key_ignores_non_primary_set_fingerprint_changes(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -4300,7 +4201,6 @@ def test_run_simulation_internal_explicit_cache_key_ignores_non_primary_set_fing
     second_key = str(controller._batch_run_context["cache_key"])
 
     assert first_key == second_key
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_baseline_explicit_run_leaves_overlay_cache_token_empty(
@@ -4359,119 +4259,9 @@ def test_run_simulation_internal_baseline_explicit_run_leaves_overlay_cache_toke
     assert mw.preview_batch_cache_token.call_args_list == []
     controller._start_next_batch_simulation.assert_called_once()
 
+@pytest.mark.unit
 
 @pytest.mark.unit
-def test_start_next_batch_simulation_explicit_run_ignores_staged_concentration_overlay(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    created: dict[str, object] = {}
-
-    class _RecordingWorker:
-        def __init__(
-            self,
-            *,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent,
-            prepared,
-            include_mechanism_in_result_payload=None,
-        ):
-            created["mechanism_text"] = str(mechanism_text)
-            created["initials"] = dict(initials)
-            created["t_span"] = tuple(t_span)
-            created["solver_config"] = dict(solver_config)
-            created["prepared"] = prepared
-            created["include_mechanism_in_result_payload"] = include_mechanism_in_result_payload
-            self.progress = _FakeSignal()
-            self.result_ready = _FakeSignal()
-            self.error = _FakeSignal()
-
-        def start(self) -> None:
-            created["started"] = True
-
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
-    controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id2"],
-        "queue_names": ["set2"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 7,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {},
-            "pending_init_applied": True,
-        }
-
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
-
-    controller._start_next_batch_simulation()
-
-    assert created["initials"] == {"A": 1.0}
-    assert created["started"] is True
-    mw.preview_initials_for_row.assert_not_called()
-
-
-@pytest.mark.unit
-def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentration_overlay(
-    mw: _FakeMainWindow, controller: SimulationController
-):
-    submitted: list[dict[str, object]] = []
-
-    class _FakeParallelFuture:
-        def add_done_callback(self, _callback) -> None:
-            return
-
-        def done(self) -> bool:
-            return False
-
-    class _FakeExecutor:
-        def submit(self, _fn, *args, **_kwargs):
-            if args:
-                submitted.append(dict(args[0]))
-            return _FakeParallelFuture()
-
-        def shutdown(self, *args, **kwargs) -> None:
-            _ = args, kwargs
-            return
-
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
-    controller.parallel_batch.executor_factory = MagicMock(return_value=_FakeExecutor())
-    controller._batch_parallel.executor = None
-    controller._batch_parallel.future_map = {}
-    controller._batch_parallel.future_meta = {}
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id2"],
-        "queue_names": ["set2"],
-        "run_id": 3,
-        "request_id": 11,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
-
-    controller._start_parallel_batch_simulations()
-
-    assert submitted and submitted[0]["initials"] == {"A": 1.0}
-    mw.preview_initials_for_row.assert_not_called()
-
 
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for_mechanism_payload(
@@ -4528,7 +4318,6 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
     by_set_id = {str(task["set_id"]): task for task in submitted}
     assert by_set_id["id1"]["include_mechanism_in_result_payload"] is True
     assert by_set_id["id2"]["include_mechanism_in_result_payload"] is False
-
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payload_and_mechanism_text(
@@ -4615,7 +4404,6 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
     assert worker._execution_request["initials"] == {"A": 1.5}  # type: ignore[index]
     assert worker._execution_request["mechanism_text"] == "reaction: A -> B; k=3"  # type: ignore[index]
 
-
 @pytest.mark.unit
 def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prepared_payload(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -4689,7 +4477,6 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
     assert created["initials"] == {"A": 4.0}
     assert created["started"] is True
     assert getattr(controller._simulation_worker, "_execution_request", None) is None
-
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_execution_request(
@@ -4781,7 +4568,6 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_exec
     assert created["started"] is True
     assert getattr(controller._simulation_worker, "_execution_request", None) is None
 
-
 @pytest.mark.unit
 def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fallback_when_prepared_missing(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -4852,7 +4638,6 @@ def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fall
     assert "param a = 2" in str(created["mechanism_text"])
     mw._apply_parameter_overrides_to_dsl.assert_called_once()
     assert created["started"] is True
-
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewritten_worker_dsl_witness(
@@ -4945,7 +4730,6 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
 
     assert first_key == second_key
 
-
 @pytest.mark.unit
 def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_seed(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -5001,7 +4785,6 @@ def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_se
     assert created["initials"] == {"A": 1.0}
     mw.preview_initials_for_row.assert_not_called()
 
-
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_init_seed(
     mw: _FakeMainWindow, controller: SimulationController
@@ -5054,7 +4837,6 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
     assert submitted and submitted[0]["initials"] == {"A": 1.0}
     mw.preview_initials_for_row.assert_not_called()
 
-
 @pytest.mark.unit
 def test_parallel_batch_pool_settings_changed_shuts_down_idle_pool_immediately(
     mw: _FakeMainWindow, controller: SimulationController
@@ -5083,7 +4865,6 @@ def test_parallel_batch_pool_settings_changed_shuts_down_idle_pool_immediately(
     assert fake.shutdown_calls == [{"wait": False, "cancel_futures": True}]
     assert controller.parallel_batch.executor is None
     assert controller._pool_eagerly_created is False
-
 
 @pytest.mark.unit
 def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_completion(
@@ -5167,7 +4948,6 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_com
     assert created == [(6, True, recreated)]
     assert controller.parallel_batch.executor is recreated
 
-
 @pytest.mark.unit
 def test_ensure_parallel_batch_pool_eagerly_created_only_once(
     mw: _FakeMainWindow, controller: SimulationController, monkeypatch
@@ -5203,7 +4983,6 @@ def test_ensure_parallel_batch_pool_eagerly_created_only_once(
     assert created == [(3, True), (3, True)]
     assert controller.parallel_batch.executor is not None
     assert controller.parallel_batch.executor is not first
-
 
 @pytest.mark.unit
 def test_ensure_parallel_batch_pool_eagerly_created_retries_after_failure(
@@ -5252,7 +5031,6 @@ def test_ensure_parallel_batch_pool_eagerly_created_retries_after_failure(
     assert controller.parallel_batch.executor is not None
     assert controller._pool_eagerly_created is True
 
-
 @pytest.mark.unit
 def test_ensure_parallel_batch_pool_eagerly_created_prewarm_failure_records_once(
     mw: _FakeMainWindow, controller: SimulationController, monkeypatch
@@ -5300,7 +5078,6 @@ def test_ensure_parallel_batch_pool_eagerly_created_prewarm_failure_records_once
     assert controller._pool_eagerly_created is False
     assert recorded == [("Failed to create and prewarm batch executor", "submit boom")]
 
-
 @pytest.mark.unit
 def test_poll_parallel_batch_futures_shuts_down_stale_pool_after_superseded_futures_drain(
     mw: _FakeMainWindow, controller: SimulationController
@@ -5343,7 +5120,6 @@ def test_poll_parallel_batch_futures_shuts_down_stale_pool_after_superseded_futu
     assert controller.parallel_batch.executor is None
     assert timer.stop.called
 
-
 @pytest.mark.unit
 def test_start_next_batch_simulation_invalid_initials_after_pending_init_migration_reinvalidates_preserved_results(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -5380,7 +5156,6 @@ def test_start_next_batch_simulation_invalid_initials_after_pending_init_migrati
     mw._batch_model.validate_rows.assert_called_once_with([0])
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     assert controller._batch_run_context["pending_init_applied"] is False
-
 
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_migration_reinvalidates_preserved_results(
@@ -5429,7 +5204,6 @@ def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_mi
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
     assert controller._batch_run_context["pending_init_applied"] is False
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
@@ -5512,7 +5286,6 @@ def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkey
     assert controller._batch_run_context["pending_init_applied"] is False
     controller._start_next_batch_simulation.assert_not_called()
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
     class _Text:
@@ -5574,59 +5347,7 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
     assert int(solver_cfg["grid"]["N"]) <= 120
     assert int(solver_cfg["grid"]["N"]) >= 50
 
-
 @pytest.mark.unit
-def test_run_simulation_internal_invalid_t_end_preserves_targeted_dirty_workspaces(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    warned: list[tuple[str, str]] = []
-
-    def _warning(_parent, title, message):
-        warned.append((str(title), str(message)))
-        return QtWidgets.QMessageBox.StandardButton.Ok
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._slider_overrides = {"k1": 2.0}
-    mw._parse_sim_time_seconds.side_effect = ValueError("bad t_end")
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    assert warned and warned[0][0] == "Invalid t_end"
-    mw.reset_mechanism_workspaces.assert_not_called()
-    controller._start_next_batch_simulation.assert_not_called()
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_invalid_t_end_does_not_schedule_pending_slider_replay_after_preflight_abort(
@@ -5689,7 +5410,6 @@ def test_run_simulation_internal_invalid_t_end_does_not_schedule_pending_slider_
     assert scheduled == []
     controller._start_next_batch_simulation.assert_not_called()
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_invalid_t_end_reinvalidates_preserved_pending_init_results(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -5740,7 +5460,6 @@ def test_run_simulation_internal_invalid_t_end_reinvalidates_preserved_pending_i
     assert warned and warned[0][0] == "Invalid t_end"
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._start_next_batch_simulation.assert_not_called()
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_no_mechanism_after_pending_init_migration_reinvalidates_preserved_results(
@@ -5793,132 +5512,8 @@ def test_run_simulation_internal_no_mechanism_after_pending_init_migration_reinv
     controller._start_next_batch_simulation.assert_not_called()
 
 @pytest.mark.unit
-def test_run_simulation_internal_invalid_initials_preserves_targeted_dirty_workspaces(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    warned: list[tuple[str, str]] = []
-
-    def _warning(_parent, title, message):
-        warned.append((str(title), str(message)))
-        return QtWidgets.QMessageBox.StandardButton.Ok
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    class _MechTmp:
-        def species_names(self):
-            return ["A", "B"]
-
-    monkeypatch.setattr("kindred.core.simulator.dsl.parse_dsl_to_mechanism", lambda *_a, **_k: _MechTmp())
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._slider_overrides = {"k1": 2.0}
-    mw._batch_initials_for_row.side_effect = ValueError("bad initials")
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    assert warned and warned[0][0] == "Invalid Initial Conditions"
-    mw.reset_mechanism_workspaces.assert_not_called()
-    controller._start_next_batch_simulation.assert_not_called()
-
 
 @pytest.mark.unit
-def test_explicit_run_worker_error_preserves_targeted_dirty_workspaces(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
-    mw.reset_mechanism_workspaces.assert_not_called()
-    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
-    mw.discard_concentration_overlays_for_rows.assert_not_called()
-
-    controller._on_simulation_error(
-        {"kind": "simulation_error", "message": "ode build failed"},
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw.reset_mechanism_workspaces.assert_not_called()
-    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
-    mw.discard_concentration_overlays_for_rows.assert_not_called()
-
 
 @pytest.mark.unit
 def test_explicit_run_worker_error_reinvalidates_preserved_pending_init_results(
@@ -5977,721 +5572,25 @@ def test_explicit_run_worker_error_reinvalidates_preserved_pending_init_results(
 
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
 
+@pytest.mark.unit
 
 @pytest.mark.unit
-def test_explicit_run_success_clears_targeted_dirty_workspaces_after_completion(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
-    mw.reset_mechanism_workspaces.assert_not_called()
-    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
-    mw.discard_concentration_overlays_for_rows.assert_not_called()
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
-    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
-    mw.discard_concentration_overlays_for_rows.assert_not_called()
-    assert mw._sync_batch_species_columns.call_count == 2
-    assert mw._sync_batch_species_columns.call_args_list[-1] == call(["A", "B"], preserve_active_cache=True)
-
 
 @pytest.mark.unit
-def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_after_row_reorder(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 2
-    mw._batch_store.set_names.return_value = ["set1", "set2"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}.get(int(row))
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
-    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id2", 1: "id1"}.get(int(row))
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
-    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
-    mw.discard_concentration_overlays_for_rows.assert_not_called()
-
 
 @pytest.mark.unit
-def test_explicit_run_success_resyncs_focused_mechanism_controls_after_targeted_workspace_reset(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw._sync_mechanism_controls_to_focused_batch_set.assert_called_once_with(use_workspace=True)
 
 @pytest.mark.unit
-def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_not_row(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-
-    mw._batch_set_id_for_row.return_value = "id2"
-    mw.discard_concentration_overlays_for_set_ids.return_value = True
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
-    mw.discard_concentration_overlays_for_rows.assert_not_called()
-
 
 @pytest.mark.unit
-def test_explicit_run_success_cancels_pending_species_preview_after_targeted_overlay_reset(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    class _ActiveTimer:
-        def __init__(self) -> None:
-            self._active = True
-            self.stop_calls = 0
-
-        def isActive(self) -> bool:
-            return bool(self._active)
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-            self._active = False
-
-    scheduled: list[object] = []
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw.discard_concentration_overlays_for_set_ids.return_value = True
-    mw._species_slider_update_timer = _ActiveTimer()
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-    controller._pending_slider_simulation = True
-    controller._pending_slider_sim_request_id = 7
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    assert mw.discard_concentration_overlays_for_set_ids.call_count == 1
-    assert mw._species_slider_update_timer.stop_calls == 1
-    assert controller._pending_slider_simulation is False
-    assert controller._pending_slider_sim_request_id is None
-    assert scheduled == []
-
 
 @pytest.mark.unit
-def test_explicit_run_success_preserves_pending_species_preview_replay_when_no_targeted_dirty_reset_occurred(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    class _ActiveTimer:
-        def __init__(self) -> None:
-            self._active = True
-            self.stop_calls = 0
-
-        def isActive(self) -> bool:
-            return bool(self._active)
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-            self._active = False
-
-    scheduled: list[object] = []
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw.reset_mechanism_workspaces.return_value = False
-    mw.discard_concentration_overlays_for_set_ids.return_value = False
-    mw._species_slider_update_timer = _ActiveTimer()
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-    controller._pending_slider_simulation = True
-    controller._pending_slider_sim_request_id = 7
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    assert mw._species_slider_update_timer.stop_calls == 1
-    assert controller._pending_slider_simulation is False
-    assert controller._pending_slider_sim_request_id == 7
-    assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
-def test_explicit_run_success_preserves_pending_slider_replay_for_non_targeted_dirty_set(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    class _ActiveTimer:
-        def __init__(self) -> None:
-            self._active = True
-            self.stop_calls = 0
-
-        def isActive(self) -> bool:
-            return bool(self._active)
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-            self._active = False
-
-    scheduled: list[object] = []
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 2
-    mw._batch_store.set_names.return_value = ["set1", "set2"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw._dirty_state_generations = {"id1": 1, "id2": 3}
-    mw.reset_mechanism_workspaces.return_value = True
-    mw.discard_concentration_overlays_for_set_ids.return_value = True
-    mw._species_slider_update_timer = _ActiveTimer()
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-    controller._pending_slider_simulation = True
-    controller._pending_slider_sim_request_id = 7
-    controller.run_state.pending_slider_target_set_ids = ("id2",)
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
-    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
-    assert controller._pending_slider_simulation is False
-    assert controller._pending_slider_sim_request_id is None
-    assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id2",)
-    assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
-def test_explicit_run_preflight_abort_does_not_schedule_pending_slider_replay(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return ""
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    scheduled: list[object] = []
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda _text: "",
-    )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 2
-    mw._batch_store.set_names.return_value = ["set1", "set2"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_current_row.return_value = 0
-    mw._last_slider_change_name = "k1"
-
-    controller._latest_sim_request_id = 2
-    controller._pending_slider_simulation = True
-    controller._pending_slider_sim_request_id = 1
-    controller.run_state.pending_slider_target_set_ids = ("id1", "id2")
-
-    controller._run_simulation()
-
-    assert controller._pending_slider_simulation is True
-    assert controller._pending_slider_sim_request_id > 2
-    assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id1", "id2")
-    assert scheduled == []
-
 
 @pytest.mark.unit
-def test_explicit_run_success_requeues_surviving_pending_slider_replay_with_fresh_request_id(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    scheduled: list[object] = []
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 2
-    mw._batch_store.set_names.return_value = ["set1", "set2"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw._dirty_state_generations = {"id1": 1, "id2": 2}
-    mw.reset_mechanism_workspaces.return_value = True
-    mw.discard_concentration_overlays_for_set_ids.return_value = True
-    mw._last_slider_change_name = "k1"
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=2, batch_rows=[0], reuse_parallel_executor=False)
-    controller._pending_slider_simulation = True
-    controller._pending_slider_sim_request_id = 1
-    controller.run_state.pending_slider_target_set_ids = ("id1", "id2")
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=2,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    controller.run_simulation_internal = MagicMock()
-    assert scheduled == [controller._run_simulation_from_slider]
-    controller._latest_sim_request_id = 2
-    scheduled[0]()
-
-    controller.run_simulation_internal.assert_called_once()
-    _, kwargs = controller.run_simulation_internal.call_args
-    assert kwargs["fast_mode"] is True
-    assert kwargs["batch_rows"] == [1]
-
-
-@pytest.mark.unit
-def test_explicit_run_success_preserves_targeted_dirty_state_edited_after_run_start(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    class _Text:
-        def toPlainText(self) -> str:
-            return "reaction: A -> B; k=1"
-
-    class _StateNetworkEditor:
-        def get_state_network_dsl(self) -> str:
-            return ""
-
-    class _MechanismEditor:
-        def __init__(self):
-            self._reactions_text = _Text()
-            self._state_network_editor = _StateNetworkEditor()
-
-    class _ActiveTimer:
-        def __init__(self) -> None:
-            self._active = True
-            self.stop_calls = 0
-
-        def isActive(self) -> bool:
-            return bool(self._active)
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-            self._active = False
-
-    scheduled: list[object] = []
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
-        lambda text: text,
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
-        lambda **_kwargs: "sig",
-    )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
-        lambda **_kwargs: 1,
-    )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
-
-    mw._mechanism_editor = _MechanismEditor()
-    mw._batch_store.row_count.return_value = 1
-    mw._batch_store.set_names.return_value = ["set1"]
-    mw._batch_rows_for_scope.return_value = [0]
-    mw._batch_set_id_for_row.return_value = "id1"
-    mw._batch_preferred_primary_set_id.return_value = "id1"
-    mw._batch_cache_key.return_value = "ck"
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw._dirty_state_generations = {"id1": 1}
-    mw.reset_mechanism_workspaces.return_value = True
-    mw.discard_concentration_overlays_for_set_ids.return_value = True
-    mw._species_slider_update_timer = _ActiveTimer()
-
-    controller._start_next_batch_simulation = MagicMock()
-    controller._shutdown_batch_executor = MagicMock()
-
-    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
-    controller._pending_slider_simulation = True
-    controller._pending_slider_sim_request_id = 7
-
-    mw._dirty_state_generations["id1"] = 2
-
-    controller._on_simulation_complete(
-        _successful_result_payload(),
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="id1",
-        cache_key="ck",
-    )
-
-    mw.reset_mechanism_workspaces.assert_not_called()
-    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
-    assert mw._species_slider_update_timer.stop_calls == 1
-    assert controller._pending_slider_simulation is False
-    assert controller._pending_slider_sim_request_id == 7
-    assert scheduled == [controller._run_simulation_from_slider]
-
 
 @pytest.mark.unit
 def test_on_simulation_complete_updates_cache_and_marks_pending_init_applied(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
@@ -6749,7 +5648,6 @@ def test_on_simulation_complete_updates_cache_and_marks_pending_init_applied(mon
     mw._arm_pending_init_result_invalidation_guard.assert_called_once_with(rewrite="reaction: A -> B; k=1")
     controller._queue_slider_plot_update.assert_called_once()
 
-
 @pytest.mark.unit
 def test_on_simulation_complete_uses_truthful_scipy_fallback_warning_text(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -6787,7 +5685,6 @@ def test_on_simulation_complete_uses_truthful_scipy_fallback_warning_text(
     assert "RK4" not in message
     assert "fixed-step" not in message
 
-
 @pytest.mark.unit
 def test_on_simulation_error_cancelled_schedules_pending_slider(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
@@ -6811,7 +5708,6 @@ def test_on_simulation_error_cancelled_schedules_pending_slider(monkeypatch, mw:
     assert "fn" in scheduled
     mw._variable_update_timer.stop.assert_called_once_with()
     mw._species_slider_update_timer.stop.assert_called_once_with()
-
 
 @pytest.mark.unit
 def test_on_simulation_error_non_cancelled_explicit_requeues_preserved_pending_slider_replay(
@@ -6859,7 +5755,6 @@ def test_on_simulation_error_non_cancelled_explicit_requeues_preserved_pending_s
     assert kwargs["fast_mode"] is True
     assert kwargs["batch_rows"] == [1]
 
-
 @pytest.mark.unit
 def test_on_simulation_error_surfaces_stack_trace_as_dialog_details_and_log(
     caplog, mw: _FakeMainWindow, controller: SimulationController
@@ -6900,7 +5795,6 @@ def test_on_simulation_error_surfaces_stack_trace_as_dialog_details_and_log(
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
 
-
 @pytest.mark.unit
 def test_consume_parallel_batch_future_error_payload_calls_on_error(controller: SimulationController):
     fut: Future = Future()
@@ -6928,7 +5822,6 @@ def test_consume_parallel_batch_future_error_payload_calls_on_error(controller: 
     assert ok is False
     controller.on_simulation_error.assert_called_once()
 
-
 @pytest.mark.unit
 def test_has_running_workers_is_pure_query(controller: SimulationController):
     worker = _FakeWorker(running=False)
@@ -6941,11 +5834,9 @@ def test_has_running_workers_is_pure_query(controller: SimulationController):
     assert controller._simulation_worker is worker
     assert controller._retained_simulation_workers == [worker]
 
-
 # ---------------------------------------------------------------------------
 # Structured execution request: non-fast-mode regression tests
 # ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_non_fast_mode_does_not_build_prepared_payloads(
@@ -7034,7 +5925,6 @@ def test_run_simulation_internal_non_fast_mode_does_not_build_prepared_payloads(
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
 
-
 @pytest.mark.unit
 def test_run_simulation_internal_non_fast_mode_builds_execution_requests(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -7122,7 +6012,6 @@ def test_run_simulation_internal_non_fast_mode_builds_execution_requests(
     mw.preview_initials_for_row.assert_not_called()
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_non_fast_mode_multiset_execution_requests_do_not_inherit_primary_dsl(
@@ -7225,7 +6114,6 @@ def test_run_simulation_internal_non_fast_mode_multiset_execution_requests_do_no
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
 
-
 @pytest.mark.unit
 def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -7290,7 +6178,6 @@ def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
     assert created["prepared"] is None
     assert created["started"] is True
     mw.preview_initials_for_row.assert_not_called()
-
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_non_fast_mode_sets_structured_execution_request(
@@ -7362,7 +6249,6 @@ def test_start_next_batch_simulation_non_fast_mode_sets_structured_execution_req
     assert worker._execution_request["prepared_payload"] is None  # type: ignore[index]
     assert worker._execution_request["mechanism_text"] == "reaction: A -> B; k=1"  # type: ignore[index]
 
-
 @pytest.mark.unit
 def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_result_payload_mode(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
@@ -7427,7 +6313,6 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
 
     assert created["started"] is True
     assert created["include_mechanism_in_result_payload"] is False
-
 
 @pytest.mark.unit
 def test_run_simulation_internal_energy_mode_builds_structured_execution_requests(
@@ -7525,3 +6410,873 @@ def test_run_simulation_internal_energy_mode_builds_structured_execution_request
     assert execution_request_by_set_id["id1"]["prepared_payload"] is None
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
+
+
+def test_start_next_batch_simulation_explicit_run_ignores_staged_concentration_overlay(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    created: dict[str, object] = {}
+
+    class _RecordingWorker:
+        def __init__(
+            self,
+            *,
+            mechanism_text,
+            initials,
+            t_span,
+            solver_config,
+            parent,
+            prepared,
+            include_mechanism_in_result_payload=None,
+        ):
+            created["mechanism_text"] = str(mechanism_text)
+            created["initials"] = dict(initials)
+            created["t_span"] = tuple(t_span)
+            created["solver_config"] = dict(solver_config)
+            created["prepared"] = prepared
+            created["include_mechanism_in_result_payload"] = include_mechanism_in_result_payload
+            self.progress = _FakeSignal()
+            self.result_ready = _FakeSignal()
+            self.error = _FakeSignal()
+
+        def start(self) -> None:
+            created["started"] = True
+
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
+    controller._release_current_simulation_worker = MagicMock()
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "pos": 0,
+        "rows": [0],
+        "queue_ids": ["id2"],
+        "queue_names": ["set2"],
+        "full_dsl": "reaction: A -> B; k=1",
+        "solver_config": {"solver": "BDF"},
+        "t_end": 10.0,
+        "fast_mode": False,
+        "request_id": 7,
+        "cache_key": "explicit-cache",
+        "pending_init_seed": {},
+            "pending_init_applied": True,
+        }
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+
+    controller._start_next_batch_simulation()
+
+    assert created["initials"] == {"A": 1.0}
+    assert created["started"] is True
+    mw.preview_initials_for_row.assert_not_called()
+
+
+def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentration_overlay(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    submitted: list[dict[str, object]] = []
+
+    class _FakeParallelFuture:
+        def add_done_callback(self, _callback) -> None:
+            return
+
+        def done(self) -> bool:
+            return False
+
+    class _FakeExecutor:
+        def submit(self, _fn, *args, **_kwargs):
+            if args:
+                submitted.append(dict(args[0]))
+            return _FakeParallelFuture()
+
+        def shutdown(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+            return
+
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
+    controller.parallel_batch.executor_factory = MagicMock(return_value=_FakeExecutor())
+    controller._batch_parallel.executor = None
+    controller._batch_parallel.future_map = {}
+    controller._batch_parallel.future_meta = {}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "rows": [0],
+        "queue_ids": ["id2"],
+        "queue_names": ["set2"],
+        "run_id": 3,
+        "request_id": 11,
+        "full_dsl": "reaction: A -> B; k=1",
+        "mechanism_signature": "sig",
+        "solver_config": {"solver": "BDF"},
+        "t_end": 10.0,
+        "effective_workers": 2,
+        "fast_mode": False,
+        "pending_init_seed": {},
+        "pending_init_applied": True,
+    }
+
+    controller._start_parallel_batch_simulations()
+
+    assert submitted and submitted[0]["initials"] == {"A": 1.0}
+    mw.preview_initials_for_row.assert_not_called()
+
+
+def test_explicit_run_worker_error_preserves_targeted_dirty_workspaces(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+
+    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
+    mw.reset_mechanism_workspaces.assert_not_called()
+    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
+    mw.discard_concentration_overlays_for_rows.assert_not_called()
+
+    controller._on_simulation_error(
+        {"kind": "simulation_error", "message": "ode build failed"},
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    mw.reset_mechanism_workspaces.assert_not_called()
+    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
+    mw.discard_concentration_overlays_for_rows.assert_not_called()
+
+
+def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_after_row_reorder(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_store.set_names.return_value = ["set1", "set2"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}.get(int(row))
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+
+    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id2", 1: "id1"}.get(int(row))
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
+    mw.discard_concentration_overlays_for_rows.assert_not_called()
+
+
+def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_not_row(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+
+    mw._batch_set_id_for_row.return_value = "id2"
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
+    mw.discard_concentration_overlays_for_rows.assert_not_called()
+
+
+def test_explicit_run_success_cancels_pending_species_preview_after_targeted_overlay_reset(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    class _ActiveTimer:
+        def __init__(self) -> None:
+            self._active = True
+            self.stop_calls = 0
+
+        def isActive(self) -> bool:
+            return bool(self._active)
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            self._active = False
+
+    scheduled: list[object] = []
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._species_slider_update_timer = _ActiveTimer()
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    assert mw.discard_concentration_overlays_for_set_ids.call_count == 1
+    assert mw._species_slider_update_timer.stop_calls == 1
+    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_sim_request_id is None
+    assert scheduled == []
+
+
+def test_explicit_run_success_preserves_pending_slider_replay_for_non_targeted_dirty_set(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    class _ActiveTimer:
+        def __init__(self) -> None:
+            self._active = True
+            self.stop_calls = 0
+
+        def isActive(self) -> bool:
+            return bool(self._active)
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            self._active = False
+
+    scheduled: list[object] = []
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_store.set_names.return_value = ["set1", "set2"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw._dirty_state_generations = {"id1": 1, "id2": 3}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._species_slider_update_timer = _ActiveTimer()
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+    controller.run_state.pending_slider_target_set_ids = ("id2",)
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
+    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_sim_request_id is None
+    assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id2",)
+    assert scheduled == [controller._run_simulation_from_slider]
+
+
+def test_explicit_run_preflight_abort_does_not_schedule_pending_slider_replay(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return ""
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    scheduled: list[object] = []
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda _text: "",
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_store.set_names.return_value = ["set1", "set2"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_current_row.return_value = 0
+    mw._last_slider_change_name = "k1"
+
+    controller._latest_sim_request_id = 2
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 1
+    controller.run_state.pending_slider_target_set_ids = ("id1", "id2")
+
+    controller._run_simulation()
+
+    assert controller._pending_slider_simulation is True
+    assert controller._pending_slider_sim_request_id > 2
+    assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id1", "id2")
+    assert scheduled == []
+
+
+def test_explicit_run_success_requeues_surviving_pending_slider_replay_with_fresh_request_id(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    scheduled: list[object] = []
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_store.set_names.return_value = ["set1", "set2"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw._dirty_state_generations = {"id1": 1, "id2": 2}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._last_slider_change_name = "k1"
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=2, batch_rows=[0], reuse_parallel_executor=False)
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 1
+    controller.run_state.pending_slider_target_set_ids = ("id1", "id2")
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=2,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    controller.run_simulation_internal = MagicMock()
+    assert scheduled == [controller._run_simulation_from_slider]
+    controller._latest_sim_request_id = 2
+    scheduled[0]()
+
+    controller.run_simulation_internal.assert_called_once()
+    _, kwargs = controller.run_simulation_internal.call_args
+    assert kwargs["fast_mode"] is True
+    assert kwargs["batch_rows"] == [1]
+
+
+def test_explicit_run_success_preserves_targeted_dirty_state_edited_after_run_start(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    class _ActiveTimer:
+        def __init__(self) -> None:
+            self._active = True
+            self.stop_calls = 0
+
+        def isActive(self) -> bool:
+            return bool(self._active)
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            self._active = False
+
+    scheduled: list[object] = []
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw._dirty_state_generations = {"id1": 1}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._species_slider_update_timer = _ActiveTimer()
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+
+    mw._dirty_state_generations["id1"] = 2
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    mw.reset_mechanism_workspaces.assert_not_called()
+    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
+    assert mw._species_slider_update_timer.stop_calls == 1
+    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_sim_request_id == 7
+    assert scheduled == [controller._run_simulation_from_slider]
+
+
+def test_run_simulation_internal_invalid_t_end_preserves_targeted_dirty_workspaces(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    warned: list[tuple[str, str]] = []
+
+    def _warning(_parent, title, message):
+        warned.append((str(title), str(message)))
+        return QtWidgets.QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._slider_overrides = {"k1": 2.0}
+    mw._parse_sim_time_seconds.side_effect = ValueError("bad t_end")
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+
+    assert warned and warned[0][0] == "Invalid t_end"
+    mw.reset_mechanism_workspaces.assert_not_called()
+    controller._start_next_batch_simulation.assert_not_called()
+
+
+def test_run_simulation_internal_invalid_initials_preserves_targeted_dirty_workspaces(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    warned: list[tuple[str, str]] = []
+
+    def _warning(_parent, title, message):
+        warned.append((str(title), str(message)))
+        return QtWidgets.QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    class _MechTmp:
+        def species_names(self):
+            return ["A", "B"]
+
+    monkeypatch.setattr("kindred.core.simulator.dsl.parse_dsl_to_mechanism", lambda *_a, **_k: _MechTmp())
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._slider_overrides = {"k1": 2.0}
+    mw._batch_initials_for_row.side_effect = ValueError("bad initials")
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+
+    assert warned and warned[0][0] == "Invalid Initial Conditions"
+    mw.reset_mechanism_workspaces.assert_not_called()
+    controller._start_next_batch_simulation.assert_not_called()
+
+
+def test_explicit_run_success_preserves_pending_species_preview_replay_when_no_targeted_dirty_reset_occurred(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    class _ActiveTimer:
+        def __init__(self) -> None:
+            self._active = True
+            self.stop_calls = 0
+
+        def isActive(self) -> bool:
+            return bool(self._active)
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            self._active = False
+
+    scheduled: list[object] = []
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw.reset_mechanism_workspaces.return_value = False
+    mw.discard_concentration_overlays_for_set_ids.return_value = False
+    mw._species_slider_update_timer = _ActiveTimer()
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    assert mw._species_slider_update_timer.stop_calls == 1
+    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_sim_request_id == 7
+    assert scheduled == [controller._run_simulation_from_slider]

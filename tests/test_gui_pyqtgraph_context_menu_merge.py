@@ -9,9 +9,7 @@ from kindred.gui.widgets.pyqtgraph_plot_panel_impl import (
     PyQtGraphPlotPanel,
 )
 
-
 pytestmark = pytest.mark.gui
-
 
 class _DummyClipboard:
     def __init__(self) -> None:
@@ -19,7 +17,6 @@ class _DummyClipboard:
 
     def setText(self, text: str, *_args, **_kwargs) -> None:  # noqa: N802 - Qt-style
         self.last_text = str(text)
-
 
 def _capture_context_menu(monkeypatch):
     captured_menus = []
@@ -31,18 +28,15 @@ def _capture_context_menu(monkeypatch):
     monkeypatch.setattr(QtWidgets.QMenu, "exec_", _fake_exec)
     return captured_menus
 
-
 def _find_action(actions, text: str):
     for action in actions:
         if action.text() == text:
             return action
     raise AssertionError(f"Missing action {text!r}")
 
-
 def _split_tsv(text: str) -> list[list[str]]:
     lines = [line for line in str(text).splitlines() if line]
     return [line.split("\t") for line in lines]
-
 
 def _find_header_index(header: list[str], *, prefix: str, contains: list[str]) -> int:
     for idx, cell in enumerate(header):
@@ -52,23 +46,19 @@ def _find_header_index(header: list[str], *, prefix: str, contains: list[str]) -
             return idx
     raise AssertionError(f"Missing header with prefix={prefix!r} contains={contains!r}")
 
-
 def _numeric_column(rows: list[list[str]], idx: int) -> np.ndarray:
     values = [row[idx] for row in rows if idx < len(row) and row[idx] != ""]
     return np.asarray([float(value) for value in values], dtype=float)
 
-
 def _axis_label_text(panel: PyQtGraphPlotPanel, axis_name: str) -> str:
     axis = panel._plot_item.getAxis(axis_name)
     return str(getattr(axis, "labelText", "") or "")
-
 
 def _legend_texts(panel: PyQtGraphPlotPanel) -> list[str]:
     legend = getattr(panel, "_legend", None)
     if legend is None:
         return []
     return [str(label.text) for _sample, label in list(legend.items)]
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_pyqtgraph_native_menus_disabled_and_custom_actions_present(qtbot, monkeypatch):
@@ -127,7 +117,6 @@ def test_pyqtgraph_native_menus_disabled_and_custom_actions_present(qtbot, monke
     menu.actions()[export_idx].trigger()
     assert export_calls["n"] == 1
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_clear_resets_simulation_metadata_to_init_values(qtbot):
     panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
@@ -160,7 +149,6 @@ def test_clear_resets_simulation_metadata_to_init_values(qtbot):
     assert panel._simulation_set_label is None
     assert panel._simulation_set_popup_label is None
     assert panel._simulation_overlays == []
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_context_menu_toggle_hides_and_restores_canonical_reference_lines(qtbot, monkeypatch):
@@ -238,7 +226,6 @@ def test_main_plot_context_menu_toggle_hides_and_restores_canonical_reference_li
     assert non_ghost_key in panel._plot_items
     assert ghost_key in panel._plot_items
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_actions_are_scoped_to_simulation_plot(qtbot, monkeypatch):
     widget = PlotTabsWidget()
@@ -265,7 +252,6 @@ def test_main_plot_axis_inversion_actions_are_scoped_to_simulation_plot(qtbot, m
     dataset_menu = captured_menus.pop()
     assert all(action.text() != "Axis Direction" for action in dataset_menu.actions())
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_context_menu_includes_copy_actions_and_dataset_plot_does_not(qtbot, monkeypatch):
     widget = PlotTabsWidget()
@@ -289,75 +275,11 @@ def test_main_plot_context_menu_includes_copy_actions_and_dataset_plot_does_not(
     assert all(action.text() != "Copy All" for action in dataset_menu.actions())
     assert all(action.text() != "Copy Visible Data" for action in dataset_menu.actions())
 
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_main_and_dataset_plot_context_menus_do_not_expose_hover_toggle(qtbot, monkeypatch):
-    widget = PlotTabsWidget()
-    qtbot.addWidget(widget)
-    widget.show()
-    QtWidgets.QApplication.processEvents()
-
-    dataset_panel = widget.add_dataset_tab("dataset-1")
-    QtWidgets.QApplication.processEvents()
-
-    captured_menus = _capture_context_menu(monkeypatch)
-
-    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
-    main_menu = captured_menus.pop()
-    assert all(action.text() != "Enable Hover/Crosshair" for action in main_menu.actions())
-
-    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
-    dataset_menu = captured_menus.pop()
-    assert all(action.text() != "Enable Hover/Crosshair" for action in dataset_menu.actions())
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_main_and_dataset_plot_context_menus_do_not_expose_secondary_axis(qtbot, monkeypatch):
-    widget = PlotTabsWidget()
-    qtbot.addWidget(widget)
-    widget.show()
-    QtWidgets.QApplication.processEvents()
-
-    dataset_panel = widget.add_dataset_tab("dataset-1")
-    QtWidgets.QApplication.processEvents()
-
-    captured_menus = _capture_context_menu(monkeypatch)
-
-    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
-    main_menu = captured_menus.pop()
-    assert all(action.text() != "Secondary Y-Axis" for action in main_menu.actions())
-
-    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
-    dataset_menu = captured_menus.pop()
-    assert all(action.text() != "Secondary Y-Axis" for action in dataset_menu.actions())
-
-
-@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
-def test_plot_panel_backend_does_not_carry_secondary_axis_or_hover_helpers_or_state(qtbot):
-    panel = PyQtGraphPlotPanel()
-    qtbot.addWidget(panel)
-    panel.show()
-    QtWidgets.QApplication.processEvents()
-
-    assert not hasattr(panel, "_add_secondary_y_axis")
-    assert not hasattr(panel, "_remove_secondary_y_axis")
-    assert not hasattr(panel, "_secondary_y_axis")
-    assert not hasattr(panel, "_secondary_y_species")
-    assert not hasattr(panel, "_secondary_y_items")
-    assert not hasattr(panel, "_secondary_y_overlay_items")
-    assert not hasattr(panel, "_secondary_y_dataset_overlay_items")
-    assert not hasattr(panel, "_enable_hover_crosshair_toggle_action")
-    assert not hasattr(panel, "_hover_crosshair_enabled")
-    assert not hasattr(panel, "_crosshair_v")
-    assert not hasattr(panel, "_crosshair_h")
-    assert not hasattr(panel, "_tooltip_text")
-    assert not hasattr(panel, "_clear_hover_state")
-    assert not hasattr(panel, "_ensure_hover_visual_items")
-    assert not hasattr(panel, "_set_hover_crosshair_enabled")
-    assert not hasattr(panel, "_find_nearest_hover_hit")
-    assert not hasattr(panel, "_find_nearest_data_point")
-    assert not hasattr(panel, "_on_mouse_moved")
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_and_dataset_markers(
@@ -479,7 +401,6 @@ def test_copy_visible_data_writes_structural_tsv_for_visible_primary_overlays_an
     assert body[2][dataset_x_idx] == ""
     assert body[2][dataset_y_idx] == ""
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_visible_export_and_copy_visible_data_use_popup_labels_for_duplicate_simulation_names(
     qtbot, monkeypatch
@@ -532,7 +453,6 @@ def test_visible_export_and_copy_visible_data_use_popup_labels_for_duplicate_sim
     assert any(cell.startswith("dup (row 1)::") for cell in header)
     assert any(cell.startswith("dup (row 2)::") for cell in header)
     assert all(not cell.startswith("dup::") for cell in header)
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_dataset_markers(
@@ -685,7 +605,6 @@ def test_copy_all_writes_structural_tsv_for_shown_blocks_deduped_overlays_and_da
     assert _numeric_column(body, dataset_x_idx).shape[0] == 3
     assert _numeric_column(body, dataset_y_idx).shape[0] == 3
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_all_soft_fail_yes_copies_available_blocks_only(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel()
@@ -748,7 +667,6 @@ def test_copy_all_soft_fail_yes_copies_available_blocks_only(qtbot, monkeypatch)
     assert rows
     assert any(cell.startswith("set1::") for cell in rows[0])
     assert all(not cell.startswith("set2::") for cell in rows[0])
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_all_does_not_recover_missing_shown_set_from_local_overlay_fallback(qtbot, monkeypatch):
@@ -823,7 +741,6 @@ def test_copy_all_does_not_recover_missing_shown_set_from_local_overlay_fallback
     assert all(not cell.startswith("dup::") for cell in header)
     assert all(not cell.startswith("dup (row 2)::") for cell in header)
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_all_soft_fail_no_leaves_clipboard_unchanged(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel()
@@ -875,7 +792,6 @@ def test_copy_all_soft_fail_no_leaves_clipboard_unchanged(qtbot, monkeypatch):
     panel._copy_all()
 
     assert clipboard.last_text == "unchanged"
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_visible_data_respects_coarse_sampling_for_overlay_blocks(qtbot, monkeypatch):
@@ -952,7 +868,6 @@ def test_copy_visible_data_respects_coarse_sampling_for_overlay_blocks(qtbot, mo
         np.linspace(100.0, 200.0, 1600)[dataset_expected_idx],
     )
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_copy_visible_data_keeps_species_x_plot_usable_when_time_mismatches(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
@@ -993,7 +908,6 @@ def test_copy_visible_data_keeps_species_x_plot_usable_when_time_mismatches(qtbo
     assert all("Time" not in cell for cell in primary_headers)
     assert any("[B]" in cell for cell in primary_headers)
     assert any(cell.endswith("::A") or cell == "set1::A" for cell in primary_headers)
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_species_x_partial_render_state_filters_incompatible_y_series_across_render_export_and_copy(
@@ -1132,7 +1046,6 @@ def test_species_x_mixed_primary_and_overlay_lengths_keep_overlay_local_c_series
     assert any(cell.startswith("set2::") and cell.endswith("::C") for cell in rows[0])
     assert any(cell.startswith("ds1::") and cell.endswith("::C") for cell in rows[0])
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_species_x_overlay_only_visible_state_exports_and_copies_overlay_blocks(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
@@ -1204,7 +1117,6 @@ def test_species_x_overlay_only_visible_state_exports_and_copies_overlay_blocks(
     assert any(cell.startswith("set2::") and cell.endswith("::C") for cell in rows[0])
     assert any(cell.startswith("ds1::") and cell.endswith("::C") for cell in rows[0])
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_species_x_dataset_overlay_enabled_subset_skips_simulation_only_species_for_status_and_export(
     qtbot,
@@ -1271,7 +1183,6 @@ def test_species_x_dataset_overlay_enabled_subset_skips_simulation_only_species_
     assert any(header.startswith("set2::") and header.endswith("::C") for header in all_header)
     assert any(header.startswith("ds1::") and header.endswith("::A") for header in all_header)
     assert all(not (header.startswith("ds1::") and header.endswith("::C")) for header in all_header)
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_dataset_overlay_cache_refreshes_on_enabled_species_change_and_later_consumers_do_not_reresolve(
@@ -1360,7 +1271,6 @@ def test_dataset_overlay_cache_refreshes_on_enabled_species_change_and_later_con
     assert rows
     assert any(cell.startswith("ds1::") and cell.endswith("::A") for cell in rows[0])
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_export_all_overlay_cache_is_built_lazily(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
@@ -1421,7 +1331,6 @@ def test_export_all_overlay_cache_is_built_lazily(qtbot, monkeypatch):
     assert cached_header == all_header
     assert build_calls == []
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_time_axis_dataset_overlay_enabled_alias_remains_visible_and_exported(
     qtbot,
@@ -1471,7 +1380,6 @@ def test_time_axis_dataset_overlay_enabled_alias_remains_visible_and_exported(
     assert all_rows
     assert any(header.startswith("ds1::") and header.endswith("::A") for header in all_header)
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_time_axis_dataset_overlay_filtered_subset_still_warns_and_blocks_export_for_missing_series(
     qtbot,
@@ -1516,7 +1424,6 @@ def test_time_axis_dataset_overlay_filtered_subset_still_warns_and_blocks_export
     header, rows = panel.build_visible_export("all")
     assert len(header) > 0
 
-
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_species_x_dataset_overlay_enabled_column_still_warns_and_blocks_export_for_real_mismatch(
     qtbot,
@@ -1557,7 +1464,6 @@ def test_species_x_dataset_overlay_enabled_column_still_warns_and_blocks_export_
 
     with pytest.raises(ValueError, match="Cannot export overlay datasets until issues are resolved"):
         panel.build_visible_export("axis")
-
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
@@ -1620,3 +1526,69 @@ def test_main_plot_axis_inversion_toggles_render_direction_and_restores(qt_app):
     finally:
         panel.deleteLater()
         qt_app.processEvents()
+
+
+def test_main_and_dataset_plot_context_menus_do_not_expose_hover_toggle(qtbot, monkeypatch):
+    widget = PlotTabsWidget()
+    qtbot.addWidget(widget)
+    widget.show()
+    QtWidgets.QApplication.processEvents()
+
+    dataset_panel = widget.add_dataset_tab("dataset-1")
+    QtWidgets.QApplication.processEvents()
+
+    captured_menus = _capture_context_menu(monkeypatch)
+
+    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
+    main_menu = captured_menus.pop()
+    assert all(action.text() != "Enable Hover/Crosshair" for action in main_menu.actions())
+
+    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
+    dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Enable Hover/Crosshair" for action in dataset_menu.actions())
+
+
+def test_main_and_dataset_plot_context_menus_do_not_expose_secondary_axis(qtbot, monkeypatch):
+    widget = PlotTabsWidget()
+    qtbot.addWidget(widget)
+    widget.show()
+    QtWidgets.QApplication.processEvents()
+
+    dataset_panel = widget.add_dataset_tab("dataset-1")
+    QtWidgets.QApplication.processEvents()
+
+    captured_menus = _capture_context_menu(monkeypatch)
+
+    widget._main_plot._show_context_menu(QtCore.QPoint(0, 0))
+    main_menu = captured_menus.pop()
+    assert all(action.text() != "Secondary Y-Axis" for action in main_menu.actions())
+
+    dataset_panel._plot_panel._show_context_menu(QtCore.QPoint(0, 0))
+    dataset_menu = captured_menus.pop()
+    assert all(action.text() != "Secondary Y-Axis" for action in dataset_menu.actions())
+
+
+def test_plot_panel_backend_does_not_carry_secondary_axis_or_hover_helpers_or_state(qtbot):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    assert not hasattr(panel, "_add_secondary_y_axis")
+    assert not hasattr(panel, "_remove_secondary_y_axis")
+    assert not hasattr(panel, "_secondary_y_axis")
+    assert not hasattr(panel, "_secondary_y_species")
+    assert not hasattr(panel, "_secondary_y_items")
+    assert not hasattr(panel, "_secondary_y_overlay_items")
+    assert not hasattr(panel, "_secondary_y_dataset_overlay_items")
+    assert not hasattr(panel, "_enable_hover_crosshair_toggle_action")
+    assert not hasattr(panel, "_hover_crosshair_enabled")
+    assert not hasattr(panel, "_crosshair_v")
+    assert not hasattr(panel, "_crosshair_h")
+    assert not hasattr(panel, "_tooltip_text")
+    assert not hasattr(panel, "_clear_hover_state")
+    assert not hasattr(panel, "_ensure_hover_visual_items")
+    assert not hasattr(panel, "_set_hover_crosshair_enabled")
+    assert not hasattr(panel, "_find_nearest_hover_hit")
+    assert not hasattr(panel, "_find_nearest_data_point")
+    assert not hasattr(panel, "_on_mouse_moved")

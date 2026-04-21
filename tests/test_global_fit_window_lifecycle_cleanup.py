@@ -810,40 +810,14 @@ def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeyp
         window.close()
 
 
-def test_completion_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
-    window = _build_window()
-    try:
-        window.show()
-        qt_app.processEvents()
-        worker = _SignalWorker()
-        worker._running = False
-        window._worker = worker
-        window._pending_best_payload = {"cost": 1.0}
-        window._pending_best_worker = worker
-        window._pending_best_timer.start()
-
-        states: list[tuple[bool, object, object]] = []
-
-        def _capture_exec(self):
-            states.append(
-                (
-                    window._pending_best_timer.isActive(),
-                    window._pending_best_payload,
-                    window._pending_best_worker,
-                )
-            )
-            return int(QtWidgets.QMessageBox.StandardButton.Ok)
-
-        monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
-
-        window._handle_global_fit_complete({"result": _build_success_result()}, worker=worker)
-
-        assert states == [(False, None, None)]
-    finally:
-        window.close()
-
-
-def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
+@pytest.mark.parametrize(
+    ("event", "expected_details"),
+    [
+        ("complete", ""),
+        ("error", ""),
+    ],
+)
+def test_completion_stops_pending_best_timer_before_dialog(qt_app, monkeypatch, event, expected_details):
     window = _build_window()
     try:
         window.show()
@@ -858,17 +832,6 @@ def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
         states: list[tuple[bool, object, object]] = []
         captured = {"details": None}
 
-        def _capture_warning(*_args, **_kwargs):
-            states.append(
-                (
-                    window._pending_best_timer.isActive(),
-                    window._pending_best_payload,
-                    window._pending_best_worker,
-                )
-            )
-            captured["details"] = None
-            return int(QtWidgets.QMessageBox.StandardButton.Ok)
-
         def _capture_exec(self):
             states.append(
                 (
@@ -880,13 +843,27 @@ def test_error_stops_pending_best_timer_before_dialog(qt_app, monkeypatch):
             captured["details"] = self.detailedText()
             return int(QtWidgets.QMessageBox.StandardButton.Ok)
 
+        def _capture_warning(*_args, **_kwargs):
+            states.append(
+                (
+                    window._pending_best_timer.isActive(),
+                    window._pending_best_payload,
+                    window._pending_best_worker,
+                )
+            )
+            captured["details"] = None
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
         monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
         monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
 
-        window._on_worker_error({"kind": "fitting_error", "message": "boom"}, worker=worker)
+        if event == "complete":
+            window._handle_global_fit_complete({"result": _build_success_result()}, worker=worker)
+        else:
+            window._on_worker_error({"kind": "fitting_error", "message": "boom"}, worker=worker)
 
         assert states == [(False, None, None)]
-        assert captured["details"] == ""
+        assert captured["details"] == expected_details
     finally:
         window.close()
 
