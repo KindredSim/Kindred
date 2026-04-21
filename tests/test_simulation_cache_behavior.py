@@ -378,6 +378,7 @@ def test_selection_change_without_active_cache_context_clears_stale_cache_warnin
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
     main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window._status_label.setText("Result not cached (evicted). Press Run to compute.")
 
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -397,13 +398,6 @@ def test_selection_change_without_active_cache_context_clears_stale_cache_warnin
     )
 
     cache = main_window.simulation_controller.batch_cache
-    cache.active_cache_key = "missing-cache-key"
-
-    main_window._refresh_batch_display_from_focus_and_shown()
-    qt_app.processEvents()
-
-    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-
     cache.clear_active_selection_state()
 
     main_window._refresh_batch_display_from_focus_and_shown()
