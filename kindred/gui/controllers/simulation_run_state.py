@@ -1,12 +1,59 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Sequence, Tuple
 
 from PySide6 import QtCore
 
 
+def _normalize_preview_request_id(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _normalize_preview_epoch(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _normalize_preview_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if isinstance(values, str):
+        values = (values,)
+    for value in values or ():
+        set_id = str(value or "").strip()
+        if not set_id or set_id in seen:
+            continue
+        seen.add(set_id)
+        normalized.append(set_id)
+    return tuple(normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewOwnershipState:
+    request_id: Optional[int] = None
+    epoch: int = 0
+    target_set_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "request_id", _normalize_preview_request_id(self.request_id))
+        object.__setattr__(self, "epoch", _normalize_preview_epoch(self.epoch))
+        object.__setattr__(
+            self,
+            "target_set_ids",
+            _normalize_preview_target_set_ids(self.target_set_ids),
+        )
+
+
 class SimulationRunState(QtCore.QObject):
-    """Owns per-run worker, request-id, and progress-throttle state."""
+    """Owns per-run worker, request-id, progress-throttle, and preview-ownership state."""
 
     def __init__(self, *, on_progress_timeout, parent: QtCore.QObject) -> None:
         super().__init__(parent)
@@ -27,6 +74,7 @@ class SimulationRunState(QtCore.QObject):
         self.latest_sim_request_id = 0
         self.pending_slider_sim_request_id: Optional[int] = None
         self.pending_slider_target_set_ids: Tuple[str, ...] = ()
+        self.preview_ownership = PreviewOwnershipState()
 
     def next_request_id(self) -> int:
         self.sim_request_id = int(self.sim_request_id) + 1

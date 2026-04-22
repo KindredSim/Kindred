@@ -10,6 +10,7 @@ from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_c
 import kindred.core.simulator.dsl as dsl
 from kindred.core.simulation_preparation import BoundMechanism
 from kindred.gui.controllers.simulation_controller import build_fallback_cache_key
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from tests.worker_stubs import make_simulation_worker_stub
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
@@ -3011,6 +3012,11 @@ def test_slider_preview_flush_uses_shown_rows_for_plot_membership_not_only_highl
     controller = main_window.simulation_controller
     controller._latest_sim_request_id = 1
     controller._active_run_id = 2
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=1,
+        epoch=1,
+        target_set_ids=(dirty_primary_id,),
+    )
     controller._queue_slider_plot_update(
         set_id=dirty_primary_id,
         cache_key=preview_key,
@@ -3106,6 +3112,11 @@ def test_slider_preview_single_shown_dirty_set_flush_displays_canonical_ref(
     controller = main_window.simulation_controller
     controller._latest_sim_request_id = 1
     controller._active_run_id = 2
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=1,
+        epoch=1,
+        target_set_ids=(shown_id,),
+    )
     controller._queue_slider_plot_update(
         set_id=shown_id,
         cache_key=preview_key,
@@ -3201,6 +3212,11 @@ def test_slider_preview_multiselect_flush_uses_requested_preview_cache_key_for_g
     controller = main_window.simulation_controller
     controller._latest_sim_request_id = 1
     controller._active_run_id = 2
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=1,
+        epoch=1,
+        target_set_ids=(dirty_primary_id,),
+    )
     controller._queue_slider_plot_update(
         set_id=dirty_primary_id,
         cache_key=requested_preview_key,

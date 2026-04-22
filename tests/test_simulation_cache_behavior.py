@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from kindred.core.batch_parallel import run_batch_simulation_task
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 
 def _fake_sim_result(*, marker: float = 1.0) -> dict:
     t = np.asarray([0.0, 1.0], dtype=float)
@@ -209,6 +210,11 @@ def test_preview_results_go_to_preview_cache_and_are_bounded(main_window, qt_app
 
     main_window.simulation_controller.run_state.latest_sim_request_id = 1
     main_window.simulation_controller.run_state.active_run_id = 1
+    main_window.simulation_controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=1,
+        epoch=1,
+        target_set_ids=("set1",),
+    )
 
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=1.0),
@@ -223,6 +229,11 @@ def test_preview_results_go_to_preview_cache_and_are_bounded(main_window, qt_app
 
     main_window.simulation_controller.run_state.latest_sim_request_id = 2
     main_window.simulation_controller.run_state.active_run_id = 2
+    main_window.simulation_controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=2,
+        epoch=2,
+        target_set_ids=("set1",),
+    )
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=2.0),
         run_id=2,

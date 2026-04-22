@@ -10,6 +10,7 @@ from kindred.gui.controllers.simulation_completion_policy import (
     SimulationCompletionPolicy,
     pending_initial_seed_for_set,
 )
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 
 
 def _context(**overrides) -> CompletionPolicyContext:
@@ -49,19 +50,11 @@ def test_resolve_superseded_fast_completion_allows_display_then_handoff_for_curr
         total=2,
         completed_set_ids=("id1",),
     )
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=True,
-        worker_running=False,
-        worker_fast_mode=None,
-        worker_request_id=None,
-        discarded_slider_preview_generation_id=None,
-    )
-    pending_replay = PendingReplayState(active=False, request_id=9, target_set_ids=())
+    preview_ownership = PreviewOwnershipState(request_id=4, epoch=1, target_set_ids=("id1", "id2"))
+    pending_replay = PendingReplayState(active=False, request_id=4, target_set_ids=())
 
     decision = policy.resolve_superseded_fast_completion(
-        activity=activity,
+        preview_ownership=preview_ownership,
         context=context,
         request_id=4,
         pending_replay=pending_replay,
@@ -258,140 +251,70 @@ def test_completion_policy_context_preserves_duplicate_queue_names() -> None:
     assert context.queue_names == ("set1", "set1")
 
 
-def test_preview_request_can_display_rejects_discarded_stale_preview() -> None:
+def test_preview_request_can_display_rejects_non_owner_preview_requests() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=True,
-        worker_running=False,
-        worker_fast_mode=None,
-        worker_request_id=None,
-        discarded_slider_preview_generation_id=9,
-    )
+    preview_ownership = PreviewOwnershipState(request_id=9, epoch=3, target_set_ids=("id1",))
 
-    assert policy.preview_request_can_display(activity=activity, context=_context(), request_id=4) is False
+    assert policy.preview_request_can_display(preview_ownership=preview_ownership, request_id=4) is False
+    assert policy.preview_request_can_display(preview_ownership=preview_ownership, request_id=9) is True
 
 
-def test_stale_fast_request_ownership_fails_closed_for_missing_context_or_worker_request_id() -> None:
+def test_stale_fast_request_ownership_fails_closed_without_preview_owner() -> None:
     policy = SimulationCompletionPolicy()
-    context = _context(request_id=float("inf"))
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=False,
-        worker_running=True,
-        worker_fast_mode=True,
-        worker_request_id=float("inf"),
-    )
 
     assert policy.stale_fast_request_still_owns_current_state(
-        activity=RunActivitySnapshot(
-            latest_request_id=9,
-            simulation_running=True,
-            slider_simulation_active=True,
-            worker_running=False,
-            worker_fast_mode=None,
-            worker_request_id=None,
-        ),
-        context=context,
-        request_id=4,
-    ) is False
-    assert policy.stale_fast_request_still_owns_current_state(
-        activity=activity,
-        context=None,
+        preview_ownership=PreviewOwnershipState(),
         request_id=4,
     ) is False
 
 
-def test_stale_fast_request_ownership_uses_stopped_fast_worker_request_id_for_mismatch() -> None:
+def test_stale_fast_request_ownership_rejects_non_owner_request_id() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=True,
-        worker_running=False,
-        worker_fast_mode=True,
-        worker_request_id=9,
-    )
+    preview_ownership = PreviewOwnershipState(request_id=9, epoch=2, target_set_ids=("id1",))
 
     assert policy.stale_fast_request_still_owns_current_state(
-        activity=activity,
-        context=None,
+        preview_ownership=preview_ownership,
         request_id=4,
     ) is False
 
 
-def test_stale_fast_request_ownership_uses_stopped_fast_worker_request_id_for_match() -> None:
+def test_stale_fast_request_ownership_accepts_owner_request_id() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=True,
-        worker_running=False,
-        worker_fast_mode=True,
-        worker_request_id=9,
-    )
+    preview_ownership = PreviewOwnershipState(request_id=9, epoch=2, target_set_ids=("id1",))
 
     assert policy.stale_fast_request_still_owns_current_state(
-        activity=activity,
-        context=None,
+        preview_ownership=preview_ownership,
         request_id=9,
     ) is True
 
 
-def test_stale_fast_request_ownership_does_not_revive_cleared_preview_from_stopped_worker() -> None:
+def test_stale_fast_request_ownership_does_not_revive_cleared_preview_owner() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=False,
-        worker_running=False,
-        worker_fast_mode=True,
-        worker_request_id=9,
-    )
 
     assert policy.stale_fast_request_still_owns_current_state(
-        activity=activity,
-        context=None,
+        preview_ownership=PreviewOwnershipState(request_id=None, epoch=4, target_set_ids=()),
         request_id=9,
     ) is False
 
 
-def test_stale_fast_request_ownership_rejects_stopped_worker_when_newer_preview_intent_exists() -> None:
+def test_stale_fast_request_ownership_rejects_old_request_after_owner_epoch_change() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=10,
-        simulation_running=True,
-        slider_simulation_active=True,
-        worker_running=False,
-        worker_fast_mode=True,
-        worker_request_id=9,
-    )
+    preview_ownership = PreviewOwnershipState(request_id=10, epoch=5, target_set_ids=("id2",))
 
     assert policy.stale_fast_request_still_owns_current_state(
-        activity=activity,
-        context=None,
+        preview_ownership=preview_ownership,
         request_id=9,
     ) is False
 
 
-def test_stale_fast_request_ownership_rejects_stopped_nonfast_worker_even_when_slider_active() -> None:
+def test_stale_fast_request_ownership_ignores_target_scope_when_request_id_matches() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=10,
-        simulation_running=True,
-        slider_simulation_active=True,
-        worker_running=False,
-        worker_fast_mode=False,
-        worker_request_id=9,
-    )
+    preview_ownership = PreviewOwnershipState(request_id=4, epoch=6, target_set_ids=("id3",))
 
     assert policy.stale_fast_request_still_owns_current_state(
-        activity=activity,
-        context=None,
+        preview_ownership=preview_ownership,
         request_id=4,
-    ) is False
+    ) is True
 
 
 def test_build_run_start_cache_decision_separates_explicit_and_preview_scope() -> None:
@@ -431,19 +354,11 @@ def test_capture_dirty_reset_tracking_keeps_only_dirty_sets_with_generations() -
 
 def test_resolve_superseded_fast_error_clears_pending_replay_when_nothing_should_replay() -> None:
     policy = SimulationCompletionPolicy()
-    activity = RunActivitySnapshot(
-        latest_request_id=9,
-        simulation_running=True,
-        slider_simulation_active=False,
-        worker_running=False,
-        worker_fast_mode=None,
-        worker_request_id=None,
-    )
     context = _context(active=True, request_id=4, fast_mode=True)
     pending_replay = PendingReplayState(active=False, request_id=None, target_set_ids=())
 
     decision = policy.resolve_superseded_fast_error(
-        activity=activity,
+        preview_ownership=PreviewOwnershipState(request_id=9, epoch=2, target_set_ids=("id2",)),
         context=context,
         request_id=4,
         pending_replay=pending_replay,
@@ -451,6 +366,45 @@ def test_resolve_superseded_fast_error_clears_pending_replay_when_nothing_should
 
     assert decision.schedule_pending_preview_run is False
     assert decision.state_patch.pending_replay == PendingReplayDirective.clear(clear_plot_updates=False)
+
+
+def test_resolve_superseded_fast_completion_rejects_same_request_after_owner_epoch_changes() -> None:
+    policy = SimulationCompletionPolicy()
+    context = _context(active=True, request_id=7, fast_mode=True, parallel=False)
+    pending_replay = PendingReplayState(active=False, request_id=None, target_set_ids=())
+
+    decision = policy.resolve_superseded_fast_completion(
+        preview_ownership=PreviewOwnershipState(request_id=7, epoch=4, target_set_ids=("id2",)),
+        context=context,
+        request_id=7,
+        preview_owner_epoch=3,
+        pending_replay=pending_replay,
+        shutdown_requested=False,
+    )
+
+    assert decision.display_current_preview is False
+    assert decision.deactivate_context_immediately is True
+    assert decision.state_patch.context is not None
+    assert decision.state_patch.context.active is False
+
+
+def test_resolve_superseded_fast_error_rejects_same_request_after_owner_epoch_changes() -> None:
+    policy = SimulationCompletionPolicy()
+    context = _context(active=True, request_id=7, fast_mode=True, parallel=False)
+    pending_replay = PendingReplayState(active=False, request_id=None, target_set_ids=())
+
+    decision = policy.resolve_superseded_fast_error(
+        preview_ownership=PreviewOwnershipState(request_id=7, epoch=4, target_set_ids=("id2",)),
+        context=context,
+        request_id=7,
+        preview_owner_epoch=3,
+        pending_replay=pending_replay,
+    )
+
+    assert decision.display_current_preview is False
+    assert decision.deactivate_context_immediately is True
+    assert decision.state_patch.context is not None
+    assert decision.state_patch.context.active is False
 
 
 def test_build_context_update_from_cache_truth_clears_explicit_subset_on_cache_key_mismatch() -> None:
@@ -488,6 +442,7 @@ def test_resolve_preflight_abort_pending_replay_returns_none_for_preview_runs() 
 
     directive = policy.resolve_preflight_abort_pending_replay(
         pending_replay=pending_replay,
+        preview_ownership=PreviewOwnershipState(request_id=7, epoch=1, target_set_ids=("id1",)),
         explicit_run=False,
     )
 
@@ -501,10 +456,17 @@ def test_resolve_explicit_error_pending_replay_queues_only_for_explicit_runs() -
     assert policy.resolve_explicit_error_pending_replay(
         fast_mode=False,
         pending_replay=pending_replay,
+        preview_ownership=PreviewOwnershipState(),
     ) == PendingReplayDirective.queue_fresh(target_set_ids=("id1",))
+    assert policy.resolve_explicit_error_pending_replay(
+        fast_mode=False,
+        pending_replay=pending_replay,
+        preview_ownership=PreviewOwnershipState(request_id=7, epoch=1, target_set_ids=("id1",)),
+    ) == PendingReplayDirective.arm_existing(target_set_ids=("id1",))
     assert policy.resolve_explicit_error_pending_replay(
         fast_mode=True,
         pending_replay=pending_replay,
+        preview_ownership=PreviewOwnershipState(request_id=7, epoch=1, target_set_ids=("id1",)),
     ) == PendingReplayDirective.clear(clear_plot_updates=False)
 
 

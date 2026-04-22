@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Mapping, Optional
 
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
+
 
 def _normalize_optional_int(value: object) -> Optional[int]:
     if value is None:
@@ -121,6 +123,7 @@ class CompletionPolicyContext:
     explicit_cache_valid_set_ids: Optional[tuple[str, ...]] = None
     explicit_cache_invalidated_set_ids: Optional[tuple[str, ...]] = None
     preview_scope_set_ids: Optional[tuple[str, ...]] = None
+    preview_owner_epoch: Optional[int] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "request_id", _normalize_optional_int(self.request_id))
@@ -181,6 +184,7 @@ class CompletionPolicyContext:
             _normalize_optional_set_ids(self.explicit_cache_invalidated_set_ids),
         )
         object.__setattr__(self, "preview_scope_set_ids", _normalize_optional_set_ids(self.preview_scope_set_ids))
+        object.__setattr__(self, "preview_owner_epoch", _normalize_optional_int(self.preview_owner_epoch))
 
     def evolve(self, **changes: object) -> CompletionPolicyContext:
         return replace(self, **changes)
@@ -398,6 +402,29 @@ class DirtyResetTrackingDecision:
 
 
 class SimulationCompletionPolicy:
+    def _pending_replay_should_schedule(
+        self,
+        *,
+        pending_replay: PendingReplayState,
+        preview_ownership: PreviewOwnershipState,
+    ) -> bool:
+        if bool(pending_replay.active):
+            return True
+        if pending_replay.request_id is None or preview_ownership.request_id is None:
+            return False
+        return int(pending_replay.request_id) == int(preview_ownership.request_id)
+
+    def _directive_for_pending_replay_owner(
+        self,
+        *,
+        pending_replay: PendingReplayState,
+        preview_ownership: PreviewOwnershipState,
+        clear_plot_updates: bool = False,
+    ) -> PendingReplayDirective:
+        if preview_ownership.request_id is not None:
+            return PendingReplayDirective.arm_existing(target_set_ids=pending_replay.target_set_ids)
+        return PendingReplayDirective.queue_fresh(target_set_ids=pending_replay.target_set_ids)
+
     def has_active_explicit_simulation(
         self,
         *,
@@ -425,49 +452,28 @@ class SimulationCompletionPolicy:
     def stale_fast_request_still_owns_current_state(
         self,
         *,
-        activity: RunActivitySnapshot,
-        context: Optional[CompletionPolicyContext],
+        preview_ownership: PreviewOwnershipState,
         request_id: int,
+        preview_owner_epoch: Optional[int] = None,
     ) -> bool:
-        if context is not None and context.active:
-            if not context.fast_mode:
-                return False
-            if context.request_id is None:
-                return False
-            return int(context.request_id) == int(request_id)
-        # A concrete fast-worker request id remains the ownership signal while
-        # preview mode is still active, but only if that worker still matches
-        # the latest known preview intent.
-        if activity.worker_request_id is not None:
-            if not bool(activity.worker_fast_mode):
-                return False
-            if int(activity.worker_request_id) != int(activity.latest_request_id):
-                return False
-            if bool(activity.worker_running) or bool(activity.slider_simulation_active):
-                return int(activity.worker_request_id) == int(request_id)
+        if preview_ownership.request_id is None:
             return False
-        if activity.worker_running:
-            if not bool(activity.worker_fast_mode):
-                return False
+        if int(preview_ownership.request_id) != int(request_id):
             return False
-        return bool(activity.slider_simulation_active)
+        if preview_owner_epoch is None:
+            return True
+        return int(preview_ownership.epoch) == int(preview_owner_epoch)
 
     def preview_request_can_display(
         self,
         *,
-        activity: RunActivitySnapshot,
-        context: Optional[CompletionPolicyContext],
+        preview_ownership: PreviewOwnershipState,
         request_id: Optional[int],
     ) -> bool:
         if request_id is None:
             return True
-        if int(request_id) == int(activity.latest_request_id):
-            return True
-        if activity.discarded_slider_preview_generation_id == int(activity.latest_request_id):
-            return False
         return self.stale_fast_request_still_owns_current_state(
-            activity=activity,
-            context=context,
+            preview_ownership=preview_ownership,
             request_id=int(request_id),
         )
 
@@ -513,23 +519,30 @@ class SimulationCompletionPolicy:
     def resolve_superseded_fast_completion(
         self,
         *,
-        activity: RunActivitySnapshot,
+        preview_ownership: PreviewOwnershipState,
         context: Optional[CompletionPolicyContext],
         request_id: int,
+        preview_owner_epoch: Optional[int] = None,
         pending_replay: PendingReplayState,
         shutdown_requested: bool,
     ) -> SupersededFastDecision:
         request_id_i = int(request_id)
-        should_schedule_pending = bool(pending_replay.active) or (
-            pending_replay.request_id is not None and pending_replay.request_id == int(activity.latest_request_id)
+        context_matches_request = bool(
+            context is not None
+            and context.active
+            and context.request_id is not None
+            and int(context.request_id) == request_id_i
+        )
+        should_schedule_pending = self._pending_replay_should_schedule(
+            pending_replay=pending_replay,
+            preview_ownership=preview_ownership,
         )
         stale_fast_owns_current_state = self.stale_fast_request_still_owns_current_state(
-            activity=activity,
-            context=context,
+            preview_ownership=preview_ownership,
             request_id=request_id_i,
+            preview_owner_epoch=preview_owner_epoch,
         )
-        suppress_discard_ui = activity.discarded_slider_preview_generation_id == int(activity.latest_request_id)
-        display_current_preview = bool(stale_fast_owns_current_state) and (not bool(suppress_discard_ui))
+        display_current_preview = bool(stale_fast_owns_current_state)
         if display_current_preview:
             defer_handoff = bool(should_schedule_pending) and not bool(context is not None and context.active and context.parallel)
             return SupersededFastDecision(
@@ -547,13 +560,14 @@ class SimulationCompletionPolicy:
                 ),
             )
         updated_context = context
-        if stale_fast_owns_current_state and context is not None and context.active:
+        if context_matches_request and context is not None:
             updated_context = context.evolve(active=False)
         pending_directive = None
-        reset_status_progress = bool(stale_fast_owns_current_state) and (not bool(suppress_discard_ui))
+        reset_status_progress = bool(context_matches_request)
         if should_schedule_pending and (not shutdown_requested):
-            pending_directive = PendingReplayDirective.queue_fresh(
-                target_set_ids=pending_replay.target_set_ids,
+            pending_directive = self._directive_for_pending_replay_owner(
+                pending_replay=pending_replay,
+                preview_ownership=preview_ownership,
             )
         else:
             pending_directive = PendingReplayDirective.clear(clear_plot_updates=False)
@@ -562,7 +576,7 @@ class SimulationCompletionPolicy:
             schedule_pending_preview_run=bool(should_schedule_pending and (not shutdown_requested)),
             reset_status_progress=reset_status_progress,
             defer_context_deactivation_until_after_display=False,
-            deactivate_context_immediately=bool(stale_fast_owns_current_state),
+            deactivate_context_immediately=bool(context_matches_request),
             state_patch=PolicyStatePatch(
                 context=updated_context,
                 pending_replay=pending_directive,
@@ -573,34 +587,44 @@ class SimulationCompletionPolicy:
     def resolve_superseded_fast_error(
         self,
         *,
-        activity: RunActivitySnapshot,
+        preview_ownership: PreviewOwnershipState,
         context: Optional[CompletionPolicyContext],
         request_id: int,
+        preview_owner_epoch: Optional[int] = None,
         pending_replay: PendingReplayState,
     ) -> SupersededFastDecision:
         request_id_i = int(request_id)
-        should_schedule_pending = bool(pending_replay.active) or (
-            pending_replay.request_id is not None and pending_replay.request_id == int(activity.latest_request_id)
+        context_matches_request = bool(
+            context is not None
+            and context.active
+            and context.request_id is not None
+            and int(context.request_id) == request_id_i
         )
-        stale_fast_owns_current_state = self.stale_fast_request_still_owns_current_state(
-            activity=activity,
-            context=context,
+        should_schedule_pending = self._pending_replay_should_schedule(
+            pending_replay=pending_replay,
+            preview_ownership=preview_ownership,
+        )
+        self.stale_fast_request_still_owns_current_state(
+            preview_ownership=preview_ownership,
             request_id=request_id_i,
+            preview_owner_epoch=preview_owner_epoch,
         )
-        suppress_discard_ui = activity.discarded_slider_preview_generation_id == int(activity.latest_request_id)
         updated_context = context
-        if stale_fast_owns_current_state and context is not None and context.active:
+        if context_matches_request and context is not None:
             updated_context = context.evolve(active=False)
         if should_schedule_pending:
-            pending_directive = PendingReplayDirective.queue_fresh(target_set_ids=pending_replay.target_set_ids)
+            pending_directive = self._directive_for_pending_replay_owner(
+                pending_replay=pending_replay,
+                preview_ownership=preview_ownership,
+            )
         else:
             pending_directive = PendingReplayDirective.clear(clear_plot_updates=False)
         return SupersededFastDecision(
             display_current_preview=False,
             schedule_pending_preview_run=bool(should_schedule_pending),
-            reset_status_progress=bool(stale_fast_owns_current_state) and (not bool(suppress_discard_ui)),
+            reset_status_progress=bool(context_matches_request),
             defer_context_deactivation_until_after_display=False,
-            deactivate_context_immediately=bool(stale_fast_owns_current_state),
+            deactivate_context_immediately=bool(context_matches_request),
             state_patch=PolicyStatePatch(
                 context=updated_context,
                 pending_replay=pending_directive,
@@ -732,13 +756,17 @@ class SimulationCompletionPolicy:
         self,
         *,
         pending_replay: PendingReplayState,
+        preview_ownership: PreviewOwnershipState,
         explicit_run: bool,
     ) -> Optional[PendingReplayDirective]:
         if not bool(explicit_run):
             return None
         if (not bool(pending_replay.active)) and (not bool(pending_replay.target_set_ids)):
             return None
-        return PendingReplayDirective.queue_fresh(target_set_ids=pending_replay.target_set_ids)
+        return self._directive_for_pending_replay_owner(
+            pending_replay=pending_replay,
+            preview_ownership=preview_ownership,
+        )
 
     def resolve_pending_replay_after_canonical_reset(
         self,
@@ -761,9 +789,13 @@ class SimulationCompletionPolicy:
         *,
         fast_mode: bool,
         pending_replay: PendingReplayState,
+        preview_ownership: PreviewOwnershipState,
     ) -> PendingReplayDirective:
         if (not bool(fast_mode)) and (bool(pending_replay.active) or bool(pending_replay.target_set_ids)):
-            return PendingReplayDirective.queue_fresh(target_set_ids=pending_replay.target_set_ids)
+            return self._directive_for_pending_replay_owner(
+                pending_replay=pending_replay,
+                preview_ownership=preview_ownership,
+            )
         return PendingReplayDirective.clear(clear_plot_updates=False)
 
     def resolve_explicit_dirty_reset(

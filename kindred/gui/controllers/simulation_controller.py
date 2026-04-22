@@ -48,7 +48,7 @@ from kindred.gui.controllers.simulation_completion_policy import (
 from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
-from kindred.gui.controllers.simulation_run_state import SimulationRunState
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState, SimulationRunState
 from kindred.gui.controllers.slider_plot_coalescer import SliderPlotCoalescer
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.batch_initial_conditions import (
@@ -350,6 +350,104 @@ class SimulationController(QtCore.QObject):
             normalized.append(set_id_s)
         self._run_state.pending_slider_target_set_ids = tuple(normalized)
 
+    @property
+    def _preview_ownership(self) -> PreviewOwnershipState:
+        ownership = getattr(self._run_state, "preview_ownership", None)
+        if isinstance(ownership, PreviewOwnershipState):
+            return ownership
+        normalized = PreviewOwnershipState()
+        self._run_state.preview_ownership = normalized
+        return normalized
+
+    @_preview_ownership.setter
+    def _preview_ownership(self, value: PreviewOwnershipState) -> None:
+        self._run_state.preview_ownership = (
+            value if isinstance(value, PreviewOwnershipState) else PreviewOwnershipState()
+        )
+
+    def _set_preview_ownership(
+        self,
+        *,
+        request_id: Optional[int],
+        target_set_ids: Sequence[str],
+    ) -> PreviewOwnershipState:
+        current = self._preview_ownership
+        candidate = PreviewOwnershipState(
+            request_id=request_id,
+            epoch=current.epoch,
+            target_set_ids=tuple(target_set_ids),
+        )
+        if (
+            current.request_id == candidate.request_id
+            and current.target_set_ids == candidate.target_set_ids
+        ):
+            return current
+        updated = PreviewOwnershipState(
+            request_id=candidate.request_id,
+            epoch=int(current.epoch) + 1,
+            target_set_ids=candidate.target_set_ids,
+        )
+        self._preview_ownership = updated
+        return updated
+
+    def _claim_preview_ownership(
+        self,
+        *,
+        request_id: int,
+        target_set_ids: Sequence[str],
+    ) -> PreviewOwnershipState:
+        return self._set_preview_ownership(
+            request_id=int(request_id),
+            target_set_ids=target_set_ids,
+        )
+
+    def _clear_preview_ownership(self) -> PreviewOwnershipState:
+        return self._set_preview_ownership(request_id=None, target_set_ids=())
+
+    def _mark_request_started(self, request_id: int) -> int:
+        request_id_i = int(request_id)
+        if request_id_i > int(getattr(self, "_latest_sim_request_id", 0)):
+            self._latest_sim_request_id = request_id_i
+        return request_id_i
+
+    def _preview_request_matches_current_owner(self, request_id: Optional[int]) -> bool:
+        if request_id is None:
+            return True
+        owner_request_id = self._preview_ownership.request_id
+        if owner_request_id is None:
+            return False
+        return int(owner_request_id) == int(request_id)
+
+    def _preview_request_matches_current_owner_epoch(
+        self,
+        request_id: Optional[int],
+        owner_epoch: Optional[int],
+    ) -> bool:
+        if not self._preview_request_matches_current_owner(request_id):
+            return False
+        if owner_epoch is None:
+            return True
+        return int(self._preview_ownership.epoch) == int(owner_epoch)
+
+    def _queued_preview_update_still_matches_current_owner(
+        self,
+        *,
+        request_id: Optional[int],
+        accepted_owner_request_id: Optional[int],
+        accepted_owner_epoch: Optional[int],
+    ) -> bool:
+        if request_id is None:
+            return True
+        current = self._preview_ownership
+        if accepted_owner_request_id is None or accepted_owner_epoch is None:
+            return False
+        return (
+            current.request_id is not None
+            and int(current.request_id) == int(request_id)
+            and int(accepted_owner_request_id) == int(request_id)
+            and int(current.epoch) == int(accepted_owner_epoch)
+        )
+
     def queue_pending_slider_preview_replay(
         self,
         *,
@@ -359,10 +457,33 @@ class SimulationController(QtCore.QObject):
     ) -> None:
         self._pending_slider_target_set_ids = target_set_ids
         if request_id is not None:
-            self._pending_slider_sim_request_id = int(request_id)
+            request_id_i = int(request_id)
+            self._pending_slider_sim_request_id = request_id_i
+            self._claim_preview_ownership(
+                request_id=request_id_i,
+                target_set_ids=self._pending_slider_target_set_ids,
+            )
+        elif bool(preserve_existing_request):
+            preserved_request_id = self._preview_ownership.request_id
+            if preserved_request_id is None:
+                preserved_request_id = self._pending_slider_sim_request_id
+            if preserved_request_id is None:
+                preserved_request_id = self._next_slider_preview_request_id()
+            self._pending_slider_sim_request_id = int(preserved_request_id)
+            self._claim_preview_ownership(
+                request_id=int(preserved_request_id),
+                target_set_ids=self._pending_slider_target_set_ids,
+            )
         elif not bool(preserve_existing_request):
             self._pending_slider_sim_request_id = None
+            self._clear_preview_ownership()
         self._pending_slider_simulation = True
+
+    def _clear_failed_fast_preview_ownership(self) -> None:
+        self._clear_preview_ownership()
+        self._pending_slider_sim_request_id = None
+        self._pending_slider_target_set_ids = ()
+        self._pending_slider_simulation = False
 
     def clear_pending_slider_preview_replay(self, *, clear_plot_updates: bool = True) -> None:
         self._pending_slider_simulation = False
@@ -410,6 +531,22 @@ class SimulationController(QtCore.QObject):
     @_pending_slider_plot_run_id.setter
     def _pending_slider_plot_run_id(self, value: Optional[int]) -> None:
         self._plot_coalescer.pending.run_id = int(value) if value is not None else None
+
+    @property
+    def _pending_slider_plot_owner_request_id(self) -> Optional[int]:
+        return self._plot_coalescer.pending.accepted_owner_request_id
+
+    @_pending_slider_plot_owner_request_id.setter
+    def _pending_slider_plot_owner_request_id(self, value: Optional[int]) -> None:
+        self._plot_coalescer.pending.accepted_owner_request_id = int(value) if value is not None else None
+
+    @property
+    def _pending_slider_plot_owner_epoch(self) -> Optional[int]:
+        return self._plot_coalescer.pending.accepted_owner_epoch
+
+    @_pending_slider_plot_owner_epoch.setter
+    def _pending_slider_plot_owner_epoch(self, value: Optional[int]) -> None:
+        self._plot_coalescer.pending.accepted_owner_epoch = int(value) if value is not None else None
 
     @property
     def _slider_plot_coalesce_interval_ms(self) -> int:
@@ -493,6 +630,7 @@ class SimulationController(QtCore.QObject):
             explicit_cache_valid_set_ids=ctx.get("explicit_cache_valid_set_ids"),
             explicit_cache_invalidated_set_ids=ctx.get("explicit_cache_invalidated_set_ids"),
             preview_scope_set_ids=ctx.get("preview_scope_set_ids"),
+            preview_owner_epoch=ctx.get("preview_owner_epoch"),
         )
 
     def _serialize_completion_policy_context(
@@ -527,6 +665,7 @@ class SimulationController(QtCore.QObject):
         raw["explicit_cache_valid_set_ids"] = context.explicit_cache_valid_set_ids
         raw["explicit_cache_invalidated_set_ids"] = context.explicit_cache_invalidated_set_ids
         raw["preview_scope_set_ids"] = context.preview_scope_set_ids
+        raw["preview_owner_epoch"] = context.preview_owner_epoch
         return raw
 
     def _completion_policy_activity_snapshot(self) -> RunActivitySnapshot:
@@ -556,6 +695,9 @@ class SimulationController(QtCore.QObject):
             request_id=getattr(self, "_pending_slider_sim_request_id", None),
             target_set_ids=tuple(getattr(self, "_pending_slider_target_set_ids", ()) or ()),
         )
+
+    def _completion_policy_preview_ownership(self) -> PreviewOwnershipState:
+        return self._preview_ownership
 
     def _completion_policy_cache_state(self) -> CacheAuthorityState:
         return CacheAuthorityState(
@@ -587,6 +729,7 @@ class SimulationController(QtCore.QObject):
                 self.queue_pending_slider_preview_replay(
                     target_set_ids=directive.target_set_ids,
                     request_id=None,
+                    preserve_existing_request=True,
                 )
                 if directive.clear_plot_updates:
                     self._clear_pending_preview_slider_plot_updates()
@@ -764,6 +907,7 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
         fast_mode: Optional[bool] = None,
         request_id: Optional[int] = None,
+        owner_epoch: Optional[int] = None,
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
@@ -773,6 +917,7 @@ class SimulationController(QtCore.QObject):
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
+            owner_epoch=owner_epoch,
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
@@ -785,6 +930,7 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
         fast_mode: Optional[bool] = None,
         request_id: Optional[int] = None,
+        owner_epoch: Optional[int] = None,
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
@@ -794,6 +940,7 @@ class SimulationController(QtCore.QObject):
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
+            owner_epoch=owner_epoch,
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
@@ -907,8 +1054,10 @@ class SimulationController(QtCore.QObject):
         shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
         self._delete_worker_if_stopped(worker, worker_name)
         pending_request_id = getattr(self, "_pending_slider_sim_request_id", None)
-        latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
-        if pending_request_id is not None and int(pending_request_id) < latest_request_id:
+        owner_request_id = self._preview_ownership.request_id
+        if pending_request_id is not None and (
+            owner_request_id is None or int(pending_request_id) != int(owner_request_id)
+        ):
             self._pending_slider_simulation = False
             self._pending_slider_sim_request_id = None
             self._pending_slider_target_set_ids = ()
@@ -984,16 +1133,44 @@ class SimulationController(QtCore.QObject):
 
     def _stale_fast_request_still_owns_current_state(self, request_id: int) -> bool:
         return self._completion_policy.stale_fast_request_still_owns_current_state(
-            activity=self._completion_policy_activity_snapshot(),
-            context=self._completion_policy_context_from_raw(),
+            preview_ownership=self._completion_policy_preview_ownership(),
             request_id=int(request_id),
         )
 
     def _preview_request_can_display(self, request_id: Optional[int]) -> bool:
         return self._completion_policy.preview_request_can_display(
-            activity=self._completion_policy_activity_snapshot(),
-            context=self._completion_policy_context_from_raw(),
+            preview_ownership=self._completion_policy_preview_ownership(),
             request_id=request_id,
+        )
+
+    def _effective_preview_owner_epoch_for_callback(
+        self,
+        *,
+        owner_epoch: Optional[int],
+        context: Optional[CompletionPolicyContext],
+    ) -> Optional[int]:
+        if owner_epoch is not None:
+            return int(owner_epoch)
+        if context is not None and context.preview_owner_epoch is not None:
+            return int(context.preview_owner_epoch)
+        return None
+
+    def _missing_preview_owner_epoch_for_current_fast_owner(
+        self,
+        *,
+        fast_mode: Optional[bool],
+        request_id: Optional[int],
+        owner_epoch: Optional[int],
+        latest_request_id: int,
+    ) -> bool:
+        if (not bool(fast_mode)) or request_id is None or owner_epoch is not None:
+            return False
+        owner_request_id = self._preview_ownership.request_id
+        if owner_request_id is None:
+            return False
+        return (
+            int(owner_request_id) == int(request_id)
+            and int(request_id) != int(latest_request_id)
         )
 
     def _prepare_simulation_shutdown_for_close(self) -> bool:
@@ -1107,6 +1284,7 @@ class SimulationController(QtCore.QObject):
         run_id: int,
         fast_mode: bool,
         request_id: int,
+        owner_epoch: Optional[int] = None,
         set_name: str,
         set_id: str,
         cache_key: str,
@@ -1117,14 +1295,46 @@ class SimulationController(QtCore.QObject):
         connected_handlers = list(getattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, ()) or ())
         progress_handler = self.on_simulation_progress
 
-        def result_handler(payload, _rid=run_id, _fast=bool(fast_mode), _req=int(request_id), _set=set_name, _sid=set_id, _key=cache_key):
+        def result_handler(
+            payload,
+            _rid=run_id,
+            _fast=bool(fast_mode),
+            _req=int(request_id),
+            _owner_epoch=owner_epoch,
+            _set=set_name,
+            _sid=set_id,
+            _key=cache_key,
+        ):
             return self.on_simulation_complete(
-                payload, run_id=_rid, fast_mode=_fast, request_id=_req, batch_set=_set, batch_set_id=_sid, cache_key=_key
+                payload,
+                run_id=_rid,
+                fast_mode=_fast,
+                request_id=_req,
+                owner_epoch=_owner_epoch,
+                batch_set=_set,
+                batch_set_id=_sid,
+                cache_key=_key,
             )
 
-        def error_handler(msg, _rid=run_id, _fast=bool(fast_mode), _req=int(request_id), _set=set_name, _sid=set_id, _key=cache_key):
+        def error_handler(
+            msg,
+            _rid=run_id,
+            _fast=bool(fast_mode),
+            _req=int(request_id),
+            _owner_epoch=owner_epoch,
+            _set=set_name,
+            _sid=set_id,
+            _key=cache_key,
+        ):
             return self.on_simulation_error(
-                msg, run_id=_rid, fast_mode=_fast, request_id=_req, batch_set=_set, batch_set_id=_sid, cache_key=_key
+                msg,
+                run_id=_rid,
+                fast_mode=_fast,
+                request_id=_req,
+                owner_epoch=_owner_epoch,
+                batch_set=_set,
+                batch_set_id=_sid,
+                cache_key=_key,
             )
 
         for signal_name, handler in (
@@ -1301,6 +1511,7 @@ class SimulationController(QtCore.QObject):
         previous_latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
+        self._clear_preview_ownership()
         self._pending_slider_simulation = False
         self._pending_slider_target_set_ids = ()
         if previous_latest_request_id > 0:
@@ -1347,6 +1558,7 @@ class SimulationController(QtCore.QObject):
         valid_set_ids: Optional[Sequence[str]] = None,
         allow_fallback: bool = True,
     ) -> None:
+        preview_ownership = self._preview_ownership
         request_accepted = (
             self._preview_request_can_display(request_id)
             if bool(slider_triggered)
@@ -1358,6 +1570,12 @@ class SimulationController(QtCore.QObject):
             request_id=request_id,
             request_accepted=bool(request_accepted),
             run_id=run_id,
+            accepted_owner_request_id=(
+                preview_ownership.request_id if bool(slider_triggered) and bool(request_accepted) else None
+            ),
+            accepted_owner_epoch=(
+                int(preview_ownership.epoch) if bool(slider_triggered) and bool(request_accepted) else None
+            ),
             slider_triggered=slider_triggered,
             valid_set_ids=valid_set_ids,
             allow_fallback=allow_fallback,
@@ -1379,6 +1597,8 @@ class SimulationController(QtCore.QObject):
         pending_cache_kind = str(pending.cache_kind or "")
         pending_request_id = pending.request_id
         pending_run_id = pending.run_id
+        pending_owner_request_id = pending.accepted_owner_request_id
+        pending_owner_epoch = pending.accepted_owner_epoch
         pending_valid_set_ids = pending.valid_set_ids
         pending_allow_fallback = bool(pending.allow_fallback)
 
@@ -1388,7 +1608,11 @@ class SimulationController(QtCore.QObject):
         if not cache_key:
             return False
         request_accepted = (
-            self._preview_request_can_display(request_id)
+            self._queued_preview_update_still_matches_current_owner(
+                request_id=request_id,
+                accepted_owner_request_id=pending_owner_request_id,
+                accepted_owner_epoch=pending_owner_epoch,
+            )
             if pending_cache_kind == "preview"
             else (request_id is None or int(request_id) == int(getattr(self, "_latest_sim_request_id", 0)))
         )
@@ -1478,6 +1702,7 @@ class SimulationController(QtCore.QObject):
             run_id=int(ctx.get("run_id") or 0),
             fast_mode=bool(ctx.get("fast_mode")),
             request_id=int(ctx.get("request_id") or 0),
+            owner_epoch=ctx.get("preview_owner_epoch"),
             batch_set="",
             batch_set_id="",
             cache_key=str(ctx.get("cache_key") or ""),
@@ -1499,6 +1724,7 @@ class SimulationController(QtCore.QObject):
         meta = dict((self._batch_parallel.future_meta or {}).get(sid) or {})
         meta["set_name"] = str(meta.get("set_name") or sid)
         set_name = meta["set_name"]
+        owner_epoch = meta.get("owner_epoch")
         self._batch_parallel.future_map.pop(sid, None)
         self._batch_parallel.future_meta.pop(sid, None)
 
@@ -1514,6 +1740,7 @@ class SimulationController(QtCore.QObject):
                 run_id=run_id,
                 fast_mode=fast_mode,
                 request_id=request_id,
+                owner_epoch=owner_epoch,
                 batch_set=set_name,
                 batch_set_id=sid,
                 cache_key=cache_key,
@@ -1527,6 +1754,7 @@ class SimulationController(QtCore.QObject):
                 run_id=run_id,
                 fast_mode=fast_mode,
                 request_id=request_id,
+                owner_epoch=owner_epoch,
                 batch_set=set_name,
                 batch_set_id=sid,
                 cache_key=cache_key,
@@ -1550,6 +1778,7 @@ class SimulationController(QtCore.QObject):
                 run_id=run_id,
                 fast_mode=fast_mode,
                 request_id=request_id,
+                owner_epoch=owner_epoch,
                 batch_set=set_name,
                 batch_set_id=sid,
                 cache_key=cache_key,
@@ -1565,6 +1794,7 @@ class SimulationController(QtCore.QObject):
                     run_id=run_id,
                     fast_mode=fast_mode,
                     request_id=request_id,
+                    owner_epoch=owner_epoch,
                     batch_set=set_name,
                     batch_set_id=sid,
                     cache_key=cache_key,
@@ -1939,6 +2169,7 @@ class SimulationController(QtCore.QObject):
     def _requeue_preserved_pending_slider_replay_after_preflight_abort(self) -> None:
         directive = self._completion_policy.resolve_preflight_abort_pending_replay(
             pending_replay=self._completion_policy_pending_replay_state(),
+            preview_ownership=self._completion_policy_preview_ownership(),
             explicit_run=True,
         )
         if directive is not None:
@@ -1979,7 +2210,7 @@ class SimulationController(QtCore.QObject):
         worker = self._simulation_worker
         request_id = getattr(self, "_pending_slider_sim_request_id", None)
         pending_target_set_ids = list(self._pending_slider_target_set_ids)
-        latest_id = int(getattr(self, "_latest_sim_request_id", 0))
+        owner_request_id = self._preview_ownership.request_id
         ctx = getattr(self, "_batch_run_context", {}) or {}
         active_fast_parallel = bool(
             isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel") and ctx.get("fast_mode")
@@ -1992,22 +2223,32 @@ class SimulationController(QtCore.QObject):
                     active_fast_request_id = int(raw_active_fast_request_id)
             except Exception:
                 active_fast_request_id = None
-        if request_id is not None and int(request_id) > latest_id:
-            self._latest_sim_request_id = int(request_id)
-            latest_id = int(request_id)
-        elif request_id is not None and int(request_id) != latest_id:
+        if request_id is not None and owner_request_id is not None and int(request_id) != int(owner_request_id):
             logger.debug(
-                "Discarding stale slider simulation request (request_id=%s, latest=%s)",
+                "Discarding stale slider simulation request (request_id=%s, preview_owner=%s)",
                 request_id,
-                latest_id,
+                owner_request_id,
             )
             self._pending_slider_simulation = False
             self._pending_slider_sim_request_id = None
             self._pending_slider_target_set_ids = ()
             return
+        if request_id is not None and owner_request_id is None:
+            self._claim_preview_ownership(
+                request_id=int(request_id),
+                target_set_ids=pending_target_set_ids,
+            )
+            owner_request_id = self._preview_ownership.request_id
         if request_id is None:
-            request_id = self._next_sim_request_id()
-            self._pending_slider_sim_request_id = request_id
+            if owner_request_id is not None:
+                request_id = int(owner_request_id)
+            else:
+                request_id = self._next_sim_request_id()
+                self._claim_preview_ownership(
+                    request_id=int(request_id),
+                    target_set_ids=pending_target_set_ids,
+                )
+            self._pending_slider_sim_request_id = int(request_id)
         self._discarded_slider_preview_generation_id = None
         self.ui.slider.set_slider_triggered_simulation(True)
 
@@ -2071,6 +2312,7 @@ class SimulationController(QtCore.QObject):
         self._simulation_running = True
         self.ui.run_ui.set_stop_button_enabled(True)
         self._slider_simulation_active = True
+        request_id = self._mark_request_started(int(request_id))
 
         logger.info("Starting slider-triggered simulation")
         self.ui.run_ui.set_status_text("Updating simulation...")
@@ -2133,6 +2375,7 @@ class SimulationController(QtCore.QObject):
                 reset_set_ids.append(set_id_s)
 
         self._flush_pending_slider_updates_for_run(reset_set_ids=reset_set_ids)
+        self._clear_preview_ownership()
         request_id = self._next_sim_request_id()
 
         self.ui.run_ui.set_run_button_enabled(False)
@@ -2245,6 +2488,8 @@ class SimulationController(QtCore.QObject):
                     "Invalid Initial Conditions",
                     f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
                 )
+                if bool(ctx.get("fast_mode")):
+                    self._clear_failed_fast_preview_ownership()
                 ctx["active"] = False
                 self._batch_run_context = dict(ctx)
                 self._shutdown_batch_executor(force_terminate=True)
@@ -2290,7 +2535,10 @@ class SimulationController(QtCore.QObject):
             fut = executor.submit(run_batch_simulation_task, task)
             sid = str(set_id)
             self._batch_parallel.future_map[sid] = fut
-            self._batch_parallel.future_meta[sid] = {"set_name": str(set_name)}
+            self._batch_parallel.future_meta[sid] = {
+                "set_name": str(set_name),
+                "owner_epoch": ctx.get("preview_owner_epoch"),
+            }
             try:
                 fut.add_done_callback(lambda _fut, sid=sid: self._enqueue_parallel_batch_completion(sid))
             except Exception as exc:
@@ -2361,6 +2609,8 @@ class SimulationController(QtCore.QObject):
                 "Invalid Initial Conditions",
                 f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
             )
+            if bool(ctx.get("fast_mode")):
+                self._clear_failed_fast_preview_ownership()
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
             self._simulation_running = False
@@ -2509,6 +2759,7 @@ class SimulationController(QtCore.QObject):
             run_id=int(run_id),
             fast_mode=bool(fast_mode),
             request_id=int(request_id),
+            owner_epoch=ctx.get("preview_owner_epoch"),
             set_name=str(set_name),
             set_id=str(set_id),
             cache_key=str(cache_key),
@@ -2541,7 +2792,22 @@ class SimulationController(QtCore.QObject):
                 logger.debug("Fast slider run already in flight; recording latest-only pending request")
                 self._pending_slider_simulation = True
                 if request_id is not None:
+                    request_id = int(request_id)
                     self._pending_slider_sim_request_id = int(request_id)
+                    deferred_target_set_ids: list[str] = list(self._pending_slider_target_set_ids)
+                    if not deferred_target_set_ids:
+                        for row in list(batch_rows or []):
+                            try:
+                                set_id = self.ui.batch.batch_set_id_for_row(int(row))
+                            except Exception:
+                                continue
+                            set_id_s = str(set_id or "").strip()
+                            if set_id_s and set_id_s not in deferred_target_set_ids:
+                                deferred_target_set_ids.append(set_id_s)
+                    self._claim_preview_ownership(
+                        request_id=int(request_id),
+                        target_set_ids=deferred_target_set_ids,
+                    )
                 return
 
         def _clear_slider_triggered_preflight_state() -> None:
@@ -2550,6 +2816,8 @@ class SimulationController(QtCore.QObject):
 
         if request_id is None:
             request_id = self._next_sim_request_id()
+        else:
+            request_id = self._mark_request_started(int(request_id))
         if batch_rows is None:
             batch_rows = self.ui.batch.batch_rows_for_scope("selected")
         row_count = int(self.ui.batch.batch_store_row_count())
@@ -2559,6 +2827,8 @@ class SimulationController(QtCore.QObject):
                 batch_rows = [0]
             else:
                 self.ui.dialogs.message_box_warning("No Sets", "Add at least one set before running.")
+                if bool(fast_mode):
+                    self._clear_failed_fast_preview_ownership()
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)
                 self.ui.run_ui.set_stop_button_enabled(False)
@@ -2578,6 +2848,8 @@ class SimulationController(QtCore.QObject):
                 "Invalid Initial Conditions",
                 "Fix invalid numeric cells in the Initial Conditions table before running:\n\n" + details + more,
             )
+            if bool(fast_mode):
+                self._clear_failed_fast_preview_ownership()
             self._simulation_running = False
             self.ui.run_ui.set_run_button_enabled(True)
             self.ui.run_ui.set_stop_button_enabled(False)
@@ -2649,6 +2921,15 @@ class SimulationController(QtCore.QObject):
             for r in batch_rows
             if 0 <= int(r) < len(names)
         ]
+        preview_owner_epoch = None
+        if bool(fast_mode):
+            preview_ownership = self._claim_preview_ownership(
+                request_id=int(request_id),
+                target_set_ids=queue_ids,
+            )
+            preview_owner_epoch = int(preview_ownership.epoch)
+        else:
+            self._clear_preview_ownership()
         reactions_text = strip_reaction_dsl_initial_concentrations(
             reactions_text_raw if pending_init_applied else migrated
         )
@@ -2673,6 +2954,8 @@ class SimulationController(QtCore.QObject):
                 "No Mechanism",
                 "Please define reactions or state network in the Mechanism editor first.",
             )
+            if bool(fast_mode):
+                self._clear_failed_fast_preview_ownership()
             self.ui.run_ui.set_status_text("Ready")
             self._simulation_running = False
             self.ui.run_ui.set_run_button_enabled(True)
@@ -2802,6 +3085,8 @@ class SimulationController(QtCore.QObject):
                 pending_init_applied=bool(pending_init_applied)
             )
             self.ui.dialogs.message_box_warning("Invalid t_end", f"Fix t_end before running:\n\n{exc}")
+            if bool(fast_mode):
+                self._clear_failed_fast_preview_ownership()
             self._simulation_running = False
             try:
                 self.ui.run_ui.set_run_button_enabled(True)
@@ -2865,6 +3150,7 @@ class SimulationController(QtCore.QObject):
                             "Invalid Initial Conditions",
                             f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
                         )
+                        self._clear_failed_fast_preview_ownership()
                         self._simulation_running = False
                         self.ui.run_ui.set_run_button_enabled(True)
                         self.ui.run_ui.set_stop_button_enabled(False)
@@ -3068,6 +3354,7 @@ class SimulationController(QtCore.QObject):
             "explicit_cache_valid_set_ids": explicit_valid_set_ids,
             "explicit_cache_invalidated_set_ids": run_start_cache_decision.explicit_cache_invalidated_set_ids,
             "preview_scope_set_ids": run_start_cache_decision.preview_scope_set_ids,
+            "preview_owner_epoch": preview_owner_epoch,
             "preview_batch_cache_token_by_set_id": dict(preview_batch_cache_token_by_set_id),
         }
 
@@ -3271,6 +3558,7 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
         fast_mode: Optional[bool] = None,
         request_id: Optional[int] = None,
+        owner_epoch: Optional[int] = None,
         *,
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
@@ -3289,11 +3577,30 @@ class SimulationController(QtCore.QObject):
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
         ctx = getattr(self, "_batch_run_context", {}) or {}
         policy_context = self._completion_policy_context_from_raw(ctx)
-        if request_id is not None and int(request_id) != latest_request_id and bool(fast_mode):
+        callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
+            owner_epoch=owner_epoch,
+            context=policy_context,
+        )
+        missing_owner_epoch = self._missing_preview_owner_epoch_for_current_fast_owner(
+            fast_mode=fast_mode,
+            request_id=request_id,
+            owner_epoch=callback_owner_epoch,
+            latest_request_id=latest_request_id,
+        )
+        is_superseded_fast_request = bool(
+            fast_mode
+            and request_id is not None
+            and (
+                bool(missing_owner_epoch)
+                or (not self._preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
+            )
+        )
+        if is_superseded_fast_request:
             stale_fast_decision = self._completion_policy.resolve_superseded_fast_completion(
-                activity=self._completion_policy_activity_snapshot(),
+                preview_ownership=self._completion_policy_preview_ownership(),
                 context=policy_context,
                 request_id=int(request_id),
+                preview_owner_epoch=callback_owner_epoch,
                 pending_replay=self._completion_policy_pending_replay_state(),
                 shutdown_requested=shutdown_requested,
             )
@@ -4020,6 +4327,7 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
         fast_mode: Optional[bool] = None,
         request_id: Optional[int] = None,
+        owner_epoch: Optional[int] = None,
         *,
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
@@ -4041,11 +4349,30 @@ class SimulationController(QtCore.QObject):
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
         ctx = getattr(self, "_batch_run_context", {}) or {}
         policy_context = self._completion_policy_context_from_raw(ctx)
-        if request_id is not None and int(request_id) != latest_request_id and bool(fast_mode):
+        callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
+            owner_epoch=owner_epoch,
+            context=policy_context,
+        )
+        missing_owner_epoch = self._missing_preview_owner_epoch_for_current_fast_owner(
+            fast_mode=fast_mode,
+            request_id=request_id,
+            owner_epoch=callback_owner_epoch,
+            latest_request_id=latest_request_id,
+        )
+        is_superseded_fast_request = bool(
+            fast_mode
+            and request_id is not None
+            and (
+                bool(missing_owner_epoch)
+                or (not self._preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
+            )
+        )
+        if is_superseded_fast_request:
             stale_fast_decision = self._completion_policy.resolve_superseded_fast_error(
-                activity=self._completion_policy_activity_snapshot(),
+                preview_ownership=self._completion_policy_preview_ownership(),
                 context=policy_context,
                 request_id=int(request_id),
+                preview_owner_epoch=callback_owner_epoch,
                 pending_replay=self._completion_policy_pending_replay_state(),
             )
             logger.debug(
@@ -4159,8 +4486,9 @@ class SimulationController(QtCore.QObject):
             pending_replay_directive = self._completion_policy.resolve_explicit_error_pending_replay(
                 fast_mode=bool(fast_mode),
                 pending_replay=self._completion_policy_pending_replay_state(),
+                preview_ownership=self._completion_policy_preview_ownership(),
             )
-            if pending_replay_directive.action == "queue_fresh":
+            if pending_replay_directive.action in {"queue_fresh", "arm_existing"}:
                 logger.debug("Replaying pending slider update after explicit failure")
                 self._apply_completion_policy_state_patch(
                     PolicyStatePatch(pending_replay=pending_replay_directive)

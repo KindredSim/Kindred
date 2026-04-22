@@ -9,6 +9,7 @@ import pytest
 from PySide6 import QtCore
 
 from kindred.core.batch_parallel import run_batch_simulation_task
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 
 pytestmark = [pytest.mark.gui]
 
@@ -144,6 +145,11 @@ def test_parallel_completion_consumes_done_futures_in_completion_order(main_wind
 def test_slider_parallel_plot_updates_are_coalesced_per_ui_tick(main_window, monkeypatch):
     main_window.simulation_controller.run_state.latest_sim_request_id = 101
     main_window.simulation_controller.run_state.active_run_id = 77
+    main_window.simulation_controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=101,
+        epoch=1,
+        target_set_ids=("set1", "set2", "set3", "set4", "set5"),
+    )
     main_window.simulation_controller.batch_cache.active_cache_key = "coalesce-key"
     main_window.simulation_controller.batch_run_context = {
         "active": True,
