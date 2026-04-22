@@ -51,7 +51,7 @@ def test_resolve_superseded_fast_completion_allows_display_then_handoff_for_curr
         completed_set_ids=("id1",),
     )
     preview_ownership = PreviewOwnershipState(request_id=4, epoch=1, target_set_ids=("id1", "id2"))
-    pending_replay = PendingReplayState(active=False, request_id=4, target_set_ids=())
+    pending_replay = PendingReplayState(active=True, request_id=4, target_set_ids=())
 
     decision = policy.resolve_superseded_fast_completion(
         preview_ownership=preview_ownership,
@@ -407,6 +407,42 @@ def test_resolve_superseded_fast_error_rejects_same_request_after_owner_epoch_ch
     assert decision.state_patch.context.active is False
 
 
+def test_resolve_explicit_error_pending_replay_queues_fresh_when_only_current_owner_exists() -> None:
+    policy = SimulationCompletionPolicy()
+    directive = policy.resolve_explicit_error_pending_replay(
+        fast_mode=False,
+        pending_replay=PendingReplayState(active=True, request_id=None, target_set_ids=("id2",)),
+        preview_ownership=PreviewOwnershipState(request_id=9, epoch=2, target_set_ids=("id1",)),
+    )
+
+    assert directive == PendingReplayDirective.queue_fresh(target_set_ids=("id2",))
+
+
+def test_resolve_superseded_fast_error_preserves_deferred_snapshot_when_active_flag_is_already_cleared() -> None:
+    policy = SimulationCompletionPolicy()
+    decision = policy.resolve_superseded_fast_error(
+        preview_ownership=PreviewOwnershipState(request_id=9, epoch=2, target_set_ids=("id9",)),
+        context=_context(request_id=7, fast_mode=True, active=False),
+        request_id=7,
+        pending_replay=PendingReplayState(active=False, request_id=7, target_set_ids=("id2",)),
+    )
+
+    assert decision.schedule_pending_preview_run is True
+    assert decision.state_patch.pending_replay == PendingReplayDirective.arm_existing(target_set_ids=("id2",))
+
+
+def test_pending_replay_state_preserves_string_normalization_contract() -> None:
+    pending_replay = PendingReplayState(
+        active="false",
+        request_id="7",
+        target_set_ids="id2",
+    )
+
+    assert pending_replay.active is False
+    assert pending_replay.request_id == 7
+    assert pending_replay.target_set_ids == ("id2",)
+
+
 def test_build_context_update_from_cache_truth_clears_explicit_subset_on_cache_key_mismatch() -> None:
     policy = SimulationCompletionPolicy()
     context = _context(
@@ -457,7 +493,7 @@ def test_resolve_explicit_error_pending_replay_queues_only_for_explicit_runs() -
         fast_mode=False,
         pending_replay=pending_replay,
         preview_ownership=PreviewOwnershipState(),
-    ) == PendingReplayDirective.queue_fresh(target_set_ids=("id1",))
+    ) == PendingReplayDirective.arm_existing(target_set_ids=("id1",))
     assert policy.resolve_explicit_error_pending_replay(
         fast_mode=False,
         pending_replay=pending_replay,

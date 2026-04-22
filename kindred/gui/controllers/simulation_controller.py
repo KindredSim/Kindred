@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from contextlib import suppress
 import hashlib
 import logging
@@ -48,7 +49,11 @@ from kindred.gui.controllers.simulation_completion_policy import (
 from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
-from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState, SimulationRunState
+from kindred.gui.controllers.simulation_run_state import (
+    DeferredPreviewReplayState,
+    PreviewOwnershipState,
+    SimulationRunState,
+)
 from kindred.gui.controllers.slider_plot_coalescer import SliderPlotCoalescer
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.batch_initial_conditions import (
@@ -284,8 +289,8 @@ class SimulationController(QtCore.QObject):
         return bool(self._run_state.pending_slider_simulation)
 
     @_pending_slider_simulation.setter
-    def _pending_slider_simulation(self, value: bool) -> None:
-        self._run_state.pending_slider_simulation = bool(value)
+    def _pending_slider_simulation(self, value: object) -> None:
+        self._run_state.pending_slider_simulation = value
 
     @property
     def _run_sequence_id(self) -> int:
@@ -349,6 +354,74 @@ class SimulationController(QtCore.QObject):
             seen.add(set_id_s)
             normalized.append(set_id_s)
         self._run_state.pending_slider_target_set_ids = tuple(normalized)
+
+    @property
+    def _pending_slider_handoff_queued(self) -> bool:
+        return bool(getattr(self._run_state, "pending_slider_handoff_queued", False))
+
+    @_pending_slider_handoff_queued.setter
+    def _pending_slider_handoff_queued(self, value: bool) -> None:
+        self._run_state.pending_slider_handoff_queued = bool(value)
+
+    @property
+    def _deferred_preview_replay(self) -> DeferredPreviewReplayState:
+        replay = getattr(self._run_state, "deferred_preview_replay", None)
+        if isinstance(replay, DeferredPreviewReplayState):
+            return replay
+        normalized = DeferredPreviewReplayState()
+        self._run_state.deferred_preview_replay = normalized
+        return normalized
+
+    def _has_deferred_preview_replay_intent(
+        self,
+        replay: Optional[DeferredPreviewReplayState] = None,
+    ) -> bool:
+        state = replay if isinstance(replay, DeferredPreviewReplayState) else self._deferred_preview_replay
+        return bool(state.active or state.target_set_ids)
+
+    def _has_deferred_preview_replay_launch_state(
+        self,
+        replay: Optional[DeferredPreviewReplayState] = None,
+    ) -> bool:
+        state = replay if isinstance(replay, DeferredPreviewReplayState) else self._deferred_preview_replay
+        return bool(state.active or state.request_id is not None or state.target_set_ids)
+
+    def _stop_deferred_preview_replay_timers(self) -> None:
+        for stop_fn, timer_name in (
+            (self.ui.slider.stop_variable_update_timer, "_variable_update_timer"),
+            (self.ui.slider.stop_species_slider_update_timer, "_species_slider_update_timer"),
+        ):
+            try:
+                stop_fn()
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    f"Failed to stop debounce timer {str(timer_name)} before deferred replay handoff",
+                    exc,
+                )
+
+    def _schedule_deferred_preview_replay_handoff_once(
+        self,
+        *,
+        stop_timers: bool = True,
+    ) -> bool:
+        replay = self._deferred_preview_replay
+        if not self._has_deferred_preview_replay_intent(replay):
+            return False
+        if replay.handoff_queued:
+            return False
+        request_id = replay.request_id
+        if request_id is None:
+            request_id = self._next_slider_preview_request_id()
+        self._run_state.deferred_preview_replay = replace(
+            replay,
+            active=True,
+            request_id=int(request_id),
+            handoff_queued=True,
+        )
+        if stop_timers:
+            self._stop_deferred_preview_replay_timers()
+        QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+        return True
 
     @property
     def _preview_ownership(self) -> PreviewOwnershipState:
@@ -455,40 +528,36 @@ class SimulationController(QtCore.QObject):
         request_id: Optional[int] = None,
         preserve_existing_request: bool = False,
     ) -> None:
-        self._pending_slider_target_set_ids = target_set_ids
+        current = self._deferred_preview_replay
+        normalized_targets = DeferredPreviewReplayState(target_set_ids=target_set_ids).target_set_ids
+        next_request_id: Optional[int]
         if request_id is not None:
-            request_id_i = int(request_id)
-            self._pending_slider_sim_request_id = request_id_i
-            self._claim_preview_ownership(
-                request_id=request_id_i,
-                target_set_ids=self._pending_slider_target_set_ids,
-            )
+            next_request_id = int(request_id)
         elif bool(preserve_existing_request):
-            preserved_request_id = self._preview_ownership.request_id
-            if preserved_request_id is None:
-                preserved_request_id = self._pending_slider_sim_request_id
+            preserved_request_id = current.request_id
             if preserved_request_id is None:
                 preserved_request_id = self._next_slider_preview_request_id()
-            self._pending_slider_sim_request_id = int(preserved_request_id)
-            self._claim_preview_ownership(
-                request_id=int(preserved_request_id),
-                target_set_ids=self._pending_slider_target_set_ids,
-            )
-        elif not bool(preserve_existing_request):
-            self._pending_slider_sim_request_id = None
-            self._clear_preview_ownership()
-        self._pending_slider_simulation = True
+            next_request_id = int(preserved_request_id)
+        else:
+            next_request_id = None
+        preserve_handoff_queued = bool(
+            current.handoff_queued
+            and current.target_set_ids == normalized_targets
+            and current.request_id == next_request_id
+        )
+        self._run_state.deferred_preview_replay = DeferredPreviewReplayState(
+            active=True,
+            request_id=next_request_id,
+            target_set_ids=normalized_targets,
+            handoff_queued=preserve_handoff_queued,
+        )
 
     def _clear_failed_fast_preview_ownership(self) -> None:
         self._clear_preview_ownership()
-        self._pending_slider_sim_request_id = None
-        self._pending_slider_target_set_ids = ()
-        self._pending_slider_simulation = False
+        self._run_state.deferred_preview_replay = DeferredPreviewReplayState()
 
     def clear_pending_slider_preview_replay(self, *, clear_plot_updates: bool = True) -> None:
-        self._pending_slider_simulation = False
-        self._pending_slider_sim_request_id = None
-        self._pending_slider_target_set_ids = ()
+        self._run_state.deferred_preview_replay = DeferredPreviewReplayState()
         if clear_plot_updates:
             self._clear_pending_preview_slider_plot_updates()
 
@@ -690,11 +759,7 @@ class SimulationController(QtCore.QObject):
         )
 
     def _completion_policy_pending_replay_state(self) -> PendingReplayState:
-        return PendingReplayState(
-            active=bool(getattr(self, "_pending_slider_simulation", False)),
-            request_id=getattr(self, "_pending_slider_sim_request_id", None),
-            target_set_ids=tuple(getattr(self, "_pending_slider_target_set_ids", ()) or ()),
-        )
+        return self._deferred_preview_replay
 
     def _completion_policy_preview_ownership(self) -> PreviewOwnershipState:
         return self._preview_ownership
@@ -827,6 +892,30 @@ class SimulationController(QtCore.QObject):
         self._stop_simulation()
 
     def run_simulation_from_slider(self) -> None:
+        if not self._has_deferred_preview_replay_intent():
+            target_set_ids = self._pending_slider_target_set_ids
+            if not target_set_ids:
+                try:
+                    target_set_ids = tuple(
+                        str(set_id)
+                        for set_id in (self.ui.batch.slider_edit_target_set_ids() or [])
+                        if str(set_id)
+                    )
+                except Exception:
+                    target_set_ids = ()
+            if not target_set_ids:
+                try:
+                    focused_set_id = self.ui.batch.focused_batch_set_id()
+                except Exception:
+                    focused_set_id = None
+                focused_set_id_s = str(focused_set_id or "").strip()
+                if focused_set_id_s:
+                    target_set_ids = (focused_set_id_s,)
+            self.queue_pending_slider_preview_replay(
+                target_set_ids=target_set_ids,
+                request_id=self._pending_slider_sim_request_id,
+                preserve_existing_request=False,
+            )
         self._run_simulation_from_slider()
 
     def invalidate_slider_preview_work(self) -> None:
@@ -907,7 +996,6 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
         fast_mode: Optional[bool] = None,
         request_id: Optional[int] = None,
-        owner_epoch: Optional[int] = None,
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
@@ -917,7 +1005,6 @@ class SimulationController(QtCore.QObject):
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
-            owner_epoch=owner_epoch,
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
@@ -930,11 +1017,76 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int] = None,
         fast_mode: Optional[bool] = None,
         request_id: Optional[int] = None,
+        batch_set: Optional[str] = None,
+        batch_set_id: Optional[str] = None,
+        cache_key: Optional[str] = None,
+    ) -> None:
+        self._on_simulation_error(
+            error_msg,
+            run_id=run_id,
+            fast_mode=fast_mode,
+            request_id=request_id,
+            batch_set=batch_set,
+            batch_set_id=batch_set_id,
+            cache_key=cache_key,
+        )
+
+    def _dispatch_simulation_complete(
+        self,
+        result: dict,
+        *,
+        run_id: Optional[int] = None,
+        fast_mode: Optional[bool] = None,
+        request_id: Optional[int] = None,
+        owner_epoch: Optional[int] = None,
+        batch_set: Optional[str] = None,
+        batch_set_id: Optional[str] = None,
+        cache_key: Optional[str] = None,
+    ):
+        if owner_epoch is None:
+            return self.on_simulation_complete(
+                result,
+                run_id=run_id,
+                fast_mode=fast_mode,
+                request_id=request_id,
+                batch_set=batch_set,
+                batch_set_id=batch_set_id,
+                cache_key=cache_key,
+            )
+        return self._on_simulation_complete(
+            result,
+            run_id=run_id,
+            fast_mode=fast_mode,
+            request_id=request_id,
+            owner_epoch=owner_epoch,
+            batch_set=batch_set,
+            batch_set_id=batch_set_id,
+            cache_key=cache_key,
+        )
+
+    def _dispatch_simulation_error(
+        self,
+        error_msg: object,
+        *,
+        run_id: Optional[int] = None,
+        fast_mode: Optional[bool] = None,
+        request_id: Optional[int] = None,
         owner_epoch: Optional[int] = None,
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
     ) -> None:
+        if owner_epoch is None:
+            self.on_simulation_error(
+                error_msg,
+                run_id=run_id,
+                fast_mode=fast_mode,
+                request_id=request_id,
+                batch_set=batch_set,
+                batch_set_id=batch_set_id,
+                cache_key=cache_key,
+            )
+            return
         self._on_simulation_error(
             error_msg,
             run_id=run_id,
@@ -1053,23 +1205,12 @@ class SimulationController(QtCore.QObject):
             self._simulation_worker = None
         shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
         self._delete_worker_if_stopped(worker, worker_name)
-        pending_request_id = getattr(self, "_pending_slider_sim_request_id", None)
-        owner_request_id = self._preview_ownership.request_id
-        if pending_request_id is not None and (
-            owner_request_id is None or int(pending_request_id) != int(owner_request_id)
-        ):
-            self._pending_slider_simulation = False
-            self._pending_slider_sim_request_id = None
-            self._pending_slider_target_set_ids = ()
-        elif (
-            self._pending_slider_simulation
+        if (
+            self._has_deferred_preview_replay_intent()
             and (not shutdown_requested)
             and (not self._has_running_owned_simulation_workers())
         ):
-            self._pending_slider_simulation = False
-            self.ui.slider.stop_variable_update_timer()
-            self.ui.slider.stop_species_slider_update_timer()
-            QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+            self._schedule_deferred_preview_replay_handoff_once()
         self._clear_shutdown_request_after_close_cleanup()
 
     def _retain_simulation_worker(self, worker, worker_name: str = "simulation worker") -> None:
@@ -1198,6 +1339,8 @@ class SimulationController(QtCore.QObject):
         self._shutdown_batch_executor(force_terminate=True)
         self._prune_stopped_owned_simulation_workers()
         has_running_workers = self._has_running_owned_simulation_workers()
+        if has_running_workers:
+            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._shutdown_requested_for_close = bool(has_running_workers)
         return not has_running_workers
 
@@ -1305,7 +1448,7 @@ class SimulationController(QtCore.QObject):
             _sid=set_id,
             _key=cache_key,
         ):
-            return self.on_simulation_complete(
+            return self._dispatch_simulation_complete(
                 payload,
                 run_id=_rid,
                 fast_mode=_fast,
@@ -1326,7 +1469,7 @@ class SimulationController(QtCore.QObject):
             _sid=set_id,
             _key=cache_key,
         ):
-            return self.on_simulation_error(
+            return self._dispatch_simulation_error(
                 msg,
                 run_id=_rid,
                 fast_mode=_fast,
@@ -1512,8 +1655,7 @@ class SimulationController(QtCore.QObject):
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
         self._clear_preview_ownership()
-        self._pending_slider_simulation = False
-        self._pending_slider_target_set_ids = ()
+        self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         if previous_latest_request_id > 0:
             self._pending_slider_sim_request_id = int(previous_latest_request_id)
         self._clear_pending_preview_slider_plot_updates()
@@ -1697,7 +1839,7 @@ class SimulationController(QtCore.QObject):
             return
         if self._batch_parallel.executor is None:
             return
-        self.on_simulation_error(
+        self._dispatch_simulation_error(
             error_msg,
             run_id=int(ctx.get("run_id") or 0),
             fast_mode=bool(ctx.get("fast_mode")),
@@ -1735,7 +1877,7 @@ class SimulationController(QtCore.QObject):
                 f"Parallel batch future failed while retrieving result (set_id={sid}, source={str(source)})",
                 exc,
             )
-            self.on_simulation_error(
+            self._dispatch_simulation_error(
                 f"Simulation failed:\n\n{exc}",
                 run_id=run_id,
                 fast_mode=fast_mode,
@@ -1749,7 +1891,7 @@ class SimulationController(QtCore.QObject):
             return False
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
-            self.on_simulation_error(
+            self._dispatch_simulation_error(
                 payload["error"],
                 run_id=run_id,
                 fast_mode=fast_mode,
@@ -1773,7 +1915,7 @@ class SimulationController(QtCore.QObject):
                 float(perf_counter()),
             )
         try:
-            self.on_simulation_complete(
+            self._dispatch_simulation_complete(
                 payload,
                 run_id=run_id,
                 fast_mode=fast_mode,
@@ -1789,7 +1931,7 @@ class SimulationController(QtCore.QObject):
                 exc,
             )
             try:
-                self.on_simulation_error(
+                self._dispatch_simulation_error(
                     f"Simulation failed:\n\n{exc}",
                     run_id=run_id,
                     fast_mode=fast_mode,
@@ -2169,7 +2311,6 @@ class SimulationController(QtCore.QObject):
     def _requeue_preserved_pending_slider_replay_after_preflight_abort(self) -> None:
         directive = self._completion_policy.resolve_preflight_abort_pending_replay(
             pending_replay=self._completion_policy_pending_replay_state(),
-            preview_ownership=self._completion_policy_preview_ownership(),
             explicit_run=True,
         )
         if directive is not None:
@@ -2207,9 +2348,17 @@ class SimulationController(QtCore.QObject):
         return str(request_mechanism_text)
 
     def _run_simulation_from_slider(self):
+        replay = self._deferred_preview_replay
+        if not self._has_deferred_preview_replay_launch_state(replay):
+            if replay.handoff_queued:
+                self._pending_slider_handoff_queued = False
+            return
+        if replay.handoff_queued:
+            replay = replace(replay, active=True, handoff_queued=False)
+            self._run_state.deferred_preview_replay = replay
         worker = self._simulation_worker
-        request_id = getattr(self, "_pending_slider_sim_request_id", None)
-        pending_target_set_ids = list(self._pending_slider_target_set_ids)
+        request_id = replay.request_id
+        pending_target_set_ids = list(replay.target_set_ids)
         owner_request_id = self._preview_ownership.request_id
         ctx = getattr(self, "_batch_run_context", {}) or {}
         active_fast_parallel = bool(
@@ -2223,32 +2372,22 @@ class SimulationController(QtCore.QObject):
                     active_fast_request_id = int(raw_active_fast_request_id)
             except Exception:
                 active_fast_request_id = None
-        if request_id is not None and owner_request_id is not None and int(request_id) != int(owner_request_id):
+        if request_id is not None and owner_request_id is not None and int(request_id) < int(owner_request_id):
             logger.debug(
                 "Discarding stale slider simulation request (request_id=%s, preview_owner=%s)",
                 request_id,
                 owner_request_id,
             )
-            self._pending_slider_simulation = False
-            self._pending_slider_sim_request_id = None
-            self._pending_slider_target_set_ids = ()
+            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
             return
-        if request_id is not None and owner_request_id is None:
-            self._claim_preview_ownership(
-                request_id=int(request_id),
-                target_set_ids=pending_target_set_ids,
-            )
-            owner_request_id = self._preview_ownership.request_id
         if request_id is None:
-            if owner_request_id is not None:
-                request_id = int(owner_request_id)
-            else:
-                request_id = self._next_sim_request_id()
-                self._claim_preview_ownership(
-                    request_id=int(request_id),
-                    target_set_ids=pending_target_set_ids,
-                )
-            self._pending_slider_sim_request_id = int(request_id)
+            request_id = self._next_slider_preview_request_id()
+            self._run_state.deferred_preview_replay = replace(
+                self._deferred_preview_replay,
+                active=True,
+                request_id=int(request_id),
+                handoff_queued=False,
+            )
         self._discarded_slider_preview_generation_id = None
         self.ui.slider.set_slider_triggered_simulation(True)
 
@@ -2306,8 +2445,7 @@ class SimulationController(QtCore.QObject):
             self.ui.run_ui.set_status_text("Cancelling previous simulation...")
             return
 
-        self._pending_slider_simulation = False
-        self._pending_slider_target_set_ids = ()
+        self._run_state.deferred_preview_replay = DeferredPreviewReplayState()
 
         self._simulation_running = True
         self.ui.run_ui.set_stop_button_enabled(True)
@@ -2791,23 +2929,20 @@ class SimulationController(QtCore.QObject):
             if active_fast_worker or active_fast_parallel:
                 logger.debug("Fast slider run already in flight; recording latest-only pending request")
                 self._pending_slider_simulation = True
+                deferred_target_set_ids: list[str] = []
+                for row in list(batch_rows or []):
+                    try:
+                        set_id = self.ui.batch.batch_set_id_for_row(int(row))
+                    except Exception:
+                        continue
+                    set_id_s = str(set_id or "").strip()
+                    if set_id_s and set_id_s not in deferred_target_set_ids:
+                        deferred_target_set_ids.append(set_id_s)
+                if deferred_target_set_ids:
+                    self._pending_slider_target_set_ids = deferred_target_set_ids
                 if request_id is not None:
                     request_id = int(request_id)
                     self._pending_slider_sim_request_id = int(request_id)
-                    deferred_target_set_ids: list[str] = list(self._pending_slider_target_set_ids)
-                    if not deferred_target_set_ids:
-                        for row in list(batch_rows or []):
-                            try:
-                                set_id = self.ui.batch.batch_set_id_for_row(int(row))
-                            except Exception:
-                                continue
-                            set_id_s = str(set_id or "").strip()
-                            if set_id_s and set_id_s not in deferred_target_set_ids:
-                                deferred_target_set_ids.append(set_id_s)
-                    self._claim_preview_ownership(
-                        request_id=int(request_id),
-                        target_set_ids=deferred_target_set_ids,
-                    )
                 return
 
         def _clear_slider_triggered_preflight_state() -> None:
@@ -3660,8 +3795,7 @@ class SimulationController(QtCore.QObject):
                             )
 
                 if stale_fast_decision.schedule_pending_preview_run and (not stale_fast_decision.display_current_preview):
-                    self._pending_slider_simulation = False
-                    QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+                    self._schedule_deferred_preview_replay_handoff_once(stop_timers=False)
                 else:
                     if stale_fast_decision.reset_status_progress:
                         try:
@@ -3672,12 +3806,6 @@ class SimulationController(QtCore.QObject):
                                 "Failed to reset status/progress after superseded fast completion",
                                 exc,
                             )
-                    self._apply_completion_policy_state_patch(
-                        PolicyStatePatch(
-                            pending_replay=PendingReplayDirective.clear(clear_plot_updates=False),
-                            clear_discarded_slider_preview_generation=True,
-                        )
-                    )
                 self._clear_shutdown_request_after_close_cleanup()
                 return
 
@@ -4309,16 +4437,10 @@ class SimulationController(QtCore.QObject):
                 self.ui.run_ui.set_stop_button_enabled(False)
                 self._slider_simulation_active = False
 
-                if self._pending_slider_simulation:
+                if self._has_deferred_preview_replay_intent():
                     logger.debug("Processing pending slider update after completion")
-                    self._pending_slider_simulation = False
-                    for stop_fn in (
-                        self.ui.slider.stop_variable_update_timer,
-                        self.ui.slider.stop_species_slider_update_timer,
-                    ):
-                        stop_fn()
                     if not shutdown_requested:
-                        QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+                        self._schedule_deferred_preview_replay_handoff_once()
                 self._clear_shutdown_request_after_close_cleanup()
 
     def _on_simulation_error(
@@ -4420,8 +4542,7 @@ class SimulationController(QtCore.QObject):
                         )
 
             if stale_fast_decision.schedule_pending_preview_run:
-                self._pending_slider_simulation = False
-                QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+                self._schedule_deferred_preview_replay_handoff_once(stop_timers=False)
             else:
                 if stale_fast_decision.reset_status_progress:
                     try:
@@ -4432,12 +4553,6 @@ class SimulationController(QtCore.QObject):
                             "Failed to reset status/progress after superseded fast error",
                             exc,
                         )
-                self._apply_completion_policy_state_patch(
-                    PolicyStatePatch(
-                        pending_replay=PendingReplayDirective.clear(clear_plot_updates=False),
-                        clear_discarded_slider_preview_generation=True,
-                    )
-                )
             return
         logger.warning("Simulation error surfaced to UI: %s", error_text)
 
@@ -4476,26 +4591,20 @@ class SimulationController(QtCore.QObject):
         self.ui.slider.set_slider_triggered_simulation(False)
 
         if cancelled:
-            if self._pending_slider_simulation:
+            if self._has_deferred_preview_replay_intent():
                 logger.debug("Resuming pending slider update after cancellation")
-                self._pending_slider_simulation = False
-                self.ui.slider.stop_variable_update_timer()
-                self.ui.slider.stop_species_slider_update_timer()
-                QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+                self._schedule_deferred_preview_replay_handoff_once()
         else:
             pending_replay_directive = self._completion_policy.resolve_explicit_error_pending_replay(
                 fast_mode=bool(fast_mode),
                 pending_replay=self._completion_policy_pending_replay_state(),
-                preview_ownership=self._completion_policy_preview_ownership(),
             )
             if pending_replay_directive.action in {"queue_fresh", "arm_existing"}:
                 logger.debug("Replaying pending slider update after explicit failure")
                 self._apply_completion_policy_state_patch(
                     PolicyStatePatch(pending_replay=pending_replay_directive)
                 )
-                self.ui.slider.stop_variable_update_timer()
-                self.ui.slider.stop_species_slider_update_timer()
-                QtCore.QTimer.singleShot(0, self._run_simulation_from_slider)
+                self._schedule_deferred_preview_replay_handoff_once()
             else:
                 self._apply_completion_policy_state_patch(
                     PolicyStatePatch(pending_replay=pending_replay_directive)

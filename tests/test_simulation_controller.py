@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from contextlib import suppress
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -1333,7 +1334,8 @@ def test_deferred_close_error_recovery_restores_later_pending_slider_rerun(
     )
 
     assert scheduled == [controller._run_simulation_from_slider]
-    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_simulation is True
+    assert controller.run_state.pending_slider_handoff_queued is True
 
 @pytest.mark.unit
 def test_simulation_worker_does_not_shadow_qthread_finished_signal():
@@ -1435,6 +1437,56 @@ def test_stale_fast_completion_schedules_pending_slider_run(monkeypatch, mw: _Fa
 
 
 @pytest.mark.unit
+def test_second_stale_fast_completion_does_not_queue_duplicate_handoff_before_first_callback_runs(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._latest_sim_request_id = 8
+    controller._active_run_id = 11
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=8,
+        epoch=2,
+        target_set_ids=("id1",),
+    )
+    controller.run_state.deferred_preview_replay = controller.run_state.deferred_preview_replay.__class__(
+        active=True,
+        request_id=7,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": False,
+        "parallel": True,
+        "fast_mode": True,
+        "request_id": 7,
+        "preview_owner_epoch": 1,
+        "keep_executor_alive": True,
+    }
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=11,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=1,
+    )
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=11,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=1,
+    )
+
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert controller._pending_slider_simulation is True
+    assert getattr(controller.run_state.deferred_preview_replay, "handoff_queued") is True
+
+
+@pytest.mark.unit
 def test_stale_fast_completion_treats_same_request_as_superseded_after_owner_epoch_changes(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
@@ -1471,6 +1523,98 @@ def test_stale_fast_completion_treats_same_request_as_superseded_after_owner_epo
     ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
     assert ctx.get("active") is False
     assert scheduled == [controller._run_simulation_from_slider]
+
+
+@pytest.mark.unit
+def test_worker_signal_completion_preserves_owner_epoch_for_stale_fast_replay(
+    monkeypatch, controller: SimulationController
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_simulation = True
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=4,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 7,
+        "preview_owner_epoch": 3,
+    }
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=5,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        set_name="set2",
+        set_id="id2",
+        cache_key="preview-cache",
+    )
+
+    worker.result_ready.emit(_successful_result_payload())
+
+    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
+    assert ctx.get("active") is False
+    assert scheduled == [controller._run_simulation_from_slider]
+
+
+@pytest.mark.unit
+def test_worker_signal_completion_uses_captured_owner_epoch_after_context_turnover(
+    monkeypatch, controller: SimulationController
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_simulation = True
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=4,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 7,
+        "preview_owner_epoch": 3,
+    }
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=5,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        set_name="set2",
+        set_id="id2",
+        cache_key="preview-cache",
+    )
+    controller._batch_run_context["preview_owner_epoch"] = 4
+
+    worker.result_ready.emit(_successful_result_payload())
+
+    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
+    assert ctx.get("active") is False
+    assert scheduled == [controller._run_simulation_from_slider]
+
 
 @pytest.mark.unit
 def test_superseded_multiset_preview_completion_still_displays_current_result_before_replay(
@@ -2065,7 +2209,8 @@ def test_stale_fast_completion_with_pending_newer_preview_replays_without_displa
     )
 
     assert scheduled == [controller._run_simulation_from_slider]
-    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_simulation is True
+    assert controller.run_state.pending_slider_handoff_queued is True
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is True
     assert mw._status_label.text == "Updating simulation..."
@@ -2083,7 +2228,7 @@ def test_stale_fast_completion_preserves_current_owner_request_for_pending_repla
     rid_owner = controller._next_sim_request_id()
     controller._latest_sim_request_id = int(rid_owner)
     controller._pending_slider_sim_request_id = int(rid_owner)
-    controller._pending_slider_simulation = False
+    controller._pending_slider_simulation = True
     controller._active_run_id = 11
     controller._batch_run_context = {}
     controller._simulation_running = True
@@ -2317,7 +2462,7 @@ def test_stale_fast_error_with_pending_newer_preview_replays_without_showing_err
     rid_new = controller._next_sim_request_id()
     controller._latest_sim_request_id = int(rid_new)
     controller._pending_slider_sim_request_id = int(rid_new)
-    controller._pending_slider_simulation = False
+    controller._pending_slider_simulation = True
     controller._discarded_slider_preview_generation_id = None
     controller._active_run_id = 11
     controller._batch_run_context = {}
@@ -2344,7 +2489,8 @@ def test_stale_fast_error_with_pending_newer_preview_replays_without_showing_err
     controller._on_simulation_error("boom", run_id=11, fast_mode=True, request_id=int(rid_old))
 
     assert scheduled == [controller._run_simulation_from_slider]
-    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_simulation is True
+    assert controller.run_state.pending_slider_handoff_queued is True
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is True
     assert mw._status_label.text == "Updating simulation..."
@@ -2514,6 +2660,156 @@ def test_fast_error_treats_missing_owner_epoch_for_current_owner_as_superseded(
     assert scheduled == []
     assert mw._status_label.text == "Ready"
 
+
+@pytest.mark.unit
+def test_worker_signal_error_preserves_owner_epoch_for_stale_fast_replay(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_simulation = True
+    controller._active_run_id = 11
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=4,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 7,
+        "preview_owner_epoch": 3,
+    }
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    message_box = MagicMock()
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", message_box)
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=11,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        set_name="set2",
+        set_id="id2",
+        cache_key="preview-cache",
+    )
+
+    worker.error.emit("boom")
+
+    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
+    assert ctx.get("active") is False
+    assert scheduled == [controller._run_simulation_from_slider]
+    message_box.assert_not_called()
+
+
+@pytest.mark.unit
+def test_worker_signal_error_uses_captured_owner_epoch_after_context_turnover(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_simulation = True
+    controller._active_run_id = 11
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=4,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 7,
+        "preview_owner_epoch": 3,
+    }
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    message_box = MagicMock()
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", message_box)
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=11,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        set_name="set2",
+        set_id="id2",
+        cache_key="preview-cache",
+    )
+    controller._batch_run_context["preview_owner_epoch"] = 4
+
+    worker.error.emit("boom")
+
+    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
+    assert ctx.get("active") is False
+    assert scheduled == [controller._run_simulation_from_slider]
+    message_box.assert_not_called()
+
+
+@pytest.mark.unit
+def test_second_stale_fast_error_preserves_queued_replay_snapshot_before_timer_fires(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    message_box = MagicMock()
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", message_box)
+
+    controller._latest_sim_request_id = 8
+    controller._active_run_id = 11
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=8,
+        epoch=2,
+        target_set_ids=("id1",),
+    )
+    controller.run_state.deferred_preview_replay = controller.run_state.deferred_preview_replay.__class__(
+        active=False,
+        request_id=7,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": False,
+        "parallel": True,
+        "fast_mode": True,
+        "request_id": 7,
+        "preview_owner_epoch": 1,
+        "keep_executor_alive": True,
+    }
+
+    controller._on_simulation_error(
+        "boom",
+        run_id=11,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=1,
+    )
+
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert controller._pending_slider_sim_request_id == 7
+    assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id2",)
+    message_box.assert_not_called()
+
+
+@pytest.mark.unit
+def test_public_simulation_callbacks_do_not_expose_owner_epoch_parameter(controller: SimulationController):
+    assert "owner_epoch" not in inspect.signature(controller.on_simulation_complete).parameters
+    assert "owner_epoch" not in inspect.signature(controller.on_simulation_error).parameters
+
+
 @pytest.mark.unit
 def test_slider_run_deferral_does_not_set_updating_status_when_no_new_run_starts(
     mw: _FakeMainWindow, controller: SimulationController
@@ -2582,7 +2878,7 @@ def test_slider_run_blocks_launch_while_retained_worker_is_still_running(
     mw._run_btn.setEnabled(True)
     mw._stop_btn.setEnabled(False)
 
-    controller._run_simulation_from_slider()
+    controller.run_simulation_from_slider()
 
     assert controller.run_simulation_internal.call_count == 0
     assert controller._simulation_worker is None
@@ -3767,6 +4063,81 @@ def test_poll_parallel_batch_futures_consumes_callback_then_scan(controller: Sim
     assert sources == ["callback", "scan"]
 
 @pytest.mark.unit
+def test_poll_parallel_batch_futures_callback_then_scan_only_queue_one_replay_handoff(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    fut1: Future = Future()
+    fut1.set_result({"ok": 1})
+    fut2: Future = Future()
+    fut2.set_result({"ok": 2})
+
+    controller._batch_parallel.completed_queue = SimpleQueue()
+    controller._batch_parallel.completed_queue.put(("a", 1.234))
+    controller._batch_parallel.future_map = {"a": fut1, "b": fut2}
+    controller._batch_parallel.future_meta = {"a": {"set_name": "A"}, "b": {"set_name": "B"}}
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._latest_sim_request_id = 8
+    controller._active_run_id = 11
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=8,
+        epoch=2,
+        target_set_ids=("id1",),
+    )
+    controller.run_state.deferred_preview_replay = controller.run_state.deferred_preview_replay.__class__(
+        active=True,
+        request_id=7,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 11,
+        "request_id": 7,
+        "fast_mode": True,
+        "cache_key": "ck",
+        "preview_owner_epoch": 1,
+        "keep_executor_alive": True,
+    }
+    stale_context = dict(controller._batch_run_context)
+
+    def _consume_stale_completion(**kwargs):
+        controller._on_simulation_complete(
+            _successful_result_payload(),
+            run_id=11,
+            fast_mode=True,
+            request_id=7,
+            owner_epoch=1,
+            batch_set="A",
+            batch_set_id=str(kwargs["set_id"]),
+            cache_key="ck",
+        )
+        if kwargs["source"] == "callback":
+            controller._batch_run_context = dict(stale_context)
+            controller._simulation_running = True
+            controller._slider_simulation_active = True
+            controller._batch_parallel.future_map = {"a": fut1, "b": fut2}
+            controller._batch_parallel.future_meta = {"a": {"set_name": "A"}, "b": {"set_name": "B"}}
+        return True
+
+    controller._consume_parallel_batch_future = MagicMock(side_effect=_consume_stale_completion)
+
+    controller._poll_parallel_batch_futures()
+
+    assert controller._consume_parallel_batch_future.call_count == 2
+    sources = [kwargs["source"] for _args, kwargs in controller._consume_parallel_batch_future.call_args_list]
+    assert sources == ["callback", "scan"]
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert getattr(controller.run_state.deferred_preview_replay, "handoff_queued") is True
+
+
+@pytest.mark.unit
 def test_poll_parallel_batch_futures_catches_unhandled_exceptions_and_shuts_down(mw: _FakeMainWindow, controller: SimulationController):
     fut1: Future = Future()
     fut1.set_result({"ok": 1})
@@ -3882,10 +4253,67 @@ def test_run_simulation_from_slider_allocates_fresh_request_after_clearing_pendi
 
     controller._run_simulation_from_slider()
 
-    assert controller.run_state.preview_ownership.request_id == 6
-    assert controller.run_state.preview_ownership.target_set_ids == ("id2",)
+    assert controller.run_state.preview_ownership.request_id == 5
+    assert controller.run_state.preview_ownership.target_set_ids == ("id1",)
     controller.run_simulation_internal.assert_called_once()
     assert controller.run_simulation_internal.call_args.kwargs["request_id"] == 6
+
+
+@pytest.mark.unit
+def test_run_simulation_from_slider_noops_for_stray_callback_after_consumed_replay(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller.run_simulation_internal = MagicMock()
+    controller.queue_pending_slider_preview_replay(
+        target_set_ids=("id2",),
+        request_id=6,
+    )
+
+    controller._run_simulation_from_slider()
+
+    assert controller.run_simulation_internal.call_count == 1
+    controller._simulation_running = False
+    controller._slider_simulation_active = False
+    controller._batch_run_context = {}
+
+    controller._run_simulation_from_slider()
+
+    assert controller.run_simulation_internal.call_count == 1
+
+
+@pytest.mark.unit
+def test_run_simulation_from_slider_keeps_current_preview_owner_until_new_request_actually_starts(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    controller.run_simulation_internal = MagicMock()
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=5,
+        epoch=2,
+        target_set_ids=("id1",),
+    )
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
+    mw._last_slider_change_name = "k1"
+
+    controller.queue_pending_slider_preview_replay(
+        target_set_ids=("id2",),
+        request_id=6,
+    )
+
+    assert controller.run_state.preview_ownership.request_id == 5
+    assert controller.run_state.preview_ownership.target_set_ids == ("id1",)
+    assert controller._pending_slider_sim_request_id == 6
+    assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id2",)
+
+    controller._run_simulation_from_slider()
+
+    controller.run_simulation_internal.assert_called_once()
+    _, kwargs = controller.run_simulation_internal.call_args
+    assert kwargs["request_id"] == 6
+    assert kwargs["batch_rows"] == [1]
+    assert controller.run_state.preview_ownership.request_id == 5
 
 
 @pytest.mark.unit
@@ -3907,8 +4335,51 @@ def test_queue_pending_slider_preview_replay_preserve_existing_rebinds_pending_r
 
     assert controller._pending_slider_simulation is True
     assert controller._pending_slider_sim_request_id == 8
-    assert controller.run_state.preview_ownership.request_id == 8
-    assert controller.run_state.preview_ownership.target_set_ids == ("id2",)
+    assert controller.run_state.preview_ownership.request_id is None
+    assert controller.run_state.preview_ownership.target_set_ids == ()
+
+
+@pytest.mark.unit
+def test_queue_pending_slider_preview_replay_preserve_existing_allocates_fresh_deferred_request_without_borrowing_owner(
+    controller: SimulationController,
+):
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=11,
+        epoch=4,
+        target_set_ids=("id1",),
+    )
+    controller._latest_sim_request_id = 11
+
+    controller.queue_pending_slider_preview_replay(
+        target_set_ids=("id2",),
+        request_id=None,
+        preserve_existing_request=True,
+    )
+
+    assert controller.run_state.preview_ownership.request_id == 11
+    assert controller._pending_slider_simulation is True
+    assert controller._pending_slider_sim_request_id == 12
+    assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id2",)
+
+
+@pytest.mark.unit
+def test_run_state_pending_slider_target_set_ids_preserves_single_string_target_identity(
+    controller: SimulationController,
+):
+    controller.run_state.pending_slider_target_set_ids = "id2"
+
+    assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id2",)
+
+
+@pytest.mark.unit
+def test_run_state_pending_slider_simulation_preserves_string_false_normalization(
+    controller: SimulationController,
+):
+    controller.run_state.pending_slider_simulation = "false"
+    assert controller.run_state.pending_slider_simulation is False
+
+    controller._pending_slider_simulation = "false"
+    assert controller._pending_slider_simulation is False
 
 
 @pytest.mark.unit
@@ -4017,8 +4488,29 @@ def test_run_simulation_from_slider_defers_when_full_run_in_progress(mw: _FakeMa
     controller._latest_sim_request_id = 0
     controller._batch_run_context = {"active": False, "parallel": False}
 
-    controller._run_simulation_from_slider()
+    controller.run_simulation_from_slider()
     assert controller._pending_slider_simulation is True
+
+@pytest.mark.unit
+def test_retained_worker_finish_preserves_valid_deferred_replay_without_current_preview_owner(
+    monkeypatch, controller: SimulationController
+):
+    worker = _FakeWorker(running=False, wait_returns=True)
+    controller._retained_simulation_workers = [worker]
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 9
+    controller.run_state.pending_slider_target_set_ids = ("id2",)
+    controller.run_state.preview_ownership = PreviewOwnershipState()
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._on_retained_simulation_worker_finished(worker)
+
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert controller._pending_slider_sim_request_id == 9
+    assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id2",)
+
 
 @pytest.mark.unit
 def test_cancel_active_run_for_restart_resets_ui_and_shuts_down(mw: _FakeMainWindow, controller: SimulationController):
@@ -4576,6 +5068,45 @@ def test_run_simulation_internal_fast_mode_marks_runtime_dirty_after_multi_set_l
         "Runtime was left 'clean' after multi-set loop; a subsequent single-set "
         "interaction would reuse the last set's bindings"
     )
+
+@pytest.mark.unit
+def test_run_simulation_internal_fast_deferral_replaces_deferred_target_snapshot_and_dispatch_uses_it(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    active_worker = _FakeWorker(running=True, wait_returns=True)
+    active_worker._fast_mode = True  # type: ignore[attr-defined]
+    controller._simulation_worker = active_worker
+    controller._simulation_running = True
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 6
+    controller.run_state.pending_slider_target_set_ids = ("stale-id",)
+    mw._batch_store.row_count.return_value = 2
+    mw._batch_set_id_for_row.side_effect = lambda row: {0: "id1", 1: "id2"}[int(row)]
+    mw._last_slider_change_name = "k1"
+
+    controller._run_simulation_internal(
+        fast_mode=True,
+        request_id=7,
+        batch_rows=[1],
+        reuse_parallel_executor=False,
+    )
+
+    assert controller._pending_slider_simulation is True
+    assert controller._pending_slider_sim_request_id == 7
+    assert tuple(controller.run_state.pending_slider_target_set_ids) == ("id2",)
+
+    controller._simulation_worker = None
+    controller._simulation_running = False
+    controller.run_simulation_internal = MagicMock()
+    mw._batch_rows_for_scope.return_value = [0]
+
+    controller._run_simulation_from_slider()
+
+    controller.run_simulation_internal.assert_called_once()
+    _, kwargs = controller.run_simulation_internal.call_args
+    assert kwargs["request_id"] == 7
+    assert kwargs["batch_rows"] == [1]
+
 
 @pytest.mark.unit
 def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
@@ -6129,6 +6660,22 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
     assert int(solver_cfg["grid"]["N"]) >= 50
 
 @pytest.mark.unit
+def test_preview_ownership_same_membership_reordering_does_not_bump_epoch(controller: SimulationController):
+    first = controller._claim_preview_ownership(
+        request_id=7,
+        target_set_ids=("id2", "id1"),
+    )
+
+    second = controller._set_preview_ownership(
+        request_id=7,
+        target_set_ids=("id1", "id2"),
+    )
+
+    assert first.epoch == second.epoch
+    assert second.target_set_ids == ("id1", "id2")
+
+
+@pytest.mark.unit
 
 @pytest.mark.unit
 def test_run_simulation_internal_invalid_t_end_does_not_schedule_pending_slider_replay_after_preflight_abort(
@@ -6186,7 +6733,7 @@ def test_run_simulation_internal_invalid_t_end_does_not_schedule_pending_slider_
 
     assert warned and warned[0][0] == "Invalid t_end"
     assert controller._pending_slider_simulation is True
-    assert controller._pending_slider_sim_request_id > 4
+    assert controller._pending_slider_sim_request_id == 3
     assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id1",)
     assert scheduled == []
     controller._start_next_batch_simulation.assert_not_called()
@@ -6629,7 +7176,7 @@ def test_on_simulation_error_non_cancelled_explicit_requeues_preserved_pending_s
 
     assert scheduled == [controller._run_simulation_from_slider]
     assert controller._pending_slider_simulation is True
-    assert controller._pending_slider_sim_request_id > 5
+    assert controller._pending_slider_sim_request_id == 4
     assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id2",)
     critical.assert_called_once()
     controller.run_simulation_internal = MagicMock()
@@ -7807,7 +8354,8 @@ def test_explicit_run_success_preserves_pending_slider_replay_for_non_targeted_d
 
     mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
     mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
-    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_simulation is True
+    assert controller.run_state.pending_slider_handoff_queued is True
     assert controller._pending_slider_sim_request_id == 7
     assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id2",)
     assert scheduled == [controller._run_simulation_from_slider]
@@ -7855,7 +8403,7 @@ def test_explicit_run_preflight_abort_does_not_schedule_pending_slider_replay(
     controller._run_simulation()
 
     assert controller._pending_slider_simulation is True
-    assert controller._pending_slider_sim_request_id > 2
+    assert controller._pending_slider_sim_request_id == 1
     assert tuple(getattr(controller.run_state, "pending_slider_target_set_ids", ())) == ("id1", "id2")
     assert scheduled == []
 
@@ -8017,7 +8565,8 @@ def test_explicit_run_success_preserves_targeted_dirty_state_edited_after_run_st
     mw.reset_mechanism_workspaces.assert_not_called()
     mw.discard_concentration_overlays_for_set_ids.assert_not_called()
     assert mw._species_slider_update_timer.stop_calls == 1
-    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_simulation is True
+    assert controller.run_state.pending_slider_handoff_queued is True
     assert controller._pending_slider_sim_request_id == 7
     assert scheduled == [controller._run_simulation_from_slider]
 
@@ -8212,6 +8761,7 @@ def test_explicit_run_success_preserves_pending_species_preview_replay_when_no_t
     )
 
     assert mw._species_slider_update_timer.stop_calls == 1
-    assert controller._pending_slider_simulation is False
+    assert controller._pending_slider_simulation is True
+    assert controller.run_state.pending_slider_handoff_queued is True
     assert controller._pending_slider_sim_request_id == 7
     assert scheduled == [controller._run_simulation_from_slider]

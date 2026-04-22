@@ -122,7 +122,7 @@ def test_parallel_completion_consumes_done_futures_in_completion_order(main_wind
     processed: list[str] = []
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "on_simulation_complete",
+        "_dispatch_simulation_complete",
         lambda _result, **kwargs: processed.append(str(kwargs.get("batch_set_id") or "")),
         raising=True,
     )

@@ -1340,7 +1340,7 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
     def _spy_complete(_result, *_args, **kwargs) -> None:
         seen_cache_keys.append(kwargs.get("cache_key"))
 
-    monkeypatch.setattr(main_window.simulation_controller, "on_simulation_complete", _spy_complete)
+    monkeypatch.setattr(main_window.simulation_controller, "_dispatch_simulation_complete", _spy_complete)
 
     prepared_args = []
     mechanism_texts = []
