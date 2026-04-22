@@ -304,6 +304,96 @@ def test_stale_fast_request_ownership_fails_closed_for_missing_context_or_worker
     ) is False
 
 
+def test_stale_fast_request_ownership_uses_stopped_fast_worker_request_id_for_mismatch() -> None:
+    policy = SimulationCompletionPolicy()
+    activity = RunActivitySnapshot(
+        latest_request_id=9,
+        simulation_running=True,
+        slider_simulation_active=True,
+        worker_running=False,
+        worker_fast_mode=True,
+        worker_request_id=9,
+    )
+
+    assert policy.stale_fast_request_still_owns_current_state(
+        activity=activity,
+        context=None,
+        request_id=4,
+    ) is False
+
+
+def test_stale_fast_request_ownership_uses_stopped_fast_worker_request_id_for_match() -> None:
+    policy = SimulationCompletionPolicy()
+    activity = RunActivitySnapshot(
+        latest_request_id=9,
+        simulation_running=True,
+        slider_simulation_active=True,
+        worker_running=False,
+        worker_fast_mode=True,
+        worker_request_id=9,
+    )
+
+    assert policy.stale_fast_request_still_owns_current_state(
+        activity=activity,
+        context=None,
+        request_id=9,
+    ) is True
+
+
+def test_stale_fast_request_ownership_does_not_revive_cleared_preview_from_stopped_worker() -> None:
+    policy = SimulationCompletionPolicy()
+    activity = RunActivitySnapshot(
+        latest_request_id=9,
+        simulation_running=True,
+        slider_simulation_active=False,
+        worker_running=False,
+        worker_fast_mode=True,
+        worker_request_id=9,
+    )
+
+    assert policy.stale_fast_request_still_owns_current_state(
+        activity=activity,
+        context=None,
+        request_id=9,
+    ) is False
+
+
+def test_stale_fast_request_ownership_rejects_stopped_worker_when_newer_preview_intent_exists() -> None:
+    policy = SimulationCompletionPolicy()
+    activity = RunActivitySnapshot(
+        latest_request_id=10,
+        simulation_running=True,
+        slider_simulation_active=True,
+        worker_running=False,
+        worker_fast_mode=True,
+        worker_request_id=9,
+    )
+
+    assert policy.stale_fast_request_still_owns_current_state(
+        activity=activity,
+        context=None,
+        request_id=9,
+    ) is False
+
+
+def test_stale_fast_request_ownership_rejects_stopped_nonfast_worker_even_when_slider_active() -> None:
+    policy = SimulationCompletionPolicy()
+    activity = RunActivitySnapshot(
+        latest_request_id=10,
+        simulation_running=True,
+        slider_simulation_active=True,
+        worker_running=False,
+        worker_fast_mode=False,
+        worker_request_id=9,
+    )
+
+    assert policy.stale_fast_request_still_owns_current_state(
+        activity=activity,
+        context=None,
+        request_id=4,
+    ) is False
+
+
 def test_build_run_start_cache_decision_separates_explicit_and_preview_scope() -> None:
     policy = SimulationCompletionPolicy()
 

@@ -1884,6 +1884,85 @@ def test_nonowning_stale_fast_completion_does_not_reset_explicit_run_status_prog
     assert mw._status_label.text == "Running simulation..."
     assert mw._sim_progress.value == 57
 
+
+@pytest.mark.unit
+def test_preview_request_can_display_rejects_stale_request_when_stopped_fast_worker_has_newer_request_id(
+    controller: SimulationController,
+):
+    controller._batch_run_context = {}
+    controller._latest_sim_request_id = 10
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._discarded_slider_preview_generation_id = None
+    worker = _FakeWorker(running=False, wait_returns=True)
+    worker._request_id = 9  # type: ignore[attr-defined]
+    worker._fast_mode = True  # type: ignore[attr-defined]
+    controller._simulation_worker = worker
+
+    assert controller._preview_request_can_display(4) is False
+
+
+@pytest.mark.unit
+def test_preview_request_can_display_accepts_matching_stopped_fast_worker_while_preview_active(
+    controller: SimulationController,
+):
+    controller._batch_run_context = {}
+    controller._latest_sim_request_id = 9
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._discarded_slider_preview_generation_id = None
+    worker = _FakeWorker(running=False, wait_returns=True)
+    worker._request_id = 9  # type: ignore[attr-defined]
+    worker._fast_mode = True  # type: ignore[attr-defined]
+    controller._simulation_worker = worker
+
+    assert controller._preview_request_can_display(9) is True
+
+
+@pytest.mark.unit
+def test_stale_fast_completion_with_pending_newer_preview_replays_without_displaying_stopped_old_worker(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    rid_old = controller._next_sim_request_id()
+    rid_new = controller._next_sim_request_id()
+    controller._latest_sim_request_id = int(rid_new)
+    controller._pending_slider_sim_request_id = int(rid_new)
+    controller._pending_slider_simulation = False
+    controller._discarded_slider_preview_generation_id = None
+    controller._active_run_id = 11
+    controller._batch_run_context = {}
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    worker = _FakeWorker(running=False, wait_returns=True)
+    worker._request_id = int(rid_old)  # type: ignore[attr-defined]
+    worker._fast_mode = True  # type: ignore[attr-defined]
+    controller._simulation_worker = worker
+
+    mw._status_label.setText("Updating simulation...")
+    mw._sim_progress.setValue(41)
+    mw.set_data.reset_mock()
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=11,
+        fast_mode=True,
+        request_id=int(rid_old),
+    )
+
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert controller._pending_slider_simulation is False
+    assert controller._simulation_running is True
+    assert controller._slider_simulation_active is True
+    assert mw._status_label.text == "Updating simulation..."
+    assert mw._sim_progress.value == 41
+    mw.set_data.assert_not_called()
+
+
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_suppresses_stale_error_ui_after_discard(
     monkeypatch,
@@ -2072,6 +2151,47 @@ def test_nonowning_stale_fast_error_does_not_reset_explicit_run_status_progress(
     assert mw._status_label.text == "Running simulation..."
     assert mw._sim_progress.value == 41
     message_box.assert_not_called()
+
+
+@pytest.mark.unit
+def test_stale_fast_error_with_pending_newer_preview_replays_without_showing_error_for_stopped_old_worker(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    rid_old = controller._next_sim_request_id()
+    rid_new = controller._next_sim_request_id()
+    controller._latest_sim_request_id = int(rid_new)
+    controller._pending_slider_sim_request_id = int(rid_new)
+    controller._pending_slider_simulation = False
+    controller._discarded_slider_preview_generation_id = None
+    controller._active_run_id = 11
+    controller._batch_run_context = {}
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    worker = _FakeWorker(running=False, wait_returns=True)
+    worker._request_id = int(rid_old)  # type: ignore[attr-defined]
+    worker._fast_mode = True  # type: ignore[attr-defined]
+    controller._simulation_worker = worker
+
+    mw._status_label.setText("Updating simulation...")
+    mw._sim_progress.setValue(41)
+
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    message_box = MagicMock()
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", message_box)
+
+    controller._on_simulation_error("boom", run_id=11, fast_mode=True, request_id=int(rid_old))
+
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert controller._pending_slider_simulation is False
+    assert controller._simulation_running is True
+    assert controller._slider_simulation_active is True
+    assert mw._status_label.text == "Updating simulation..."
+    assert mw._sim_progress.value == 41
+    message_box.assert_not_called()
+
 
 @pytest.mark.unit
 def test_stale_fast_error_without_pending_still_cleans_up_active_run(

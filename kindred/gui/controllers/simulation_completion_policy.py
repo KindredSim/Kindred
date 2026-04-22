@@ -435,12 +435,21 @@ class SimulationCompletionPolicy:
             if context.request_id is None:
                 return False
             return int(context.request_id) == int(request_id)
+        # A concrete fast-worker request id remains the ownership signal while
+        # preview mode is still active, but only if that worker still matches
+        # the latest known preview intent.
+        if activity.worker_request_id is not None:
+            if not bool(activity.worker_fast_mode):
+                return False
+            if int(activity.worker_request_id) != int(activity.latest_request_id):
+                return False
+            if bool(activity.worker_running) or bool(activity.slider_simulation_active):
+                return int(activity.worker_request_id) == int(request_id)
+            return False
         if activity.worker_running:
             if not bool(activity.worker_fast_mode):
                 return False
-            if activity.worker_request_id is None:
-                return False
-            return int(activity.worker_request_id) == int(request_id)
+            return False
         return bool(activity.slider_simulation_active)
 
     def preview_request_can_display(
