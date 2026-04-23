@@ -93,6 +93,10 @@ def _track_checkstate_set_data(model: QtCore.QAbstractItemModel, monkeypatch) ->
     monkeypatch.setattr(model, "setData", _tracked)
     return calls
 
+
+def _pending_slider_preview_launch(main_window):
+    return main_window.simulation_controller.run_state.pending_slider_preview_launch
+
 def _find_slider_visibility_action(main_window, entry_kind: str, name: str) -> QtGui.QAction:
     picker = main_window.findChild(QtWidgets.QToolButton, "sliderVisibilityPickerButton")
     assert picker is not None
@@ -139,7 +143,7 @@ def test_unified_surface_builds_species_sliders_and_syncs_with_batch_table(main_
     def _count_runs():
         calls["n"] += 1
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", _count_runs)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", _count_runs)
     monkeypatch.setattr(main_window.simulation_controller, "run_simulation", lambda: reset_runs.__setitem__("n", reset_runs["n"] + 1))
 
     qtbot.addWidget(main_window)
@@ -223,7 +227,7 @@ def test_species_set_change_prunes_removed_species_overlays_and_clears_dirty_sta
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -268,7 +272,7 @@ def test_species_set_change_clears_active_overlay_display_state_after_pruning(ma
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 
@@ -332,7 +336,7 @@ def test_species_set_change_clears_old_explicit_cache_even_when_unrelated_row_pr
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 
@@ -402,7 +406,7 @@ def test_species_set_change_preserves_fresh_explicit_cache_during_post_run_sync(
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 
@@ -473,7 +477,7 @@ def test_species_set_change_clears_fresh_explicit_cache_during_post_run_sync_whe
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 
@@ -537,7 +541,7 @@ def test_species_set_change_narrows_active_valid_subset_after_partial_post_run_p
     assert model.setData(model.index(1, 1), "0.25")
     assert model.setData(model.index(1, 2), "0.75")
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -625,7 +629,7 @@ def test_species_set_change_cancels_queued_species_preview_after_pruning(main_wi
     preview_runs: list[str] = []
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "run_simulation_from_slider",
+        "launch_pending_slider_preview_replay",
         lambda: preview_runs.append("run"),
     )
 
@@ -637,13 +641,13 @@ def test_species_set_change_cancels_queued_species_preview_after_pruning(main_wi
     timer = getattr(main_window._preview_session, "_species_slider_update_timer", None)
     assert timer is not None
     assert timer.isActive() is True
-    assert main_window.simulation_controller.run_state.pending_slider_simulation is True
+    assert _pending_slider_preview_launch(main_window).active is True
 
     main_window._sync_batch_species_columns(["A", "C"])
     QtWidgets.QApplication.processEvents()
 
     assert timer.isActive() is False
-    assert main_window.simulation_controller.run_state.pending_slider_simulation is False
+    assert _pending_slider_preview_launch(main_window).active is False
     qtbot.wait(120)
     QtWidgets.QApplication.processEvents()
     assert preview_runs == []
@@ -680,7 +684,7 @@ def test_species_mode_slider_fans_out_to_all_selected_rows(main_window, qtbot, m
     def _count_runs():
         calls["n"] += 1
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", _count_runs)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", _count_runs)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -734,7 +738,7 @@ def test_concentration_surface_shows_mixed_value_before_edit_for_multi_selection
     def _count_runs():
         calls["n"] += 1
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", _count_runs)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", _count_runs)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -1128,7 +1132,7 @@ def test_species_mode_slider_targets_explicit_edit_rows_not_selected_rows(main_w
     )
 
     calls = {"n": 0}
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: calls.__setitem__("n", calls["n"] + 1))
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -1177,7 +1181,7 @@ def test_concentration_surface_uses_focused_row_as_display_source_when_selection
     def _count_runs():
         calls["n"] += 1
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", _count_runs)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", _count_runs)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -1234,7 +1238,7 @@ def test_species_mode_reset_restores_all_explicit_edit_targets_even_if_only_one_
     def _count_runs():
         calls["n"] += 1
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", _count_runs)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", _count_runs)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -1269,13 +1273,15 @@ def test_species_mode_reset_restores_all_explicit_edit_targets_even_if_only_one_
 def test_species_slider_queue_marks_pending_slider_simulation(main_window, qtbot):
     _set_valid_preview_mechanism(main_window)
     qtbot.addWidget(main_window)
-    assert main_window.simulation_controller.run_state.pending_slider_simulation is False
-    assert main_window.simulation_controller.run_state.pending_slider_sim_request_id is None
+    pending_launch = _pending_slider_preview_launch(main_window)
+    assert pending_launch.active is False
+    assert pending_launch.request_id is None
 
     main_window._queue_species_slider_simulation(label="init:A", delay_ms=500)
 
-    assert main_window.simulation_controller.run_state.pending_slider_simulation is True
-    assert isinstance(main_window.simulation_controller.run_state.pending_slider_sim_request_id, int)
+    pending_launch = _pending_slider_preview_launch(main_window)
+    assert pending_launch.active is True
+    assert isinstance(pending_launch.request_id, int)
     timer = getattr(main_window._preview_session, "_species_slider_update_timer", None)
     assert timer is not None
     assert timer.isActive()
@@ -1416,7 +1422,7 @@ def test_species_mode_attach_uses_unified_transaction_clear_for_reused_set_id(ma
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -1486,7 +1492,7 @@ def test_hiding_species_slider_preserves_hidden_staged_overlays_until_reset(main
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     monkeypatch.setattr(
         main_window,
         "_prompt_slider_transaction_invalidation",
@@ -1552,7 +1558,7 @@ def test_batch_selection_change_with_hidden_overlay_does_not_prompt(main_window,
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     monkeypatch.setattr(
         main_window,
         "_prompt_slider_transaction_invalidation",
@@ -1590,7 +1596,7 @@ def test_species_mode_reset_clears_overlay_derived_explicit_cache_selection_stat
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 
@@ -1648,7 +1654,7 @@ def test_species_mode_reset_preserves_baseline_explicit_cache_selection_state_wh
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 
@@ -1714,7 +1720,7 @@ def test_species_mode_reset_clears_subset_scope_overlay_cache_even_with_unrelate
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     display_calls: list[dict[str, object]] = []
 

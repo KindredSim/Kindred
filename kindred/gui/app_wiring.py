@@ -210,6 +210,7 @@ def build_simulation_plumbing(main_window: MainWindow) -> SimulationPlumbing:
         mechanism_helpers=main_window._mechanism_helpers,
     )
     controller = SimulationController(ui_port, parent=main_window)
+    main_window._preview_session.set_slider_preview_lifecycle_port(controller)
     return SimulationPlumbing(ui_port=ui_port, controller=controller)
 
 

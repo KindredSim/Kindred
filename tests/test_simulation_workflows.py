@@ -268,7 +268,7 @@ def test_species_mode_slider_overlay_commit_and_reset_follow_transaction_boundar
         ]
     )
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     qtbot.addWidget(main_window)
     main_window.show()

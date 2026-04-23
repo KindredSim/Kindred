@@ -171,6 +171,32 @@ def test_main_window_simulation_controller_uses_window_owned_ui_ports(main_windo
     assert ui.mechanism_helpers is main_window._mechanism_helpers
 
 
+def test_main_window_preview_session_uses_bound_lifecycle_port_instead_of_main_window_controller_attr(
+    main_window,
+    monkeypatch,
+) -> None:
+    owner = main_window._preview_session
+    controller = main_window.simulation_controller
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        controller,
+        "launch_pending_slider_preview_replay",
+        lambda: calls.append("launch"),
+    )
+
+    class _PoisonController:
+        def launch_pending_slider_preview_replay(self) -> None:
+            raise AssertionError("Preview session should not launch previews through main_window._sim_controller")
+
+    monkeypatch.setattr(main_window, "_sim_controller", _PoisonController())
+    monkeypatch.setattr(main_window, "is_mechanism_valid_for_preview", lambda: True)
+
+    owner._dispatch_variable_slider_preview_if_valid()
+
+    assert calls == ["launch"]
+
+
 def test_right_panel_exposes_dataset_lookup_without_private_widget_reachthrough(main_window) -> None:
     panel = main_window._right_panel
 

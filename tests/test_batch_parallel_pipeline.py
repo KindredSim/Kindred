@@ -459,7 +459,7 @@ def test_slider_release_timer_uses_persisted_preview_debounce_controls(main_wind
         "init: A=1, B=0, C=0\n"
     )
     main_window._extract_and_populate_variables()
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     preview = main_window._preview_session
     sliders = main_window._mechanism_editor._variable_sliders

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.ports import SliderReplayIntent
 
 pytestmark = pytest.mark.gui
 
@@ -1208,14 +1209,17 @@ def test_preview_run_not_gated_by_validity(main_window, qt_app):
     main_window._force_lock_editor()
     main_window._mechanism_editor.set_reactions_text("this line does not parse", block_signals=True)
     main_window.simulation_controller.run_simulation_internal = MagicMock()
-    main_window.simulation_controller._pending_slider_target_set_ids = ()
-    main_window.simulation_controller._pending_slider_simulation = False
-    main_window.simulation_controller._pending_slider_sim_request_id = None
+    main_window.simulation_controller.submit_slider_preview_replay_intent(
+        SliderReplayIntent(
+            target_set_ids=tuple(main_window._preview_session.effective_slider_edit_target_set_ids()),
+            source="test",
+        ),
+    )
     main_window.simulation_controller._simulation_worker = None
     main_window.simulation_controller._simulation_running = False
     main_window._run_btn.setEnabled(True)
 
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     qt_app.processEvents()
 
     main_window.simulation_controller.run_simulation_internal.assert_called_once()

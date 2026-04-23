@@ -233,7 +233,7 @@ def test_gui_energy_slider_updates_worker_mechanism_text_and_commits_state_netwo
     if timer is not None:
         timer.stop()
 
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     worker_text = main_window.simulation_controller.run_state.simulation_worker._mechanism_text
     assert re.search(r"^state:\s*B,.*\benergy=-5\b", worker_text, flags=re.MULTILINE)
 
@@ -241,7 +241,7 @@ def test_gui_energy_slider_updates_worker_mechanism_text_and_commits_state_netwo
     release_timer = getattr(preview, "_slider_release_commit_timer", None)
     if release_timer is not None:
         release_timer.stop()
-    main_window.simulation_controller.run_state.pending_slider_simulation = False
+    main_window.simulation_controller._pending_slider_simulation = False
     preview._pending_slider_values.clear()
     preview._slider_release_in_progress = False
     preview._slider_release_primary_name = ""
@@ -326,7 +326,7 @@ def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(m
     if timer is not None:
         timer.stop()
 
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     worker_text = main_window.simulation_controller.run_state.simulation_worker._mechanism_text
     m = re.search(
         rf"^state:.*\bname\s*=\s*{re.escape(product)}\b.*\benergy\s*=\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
@@ -340,7 +340,7 @@ def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(m
     release_timer = getattr(preview, "_slider_release_commit_timer", None)
     if release_timer is not None:
         release_timer.stop()
-    main_window.simulation_controller.run_state.pending_slider_simulation = False
+    main_window.simulation_controller._pending_slider_simulation = False
     preview._pending_slider_values.clear()
     preview._slider_release_in_progress = False
     preview._slider_release_primary_name = ""

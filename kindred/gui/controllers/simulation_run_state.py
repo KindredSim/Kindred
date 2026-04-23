@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 from PySide6 import QtCore
@@ -69,7 +69,7 @@ class PreviewOwnershipState:
 
 
 @dataclass(frozen=True, slots=True)
-class DeferredPreviewReplayState:
+class PendingSliderPreviewLaunchState:
     active: bool = False
     request_id: Optional[int] = None
     target_set_ids: tuple[str, ...] = ()
@@ -101,56 +101,12 @@ class SimulationRunState(QtCore.QObject):
         self.progress_flush_timer.setInterval(int(self.progress_flush_interval_ms))
         self.progress_flush_timer.timeout.connect(on_progress_timeout)
         self.slider_simulation_active = False
-        self.deferred_preview_replay = DeferredPreviewReplayState()
+        self.pending_slider_preview_launch = PendingSliderPreviewLaunchState()
         self.run_sequence_id = 0
         self.active_run_id = 0
         self.sim_request_id = 0
         self.latest_sim_request_id = 0
         self.preview_ownership = PreviewOwnershipState()
-
-    @property
-    def pending_slider_simulation(self) -> bool:
-        return bool(self.deferred_preview_replay.active)
-
-    @pending_slider_simulation.setter
-    def pending_slider_simulation(self, value: object) -> None:
-        self.deferred_preview_replay = replace(
-            self.deferred_preview_replay,
-            active=value,
-        )
-
-    @property
-    def pending_slider_sim_request_id(self) -> Optional[int]:
-        return self.deferred_preview_replay.request_id
-
-    @pending_slider_sim_request_id.setter
-    def pending_slider_sim_request_id(self, value: Optional[int]) -> None:
-        self.deferred_preview_replay = replace(
-            self.deferred_preview_replay,
-            request_id=value,
-        )
-
-    @property
-    def pending_slider_target_set_ids(self) -> Tuple[str, ...]:
-        return tuple(self.deferred_preview_replay.target_set_ids)
-
-    @pending_slider_target_set_ids.setter
-    def pending_slider_target_set_ids(self, value: Sequence[str] | object) -> None:
-        self.deferred_preview_replay = replace(
-            self.deferred_preview_replay,
-            target_set_ids=value,
-        )
-
-    @property
-    def pending_slider_handoff_queued(self) -> bool:
-        return bool(self.deferred_preview_replay.handoff_queued)
-
-    @pending_slider_handoff_queued.setter
-    def pending_slider_handoff_queued(self, value: object) -> None:
-        self.deferred_preview_replay = replace(
-            self.deferred_preview_replay,
-            handoff_queued=value,
-        )
 
     def next_request_id(self) -> int:
         self.sim_request_id = int(self.sim_request_id) + 1

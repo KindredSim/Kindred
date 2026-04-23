@@ -58,6 +58,26 @@ def test_simulation_slider_port_exposes_preview_validity_query() -> None:
     assert "def is_mechanism_valid_for_preview(" in slider_block
 
 
+def test_slider_preview_lifecycle_port_is_explicit_and_bounded() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "ports.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    lifecycle_block = _protocol_block(source, "SliderPreviewLifecyclePort")
+
+    expected_methods = {
+        "submit_slider_preview_replay_intent",
+        "clear_pending_slider_preview_replay",
+        "invalidate_slider_preview_work",
+        "launch_pending_slider_preview_replay",
+    }
+    actual_methods = set(re.findall(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\(", lifecycle_block))
+
+    assert actual_methods == expected_methods
+    assert "__getattr__" not in lifecycle_block
+
+
 def test_build_simulation_plumbing_wires_truthful_explicit_owners() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "app_wiring.py"

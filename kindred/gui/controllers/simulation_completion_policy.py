@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from typing import Mapping, Optional
 
 from kindred.gui.controllers.simulation_run_state import (
-    DeferredPreviewReplayState,
+    PendingSliderPreviewLaunchState,
     PreviewOwnershipState,
 )
 
@@ -218,7 +218,7 @@ class RunActivitySnapshot:
         )
 
 
-PendingReplayState = DeferredPreviewReplayState
+PendingReplayState = PendingSliderPreviewLaunchState
 
 
 @dataclass(frozen=True, slots=True)

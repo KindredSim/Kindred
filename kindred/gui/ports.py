@@ -4,6 +4,49 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Set, Tuple
 
 
+def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if isinstance(values, str):
+        values = (values,)
+    for value in values or ():
+        set_id = str(value or "").strip()
+        if not set_id or set_id in seen:
+            continue
+        seen.add(set_id)
+        normalized.append(set_id)
+    return tuple(normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class SliderReplayIntent:
+    target_set_ids: tuple[str, ...] = ()
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "target_set_ids",
+            _normalize_slider_replay_target_set_ids(self.target_set_ids),
+        )
+        object.__setattr__(self, "source", str(self.source or "").strip())
+
+
+class SliderPreviewLifecyclePort(Protocol):
+    def submit_slider_preview_replay_intent(
+        self,
+        intent: SliderReplayIntent,
+        *,
+        preserve_existing_request: bool = False,
+    ) -> None: ...
+
+    def clear_pending_slider_preview_replay(self, *, clear_plot_updates: bool = True) -> None: ...
+
+    def invalidate_slider_preview_work(self) -> None: ...
+
+    def launch_pending_slider_preview_replay(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class SimulationCacheOpResult:
     ok: bool

@@ -11,6 +11,7 @@ import kindred.core.simulator.dsl as dsl
 from kindred.core.simulation_preparation import BoundMechanism
 from kindred.gui.controllers.simulation_controller import build_fallback_cache_key
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
+from kindred.gui.ports import SliderReplayIntent
 from tests.worker_stubs import make_simulation_worker_stub
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
@@ -85,6 +86,13 @@ def _set_edit_target_rows(main_window, rows: list[int]) -> None:
     set_ids = [str(main_window._batch_set_id_for_row(int(row)) or "") for row in rows]
     main_window.set_slider_edit_target_set_ids([set_id for set_id in set_ids if set_id])
 
+def _ensure_batch_rows(main_window, count: int) -> None:
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    while int(main_window._batch_store.row_count()) < int(count):
+        add_btn.click()
+        QtWidgets.QApplication.processEvents()
+
 def _parameter_table_numeric_value(main_window, name: str) -> float:
     table = main_window.main_plot().parameter_table()
     for row in range(table.rowCount()):
@@ -112,6 +120,10 @@ def _current_preview_time_axis(main_window) -> np.ndarray:
     )
     grid_n = int((solver_config.get("grid") or {}).get("N") or 0)
     return np.linspace(0.0, float(t_end), max(2, grid_n), dtype=float)
+
+
+def _pending_slider_preview_launch(main_window):
+    return main_window.simulation_controller.run_state.pending_slider_preview_launch
 
 def test_slider_changes_use_precompiled_rhs(main_window, monkeypatch):
     """Repeated slider runs should reuse a compiled mechanism instead of re-parsing."""
@@ -147,12 +159,15 @@ def test_slider_changes_use_precompiled_rhs(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "A -> B ; k=1.0"
     )
-    main_window._preview_session.stage_slider_value("k1", 1.0)
+    main_window._preview_session.commit_slider_value("k1", 1.0)
+    main_window._preview_session.stop_variable_update_timer()
 
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     QtWidgets.QApplication.processEvents()
     parse_after_first = parse_calls
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window._preview_session.commit_slider_value("k1", 1.0)
+    main_window._preview_session.stop_variable_update_timer()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     QtWidgets.QApplication.processEvents()
 
     assert parse_after_first >= 1, "first slider run should parse the DSL"
@@ -190,8 +205,9 @@ def test_slider_binding_updates_across_changes(main_window, monkeypatch):
     )
 
     for value in (1.0, 0.45, 0.12):
-        main_window._preview_session.stage_slider_value("k1", value)
-        main_window.simulation_controller.run_simulation_from_slider()
+        main_window._preview_session.commit_slider_value("k1", value)
+        main_window._preview_session.stop_variable_update_timer()
+        main_window.simulation_controller.launch_pending_slider_preview_replay()
         QtWidgets.QApplication.processEvents()
 
     assert seen_rates == [1.0, 0.45, 0.12]
@@ -343,7 +359,7 @@ def test_scalar_param_slider_updates_existing_param_in_reactions_algebra(main_wi
         + "\n"
     )
     main_window._mechanism_editor._notes_text.setPlainText("keep this note\n")
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     # Mark `a` as a scalar so the slider commit path routes through `_update_scalar_param_in_algebra`.
     main_window.set_variable_metadata({"a": {"type": "scalar"}})
@@ -380,7 +396,7 @@ def test_scalar_param_slider_commit_uses_authoritative_parameter_precision(main_
         )
         + "\n"
     )
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     main_window.set_variable_metadata({"a": {"type": "scalar"}})
 
     main_window._commit_slider_value("a", 1000000.1234567)
@@ -404,7 +420,7 @@ def test_scalar_param_slider_updates_existing_param_without_header(main_window, 
         + "\n"
     )
     main_window._mechanism_editor._notes_text.setPlainText("keep this note\n")
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     main_window.set_variable_metadata({"a": {"type": "scalar"}})
 
     main_window._commit_slider_value("a", 0.331131)
@@ -438,7 +454,7 @@ def test_slider_release_does_not_commit_dsl_in_override_mode(main_window, qtbot,
     assert sliders.has_variable("Keq1")
 
     # Prevent background simulation from running in this test.
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     baseline_text = main_window._mechanism_editor._reactions_text.toPlainText()
 
     commits: list[tuple[str, float]] = []
@@ -472,7 +488,7 @@ def test_direct_commit_slider_value_materializes_authoritative_text_and_clears_w
 
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "run_simulation_from_slider",
+        "launch_pending_slider_preview_replay",
         lambda: (_ for _ in ()).throw(AssertionError("direct authoritative slider commit queued preview rerun")),
     )
 
@@ -489,7 +505,7 @@ def test_direct_commit_slider_value_materializes_authoritative_text_and_clears_w
     assert preview.has_local_mechanism_workspaces() is False
     assert preview.slider_overrides() == {}
     assert main_window._mechanism_editor._variable_sliders.get_variables()["k1"] == pytest.approx(2.0)
-    assert main_window.simulation_controller.run_state.pending_slider_simulation is False
+    assert _pending_slider_preview_launch(main_window).active is False
 
 def test_direct_commit_slider_value_preserves_other_focused_workspace_overrides(
     main_window,
@@ -510,7 +526,7 @@ def test_direct_commit_slider_value_preserves_other_focused_workspace_overrides(
 
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "run_simulation_from_slider",
+        "launch_pending_slider_preview_replay",
         lambda: (_ for _ in ()).throw(AssertionError("direct authoritative slider commit queued preview rerun")),
     )
 
@@ -567,7 +583,7 @@ def test_direct_scalar_commit_with_colliding_name_preserves_workspace_without_re
 
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "run_simulation_from_slider",
+        "launch_pending_slider_preview_replay",
         lambda: (_ for _ in ()).throw(AssertionError("direct authoritative slider commit queued preview rerun")),
     )
 
@@ -689,7 +705,7 @@ def test_commit_and_reset_buttons_control_dsl_overrides(main_window, qtbot, monk
     main_window._extract_and_populate_variables()
 
     # Avoid background simulation from running in this test.
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     sliders = main_window._mechanism_editor._variable_sliders
     assert sliders.has_variable("k1")
@@ -744,7 +760,7 @@ def test_commit_and_reset_preserve_mixed_visible_slider_selection(main_window, q
     sel.select(model.index(0, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
     main_window._extract_and_populate_variables()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -816,7 +832,7 @@ def test_unified_slider_surface_picker_hides_dirty_mechanism_without_clearing_tr
     sel.select(model.index(0, 0), QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
     main_window._extract_and_populate_variables()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     qtbot.addWidget(main_window)
     main_window.show()
@@ -1152,7 +1168,7 @@ def test_template_load_dirty_slider_discard_does_not_trigger_stale_preview_run(m
     slider_runs: list[str] = []
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "run_simulation_from_slider",
+        "launch_pending_slider_preview_replay",
         lambda: slider_runs.append("run"),
     )
     monkeypatch.setattr(
@@ -1174,7 +1190,7 @@ def test_template_load_dirty_slider_commit_records_post_commit_undo_baseline(mai
 
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "run_simulation_from_slider",
+        "launch_pending_slider_preview_replay",
         lambda: None,
     )
     monkeypatch.setattr(
@@ -1221,7 +1237,7 @@ def test_release_does_not_recompute_K_when_editing_kr_with_explicit_K(main_windo
     assert sliders.has_variable("kr1")
 
     # Prevent background simulation from running in this test.
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     # Capture the initial K value (should remain stable through a kr edit).
     initial_K = float(sliders.get_variables().get("Keq1"))
@@ -1305,7 +1321,7 @@ def test_slider_release_never_auto_commits_with_queued_changes(main_window, qtbo
     )
     main_window._extract_and_populate_variables()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     commits: list[tuple[str, float]] = []
 
@@ -1441,7 +1457,7 @@ def test_reset_slider_overrides_ends_live_drag(main_window, monkeypatch):
     assert sliders.has_variable("k1")
 
     # Avoid background simulation from running in this test.
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     monkeypatch.setattr(main_window.simulation_controller, "run_simulation", lambda: None)
 
     main_window._on_slider_drag_started("k1")
@@ -1457,22 +1473,22 @@ def test_reset_slider_overrides_clears_pending_preview_request_without_forcing_r
     )
     main_window._extract_and_populate_variables()
     main_window._preview_session.stage_slider_value("k1", 2.0)
-    main_window.simulation_controller.run_state.pending_slider_sim_request_id = 99
+    main_window.simulation_controller._pending_slider_sim_request_id = 99
 
     reruns: list[str] = []
     observed_request_ids: list[object] = []
 
     def _record_rerun() -> None:
-        observed_request_ids.append(main_window.simulation_controller.run_state.pending_slider_sim_request_id)
+        observed_request_ids.append(main_window.simulation_controller._pending_slider_sim_request_id)
         reruns.append("run")
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", _record_rerun)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", _record_rerun)
 
     main_window._on_reset_slider_overrides_clicked()
 
     assert reruns == []
     assert observed_request_ids == []
-    assert main_window.simulation_controller.run_state.pending_slider_sim_request_id is None
+    assert main_window.simulation_controller._pending_slider_sim_request_id is None
 
 def test_reset_slider_overrides_clears_all_selected_parameter_workspaces(main_window, monkeypatch, qt_app):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1493,7 +1509,7 @@ def test_reset_slider_overrides_clears_all_selected_parameter_workspaces(main_wi
     _set_edit_target_rows(main_window, [0, 1])
     qt_app.processEvents()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
     monkeypatch.setattr(main_window.simulation_controller, "run_simulation", lambda: None)
 
     main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
@@ -1511,6 +1527,250 @@ def test_reset_slider_overrides_clears_all_selected_parameter_workspaces(main_wi
     for set_id in selected_ids[:2]:
         assert main_window._preview_session.local_mechanism_workspace(set_id) == {}
         assert main_window._preview_session.effective_slider_values_for_set(set_id) == {"k1": pytest.approx(1.0)}
+
+def test_reset_slider_overrides_overlay_replay_uses_preview_session_intent_not_controller_pending_scope(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 3)
+    qt_app.processEvents()
+
+    for row, value in enumerate((1.0, 2.0, 3.0)):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), f"{value:.1f}")
+
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    set2_id = str(main_window.batch_set_id_for_row(2) or "")
+    assert set0_id and set2_id
+
+    _select_batch_rows(main_window, [2])
+    _set_edit_target_rows(main_window, [2])
+    qt_app.processEvents()
+
+    owner = main_window._preview_session
+    assert owner.stage_concentration_value_for_rows([2], species="A", value=4.0) is True
+    assert owner.current_slider_replay_intent() is not None
+    assert owner.current_slider_replay_intent().target_set_ids == (set2_id,)
+
+    main_window.simulation_controller.queue_pending_slider_preview_replay(
+        target_set_ids=(set0_id,),
+        request_id=9,
+    )
+
+    captured_targets: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_run_simulation_from_slider",
+        lambda: captured_targets.append(tuple(main_window.simulation_controller._pending_slider_target_set_ids)),
+        raising=True,
+    )
+
+    main_window._on_reset_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert captured_targets == [(set2_id,)]
+
+def test_reset_slider_overrides_overlay_replay_falls_back_to_overlay_scope_when_intent_cleared(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 3)
+    qt_app.processEvents()
+
+    for row, value in enumerate((1.0, 2.0, 3.0)):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), f"{value:.1f}")
+
+    owner = main_window._preview_session
+    set1_id = str(main_window.batch_set_id_for_row(1) or "")
+    assert set1_id
+
+    _select_batch_rows(main_window, [1])
+    qt_app.processEvents()
+
+    assert owner.stage_concentration_value_for_rows([1], species="A", value=5.0) is True
+    owner._current_slider_replay_intent = None
+
+    captured_targets: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_run_simulation_from_slider",
+        lambda: captured_targets.append(tuple(main_window.simulation_controller._pending_slider_target_set_ids)),
+        raising=True,
+    )
+
+    main_window._on_reset_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert captured_targets == [(set1_id,)]
+
+def test_reset_slider_overrides_overlay_replay_noops_without_gui_owned_intent_or_overlay_scope(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 2)
+    qt_app.processEvents()
+
+    for row, value in enumerate((1.0, 2.0)):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), f"{value:.1f}")
+
+    owner = main_window._preview_session
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    assert owner.stage_concentration_value_for_rows([0], species="A", value=4.5) is True
+    owner._staged_concentration_overlays_by_set_id.clear()
+    owner._current_slider_replay_intent = None
+
+    captured_targets: list[tuple[str, ...]] = []
+    refresh_calls = {"count": 0}
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_batch_display_from_focus_and_shown",
+        lambda: refresh_calls.__setitem__("count", refresh_calls["count"] + 1),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_run_simulation_from_slider",
+        lambda: captured_targets.append(tuple(main_window.simulation_controller._pending_slider_target_set_ids)),
+        raising=True,
+    )
+
+    main_window._on_reset_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert captured_targets == []
+    pending_launch = _pending_slider_preview_launch(main_window)
+    assert pending_launch.active is False
+    assert pending_launch.target_set_ids == ()
+    assert refresh_calls["count"] == 1
+
+
+def test_reset_slider_overrides_overlay_replay_prefers_current_overlay_scope_over_variable_slider_intent(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 3)
+    qt_app.processEvents()
+
+    for row, value in enumerate((1.0, 2.0, 3.0)):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), f"{value:.1f}")
+
+    owner = main_window._preview_session
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    set2_id = str(main_window.batch_set_id_for_row(2) or "")
+    assert set0_id and set2_id
+
+    _select_batch_rows(main_window, [2])
+    _set_edit_target_rows(main_window, [2])
+    qt_app.processEvents()
+    assert owner.stage_concentration_value_for_rows([2], species="A", value=4.0) is True
+
+    conflicting_intent = owner.build_slider_replay_intent(
+        set_ids=[set0_id],
+        source="variable_slider",
+    )
+    owner.submit_slider_replay_intent(conflicting_intent)
+    assert owner.current_slider_replay_intent() is not None
+    assert owner.current_slider_replay_intent().target_set_ids == (set0_id,)
+
+    captured_targets: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_run_simulation_from_slider",
+        lambda: captured_targets.append(tuple(main_window.simulation_controller._pending_slider_target_set_ids)),
+        raising=True,
+    )
+
+    main_window._on_reset_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert captured_targets == [(set2_id,)]
+
+
+def test_reset_slider_overrides_overlay_replay_tracks_remaining_overlay_scope_after_discard(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 3)
+    qt_app.processEvents()
+
+    for row, value in enumerate((1.0, 2.0, 3.0)):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), f"{value:.1f}")
+
+    owner = main_window._preview_session
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    set2_id = str(main_window.batch_set_id_for_row(2) or "")
+    assert set0_id and set2_id
+
+    _select_batch_rows(main_window, [0, 2])
+    _set_edit_target_rows(main_window, [0, 2])
+    qt_app.processEvents()
+
+    assert owner.stage_concentration_value_for_rows([0], species="A", value=4.0) is True
+    assert owner.stage_concentration_value_for_rows([2], species="A", value=5.0) is True
+    assert owner.discard_concentration_overlays_for_set_ids([set2_id]) is True
+
+    captured_targets: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_run_simulation_from_slider",
+        lambda: captured_targets.append(tuple(main_window.simulation_controller._pending_slider_target_set_ids)),
+        raising=True,
+    )
+
+    main_window._on_reset_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert captured_targets == [(set0_id,)]
+
+
+def test_reset_slider_overrides_overlay_replay_includes_dirty_parameter_workspace_scope(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 3)
+    qt_app.processEvents()
+
+    for row, value in enumerate((1.0, 2.0, 3.0)):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), f"{value:.1f}")
+
+    owner = main_window._preview_session
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    set2_id = str(main_window.batch_set_id_for_row(2) or "")
+    assert set0_id and set2_id
+
+    owner.stage_slider_value("k1", 2.0, target_set_ids=[set0_id])
+    assert owner.local_mechanism_workspace(set0_id) == {"k1": pytest.approx(2.0)}
+
+    _select_batch_rows(main_window, [2])
+    _set_edit_target_rows(main_window, [2])
+    qt_app.processEvents()
+    assert owner.stage_concentration_value_for_rows([2], species="A", value=4.0) is True
+
+    captured_targets: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_run_simulation_from_slider",
+        lambda: captured_targets.append(tuple(main_window.simulation_controller._pending_slider_target_set_ids)),
+        raising=True,
+    )
+
+    main_window._on_reset_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert len(captured_targets) == 1
+    assert set(captured_targets[0]) == {set0_id, set2_id}
 
 def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_request_without_advancing_latest(
     main_window, qt_app
@@ -1531,14 +1791,14 @@ def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_re
     main_window._on_variable_changed("k1", 2.0)
     qt_app.processEvents()
 
-    first_reserved = controller.run_state.pending_slider_sim_request_id
+    first_reserved = controller._pending_slider_sim_request_id
     assert first_reserved == 6
     assert controller.run_state.latest_sim_request_id == 5
 
     main_window._on_variable_changed("k1", 3.0)
     qt_app.processEvents()
 
-    assert controller.run_state.pending_slider_sim_request_id == 6
+    assert controller._pending_slider_sim_request_id == 6
     assert controller.run_state.latest_sim_request_id == 5
     main_window._preview_session.stop_variable_update_timer()
 
@@ -1564,21 +1824,21 @@ def test_parameter_slider_change_after_invalidated_serial_fast_preview_reserves_
     controller.batch_run_context = {}
     controller.run_state.sim_request_id = 5
     controller.run_state.latest_sim_request_id = 5
-    controller.run_state.pending_slider_sim_request_id = 5
+    controller._pending_slider_sim_request_id = 5
     controller.run_state.simulation_running = True
     controller.run_state.slider_simulation_active = True
 
     controller.invalidate_slider_preview_work()
 
     assert controller.run_state.latest_sim_request_id == 6
-    assert controller.run_state.pending_slider_sim_request_id == 5
+    assert controller._pending_slider_sim_request_id is None
     assert controller.run_state.simulation_running is False
     assert controller.run_state.slider_simulation_active is False
 
     main_window._on_variable_changed("k1", 2.0)
     qt_app.processEvents()
 
-    assert controller.run_state.pending_slider_sim_request_id == 7
+    assert controller._pending_slider_sim_request_id == 7
     assert controller.run_state.latest_sim_request_id == 6
     controller._simulation_worker = None
     worker._fast_mode = False
@@ -1776,7 +2036,7 @@ def test_K_slider_uses_longer_debounce_than_other_params(main_window, qtbot, mon
     main_window._extract_and_populate_variables()
 
     # Prevent an actual run; we're only inspecting the timer configuration.
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     sliders = main_window._mechanism_editor._variable_sliders
     preview = main_window._preview_session
@@ -1807,7 +2067,7 @@ def test_slider_preview_debounce_settings_drive_parameter_and_K_timers(main_wind
     )
     main_window._extract_and_populate_variables()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     sliders = main_window._mechanism_editor._variable_sliders
     preview = main_window._preview_session
@@ -1943,8 +2203,9 @@ def test_stale_slider_worker_completion_does_not_override_latest(main_window, mo
     qtbot.waitUntil(lambda: len(workers) >= 1, timeout=1000)
     worker1 = workers[-1]
 
-    rid2 = main_window.simulation_controller.next_sim_request_id()
-    main_window.simulation_controller.run_simulation_internal(fast_mode=True, request_id=int(rid2))
+    main_window._preview_session.commit_slider_value("kf1", 2.0)
+    main_window._preview_session.stop_variable_update_timer()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     assert len(workers) == 1  # latest-only: no new worker while fast run in flight
 
     payload1 = {
@@ -2084,7 +2345,7 @@ def test_selection_change_without_display_retargets_next_slider_edit_to_focused_
     add_btn.click()
     qt_app.processEvents()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     sliders = main_window._mechanism_editor._variable_sliders
     _select_batch_rows(main_window, [0])
@@ -2150,7 +2411,7 @@ def test_multiselect_workspace_retains_staged_values_after_switching_to_fresh_se
     add_btn.click()
     qt_app.processEvents()
 
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     sliders = main_window._mechanism_editor._variable_sliders
     _select_batch_rows(main_window, [0, 1])
@@ -2561,7 +2822,7 @@ def test_commit_does_not_preserve_older_active_preview_when_dirty_state_has_adva
     )
 
     main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[set_id])
-    main_window._sim_controller.run_state.pending_slider_simulation = False
+    main_window._sim_controller._pending_slider_simulation = False
     assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
 
     main_window._on_commit_slider_overrides_clicked()
@@ -2632,7 +2893,7 @@ def test_single_set_stale_preview_cache_display_returns_false_and_defers_to_prev
     cache.active_preview_scope_set_ids = (set_id,)
 
     main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[set_id])
-    main_window._sim_controller.run_state.pending_slider_simulation = False
+    main_window._sim_controller._pending_slider_simulation = False
     assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
 
     assert (
@@ -2741,7 +3002,7 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
     )
 
     assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=3.5) is True
-    main_window._sim_controller.run_state.pending_slider_simulation = False
+    main_window._sim_controller._pending_slider_simulation = False
     assert main_window._matching_preview_entry_for_workspace_set(set_id=secondary_set_id).entry is None
     assert main_window._matching_preview_entry_for_workspace_set(set_id=primary_set_id).entry is not None
 
@@ -3814,6 +4075,85 @@ def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_s
     assert panel._rows["A"].value_label.text() == "1.000"
 
 
+def test_run_selected_completion_preserves_surviving_pending_slider_replay_after_targeted_reset(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    _ensure_batch_rows(main_window, 2)
+
+    owner = main_window._preview_session
+    controller = main_window.simulation_controller
+    owner.sync_committed_slider_values({"k1": 1.0})
+
+    _select_batch_rows(main_window, [0])
+    _set_edit_target_rows(main_window, [0])
+    qt_app.processEvents()
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    set1_id = str(main_window.batch_set_id_for_row(1) or "")
+    assert set0_id
+    assert set1_id
+
+    owner.stage_slider_value("k1", 2.0, target_set_ids=[set0_id])
+
+    monkeypatch.setattr(controller, "_start_next_batch_simulation", lambda: None, raising=True)
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller.run_simulation_internal(fast_mode=False)
+    ctx = dict(controller._batch_run_context or {})
+    assert ctx.get("pending_workspace_reset_set_ids") == [set0_id]
+
+    intent = owner.build_slider_replay_intent(set_ids=[set1_id], source="variable_slider")
+    assert intent is not None
+    owner.submit_slider_replay_intent(intent, preserve_existing_request=True)
+    pending_before = controller.run_state.pending_slider_preview_launch
+    assert pending_before.active is True
+    assert pending_before.target_set_ids == (set1_id,)
+
+    mechanism_text_by_set_id = dict(ctx.get("mechanism_text_by_set_id") or {})
+    result = {
+        "t": np.linspace(0.0, 1.0, 3),
+        "Y": np.asarray([[1.0, 0.5, 0.1], [0.0, 0.5, 0.9]], dtype=float),
+        "species_names": ["A", "B"],
+        "mechanism": None,
+        "mechanism_text": str(mechanism_text_by_set_id.get(set0_id) or ""),
+        "solver_config": {"solver": "Radau", "temperature_K": 298.15},
+        "algebra_scalars": {},
+        "algebra_errors": [],
+        "fallback_occurred": False,
+        "fallback_message": None,
+    }
+
+    controller._on_simulation_complete(
+        result,
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=int(ctx.get("request_id") or 0),
+        batch_set=str(main_window.batch_set_name_for_id(set0_id) or ""),
+        batch_set_id=set0_id,
+        cache_key=str(ctx.get("cache_key") or ""),
+    )
+
+    pending_after = controller.run_state.pending_slider_preview_launch
+    assert pending_after.active is True
+    assert pending_after.target_set_ids == (set1_id,)
+    assert pending_after.handoff_queued is True
+    assert owner.current_slider_replay_intent() == SliderReplayIntent(
+        target_set_ids=(set1_id,),
+        source="variable_slider",
+    )
+    assert any(
+        getattr(callback, "__self__", None) is controller
+        and getattr(callback, "__func__", None) is type(controller)._run_simulation_from_slider
+        for callback in scheduled
+    )
+
+
 def test_run_selected_after_slider_gesture_does_not_replay_fast_preview(
     main_window,
     qtbot,
@@ -3866,7 +4206,7 @@ def test_run_selected_after_slider_gesture_does_not_replay_fast_preview(
     sliders = main_window._mechanism_editor._variable_sliders
     sliders.update_variable("k1", 2.0)
     main_window._on_variable_changed("k1", 2.0)
-    qtbot.waitUntil(lambda: bool(main_window.simulation_controller.run_state.pending_slider_simulation), timeout=1000)
+    qtbot.waitUntil(lambda: bool(main_window.simulation_controller._pending_slider_simulation), timeout=1000)
 
     display_lengths.clear()
     main_window.simulation_controller._run_simulation()

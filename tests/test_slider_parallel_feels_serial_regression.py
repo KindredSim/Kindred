@@ -72,11 +72,11 @@ def _prime_three_batch_sets(main_window) -> list[str]:
 
 
 def _queue_slider_run(main_window) -> None:
-    main_window.simulation_controller.run_state.pending_slider_sim_request_id = (
-        main_window.simulation_controller.next_sim_request_id()
+    main_window.simulation_controller.queue_pending_slider_preview_replay(
+        target_set_ids=main_window._batch_set_ids_for_scope("selected"),
+        request_id=main_window.simulation_controller.next_sim_request_id(),
     )
-    main_window.simulation_controller.run_state.pending_slider_simulation = True
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
 
 
 def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:

@@ -493,7 +493,7 @@ def test_selection_change_keeps_plot_and_mechanism_controls_on_same_set(main_win
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
         raising=True,
     )
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     _select_rows(main_window, [0])
     qt_app.processEvents()
@@ -576,7 +576,7 @@ def test_selection_change_no_display_branch_clears_plot_and_retargets_controls(
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
         raising=True,
     )
-    monkeypatch.setattr(main_window.simulation_controller, "run_simulation_from_slider", lambda: None)
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
 
     _select_rows(main_window, [0])
     qt_app.processEvents()
@@ -1788,7 +1788,7 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
     main_window._on_slider_drag_started("k1")
     main_window._on_variable_changed("k1", 2.0)
     main_window._preview_session.stop_variable_update_timer()
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     qt_app.processEvents()
 
     assert main_window.simulation_controller.parallel_batch.executor is fake
@@ -1878,7 +1878,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     main_window._on_slider_drag_started("k1")
     main_window._on_variable_changed("k1", 2.0)
     main_window._preview_session.stop_variable_update_timer()
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     qt_app.processEvents()
 
     assert main_window.simulation_controller.parallel_batch.executor is fake
@@ -1887,7 +1887,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
 
     main_window._on_variable_changed("k1", 3.0)
     main_window._preview_session.stop_variable_update_timer()
-    main_window.simulation_controller.run_simulation_from_slider()
+    main_window.simulation_controller.launch_pending_slider_preview_replay()
     qt_app.processEvents()
 
     simulation_submissions = _simulation_submissions(fake)

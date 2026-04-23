@@ -3271,7 +3271,8 @@ class MainWindow(
             return None
 
         run_state = getattr(getattr(self, "_sim_controller", None), "run_state", None)
-        if bool(getattr(run_state, "pending_slider_simulation", False)):
+        pending_launch = getattr(run_state, "pending_slider_preview_launch", None)
+        if bool(getattr(pending_launch, "active", False)):
             return None
 
         current_t_raw = getattr(plot, "_t", None)
@@ -7775,7 +7776,7 @@ class MainWindow(
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
         self._materialize_direct_slider_commit_to_authoritative_editors(name, value)
-        self._preview_session.commit_current_mechanism_workspace()
+        self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
         self._sync_after_authoritative_slider_materialization()
 
     def _on_slider_drag_started(self, name: str) -> None:
@@ -7988,7 +7989,7 @@ class MainWindow(
         )
         if bool(apply_species_overlays):
             self._commit_species_slider_values_to_selected_batch_rows()
-        self._preview_session.commit_current_mechanism_workspace()
+        self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
         self._sync_after_authoritative_slider_materialization(
             preserve_current_display=preserve_current_display
         )
@@ -8055,6 +8056,7 @@ class MainWindow(
     def _on_reset_slider_overrides_clicked(self) -> None:
         """Reset slider overrides back to the baseline DSL values and refresh slider widgets."""
         if bool(self._preview_session.has_staged_concentration_overlays()):
+            replay_intent = self._preview_session.capture_reset_slider_replay_intent()
             self._discard_slider_transaction_for_invalidation()
         else:
             self._sim_controller.invalidate_slider_preview_work()
@@ -8090,7 +8092,11 @@ class MainWindow(
             self._refresh_batch_display_from_focus_and_shown()
             return
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-        self._sim_controller.run_simulation_from_slider()
+        if replay_intent is not None:
+            self._preview_session.submit_slider_replay_intent(replay_intent)
+            self._sim_controller.launch_pending_slider_preview_replay()
+        else:
+            self._refresh_batch_display_from_focus_and_shown()
 
     def _discard_slider_transaction_for_invalidation(self) -> None:
         """Clear the staged transaction without scheduling a preview rerun."""
@@ -8117,7 +8123,7 @@ class MainWindow(
             if row_count > 0:
                 current_overlay_token = self._preview_session.preview_batch_cache_token(list(range(int(row_count)))) or None
         self._sim_controller.invalidate_slider_preview_work()
-        self._preview_session.clear_working_transaction()
+        self._preview_session.clear_working_transaction(invalidate_preview_work=False)
         if current_overlay_token and active_overlay_token == str(current_overlay_token):
             batch_cache.clear_active_selection_state()
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)

@@ -6,6 +6,8 @@ import shiboken6
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
+from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
+from kindred.gui.ports import SliderReplayIntent
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 pytestmark = pytest.mark.gui
@@ -20,6 +22,50 @@ def _load_project_via_file_dialog(main_window, tmp_path, monkeypatch, payload) -
         lambda *args, **kwargs: (str(project_path), "Kindred Project (*.kin)"),
     )
     main_window.project_controller.load_project()
+
+
+def _arm_pending_preview_state(main_window) -> tuple[str, int]:
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    table = main_window._batch_table
+    model = main_window._batch_model
+    selection = table.selectionModel()
+    index = model.index(0, 0)
+    table.setCurrentIndex(index)
+    selection.clearSelection()
+    selection.select(index, QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+
+    owner = main_window._preview_session
+    controller = main_window.simulation_controller
+    set0_id = str(main_window.batch_set_id_for_row(0) or "")
+    assert set0_id
+
+    owner.sync_committed_slider_values({"k1": 1.0})
+    owner.stage_slider_value("k1", 2.0, target_set_ids=[set0_id])
+    owner.submit_slider_replay_intent(
+        SliderReplayIntent(target_set_ids=(set0_id,), source="variable_slider"),
+        preserve_existing_request=True,
+    )
+
+    request_id = controller.run_state.pending_slider_preview_launch.request_id
+    assert request_id is not None
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=int(request_id),
+        epoch=1,
+        target_set_ids=(set0_id,),
+    )
+    controller._active_run_id = 11
+    controller._latest_sim_request_id = int(request_id)
+    controller._queue_slider_plot_update(
+        set_id=set0_id,
+        cache_key="project-apply-pending-preview-cache",
+        request_id=int(request_id),
+        run_id=11,
+        slider_triggered=True,
+    )
+    return set0_id, int(request_id)
 
 
 def test_set_status_text_only_updates_label(main_window):
@@ -850,6 +896,30 @@ def test_spinbox_during_project_apply_does_not_update_user_preferences(main_wind
     # User preferences unchanged
     assert main_window.config_controller._user_preferences["temperature_K"] == pytest.approx(original_temp)
     assert main_window.config_controller._user_preferences["num_points"] == original_points
+
+
+def test_reset_project_apply_dirty_session_state_clears_pending_preview_state_without_display_state(main_window):
+    controller = main_window.simulation_controller
+    set0_id, request_id = _arm_pending_preview_state(main_window)
+
+    assert main_window.main_plot_has_data() is False
+    assert controller.run_state.pending_slider_preview_launch.active is True
+    assert controller.run_state.preview_ownership.request_id == request_id
+    assert controller._plot_coalescer.pending.set_ids == {set0_id}
+
+    main_window._reset_project_apply_dirty_session_state()
+
+    pending_launch = controller.run_state.pending_slider_preview_launch
+    assert pending_launch.active is False
+    assert pending_launch.request_id is None
+    assert pending_launch.target_set_ids == ()
+    ownership = controller.run_state.preview_ownership
+    assert ownership.request_id is None
+    assert ownership.target_set_ids == ()
+    queued_plot = controller._plot_coalescer.pending
+    assert queued_plot.set_ids == set()
+    assert queued_plot.request_id is None
+    assert queued_plot.cache_key is None
 
 
 def test_solver_combo_change_persists_to_qsettings(main_window):

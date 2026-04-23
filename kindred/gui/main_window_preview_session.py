@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Sequence
 from PySide6 import QtCore
 
 from kindred.core.document_parameter_store import DocumentParameterStore
+from kindred.gui.ports import SliderPreviewLifecyclePort, SliderReplayIntent
 
 if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
@@ -46,6 +47,9 @@ class MainWindowPreviewSession:
         self._variable_update_timer = None
         self._species_slider_update_timer = None
         self._slider_release_commit_timer = None
+        self._current_slider_replay_intent: Optional[SliderReplayIntent] = None
+        self._last_submitted_slider_replay_intent: Optional[SliderReplayIntent] = None
+        self._slider_preview_lifecycle_port: Optional[SliderPreviewLifecyclePort] = None
 
     @property
     def param_store(self) -> DocumentParameterStore:
@@ -60,6 +64,15 @@ class MainWindowPreviewSession:
 
     def clear_pending_slider_values(self) -> None:
         self._pending_slider_values.clear()
+
+    def set_slider_preview_lifecycle_port(self, port: SliderPreviewLifecyclePort) -> None:
+        self._slider_preview_lifecycle_port = port
+
+    def _require_slider_preview_lifecycle_port(self) -> SliderPreviewLifecyclePort:
+        port = self._slider_preview_lifecycle_port
+        if port is None:
+            raise RuntimeError("Slider preview lifecycle port is not bound.")
+        return port
 
     def _refresh_transaction_button_state(self) -> None:
         mw = self._mw
@@ -208,6 +221,7 @@ class MainWindowPreviewSession:
             return False
         self._bump_dirty_state_generation([set_id])
         self.reset_preview_state()
+        self._require_slider_preview_lifecycle_port().invalidate_slider_preview_work()
         self._refresh_transaction_button_state()
         return True
 
@@ -226,11 +240,11 @@ class MainWindowPreviewSession:
         if not changed:
             return False
         self._bump_dirty_state_generation(cleared_set_ids)
-        self.reset_preview_state()
+        self._prune_targeted_preview_state_for_reset(cleared_set_ids)
         self._refresh_transaction_button_state()
         return True
 
-    def commit_current_mechanism_workspace(self) -> dict[str, float]:
+    def commit_current_mechanism_workspace(self, *, invalidate_preview_work: bool = True) -> dict[str, float]:
         focused_set_id = self._focused_mechanism_workspace_set_id()
         result = self._param_store.commit_effective_as_shared(
             focused_set_id
@@ -238,11 +252,246 @@ class MainWindowPreviewSession:
         if focused_set_id:
             self._bump_dirty_state_generation([focused_set_id])
         self.reset_preview_state()
+        if invalidate_preview_work:
+            self._require_slider_preview_lifecycle_port().invalidate_slider_preview_work()
         self._refresh_transaction_button_state()
         return result
 
     def slider_gesture_target_set_ids_snapshot(self) -> list[str]:
         return [str(set_id) for set_id in self._slider_gesture_target_set_ids_snapshot]
+
+    def current_slider_replay_intent(self) -> Optional[SliderReplayIntent]:
+        intent = self._current_slider_replay_intent
+        return intent if isinstance(intent, SliderReplayIntent) else None
+
+    def _stop_preview_timer(self, timer_attr: str) -> None:
+        timer = getattr(self, timer_attr, None)
+        try:
+            if timer is not None and timer.isActive():
+                timer.stop()
+        except RuntimeError as exc:
+            logger.debug("Timer %s was invalid while pruning preview state: %s", timer_attr, exc, exc_info=True)
+            setattr(self, timer_attr, None)
+
+    def _pruned_slider_replay_intent_for_reset(
+        self,
+        intent: Optional[SliderReplayIntent],
+        *,
+        cleared_set_ids: set[str],
+    ) -> Optional[SliderReplayIntent]:
+        if not isinstance(intent, SliderReplayIntent):
+            return None
+        current_target_ids = tuple(str(set_id) for set_id in intent.target_set_ids if str(set_id))
+        if not current_target_ids:
+            return None
+        if intent.source == "species_slider":
+            truthful_target_ids = set(self._staged_concentration_overlay_target_set_ids())
+            surviving_target_ids = tuple(
+                set_id for set_id in current_target_ids if set_id in truthful_target_ids
+            )
+        elif intent.source == "reset":
+            truthful_target_ids = set(self._dirty_slider_replay_target_set_ids_for_reset())
+            surviving_target_ids = tuple(
+                set_id for set_id in current_target_ids if set_id in truthful_target_ids
+            )
+        else:
+            surviving_target_ids = tuple(
+                set_id for set_id in current_target_ids if set_id not in cleared_set_ids
+            )
+        return self.build_slider_replay_intent(
+            set_ids=surviving_target_ids,
+            source=intent.source,
+        )
+
+    def _prune_targeted_preview_state_for_reset(self, cleared_set_ids: Sequence[str]) -> None:
+        cleared_set_id_set = {
+            str(set_id or "").strip()
+            for set_id in (cleared_set_ids or ())
+            if str(set_id or "").strip()
+        }
+        if not cleared_set_id_set:
+            return
+
+        self._current_slider_replay_intent = self._pruned_slider_replay_intent_for_reset(
+            self._current_slider_replay_intent,
+            cleared_set_ids=cleared_set_id_set,
+        )
+        self._last_submitted_slider_replay_intent = self._pruned_slider_replay_intent_for_reset(
+            self._last_submitted_slider_replay_intent,
+            cleared_set_ids=cleared_set_id_set,
+        )
+
+        surviving_gesture_target_ids = [
+            str(set_id)
+            for set_id in self._slider_gesture_target_set_ids_snapshot
+            if str(set_id) and str(set_id) not in cleared_set_id_set
+        ]
+        self._slider_gesture_target_set_ids_snapshot = surviving_gesture_target_ids
+
+        has_surviving_gesture_scope = bool(surviving_gesture_target_ids)
+        surviving_replay_intents = tuple(
+            intent
+            for intent in (
+                self._current_slider_replay_intent,
+                self._last_submitted_slider_replay_intent,
+            )
+            if isinstance(intent, SliderReplayIntent)
+        )
+        has_surviving_replay_scope = bool(surviving_replay_intents)
+
+        if not has_surviving_gesture_scope:
+            self._pending_slider_values.clear()
+            self._slider_drag_active = False
+            self._slider_release_in_progress = False
+            self._slider_release_primary_name = ""
+            self._drag_baseline_text = None
+            self._drag_baseline_state_network_dsl = None
+            self._suppress_slider_refresh = False
+            self._stop_preview_timer("_slider_release_commit_timer")
+
+        if not (has_surviving_gesture_scope or has_surviving_replay_scope):
+            self._slider_triggered_simulation = False
+            self._last_slider_change_name = ""
+            self._stop_preview_timer("_variable_update_timer")
+            self._stop_preview_timer("_species_slider_update_timer")
+            return
+
+        replay_sources = {str(intent.source) for intent in surviving_replay_intents if str(intent.source)}
+        if (not has_surviving_gesture_scope) and replay_sources.isdisjoint({"variable_slider", "drag_release", "reset"}):
+            self._stop_preview_timer("_variable_update_timer")
+        if "species_slider" not in replay_sources:
+            self._stop_preview_timer("_species_slider_update_timer")
+
+    def build_slider_replay_intent(
+        self,
+        *,
+        set_ids: Sequence[str] | str,
+        source: str,
+    ) -> Optional[SliderReplayIntent]:
+        intent = SliderReplayIntent(target_set_ids=set_ids, source=str(source or ""))
+        if not intent.target_set_ids or not intent.source:
+            return None
+        return intent
+
+    def stage_slider_replay_intent(
+        self,
+        *,
+        set_ids: Sequence[str],
+        source: str,
+    ) -> Optional[SliderReplayIntent]:
+        intent = self.build_slider_replay_intent(set_ids=set_ids, source=source)
+        self._current_slider_replay_intent = intent
+        return intent
+
+    def _reconcile_species_slider_replay_intent(self) -> None:
+        current = self.current_slider_replay_intent()
+        submitted_intent = self._last_submitted_slider_replay_intent
+        submitted_species_intent = (
+            submitted_intent
+            if isinstance(submitted_intent, SliderReplayIntent) and submitted_intent.source == "species_slider"
+            else None
+        )
+        if current is not None and current.source != "species_slider":
+            return
+        if current is None and submitted_species_intent is None:
+            return
+        next_intent = self.build_slider_replay_intent(
+            set_ids=self._staged_concentration_overlay_target_set_ids(),
+            source="species_slider",
+        )
+        if submitted_species_intent is not None:
+            if next_intent == submitted_species_intent:
+                self._current_slider_replay_intent = next_intent
+                return
+            self._last_submitted_slider_replay_intent = None
+            self._require_slider_preview_lifecycle_port().invalidate_slider_preview_work()
+            if next_intent is None:
+                self._current_slider_replay_intent = None
+                return
+            self.submit_slider_replay_intent(
+                next_intent,
+                preserve_existing_request=True,
+            )
+            return
+        self._current_slider_replay_intent = next_intent
+
+    def submit_slider_replay_intent(
+        self,
+        intent: Optional[SliderReplayIntent],
+        *,
+        preserve_existing_request: bool = False,
+    ) -> None:
+        normalized_intent = (
+            intent
+            if isinstance(intent, SliderReplayIntent) and intent.target_set_ids and intent.source
+            else None
+        )
+        lifecycle_port = self._require_slider_preview_lifecycle_port()
+        if normalized_intent is None:
+            self._current_slider_replay_intent = None
+            self._last_submitted_slider_replay_intent = None
+            lifecycle_port.clear_pending_slider_preview_replay(clear_plot_updates=False)
+            return
+        lifecycle_port.submit_slider_preview_replay_intent(
+            normalized_intent,
+            preserve_existing_request=bool(preserve_existing_request),
+        )
+        self._current_slider_replay_intent = normalized_intent
+        self._last_submitted_slider_replay_intent = normalized_intent
+
+    def _staged_concentration_overlay_target_set_ids(self) -> tuple[str, ...]:
+        return tuple(
+            str(set_id)
+            for set_id, overlay in self._staged_concentration_overlays_by_set_id.items()
+            if str(set_id) and bool(overlay)
+        )
+
+    def _prune_current_species_slider_replay_intent(self) -> None:
+        self._reconcile_species_slider_replay_intent()
+
+    def _dirty_slider_replay_target_set_ids_for_reset(self) -> tuple[str, ...]:
+        dirty_workspace_ids = {
+            str(set_id)
+            for set_id in self.local_mechanism_workspace_set_ids()
+            if str(set_id)
+        }
+        dirty_overlay_ids = set(self._staged_concentration_overlay_target_set_ids())
+        dirty_target_ids = dirty_workspace_ids | dirty_overlay_ids
+        if not dirty_target_ids:
+            return ()
+        ordered_target_ids: list[str] = []
+        seen: set[str] = set()
+        for set_id in self.effective_slider_edit_target_set_ids():
+            set_id_s = str(set_id or "").strip()
+            if not set_id_s or set_id_s in seen or set_id_s not in dirty_target_ids:
+                continue
+            seen.add(set_id_s)
+            ordered_target_ids.append(set_id_s)
+        for set_id in (*self.local_mechanism_workspace_set_ids(), *self._staged_concentration_overlay_target_set_ids()):
+            set_id_s = str(set_id or "").strip()
+            if not set_id_s or set_id_s in seen or set_id_s not in dirty_target_ids:
+                continue
+            seen.add(set_id_s)
+            ordered_target_ids.append(set_id_s)
+        return tuple(ordered_target_ids)
+
+    def capture_reset_slider_replay_intent(self) -> Optional[SliderReplayIntent]:
+        intent = self.build_slider_replay_intent(
+            set_ids=self._dirty_slider_replay_target_set_ids_for_reset(),
+            source="reset",
+        )
+        if intent is not None:
+            return intent
+        current = self.current_slider_replay_intent()
+        if current is None:
+            return None
+        intent = self.build_slider_replay_intent(
+            set_ids=current.target_set_ids,
+            source="reset",
+        )
+        if intent is not None:
+            return intent
+        return None
 
     def _capture_slider_gesture_target_snapshot(self) -> list[str]:
         snapshot = self._selected_mechanism_target_set_ids()
@@ -364,6 +613,11 @@ class MainWindowPreviewSession:
                 changed_set_ids.append(str(set_id))
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
+            self.stage_slider_replay_intent(
+                set_ids=changed_set_ids,
+                source="species_slider",
+            )
+            self._reconcile_species_slider_replay_intent()
             self._refresh_transaction_button_state()
         return bool(changed)
 
@@ -371,6 +625,7 @@ class MainWindowPreviewSession:
         cleared_set_ids = list(self._staged_concentration_overlays_by_set_id.keys())
         self._staged_concentration_overlays_by_set_id.clear()
         self._bump_dirty_state_generation(cleared_set_ids)
+        self._prune_current_species_slider_replay_intent()
         self._refresh_transaction_button_state()
 
     def discard_concentration_overlays_for_rows(self, rows: Sequence[int]) -> bool:
@@ -396,6 +651,7 @@ class MainWindowPreviewSession:
                 cleared_set_ids.append(set_id_s)
         if changed:
             self._bump_dirty_state_generation(cleared_set_ids)
+            self._prune_current_species_slider_replay_intent()
             self._refresh_transaction_button_state()
         return bool(changed)
 
@@ -417,6 +673,7 @@ class MainWindowPreviewSession:
         if not changed:
             return False
         self._staged_concentration_overlays_by_set_id = pruned_overlays
+        self._prune_current_species_slider_replay_intent()
         self._refresh_transaction_button_state()
         return True
 
@@ -455,10 +712,16 @@ class MainWindowPreviewSession:
                 model.setData(model_index, f"{float(value):.6g}")
         self._staged_concentration_overlays_by_set_id.clear()
         self._bump_dirty_state_generation(touched_set_ids)
+        self._prune_current_species_slider_replay_intent()
         self._refresh_transaction_button_state()
         return touched_rows
 
-    def clear_working_transaction(self, *, clear_committed_slider_values: bool = False) -> None:
+    def clear_working_transaction(
+        self,
+        *,
+        clear_committed_slider_values: bool = False,
+        invalidate_preview_work: bool = True,
+    ) -> None:
         changed_set_ids = self.local_mechanism_workspace_set_ids() + list(
             self._staged_concentration_overlays_by_set_id.keys()
         )
@@ -468,6 +731,8 @@ class MainWindowPreviewSession:
         if clear_committed_slider_values:
             self._param_store.clear_shared_params()
         self.reset_preview_state()
+        if invalidate_preview_work:
+            self._require_slider_preview_lifecycle_port().invalidate_slider_preview_work()
         self._refresh_transaction_button_state()
 
     def stop_slider_release_commit_timer(self) -> None:
@@ -497,42 +762,6 @@ class MainWindowPreviewSession:
     def set_slider_triggered_simulation(self, value: bool) -> None:
         self._slider_triggered_simulation = bool(value)
 
-    def _queue_pending_slider_preview_replay(
-        self,
-        *,
-        set_ids: Sequence[str],
-        request_id: Optional[int] = None,
-        preserve_existing_request: bool = False,
-    ) -> None:
-        controller = getattr(self._mw, "_sim_controller", None)
-        if controller is None:
-            return
-        queue_pending = getattr(controller, "queue_pending_slider_preview_replay", None)
-        if callable(queue_pending):
-            queue_pending(
-                target_set_ids=set_ids,
-                request_id=request_id,
-                preserve_existing_request=bool(preserve_existing_request),
-            )
-            return
-        run_state = getattr(controller, "run_state", None)
-        if run_state is None:
-            return
-        normalized: list[str] = []
-        seen: set[str] = set()
-        for set_id in set_ids or ():
-            set_id_s = str(set_id or "").strip()
-            if not set_id_s or set_id_s in seen:
-                continue
-            seen.add(set_id_s)
-            normalized.append(set_id_s)
-        if request_id is not None:
-            run_state.pending_slider_sim_request_id = int(request_id)
-        elif not bool(preserve_existing_request):
-            run_state.pending_slider_sim_request_id = None
-        run_state.pending_slider_target_set_ids = tuple(normalized)
-        run_state.pending_slider_simulation = True
-
     def slider_triggered_simulation(self) -> bool:
         return bool(self._slider_triggered_simulation)
 
@@ -550,12 +779,13 @@ class MainWindowPreviewSession:
         self._slider_triggered_simulation = False
         self._slider_drag_active = False
         self._clear_slider_gesture_target_snapshot()
+        self._current_slider_replay_intent = None
+        self._last_submitted_slider_replay_intent = None
         self._drag_baseline_text = None
         self._drag_baseline_state_network_dsl = None
         self._suppress_slider_refresh = False
         self._slider_release_in_progress = False
         self._slider_release_primary_name = ""
-        self._clear_active_preview_cache_state()
 
         for timer_attr in (
             "_variable_update_timer",
@@ -615,21 +845,14 @@ class MainWindowPreviewSession:
         logger.debug("Variable %s changed to %s", name, value)
         self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
-        controller = getattr(mw, "_sim_controller", None)
-        run_state = getattr(controller, "run_state", None)
-        if controller is not None:
-            next_slider_preview_request_id = getattr(controller, "next_slider_preview_request_id", None)
-            if callable(next_slider_preview_request_id):
-                request_id = int(next_slider_preview_request_id())
-            else:
-                request_id = int(mw._sim_controller.next_sim_request_id())
-        else:
-            request_id = int(mw._sim_controller.next_sim_request_id())
-        if run_state is not None:
-            self._queue_pending_slider_preview_replay(
-                set_ids=target_set_ids,
-                request_id=int(request_id),
-            )
+        intent = self.stage_slider_replay_intent(
+            set_ids=target_set_ids,
+            source="variable_slider",
+        )
+        self.submit_slider_replay_intent(
+            intent,
+            preserve_existing_request=True,
+        )
         self.stage_slider_value(name, float(value), target_set_ids=target_set_ids)
         if self._slider_drag_active or self._slider_release_in_progress:
             self._pending_slider_values[name] = value
@@ -645,10 +868,6 @@ class MainWindowPreviewSession:
             if timer is not None:
                 timer.stop()
                 timer.start()
-            self._queue_pending_slider_preview_replay(
-                set_ids=target_set_ids,
-                preserve_existing_request=True,
-            )
             return
 
         self._slider_triggered_simulation = True
@@ -658,10 +877,6 @@ class MainWindowPreviewSession:
         else:
             mw._status_label.setText(f"Previewing {name} = {value:.3g}")
         timer = self._ensure_variable_update_timer(interval_ms=interval_ms)
-        self._queue_pending_slider_preview_replay(
-            set_ids=target_set_ids,
-            preserve_existing_request=True,
-        )
         timer.stop()
         timer.setInterval(interval_ms)
         timer.start()
@@ -674,8 +889,12 @@ class MainWindowPreviewSession:
             return
         self._last_slider_change_name = name
         target_set_ids = self._ensure_slider_gesture_target_snapshot()
-        self._queue_pending_slider_preview_replay(
+        intent = self.stage_slider_replay_intent(
             set_ids=target_set_ids,
+            source="variable_slider",
+        )
+        self.submit_slider_replay_intent(
+            intent,
             preserve_existing_request=True,
         )
         self.stage_slider_value(name, float(value), target_set_ids=target_set_ids)
@@ -689,7 +908,6 @@ class MainWindowPreviewSession:
 
         interval_ms = self.variable_preview_debounce_ms(name)
         timer = self._ensure_variable_update_timer(interval_ms=interval_ms)
-        self._queue_pending_slider_preview_replay(set_ids=target_set_ids)
         timer.stop()
         timer.setInterval(interval_ms)
         timer.start()
@@ -721,10 +939,6 @@ class MainWindowPreviewSession:
 
         self._slider_release_in_progress = True
         self._slider_release_primary_name = str(name)
-        self._queue_pending_slider_preview_replay(
-            set_ids=self.slider_gesture_target_set_ids_snapshot(),
-            preserve_existing_request=True,
-        )
 
         timer = self._ensure_slider_release_commit_timer()
         interval_ms = self.variable_preview_debounce_ms(name)
@@ -734,7 +948,6 @@ class MainWindowPreviewSession:
 
     def queue_species_slider_simulation(self, *, label: str, delay_ms: int) -> None:
         """Queue a fast preview run for species-mode slider edits."""
-        mw = self._mw
         if not self.is_mechanism_valid_for_preview():
             self._show_invalid_preview_state()
             return
@@ -745,10 +958,13 @@ class MainWindowPreviewSession:
         delay_ms_i = max(0, min(500, delay_ms_i))
 
         self._last_slider_change_name = str(label or "init")
-        request_id = mw._sim_controller.next_sim_request_id()
-        self._queue_pending_slider_preview_replay(
+        intent = self.stage_slider_replay_intent(
             set_ids=self._selected_mechanism_target_set_ids(),
-            request_id=int(request_id),
+            source="species_slider",
+        )
+        self.submit_slider_replay_intent(
+            intent,
+            preserve_existing_request=True,
         )
 
         timer = self._ensure_species_slider_update_timer()
@@ -778,8 +994,12 @@ class MainWindowPreviewSession:
         if not pending:
             return
 
-        self._queue_pending_slider_preview_replay(
+        intent = self.stage_slider_replay_intent(
             set_ids=target_set_ids,
+            source="drag_release",
+        )
+        self.submit_slider_replay_intent(
+            intent,
             preserve_existing_request=True,
         )
         timer = self._ensure_variable_update_timer()
@@ -791,13 +1011,13 @@ class MainWindowPreviewSession:
         if not self.is_mechanism_valid_for_preview():
             self._show_invalid_preview_state()
             return
-        self._mw._sim_controller.run_simulation_from_slider()
+        self._require_slider_preview_lifecycle_port().launch_pending_slider_preview_replay()
 
     def _dispatch_species_slider_preview_if_valid(self) -> None:
         if not self.is_mechanism_valid_for_preview():
             self._show_invalid_preview_state()
             return
-        self._mw._sim_controller.run_simulation_from_slider()
+        self._require_slider_preview_lifecycle_port().launch_pending_slider_preview_replay()
 
     def _ensure_variable_update_timer(self, *, interval_ms: Optional[int] = None):
         if self._variable_update_timer is None:
