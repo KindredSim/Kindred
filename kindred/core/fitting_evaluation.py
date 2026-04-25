@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import numbers
 import pickle
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -34,6 +35,7 @@ from kindred.core.simulation_preparation import (
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
 )
+from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, SimulationRequest
 
@@ -319,39 +321,146 @@ def evaluate_fitting_series(
     return coerce_simulation_series_payload(normalized.evaluate_series(forwarded))
 
 
-@dataclass(frozen=True)
+def _payload_value_for_comparison(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return np.asarray(value).tolist()
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _payload_value_for_comparison(to_dict())
+    fingerprint = getattr(value, "fingerprint", None)
+    if callable(fingerprint):
+        return str(fingerprint())
+    if isinstance(value, Mapping):
+        return {str(key): _payload_value_for_comparison(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_payload_value_for_comparison(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_payload_value_for_comparison(item) for item in value)
+    return value
+
+
+def _binding_payload_for_comparison(name: str, binding: Any) -> Dict[str, Any]:
+    if isinstance(binding, Mapping):
+        binding_name = binding.get("name", name)
+        binding_value = binding.get("value")
+    elif isinstance(binding, numbers.Real):
+        binding_name = name
+        binding_value = binding
+    else:
+        binding_name = getattr(binding, "name", name)
+        binding_value = getattr(binding, "value", None)
+    if binding_value is None and callable(binding):
+        binding_value = binding()
+    if binding_value is None:
+        binding_value = 0.0
+    return {"name": str(binding_name), "value": float(binding_value)}
+
+
+def _execution_request_payload_for_comparison(value: SimulationExecutionRequest) -> Dict[str, Any]:
+    payload = _payload_value_for_comparison(value.to_payload())
+    prepared_payload = payload.get("prepared_payload")
+    if isinstance(prepared_payload, dict):
+        prepared_payload = dict(prepared_payload)
+        prepared_payload.pop("mechanism", None)
+        bindings = prepared_payload.get("bindings")
+        if isinstance(bindings, dict):
+            prepared_payload["bindings"] = {
+                str(name): _binding_payload_for_comparison(str(name), binding)
+                for name, binding in bindings.items()
+            }
+        payload["prepared_payload"] = prepared_payload
+    return payload
+
+
+def _fitting_plan_from_execution_request(
+    execution_request: SimulationExecutionRequest | Mapping[str, Any],
+) -> SimulationPlan:
+    return SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode="fitting",
+        algebra_policy=SimulationAlgebraPolicy.FITTING_STRICT,
+    )
+
+
+def _coerce_fitting_simulation_plan(
+    value: SimulationPlan | Mapping[str, Any],
+) -> SimulationPlan:
+    plan = value if isinstance(value, SimulationPlan) else SimulationPlan.from_payload(value)
+    if plan.execution_mode != "fitting":
+        raise ValueError("Fitting execution context requires a fitting simulation plan.")
+    if plan.algebra_policy is not SimulationAlgebraPolicy.FITTING_STRICT:
+        raise ValueError("Fitting execution context requires a fitting_strict algebra policy.")
+    return SimulationPlan.from_payload(plan.to_payload())
+
+
+def _assert_matching_fitting_execution_request(
+    *,
+    simulation_plan: SimulationPlan,
+    execution_request: SimulationExecutionRequest | Mapping[str, Any],
+) -> None:
+    request = (
+        execution_request
+        if isinstance(execution_request, SimulationExecutionRequest)
+        else SimulationExecutionRequest.from_mapping(dict(execution_request))
+    )
+    if _execution_request_payload_for_comparison(request) != _execution_request_payload_for_comparison(
+        simulation_plan.execution_request
+    ):
+        raise ValueError("Fitting simulation_plan execution_request does not match execution_request.")
+
+
+@dataclass(frozen=True, init=False)
 class PreparedFittingExecutionContext:
     """Structured execution data for the shared fitting evaluation seam."""
 
-    execution_request: SimulationExecutionRequest
+    simulation_plan: SimulationPlan
     requested_param_names: List[str]
     prepared_metadata: PreparedSimulationMetadata
     temperature_K: float
     initial_prefix: str
 
-    def __post_init__(self) -> None:
-        request = self.execution_request
-        if not isinstance(request, SimulationExecutionRequest):
-            request = SimulationExecutionRequest.from_mapping(dict(request))
-        request_copy = SimulationExecutionRequest.from_mapping(copy.deepcopy(request.to_payload()))
-        metadata_copy = coerce_prepared_simulation_metadata(self.prepared_metadata)
+    def __init__(
+        self,
+        *,
+        requested_param_names: List[str],
+        prepared_metadata: PreparedSimulationMetadata | Mapping[str, Any],
+        temperature_K: float,
+        initial_prefix: str,
+        simulation_plan: SimulationPlan | Mapping[str, Any] | None = None,
+        execution_request: SimulationExecutionRequest | Mapping[str, Any] | None = None,
+    ) -> None:
+        plan_value = simulation_plan
+        if plan_value is None:
+            if execution_request is None:
+                raise TypeError("simulation_plan or execution_request is required.")
+            plan = _fitting_plan_from_execution_request(execution_request)
+        else:
+            plan = _coerce_fitting_simulation_plan(plan_value)
+            if execution_request is not None:
+                _assert_matching_fitting_execution_request(
+                    simulation_plan=plan,
+                    execution_request=execution_request,
+                )
+        metadata_copy = coerce_prepared_simulation_metadata(prepared_metadata)
         if metadata_copy is None:
             raise TypeError("prepared_metadata must be a PreparedSimulationMetadata or compatible mapping.")
-        object.__setattr__(self, "execution_request", request_copy)
+        object.__setattr__(self, "simulation_plan", plan)
         object.__setattr__(
             self,
             "requested_param_names",
-            [str(name) for name in list(self.requested_param_names or []) if str(name).strip()],
+            [str(name) for name in list(requested_param_names or []) if str(name).strip()],
         )
         object.__setattr__(self, "prepared_metadata", metadata_copy)
-        object.__setattr__(self, "temperature_K", float(self.temperature_K))
-        object.__setattr__(self, "initial_prefix", str(self.initial_prefix or "init:"))
+        object.__setattr__(self, "temperature_K", float(temperature_K))
+        object.__setattr__(self, "initial_prefix", str(initial_prefix or "init:"))
+
+    @property
+    def execution_request(self) -> SimulationExecutionRequest:
+        return self.simulation_plan.execution_request
 
     def clone(self) -> "PreparedFittingExecutionContext":
         return type(self)(
-            execution_request=SimulationExecutionRequest.from_mapping(
-                copy.deepcopy(self.execution_request.to_payload())
-            ),
+            simulation_plan=SimulationPlan.from_payload(copy.deepcopy(self.simulation_plan.to_payload())),
             requested_param_names=list(self.requested_param_names),
             prepared_metadata=self.prepared_metadata,
             temperature_K=float(self.temperature_K),
@@ -504,6 +613,7 @@ class SerialFittingEvaluator:
 
     def to_process_payload(self) -> Dict[str, Any]:
         payload = {
+            "simulation_plan": self._context.simulation_plan.to_payload(),
             "execution_request": self._context.execution_request.to_payload(),
             "requested_param_names": list(self._context.requested_param_names),
             "prepared_metadata": self._context.prepared_metadata.to_serializable_dict(),
@@ -519,6 +629,7 @@ class SerialFittingEvaluator:
     @classmethod
     def from_process_payload(cls, payload: Mapping[str, Any]) -> "SerialFittingEvaluator":
         required_keys = (
+            "simulation_plan",
             "execution_request",
             "requested_param_names",
             "prepared_metadata",
@@ -532,11 +643,20 @@ class SerialFittingEvaluator:
         missing = [name for name in required_keys if name not in payload]
         if missing:
             raise KeyError(f"Process payload is missing required keys: {', '.join(missing)}")
+        simulation_plan = payload["simulation_plan"]
+        if not isinstance(simulation_plan, Mapping):
+            raise TypeError("Process payload simulation_plan must be a mapping.")
+        plan_payload = SimulationPlan.from_payload(simulation_plan).to_payload()
+        _assert_matching_fitting_execution_request(
+            simulation_plan=SimulationPlan.from_payload(plan_payload),
+            execution_request=SimulationExecutionRequest.from_mapping(
+                dict(payload["execution_request"])
+            ),
+        )
         return cls(
             PreparedFittingExecutionContext(
-                execution_request=SimulationExecutionRequest.from_mapping(
-                    dict(payload["execution_request"])
-                ),
+                simulation_plan=plan_payload,
+                execution_request=None,
                 requested_param_names=list(payload["requested_param_names"]),
                 prepared_metadata=PreparedSimulationMetadata.from_mapping(
                     dict(payload["prepared_metadata"])

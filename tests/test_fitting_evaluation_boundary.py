@@ -8,6 +8,41 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+def _assert_execution_request_payloads_equal(left: dict, right: dict) -> None:
+    left_prepared = dict(left.get("prepared_payload") or {})
+    right_prepared = dict(right.get("prepared_payload") or {})
+    left_y0 = left_prepared.pop("y0", None)
+    right_y0 = right_prepared.pop("y0", None)
+    left_prepared.pop("mechanism", None)
+    right_prepared.pop("mechanism", None)
+    for prepared in (left_prepared, right_prepared):
+        bindings = prepared.get("bindings")
+        if isinstance(bindings, dict):
+            normalized_bindings = {}
+            for name, binding in bindings.items():
+                if isinstance(binding, dict):
+                    binding_name = binding.get("name", name)
+                    binding_value = binding.get("value")
+                elif isinstance(binding, (int, float)):
+                    binding_name = name
+                    binding_value = binding
+                else:
+                    binding_name = getattr(binding, "name", name)
+                    binding_value = getattr(binding, "value", None)
+                if binding_value is None and callable(binding):
+                    binding_value = binding()
+                if binding_value is None:
+                    binding_value = 0.0
+                normalized_bindings[str(name)] = {
+                    "name": str(binding_name),
+                    "value": float(binding_value),
+                }
+            prepared["bindings"] = normalized_bindings
+    assert {**left, "prepared_payload": left_prepared} == {**right, "prepared_payload": right_prepared}
+    if left_y0 is not None or right_y0 is not None:
+        np.testing.assert_allclose(left_y0, right_y0)
+
+
 
 def test_prepare_fitting_execution_context_uses_serializable_execution_request_payload() -> None:
     from kindred.core.fitting_evaluation import prepare_fitting_execution_context
@@ -36,6 +71,38 @@ def test_prepare_fitting_execution_context_uses_serializable_execution_request_p
     assert "rhs" not in payload["prepared_payload"]
     assert "bindings" in payload["prepared_payload"]
     pickle.dumps(payload)
+
+
+def test_prepare_fitting_execution_context_carries_authoritative_fitting_plan() -> None:
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    assert isinstance(context.simulation_plan, SimulationPlan)
+    assert context.simulation_plan.execution_mode == "fitting"
+    assert context.simulation_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
+    assert context.execution_request is context.simulation_plan.execution_request
+    _assert_execution_request_payloads_equal(
+        context.execution_request.to_payload(),
+        context.simulation_plan.execution_request.to_payload(),
+    )
 
 
 def test_prepare_fitting_execution_context_preserves_solver_flags_in_execution_request_and_metadata() -> None:
@@ -152,7 +219,10 @@ def test_serial_fitting_evaluator_with_fixed_params_keeps_evaluators_isolated() 
     derived = base.with_fixed_params({"k1": 0.2})
 
     assert base.context is not derived.context
+    assert base.context.simulation_plan is not derived.context.simulation_plan
     assert base.context.execution_request is not derived.context.execution_request
+    assert base.context.execution_request is base.context.simulation_plan.execution_request
+    assert derived.context.execution_request is derived.context.simulation_plan.execution_request
     assert base.context.execution_request.prepared_payload is not derived.context.execution_request.prepared_payload
     assert (
         base.context.execution_request.prepared_payload["bindings"]
@@ -199,7 +269,10 @@ def test_serial_fitting_evaluator_lane_clone_keeps_context_and_bindings_isolated
     assert lane is not None
     assert lane is not base
     assert lane.context is not base.context
+    assert lane.context.simulation_plan is not base.context.simulation_plan
     assert lane.context.execution_request is not base.context.execution_request
+    assert lane.context.execution_request is lane.context.simulation_plan.execution_request
+    assert base.context.execution_request is base.context.simulation_plan.execution_request
     assert lane.context.execution_request.prepared_payload is not base.context.execution_request.prepared_payload
     assert (
         lane.context.execution_request.prepared_payload["bindings"]
@@ -412,6 +485,7 @@ def test_serial_fitting_evaluator_lane_solver_event_reports_mid_solve_cancellati
 
 def test_serial_fitting_evaluator_process_payload_round_trip_matches_original() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 
     mechanism_text = "\n".join(
         [
@@ -434,7 +508,20 @@ def test_serial_fitting_evaluator_process_payload_round_trip_matches_original() 
 
     expected = evaluator({"init:A": 1.0})
     payload = evaluator.to_process_payload()
+    assert "simulation_plan" in payload
+    process_plan = SimulationPlan.from_payload(payload["simulation_plan"])
+    assert process_plan.execution_mode == "fitting"
+    assert process_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
+    _assert_execution_request_payloads_equal(process_plan.execution_request.to_payload(), payload["execution_request"])
+
     restored = SerialFittingEvaluator.from_process_payload(payload)
+    assert restored.context.simulation_plan.execution_mode == "fitting"
+    assert restored.context.simulation_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
+    assert restored.context.execution_request is restored.context.simulation_plan.execution_request
+    _assert_execution_request_payloads_equal(
+        restored.context.execution_request.to_payload(),
+        context.execution_request.to_payload(),
+    )
     actual = restored({"init:A": 1.0})
 
     np.testing.assert_allclose(np.asarray(actual.t, dtype=float), np.asarray(expected.t, dtype=float))
@@ -474,8 +561,138 @@ def test_serial_fitting_evaluator_process_payload_is_picklable_without_prepared_
     payload = evaluator.to_process_payload()
 
     assert payload["execution_request"]["prepared_payload"] is not None
+    _assert_execution_request_payloads_equal(payload["simulation_plan"]["execution_request"], payload["execution_request"])
     assert "rhs" not in payload["execution_request"]["prepared_payload"]
     pickle.dumps(payload)
+
+
+def test_fitting_context_accepts_equivalent_plan_and_request_with_temperature_schedule() -> None:
+    from kindred.core.fitting_evaluation import PreparedFittingExecutionContext, prepare_fitting_execution_context
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+    from kindred.core.temperature import TemperatureSchedule
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    request_payload = context.execution_request.to_payload()
+    request_payload["prepared_payload"]["temperature_schedule"] = TemperatureSchedule.constant(298.15)
+    plan_payload = SimulationPlan.from_execution_request(
+        request_payload,
+        execution_mode="fitting",
+        algebra_policy=SimulationAlgebraPolicy.FITTING_STRICT,
+    ).to_payload()
+
+    restored = PreparedFittingExecutionContext(
+        simulation_plan=plan_payload,
+        execution_request=request_payload,
+        requested_param_names=list(context.requested_param_names),
+        prepared_metadata=context.prepared_metadata,
+        temperature_K=context.temperature_K,
+        initial_prefix=context.initial_prefix,
+    )
+
+    assert restored.execution_request is restored.simulation_plan.execution_request
+
+
+def test_serial_fitting_evaluator_from_process_payload_rejects_malformed_simulation_plan() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    payload["simulation_plan"] = "broken"
+
+    with pytest.raises(TypeError, match="simulation_plan"):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
+def test_serial_fitting_evaluator_from_process_payload_rejects_plan_request_binding_mismatch() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    plan_bindings = payload["simulation_plan"]["execution_request"]["prepared_payload"]["bindings"]
+    request_bindings = payload["execution_request"]["prepared_payload"]["bindings"]
+    plan_bindings["k1"] = {"name": "k1", "value": 0.2}
+    request_bindings["k1"] = {"name": "k1", "value": 0.9}
+
+    with pytest.raises(ValueError, match="does not match"):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
+def test_serial_fitting_evaluator_from_process_payload_rejects_scalar_binding_mismatch() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    plan_bindings = payload["simulation_plan"]["execution_request"]["prepared_payload"]["bindings"]
+    request_bindings = payload["execution_request"]["prepared_payload"]["bindings"]
+    plan_bindings["k1"] = 0.2
+    request_bindings["k1"] = 0.9
+
+    with pytest.raises(ValueError, match="does not match"):
+        SerialFittingEvaluator.from_process_payload(payload)
 
 
 def test_serial_fitting_evaluator_process_payload_handles_empty_param_names() -> None:
@@ -539,17 +756,38 @@ def test_serial_fitting_evaluator_process_payload_handles_large_mechanism() -> N
 
 
 def test_serial_fitting_evaluator_from_process_payload_requires_all_fields() -> None:
-    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 
-    with pytest.raises(KeyError, match="execution_request"):
+    context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k"],
+        t_end=1.0,
+        num_points=3,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+
+    for missing_key in ("simulation_plan", "execution_request"):
+        incomplete_payload = dict(payload)
+        incomplete_payload.pop(missing_key)
+        with pytest.raises(KeyError, match=missing_key):
+            SerialFittingEvaluator.from_process_payload(incomplete_payload)
+
+    with pytest.raises(KeyError, match="simulation_plan"):
         SerialFittingEvaluator.from_process_payload(
             {
-                "requested_param_names": [],
-                "prepared_metadata": {},
-                "temperature_K": 298.15,
-                "initial_prefix": "init:",
-                "fixed_params": {},
-                "fixed_param_origins": {},
+                name: value
+                for name, value in payload.items()
+                if name not in {"simulation_plan", "execution_request"}
             }
         )
 

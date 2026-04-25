@@ -27,6 +27,7 @@ from kindred.core.simulation_identity import (
     SimulationScopeIdentity,
     coerce_simulation_identity,
 )
+from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     is_cancelled_failure,
@@ -77,6 +78,57 @@ def _try_float(value: object) -> Optional[float]:
     if not np.isfinite(out):
         return None
     return float(out)
+
+
+def _simulation_plan_payload(value: object) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, SimulationPlan):
+        return value.to_payload()
+    if isinstance(value, Mapping):
+        return SimulationPlan.from_payload(value).to_payload()
+    return None
+
+
+def _execution_request_payload_from_plan(value: object) -> Optional[Dict[str, Any]]:
+    payload = _simulation_plan_payload(value)
+    if payload is None:
+        return None
+    return SimulationPlan.from_payload(payload).to_execution_request().to_payload()
+
+
+def _simulation_plan_payload_with_execution_request(
+    plan_payload: Mapping[str, Any],
+    execution_request: Mapping[str, Any],
+) -> Dict[str, Any]:
+    plan = SimulationPlan.from_payload(plan_payload)
+    return SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode=plan.execution_mode,
+        algebra_policy=plan.algebra_policy,
+        cache_identity_payload=plan.cache_identity_payload,
+        cache_scope_payload=plan.cache_scope_payload,
+        metadata=plan.metadata,
+        version=plan.version,
+    ).to_payload()
+
+
+def _new_simulation_plan_payload(
+    execution_request: Mapping[str, Any],
+    *,
+    execution_mode: str,
+    cache_identity_payload: Optional[Mapping[str, Any]] = None,
+    cache_scope_payload: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    return SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode=execution_mode,
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload=cache_identity_payload,
+        cache_scope_payload=cache_scope_payload,
+        metadata=metadata,
+    ).to_payload()
 
 
 def _safe_int(value: object, *, default: int = 0) -> int:
@@ -2593,6 +2645,11 @@ class SimulationController(QtCore.QObject):
             for set_id, payload in dict(ctx.get("execution_request_by_set_id") or {}).items()
             if str(set_id) and isinstance(payload, dict)
         }
+        simulation_plan_by_set_id = {
+            str(set_id): dict(payload)
+            for set_id, payload in dict(ctx.get("simulation_plan_by_set_id") or {}).items()
+            if str(set_id) and isinstance(payload, dict)
+        }
         mechanism_text_by_set_id = {
             str(set_id): str(text)
             for set_id, text in dict(ctx.get("mechanism_text_by_set_id") or {}).items()
@@ -2662,12 +2719,53 @@ class SimulationController(QtCore.QObject):
                     context=ctx,
                 ),
             }
-            execution_request = execution_request_by_set_id.get(str(set_id))
+            plan_payload = simulation_plan_by_set_id.get(str(set_id))
+            execution_request = _execution_request_payload_from_plan(plan_payload)
+            if execution_request is None:
+                execution_request = execution_request_by_set_id.get(str(set_id))
             if isinstance(execution_request, dict):
                 if not bool(ctx.get("fast_mode")):
                     execution_request = dict(execution_request)
                     execution_request["prepared_payload"] = None
+                    if isinstance(plan_payload, dict):
+                        plan_payload = _simulation_plan_payload_with_execution_request(
+                            plan_payload,
+                            execution_request,
+                        )
                 task["execution_request"] = dict(execution_request)
+            if plan_payload is None:
+                plan_request = (
+                    dict(execution_request)
+                    if isinstance(execution_request, dict)
+                    else SimulationExecutionRequest(
+                        prepared_payload=None,
+                        initials=dict(initials_dict),
+                        t_span=(0.0, float(t_end)),
+                        solver_config=dict(solver_config),
+                        mechanism_text=str(task["mechanism_text"]),
+                        simulation_identity=simulation_identity_by_set_id.get(str(set_id)),
+                    ).to_payload()
+                )
+                cache_identity_payload: Dict[str, Any] = {
+                    "cache_key": str(ctx.get("cache_key") or ""),
+                    "simulation_identity": dict(simulation_identity_by_set_id.get(str(set_id)) or {}),
+                }
+                preview_token = dict(ctx.get("preview_batch_cache_token_by_set_id") or {}).get(str(set_id))
+                if preview_token:
+                    cache_identity_payload["preview_batch_cache_token"] = str(preview_token)
+                plan_payload = _new_simulation_plan_payload(
+                    plan_request,
+                    execution_mode="preview" if bool(ctx.get("fast_mode")) else "explicit",
+                    cache_identity_payload=cache_identity_payload,
+                    cache_scope_payload=dict(ctx.get("scope_identity") or {}),
+                    metadata={
+                        "set_id": str(set_id),
+                        "set_name": str(set_name),
+                        "fast_mode": bool(ctx.get("fast_mode")),
+                    },
+                )
+            if isinstance(plan_payload, dict):
+                task["simulation_plan"] = dict(plan_payload)
             fut = executor.submit(run_batch_simulation_task, task)
             sid = str(set_id)
             self._batch_parallel.future_map[sid] = fut
@@ -2780,6 +2878,11 @@ class SimulationController(QtCore.QObject):
             for candidate_set_id, payload in dict(ctx.get("execution_request_by_set_id") or {}).items()
             if str(candidate_set_id) and isinstance(payload, dict)
         }
+        simulation_plan_by_set_id = {
+            str(candidate_set_id): dict(payload)
+            for candidate_set_id, payload in dict(ctx.get("simulation_plan_by_set_id") or {}).items()
+            if str(candidate_set_id) and isinstance(payload, dict)
+        }
         mechanism_text_by_set_id = {
             str(candidate_set_id): str(text)
             for candidate_set_id, text in dict(ctx.get("mechanism_text_by_set_id") or {}).items()
@@ -2805,14 +2908,27 @@ class SimulationController(QtCore.QObject):
             candidate = ctx.get("prepared")
         if isinstance(candidate, dict):
             prepared_payload = candidate
-        candidate_request = execution_request_by_set_id.get(set_id)
+        candidate_plan = simulation_plan_by_set_id.get(set_id)
+        plan_payload = _simulation_plan_payload(candidate_plan)
+        candidate_request = _execution_request_payload_from_plan(candidate_plan)
+        if candidate_request is None:
+            candidate_request = execution_request_by_set_id.get(set_id)
         if allow_batch_global_fallback and candidate_request is None:
-            candidate_request = ctx.get("execution_request")
+            candidate_plan = ctx.get("simulation_plan")
+            plan_payload = _simulation_plan_payload(candidate_plan)
+            candidate_request = _execution_request_payload_from_plan(candidate_plan)
+            if candidate_request is None:
+                candidate_request = ctx.get("execution_request")
         if isinstance(candidate_request, dict):
             execution_request = candidate_request
             if not bool(fast_mode):
                 execution_request = dict(execution_request)
                 execution_request["prepared_payload"] = None
+                if isinstance(plan_payload, dict):
+                    plan_payload = _simulation_plan_payload_with_execution_request(
+                        plan_payload,
+                        execution_request,
+                    )
             initials_dict = dict(candidate_request.get("initials") or initials_dict)
             solver_config = dict(candidate_request.get("solver_config") or solver_config)
             request_t_span = candidate_request.get("t_span") or (0.0, t_end)
@@ -2864,6 +2980,30 @@ class SimulationController(QtCore.QObject):
                     ctx["cache_key"] = str(cache_key)
                     self._batch_run_context = dict(ctx)
 
+        if plan_payload is None:
+            plan_request = SimulationExecutionRequest(
+                prepared_payload=dict(prepared_payload) if isinstance(prepared_payload, dict) else None,
+                initials=dict(initials_dict),
+                t_span=(0.0, float(t_end)),
+                solver_config=dict(solver_config),
+                mechanism_text=str(mechanism_text_for_worker),
+                simulation_identity=simulation_identity_by_set_id.get(set_id),
+            ).to_payload()
+            cache_identity_payload: Dict[str, Any] = {
+                "cache_key": str(cache_key),
+                "simulation_identity": dict(simulation_identity_by_set_id.get(set_id) or {}),
+            }
+            plan_payload = _new_simulation_plan_payload(
+                plan_request,
+                execution_mode="preview" if bool(fast_mode) else "explicit",
+                cache_identity_payload=cache_identity_payload,
+                metadata={
+                    "set_id": str(set_id),
+                    "set_name": str(set_name),
+                    "fast_mode": bool(fast_mode),
+                },
+            )
+
         include_mechanism_in_result_payload = self._include_mechanism_in_result_payload(
             fast_mode=bool(fast_mode),
             batch_set_id=set_id,
@@ -2887,6 +3027,8 @@ class SimulationController(QtCore.QObject):
         self._simulation_worker._batch_cache_key = cache_key  # type: ignore[attr-defined]
         if worker_signature:
             self._simulation_worker._batch_mechanism_signature = str(worker_signature)  # type: ignore[attr-defined]
+        if isinstance(plan_payload, dict):
+            self._simulation_worker._simulation_plan = dict(plan_payload)  # type: ignore[attr-defined]
         if isinstance(execution_request, dict):
             self._simulation_worker._execution_request = dict(execution_request)  # type: ignore[attr-defined]
 
@@ -3236,6 +3378,7 @@ class SimulationController(QtCore.QObject):
             return
 
         execution_request_by_set_id: Dict[str, Dict[str, Any]] = {}
+        simulation_plan_by_set_id: Dict[str, Dict[str, Any]] = {}
         mechanism_text_by_set_id: Dict[str, str] = {}
         mechanism_signature_by_set_id: Dict[str, str] = {}
         preview_batch_cache_token_by_set_id: Dict[str, str] = {}
@@ -3370,6 +3513,33 @@ class SimulationController(QtCore.QObject):
             self._batch_cache.active_cache_key = cache_key
             self._batch_cache.active_cache_preview_token = None
 
+        set_name_by_set_id = {
+            str(set_id): str(queue_names[index]) if index < len(queue_names) else str(set_id)
+            for index, set_id in enumerate(queue_ids)
+        }
+        for set_id, request_payload in execution_request_by_set_id.items():
+            preview_token = preview_batch_cache_token_by_set_id.get(str(set_id), "")
+            cache_identity_payload: Dict[str, Any] = {
+                "cache_key": cache_key,
+                "simulation_identity": dict(simulation_identity_by_set_id.get(str(set_id)) or {}),
+            }
+            if preview_token:
+                cache_identity_payload["preview_batch_cache_token"] = str(preview_token)
+            simulation_plan_by_set_id[str(set_id)] = _new_simulation_plan_payload(
+                request_payload,
+                execution_mode="preview" if bool(fast_mode) else "explicit",
+                cache_identity_payload=cache_identity_payload,
+                cache_scope_payload={
+                    "scope_identity": scope_identity.to_payload(),
+                    "queue_ids": [str(queue_id) for queue_id in queue_ids],
+                },
+                metadata={
+                    "set_id": str(set_id),
+                    "set_name": set_name_by_set_id.get(str(set_id), str(set_id)),
+                    "fast_mode": bool(fast_mode),
+                },
+            )
+
         if bool(reuse_parallel_executor):
             self._supersede_parallel_batch_run_soft()
         else:
@@ -3406,11 +3576,15 @@ class SimulationController(QtCore.QObject):
             self._active_run_id = int(run_id)
 
         primary_execution_request = None
+        primary_simulation_plan = None
         if not bool(fast_mode):
             if primary_set_id:
                 primary_execution_request = execution_request_by_set_id.get(str(primary_set_id))
+                primary_simulation_plan = simulation_plan_by_set_id.get(str(primary_set_id))
             if primary_execution_request is None and execution_request_by_set_id:
                 primary_execution_request = dict(next(iter(execution_request_by_set_id.values())))
+            if primary_simulation_plan is None and simulation_plan_by_set_id:
+                primary_simulation_plan = dict(next(iter(simulation_plan_by_set_id.values())))
 
         self._batch_run_context = {
             "active": True,
@@ -3440,8 +3614,16 @@ class SimulationController(QtCore.QObject):
                 if ((not bool(fast_mode)) and isinstance(primary_execution_request, dict))
                 else None
             ),
+            "simulation_plan": (
+                dict(primary_simulation_plan)
+                if ((not bool(fast_mode)) and isinstance(primary_simulation_plan, dict))
+                else None
+            ),
             "execution_request_by_set_id": {
                 str(set_id): dict(payload) for set_id, payload in execution_request_by_set_id.items()
+            },
+            "simulation_plan_by_set_id": {
+                str(set_id): dict(payload) for set_id, payload in simulation_plan_by_set_id.items()
             },
             "cache_key": cache_key,
             "scope_identity": scope_identity.to_payload(),

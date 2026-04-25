@@ -356,6 +356,95 @@ def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(mon
     assert payload["provenance"] == {"path": "batch"}
 
 
+def test_run_batch_simulation_task_uses_text_path_for_plan_without_prepared_payload(monkeypatch):
+    import numpy as np
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    class _FakeSpecies:
+        def __init__(self) -> None:
+            self.initial_conc = 0.0
+
+    class _FakeMechanism:
+        def __init__(self) -> None:
+            self.species = {"A": _FakeSpecies()}
+            self.metadata = {}
+
+        def clone(self):
+            cloned = copy.copy(self)
+            cloned.species = {k: copy.copy(v) for k, v in self.species.items()}
+            cloned.metadata = dict(self.metadata)
+            return cloned
+
+        def set_initial(self, name: str, initial_conc: float) -> None:
+            self.species[str(name)].initial_conc = float(initial_conc)
+
+    class _FakeBound:
+        def __init__(self) -> None:
+            self.species_names = ["A"]
+            self.y0 = np.asarray([1.0], dtype=float)
+            self.mechanism = _FakeMechanism()
+
+        def rhs(self, *_args, **_kwargs):
+            return None
+
+    class _FakeResult:
+        def __init__(self) -> None:
+            self.t = np.asarray([0.0, 1.0], dtype=float)
+            self.Y = np.asarray([[4.0, 3.0]], dtype=float)
+            self.provenance = {"path": "plan-text"}
+            self.fallback_occurred = False
+            self.fallback_message = None
+
+    seen: dict[str, object] = {}
+
+    def _fake_prepared_entry(**kwargs):
+        seen["prepared_entry_kwargs"] = dict(kwargs)
+        return {"bound": _FakeBound()}
+
+    def _fake_solve(request):
+        seen["request"] = request
+        return _FakeResult()
+
+    monkeypatch.setattr(batch_parallel, "_prepared_entry", _fake_prepared_entry)
+    monkeypatch.setattr(
+        "kindred.core.simulator.parameter_algebra.apply_parameter_algebra_to_mechanism",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "kindred.core.algebra.simulation_series.evaluate_algebra_series_for_simulation",
+        lambda *_a, **_k: ({}, {}),
+    )
+    monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve)
+
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": {"A": 4.0},
+            "t_span": (0.0, 1.0),
+            "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+            "mechanism_text": "reaction: A -> B; k=PLAN",
+            "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+        },
+        execution_mode="preview",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    ).to_payload()
+
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "mechanism_text": "reaction: A -> B; k=STALE",
+            "simulation_plan": plan_payload,
+        }
+    )
+
+    assert payload["success"] is True
+    assert payload["mechanism_text"] == "reaction: A -> B; k=PLAN"
+    assert seen["prepared_entry_kwargs"]["mechanism_text"] == "reaction: A -> B; k=PLAN"  # type: ignore[index]
+    assert np.asarray(seen["request"].y0).tolist() == [4.0]  # type: ignore[union-attr]
+
+
 def test_run_batch_simulation_task_secondary_payload_reports_base_species_count(monkeypatch):
     import numpy as np
 
@@ -422,6 +511,7 @@ def test_run_batch_simulation_task_secondary_payload_reports_base_species_count(
 
 def test_run_batch_simulation_task_preserves_structured_execution_request_provenance_text(monkeypatch):
     import numpy as np
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 
     class _FakeSpecies:
         def __init__(self) -> None:
@@ -466,6 +556,29 @@ def test_run_batch_simulation_task_preserves_structured_execution_request_proven
     )
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve)
 
+    execution_request = {
+        "prepared_payload": {
+            "version": 2,
+            "mechanism": _FakeMechanism(),
+            "species_names": ["A"],
+            "y0": np.asarray([1.0], dtype=float),
+            "mechanism_text": "",
+            "temperature_schedule": None,
+            "jacobian_func": None,
+        },
+        "initials": {"A": 3.0},
+        "t_span": (0.0, 1.0),
+        "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+        "mechanism_text": "reaction: A -> B; k=SET1",
+        "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+    }
+    plan_payload = SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+        metadata={"set_id": "id1", "set_name": "set1"},
+    ).to_payload()
+
     payload = batch_parallel.run_batch_simulation_task(
         {
             "run_id": 1,
@@ -473,22 +586,7 @@ def test_run_batch_simulation_task_preserves_structured_execution_request_proven
             "set_name": "set1",
             "include_mechanism_in_result_payload": False,
             "mechanism_text": "reaction: A -> B; k=PRIMARY",
-            "execution_request": {
-                "prepared_payload": {
-                    "version": 2,
-                    "mechanism": _FakeMechanism(),
-                    "species_names": ["A"],
-                    "y0": np.asarray([1.0], dtype=float),
-                    "mechanism_text": "",
-                    "temperature_schedule": None,
-                    "jacobian_func": None,
-                },
-                "initials": {"A": 3.0},
-                "t_span": (0.0, 1.0),
-                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
-                "mechanism_text": "reaction: A -> B; k=SET1",
-                "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
-            },
+            "simulation_plan": plan_payload,
         }
     )
 

@@ -191,6 +191,18 @@ def _prepared_payload_from_bound(bound: Any) -> Dict[str, Any]:
     }
 
 
+def _execution_request_payload_from_simulation_plan(value: Any) -> Dict[str, Any] | None:
+    if value is None:
+        return None
+    from kindred.core.simulation_plan import SimulationPlan
+
+    if isinstance(value, SimulationPlan):
+        return value.to_execution_request().to_payload()
+    if isinstance(value, Mapping):
+        return SimulationPlan.from_payload(value).to_execution_request().to_payload()
+    return None
+
+
 def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Execute one batch-set simulation in a worker process.
@@ -205,6 +217,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     )
     from kindred.core.simulator.solvers import solve_ode
 
+    plan_execution_request = _execution_request_payload_from_simulation_plan(task.get("simulation_plan"))
     execution_request = task.get("execution_request")
     mechanism_text = str(task.get("mechanism_text") or "")
     solver_config = dict(task.get("solver_config") or {})
@@ -212,6 +225,14 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     signature = str(task.get("mechanism_signature") or "").strip()
     simulation_identity = task.get("simulation_identity")
     include_mechanism_in_result_payload = bool(task.get("include_mechanism_in_result_payload", False))
+    if isinstance(plan_execution_request, Mapping) and not isinstance(execution_request, Mapping):
+        if plan_execution_request.get("prepared_payload") is not None:
+            execution_request = plan_execution_request
+        else:
+            mechanism_text = str(plan_execution_request.get("mechanism_text") or mechanism_text or "")
+            solver_config = dict(plan_execution_request.get("solver_config") or solver_config)
+            initials = dict(plan_execution_request.get("initials") or initials)
+            simulation_identity = plan_execution_request.get("simulation_identity") or simulation_identity
     structured_prepared_request = isinstance(execution_request, Mapping) and execution_request.get("prepared_payload") is not None
     if isinstance(execution_request, Mapping):
         if structured_prepared_request:
@@ -252,7 +273,15 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
             wegscheider_cyclicity_enabled=bool(wegscheider_enabled),
         )
 
-    t_span_raw = task.get("t_span") or (0.0, float(task.get("t_end") or 0.0))
+    t_span_raw = (
+        execution_request.get("t_span")
+        if isinstance(execution_request, Mapping)
+        else (
+            plan_execution_request.get("t_span")
+            if isinstance(plan_execution_request, Mapping)
+            else None
+        )
+    ) or task.get("t_span") or (0.0, float(task.get("t_end") or 0.0))
     try:
         t_start, t_end = float(t_span_raw[0]), float(t_span_raw[1])
     except (TypeError, ValueError, IndexError) as exc:

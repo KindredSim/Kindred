@@ -91,6 +91,7 @@ def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkey
     from PySide6 import QtWidgets
 
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy
     from kindred.gui.fitting import launch_global_fit_session
 
     _seed_one_dataset(main_window)
@@ -127,6 +128,8 @@ def test_fitting_package_launch_owner_builds_window_payloads(main_window, monkey
     assert isinstance(kwargs, dict)
     assert "simulation_func" in kwargs
     assert isinstance(kwargs["simulation_func"], SerialFittingEvaluator)
+    assert kwargs["simulation_func"].context.simulation_plan.execution_mode == "fitting"
+    assert kwargs["simulation_func"].context.simulation_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
     prepared_payload = kwargs["simulation_func"].context.execution_request.to_payload()["prepared_payload"]
     assert isinstance(prepared_payload, dict)
     assert "rhs" not in prepared_payload
@@ -144,6 +147,7 @@ def test_fitting_package_launch_owner_uses_serial_evaluator(
     from PySide6 import QtWidgets
 
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy
     from kindred.gui.fitting import launch_global_fit_session
 
     _seed_one_dataset(main_window)
@@ -183,10 +187,12 @@ def test_fitting_package_launch_owner_uses_serial_evaluator(
         simulation_func = kwargs.get("simulation_func")
         assert isinstance(simulation_func, SerialFittingEvaluator)
         assert type(simulation_func) is SerialFittingEvaluator
+        assert simulation_func.context.simulation_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
 
         fixed = simulation_func.with_fixed_params({"k_fixed": 1.23})
         assert isinstance(fixed, SerialFittingEvaluator)
         assert type(fixed) is SerialFittingEvaluator
+        assert fixed.context.simulation_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
 
         simulation_builder = kwargs.get("simulation_builder")
         assert callable(simulation_builder)
@@ -199,6 +205,8 @@ def test_fitting_package_launch_owner_uses_serial_evaluator(
         )
         assert isinstance(rebuilt, SerialFittingEvaluator)
         assert type(rebuilt) is SerialFittingEvaluator
+        assert rebuilt.context.simulation_plan.execution_mode == "fitting"
+        assert rebuilt.context.simulation_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
     finally:
         window.close()
         window.deleteLater()
@@ -215,6 +223,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
 
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy
     from kindred.gui.fitting import launch_global_fit_session
     from kindred.gui.fitting.window import FittingWindow
 
@@ -311,6 +320,14 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
         captured_fit_evaluator = captured.get("fit_evaluator")
         assert isinstance(captured_fit_evaluator, SerialFittingEvaluator)
         assert type(captured_fit_evaluator) is SerialFittingEvaluator
+        assert (
+            captured_fit_evaluator.context.execution_request
+            is captured_fit_evaluator.context.simulation_plan.execution_request
+        )
+        assert (
+            captured_fit_evaluator.context.simulation_plan.algebra_policy
+            is SimulationAlgebraPolicy.FITTING_STRICT
+        )
     finally:
         eager_window.close()
         eager_window.deleteLater()
