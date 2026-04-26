@@ -75,6 +75,14 @@ def _assert_selection_plot_cleared(main_window) -> None:
     assert getattr(plot, "_t", None) is None
     assert dict(getattr(plot, "_series", {}) or {}) == {}
 
+def _assert_main_plot_matches(main_window, t, series: dict[str, np.ndarray]) -> None:
+    plot = main_window._plot_tabs._main_plot
+    np.testing.assert_allclose(getattr(plot, "_t", None), np.asarray(t, dtype=float))
+    actual = dict(getattr(plot, "_series", {}) or {})
+    assert set(actual) == set(series)
+    for name, expected in series.items():
+        np.testing.assert_allclose(actual[name], np.asarray(expected, dtype=float))
+
 def _current_preview_solver_config(main_window) -> dict:
     from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 
@@ -293,13 +301,8 @@ def test_result_cache_is_bounded_separately_from_preview(main_window, qt_app):
     assert "result-k2::set1" not in preview
 
 @pytest.mark.gui
-def test_cache_miss_on_selection_change_sets_evicted_message_and_clears_plot(main_window, monkeypatch, qt_app):
+def test_cache_miss_on_clean_selection_preserves_plot_and_sets_evicted_message(main_window, monkeypatch, qt_app):
     from PySide6 import QtWidgets
-
-    # Establish a known plot state.
-    t0 = np.asarray([0.0, 1.0], dtype=float)
-    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
 
     # Ensure there are at least two batch sets and a selection exists.
     main_window._batch_model.set_species(["A"])
@@ -309,6 +312,11 @@ def test_cache_miss_on_selection_change_sets_evicted_message_and_clears_plot(mai
     add_btn.click()
     qt_app.processEvents()
     _select_rows(main_window, [0, 1])
+
+    # Establish a known plot state before the cache-miss selection reconciliation.
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
 
     # A selection change must never trigger a run; hard-fail if it does.
     monkeypatch.setattr(
@@ -324,7 +332,46 @@ def test_cache_miss_on_selection_change_sets_evicted_message_and_clears_plot(mai
     qt_app.processEvents()
 
     assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    _assert_selection_plot_cleared(main_window)
+    _assert_main_plot_matches(main_window, t0, series0)
+
+@pytest.mark.gui
+def test_lru_evicted_clean_selection_preserves_current_plot_and_reports_cache_miss(main_window, monkeypatch, qt_app):
+    from PySide6 import QtWidgets
+
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    add_btn.click()
+    qt_app.processEvents()
+
+    t0 = np.asarray([0.0, 1.0], dtype=float)
+    series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
+    main_window.set_data(t0, series0, label="baseline", overlays=[])
+
+    first_set_id = str(main_window._batch_set_id_for_row(0))
+    second_set_id = str(main_window._batch_set_id_for_row(1))
+    cache_key = "bounded-cache-key"
+    evicting_cache_key = "evicting-cache-key"
+    cache = main_window.simulation_controller.batch_cache
+    main_window.set_simulation_cache_caps(result_cap=1, preview_cap=10)
+    cache.result_cache.put(f"{cache_key}::{first_set_id}", {"t": [0.0, 1.0], "series": {"A": [1.0, 0.9]}})
+    cache.result_cache.put(f"{evicting_cache_key}::{second_set_id}", {"t": [0.0, 1.0], "series": {"A": [2.0, 1.8]}})
+    assert f"{cache_key}::{first_set_id}" not in cache.result_cache
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    cache.active_cache_key = cache_key
+    _select_rows(main_window, [0])
+    qt_app.processEvents()
+
+    assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
+    _assert_main_plot_matches(main_window, t0, series0)
 
 @pytest.mark.gui
 def test_selection_change_without_active_cache_context_does_not_show_evicted_warning(main_window, monkeypatch, qt_app):

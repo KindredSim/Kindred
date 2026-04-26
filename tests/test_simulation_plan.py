@@ -39,6 +39,48 @@ def test_text_request_round_trip_preserves_request_identity_and_policy() -> None
     assert restored.to_execution_request().to_payload() == request.to_payload()
 
 
+def test_cache_identity_and_scope_helpers_return_defensive_payload_views() -> None:
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.25},
+        t_span=(0.0, 12.5),
+        solver_config={"solver": "BDF", "grid": {"N": 25}},
+        mechanism_text="reaction: A -> B; k=1",
+        simulation_identity={"schema_id": "schema", "param_fingerprint": "params"},
+    )
+    plan = SimulationPlan.from_execution_request(
+        request,
+        execution_mode="preview",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload={
+            "cache_key": "preview-cache",
+            "simulation_identity": {"schema_id": "schema", "param_fingerprint": "params"},
+            "preview_batch_cache_token": "preview-token",
+        },
+        cache_scope_payload={
+            "scope_identity": {"schema_id": "scope", "queue_fingerprint": "queue"},
+            "queue_ids": ["id1", "id2"],
+        },
+    )
+
+    identity_payload = plan.simulation_identity_payload()
+    scope_payload = plan.scope_identity_payload()
+    queue_ids = plan.cache_queue_ids()
+
+    assert plan.cache_key() == "preview-cache"
+    assert plan.preview_batch_cache_token() == "preview-token"
+    assert identity_payload == {"schema_id": "schema", "param_fingerprint": "params"}
+    assert scope_payload == {"schema_id": "scope", "queue_fingerprint": "queue"}
+    assert queue_ids == ("id1", "id2")
+
+    identity_payload["schema_id"] = "mutated"
+    scope_payload["schema_id"] = "mutated"
+    assert plan.simulation_identity_payload() == {"schema_id": "schema", "param_fingerprint": "params"}
+    assert plan.scope_identity_payload() == {"schema_id": "scope", "queue_fingerprint": "queue"}
+
+
 def test_prepared_request_round_trip_preserves_payload_and_copies_arrays_defensively() -> None:
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 

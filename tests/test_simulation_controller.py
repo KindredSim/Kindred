@@ -7158,6 +7158,145 @@ def test_on_simulation_complete_updates_cache_and_marks_pending_init_applied(mon
     mw._arm_pending_init_result_invalidation_guard.assert_called_once_with(rewrite="reaction: A -> B; k=1")
     controller._queue_slider_plot_update.assert_called_once()
 
+
+@pytest.mark.unit
+def test_on_simulation_complete_writes_cache_identity_from_simulation_plan(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+
+    solver_config = {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15}
+    plan_identity = SimulationIdentity.build(
+        schema_id="schema-from-plan",
+        param_fingerprint="plan-fingerprint",
+        solver_config=solver_config,
+        t_end=1.0,
+    ).to_payload()
+    stale_context_identity = SimulationIdentity.build(
+        schema_id="schema-from-context",
+        param_fingerprint="context-fingerprint",
+        solver_config=solver_config,
+        t_end=1.0,
+    ).to_payload()
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": {"A": 1.0},
+            "t_span": (0.0, 1.0),
+            "solver_config": solver_config,
+            "mechanism_text": "reaction: A -> B; k=1",
+            "simulation_identity": plan_identity,
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload={"cache_key": "ck", "simulation_identity": plan_identity},
+        cache_scope_payload={"scope_identity": {"schema_id": "scope"}, "queue_ids": ["id1"]},
+    ).to_payload()
+
+    controller._latest_sim_request_id = 1
+    controller._active_run_id = 2
+    controller._queue_slider_plot_update = MagicMock()
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "pos": 0,
+        "queue_names": ["set1"],
+        "queue_ids": ["id1"],
+        "cache_key": "ck",
+        "primary_set_id": "id1",
+        "pending_init_seed": {},
+        "pending_init_applied": True,
+        "simulation_plan_by_set_id": {"id1": plan_payload},
+        "simulation_identity_by_set_id": {"id1": stale_context_identity},
+    }
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=2,
+        fast_mode=False,
+        request_id=1,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    payload = controller.batch_cache.result_cache.get("ck::id1")
+    assert isinstance(payload, dict)
+    assert payload["simulation_identity"] == plan_identity
+
+
+@pytest.mark.unit
+def test_on_simulation_complete_uses_plan_identity_after_batch_set_id_fallback(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+
+    solver_config = {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15}
+    plan_identity = SimulationIdentity.build(
+        schema_id="schema-from-plan",
+        param_fingerprint="fallback-plan-fingerprint",
+        solver_config=solver_config,
+        t_end=1.0,
+    ).to_payload()
+    stale_context_identity = SimulationIdentity.build(
+        schema_id="schema-from-context",
+        param_fingerprint="fallback-context-fingerprint",
+        solver_config=solver_config,
+        t_end=1.0,
+    ).to_payload()
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": {"A": 1.0},
+            "t_span": (0.0, 1.0),
+            "solver_config": solver_config,
+            "mechanism_text": "reaction: A -> B; k=1",
+            "simulation_identity": plan_identity,
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload={"cache_key": "ck", "simulation_identity": plan_identity},
+        cache_scope_payload={"scope_identity": {"schema_id": "scope"}, "queue_ids": ["id1"]},
+    ).to_payload()
+
+    controller._latest_sim_request_id = 1
+    controller._active_run_id = 2
+    controller._queue_slider_plot_update = MagicMock()
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "pos": 0,
+        "queue_names": ["set1"],
+        "queue_ids": ["id1"],
+        "cache_key": "ck",
+        "primary_set_id": "id1",
+        "pending_init_seed": {},
+        "pending_init_applied": True,
+        "simulation_plan_by_set_id": {"id1": plan_payload},
+        "simulation_identity_by_set_id": {"id1": stale_context_identity},
+    }
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=2,
+        fast_mode=False,
+        request_id=1,
+        batch_set=None,
+        batch_set_id=None,
+        cache_key="ck",
+    )
+
+    payload = controller.batch_cache.result_cache.get("ck::id1")
+    assert isinstance(payload, dict)
+    assert payload["simulation_identity"] == plan_identity
+
+
 @pytest.mark.unit
 def test_on_simulation_complete_uses_truthful_scipy_fallback_warning_text(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController

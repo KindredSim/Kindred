@@ -191,6 +191,35 @@ class SimulationPlan:
     def to_execution_request(self) -> SimulationExecutionRequest:
         return _coerce_execution_request(self.execution_request)
 
+    def cache_key(self) -> str:
+        payload = self.cache_identity_payload or {}
+        return str(payload.get("cache_key") or "")
+
+    def simulation_identity_payload(self) -> Dict[str, Any]:
+        payload = self.cache_identity_payload or {}
+        identity = payload.get("simulation_identity")
+        if not isinstance(identity, Mapping):
+            return {}
+        return _copy_payload_value(identity)
+
+    def preview_batch_cache_token(self) -> str:
+        payload = self.cache_identity_payload or {}
+        return str(payload.get("preview_batch_cache_token") or "")
+
+    def scope_identity_payload(self) -> Dict[str, Any]:
+        payload = self.cache_scope_payload or {}
+        scope_identity = payload.get("scope_identity")
+        if isinstance(scope_identity, Mapping):
+            return _copy_payload_value(scope_identity)
+        return _copy_payload_value(payload)
+
+    def cache_queue_ids(self) -> tuple[str, ...]:
+        payload = self.cache_scope_payload or {}
+        queue_ids = payload.get("queue_ids")
+        if not isinstance(queue_ids, (list, tuple)):
+            return ()
+        return tuple(str(item) for item in queue_ids if str(item))
+
 
 _RESULT_KNOWN_FIELDS = {
     "t",

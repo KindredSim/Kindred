@@ -6116,8 +6116,18 @@ class MainWindow(
                 logger.debug("Failed to update status label: %s", exc, exc_info=True)
                 self._status_label = None
 
-        def _clear_non_displayed_selection_state() -> None:
+        def _clear_non_displayed_selection_state(*, preserve_plot: bool = False) -> None:
+            if preserve_plot:
+                self.clear_display_selection_state()
+                return
             self._clear_batch_selection_display_state()
+
+        def _selection_contains_active_invalidated_set() -> bool:
+            invalidated = batch_cache.active_cache_invalidated_set_ids
+            if invalidated is None:
+                return False
+            invalidated_set_ids = {str(set_id) for set_id in invalidated if str(set_id)}
+            return any(str(set_id) in invalidated_set_ids for set_id in shown_sets)
 
         def _finalize_displayed_selection_change() -> None:
             self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
@@ -6273,6 +6283,16 @@ class MainWindow(
                 use_workspace=bool(focused_selection_is_dirty)
             )
             _set_selection_status(preview_pending_msg)
+            return
+        if (
+            outcome_reason == "no_cached_results"
+            and (not has_workspace_selection)
+            and active_cache_key
+            and not _selection_contains_active_invalidated_set()
+        ):
+            _clear_non_displayed_selection_state(preserve_plot=True)
+            self._sync_mechanism_controls_to_focused_batch_set(use_workspace=False)
+            _set_selection_status(miss_msg)
             return
         _clear_non_displayed_selection_state()
         self._sync_mechanism_controls_to_focused_batch_set(
