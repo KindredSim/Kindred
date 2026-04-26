@@ -619,6 +619,117 @@ def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_w
     )
 
 
+def test_global_fit_objective_timeout_fit_simulation_error_uses_penalty_residuals() -> None:
+    t_obs = np.linspace(0.0, 1.0, 4, dtype=float)
+    payload = FitDatasetSpec(
+        dataset_id="ds-timeout",
+        t_exp=t_obs,
+        species_list=["A"],
+        y_matrix=np.zeros((1, t_obs.size), dtype=float),
+        point_count=int(t_obs.size),
+        x_name="t",
+        x_obs=None,
+        x_mode="auto",
+    )
+    layout = _build_parameter_layout(
+        payloads=[payload],
+        shared_params={"k": 0.5},
+        dataset_variable_params={},
+        bounds=None,
+        log10_params=None,
+    )
+
+    def _timeout(_params):
+        raise FitSimulationError(
+            "Fitting simulation failed: Simulation timed out after 0.2 seconds.",
+            details={
+                "fatal": False,
+                "failure": build_simulation_failure(
+                    "timeout",
+                    "Simulation timed out after 0.2 seconds.",
+                    details={"walltime_s": 0.2},
+                ),
+            },
+        )
+
+    objective = _GlobalFitObjective(
+        fit_evaluator=CallableFittingEvaluator(_timeout),
+        payloads=[payload],
+        shared_params={"k": 0.5},
+        dataset_params={},
+        weights={"ds-timeout": 1.0},
+        layout=layout,
+        penalty_value=10.0,
+        ctx=ObjectiveContext(),
+        progress_callback=None,
+        cancellation_check=None,
+    )
+
+    residuals = objective(layout.x0.copy())
+
+    np.testing.assert_allclose(residuals, np.full_like(t_obs, 10.0))
+    assert isinstance(objective._ctx.last_error, FitSimulationError)
+    assert objective._ctx.last_error.details["fatal"] is False
+
+
+def test_final_replay_timeout_failure_is_scoped_to_failed_dataset(monkeypatch) -> None:
+    from kindred.core.analysis import global_fitting
+    from kindred.core.fitting_optimization import FitResult
+
+    t_obs = np.linspace(0.0, 1.0, 4, dtype=float)
+
+    def _fake_fit_parameters(*_args, **_kwargs):
+        return FitResult(
+            success=True,
+            parameters={"k": 0.5},
+            uncertainties=None,
+            chi_squared=0.0,
+            r_squared=1.0,
+            residuals=np.zeros(t_obs.size * 2, dtype=float),
+            nfev=1,
+            message="Optimization terminated successfully.",
+            covariance=None,
+        )
+
+    calls = {"n": 0}
+
+    def _evaluate_final_replay(_evaluator, _params, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise FitSimulationError(
+                "Fitting simulation failed: Simulation timed out after 0.2 seconds.",
+                details={
+                    "fatal": False,
+                    "failure": build_simulation_failure(
+                        "timeout",
+                        "Simulation timed out after 0.2 seconds.",
+                        details={"walltime_s": 0.2},
+                    ),
+                },
+            )
+        return {"t": t_obs.copy(), "species": {"A": np.zeros_like(t_obs)}}
+
+    monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
+    monkeypatch.setattr(global_fitting, "evaluate_fitting_series", _evaluate_final_replay)
+
+    result = global_fitting.fit_global(
+        lambda _params: {"t": t_obs.copy(), "A": np.zeros_like(t_obs)},
+        datasets=[
+            {"id": "ds-ok", "t": t_obs.copy(), "y": np.zeros_like(t_obs), "species": "A"},
+            {"id": "ds-timeout", "t": t_obs.copy(), "y": np.zeros_like(t_obs), "species": "A"},
+        ],
+        shared_params={"k": 0.2},
+        method="trf",
+        max_nfev=1,
+    )
+
+    assert result.completion.status == "fail"
+    assert set(result.completion.dataset_failures) == {"ds-timeout"}
+    assert result.completion.dataset_failures["ds-timeout"].failure["kind"] == "timeout"
+    assert "ds-ok" in result.model_series
+    assert "ds-timeout" not in result.model_series
+
+
 def test_global_fit_objective_rebalances_targets_without_raw_cross_dataset_inflation_under_equal_baseline_residuals() -> None:
     t_obs = np.linspace(0.0, 1.0, 4, dtype=float)
     ds1_y = np.linspace(1.0, 2.0, t_obs.size, dtype=float)

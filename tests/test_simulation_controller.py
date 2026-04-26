@@ -14,6 +14,7 @@ import pytest
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.simulator.dsl_text_update import format_authoritative_parameter_value
+from kindred.core.simulation_failure import build_simulation_failure
 from kindred.core.simulation_identity import SimulationIdentity, SimulationScopeIdentity
 from kindred.gui.controllers.simulation_controller import (
     SimulationController,
@@ -2313,6 +2314,49 @@ def test_invalidate_slider_preview_work_suppresses_stale_error_ui_after_discard(
     assert mw._stop_btn.isEnabled() is False
     message_box.assert_not_called()
 
+
+@pytest.mark.unit
+def test_stale_contained_timeout_error_from_old_run_does_not_clobber_newer_run(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._active_run_id = 22
+    controller._latest_sim_request_id = 8
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": 8,
+    }
+    mw._run_btn.setEnabled(False)
+    mw._stop_btn.setEnabled(True)
+    mw._status_label.setText("Running simulation...")
+    mw._sim_progress.setValue(44)
+    message_box = MagicMock()
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", message_box)
+
+    controller._on_simulation_error(
+        build_simulation_failure(
+            "timeout",
+            "Simulation timed out after 0.2 seconds.",
+            details={"walltime_s": 0.2},
+        ),
+        run_id=21,
+        fast_mode=False,
+        request_id=7,
+    )
+
+    assert controller._simulation_running is True
+    assert controller._batch_run_context["active"] is True
+    assert mw._run_btn.isEnabled() is False
+    assert mw._stop_btn.isEnabled() is True
+    assert mw._status_label.text == "Running simulation..."
+    assert mw._sim_progress.value == 44
+    message_box.assert_not_called()
+
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_error(
     monkeypatch,
@@ -3954,6 +3998,566 @@ def test_consume_parallel_batch_future_error_calls_on_error_and_shutdown(mw: _Fa
     assert ok is False
     controller._on_simulation_error.assert_called_once()
     controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
+
+
+@pytest.mark.unit
+def test_consume_parallel_batch_future_error_is_set_scoped_when_batch_sets_remain(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+    pending_future: Future = Future()
+
+    controller._batch_parallel.future_map = {"bad": failed_future, "ok": pending_future}
+    controller._batch_parallel.future_meta = {
+        "bad": {"set_name": "Bad Set"},
+        "ok": {"set_name": "OK Set"},
+    }
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["bad", "ok"],
+        "queue_names": ["Bad Set", "OK Set"],
+        "total": 2,
+    }
+
+    controller._on_simulation_error = MagicMock()
+    controller._shutdown_batch_executor = MagicMock()
+
+    ok = controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=1.0,
+    )
+
+    assert ok is True
+    controller._on_simulation_error.assert_not_called()
+    controller._shutdown_batch_executor.assert_not_called()
+    assert controller._batch_run_context["active"] is True
+    assert controller._batch_run_context["failed_set_ids"] == ["bad"]
+    assert "bad" in controller._batch_run_context["completed_set_ids"]
+
+
+@pytest.mark.unit
+def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+    success_result = _successful_result_payload()
+    success_result.update(
+        {
+            "success": True,
+            "run_id": 1,
+            "set_id": "ok",
+            "set_name": "OK Set",
+        }
+    )
+    success_future: Future = Future()
+    success_future.set_result(success_result)
+
+    controller._batch_parallel.future_map = {"bad": failed_future, "ok": success_future}
+    controller._batch_parallel.future_meta = {
+        "bad": {"set_name": "Bad Set"},
+        "ok": {"set_name": "OK Set"},
+    }
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["bad", "ok"],
+        "queue_names": ["Bad Set", "OK Set"],
+        "total": 2,
+        "pending_workspace_reset_set_ids": ["bad", "ok"],
+        "pending_dirty_reset_generation_by_set_id": {"bad": 1, "ok": 1},
+        "explicit_cache_valid_set_ids": ("bad", "ok"),
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    controller.batch_cache.active_cache_key = "ck"
+    controller.batch_cache.active_cache_valid_set_ids = ("bad", "ok")
+    mw._dirty_state_generations = {"bad": 1, "ok": 1}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw.message_box_critical = MagicMock()
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=1.0,
+    ) is True
+    assert controller._batch_run_context["explicit_cache_valid_set_ids"] == ("ok",)
+    assert controller._batch_run_context["explicit_cache_invalidated_set_ids"] == ("bad",)
+    assert controller.batch_cache.active_cache_valid_set_ids == ("ok",)
+    assert controller.batch_cache.active_cache_invalidated_set_ids == ("bad",)
+
+    assert controller._consume_parallel_batch_future(
+        set_id="ok",
+        fut=success_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=2.0,
+    ) is True
+
+    assert mw._status_label.text == "Batch completed with 1 failed set(s)"
+    assert "Simulation complete:" not in mw._status_label.text
+    mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["ok"])
+    mw.message_box_critical.assert_called_once()
+
+
+@pytest.mark.unit
+def test_parallel_batch_final_scoped_failure_finalizes_prior_success(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+
+    controller._batch_parallel.future_map = {"bad": failed_future}
+    controller._batch_parallel.future_meta = {"bad": {"set_name": "Bad Set"}}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["ok", "bad"],
+        "queue_names": ["OK Set", "Bad Set"],
+        "total": 2,
+        "completed_set_ids": ["ok"],
+        "pending_workspace_reset_set_ids": ["ok", "bad"],
+        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
+        "explicit_cache_valid_set_ids": ("ok", "bad"),
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    controller.batch_cache.active_cache_key = "ck"
+    controller.batch_cache.active_cache_valid_set_ids = ("ok", "bad")
+    mw._dirty_state_generations = {"ok": 1, "bad": 1}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._shown_batch_set_ids.return_value = ["ok"]
+    mw._display_cached_batch_selection.return_value = True
+    mw.message_box_critical = MagicMock()
+
+    controller._queue_slider_plot_update(
+        set_id="ok",
+        cache_key="ck",
+        request_id=2,
+        run_id=1,
+        slider_triggered=False,
+        valid_set_ids=("ok",),
+        allow_fallback=False,
+    )
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=2.0,
+    ) is True
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["ok"])
+    kwargs = mw._display_cached_batch_selection.call_args.kwargs
+    assert kwargs["selected_sets"] == ["ok"]
+    assert kwargs["valid_set_ids"] == ("ok",)
+    assert kwargs["allow_fallback"] is False
+    assert controller.batch_cache.active_cache_valid_set_ids == ("ok",)
+    assert controller.batch_cache.active_cache_invalidated_set_ids == ("bad",)
+    assert mw._status_label.text == "Batch completed with 1 failed set(s)"
+
+
+@pytest.mark.unit
+def test_parallel_batch_final_scoped_failure_prunes_reset_sets_from_pending_replay(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._batch_parallel.future_map = {"bad": failed_future}
+    controller._batch_parallel.future_meta = {"bad": {"set_name": "Bad Set"}}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["ok", "bad"],
+        "queue_names": ["OK Set", "Bad Set"],
+        "total": 2,
+        "completed_set_ids": ["ok"],
+        "pending_workspace_reset_set_ids": ["ok", "bad"],
+        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
+        "explicit_cache_valid_set_ids": ("ok", "bad"),
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    controller.batch_cache.active_cache_key = "ck"
+    controller.batch_cache.active_cache_valid_set_ids = ("ok", "bad")
+    mw._dirty_state_generations = {"ok": 1, "bad": 1}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw.message_box_critical = MagicMock()
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_target_set_ids = ("ok", "bad")
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=2.0,
+    ) is True
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
+    assert controller._pending_slider_simulation is True
+    assert controller._pending_slider_sim_request_id == 7
+    assert controller._pending_slider_target_set_ids == ("bad",)
+    assert scheduled == [controller._run_simulation_from_slider]
+
+
+@pytest.mark.unit
+def test_parallel_batch_final_scoped_failure_keeps_replay_when_reset_clear_fails(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._batch_parallel.future_map = {"bad": failed_future}
+    controller._batch_parallel.future_meta = {"bad": {"set_name": "Bad Set"}}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["ok", "bad"],
+        "queue_names": ["OK Set", "Bad Set"],
+        "total": 2,
+        "completed_set_ids": ["ok"],
+        "pending_workspace_reset_set_ids": ["ok", "bad"],
+        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
+        "explicit_cache_valid_set_ids": ("ok", "bad"),
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    controller.batch_cache.active_cache_key = "ck"
+    controller.batch_cache.active_cache_valid_set_ids = ("ok", "bad")
+    mw._dirty_state_generations = {"ok": 1, "bad": 1}
+    mw.reset_mechanism_workspaces.return_value = False
+    mw.discard_concentration_overlays_for_set_ids.return_value = False
+    mw.message_box_critical = MagicMock()
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_target_set_ids = ("ok", "bad")
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=2.0,
+    ) is True
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["ok"])
+    assert controller._pending_slider_simulation is True
+    assert controller._pending_slider_target_set_ids == ("ok", "bad")
+    assert scheduled == [controller._run_simulation_from_slider]
+
+
+@pytest.mark.unit
+def test_parallel_batch_final_scoped_failure_refreshes_batch_columns_after_overlay_clear(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    class _Mechanism:
+        def species_names(self) -> list[str]:
+            return ["A", "B"]
+
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+
+    controller._batch_parallel.future_map = {"bad": failed_future}
+    controller._batch_parallel.future_meta = {"bad": {"set_name": "Bad Set"}}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["ok", "bad"],
+        "queue_names": ["OK Set", "Bad Set"],
+        "total": 2,
+        "completed_set_ids": ["ok"],
+        "pending_workspace_reset_set_ids": ["ok", "bad"],
+        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
+        "explicit_cache_valid_set_ids": ("ok", "bad"),
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    controller.batch_cache.active_cache_key = "ck"
+    controller.batch_cache.active_cache_valid_set_ids = ("ok", "bad")
+    mw._dirty_state_generations = {"ok": 1, "bad": 1}
+    mw.reset_mechanism_workspaces.return_value = False
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    mw._mechanism_helpers.remember_last_mechanism(_Mechanism(), "reaction: A -> B ; k=1", {})
+    mw.message_box_critical = MagicMock()
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=2.0,
+    ) is True
+
+    mw._sync_batch_species_columns.assert_called_once_with(["A", "B"], preserve_active_cache=True)
+
+
+@pytest.mark.unit
+def test_parallel_batch_scoped_failure_reinvalidates_pending_init_results(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_future: Future = Future()
+    failed_future.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+
+    controller._batch_parallel.future_map = {"bad": failed_future}
+    controller._batch_parallel.future_meta = {"bad": {"set_name": "Bad Set"}}
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["bad", "ok"],
+        "queue_names": ["Bad Set", "OK Set"],
+        "total": 2,
+        "pending_init_seed": {},
+        "pending_init_rewrite": "reaction: A -> B; k=1",
+        "pending_init_applied": True,
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad",
+        fut=failed_future,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=1.0,
+    ) is True
+
+    mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
+    assert controller._batch_run_context["pending_init_applied"] is False
+
+
+@pytest.mark.unit
+def test_parallel_batch_all_scoped_failures_replays_deferred_preview(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed_a: Future = Future()
+    failed_a.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.2 seconds.",
+                details={"walltime_s": 0.2},
+            ),
+        }
+    )
+    failed_b: Future = Future()
+    failed_b.set_result(
+        {
+            "success": False,
+            "error": build_simulation_failure(
+                "timeout",
+                "Simulation timed out after 0.3 seconds.",
+                details={"walltime_s": 0.3},
+            ),
+        }
+    )
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._batch_parallel.future_map = {"bad-a": failed_a, "bad-b": failed_b}
+    controller._batch_parallel.future_meta = {
+        "bad-a": {"set_name": "Bad A"},
+        "bad-b": {"set_name": "Bad B"},
+    }
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "run_id": 1,
+        "request_id": 2,
+        "fast_mode": False,
+        "cache_key": "ck",
+        "queue_ids": ["bad-a", "bad-b"],
+        "queue_names": ["Bad A", "Bad B"],
+        "total": 2,
+        "pending_workspace_reset_set_ids": ["bad-a", "bad-b"],
+        "pending_dirty_reset_generation_by_set_id": {"bad-a": 1, "bad-b": 1},
+    }
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    controller._pending_slider_simulation = True
+    controller._pending_slider_sim_request_id = 7
+    controller._pending_slider_target_set_ids = ("bad-a", "bad-b")
+    mw.message_box_critical = MagicMock()
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad-a",
+        fut=failed_a,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=1.0,
+    ) is True
+    assert scheduled == []
+
+    assert controller._consume_parallel_batch_future(
+        set_id="bad-b",
+        fut=failed_b,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="callback",
+        completed_ts=2.0,
+    ) is True
+
+    assert mw._status_label.text == "Batch completed with 2 failed set(s)"
+    assert controller._pending_slider_simulation is True
+    assert controller._pending_slider_sim_request_id == 7
+    assert controller._pending_slider_target_set_ids == ("bad-a", "bad-b")
+    assert scheduled == [controller._run_simulation_from_slider]
+    mw.reset_mechanism_workspaces.assert_not_called()
+    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
+    mw.message_box_critical.assert_called_once()
+
 
 @pytest.mark.unit
 def test_consume_parallel_batch_future_exception_tears_down_pool_and_next_parallel_run_recreates_executor(

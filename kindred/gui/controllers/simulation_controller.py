@@ -9,7 +9,7 @@ import platform
 from datetime import datetime
 from queue import Empty
 from time import perf_counter
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from PySide6 import QtCore
@@ -1934,6 +1934,271 @@ class SimulationController(QtCore.QObject):
             cache_key=str(ctx.get("cache_key") or ""),
         )
 
+    def _scoped_batch_failure_detail_lines(
+        self,
+        *,
+        failed_set_ids: Iterable[str],
+        failed_errors: Mapping[str, Any],
+    ) -> list[str]:
+        detail_lines: list[str] = []
+        for failed_id in sorted(str(set_id) for set_id in failed_set_ids if str(set_id)):
+            failed = coerce_simulation_failure(failed_errors.get(failed_id) or {})
+            try:
+                failed_name = str(self.ui.batch.batch_set_name_for_id(failed_id) or failed_id)
+            except Exception:
+                failed_name = str(failed_id)
+            detail_lines.append(f"{failed_name}: {simulation_failure_user_message(failed)}")
+        return detail_lines
+
+    def _show_scoped_batch_failure_summary(
+        self,
+        *,
+        failed_set_ids: Iterable[str],
+        failed_errors: Mapping[str, Any],
+    ) -> None:
+        failed_ids = [str(set_id) for set_id in failed_set_ids if str(set_id)]
+        failed_count = len(failed_ids)
+        if failed_count <= 0:
+            return
+        detail_lines = self._scoped_batch_failure_detail_lines(
+            failed_set_ids=failed_ids,
+            failed_errors=failed_errors,
+        )
+        self.ui.dialogs.message_box_critical(
+            "Batch Simulation Error",
+            f"Batch completed with {failed_count} failed set(s).",
+            details="\n".join(detail_lines) if detail_lines else None,
+        )
+
+    def _apply_explicit_failure_pending_replay_policy(self, *, fast_mode: bool) -> None:
+        pending_replay_directive = self._completion_policy.resolve_explicit_error_pending_replay(
+            fast_mode=bool(fast_mode),
+            pending_replay=self._completion_policy_pending_replay_state(),
+        )
+        if pending_replay_directive.action in {"queue_fresh", "arm_existing"}:
+            logger.debug("Replaying pending slider update after explicit failure")
+            self._apply_completion_policy_state_patch(
+                PolicyStatePatch(pending_replay=pending_replay_directive)
+            )
+            self._schedule_deferred_preview_replay_handoff_once()
+        else:
+            self._apply_completion_policy_state_patch(
+                PolicyStatePatch(pending_replay=pending_replay_directive)
+            )
+
+    def _record_scoped_batch_failure_cache_state(self, ctx: dict[str, Any], failed_set_id: str) -> None:
+        sid = str(failed_set_id or "")
+        if not sid:
+            return
+        valid_raw = ctx.get("explicit_cache_valid_set_ids")
+        if valid_raw is None:
+            return
+        valid_set_ids = tuple(str(item) for item in (valid_raw or ()) if str(item) and str(item) != sid)
+        invalidated_seen = {
+            str(item)
+            for item in (ctx.get("explicit_cache_invalidated_set_ids") or ())
+            if str(item)
+        }
+        invalidated_seen.add(sid)
+        queue_order = [str(item) for item in (ctx.get("queue_ids") or ()) if str(item)]
+        invalidated_set_ids = tuple(
+            item for item in queue_order if item in invalidated_seen
+        ) + tuple(sorted(item for item in invalidated_seen if item not in set(queue_order)))
+        ctx["explicit_cache_valid_set_ids"] = valid_set_ids
+        ctx["explicit_cache_invalidated_set_ids"] = invalidated_set_ids
+        if str(getattr(self._batch_cache, "active_cache_key", "") or "") == str(ctx.get("cache_key") or ""):
+            self._batch_cache.active_cache_valid_set_ids = valid_set_ids
+            self._batch_cache.active_cache_invalidated_set_ids = invalidated_set_ids
+
+    def _current_mechanism_species_for_batch_sync(self) -> list[str]:
+        try:
+            last_mech = self.ui.mechanism_helpers.last_mechanism()
+            if last_mech is not None and hasattr(last_mech, "species_names"):
+                species_names = [str(name) for name in (last_mech.species_names() or ()) if str(name)]
+                if species_names:
+                    return species_names
+        except Exception:
+            pass
+        try:
+            mechanism_text = str(self.ui.mechanism.get_mechanism_text() or "")
+            if not mechanism_text.strip():
+                return []
+            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.units import UnitsModel
+
+            temperature_K = self.ui.solver.dsl_global_temperature_K(mechanism_text)
+            if temperature_K is None:
+                temperature_K = float(self.ui.solver.temperature_spinbox_value())
+            mechanism = parse_dsl_to_mechanism(
+                mechanism_text,
+                initials={},
+                units=UnitsModel(temperature_K=float(temperature_K), energy_unit="kJ/mol"),
+            )
+            return [str(name) for name in (mechanism.species_names() or ()) if str(name)]
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to resolve mechanism species after partial staged overlay reset",
+                exc,
+            )
+            return []
+
+    def _finalize_scoped_batch_success_subset(self, ctx: Mapping[str, Any]) -> tuple[str, ...]:
+        if not isinstance(ctx, Mapping):
+            return ()
+        policy_context = self._completion_policy_context_from_raw(ctx)
+        if policy_context is None:
+            return ()
+        reset_target_set_ids = tuple(policy_context.pending_workspace_reset_set_ids)
+        dirty_reset_decision = self._completion_policy.resolve_explicit_dirty_reset(
+            context=policy_context,
+            dirty_state_by_set_id=self._capture_dirty_state_by_set_id(reset_target_set_ids),
+        )
+        eligible_reset_set_ids = list(dirty_reset_decision.eligible_reset_set_ids)
+        workspaces_cleared = False
+        if eligible_reset_set_ids:
+            try:
+                workspaces_cleared = bool(
+                    self.ui.slider.reset_mechanism_workspaces(eligible_reset_set_ids)
+                )
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    "Failed to clear targeted slider workspaces after partial canonical explicit run",
+                    exc,
+                )
+        overlays_cleared = False
+        if eligible_reset_set_ids:
+            try:
+                overlays_cleared = bool(
+                    self.ui.slider.discard_concentration_overlays_for_set_ids(
+                        eligible_reset_set_ids
+                    )
+                )
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    "Failed to clear staged concentration overlays after partial canonical explicit run",
+                    exc,
+                )
+        updated_context = self._apply_completion_policy_state_patch(
+            dirty_reset_decision.state_patch,
+            base_context=ctx,
+        )
+        if updated_context is not None:
+            ctx = self._batch_run_context
+        if overlays_cleared:
+            species_for_sync = self._current_mechanism_species_for_batch_sync()
+            if species_for_sync:
+                try:
+                    self.ui.batch.sync_batch_species_columns(
+                        species_for_sync,
+                        preserve_active_cache=True,
+                    )
+                except Exception as exc:
+                    self._record_nonfatal_exception(
+                        "Failed to refresh batch/species surfaces after partial staged overlay reset",
+                        exc,
+                    )
+        if workspaces_cleared or overlays_cleared:
+            pending_replay_directive = self._completion_policy.resolve_pending_replay_after_canonical_reset(
+                pending_replay=self._completion_policy_pending_replay_state(),
+                reset_set_ids=tuple(eligible_reset_set_ids),
+            )
+            self._apply_completion_policy_state_patch(
+                PolicyStatePatch(pending_replay=pending_replay_directive)
+            )
+        if eligible_reset_set_ids:
+            try:
+                self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
+                    use_workspace=True
+                )
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    "Failed to resync focused mechanism controls after partial canonical explicit run",
+                    exc,
+                )
+        self.flush_slider_plot_updates(
+            force=True,
+            cache_key=str(ctx.get("cache_key") or ""),
+            request_id=ctx.get("request_id"),
+            run_id=ctx.get("run_id"),
+        )
+        return tuple(eligible_reset_set_ids)
+
+    def _try_handle_scoped_batch_failure(
+        self,
+        *,
+        set_id: str,
+        set_name: str,
+        error_payload: Mapping[str, Any],
+    ) -> bool:
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if not (isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel")):
+            return False
+        if bool(ctx.get("fast_mode")):
+            return False
+        queue_ids = [str(item) for item in (ctx.get("queue_ids") or ()) if str(item)]
+        total = _safe_int(ctx.get("total"), default=max(1, len(queue_ids)))
+        total = max(1, total or len(queue_ids) or 1)
+        if total <= 1:
+            return False
+
+        sid = str(set_id or "")
+        failure = coerce_simulation_failure(error_payload)
+        completed_ids = set(str(item) for item in (ctx.get("completed_set_ids") or ()) if str(item))
+        failed_set_ids = set(str(item) for item in (ctx.get("failed_set_ids") or ()) if str(item))
+        failed_errors = dict(ctx.get("failed_set_errors") or {})
+        completed_ids.add(sid)
+        failed_set_ids.add(sid)
+        failed_errors[sid] = failure
+        pending_reset_ids = [
+            str(item)
+            for item in (ctx.get("pending_workspace_reset_set_ids") or ())
+            if str(item) and str(item) != sid
+        ]
+        pending_reset_generations = dict(ctx.get("pending_dirty_reset_generation_by_set_id") or {})
+        pending_reset_generations.pop(sid, None)
+        self._record_scoped_batch_failure_cache_state(ctx, sid)
+        ctx["completed_set_ids"] = sorted(completed_ids)
+        ctx["failed_set_ids"] = sorted(failed_set_ids)
+        ctx["failed_set_errors"] = failed_errors
+        ctx["pending_workspace_reset_set_ids"] = pending_reset_ids
+        ctx["pending_dirty_reset_generation_by_set_id"] = pending_reset_generations
+        self._batch_run_context = dict(ctx)
+        self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
+        ctx = dict(getattr(self, "_batch_run_context", {}) or ctx)
+
+        completed_count = len(completed_ids)
+        if completed_count < total:
+            if total > 1:
+                self.ui.run_ui.set_sim_progress_value(
+                    max(0, min(100, int((completed_count / float(total)) * 100.0)))
+                )
+            label = str(set_name or sid or "set")
+            self.ui.run_ui.set_status_text(f"Failed {label} ({completed_count}/{total})")
+            return True
+
+        ctx["active"] = False
+        self._batch_run_context = dict(ctx)
+        self._finalize_scoped_batch_success_subset(ctx)
+        ctx = dict(getattr(self, "_batch_run_context", {}) or ctx)
+        self._cleanup_parallel_batch_executor_after_run(
+            keep_executor_alive=False,
+            clear_pending_plot_updates=False,
+        )
+        self._simulation_running = False
+        self._slider_simulation_active = False
+        self.ui.slider.set_slider_triggered_simulation(False)
+        self.ui.run_ui.set_sim_progress_value(100)
+        self.ui.run_ui.set_run_button_enabled(True)
+        self.ui.run_ui.set_stop_button_enabled(False)
+        failed_count = len(failed_set_ids)
+        self.ui.run_ui.set_status_text(f"Batch completed with {failed_count} failed set(s)")
+        self._show_scoped_batch_failure_summary(
+            failed_set_ids=failed_set_ids,
+            failed_errors=failed_errors,
+        )
+        self._apply_explicit_failure_pending_replay_policy(fast_mode=False)
+        return True
+
     def _consume_parallel_batch_future(
         self,
         *,
@@ -1975,6 +2240,12 @@ class SimulationController(QtCore.QObject):
             return False
 
         if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
+            if self._try_handle_scoped_batch_failure(
+                set_id=sid,
+                set_name=set_name,
+                error_payload=payload["error"],
+            ):
+                return True
             self._dispatch_simulation_error(
                 payload["error"],
                 run_id=run_id,
@@ -4660,10 +4931,30 @@ class SimulationController(QtCore.QObject):
                         request_id=request_id,
                         run_id=run_id,
                     )
+                failed_set_ids = []
+                failed_errors: Mapping[str, Any] = {}
+                if isinstance(ctx, Mapping):
+                    failed_set_ids = [
+                        str(set_id)
+                        for set_id in (ctx.get("failed_set_ids") or ())
+                        if str(set_id)
+                    ]
+                    raw_failed_errors = ctx.get("failed_set_errors")
+                    if isinstance(raw_failed_errors, Mapping):
+                        failed_errors = raw_failed_errors
+
                 self.ui.run_ui.set_sim_progress_value(100)
-                self.ui.run_ui.set_status_text(
-                    f"Simulation complete: {len(species_names)} species, {len(t)} points"
-                )
+                if failed_set_ids and not bool(is_preview):
+                    failed_count = len(failed_set_ids)
+                    self.ui.run_ui.set_status_text(f"Batch completed with {failed_count} failed set(s)")
+                    self._show_scoped_batch_failure_summary(
+                        failed_set_ids=failed_set_ids,
+                        failed_errors=failed_errors,
+                    )
+                else:
+                    self.ui.run_ui.set_status_text(
+                        f"Simulation complete: {len(species_names)} species, {len(t)} points"
+                    )
 
                 self.ui.run_ui.repaint_simulation_widgets()
 
@@ -4854,20 +5145,7 @@ class SimulationController(QtCore.QObject):
                 logger.debug("Resuming pending slider update after cancellation")
                 self._schedule_deferred_preview_replay_handoff_once()
         else:
-            pending_replay_directive = self._completion_policy.resolve_explicit_error_pending_replay(
-                fast_mode=bool(fast_mode),
-                pending_replay=self._completion_policy_pending_replay_state(),
-            )
-            if pending_replay_directive.action in {"queue_fresh", "arm_existing"}:
-                logger.debug("Replaying pending slider update after explicit failure")
-                self._apply_completion_policy_state_patch(
-                    PolicyStatePatch(pending_replay=pending_replay_directive)
-                )
-                self._schedule_deferred_preview_replay_handoff_once()
-            else:
-                self._apply_completion_policy_state_patch(
-                    PolicyStatePatch(pending_replay=pending_replay_directive)
-                )
+            self._apply_explicit_failure_pending_replay_policy(fast_mode=bool(fast_mode))
 
         self._invalidate_preserved_pending_init_results_after_failed_run(
             ctx=ctx if isinstance(ctx, Mapping) else None,
