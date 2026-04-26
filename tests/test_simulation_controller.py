@@ -4950,20 +4950,23 @@ def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
     controller._run_simulation_internal(fast_mode=True, request_id=7, batch_rows=[0, 1], reuse_parallel_executor=False)
 
     prepared_by_set_id = controller._batch_run_context["prepared_by_set_id"]
-    execution_request_by_set_id = controller._batch_run_context["execution_request_by_set_id"]
     simulation_plan_by_set_id = controller._batch_run_context["simulation_plan_by_set_id"]
     assert controller._batch_run_context["prepared"] is None
-    assert controller._batch_run_context["execution_request"] is None
+    assert "execution_request" not in controller._batch_run_context
+    assert "execution_request_by_set_id" not in controller._batch_run_context
     assert prepared_by_set_id["id1"]["mechanism"]["bound_set_id"] == "id1"
     assert prepared_by_set_id["id2"]["mechanism"]["bound_set_id"] == "id2"
-    assert execution_request_by_set_id["id1"]["prepared_payload"]["mechanism"]["bound_set_id"] == "id1"
-    assert execution_request_by_set_id["id2"]["prepared_payload"]["mechanism"]["bound_set_id"] == "id2"
-    assert execution_request_by_set_id["id1"]["initials"] == {"A": 2.5}
-    assert execution_request_by_set_id["id2"]["initials"] == {"A": 5.5}
     plan = SimulationPlan.from_payload(simulation_plan_by_set_id["id1"])
     assert plan.execution_mode == "preview"
     assert plan.algebra_policy is SimulationAlgebraPolicy.GUI_BEST_EFFORT
-    assert plan.to_execution_request().to_payload() == execution_request_by_set_id["id1"]
+    request_id1 = plan.to_execution_request().to_payload()
+    request_id2 = SimulationPlan.from_payload(
+        simulation_plan_by_set_id["id2"]
+    ).to_execution_request().to_payload()
+    assert request_id1["prepared_payload"]["mechanism"]["bound_set_id"] == "id1"
+    assert request_id2["prepared_payload"]["mechanism"]["bound_set_id"] == "id2"
+    assert request_id1["initials"] == {"A": 2.5}
+    assert request_id2["initials"] == {"A": 5.5}
     assert created_runtimes[0] is not created_runtimes[1]
 
 @pytest.mark.unit
@@ -5719,6 +5722,8 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
 def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payload_and_mechanism_text(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
     created: dict[str, object] = {}
 
     class _RecordingWorker:
@@ -5746,6 +5751,14 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
     controller._release_current_simulation_worker = MagicMock()
+    request_payload = {
+        "prepared_payload": {"version": 2, "prepared_for": "id2"},
+        "initials": {"A": 1.5},
+        "t_span": (0.0, 10.0),
+        "solver_config": {"solver": "BDF"},
+        "mechanism_text": "reaction: A -> B; k=3",
+        "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+    }
     controller._batch_run_context = {
         "active": True,
         "parallel": False,
@@ -5768,15 +5781,14 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
             "id1": {"prepared_for": "id1"},
             "id2": {"prepared_for": "id2"},
         },
-        "execution_request_by_set_id": {
-            "id2": {
-                "prepared_payload": {"version": 2, "prepared_for": "id2"},
-                "initials": {"A": 1.5},
-                "t_span": (0.0, 10.0),
-                "solver_config": {"solver": "BDF"},
-                "mechanism_text": "reaction: A -> B; k=3",
-                "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
-            },
+        "simulation_plan_by_set_id": {
+            "id2": SimulationPlan.from_execution_request(
+                request_payload,
+                execution_mode="preview",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                cache_identity_payload={"cache_key": "slider-cache"},
+                metadata={"set_id": "id2", "set_name": "set2", "fast_mode": True},
+            ).to_payload(),
         },
         "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
@@ -5795,10 +5807,12 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
     assert created["prepared"] == {"prepared_for": "id2"}
     assert created["started"] is True
     worker = controller._simulation_worker
-    assert getattr(worker, "_execution_request", None) is not None
-    assert worker._execution_request["prepared_payload"] == {"version": 2, "prepared_for": "id2"}  # type: ignore[index]
-    assert worker._execution_request["initials"] == {"A": 1.5}  # type: ignore[index]
-    assert worker._execution_request["mechanism_text"] == "reaction: A -> B; k=3"  # type: ignore[index]
+    worker_plan = SimulationPlan.from_payload(getattr(worker, "_simulation_plan", None))
+    worker_request = worker_plan.to_execution_request().to_payload()
+    assert worker_request["prepared_payload"] == {"version": 2, "prepared_for": "id2"}
+    assert worker_request["initials"] == {"A": 1.5}
+    assert worker_request["mechanism_text"] == "reaction: A -> B; k=3"
+    assert getattr(worker, "_execution_request", None) is None
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prepared_payload(
@@ -5853,8 +5867,6 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
         "prepared_by_set_id": {
             "id1": {"prepared_for": "id1"},
         },
-        "execution_request": None,
-        "execution_request_by_set_id": {},
         "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": True,
@@ -6230,7 +6242,12 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
 
     controller._start_parallel_batch_simulations()
 
-    assert submitted and submitted[0]["initials"] == {"A": 1.0}
+    assert submitted
+    from kindred.core.simulation_plan import SimulationPlan
+
+    submitted_request = SimulationPlan.from_payload(submitted[0]["simulation_plan"]).to_execution_request().to_payload()
+    assert submitted_request["initials"] == {"A": 1.0}
+    assert "initials" not in submitted[0]
     mw.preview_initials_for_row.assert_not_called()
 
 @pytest.mark.unit
@@ -7631,7 +7648,7 @@ def test_run_simulation_internal_non_fast_mode_does_not_build_prepared_payloads(
     mw._apply_slider_overrides_to_bindings.assert_not_called()
 
 @pytest.mark.unit
-def test_run_simulation_internal_non_fast_mode_builds_execution_requests(
+def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
@@ -7707,15 +7724,14 @@ def test_run_simulation_internal_non_fast_mode_builds_execution_requests(
 
     controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0], reuse_parallel_executor=False)
 
-    execution_request_by_set_id = controller._batch_run_context.get("execution_request_by_set_id", {})
     simulation_plan_by_set_id = controller._batch_run_context.get("simulation_plan_by_set_id", {})
-    assert "id1" in execution_request_by_set_id
+    assert "execution_request" not in controller._batch_run_context
+    assert "execution_request_by_set_id" not in controller._batch_run_context
     assert "id1" in simulation_plan_by_set_id
-    request = execution_request_by_set_id["id1"]
     plan = SimulationPlan.from_payload(simulation_plan_by_set_id["id1"])
+    request = plan.to_execution_request().to_payload()
     assert plan.execution_mode == "explicit"
     assert plan.algebra_policy is SimulationAlgebraPolicy.GUI_BEST_EFFORT
-    assert plan.to_execution_request().to_payload() == request
     assert request["prepared_payload"] is None
     assert request["initials"] == {"A": 1.0}
     assert tuple(request["t_span"]) == (0.0, 10.0)
@@ -7727,9 +7743,11 @@ def test_run_simulation_internal_non_fast_mode_builds_execution_requests(
     mw._apply_slider_overrides_to_bindings.assert_not_called()
 
 @pytest.mark.unit
-def test_run_simulation_internal_non_fast_mode_multiset_execution_requests_do_not_inherit_primary_dsl(
+def test_run_simulation_internal_non_fast_mode_multiset_plans_do_not_inherit_primary_dsl(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
+    from kindred.core.simulation_plan import SimulationPlan
+
     class _Text:
         def __init__(self, text: str) -> None:
             self._text = text
@@ -7816,13 +7834,17 @@ def test_run_simulation_internal_non_fast_mode_multiset_execution_requests_do_no
 
     controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0, 1], reuse_parallel_executor=False)
 
-    execution_request_by_set_id = controller._batch_run_context.get("execution_request_by_set_id", {})
-    assert execution_request_by_set_id["id1"]["prepared_payload"] is None
-    assert execution_request_by_set_id["id2"]["prepared_payload"] is None
-    assert execution_request_by_set_id["id1"]["mechanism_text"] == "reaction: A -> B; k=PRIMARY"
-    assert execution_request_by_set_id["id2"]["mechanism_text"] == "reaction: A -> B; k=PRIMARY"
-    assert execution_request_by_set_id["id1"]["initials"] == {"A": 1.0}
-    assert execution_request_by_set_id["id2"]["initials"] == {"A": 4.0}
+    assert "execution_request" not in controller._batch_run_context
+    assert "execution_request_by_set_id" not in controller._batch_run_context
+    plan_by_set_id = controller._batch_run_context.get("simulation_plan_by_set_id", {})
+    request_id1 = SimulationPlan.from_payload(plan_by_set_id["id1"]).to_execution_request().to_payload()
+    request_id2 = SimulationPlan.from_payload(plan_by_set_id["id2"]).to_execution_request().to_payload()
+    assert request_id1["prepared_payload"] is None
+    assert request_id2["prepared_payload"] is None
+    assert request_id1["mechanism_text"] == "reaction: A -> B; k=PRIMARY"
+    assert request_id2["mechanism_text"] == "reaction: A -> B; k=PRIMARY"
+    assert request_id1["initials"] == {"A": 1.0}
+    assert request_id2["initials"] == {"A": 4.0}
     mw.preview_initials_for_row.assert_not_called()
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
@@ -7893,7 +7915,7 @@ def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
     mw.preview_initials_for_row.assert_not_called()
 
 @pytest.mark.unit
-def test_start_next_batch_simulation_non_fast_mode_sets_structured_execution_request(
+def test_start_next_batch_simulation_non_fast_mode_sets_plan_only_execution_boundary(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
@@ -7949,7 +7971,6 @@ def test_start_next_batch_simulation_non_fast_mode_sets_structured_execution_req
         "queue_names": ["set1"],
         "full_dsl": "reaction: A -> B; k=1",
         "simulation_plan_by_set_id": {"id1": plan_payload},
-        "execution_request_by_set_id": {},
         "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
         "fast_mode": False,
@@ -7968,11 +7989,11 @@ def test_start_next_batch_simulation_non_fast_mode_sets_structured_execution_req
     worker = controller._simulation_worker
     worker_plan = SimulationPlan.from_payload(getattr(worker, "_simulation_plan", None))
     assert worker_plan.algebra_policy is SimulationAlgebraPolicy.GUI_BEST_EFFORT
-    assert worker_plan.to_execution_request().to_payload()["prepared_payload"] is None
-    assert getattr(worker, "_execution_request", None) is not None
-    assert worker._execution_request["initials"] == {"A": 3.0}  # type: ignore[index]
-    assert worker._execution_request["prepared_payload"] is None  # type: ignore[index]
-    assert worker._execution_request["mechanism_text"] == "reaction: A -> B; k=1"  # type: ignore[index]
+    worker_request = worker_plan.to_execution_request().to_payload()
+    assert worker_request["initials"] == {"A": 3.0}
+    assert worker_request["prepared_payload"] is None
+    assert worker_request["mechanism_text"] == "reaction: A -> B; k=1"
+    assert getattr(worker, "_execution_request", None) is None
 
 
 @pytest.mark.unit
@@ -8019,7 +8040,6 @@ def test_start_parallel_batch_simulations_submits_simulation_plan_payload(
         "effective_workers": 2,
         "full_dsl": "reaction: A -> B; k=1",
         "simulation_plan_by_set_id": {"id1": plan_payload},
-        "execution_request_by_set_id": {},
         "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=1"},
         "mechanism_signature_by_set_id": {"id1": "sig"},
         "simulation_identity_by_set_id": {
@@ -8037,6 +8057,8 @@ def test_start_parallel_batch_simulations_submits_simulation_plan_payload(
 
     task = submitted["task"]
     assert "simulation_plan" in task
+    assert "execution_request" not in task
+    assert "mechanism_signature" not in task
     submitted_plan = SimulationPlan.from_payload(task["simulation_plan"])  # type: ignore[arg-type]
     assert submitted_plan.algebra_policy is SimulationAlgebraPolicy.BATCH_BEST_EFFORT
     request = submitted_plan.to_execution_request().to_payload()
@@ -8074,7 +8096,6 @@ def test_start_parallel_batch_simulations_fast_fallback_submits_preview_plan_wit
         "effective_workers": 2,
         "full_dsl": "reaction: A -> B; k=1",
         "simulation_plan_by_set_id": {},
-        "execution_request_by_set_id": {},
         "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=4"},
         "mechanism_signature_by_set_id": {"id1": "sig"},
         "simulation_identity_by_set_id": {
@@ -8159,7 +8180,6 @@ def test_start_parallel_batch_simulations_fast_existing_gui_plan_submits_batch_p
         "effective_workers": 2,
         "full_dsl": "reaction: A -> B; k=1",
         "simulation_plan_by_set_id": {"id1": plan_payload},
-        "execution_request_by_set_id": {},
         "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=4"},
         "mechanism_signature_by_set_id": {"id1": "sig"},
         "simulation_identity_by_set_id": {
@@ -8176,6 +8196,7 @@ def test_start_parallel_batch_simulations_fast_existing_gui_plan_submits_batch_p
     controller._start_parallel_batch_simulations()
 
     task = submitted["task"]
+    assert "execution_request" not in task
     submitted_plan = SimulationPlan.from_payload(task["simulation_plan"])  # type: ignore[arg-type]
     assert submitted_plan.execution_mode == "preview"
     assert submitted_plan.algebra_policy is SimulationAlgebraPolicy.BATCH_BEST_EFFORT
@@ -8185,13 +8206,15 @@ def test_start_parallel_batch_simulations_fast_existing_gui_plan_submits_batch_p
     assert submitted_plan.version == SimulationPlan.from_payload(plan_payload).version
     expected_request_payload = {**request_payload, "version": 1}
     assert submitted_plan.to_execution_request().to_payload() == expected_request_payload
-    assert task["execution_request"] == expected_request_payload
+    assert "execution_request" not in task
 
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_result_payload_mode(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
     created: dict[str, object] = {}
 
     class _RecordingWorker:
@@ -8221,6 +8244,14 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
     controller._release_current_simulation_worker = MagicMock()
+    request_payload = {
+        "prepared_payload": {"version": 1, "prepared_for": "id2"},
+        "initials": {"A": 3.0},
+        "t_span": (0.0, 10.0),
+        "solver_config": {"solver": "BDF"},
+        "mechanism_text": "reaction: A -> B; k=2",
+        "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+    }
     controller._batch_run_context = {
         "active": True,
         "parallel": False,
@@ -8230,15 +8261,14 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
         "queue_names": ["set1", "set2"],
         "primary_set_id": "id1",
         "full_dsl": "reaction: A -> B; k=1",
-        "execution_request_by_set_id": {
-            "id2": {
-                "prepared_payload": {"version": 1, "prepared_for": "id2"},
-                "initials": {"A": 3.0},
-                "t_span": (0.0, 10.0),
-                "solver_config": {"solver": "BDF"},
-                "mechanism_text": "reaction: A -> B; k=2",
-                "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
-            },
+        "simulation_plan_by_set_id": {
+            "id2": SimulationPlan.from_execution_request(
+                request_payload,
+                execution_mode="explicit",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                cache_identity_payload={"cache_key": "explicit-cache"},
+                metadata={"set_id": "id2", "set_name": "set2", "fast_mode": False},
+            ).to_payload(),
         },
         "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
@@ -8256,10 +8286,12 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
     assert created["started"] is True
     assert created["include_mechanism_in_result_payload"] is False
     worker = controller._simulation_worker
-    assert getattr(worker, "_execution_request", None) is not None
-    assert worker._execution_request["initials"] == {"A": 3.0}  # type: ignore[index]
-    assert worker._execution_request["prepared_payload"] is None  # type: ignore[index]
-    assert worker._execution_request["mechanism_text"] == "reaction: A -> B; k=2"  # type: ignore[index]
+    worker_plan = SimulationPlan.from_payload(getattr(worker, "_simulation_plan", None))
+    worker_request = worker_plan.to_execution_request().to_payload()
+    assert worker_request["initials"] == {"A": 3.0}
+    assert worker_request["prepared_payload"] is None
+    assert worker_request["mechanism_text"] == "reaction: A -> B; k=2"
+    assert getattr(worker, "_execution_request", None) is None
 
 
 @pytest.mark.unit
@@ -8311,7 +8343,6 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
             "id2": {"schema_id": "schema-b", "param_fingerprint": "fingerprint-b"}
         },
         "simulation_plan_by_set_id": {},
-        "execution_request_by_set_id": {},
         "prepared_by_set_id": {},
         "solver_config": {"solver": "BDF"},
         "t_end": 10.0,
@@ -8335,9 +8366,10 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
     assert plan.to_execution_request().to_payload()["mechanism_text"] == "reaction: A -> B; k=3"
 
 @pytest.mark.unit
-def test_run_simulation_internal_energy_mode_builds_structured_execution_requests(
+def test_run_simulation_internal_energy_mode_builds_simulation_plans(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
+    from kindred.core.simulation_plan import SimulationPlan
     from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 
     class _Text:
@@ -8423,11 +8455,13 @@ def test_run_simulation_internal_energy_mode_builds_structured_execution_request
     controller._run_simulation_internal(fast_mode=False, request_id=99, batch_rows=[0], reuse_parallel_executor=False)
 
     prepared_by_set_id = controller._batch_run_context.get("prepared_by_set_id", {})
-    execution_request_by_set_id = controller._batch_run_context.get("execution_request_by_set_id", {})
+    simulation_plan_by_set_id = controller._batch_run_context.get("simulation_plan_by_set_id", {})
 
     assert prepared_by_set_id == {}
-    assert "id1" in execution_request_by_set_id
-    assert execution_request_by_set_id["id1"]["prepared_payload"] is None
+    assert "execution_request" not in controller._batch_run_context
+    assert "execution_request_by_set_id" not in controller._batch_run_context
+    request = SimulationPlan.from_payload(simulation_plan_by_set_id["id1"]).to_execution_request().to_payload()
+    assert request["prepared_payload"] is None
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
 
@@ -8539,7 +8573,12 @@ def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentrat
 
     controller._start_parallel_batch_simulations()
 
-    assert submitted and submitted[0]["initials"] == {"A": 1.0}
+    assert submitted
+    from kindred.core.simulation_plan import SimulationPlan
+
+    submitted_request = SimulationPlan.from_payload(submitted[0]["simulation_plan"]).to_execution_request().to_payload()
+    assert submitted_request["initials"] == {"A": 1.0}
+    assert "initials" not in submitted[0]
     mw.preview_initials_for_row.assert_not_called()
 
 

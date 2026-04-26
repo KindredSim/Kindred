@@ -8,6 +8,7 @@ import pytest
 from PySide6 import QtCore
 
 from kindred.core.batch_parallel import run_batch_simulation_task
+from kindred.core.simulation_plan import SimulationPlan
 
 pytestmark = [pytest.mark.gui]
 
@@ -158,9 +159,13 @@ def test_slider_parallel_path_uses_per_set_local_mechanism_workspaces(main_windo
     assert main_window.simulation_controller.parallel_batch.executor is fake
     submitted_by_set_id = {str(sub.args[0]["set_id"]): dict(sub.args[0]) for sub in _simulation_submissions(fake)}
     assert len(submitted_by_set_id) == 3
-    assert "k=0.5" in str(submitted_by_set_id[set0_id]["mechanism_text"])
-    assert "k=0.75" in str(submitted_by_set_id[set1_id]["mechanism_text"])
-    assert "k=0.25" in str(submitted_by_set_id[set2_id]["mechanism_text"])
+    submitted_text_by_set_id = {
+        set_id: SimulationPlan.from_payload(task["simulation_plan"]).to_execution_request().mechanism_text
+        for set_id, task in submitted_by_set_id.items()
+    }
+    assert "k=0.5" in submitted_text_by_set_id[set0_id]
+    assert "k=0.75" in submitted_text_by_set_id[set1_id]
+    assert "k=0.25" in submitted_text_by_set_id[set2_id]
     main_window.simulation_controller.shutdown_batch_executor(force_terminate=True)
 
 

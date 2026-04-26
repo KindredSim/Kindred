@@ -231,30 +231,29 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     simulation_plan = task.get("simulation_plan")
     algebra_policy = _algebra_policy_from_simulation_plan(simulation_plan)
     plan_execution_request = _execution_request_payload_from_simulation_plan(simulation_plan)
-    execution_request = task.get("execution_request")
+    has_plan_execution_request = isinstance(plan_execution_request, Mapping)
+    if not has_plan_execution_request and "execution_request" in task:
+        raise SimulationPreparationError(
+            "execution_request",
+            "Batch task execution_request payloads must be carried by simulation_plan.",
+        )
+    execution_request = None
     mechanism_text = str(task.get("mechanism_text") or "")
     solver_config = dict(task.get("solver_config") or {})
     initials = dict(task.get("initials") or {})
     signature = str(task.get("mechanism_signature") or "").strip()
     simulation_identity = task.get("simulation_identity")
     include_mechanism_in_result_payload = bool(task.get("include_mechanism_in_result_payload", False))
-    if isinstance(plan_execution_request, Mapping) and not isinstance(execution_request, Mapping):
+    if has_plan_execution_request:
+        mechanism_text = str(plan_execution_request.get("mechanism_text") or mechanism_text or "")
+        solver_config = dict(plan_execution_request.get("solver_config") or solver_config)
+        initials = dict(plan_execution_request.get("initials") or initials)
+        simulation_identity = plan_execution_request.get("simulation_identity") or simulation_identity
         if plan_execution_request.get("prepared_payload") is not None:
             execution_request = plan_execution_request
         else:
-            mechanism_text = str(plan_execution_request.get("mechanism_text") or mechanism_text or "")
-            solver_config = dict(plan_execution_request.get("solver_config") or solver_config)
-            initials = dict(plan_execution_request.get("initials") or initials)
-            simulation_identity = plan_execution_request.get("simulation_identity") or simulation_identity
+            execution_request = None
     structured_prepared_request = isinstance(execution_request, Mapping) and execution_request.get("prepared_payload") is not None
-    if isinstance(execution_request, Mapping):
-        if structured_prepared_request:
-            mechanism_text = str(execution_request.get("mechanism_text") or "")
-        else:
-            mechanism_text = str(execution_request.get("mechanism_text") or mechanism_text or "")
-        solver_config = dict(execution_request.get("solver_config") or solver_config)
-        initials = dict(execution_request.get("initials") or initials)
-        simulation_identity = execution_request.get("simulation_identity") or simulation_identity
     temperature_K = float(solver_config.get("temperature_K") or 298.15)
     wegscheider_enabled = bool(
         solver_config.get(

@@ -509,10 +509,10 @@ def test_serial_fitting_evaluator_process_payload_round_trip_matches_original() 
     expected = evaluator({"init:A": 1.0})
     payload = evaluator.to_process_payload()
     assert "simulation_plan" in payload
+    assert "execution_request" not in payload
     process_plan = SimulationPlan.from_payload(payload["simulation_plan"])
     assert process_plan.execution_mode == "fitting"
     assert process_plan.algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT
-    _assert_execution_request_payloads_equal(process_plan.execution_request.to_payload(), payload["execution_request"])
 
     restored = SerialFittingEvaluator.from_process_payload(payload)
     assert restored.context.simulation_plan.execution_mode == "fitting"
@@ -560,9 +560,10 @@ def test_serial_fitting_evaluator_process_payload_is_picklable_without_prepared_
 
     payload = evaluator.to_process_payload()
 
-    assert payload["execution_request"]["prepared_payload"] is not None
-    _assert_execution_request_payloads_equal(payload["simulation_plan"]["execution_request"], payload["execution_request"])
-    assert "rhs" not in payload["execution_request"]["prepared_payload"]
+    assert "execution_request" not in payload
+    plan_request = payload["simulation_plan"]["execution_request"]
+    assert plan_request["prepared_payload"] is not None
+    assert "rhs" not in plan_request["prepared_payload"]
     pickle.dumps(payload)
 
 
@@ -635,7 +636,7 @@ def test_serial_fitting_evaluator_from_process_payload_rejects_malformed_simulat
         SerialFittingEvaluator.from_process_payload(payload)
 
 
-def test_serial_fitting_evaluator_from_process_payload_rejects_plan_request_binding_mismatch() -> None:
+def test_serial_fitting_evaluator_from_process_payload_rejects_legacy_execution_request_key() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 
     mechanism_text = "\n".join(
@@ -656,42 +657,9 @@ def test_serial_fitting_evaluator_from_process_payload_rejects_plan_request_bind
         initial_prefix="init:",
     )
     payload = SerialFittingEvaluator(context).to_process_payload()
-    plan_bindings = payload["simulation_plan"]["execution_request"]["prepared_payload"]["bindings"]
-    request_bindings = payload["execution_request"]["prepared_payload"]["bindings"]
-    plan_bindings["k1"] = {"name": "k1", "value": 0.2}
-    request_bindings["k1"] = {"name": "k1", "value": 0.9}
+    payload["execution_request"] = context.execution_request.to_payload()
 
-    with pytest.raises(ValueError, match="does not match"):
-        SerialFittingEvaluator.from_process_payload(payload)
-
-
-def test_serial_fitting_evaluator_from_process_payload_rejects_scalar_binding_mismatch() -> None:
-    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-
-    mechanism_text = "\n".join(
-        [
-            "reaction: A -> B; k=0.2",
-            "initial: A=1.0",
-            "initial: B=0.0",
-        ]
-    )
-    context = prepare_fitting_execution_context(
-        mechanism_text=mechanism_text,
-        param_names=["k1"],
-        t_end=1.0,
-        num_points=5,
-        solver="BDF",
-        rtol=1e-6,
-        atol=1e-12,
-        initial_prefix="init:",
-    )
-    payload = SerialFittingEvaluator(context).to_process_payload()
-    plan_bindings = payload["simulation_plan"]["execution_request"]["prepared_payload"]["bindings"]
-    request_bindings = payload["execution_request"]["prepared_payload"]["bindings"]
-    plan_bindings["k1"] = 0.2
-    request_bindings["k1"] = 0.9
-
-    with pytest.raises(ValueError, match="does not match"):
+    with pytest.raises(KeyError, match="execution_request"):
         SerialFittingEvaluator.from_process_payload(payload)
 
 
@@ -776,18 +744,17 @@ def test_serial_fitting_evaluator_from_process_payload_requires_all_fields() -> 
     )
     payload = SerialFittingEvaluator(context).to_process_payload()
 
-    for missing_key in ("simulation_plan", "execution_request"):
-        incomplete_payload = dict(payload)
-        incomplete_payload.pop(missing_key)
-        with pytest.raises(KeyError, match=missing_key):
-            SerialFittingEvaluator.from_process_payload(incomplete_payload)
+    incomplete_payload = dict(payload)
+    incomplete_payload.pop("simulation_plan")
+    with pytest.raises(KeyError, match="simulation_plan"):
+        SerialFittingEvaluator.from_process_payload(incomplete_payload)
 
     with pytest.raises(KeyError, match="simulation_plan"):
         SerialFittingEvaluator.from_process_payload(
             {
                 name: value
                 for name, value in payload.items()
-                if name not in {"simulation_plan", "execution_request"}
+                if name != "simulation_plan"
             }
         )
 

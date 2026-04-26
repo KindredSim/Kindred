@@ -100,9 +100,15 @@ def test_simulation_worker_reads_algebra_policy_from_attached_plan(monkeypatch, 
     from kindred.gui.simulation_worker import SimulationWorker
 
     captured = {}
+    captured_prepare_kwargs = {}
+
+    def _capture_prepare_kwargs(**kwargs):
+        captured_prepare_kwargs.update(kwargs)
+        return _prepared_payload(algebra_text="obs = A")
+
     monkeypatch.setattr(
         "kindred.core.simulation_preparation.prepare_simulation_worker_run",
-        lambda **_kwargs: _prepared_payload(algebra_text="obs = A"),
+        _capture_prepare_kwargs,
     )
     monkeypatch.setattr(
         "kindred.core.simulator.solvers.solve_ode",
@@ -142,6 +148,8 @@ def test_simulation_worker_reads_algebra_policy_from_attached_plan(monkeypatch, 
 
     worker.wait(1000)
     assert captured["policy"] is SimulationAlgebraPolicy.GUI_BEST_EFFORT
+    assert captured_prepare_kwargs["execution_request"]["mechanism_text"] == "reaction: A -> B; k=0.2"
+    assert captured_prepare_kwargs["execution_request"]["initials"] == {"A": 1.0}
 
 
 def test_simulation_worker_unexpected_internal_failure_reports_stage(monkeypatch, qtbot):

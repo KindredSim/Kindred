@@ -11,7 +11,7 @@ This module provides:
 import logging
 import traceback
 import numpy as np
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from PySide6 import QtCore
 from PySide6.QtCore import Signal
 
@@ -143,6 +143,19 @@ class SimulationWorker(QtCore.QThread):
             self.progress.emit(percent, f"Solving ODEs... t={t:.3f}/{t_end:.3f}")
 
         return progress_callback
+
+    def _execution_request_from_attached_plan(self) -> Optional[dict]:
+        simulation_plan = getattr(self, "_simulation_plan", None)
+        if simulation_plan is None:
+            return None
+
+        from kindred.core.simulation_plan import SimulationPlan
+
+        if isinstance(simulation_plan, SimulationPlan):
+            return simulation_plan.to_execution_request().to_payload()
+        if isinstance(simulation_plan, Mapping):
+            return SimulationPlan.from_payload(simulation_plan).to_execution_request().to_payload()
+        raise TypeError("Simulation worker _simulation_plan must be a SimulationPlan or mapping.")
 
     def _prepare_worker_run(
         self,
@@ -299,7 +312,7 @@ class SimulationWorker(QtCore.QThread):
 
             from kindred.core.simulator.solvers import solve_ode
 
-            execution_request = getattr(self, "_execution_request", None)
+            execution_request = self._execution_request_from_attached_plan()
             prepared_payload = getattr(self, "_prepared", None)
             if isinstance(execution_request, dict) and execution_request.get("prepared_payload") is not None:
                 self.progress.emit(10, "Using structured execution request...")

@@ -9,6 +9,7 @@ from kindred.core.fitting_evaluation import (
     evaluate_fitting_series,
     prepare_fitting_execution_context,
 )
+from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import (
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
@@ -79,22 +80,28 @@ def _solve_preview_series(mechanism_text: str) -> tuple[list[str], np.ndarray]:
 
 
 def _solve_batch_explicit_series(mechanism_text: str) -> tuple[list[str], np.ndarray]:
+    execution_request = {
+        "prepared_payload": None,
+        "initials": dict(_INITIALS),
+        "t_span": (0.0, 20.0),
+        "solver_config": dict(_SOLVER_CONFIG),
+        "mechanism_text": mechanism_text,
+        "simulation_identity": {
+            "schema_id": "override-runtime-regression",
+            "param_fingerprint": mechanism_text,
+        },
+    }
     payload = run_batch_simulation_task(
         {
             "run_id": 1,
             "set_id": "id1",
             "set_name": "set1",
-            "execution_request": {
-                "prepared_payload": None,
-                "initials": dict(_INITIALS),
-                "t_span": (0.0, 20.0),
-                "solver_config": dict(_SOLVER_CONFIG),
-                "mechanism_text": mechanism_text,
-                "simulation_identity": {
-                    "schema_id": "override-runtime-regression",
-                    "param_fingerprint": mechanism_text,
-                },
-            },
+            "simulation_plan": SimulationPlan.from_execution_request(
+                execution_request,
+                execution_mode="explicit",
+                algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+                metadata={"set_id": "id1", "set_name": "set1"},
+            ).to_payload(),
         }
     )
     assert payload["success"] is True

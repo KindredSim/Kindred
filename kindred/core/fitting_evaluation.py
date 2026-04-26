@@ -615,7 +615,6 @@ class SerialFittingEvaluator:
     def to_process_payload(self) -> Dict[str, Any]:
         payload = {
             "simulation_plan": self._context.simulation_plan.to_payload(),
-            "execution_request": self._context.execution_request.to_payload(),
             "requested_param_names": list(self._context.requested_param_names),
             "prepared_metadata": self._context.prepared_metadata.to_serializable_dict(),
             "temperature_K": float(self._context.temperature_K),
@@ -631,7 +630,6 @@ class SerialFittingEvaluator:
     def from_process_payload(cls, payload: Mapping[str, Any]) -> "SerialFittingEvaluator":
         required_keys = (
             "simulation_plan",
-            "execution_request",
             "requested_param_names",
             "prepared_metadata",
             "temperature_K",
@@ -641,6 +639,8 @@ class SerialFittingEvaluator:
         )
         if not isinstance(payload, Mapping):
             raise TypeError("Process payload must be a mapping.")
+        if "execution_request" in payload:
+            raise KeyError("Process payload contains legacy execution_request key.")
         missing = [name for name in required_keys if name not in payload]
         if missing:
             raise KeyError(f"Process payload is missing required keys: {', '.join(missing)}")
@@ -648,12 +648,6 @@ class SerialFittingEvaluator:
         if not isinstance(simulation_plan, Mapping):
             raise TypeError("Process payload simulation_plan must be a mapping.")
         plan_payload = SimulationPlan.from_payload(simulation_plan).to_payload()
-        _assert_matching_fitting_execution_request(
-            simulation_plan=SimulationPlan.from_payload(plan_payload),
-            execution_request=SimulationExecutionRequest.from_mapping(
-                dict(payload["execution_request"])
-            ),
-        )
         return cls(
             PreparedFittingExecutionContext(
                 simulation_plan=plan_payload,

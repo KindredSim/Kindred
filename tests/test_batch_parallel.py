@@ -517,6 +517,13 @@ def test_run_batch_simulation_task_uses_text_path_for_plan_without_prepared_payl
             "set_id": "id1",
             "set_name": "set1",
             "mechanism_text": "reaction: A -> B; k=STALE",
+            "execution_request": {
+                "prepared_payload": None,
+                "initials": {"A": 99.0},
+                "t_span": (0.0, 1.0),
+                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+                "mechanism_text": "reaction: A -> B; k=STALE_REQUEST",
+            },
             "simulation_plan": plan_payload,
         }
     )
@@ -525,6 +532,28 @@ def test_run_batch_simulation_task_uses_text_path_for_plan_without_prepared_payl
     assert payload["mechanism_text"] == "reaction: A -> B; k=PLAN"
     assert seen["prepared_entry_kwargs"]["mechanism_text"] == "reaction: A -> B; k=PLAN"  # type: ignore[index]
     assert np.asarray(seen["request"].y0).tolist() == [4.0]  # type: ignore[union-attr]
+
+
+def test_run_batch_simulation_task_rejects_legacy_execution_request_without_plan():
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "execution_request": {
+                "prepared_payload": None,
+                "initials": {"A": 1.0},
+                "t_span": (0.0, 1.0),
+                "solver_config": {"solver": "BDF"},
+                "mechanism_text": "reaction: A -> B; k=1",
+            },
+        }
+    )
+
+    assert payload["success"] is False
+    assert payload["error"]["kind"] == "preparation_error"
+    assert "simulation_plan" in payload["error"]["message"]
+    assert payload["error"]["details"]["stage"] == "execution_request"
 
 
 def test_run_batch_simulation_task_secondary_payload_reports_base_species_count(monkeypatch):
@@ -650,7 +679,13 @@ def test_run_batch_simulation_task_preserves_structured_execution_request_proven
         },
         "initials": {"A": 3.0},
         "t_span": (0.0, 1.0),
-        "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+        "solver_config": {
+            "solver": "BDF",
+            "grid": {"N": 2},
+            "temperature_K": 310.0,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": True,
+        },
         "mechanism_text": "reaction: A -> B; k=SET1",
         "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
     }
@@ -675,12 +710,16 @@ def test_run_batch_simulation_task_preserves_structured_execution_request_proven
     assert payload["success"] is True
     assert "mechanism" not in payload
     assert payload["mechanism_text"] == "reaction: A -> B; k=SET1"
+    assert payload["solver_config"]["temperature_K"] == pytest.approx(310.0)
+    assert payload["solver_config"]["use_sparse_jacobian"] is True
+    assert payload["solver_config"]["wegscheider_cyclicity_enabled"] is True
     assert seen["mechanism"] is not None
     assert np.asarray(seen["request"].y0).tolist() == [3.0]  # type: ignore[union-attr]
 
 
 def test_run_batch_simulation_task_can_include_mechanism_for_primary_completion_payloads(monkeypatch):
     import numpy as np
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 
     class _FakeSpecies:
         def __init__(self) -> None:
@@ -725,6 +764,29 @@ def test_run_batch_simulation_task_can_include_mechanism_for_primary_completion_
     )
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve)
 
+    execution_request = {
+        "prepared_payload": {
+            "version": 2,
+            "mechanism": _FakeMechanism(),
+            "species_names": ["A"],
+            "y0": np.asarray([1.0], dtype=float),
+            "mechanism_text": "",
+            "temperature_schedule": None,
+            "jacobian_func": None,
+        },
+        "initials": {"A": 3.0},
+        "t_span": (0.0, 1.0),
+        "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+        "mechanism_text": "reaction: A -> B; k=SET1",
+        "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+    }
+    plan_payload = SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+        metadata={"set_id": "id1", "set_name": "set1"},
+    ).to_payload()
+
     payload = batch_parallel.run_batch_simulation_task(
         {
             "run_id": 1,
@@ -732,22 +794,7 @@ def test_run_batch_simulation_task_can_include_mechanism_for_primary_completion_
             "set_name": "set1",
             "include_mechanism_in_result_payload": True,
             "mechanism_text": "reaction: A -> B; k=PRIMARY",
-            "execution_request": {
-                "prepared_payload": {
-                    "version": 2,
-                    "mechanism": _FakeMechanism(),
-                    "species_names": ["A"],
-                    "y0": np.asarray([1.0], dtype=float),
-                    "mechanism_text": "",
-                    "temperature_schedule": None,
-                    "jacobian_func": None,
-                },
-                "initials": {"A": 3.0},
-                "t_span": (0.0, 1.0),
-                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
-                "mechanism_text": "reaction: A -> B; k=SET1",
-                "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
-            },
+            "simulation_plan": plan_payload,
         }
     )
 
@@ -1112,6 +1159,7 @@ def test_run_batch_simulation_task_non_structured_text_path_invalidates_worker_c
 
 def test_run_batch_simulation_task_honors_energy_prepared_payload_over_stale_text(monkeypatch):
     from kindred.core.kinetics import K_from_deltaG_eq
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
     from kindred.core.simulation_preparation import prepare_bound_mechanism
 
     bound = prepare_bound_mechanism(
@@ -1149,6 +1197,21 @@ def test_run_batch_simulation_task_honors_energy_prepared_payload_over_stale_tex
         lambda _request: _FakeResult(),
     )
 
+    execution_request = {
+        "prepared_payload": bound.as_serializable_execution_payload(),
+        "initials": {"A": 3.0, "B": 0.0},
+        "t_span": (0.0, 1.0),
+        "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+        "mechanism_text": "reaction: A -> B; k=PRIMARY",
+        "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+    }
+    plan_payload = SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+        metadata={"set_id": "id1", "set_name": "set1"},
+    ).to_payload()
+
     payload = batch_parallel.run_batch_simulation_task(
         {
             "run_id": 1,
@@ -1156,14 +1219,7 @@ def test_run_batch_simulation_task_honors_energy_prepared_payload_over_stale_tex
             "set_name": "set1",
             "include_mechanism_in_result_payload": True,
             "mechanism_text": "reaction: A -> B; k=PRIMARY",
-            "execution_request": {
-                "prepared_payload": bound.as_serializable_execution_payload(),
-                "initials": {"A": 3.0, "B": 0.0},
-                "t_span": (0.0, 1.0),
-                "solver_config": {"solver": "BDF", "grid": {"N": 2}},
-                "mechanism_text": "reaction: A -> B; k=PRIMARY",
-                "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
-            },
+            "simulation_plan": plan_payload,
         }
     )
 
