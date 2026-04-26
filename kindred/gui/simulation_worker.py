@@ -18,7 +18,6 @@ from PySide6.QtCore import Signal
 from kindred.core.exceptions import KindredError, SimulationCancelled
 from kindred.core.simulation_failure import (
     build_simulation_failure,
-    serialize_algebra_error,
     simulation_failure_from_exception,
 )
 from kindred.core.simulation_preparation import metadata_view_for_mechanism
@@ -203,52 +202,46 @@ class SimulationWorker(QtCore.QThread):
         if not algebra_text:
             return result.Y, species_names, algebra_scalars, algebra_errors, warnings
 
-        try:
-            self.progress.emit(96, "Evaluating algebraic species...")
-            logger.info("Evaluating algebraic species...")
+        self.progress.emit(96, "Evaluating algebraic species...")
+        logger.info("Evaluating algebraic species...")
 
-            from kindred.core.algebra.simulation_series import (
-                evaluate_algebra_series_for_simulation_with_errors,
-            )
+        from kindred.core.simulation_algebra_policy import (
+            algebra_policy_from_simulation_plan,
+            evaluate_simulation_algebra,
+        )
+        from kindred.core.algebra.simulation_series import (
+            evaluate_algebra_series_for_simulation_with_errors,
+        )
+        from kindred.core.simulation_plan import SimulationAlgebraPolicy
 
-            species_series = {sp: result.Y[i, :] for i, sp in enumerate(species_names)}
-            if isinstance(initials_for_algebra, dict):
-                initials = dict(initials_for_algebra)
-            else:
-                initials = {sp: mechanism.species[sp].initial_conc for sp in species_names}
-
-            algebra_series, algebra_scalars, errors = evaluate_algebra_series_for_simulation_with_errors(
-                mechanism,
-                t=result.t,
-                species_series=species_series,
-                initials=initials,
-            )
-            for error_entry in (errors or []):
-                try:
-                    algebra_errors.append(serialize_algebra_error(error_entry))
-                except Exception as exc:
-                    logger.debug("Failed to serialize algebra error entry: %s", exc, exc_info=True)
-            if not algebra_series:
-                return result.Y, species_names, algebra_scalars, algebra_errors, warnings
-            algebra_names = list(algebra_series.keys())
-            algebra_matrix = np.vstack([algebra_series[name] for name in algebra_names])
-            extended_Y = np.vstack([result.Y, algebra_matrix])
-            extended_species_names = list(species_names) + algebra_names
-            return extended_Y, extended_species_names, algebra_scalars, algebra_errors, warnings
-        except Exception as exc:
-            logger.warning("Algebra evaluation failed: %s", exc, exc_info=True)
-            warning = simulation_failure_from_exception(
-                exc,
-                kind="algebra_warning",
-                details={"stage": "algebra_evaluation"},
-            )
-            return (
-                result.Y,
-                species_names,
-                algebra_scalars,
-                [serialize_algebra_error(exc, name="__algebra__")],
-                [warning],
-            )
+        species_series = {sp: result.Y[i, :] for i, sp in enumerate(species_names)}
+        if isinstance(initials_for_algebra, dict):
+            initials = dict(initials_for_algebra)
+        else:
+            initials = {sp: mechanism.species[sp].initial_conc for sp in species_names}
+        policy = algebra_policy_from_simulation_plan(
+            getattr(self, "_simulation_plan", None),
+            default=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        )
+        evaluation = evaluate_simulation_algebra(
+            policy,
+            mechanism,
+            t=result.t,
+            species_series=species_series,
+            initials=initials,
+            gui_evaluator=evaluate_algebra_series_for_simulation_with_errors,
+        )
+        algebra_scalars = dict(evaluation.scalars)
+        algebra_errors = list(evaluation.errors)
+        if evaluation.warning is not None:
+            warnings.append(evaluation.warning)
+        if not evaluation.series:
+            return result.Y, species_names, algebra_scalars, algebra_errors, warnings
+        algebra_names = list(evaluation.series.keys())
+        algebra_matrix = np.vstack([evaluation.series[name] for name in algebra_names])
+        extended_Y = np.vstack([result.Y, algebra_matrix])
+        extended_species_names = list(species_names) + algebra_names
+        return extended_Y, extended_species_names, algebra_scalars, algebra_errors, warnings
 
     def _build_result_payload(
         self,

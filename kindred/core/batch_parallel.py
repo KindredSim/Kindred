@@ -13,7 +13,6 @@ import numpy as np
 from kindred.core.simulation_identity import coerce_simulation_identity
 from kindred.core.simulation_failure import (
     build_simulation_failure,
-    serialize_algebra_error,
     simulation_failure_from_exception,
 )
 from kindred.core.simulation_result_payload import (
@@ -203,6 +202,18 @@ def _execution_request_payload_from_simulation_plan(value: Any) -> Dict[str, Any
     return None
 
 
+def _algebra_policy_from_simulation_plan(value: Any):
+    from kindred.core.simulation_algebra_policy import algebra_policy_from_simulation_plan
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy
+
+    if value is None:
+        return SimulationAlgebraPolicy.BATCH_BEST_EFFORT
+    return algebra_policy_from_simulation_plan(
+        value,
+        default=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    )
+
+
 def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Execute one batch-set simulation in a worker process.
@@ -210,14 +221,16 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     This function is process-safe (no Qt objects) and supports per-process
     prepared-runtime reuse keyed by `mechanism_signature`.
     """
-    from kindred.core.algebra.simulation_series import evaluate_algebra_series_for_simulation
+    from kindred.core.simulation_algebra_policy import evaluate_simulation_algebra
     from kindred.core.simulation_preparation import (
         SimulationPreparationError,
         prepare_simulation_worker_run,
     )
     from kindred.core.simulator.solvers import solve_ode
 
-    plan_execution_request = _execution_request_payload_from_simulation_plan(task.get("simulation_plan"))
+    simulation_plan = task.get("simulation_plan")
+    algebra_policy = _algebra_policy_from_simulation_plan(simulation_plan)
+    plan_execution_request = _execution_request_payload_from_simulation_plan(simulation_plan)
     execution_request = task.get("execution_request")
     mechanism_text = str(task.get("mechanism_text") or "")
     solver_config = dict(task.get("solver_config") or {})
@@ -337,27 +350,23 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
     base_species_count = len(species_names)
     species_series = {sp: result.Y[i, :] for i, sp in enumerate(species_names)}
     initials_map = dict(prepared.initials_for_algebra or {})
-    try:
-        algebra_series, algebra_scalars = evaluate_algebra_series_for_simulation(
-            prepared.mechanism,
-            t=result.t,
-            species_series=species_series,
-            initials=initials_map,
-        )
-        if algebra_series:
-            algebra_names = list(algebra_series.keys())
-            algebra_matrix = np.vstack([algebra_series[name] for name in algebra_names])
-            extended_y = np.vstack([result.Y, algebra_matrix])
-            extended_species_names = species_names + algebra_names
-        else:
-            extended_y = result.Y
-            extended_species_names = species_names
-        algebra_errors: list[dict[str, Any]] = []
-    except Exception as exc:
-        logger.warning("Algebra evaluation failed in batch worker: %s", exc)
+    algebra_evaluation = evaluate_simulation_algebra(
+        algebra_policy,
+        prepared.mechanism,
+        t=result.t,
+        species_series=species_series,
+        initials=initials_map,
+    )
+    algebra_scalars = dict(algebra_evaluation.scalars)
+    algebra_errors: list[dict[str, Any]] = list(algebra_evaluation.errors)
+    if algebra_evaluation.series:
+        algebra_names = list(algebra_evaluation.series.keys())
+        algebra_matrix = np.vstack([algebra_evaluation.series[name] for name in algebra_names])
+        extended_y = np.vstack([result.Y, algebra_matrix])
+        extended_species_names = species_names + algebra_names
+    else:
         extended_y = result.Y
         extended_species_names = species_names
-        algebra_errors = [serialize_algebra_error(exc, name="__algebra__")]
 
     builder = (
         build_simulation_success_payload

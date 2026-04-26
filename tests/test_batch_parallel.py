@@ -288,6 +288,88 @@ def test_run_batch_simulation_task_reports_algebra_errors_with_shared_schema(mon
     assert errors[0]["message"] == "algebra exploded"
 
 
+def test_run_batch_simulation_task_reads_algebra_policy_from_plan(monkeypatch):
+    import numpy as np
+
+    from kindred.core.simulation_algebra_policy import SimulationAlgebraEvaluation
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    class _FakeSpecies:
+        def __init__(self) -> None:
+            self.initial_conc = 0.0
+
+    class _FakeMechanism:
+        def __init__(self) -> None:
+            self.species = {"A": _FakeSpecies()}
+            self.metadata = {"algebra_text": "let obs = [A]"}
+
+        def clone(self):
+            cloned = copy.copy(self)
+            cloned.species = {k: copy.copy(v) for k, v in self.species.items()}
+            cloned.metadata = dict(self.metadata)
+            return cloned
+
+        def set_initial(self, name: str, initial_conc: float) -> None:
+            self.species[str(name)].initial_conc = float(initial_conc)
+
+    class _FakeBound:
+        def __init__(self) -> None:
+            self.species_names = ["A"]
+            self.y0 = np.asarray([1.0], dtype=float)
+            self.mechanism = _FakeMechanism()
+
+        def rhs(self, *_args, **_kwargs):
+            return None
+
+    class _FakeResult:
+        def __init__(self) -> None:
+            self.t = np.asarray([0.0, 1.0], dtype=float)
+            self.Y = np.asarray([[1.0, 0.5]], dtype=float)
+            self.provenance = {}
+            self.fallback_occurred = False
+            self.fallback_message = None
+
+    captured = {}
+
+    def _capture_policy(policy, *_args, **_kwargs):
+        captured["policy"] = policy
+        return SimulationAlgebraEvaluation(series={}, scalars={}, errors=[], warning=None)
+
+    monkeypatch.setattr(batch_parallel, "_prepared_entry", lambda **_kwargs: {"bound": _FakeBound()})
+    monkeypatch.setattr(
+        "kindred.core.simulator.parameter_algebra.apply_parameter_algebra_to_mechanism",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: _FakeResult())
+    monkeypatch.setattr("kindred.core.simulation_algebra_policy.evaluate_simulation_algebra", _capture_policy)
+
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": {"A": 1.0},
+            "t_span": (0.0, 1.0),
+            "solver_config": {"solver": "BDF", "grid": {"N": 2}},
+            "mechanism_text": "reaction: A -> B; k=1",
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    ).to_payload()
+
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "mechanism_text": "reaction: A -> B; k=1",
+            "solver_config": {"solver": "BDF"},
+            "t_end": 1.0,
+            "set_id": "id1",
+            "set_name": "set1",
+            "simulation_plan": plan_payload,
+        }
+    )
+
+    assert payload["success"] is True
+    assert captured["policy"] is SimulationAlgebraPolicy.BATCH_BEST_EFFORT
+
+
 def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(monkeypatch):
     import numpy as np
 

@@ -100,12 +100,14 @@ def _execution_request_payload_from_plan(value: object) -> Optional[Dict[str, An
 def _simulation_plan_payload_with_execution_request(
     plan_payload: Mapping[str, Any],
     execution_request: Mapping[str, Any],
+    *,
+    algebra_policy: Optional[SimulationAlgebraPolicy] = None,
 ) -> Dict[str, Any]:
     plan = SimulationPlan.from_payload(plan_payload)
     return SimulationPlan.from_execution_request(
         execution_request,
         execution_mode=plan.execution_mode,
-        algebra_policy=plan.algebra_policy,
+        algebra_policy=algebra_policy or plan.algebra_policy,
         cache_identity_payload=plan.cache_identity_payload,
         cache_scope_payload=plan.cache_scope_payload,
         metadata=plan.metadata,
@@ -117,6 +119,7 @@ def _new_simulation_plan_payload(
     execution_request: Mapping[str, Any],
     *,
     execution_mode: str,
+    algebra_policy: SimulationAlgebraPolicy = SimulationAlgebraPolicy.GUI_BEST_EFFORT,
     cache_identity_payload: Optional[Mapping[str, Any]] = None,
     cache_scope_payload: Optional[Mapping[str, Any]] = None,
     metadata: Optional[Mapping[str, Any]] = None,
@@ -124,7 +127,7 @@ def _new_simulation_plan_payload(
     return SimulationPlan.from_execution_request(
         execution_request,
         execution_mode=execution_mode,
-        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        algebra_policy=algebra_policy,
         cache_identity_payload=cache_identity_payload,
         cache_scope_payload=cache_scope_payload,
         metadata=metadata,
@@ -2731,6 +2734,7 @@ class SimulationController(QtCore.QObject):
                         plan_payload = _simulation_plan_payload_with_execution_request(
                             plan_payload,
                             execution_request,
+                            algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
                         )
                 task["execution_request"] = dict(execution_request)
             if plan_payload is None:
@@ -2756,6 +2760,7 @@ class SimulationController(QtCore.QObject):
                 plan_payload = _new_simulation_plan_payload(
                     plan_request,
                     execution_mode="preview" if bool(ctx.get("fast_mode")) else "explicit",
+                    algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
                     cache_identity_payload=cache_identity_payload,
                     cache_scope_payload=dict(ctx.get("scope_identity") or {}),
                     metadata={
@@ -2765,6 +2770,17 @@ class SimulationController(QtCore.QObject):
                     },
                 )
             if isinstance(plan_payload, dict):
+                plan_execution_request = (
+                    dict(execution_request)
+                    if isinstance(execution_request, dict)
+                    else _execution_request_payload_from_plan(plan_payload)
+                )
+                if isinstance(plan_execution_request, dict):
+                    plan_payload = _simulation_plan_payload_with_execution_request(
+                        plan_payload,
+                        plan_execution_request,
+                        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+                    )
                 task["simulation_plan"] = dict(plan_payload)
             fut = executor.submit(run_batch_simulation_task, task)
             sid = str(set_id)
@@ -2928,6 +2944,7 @@ class SimulationController(QtCore.QObject):
                     plan_payload = _simulation_plan_payload_with_execution_request(
                         plan_payload,
                         execution_request,
+                        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
                     )
             initials_dict = dict(candidate_request.get("initials") or initials_dict)
             solver_config = dict(candidate_request.get("solver_config") or solver_config)
@@ -2996,6 +3013,7 @@ class SimulationController(QtCore.QObject):
             plan_payload = _new_simulation_plan_payload(
                 plan_request,
                 execution_mode="preview" if bool(fast_mode) else "explicit",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
                 cache_identity_payload=cache_identity_payload,
                 metadata={
                     "set_id": str(set_id),
@@ -3028,6 +3046,17 @@ class SimulationController(QtCore.QObject):
         if worker_signature:
             self._simulation_worker._batch_mechanism_signature = str(worker_signature)  # type: ignore[attr-defined]
         if isinstance(plan_payload, dict):
+            plan_execution_request = (
+                dict(execution_request)
+                if isinstance(execution_request, dict)
+                else _execution_request_payload_from_plan(plan_payload)
+            )
+            if isinstance(plan_execution_request, dict):
+                plan_payload = _simulation_plan_payload_with_execution_request(
+                    plan_payload,
+                    plan_execution_request,
+                    algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                )
             self._simulation_worker._simulation_plan = dict(plan_payload)  # type: ignore[attr-defined]
         if isinstance(execution_request, dict):
             self._simulation_worker._execution_request = dict(execution_request)  # type: ignore[attr-defined]
@@ -3528,6 +3557,7 @@ class SimulationController(QtCore.QObject):
             simulation_plan_by_set_id[str(set_id)] = _new_simulation_plan_payload(
                 request_payload,
                 execution_mode="preview" if bool(fast_mode) else "explicit",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
                 cache_identity_payload=cache_identity_payload,
                 cache_scope_payload={
                     "scope_identity": scope_identity.to_payload(),

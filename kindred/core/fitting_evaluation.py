@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from kindred.core.exceptions import ErrorContext, FitSimulationError, FittingCancelled, SimulationCancelled
+from kindred.core.exceptions import FitSimulationError, FittingCancelled, SimulationCancelled
 from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
@@ -385,11 +385,12 @@ def _fitting_plan_from_execution_request(
 def _coerce_fitting_simulation_plan(
     value: SimulationPlan | Mapping[str, Any],
 ) -> SimulationPlan:
+    from kindred.core.simulation_algebra_policy import ensure_fitting_strict_algebra_policy
+
     plan = value if isinstance(value, SimulationPlan) else SimulationPlan.from_payload(value)
     if plan.execution_mode != "fitting":
         raise ValueError("Fitting execution context requires a fitting simulation plan.")
-    if plan.algebra_policy is not SimulationAlgebraPolicy.FITTING_STRICT:
-        raise ValueError("Fitting execution context requires a fitting_strict algebra policy.")
+    ensure_fitting_strict_algebra_policy(plan.algebra_policy)
     return SimulationPlan.from_payload(plan.to_payload())
 
 
@@ -784,16 +785,15 @@ class SerialFittingEvaluator:
 
         algebra_scalars: Dict[str, float] = {}
         if self._compiled_algebra is not None:
-            from kindred.core.algebra.errors import (
-                AlgebraError,
-                AlgebraNameError,
-                AlgebraShadowError,
-                AlgebraSyntaxError,
-            )
             from kindred.core.algebra.simulation_series import (
                 evaluate_compiled_algebra_series_for_simulation,
             )
+            from kindred.core.simulation_algebra_policy import (
+                ensure_fitting_strict_algebra_policy,
+                fitting_strict_evaluation_error,
+            )
 
+            ensure_fitting_strict_algebra_policy(self._context.simulation_plan.algebra_policy)
             try:
                 initials_map = {
                     name: float(y0[idx]) for idx, name in enumerate(prepared_run.species_names)
@@ -814,19 +814,12 @@ class SerialFittingEvaluator:
                     if name in species_payload:
                         continue
                     species_payload[str(name)] = np.asarray(values, dtype=float).reshape(-1).copy()
-            except AlgebraError as exc:
-                is_fatal = isinstance(exc, (AlgebraNameError, AlgebraShadowError, AlgebraSyntaxError))
-                raise FitSimulationError(
-                    f"Algebra evaluation failed during fitting simulation: {exc}",
-                    details={"fatal": bool(is_fatal)},
-                    context=ErrorContext(line=exc.line, col=exc.col, line_text=exc.line_text),
-                ) from exc
             except FitSimulationError:
                 raise
             except Exception as exc:
-                raise FitSimulationError(
-                    f"Algebra evaluation failed during fitting simulation: {exc}",
-                    details={"fatal": False},
+                raise fitting_strict_evaluation_error(
+                    exc,
+                    message_prefix="Algebra evaluation failed during fitting simulation",
                 ) from exc
 
         return coerce_simulation_series_payload(
@@ -872,8 +865,14 @@ class SerialFittingEvaluator:
             CompiledAlgebraSeries,
             compile_algebra_observables,
         )
+        from kindred.core.simulation_algebra_policy import (
+            ensure_fitting_strict_algebra_policy,
+            fitting_strict_parse_error,
+            fitting_strict_time_ref_error,
+        )
         from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
 
+        ensure_fitting_strict_algebra_policy(self._context.simulation_plan.algebra_policy)
         self._parameter_algebra_spec = parameter_algebra_spec_from_mechanism(prepared_run.mechanism)
         self._raise_if_cancel_requested()
 
@@ -883,17 +882,13 @@ class SerialFittingEvaluator:
             try:
                 compiled_algebra = compile_algebra_observables(str(algebra_text))
             except Exception as exc:
-                raise FitSimulationError(
-                    f"Failed to parse Algebra observables for fitting: {exc}",
-                    details={"fatal": True},
+                raise fitting_strict_parse_error(
+                    exc,
+                    message_prefix="Failed to parse Algebra observables for fitting",
                 ) from exc
             if compiled_algebra.time_ref_statements:
                 stmt = compiled_algebra.time_ref_statements[0]
-                raise FitSimulationError(
-                    "Algebra baseline references like [A](T0) are not supported for fitting (v1).",
-                    details={"fatal": True},
-                    context=ErrorContext(line=stmt.line, col=stmt.col, line_text=stmt.line_text),
-                )
+                raise fitting_strict_time_ref_error(stmt)
         self._compiled_algebra = compiled_algebra
         self._raise_if_cancel_requested()
 

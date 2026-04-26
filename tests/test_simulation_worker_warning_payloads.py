@@ -37,6 +37,8 @@ def _prepared_payload(*, algebra_text: str | None = None) -> SimpleNamespace:
 
 def test_simulation_worker_emits_nonfatal_algebra_warning_payload(monkeypatch, qtbot):
     from kindred.core.simulator.solvers import SimulationOutput
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+    from kindred.core.simulation_preparation import SimulationExecutionRequest
     from kindred.gui.simulation_worker import SimulationWorker
 
     monkeypatch.setattr(
@@ -63,6 +65,17 @@ def test_simulation_worker_emits_nonfatal_algebra_warning_payload(monkeypatch, q
         (0.0, 1.0),
         {"solver": "BDF", "grid": {"N": 5}},
     )
+    worker._simulation_plan = SimulationPlan.from_execution_request(  # type: ignore[attr-defined]
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0},
+            t_span=(0.0, 1.0),
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
+            mechanism_text="reaction: A -> B; k=0.2",
+        ),
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+    ).to_payload()
 
     with qtbot.waitSignal(worker.result_ready, timeout=3000) as blocker:
         worker.start()
@@ -77,6 +90,58 @@ def test_simulation_worker_emits_nonfatal_algebra_warning_payload(monkeypatch, q
     assert warnings[0]["message"] == "algebra boom"
     assert payload["algebra_errors"][0]["message"] == "algebra boom"
     assert payload["success"] is True
+
+
+def test_simulation_worker_reads_algebra_policy_from_attached_plan(monkeypatch, qtbot):
+    from kindred.core.simulation_algebra_policy import SimulationAlgebraEvaluation
+    from kindred.core.simulator.solvers import SimulationOutput
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+    from kindred.core.simulation_preparation import SimulationExecutionRequest
+    from kindred.gui.simulation_worker import SimulationWorker
+
+    captured = {}
+    monkeypatch.setattr(
+        "kindred.core.simulation_preparation.prepare_simulation_worker_run",
+        lambda **_kwargs: _prepared_payload(algebra_text="obs = A"),
+    )
+    monkeypatch.setattr(
+        "kindred.core.simulator.solvers.solve_ode",
+        lambda _request: SimulationOutput(
+            t=np.asarray([0.0, 1.0], dtype=float),
+            Y=np.asarray([[1.0, 0.5]], dtype=float),
+            provenance={},
+        ),
+    )
+
+    def _capture_policy(policy, *_args, **_kwargs):
+        captured["policy"] = policy
+        return SimulationAlgebraEvaluation(series={}, scalars={}, errors=[], warning=None)
+
+    monkeypatch.setattr("kindred.core.simulation_algebra_policy.evaluate_simulation_algebra", _capture_policy)
+
+    worker = SimulationWorker(
+        "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
+        {"A": 1.0, "B": 0.0},
+        (0.0, 1.0),
+        {"solver": "BDF", "grid": {"N": 5}},
+    )
+    worker._simulation_plan = SimulationPlan.from_execution_request(  # type: ignore[attr-defined]
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0},
+            t_span=(0.0, 1.0),
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
+            mechanism_text="reaction: A -> B; k=0.2",
+        ),
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+    ).to_payload()
+
+    with qtbot.waitSignal(worker.result_ready, timeout=3000):
+        worker.start()
+
+    worker.wait(1000)
+    assert captured["policy"] is SimulationAlgebraPolicy.GUI_BEST_EFFORT
 
 
 def test_simulation_worker_unexpected_internal_failure_reports_stage(monkeypatch, qtbot):
