@@ -42,6 +42,7 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+    SerialFittingEvaluator,
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
@@ -1729,6 +1730,7 @@ def fit_global(
     objective_impl: Optional[_GlobalFitObjective] = None
     fit_parameters_completed = False
     result_to_return: Optional[GlobalFitResult] = None
+    contained_fit_evaluator = None
 
     def _failed_result(
         message: str,
@@ -1798,8 +1800,19 @@ def fit_global(
         )
 
     try:
+        if type(fit_evaluator) is SerialFittingEvaluator:
+            from kindred.core.fitting_containment import ContainedSerialFittingEvaluator
+
+            contained_fit_evaluator = ContainedSerialFittingEvaluator(
+                fit_evaluator,
+                cancellation_check=cancellation_check,
+            )
+            fit_evaluator_for_run = contained_fit_evaluator
+        else:
+            fit_evaluator_for_run = fit_evaluator
+
         objective_impl = _GlobalFitObjective(
-            fit_evaluator=fit_evaluator,
+            fit_evaluator=fit_evaluator_for_run,
             payloads=payloads,
             shared_params=shared_params,
             dataset_params=dataset_params_map,
@@ -1884,7 +1897,7 @@ def fit_global(
                 logger.debug("Failed to calculate uncertainties: %s", exc)
 
         result_to_return = _assemble_global_fit_result(
-            fit_evaluator=fit_evaluator,
+            fit_evaluator=fit_evaluator_for_run,
             payloads=payloads,
             layout=layout,
             fitted_params=fitted_params,
@@ -1931,3 +1944,6 @@ def fit_global(
                 phase="fatal",
             ),
         )
+    finally:
+        if contained_fit_evaluator is not None:
+            contained_fit_evaluator.close()
