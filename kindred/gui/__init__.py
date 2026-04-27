@@ -4,8 +4,9 @@ Kindred GUI package.
 Contracts
 ---------
 - Contains all PySide6 UI wiring: main window, widgets, dialogs, controllers.
-- Entry point is `kindred.__main__:main` (via `kindred` or `python -m kindred`),
-  which boots QApplication and shows `kindred.gui.main_window.MainWindow`.
+- Console-script GUI entry point is `kindred.gui_entrypoint:main`; `python -m
+  kindred` uses `kindred.__main__:main`. Both boot QApplication and show
+  `kindred.gui.main_window.MainWindow`.
 - Feature set: simulation + plotting, sliders, statistics/CTC, global fit,
   solver settings, temperature schedules, species registry, templates/profiles,
   and CSV export (only).

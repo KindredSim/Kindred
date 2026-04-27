@@ -7,6 +7,9 @@ def main() -> int:
 
     Importing PySide6 here makes the GUI runtime dependency contract explicit.
     """
+    from multiprocessing import freeze_support
+
+    freeze_support()
     try:
         import PySide6  # noqa: F401
     except ModuleNotFoundError as exc:

@@ -339,6 +339,27 @@ def test_warm_simulation_owner_active_timeout_starts_after_accept_and_kills_chil
         owner.close(kill=True)
 
 
+def test_warm_simulation_owner_accept_timeout_kills_child():
+    from kindred.core.simulation_containment import SimulationContainmentAcceptTimeout, WarmSimulationOwner
+
+    mp_context = _require_spawn_primitive_support()
+    owner = WarmSimulationOwner(
+        {},
+        mp_context=mp_context,
+        child_target=_warm_owner_test_child,
+        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
+        accept_timeout_s=0.05,
+        active_timeout_s=5.0,
+    )
+
+    try:
+        with pytest.raises(SimulationContainmentAcceptTimeout):
+            owner.solve({"behavior": "fatal_before_accept", "fatal_delay_s": 0.2})
+        assert owner.is_running is False
+    finally:
+        owner.close(kill=True)
+
+
 def test_warm_simulation_owner_reconstruction_failure_before_accept_is_not_active_timeout():
     from kindred.core.simulation_containment import (
         SimulationContainmentChildFailure,
@@ -367,7 +388,11 @@ def test_warm_simulation_owner_reconstruction_failure_before_accept_is_not_activ
 
 
 def test_warm_simulation_owner_request_reconstruction_failure_includes_child_traceback():
-    from kindred.core.simulation_containment import SimulationContainmentChildFailure, WarmSimulationOwner
+    from kindred.core.simulation_containment import (
+        SimulationContainmentChildFailure,
+        SimulationContainmentTimeout,
+        WarmSimulationOwner,
+    )
 
     mp_context = _require_spawn_primitive_support()
     owner = WarmSimulationOwner(
@@ -375,7 +400,7 @@ def test_warm_simulation_owner_request_reconstruction_failure_includes_child_tra
         mp_context=mp_context,
         ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
         accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.5,
+        active_timeout_s=0.001,
     )
 
     try:
@@ -388,7 +413,10 @@ def test_warm_simulation_owner_request_reconstruction_failure_includes_child_tra
         stack_trace = str(context.get("stack_trace") or "")
         assert "ValueError" in stack_trace
         assert "SimulationPlan payload missing execution_request" in stack_trace
-        assert "_simulation_owner_child" in stack_trace
+        assert "before_accept" in stack_trace
+        assert owner.is_running is False
+    except SimulationContainmentTimeout as exc:  # pragma: no cover - documents the red/green distinction
+        pytest.fail(f"default runtime reconstruction failure used active timeout path: {exc!r}")
     finally:
         owner.close(kill=True)
 
@@ -420,7 +448,7 @@ def test_warm_simulation_owner_startup_failure_includes_child_traceback():
         stack_trace = str(context.get("stack_trace") or "")
         assert "ValueError" in stack_trace
         assert "SimulationPlan execution_request must be a mapping" in stack_trace
-        assert "_simulation_owner_child" in stack_trace
+        assert "create_simulation_child_handler" in stack_trace
     finally:
         owner.close(kill=True)
 

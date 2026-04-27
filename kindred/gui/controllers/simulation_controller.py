@@ -1565,6 +1565,31 @@ class SimulationController(QtCore.QObject):
         setattr(self, attr, owner)
         return owner
 
+    def _warm_contained_simulation_owner_for_plan(
+        self,
+        *,
+        fast_mode: bool,
+        simulation_plan_payload: Mapping[str, Any],
+    ) -> None:
+        plan_payload = dict(simulation_plan_payload or {})
+        if not plan_payload:
+            return
+        from kindred.core.simulation_containment import contained_payloads_equal
+
+        attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
+        existing_owner = getattr(self, attr, None)
+        if existing_owner is not None:
+            existing_payload = getattr(existing_owner, "simulation_plan_payload", None)
+            if not isinstance(existing_payload, Mapping) or not contained_payloads_equal(dict(existing_payload), plan_payload):
+                self._close_contained_simulation_owner(fast_mode=bool(fast_mode), kill=False)
+        owner = self._contained_simulation_owner(
+            fast_mode=bool(fast_mode),
+            simulation_plan_payload=plan_payload,
+        )
+        start = getattr(owner, "start", None)
+        if callable(start):
+            start(wait=False)
+
     def _detach_contained_simulation_owner(self, *, fast_mode: bool):
         attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
         owner = getattr(self, attr, None)
@@ -4138,6 +4163,25 @@ class SimulationController(QtCore.QObject):
             "preview_batch_cache_token_by_set_id": dict(preview_batch_cache_token_by_set_id),
         }
 
+        if not bool(parallel_mode):
+            warm_plan_payload: Optional[Dict[str, Any]] = None
+            if primary_set_id:
+                candidate = simulation_plan_by_set_id.get(str(primary_set_id))
+                if isinstance(candidate, dict):
+                    warm_plan_payload = dict(candidate)
+            if warm_plan_payload is None and simulation_plan_by_set_id:
+                warm_plan_payload = dict(next(iter(simulation_plan_by_set_id.values())))
+            if isinstance(warm_plan_payload, dict):
+                try:
+                    from kindred.core.simulation_containment import build_contained_simulation_plan_payload
+
+                    self._warm_contained_simulation_owner_for_plan(
+                        fast_mode=bool(fast_mode),
+                        simulation_plan_payload=build_contained_simulation_plan_payload(warm_plan_payload),
+                    )
+                except Exception as exc:
+                    self._record_nonfatal_exception("Failed to eager-warm contained simulation owner", exc)
+
         self._slider_simulation_active = bool(fast_mode)
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
@@ -5113,8 +5157,6 @@ class SimulationController(QtCore.QObject):
                     if not shutdown_requested:
                         self._schedule_deferred_preview_replay_handoff_once()
                 self._clear_shutdown_request_after_close_cleanup()
-                if not bool(is_preview):
-                    self._close_contained_simulation_owner(fast_mode=False, kill=False)
 
     def _on_simulation_error(
         self,

@@ -277,6 +277,40 @@ def test_contained_worker_omits_plan_from_request_when_owner_has_matching_startu
     assert captured["payload"]["include_mechanism_in_result_payload"] is False
 
 
+def test_contained_worker_warm_owner_does_not_emit_cold_initializing_status(qt_app):
+    from kindred.gui.simulation_worker import ContainedSimulationWorker
+
+    _ = qt_app
+    startup_payload = _normal_plan().to_payload()
+
+    class _Owner:
+        @property
+        def is_running(self) -> bool:
+            return True
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, Any]:
+            return dict(startup_payload)
+
+        def solve(self, payload, *, cancellation_check):
+            _ = payload
+            assert cancellation_check() is False
+            return {"success": True}
+
+    worker = ContainedSimulationWorker(
+        owner=_Owner(),
+        simulation_plan_payload=startup_payload,
+        include_mechanism_in_result_payload=False,
+    )
+    progress_messages: list[str] = []
+    worker.progress.connect(lambda _percent, message: progress_messages.append(str(message)))
+
+    worker.run()
+
+    assert "Initializing simulation..." not in progress_messages
+    assert progress_messages[0] == "Running simulation..."
+
+
 def test_contained_worker_omits_plan_for_equivalent_copied_numpy_y0(qt_app):
     from kindred.gui.simulation_worker import ContainedSimulationWorker
 
@@ -411,3 +445,55 @@ def test_contained_worker_closes_owner_once_when_solve_reports_cancelled(qt_app)
     assert owner.close_calls == [True]
     worker.cleanup()
     assert owner.close_calls == [True]
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "expected_phase", "expected_timeout_s"),
+    [
+        ("startup", "startup", 0.125),
+        ("accept", "accept", 0.25),
+    ],
+)
+def test_contained_worker_serializes_pre_active_timeouts_as_timeout_failures(
+    qt_app,
+    exception_name: str,
+    expected_phase: str,
+    expected_timeout_s: float,
+):
+    from kindred.core.simulation_containment import (
+        SimulationContainmentAcceptTimeout,
+        SimulationContainmentStartupTimeout,
+    )
+    from kindred.gui.simulation_worker import ContainedSimulationWorker
+
+    _ = qt_app
+    startup_payload = _normal_plan().to_payload()
+
+    class _Owner:
+        def __init__(self) -> None:
+            self.close_calls: list[bool] = []
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, Any]:
+            return dict(startup_payload)
+
+        def solve(self, payload, *, cancellation_check):
+            _ = (payload, cancellation_check)
+            if exception_name == "startup":
+                raise SimulationContainmentStartupTimeout(expected_timeout_s)
+            raise SimulationContainmentAcceptTimeout(expected_timeout_s)
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    owner = _Owner()
+    worker = ContainedSimulationWorker(owner=owner, simulation_plan_payload=startup_payload)
+    captured_errors: list[dict[str, Any]] = []
+    worker.error.connect(lambda payload: captured_errors.append(dict(payload)))
+
+    worker.run()
+
+    assert owner.close_calls == [True]
+    assert [error["kind"] for error in captured_errors] == ["timeout"]
+    assert captured_errors[0]["details"]["timeout_phase"] == expected_phase
+    assert captured_errors[0]["details"][f"{expected_phase}_timeout_s"] == pytest.approx(expected_timeout_s)

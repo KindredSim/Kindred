@@ -50,6 +50,20 @@ def _failure_payload_with_stack_trace(payload: dict[str, Any], *, exc: BaseExcep
     return enriched_payload
 
 
+def _pre_active_timeout_failure(exc: BaseException, *, phase: str) -> dict[str, Any]:
+    timeout_s = float(getattr(exc, "timeout_s", 0.0) or 0.0)
+    return build_simulation_failure(
+        "timeout",
+        str(exc),
+        code="E306",
+        details={
+            "timeout_phase": str(phase),
+            f"{phase}_timeout_s": timeout_s,
+        },
+        exc_type=exc.__class__.__name__,
+    )
+
+
 class SimulationWorker(QtCore.QThread):
     """
     Background worker for running ODE simulations.
@@ -470,10 +484,18 @@ class ContainedSimulationWorker(QtCore.QThread):
         try:
             if self._cancelled:
                 raise SimulationCancelled()
-            self.progress.emit(0, "Initializing simulation...")
             owner = self._owner
             if owner is None:
                 raise RuntimeError("Contained simulation owner is unavailable.")
+            owner_running = False
+            try:
+                owner_running = bool(getattr(owner, "is_running", False))
+            except Exception:
+                owner_running = False
+            self.progress.emit(
+                0,
+                "Running simulation..." if owner_running else "Initializing simulation...",
+            )
             request_payload = {
                 "include_mechanism_in_result_payload": bool(
                     self._include_mechanism_in_result_payload
@@ -499,13 +521,19 @@ class ContainedSimulationWorker(QtCore.QThread):
         except BaseException as exc:  # noqa: BLE001 - Qt boundary must serialize all failures
             self._close_owner_once(kill=True)
             from kindred.core.simulation_containment import (
+                SimulationContainmentAcceptTimeout,
                 SimulationContainmentChildFailure,
                 SimulationContainmentProtocolError,
+                SimulationContainmentStartupTimeout,
                 SimulationContainmentTimeout,
             )
 
             if isinstance(exc, SimulationContainmentTimeout):
                 self.error.emit(dict(exc.failure))
+            elif isinstance(exc, SimulationContainmentStartupTimeout):
+                self.error.emit(_pre_active_timeout_failure(exc, phase="startup"))
+            elif isinstance(exc, SimulationContainmentAcceptTimeout):
+                self.error.emit(_pre_active_timeout_failure(exc, phase="accept"))
             elif isinstance(exc, SimulationContainmentChildFailure):
                 failure = dict(exc.failure)
                 details = failure.get("details")

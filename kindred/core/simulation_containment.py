@@ -12,6 +12,16 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
+from kindred.core.containment_kernel import (
+    ContainmentChildFatal,
+    ContainmentHandlerResponse,
+    ContainmentKernelAcceptTimeout,
+    ContainmentKernelActiveTimeout,
+    ContainmentKernelCancelled,
+    ContainmentKernelChildFailure,
+    ContainmentKernelProtocolError,
+    ContainmentKernelStartupTimeout,
+)
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_failure import (
     build_simulation_failure,
@@ -26,6 +36,7 @@ from kindred.core.simulation_preparation import (
 )
 from kindred.core.simulation_result_finalization import build_finalized_simulation_result_payload
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
+from kindred.core.simulation_runtime_service import SimulationRuntimeOwner
 
 _DEFAULT_SIMULATION_ACTIVE_TIMEOUT_S = 60.0
 _OWNER_READY_TIMEOUT_S = 30.0
@@ -251,6 +262,131 @@ def _terminate_process(proc: multiprocessing.Process, *, join_timeout_s: float =
         proc.join(timeout=join_timeout_s)
 
 
+@dataclass(frozen=True)
+class _PreparedContainedSimulationRequest:
+    request_payload: dict[str, Any]
+    plan: SimulationPlan
+    execution_request: dict[str, Any]
+    prepared: Any
+
+
+class _SimulationChildHandler:
+    def __init__(self, simulation_plan_payload: Mapping[str, Any]) -> None:
+        self._startup_plan_payload: dict[str, Any] | None = None
+        self._startup_prepared = None
+        self._prepared_by_request_id: dict[int, _PreparedContainedSimulationRequest] = {}
+        if isinstance(simulation_plan_payload, Mapping) and "execution_request" in simulation_plan_payload:
+            self._startup_plan_payload = validate_contained_simulation_payload(simulation_plan_payload)
+            startup_plan = SimulationPlan.from_payload(self._startup_plan_payload)
+            startup_execution_request = startup_plan.to_execution_request().to_payload()
+            self._startup_prepared = prepare_simulation_worker_run(execution_request=startup_execution_request)
+
+    def _prepare_request(self, request_payload: Mapping[str, Any]) -> _PreparedContainedSimulationRequest:
+        payload = dict(request_payload or {})
+        request_plan_payload = payload.get("simulation_plan_payload")
+        if isinstance(request_plan_payload, Mapping):
+            plan_payload = validate_contained_simulation_payload(request_plan_payload)
+            plan = SimulationPlan.from_payload(plan_payload)
+            execution_request = plan.to_execution_request().to_payload()
+            prepared = prepare_simulation_worker_run(execution_request=execution_request)
+        elif self._startup_prepared is not None and self._startup_plan_payload is not None:
+            plan = SimulationPlan.from_payload(self._startup_plan_payload)
+            execution_request = plan.to_execution_request().to_payload()
+            prepared = self._startup_prepared
+        else:
+            raise SimulationContainmentPayloadError(
+                "Contained simulation request missing simulation_plan_payload."
+            )
+        return _PreparedContainedSimulationRequest(
+            request_payload=payload,
+            plan=plan,
+            execution_request=execution_request,
+            prepared=prepared,
+        )
+
+    def before_accept(self, request_payload: Mapping[str, Any], context: Any) -> None:
+        try:
+            self._prepared_by_request_id[int(context.request_id)] = self._prepare_request(request_payload)
+        except BaseException as exc:  # noqa: BLE001 - child boundary must serialize reconstruction failures
+            reconstruction_failure = isinstance(
+                exc,
+                (
+                    SimulationContainmentPayloadError,
+                    SimulationPreparationError,
+                    TypeError,
+                    ValueError,
+                ),
+            )
+            raise ContainmentChildFatal(
+                _failure_payload_with_stack_trace(
+                    simulation_failure_from_exception(
+                        exc,
+                        kind="simulation_containment_reconstruction" if reconstruction_failure else None,
+                    ),
+                    exc=exc,
+                )
+            ) from exc
+
+    def handle_request(self, request_payload: Mapping[str, Any], _context: Any) -> dict[str, Any] | ContainmentHandlerResponse:
+        try:
+            request_id = int(getattr(_context, "request_id", -1))
+            prepared_request = self._prepared_by_request_id.pop(request_id, None)
+            if prepared_request is None:
+                prepared_request = self._prepare_request(request_payload)
+
+            result = solve_ode(prepared_request.prepared.request)
+            include_mechanism = bool(prepared_request.request_payload.get("include_mechanism_in_result_payload"))
+            return build_finalized_simulation_result_payload(
+                mechanism=prepared_request.prepared.mechanism,
+                result=result,
+                species_names=list(prepared_request.prepared.species_names),
+                initials_for_algebra=prepared_request.prepared.initials_for_algebra,
+                simulation_plan=prepared_request.plan,
+                preparation_warnings=list(getattr(prepared_request.prepared, "warnings", None) or []),
+                solver=str(getattr(prepared_request.prepared.request, "solver", "") or ""),
+                mechanism_text=str(prepared_request.execution_request.get("mechanism_text") or ""),
+                solver_config=dict(prepared_request.execution_request.get("solver_config") or {}),
+                include_mechanism=include_mechanism,
+            )
+        except SimulationCancelled as exc:
+            return ContainmentHandlerResponse(
+                kind="cancelled",
+                failure=simulation_failure_from_exception(exc),
+            )
+        except BaseException as exc:  # noqa: BLE001 - process boundary must serialize all failures
+            reconstruction_failure = isinstance(
+                exc,
+                (
+                    SimulationContainmentPayloadError,
+                    SimulationPreparationError,
+                    TypeError,
+                    ValueError,
+                ),
+            )
+            return ContainmentHandlerResponse(
+                kind="fatal" if reconstruction_failure else "error",
+                failure=_failure_payload_with_stack_trace(
+                    simulation_failure_from_exception(
+                        exc,
+                        kind="simulation_containment_reconstruction" if reconstruction_failure else None,
+                    ),
+                    exc=exc,
+                ),
+            )
+
+
+def create_simulation_child_handler(simulation_plan_payload: Mapping[str, Any]) -> _SimulationChildHandler:
+    try:
+        return _SimulationChildHandler(simulation_plan_payload)
+    except BaseException as exc:  # noqa: BLE001 - startup/reconstruction failure is fatal to the owner
+        raise ContainmentChildFatal(
+            _failure_payload_with_stack_trace(
+                simulation_failure_from_exception(exc, kind="simulation_containment_startup"),
+                exc=exc,
+            )
+        ) from exc
+
+
 def _simulation_owner_child(
     simulation_plan_payload: Mapping[str, Any],
     input_queue: multiprocessing.Queue,
@@ -410,9 +546,20 @@ class WarmSimulationOwner:
         self._output_queue: Optional[multiprocessing.Queue] = None
         self._owner_epoch = 0
         self._request_id = 0
+        self._runtime_owner: Optional[SimulationRuntimeOwner] = None
+        if child_target is None:
+            self._runtime_owner = SimulationRuntimeOwner(
+                handler_import_path="kindred.core.simulation_containment:create_simulation_child_handler",
+                startup_payload=dict(self._simulation_plan_payload),
+                ready_timeout_s=self._ready_timeout_s,
+                accept_timeout_s=self._accept_timeout_s,
+                mp_context=self._mp_context,
+            )
 
     @property
     def owner_epoch(self) -> int:
+        if self._runtime_owner is not None:
+            return int(self._runtime_owner.owner_epoch)
         return int(self._owner_epoch)
 
     @property
@@ -421,8 +568,31 @@ class WarmSimulationOwner:
 
     @property
     def is_running(self) -> bool:
+        if self._runtime_owner is not None:
+            return bool(self._runtime_owner.is_running)
         proc = self._process
         return bool(proc is not None and proc.is_alive())
+
+    def start(
+        self,
+        *,
+        wait: bool = False,
+        cancellation_check: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        if self._runtime_owner is not None:
+            try:
+                self._runtime_owner.warm(wait=bool(wait), cancellation_check=cancellation_check)
+            except ContainmentKernelCancelled as exc:
+                raise SimulationCancelled() from exc
+            except ContainmentKernelStartupTimeout as exc:
+                raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
+            except ContainmentKernelChildFailure as exc:
+                raise SimulationContainmentChildFailure(exc.failure) from exc
+            except ContainmentKernelProtocolError as exc:
+                raise SimulationContainmentProtocolError(str(exc)) from exc
+            return
+        if bool(wait):
+            self._ensure_started(cancellation_check=cancellation_check)
 
     def solve(
         self,
@@ -430,6 +600,28 @@ class WarmSimulationOwner:
         *,
         cancellation_check: Optional[Callable[[], bool]] = None,
     ) -> dict[str, Any]:
+        if self._runtime_owner is not None:
+            if self._cancel_requested(cancellation_check):
+                self.close(kill=True)
+                raise SimulationCancelled()
+            try:
+                return self._runtime_owner.solve(
+                    dict(payload or {}),
+                    active_timeout_s=self._active_timeout_s,
+                    cancellation_check=cancellation_check,
+                )
+            except ContainmentKernelCancelled as exc:
+                raise SimulationCancelled() from exc
+            except ContainmentKernelStartupTimeout as exc:
+                raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
+            except ContainmentKernelAcceptTimeout as exc:
+                raise SimulationContainmentAcceptTimeout(exc.timeout_s) from exc
+            except ContainmentKernelActiveTimeout as exc:
+                raise SimulationContainmentTimeout(exc.timeout_s) from exc
+            except ContainmentKernelChildFailure as exc:
+                raise SimulationContainmentChildFailure(exc.failure) from exc
+            except ContainmentKernelProtocolError as exc:
+                raise SimulationContainmentProtocolError(str(exc)) from exc
         if self._cancel_requested(cancellation_check):
             self.close(kill=True)
             raise SimulationCancelled()
@@ -502,6 +694,9 @@ class WarmSimulationOwner:
         )
 
     def close(self, *, kill: bool = False) -> None:
+        if self._runtime_owner is not None:
+            self._runtime_owner.close(kill=bool(kill))
+            return
         proc = self._process
         input_queue = self._input_queue
         output_queue = self._output_queue

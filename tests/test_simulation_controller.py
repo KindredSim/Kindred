@@ -792,6 +792,8 @@ def controller(mw: _FakeMainWindow) -> SimulationController:
     try:
         yield c
     finally:
+        with suppress(RuntimeError, TypeError):
+            c._close_contained_simulation_owner(kill=True)
         timer = getattr(c, "_slider_plot_coalesce_timer", None)
         with suppress(RuntimeError, TypeError):
             if timer is not None and timer.isActive():
@@ -5824,6 +5826,122 @@ def test_close_teardown_closes_detached_owner_when_worker_stops_during_cleanup(
 
 
 @pytest.mark.unit
+def test_successful_ordinary_completion_retains_contained_owner(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    owner = _FakeContainedOwner()
+    controller._ordinary_simulation_owner = owner
+    controller._simulation_running = True
+    controller._active_run_id = 1
+    controller.run_state.latest_sim_request_id = 2
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "completed_set_ids": [],
+        "total": 1,
+        "pos": 0,
+        "pending_workspace_reset_set_ids": [],
+    }
+    controller._cleanup_parallel_batch_executor_after_run = MagicMock()
+
+    payload = _successful_result_payload()
+    payload.update(
+        {
+            "success": True,
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+        }
+    )
+
+    controller.on_simulation_complete(
+        payload,
+        run_id=1,
+        fast_mode=False,
+        request_id=2,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="cache-key",
+    )
+
+    assert controller._ordinary_simulation_owner is owner
+    assert owner.close_calls == []
+    assert controller._simulation_running is False
+    assert mw.run_button_is_enabled() is True
+    assert mw._stop_btn.enabled is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("phase", "message"),
+    [
+        ("ready", "Contained simulation owner startup timed out."),
+        ("accept", "Contained simulation owner accept timed out."),
+        ("active_solve", "Simulation timed out during active solve."),
+    ],
+)
+def test_ordinary_containment_timeout_error_resets_ui_and_discards_owner(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+    phase: str,
+    message: str,
+):
+    owner = _FakeContainedOwner()
+    controller._ordinary_simulation_owner = owner
+    controller._simulation_running = True
+    controller._active_run_id = 7
+    controller.run_state.latest_sim_request_id = 8
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "completed_set_ids": [],
+        "total": 1,
+        "pos": 0,
+    }
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._shutdown_batch_executor = MagicMock()
+    critical_messages: list[tuple[str, str, Optional[str]]] = []
+    mw.message_box_critical = lambda title, text, *, details=None: critical_messages.append(
+        (str(title), str(text), str(details) if details else None)
+    )
+    mw.set_sim_progress_value(55)
+    mw.set_run_button_enabled(False)
+    mw.set_stop_button_enabled(True)
+
+    controller.on_simulation_error(
+        build_simulation_failure(
+            "timeout",
+            message,
+            details={"phase": phase},
+            exc_type="SimulationContainmentTimeout",
+        ),
+        run_id=7,
+        fast_mode=False,
+        request_id=8,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="cache-key",
+    )
+
+    assert controller._ordinary_simulation_owner is None
+    assert owner.close_calls == [True]
+    assert controller._simulation_running is False
+    assert mw.run_button_is_enabled() is True
+    assert mw._stop_btn.enabled is False
+    assert mw._sim_progress.value == 0
+    assert mw._status_label.text == "Simulation failed"
+    assert critical_messages
+    controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
+
+
+@pytest.mark.unit
 def test_contained_owner_reuse_accepts_equivalent_copied_numpy_y0(controller: SimulationController):
     from tests.test_simulation_containment_payloads import _normal_plan, _payload_copy_with_distinct_y0
 
@@ -5873,6 +5991,73 @@ def test_contained_owner_reuse_accepts_changed_copied_numpy_y0(controller: Simul
     assert reused is owner
     assert controller._ordinary_simulation_owner is owner
     assert owner.close_calls == []
+
+
+@pytest.mark.unit
+def test_eager_warm_starts_matching_contained_owner_without_waiting(controller: SimulationController):
+    from tests.test_simulation_containment_payloads import _normal_plan
+
+    startup_payload = _normal_plan().to_payload()
+
+    class _Owner:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = dict(payload)
+            self.start_calls: list[dict[str, object]] = []
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, object]:
+            return dict(self._payload)
+
+        def start(self, *, wait: bool = True) -> None:
+            self.start_calls.append({"wait": bool(wait)})
+
+    owner = _Owner(startup_payload)
+    controller._ordinary_simulation_owner = owner
+
+    controller._warm_contained_simulation_owner_for_plan(
+        fast_mode=False,
+        simulation_plan_payload=startup_payload,
+    )
+
+    assert owner.start_calls == [{"wait": False}]
+
+
+@pytest.mark.unit
+def test_eager_warm_replaces_existing_mismatched_contained_owner(controller: SimulationController):
+    from tests.test_simulation_containment_payloads import _normal_plan, _payload_copy_with_distinct_y0
+
+    startup_payload = _normal_plan().to_payload()
+    changed_payload = _payload_copy_with_distinct_y0(startup_payload, [1.0, 0.5])
+
+    class _Owner:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = dict(payload)
+            self.start_calls: list[dict[str, object]] = []
+            self.close_calls: list[bool] = []
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, object]:
+            return dict(self._payload)
+
+        def start(self, *, wait: bool = True) -> None:
+            self.start_calls.append({"wait": bool(wait)})
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    owner = _Owner(startup_payload)
+    replacement = _Owner(changed_payload)
+    controller._ordinary_simulation_owner = owner
+    controller._contained_simulation_owner_factory = lambda *, fast_mode, simulation_plan_payload: replacement
+
+    controller._warm_contained_simulation_owner_for_plan(
+        fast_mode=False,
+        simulation_plan_payload=changed_payload,
+    )
+
+    assert owner.close_calls == [False]
+    assert replacement.start_calls == [{"wait": False}]
+    assert controller._ordinary_simulation_owner is replacement
 
 
 @pytest.mark.unit
