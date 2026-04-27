@@ -57,18 +57,24 @@ def test_run_does_not_auto_run_pending_slider_simulation(main_window, qtbot, mon
 
         def __init__(
             self,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent=None,
-            prepared=None,
+            *,
+            owner,
+            simulation_plan_payload,
             include_mechanism_in_result_payload=True,
+            parent=None,
         ):
             super().__init__(parent)
+            from kindred.core.simulation_plan import SimulationPlan
+
+            _ = owner
+            request = (
+                SimulationPlan.from_payload(dict(simulation_plan_payload or {}))
+                .to_execution_request()
+                .to_payload()
+            )
             self._running = False
-            self._mechanism_text = str(mechanism_text)
-            self._solver_config = dict(solver_config or {})
+            self._mechanism_text = str(request.get("mechanism_text") or "")
+            self._solver_config = dict(request.get("solver_config") or {})
             self._include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
             n_points = int(self._solver_config.get("grid", {}).get("N", 2) or 2)
             self._payload = _payload(n_points, self._mechanism_text, self._solver_config)
@@ -99,7 +105,7 @@ def test_run_does_not_auto_run_pending_slider_simulation(main_window, qtbot, mon
         def terminate(self):
             self._running = False
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _ControlledWorker)
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _ControlledWorker)
 
     # Simulate a Keq1 drag+release to arm the slider-release commit timer.
     preview = main_window._preview_session

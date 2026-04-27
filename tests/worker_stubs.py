@@ -149,6 +149,93 @@ def make_simulation_worker_stub(
     return _Worker
 
 
+def make_contained_simulation_worker_stub(
+    *,
+    on_init: Optional[Callable[[Any], None]] = None,
+    on_start: Optional[Callable[[Any], None]] = None,
+    payload_factory: Optional[Callable[[Any], dict]] = None,
+    emit_progress: Optional[tuple[int, str]] = None,
+    stop_after_start: bool = True,
+    wait_returns: bool = True,
+) -> type:
+    """
+    Create a ContainedSimulationWorker-like QObject class for monkeypatching.
+
+    The returned class exposes the same attrs most legacy SimulationWorker tests
+    inspect, but derives them from the serialized SimulationPlan payload that the
+    contained GUI path now passes to the worker adapter.
+    """
+
+    class _ContainedWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        result_ready = QtCore.Signal(dict)
+        error = QtCore.Signal(object)
+
+        def __init__(
+            self,
+            *,
+            owner,
+            simulation_plan_payload,
+            include_mechanism_in_result_payload=True,
+            parent=None,
+        ):
+            super().__init__(parent)
+            from kindred.core.simulation_plan import SimulationPlan
+
+            self._running = False
+            self._owner = owner
+            self._simulation_plan_payload = dict(simulation_plan_payload or {})
+            execution_request = (
+                SimulationPlan.from_payload(self._simulation_plan_payload)
+                .to_execution_request()
+                .to_payload()
+            )
+            self._mechanism_text = str(execution_request.get("mechanism_text") or "")
+            self._initials = dict(execution_request.get("initials") or {})
+            self._t_span = tuple(execution_request.get("t_span") or (0.0, 0.0))
+            self._t_start = float(self._t_span[0]) if len(self._t_span) >= 1 else 0.0
+            self._t_end = float(self._t_span[-1]) if len(self._t_span) >= 1 else 0.0
+            self._solver_config = dict(execution_request.get("solver_config") or {})
+            self._prepared = execution_request.get("prepared_payload")
+            self._include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
+            if on_init is not None:
+                on_init(self)
+
+        def start(self) -> None:
+            self._running = True
+            if on_start is not None:
+                on_start(self)
+            if payload_factory is not None:
+                if emit_progress is not None:
+                    self.progress.emit(int(emit_progress[0]), str(emit_progress[1]))
+                self.result_ready.emit(payload_factory(self))
+            if bool(stop_after_start):
+                self._running = False
+
+        def cancel(self) -> None:
+            self._running = False
+            owner = getattr(self, "_owner", None)
+            if owner is not None and hasattr(owner, "cancel"):
+                owner.cancel()
+
+        def isRunning(self) -> bool:
+            return bool(self._running)
+
+        def wait(self, *_args, **_kwargs) -> bool:
+            if bool(wait_returns):
+                self._running = False
+            return bool(wait_returns)
+
+        def terminate(self) -> None:
+            self._running = False
+
+    if payload_factory is not None:
+        payload_qualname = getattr(payload_factory, "__qualname__", payload_factory.__class__.__qualname__)
+        _ContainedWorker.__qualname__ = f"ContainedWorkerStub[{payload_qualname}]"
+
+    return _ContainedWorker
+
+
 def make_stubborn_worker(fake_worker_cls: type) -> Any:
     """
     Return a FakeWorker-derived instance that stays 'running' even after cancel().

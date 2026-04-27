@@ -12,7 +12,7 @@ from kindred.core.simulation_preparation import BoundMechanism
 from kindred.gui.controllers.simulation_controller import build_fallback_cache_key
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
-from tests.worker_stubs import make_simulation_worker_stub
+from tests.worker_stubs import make_contained_simulation_worker_stub
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
 
@@ -147,8 +147,8 @@ def test_slider_changes_use_precompiled_rhs(main_window, monkeypatch):
         return _worker_payload(worker._prepared or {}, worker._mechanism_text)
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(on_init=_on_init, payload_factory=_payload, emit_progress=(100, "done")),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(on_init=_on_init, payload_factory=_payload, emit_progress=(100, "done")),
     )
 
     main_window._use_sparse_jacobian = False
@@ -196,8 +196,8 @@ def test_slider_binding_updates_across_changes(main_window, monkeypatch):
         return _worker_payload(prepared, worker._mechanism_text)
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(on_start=_on_start, payload_factory=_payload),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(on_start=_on_start, payload_factory=_payload),
     )
 
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -258,8 +258,8 @@ def test_slider_move_triggers_fresh_simulation(main_window, qtbot, monkeypatch):
         }
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(on_start=_on_start, payload_factory=_payload),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(on_start=_on_start, payload_factory=_payload),
     )
 
     # Grab the slider widget for k1 and move it to a new value
@@ -1300,8 +1300,8 @@ def test_fast_worker_completion_never_reextracts_sliders(main_window, qtbot, mon
         }
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(payload_factory=_payload),
     )
 
     # Trigger a fast-mode run; completion should not re-extract sliders.
@@ -1402,8 +1402,8 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
         }
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(on_init=_on_init, payload_factory=_payload),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(on_init=_on_init, payload_factory=_payload),
     )
 
     sliders = main_window._mechanism_editor._variable_sliders
@@ -2147,8 +2147,8 @@ def test_K_drag_uses_preview_t_end_and_release_uses_full_t_end(main_window, monk
         }
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(on_init=_on_init, payload_factory=_payload),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(on_init=_on_init, payload_factory=_payload),
     )
 
     # Drag preview
@@ -2194,8 +2194,8 @@ def test_stale_slider_worker_completion_does_not_override_latest(main_window, mo
         workers.append(worker)
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(on_init=_on_init, payload_factory=None, stop_after_start=False),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(on_init=_on_init, payload_factory=None, stop_after_start=False),
     )
 
     rid1 = main_window.simulation_controller.next_sim_request_id()
@@ -3891,18 +3891,24 @@ def test_first_explicit_run_after_example_load_keeps_displayed_result(main_windo
 
         def __init__(
             self,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent=None,
-            prepared=None,
+            *,
+            owner,
+            simulation_plan_payload,
             include_mechanism_in_result_payload=True,
+            parent=None,
         ):
             super().__init__(parent)
+            from kindred.core.simulation_plan import SimulationPlan
+
+            _ = owner, include_mechanism_in_result_payload
+            request = (
+                SimulationPlan.from_payload(dict(simulation_plan_payload or {}))
+                .to_execution_request()
+                .to_payload()
+            )
             self._running = False
-            self._mechanism_text = str(mechanism_text)
-            self._prepared = prepared
+            self._mechanism_text = str(request.get("mechanism_text") or "")
+            self._prepared = request.get("prepared_payload")
             self._fast_mode = False
 
         def start(self) -> None:
@@ -3928,7 +3934,7 @@ def test_first_explicit_run_after_example_load_keeps_displayed_result(main_windo
         def terminate(self) -> None:
             self._running = False
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _AsyncWorker)
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _AsyncWorker)
 
     main_window._load_preset_mechanism("M1")
     qt_app.processEvents()
@@ -4199,8 +4205,8 @@ def test_run_selected_after_slider_gesture_does_not_replay_fast_preview(
         }
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload, emit_progress=(100, "done")),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(payload_factory=_payload, emit_progress=(100, "done")),
     )
 
     sliders = main_window._mechanism_editor._variable_sliders

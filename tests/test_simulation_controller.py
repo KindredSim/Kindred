@@ -114,6 +114,54 @@ class _FakeWorker(QtCore.QObject):
     def start(self) -> None:
         self._running = True
 
+
+class _FakeContainedOwner:
+    def __init__(self) -> None:
+        self.close_calls: list[bool] = []
+
+    def close(self, *, kill: bool = False) -> None:
+        self.close_calls.append(bool(kill))
+
+
+def _install_recording_contained_worker(monkeypatch, created: dict[str, object]) -> None:
+    from kindred.core.simulation_plan import SimulationPlan
+
+    class _RecordingContainedWorker:
+        def __init__(
+            self,
+            *,
+            owner,
+            simulation_plan_payload,
+            include_mechanism_in_result_payload=True,
+            parent=None,
+        ):
+            self.owner = owner
+            self.parent = parent
+            self.simulation_plan_payload = dict(simulation_plan_payload)
+            self.progress = _FakeSignal()
+            self.result_ready = _FakeSignal()
+            self.error = _FakeSignal()
+            plan = SimulationPlan.from_payload(self.simulation_plan_payload)
+            request = plan.to_execution_request().to_payload()
+            created["mechanism_text"] = str(request.get("mechanism_text") or "")
+            created["initials"] = dict(request.get("initials") or {})
+            created["t_span"] = tuple(request.get("t_span") or ())
+            created["solver_config"] = dict(request.get("solver_config") or {})
+            prepared = request.get("prepared_payload")
+            created["prepared"] = dict(prepared) if isinstance(prepared, dict) else prepared
+            created["include_mechanism_in_result_payload"] = bool(include_mechanism_in_result_payload)
+
+        def start(self) -> None:
+            created["started"] = True
+
+        def isRunning(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            created["cancelled"] = True
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingContainedWorker)
+
 class _QtSignalWorker(QtCore.QObject):
     finished = QtCore.Signal()
     progress = QtCore.Signal(int, str)
@@ -327,6 +375,9 @@ class _FakeMainWindow(QtCore.QObject):
     def preview_batch_cache_token(self, rows: list[int]) -> str:
         _ = rows
         return ""
+
+    def show_preview_unavailable_for_dirty_state(self, message: str) -> None:
+        self._preview_unavailable_messages.append(str(message))
 
     def _remember_last_mechanism(self, mechanism: object, dsl_text: str, solver_config: dict[str, Any]) -> None:
         self._mechanism_helpers.remember_last_mechanism(mechanism, dsl_text, solver_config)
@@ -624,6 +675,7 @@ def mw(qt_app) -> _FakeMainWindow:
     window._slider_gesture_target_set_ids_snapshot = []
     window._last_slider_change_name = ""
     window._slider_runtime_dirty = False
+    window._preview_unavailable_messages = []
     window._use_sparse_jacobian = False
     window._wegscheider_cyclicity_enabled = False
 
@@ -2356,6 +2408,222 @@ def test_stale_contained_timeout_error_from_old_run_does_not_clobber_newer_run(
     assert mw._status_label.text == "Running simulation..."
     assert mw._sim_progress.value == 44
     message_box.assert_not_called()
+
+
+@pytest.mark.unit
+def test_current_preview_timeout_marks_dirty_preview_unavailable_without_modal(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._active_run_id = 31
+    controller._latest_sim_request_id = 9
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=9,
+        epoch=4,
+        target_set_ids=("id1",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "run_id": 31,
+        "request_id": 9,
+        "preview_owner_epoch": 4,
+        "queue_ids": ["id1"],
+        "queue_names": ["Set 1"],
+    }
+    mw._dirty_state_generations = {"id1": 7}
+    mw._run_btn.setEnabled(False)
+    mw._stop_btn.setEnabled(True)
+    mw._status_label.setText("Updating simulation...")
+    mw._sim_progress.setValue(44)
+    mw.message_box_critical = MagicMock()
+    mw.show_preview_unavailable_for_dirty_state = MagicMock()
+
+    controller._on_simulation_error(
+        build_simulation_failure(
+            "timeout",
+            "Preview simulation timed out after 0.2 seconds.",
+            details={"active_solve_timeout_s": 0.2},
+        ),
+        run_id=31,
+        fast_mode=True,
+        request_id=9,
+        owner_epoch=4,
+        batch_set="Set 1",
+        batch_set_id="id1",
+    )
+
+    mw.message_box_critical.assert_not_called()
+    mw.show_preview_unavailable_for_dirty_state.assert_called_once()
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
+    assert controller._batch_run_context["active"] is False
+    assert mw._run_btn.isEnabled() is True
+    assert mw._stop_btn.isEnabled() is False
+    assert mw._sim_progress.value == 0
+    assert mw._status_label.text.startswith("Preview timed out")
+    assert mw.has_dirty_state_for_set("id1") is True
+    mw.reset_mechanism_workspaces.assert_not_called()
+    mw.discard_concentration_overlays_for_set_ids.assert_not_called()
+
+
+@pytest.mark.unit
+def test_stale_preview_timeout_does_not_mark_current_dirty_preview_unavailable(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+
+    controller._active_run_id = 41
+    controller._latest_sim_request_id = 12
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=12,
+        epoch=6,
+        target_set_ids=("id1",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "run_id": 41,
+        "request_id": 12,
+        "preview_owner_epoch": 6,
+        "queue_ids": ["id1"],
+        "queue_names": ["Set 1"],
+    }
+    mw._run_btn.setEnabled(False)
+    mw._stop_btn.setEnabled(True)
+    mw._status_label.setText("Updating current preview...")
+    mw._sim_progress.setValue(55)
+    mw.message_box_critical = MagicMock()
+    mw.show_preview_unavailable_for_dirty_state = MagicMock()
+
+    controller._on_simulation_error(
+        build_simulation_failure(
+            "timeout",
+            "Old preview timed out.",
+            details={"active_solve_timeout_s": 0.2},
+        ),
+        run_id=41,
+        fast_mode=True,
+        request_id=11,
+        owner_epoch=5,
+        batch_set="Set 1",
+        batch_set_id="id1",
+    )
+
+    mw.message_box_critical.assert_not_called()
+    mw.show_preview_unavailable_for_dirty_state.assert_not_called()
+    assert controller._simulation_running is True
+    assert controller._slider_simulation_active is True
+    assert controller._batch_run_context["active"] is True
+    assert mw._run_btn.isEnabled() is False
+    assert mw._stop_btn.isEnabled() is True
+    assert mw._status_label.text == "Updating current preview..."
+    assert mw._sim_progress.value == 55
+    assert scheduled == []
+
+
+@pytest.mark.unit
+def test_current_preview_non_timeout_error_closes_preview_owner_not_ordinary_owner(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._active_run_id = 51
+    controller._latest_sim_request_id = 14
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=14,
+        epoch=8,
+        target_set_ids=("id1",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "run_id": 51,
+        "request_id": 14,
+        "preview_owner_epoch": 8,
+        "queue_ids": ["id1"],
+        "queue_names": ["Set 1"],
+    }
+    ordinary_owner = _FakeContainedOwner()
+    preview_owner = _FakeContainedOwner()
+    controller._ordinary_simulation_owner = ordinary_owner
+    controller._preview_simulation_owner = preview_owner
+    mw.message_box_critical = MagicMock()
+
+    controller._on_simulation_error(
+        build_simulation_failure("simulation_error", "Preview child failed."),
+        run_id=51,
+        fast_mode=True,
+        request_id=14,
+        owner_epoch=8,
+        batch_set="Set 1",
+        batch_set_id="id1",
+    )
+
+    assert preview_owner.close_calls == [True]
+    assert ordinary_owner.close_calls == []
+    assert controller._preview_simulation_owner is None
+    assert controller._ordinary_simulation_owner is ordinary_owner
+
+
+@pytest.mark.unit
+def test_current_contained_preview_child_failure_is_status_only_dirty_no_preview(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._active_run_id = 52
+    controller._latest_sim_request_id = 15
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=15,
+        epoch=9,
+        target_set_ids=("id1",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "run_id": 52,
+        "request_id": 15,
+        "preview_owner_epoch": 9,
+        "queue_ids": ["id1"],
+        "queue_names": ["Set 1"],
+    }
+    preview_owner = _FakeContainedOwner()
+    controller._preview_simulation_owner = preview_owner
+    mw.message_box_critical = MagicMock()
+
+    controller._on_simulation_error(
+        build_simulation_failure(
+            "simulation_error",
+            "Preview child failed.",
+            details={"source": "simulation_containment"},
+        ),
+        run_id=52,
+        fast_mode=True,
+        request_id=15,
+        owner_epoch=9,
+        batch_set="Set 1",
+        batch_set_id="id1",
+    )
+
+    mw.message_box_critical.assert_not_called()
+    assert preview_owner.close_calls == [True]
+    assert mw._preview_unavailable_messages == ["Preview unavailable. Adjust sliders or run again."]
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
 
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_error(
@@ -5208,6 +5476,27 @@ def test_cancel_active_run_for_restart_resets_ui_and_shuts_down(mw: _FakeMainWin
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
 
+
+@pytest.mark.unit
+def test_stop_simulation_does_not_close_active_contained_owner_outside_worker_thread(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._simulation_running = True
+    controller._batch_run_context = {"active": True, "fast_mode": False}
+    controller._shutdown_batch_executor = MagicMock()
+    owner = _FakeContainedOwner()
+    controller._ordinary_simulation_owner = owner
+    worker = _FakeWorker(running=True, wait_returns=False)
+    controller._simulation_worker = worker
+
+    controller._stop_simulation()
+
+    assert worker._cancelled is True
+    assert owner.close_calls == []
+    assert controller._ordinary_simulation_owner is None
+    assert mw._status_label.text == "Cancelling simulation..."
+
 @pytest.mark.unit
 def test_run_simulation_blocks_restart_while_retained_worker_is_still_running(
     mw: _FakeMainWindow, controller: SimulationController
@@ -5368,6 +5657,223 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
     assert isinstance(ctx["pending_init_rewrite"], str) and ctx["pending_init_rewrite"]
     assert ctx["pending_init_applied"] is True
     controller._start_next_batch_simulation.assert_called_once()
+
+
+@pytest.mark.unit
+def test_serial_single_set_run_uses_contained_owner_lane(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    class _FakeContainedWorker:
+        def __init__(
+            self,
+            *,
+            owner,
+            simulation_plan_payload,
+            include_mechanism_in_result_payload=True,
+            parent=None,
+        ):
+            self.owner = owner
+            self.simulation_plan_payload = dict(simulation_plan_payload)
+            self.include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
+            self.parent = parent
+            self.progress = _FakeSignal()
+            self.result_ready = _FakeSignal()
+            self.error = _FakeSignal()
+            self.started = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def isRunning(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            return
+
+    class _FakeOwner:
+        def __init__(self, label: str) -> None:
+            self.label = str(label)
+            self.close_calls: list[bool] = []
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    created_workers: list[_FakeContainedWorker] = []
+    owners = {False: _FakeOwner("ordinary"), True: _FakeOwner("preview")}
+
+    def _worker_factory(**kwargs):
+        worker = _FakeContainedWorker(**kwargs)
+        created_workers.append(worker)
+        return worker
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _worker_factory)
+    controller._contained_simulation_owner_factory = lambda *, fast_mode: owners[bool(fast_mode)]
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        lambda text, default_set_name="set1": ({}, text),
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
+    mw._parse_sim_time_seconds.return_value = 10.0
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_executor=False)
+
+    assert len(created_workers) == 1
+    worker = created_workers[0]
+    assert worker.owner is owners[False]
+    assert controller._ordinary_simulation_owner is owners[False]
+    assert controller._preview_simulation_owner is None
+    assert worker.started is True
+    assert worker.simulation_plan_payload["execution_mode"] == "explicit"
+    assert worker.simulation_plan_payload["execution_request"]["prepared_payload"] is None
+
+
+@pytest.mark.unit
+def test_controller_close_teardown_closes_ordinary_and_preview_contained_owners(
+    controller: SimulationController,
+):
+    class _FakeOwner:
+        def __init__(self) -> None:
+            self.close_calls: list[bool] = []
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    ordinary = _FakeOwner()
+    preview = _FakeOwner()
+    controller._ordinary_simulation_owner = ordinary
+    controller._preview_simulation_owner = preview
+    controller._shutdown_batch_executor = MagicMock()
+
+    assert controller._prepare_simulation_shutdown_for_close() is True
+
+    assert ordinary.close_calls == [True]
+    assert preview.close_calls == [True]
+    assert controller._ordinary_simulation_owner is None
+    assert controller._preview_simulation_owner is None
+    controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
+
+
+@pytest.mark.unit
+def test_close_teardown_detaches_active_contained_owner_for_running_worker(
+    controller: SimulationController,
+):
+    worker = make_stubborn_worker(_FakeWorker)
+    owner = _FakeContainedOwner()
+    controller._simulation_worker = worker
+    controller._ordinary_simulation_owner = owner
+    controller._batch_run_context = {"active": True, "fast_mode": False}
+    controller._shutdown_batch_executor = MagicMock()
+
+    assert controller._prepare_simulation_shutdown_for_close() is False
+
+    assert worker._cancelled is True
+    assert owner.close_calls == []
+    assert controller._ordinary_simulation_owner is None
+    assert worker in controller._retained_simulation_workers
+    controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
+
+
+@pytest.mark.unit
+def test_close_teardown_closes_detached_owner_when_worker_stops_during_cleanup(
+    controller: SimulationController,
+):
+    worker = _FakeWorker(running=True, wait_returns=True)
+    owner = _FakeContainedOwner()
+    controller._simulation_worker = worker
+    controller._ordinary_simulation_owner = owner
+    controller._batch_run_context = {"active": True, "fast_mode": False}
+    controller._shutdown_batch_executor = MagicMock()
+
+    assert controller._prepare_simulation_shutdown_for_close() is True
+
+    assert worker._cancelled is True
+    assert owner.close_calls == [True]
+    assert controller._ordinary_simulation_owner is None
+    assert worker not in controller._retained_simulation_workers
+    controller._shutdown_batch_executor.assert_called_once_with(force_terminate=True)
+
+
+@pytest.mark.unit
+def test_contained_owner_reuse_accepts_equivalent_copied_numpy_y0(controller: SimulationController):
+    from tests.test_simulation_containment_payloads import _normal_plan, _payload_copy_with_distinct_y0
+
+    startup_payload = _normal_plan().to_payload()
+    equivalent_payload = _payload_copy_with_distinct_y0(startup_payload)
+
+    class _Owner:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+            self.close_calls: list[bool] = []
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, object]:
+            return dict(self._payload)
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    owner = _Owner(startup_payload)
+    controller._ordinary_simulation_owner = owner
+
+    reused = controller._contained_simulation_owner(
+        fast_mode=False,
+        simulation_plan_payload=equivalent_payload,
+    )
+
+    assert reused is owner
+    assert controller._ordinary_simulation_owner is owner
+    assert owner.close_calls == []
+
+
+@pytest.mark.unit
+def test_contained_owner_reuse_accepts_changed_copied_numpy_y0(controller: SimulationController):
+    from tests.test_simulation_containment_payloads import _normal_plan, _payload_copy_with_distinct_y0
+
+    startup_payload = _normal_plan().to_payload()
+    changed_payload = _payload_copy_with_distinct_y0(startup_payload, [1.0, 0.5])
+    owner = _FakeContainedOwner()
+    owner.simulation_plan_payload = startup_payload
+    controller._ordinary_simulation_owner = owner
+
+    reused = controller._contained_simulation_owner(
+        fast_mode=False,
+        simulation_plan_payload=changed_payload,
+    )
+
+    assert reused is owner
+    assert controller._ordinary_simulation_owner is owner
+    assert owner.close_calls == []
+
 
 @pytest.mark.unit
 def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_initials(
@@ -6403,12 +6909,12 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
     assert created["mechanism_text"] == "reaction: A -> B; k=3"
-    assert created["prepared"] == {"prepared_for": "id2"}
+    assert created["prepared"] == {"version": 2, "prepared_for": "id2"}
     assert created["started"] is True
     worker = controller._simulation_worker
     worker_plan = SimulationPlan.from_payload(getattr(worker, "_simulation_plan", None))
@@ -6480,7 +6986,7 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
@@ -6569,7 +7075,7 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_exec
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
@@ -6642,7 +7148,7 @@ def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fall
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
@@ -6655,6 +7161,8 @@ def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fall
 def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewritten_worker_dsl_witness(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
+    created: dict[str, object] = {}
+
     class _RecordingWorker:
         def __init__(
             self,
@@ -6730,7 +7238,7 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
     ]
     mw._apply_parameter_overrides_to_dsl = MagicMock(side_effect=list(rewritten_texts))
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
     first_key = str(controller._batch_run_context["cache_key"])
@@ -6789,7 +7297,7 @@ def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_se
         "pending_init_applied": False,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
@@ -8510,7 +9018,7 @@ def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
@@ -8584,7 +9092,7 @@ def test_start_next_batch_simulation_non_fast_mode_sets_plan_only_execution_boun
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 
@@ -8825,18 +9333,14 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
         def __init__(
             self,
             *,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent,
-            prepared,
+            owner,
+            simulation_plan_payload,
             include_mechanism_in_result_payload,
+            parent,
         ):
-            created["mechanism_text"] = str(mechanism_text)
-            created["initials"] = dict(initials)
-            created["solver_config"] = dict(solver_config)
-            _ = t_span, parent, prepared
+            created["owner"] = owner
+            created["simulation_plan_payload"] = dict(simulation_plan_payload)
+            _ = parent
             created["include_mechanism_in_result_payload"] = bool(include_mechanism_in_result_payload)
             self.progress = _FakeSignal()
             self.result_ready = _FakeSignal()
@@ -8883,11 +9387,13 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
+    controller._contained_simulation_owner_factory = lambda *, fast_mode: "ordinary-owner"
 
     controller._start_next_batch_simulation()
 
     assert created["started"] is True
+    assert created["owner"] == "ordinary-owner"
     assert created["include_mechanism_in_result_payload"] is False
     worker = controller._simulation_worker
     worker_plan = SimulationPlan.from_payload(getattr(worker, "_simulation_plan", None))
@@ -8910,18 +9416,15 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
         def __init__(
             self,
             *,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent,
-            prepared,
+            owner,
+            simulation_plan_payload,
             include_mechanism_in_result_payload=None,
+            parent,
         ):
-            created["mechanism_text"] = str(mechanism_text)
-            created["initials"] = dict(initials)
-            created["prepared"] = prepared
-            _ = t_span, solver_config, parent, include_mechanism_in_result_payload
+            created["owner"] = owner
+            created["simulation_plan_payload"] = dict(simulation_plan_payload)
+            created["include_mechanism_in_result_payload"] = bool(include_mechanism_in_result_payload)
+            _ = parent
             self.progress = _FakeSignal()
             self.result_ready = _FakeSignal()
             self.error = _FakeSignal()
@@ -8957,11 +9460,14 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
         "pending_init_applied": True,
     }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
+    controller._contained_simulation_owner_factory = lambda *, fast_mode: "preview-owner"
 
     controller._start_next_batch_simulation()
 
     assert created["started"] is True
+    assert created["owner"] == "preview-owner"
+    assert created["include_mechanism_in_result_payload"] is False
     assert getattr(controller._simulation_worker, "_execution_request", None) is None
     plan_payload = getattr(controller._simulation_worker, "_simulation_plan", None)
     plan = SimulationPlan.from_payload(plan_payload)
@@ -9120,7 +9626,7 @@ def test_start_next_batch_simulation_explicit_run_ignores_staged_concentration_o
             "pending_init_applied": True,
         }
 
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _RecordingWorker)
+    _install_recording_contained_worker(monkeypatch, created)
 
     controller._start_next_batch_simulation()
 

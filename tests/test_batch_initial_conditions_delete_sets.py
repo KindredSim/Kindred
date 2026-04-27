@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
-from tests.worker_stubs import make_simulation_worker_stub
+from tests.worker_stubs import make_contained_simulation_worker_stub
 
 
 def _select_rows(main_window, rows: list[int]) -> None:
@@ -317,8 +317,8 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
             "fallback_message": None,
         }
 
-    _StubWorker = make_simulation_worker_stub(payload_factory=_payload)
-    monkeypatch.setattr("kindred.gui.simulation_worker.SimulationWorker", _StubWorker)
+    _StubWorker = make_contained_simulation_worker_stub(payload_factory=_payload)
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _StubWorker)
 
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B ; k=0.5")
     main_window._batch_model.set_species(["A", "B"])

@@ -20,7 +20,8 @@ from kindred.core.simulation_failure import (
     build_simulation_failure,
     simulation_failure_from_exception,
 )
-from kindred.core.simulation_preparation import metadata_view_for_mechanism
+from kindred.core.simulation_containment import contained_payloads_equal
+from kindred.core.simulation_result_finalization import evaluate_simulation_result_algebra
 from kindred.core.simulation_result_payload import (
     build_secondary_simulation_success_payload,
     build_simulation_success_payload,
@@ -208,53 +209,23 @@ class SimulationWorker(QtCore.QThread):
         species_names: list[str],
         initials_for_algebra: Dict[str, float],
     ) -> tuple[np.ndarray, list[str], dict, list[dict], list[dict]]:
-        algebra_scalars = {}
-        algebra_errors: list[dict] = []
-        warnings: list[dict] = []
-        algebra_text = metadata_view_for_mechanism(mechanism).algebra_text
-        if not algebra_text:
-            return result.Y, species_names, algebra_scalars, algebra_errors, warnings
-
-        self.progress.emit(96, "Evaluating algebraic species...")
-        logger.info("Evaluating algebraic species...")
-
-        from kindred.core.simulation_algebra_policy import (
-            algebra_policy_from_simulation_plan,
-            evaluate_simulation_algebra,
+        finalized = evaluate_simulation_result_algebra(
+            mechanism=mechanism,
+            result=result,
+            species_names=species_names,
+            initials_for_algebra=initials_for_algebra,
+            simulation_plan=getattr(self, "_simulation_plan", None),
         )
-        from kindred.core.algebra.simulation_series import (
-            evaluate_algebra_series_for_simulation_with_errors,
+        if len(finalized.species_names) > len(species_names) or finalized.algebra_scalars or finalized.algebra_errors:
+            self.progress.emit(96, "Evaluating algebraic species...")
+            logger.info("Evaluating algebraic species...")
+        return (
+            finalized.y,
+            finalized.species_names,
+            finalized.algebra_scalars,
+            finalized.algebra_errors,
+            finalized.warnings,
         )
-        from kindred.core.simulation_plan import SimulationAlgebraPolicy
-
-        species_series = {sp: result.Y[i, :] for i, sp in enumerate(species_names)}
-        if isinstance(initials_for_algebra, dict):
-            initials = dict(initials_for_algebra)
-        else:
-            initials = {sp: mechanism.species[sp].initial_conc for sp in species_names}
-        policy = algebra_policy_from_simulation_plan(
-            getattr(self, "_simulation_plan", None),
-            default=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
-        )
-        evaluation = evaluate_simulation_algebra(
-            policy,
-            mechanism,
-            t=result.t,
-            species_series=species_series,
-            initials=initials,
-            gui_evaluator=evaluate_algebra_series_for_simulation_with_errors,
-        )
-        algebra_scalars = dict(evaluation.scalars)
-        algebra_errors = list(evaluation.errors)
-        if evaluation.warning is not None:
-            warnings.append(evaluation.warning)
-        if not evaluation.series:
-            return result.Y, species_names, algebra_scalars, algebra_errors, warnings
-        algebra_names = list(evaluation.series.keys())
-        algebra_matrix = np.vstack([evaluation.series[name] for name in algebra_names])
-        extended_Y = np.vstack([result.Y, algebra_matrix])
-        extended_species_names = list(species_names) + algebra_names
-        return extended_Y, extended_species_names, algebra_scalars, algebra_errors, warnings
 
     def _build_result_payload(
         self,
@@ -450,3 +421,104 @@ class SimulationWorker(QtCore.QThread):
         # Wait for thread to finish (with timeout)
         if self.isRunning():
             logger.warning("Simulation thread is still running; cleanup() does not block waiting for it to finish")
+
+
+class ContainedSimulationWorker(QtCore.QThread):
+    """Qt adapter for a controller-owned warm contained simulation owner."""
+
+    progress = Signal(int, str)
+    result_ready = Signal(dict)
+    error = Signal(object)
+
+    def __init__(
+        self,
+        *,
+        owner,
+        simulation_plan_payload: Mapping[str, Any],
+        include_mechanism_in_result_payload: bool = True,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._owner = owner
+        self._simulation_plan_payload = dict(simulation_plan_payload)
+        self._include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
+        self._cancelled = False
+        self._is_running = False
+        self._owner_closed = False
+
+    def cancel(self) -> None:
+        logger.info("Contained simulation cancellation requested")
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return bool(self._cancelled)
+
+    def _close_owner_once(self, *, kill: bool) -> None:
+        if self._owner_closed:
+            return
+        self._owner_closed = True
+        owner = self._owner
+        if owner is None or not hasattr(owner, "close"):
+            return
+        try:
+            owner.close(kill=bool(kill))
+        except Exception as exc:
+            logger.debug("Contained simulation owner cleanup failed: %s", exc, exc_info=True)
+
+    def run(self) -> None:
+        self._is_running = True
+        try:
+            if self._cancelled:
+                raise SimulationCancelled()
+            self.progress.emit(0, "Initializing simulation...")
+            owner = self._owner
+            if owner is None:
+                raise RuntimeError("Contained simulation owner is unavailable.")
+            request_payload = {
+                "include_mechanism_in_result_payload": bool(
+                    self._include_mechanism_in_result_payload
+                ),
+            }
+            owner_plan_payload = getattr(owner, "simulation_plan_payload", None)
+            if not isinstance(owner_plan_payload, Mapping) or not contained_payloads_equal(
+                dict(owner_plan_payload),
+                self._simulation_plan_payload,
+            ):
+                request_payload["simulation_plan_payload"] = dict(self._simulation_plan_payload)
+            result = owner.solve(
+                request_payload,
+                cancellation_check=self.is_cancelled,
+            )
+            if self._cancelled:
+                raise SimulationCancelled()
+            self.progress.emit(100, "Complete!")
+            self.result_ready.emit(dict(result))
+        except SimulationCancelled as exc:
+            self._close_owner_once(kill=True)
+            self.error.emit(simulation_failure_from_exception(exc))
+        except BaseException as exc:  # noqa: BLE001 - Qt boundary must serialize all failures
+            self._close_owner_once(kill=True)
+            from kindred.core.simulation_containment import (
+                SimulationContainmentChildFailure,
+                SimulationContainmentProtocolError,
+                SimulationContainmentTimeout,
+            )
+
+            if isinstance(exc, SimulationContainmentTimeout):
+                self.error.emit(dict(exc.failure))
+            elif isinstance(exc, SimulationContainmentChildFailure):
+                failure = dict(exc.failure)
+                details = failure.get("details")
+                failure["details"] = dict(details) if isinstance(details, Mapping) else {}
+                failure["details"]["source"] = "simulation_containment"
+                self.error.emit(failure)
+            elif isinstance(exc, SimulationContainmentProtocolError):
+                self.error.emit(simulation_failure_from_exception(exc, kind="simulation_containment_protocol"))
+            else:
+                self.error.emit(simulation_failure_from_exception(exc))
+        finally:
+            self._is_running = False
+
+    def cleanup(self) -> None:
+        self._cancelled = True
+        self._close_owner_once(kill=True)

@@ -14,7 +14,7 @@ from tests.test_gui_species_mode_sliders import (
     _set_batch_current_and_selected_rows,
     _slider_handle_center,
 )
-from tests.worker_stubs import make_simulation_worker_stub
+from tests.worker_stubs import make_contained_simulation_worker_stub
 
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
@@ -112,8 +112,8 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
     assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_stub_payload, emit_progress=(100, "done")),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(payload_factory=_stub_payload, emit_progress=(100, "done")),
     )
     main_window.simulation_controller._run_simulation()
     qtbot.waitUntil(lambda: main_window._preview_session.local_mechanism_workspace(first_set_id) == {}, timeout=2000)
@@ -194,8 +194,8 @@ def test_cached_explicit_selection_change_reuses_cached_overlay_without_recomput
 
     worker_initials: list[dict[str, float]] = []
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(
             on_start=lambda worker: worker_initials.append(dict(worker._initials or {})),
             payload_factory=_stub_payload,
             emit_progress=(100, "done"),

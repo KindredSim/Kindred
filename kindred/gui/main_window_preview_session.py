@@ -108,6 +108,12 @@ class MainWindowPreviewSession:
         mw._refresh_batch_display_from_focus_and_shown()
         mw._status_label.setText("Mechanism invalid — no preview available.")
 
+    def show_preview_unavailable_for_dirty_state(self, message: str) -> None:
+        mw = self._mw
+        self._clear_active_preview_cache_state()
+        mw._refresh_batch_display_from_focus_and_shown()
+        mw._status_label.setText(str(message or "Preview unavailable. Adjust sliders or run again."))
+
     def _focused_mechanism_workspace_set_id(self) -> str:
         mw = self._mw
         try:

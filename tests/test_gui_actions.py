@@ -8,7 +8,7 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.gui.main_window import MainWindow
 from kindred.gui.plot_config import is_pyqtgraph_available
-from tests.worker_stubs import ImmediateWorker
+from tests.worker_stubs import make_contained_simulation_worker_stub
 
 pytestmark = pytest.mark.gui
 
@@ -46,9 +46,25 @@ def test_run_simulation_requires_mechanism(main_window: MainWindow, monkeypatch)
 
 def test_run_simulation_uses_worker_stub(main_window: MainWindow, monkeypatch):
     """Happy-path simulation hooks should update provenance when worker succeeds."""
+    def _payload(worker) -> dict:
+        return {
+            "t": np.linspace(0.0, 1.0, 6),
+            "Y": np.vstack(
+                [
+                    np.linspace(1.0, 0.2, 6),
+                    np.linspace(0.0, 0.8, 6),
+                ]
+            ),
+            "species_names": ["A", "B"],
+            "mechanism": None,
+            "mechanism_text": worker._mechanism_text,
+            "solver_config": dict(worker._solver_config),
+        }
+
+    worker_stub = make_contained_simulation_worker_stub(payload_factory=_payload)
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        ImmediateWorker,
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        worker_stub,
     )
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=0.5\ninitial: A=1.0\ninitial: B=0.0"

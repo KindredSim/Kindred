@@ -75,18 +75,18 @@ def test_evidenced_gui_import_sites_point_to_real_owner_modules() -> None:
                 "from kindred.core.units import UnitsModel",
             ],
         ),
-        (
-            "kindred/gui/simulation_worker.py",
-            [
-                "from kindred.compat.shims import evaluate_algebra_series_for_simulation_with_errors",
-                "from kindred.compat.shims import solve_ode",
-                "Import lazily through compatibility shims to avoid circular dependencies.",
-            ],
-            [
-                "from kindred.core.algebra.simulation_series import (",
-                "from kindred.core.simulator.solvers import solve_ode",
-            ],
-        ),
+            (
+                "kindred/gui/simulation_worker.py",
+                [
+                    "from kindred.compat.shims import evaluate_algebra_series_for_simulation_with_errors",
+                    "from kindred.compat.shims import solve_ode",
+                    "Import lazily through compatibility shims to avoid circular dependencies.",
+                ],
+                [
+                    "from kindred.core.simulation_result_finalization import evaluate_simulation_result_algebra",
+                    "from kindred.core.simulator.solvers import solve_ode",
+                ],
+            ),
         (
             "kindred/gui/main_window_variable_runtime.py",
             ["from kindred.compat.shims import ("],

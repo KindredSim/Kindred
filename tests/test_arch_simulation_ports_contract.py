@@ -56,6 +56,7 @@ def test_simulation_slider_port_exposes_preview_validity_query() -> None:
     slider_block = _protocol_block(source, "SimulationSliderPort")
 
     assert "def is_mechanism_valid_for_preview(" in slider_block
+    assert "def show_preview_unavailable_for_dirty_state(" in slider_block
 
 
 def test_slider_preview_lifecycle_port_is_explicit_and_bounded() -> None:

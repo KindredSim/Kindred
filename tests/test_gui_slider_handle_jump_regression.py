@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
-from tests.worker_stubs import make_simulation_worker_stub
+from tests.worker_stubs import make_contained_simulation_worker_stub
 
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
@@ -57,8 +57,8 @@ def test_slider_drag_does_not_recenter_other_ranges_or_break_ctc(main_window, qt
         }
 
     monkeypatch.setattr(
-        "kindred.gui.simulation_worker.SimulationWorker",
-        make_simulation_worker_stub(payload_factory=_payload),
+        "kindred.gui.simulation_worker.ContainedSimulationWorker",
+        make_contained_simulation_worker_stub(payload_factory=_payload),
     )
 
     sliders = main_window._mechanism_editor._variable_sliders

@@ -217,9 +217,10 @@ def _prime_energy_mode_sliders_in_reaction_editor(main_window, monkeypatch, *, T
 def test_gui_energy_slider_updates_worker_mechanism_text_and_commits_state_network_dsl(main_window, monkeypatch):
     _prime_energy_mode_sliders(main_window, monkeypatch, T=200.0)
 
-    from kindred.gui.simulation_worker import SimulationWorker
+    from kindred.core.simulation_plan import SimulationPlan
+    from kindred.gui.simulation_worker import ContainedSimulationWorker
 
-    monkeypatch.setattr(SimulationWorker, "start", lambda self: None)
+    monkeypatch.setattr(ContainedSimulationWorker, "start", lambda self: None)
 
     var_eq = "dG_eq__TS1__A__B"
     sliders = main_window._mechanism_editor._variable_sliders
@@ -234,7 +235,9 @@ def test_gui_energy_slider_updates_worker_mechanism_text_and_commits_state_netwo
         timer.stop()
 
     main_window.simulation_controller.launch_pending_slider_preview_replay()
-    worker_text = main_window.simulation_controller.run_state.simulation_worker._mechanism_text
+    worker = main_window.simulation_controller.run_state.simulation_worker
+    worker_plan = getattr(worker, "_simulation_plan", getattr(worker, "_simulation_plan_payload", {}))
+    worker_text = SimulationPlan.from_payload(worker_plan).to_execution_request().mechanism_text
     assert re.search(r"^state:\s*B,.*\benergy=-5\b", worker_text, flags=re.MULTILINE)
 
     main_window._on_slider_drag_finished(var_eq)
@@ -296,9 +299,10 @@ def test_gui_energy_slider_refreshes_derived_K_immediately(main_window, monkeypa
 def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(main_window, monkeypatch):
     _prime_energy_mode_sliders_in_reaction_editor(main_window, monkeypatch, T=200.0)
 
-    from kindred.gui.simulation_worker import SimulationWorker
+    from kindred.core.simulation_plan import SimulationPlan
+    from kindred.gui.simulation_worker import ContainedSimulationWorker
 
-    monkeypatch.setattr(SimulationWorker, "start", lambda self: None)
+    monkeypatch.setattr(ContainedSimulationWorker, "start", lambda self: None)
 
     meta_map = dict(main_window.variable_metadata() or {})
     var_eq = next(
@@ -327,7 +331,9 @@ def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(m
         timer.stop()
 
     main_window.simulation_controller.launch_pending_slider_preview_replay()
-    worker_text = main_window.simulation_controller.run_state.simulation_worker._mechanism_text
+    worker = main_window.simulation_controller.run_state.simulation_worker
+    worker_plan = getattr(worker, "_simulation_plan", getattr(worker, "_simulation_plan_payload", {}))
+    worker_text = SimulationPlan.from_payload(worker_plan).to_execution_request().mechanism_text
     m = re.search(
         rf"^state:.*\bname\s*=\s*{re.escape(product)}\b.*\benergy\s*=\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
         worker_text,

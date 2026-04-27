@@ -31,6 +31,7 @@ from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     is_cancelled_failure,
+    simulation_failure_from_exception,
     simulation_failure_detail_text,
     simulation_failure_user_message,
 )
@@ -309,6 +310,8 @@ class SimulationController(QtCore.QObject):
         self._discarded_slider_preview_generation_id: Optional[int] = None
         self._pool_eagerly_created: bool = False
         self._completion_policy = SimulationCompletionPolicy()
+        self._ordinary_simulation_owner = None
+        self._preview_simulation_owner = None
 
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
@@ -1405,6 +1408,13 @@ class SimulationController(QtCore.QObject):
         seen_ids: set[int] = set()
         owned_workers = []
         current_worker = getattr(self, "_simulation_worker", None)
+        current_worker_running = self._worker_is_running(current_worker)
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        active_fast = bool(isinstance(ctx, dict) and ctx.get("fast_mode"))
+        detached_active_owner = None
+        if current_worker_running:
+            detached_active_owner = self._detach_contained_simulation_owner(fast_mode=active_fast)
+        self._close_contained_simulation_owner(kill=True)
         if current_worker is not None:
             owned_workers.append(current_worker)
             seen_ids.add(id(current_worker))
@@ -1421,6 +1431,20 @@ class SimulationController(QtCore.QObject):
                 retain_if_running=True,
                 preserve_handlers_if_running=True,
             )
+            if (
+                worker is current_worker
+                and (not still_running)
+                and detached_active_owner is not None
+                and hasattr(detached_active_owner, "close")
+            ):
+                try:
+                    detached_active_owner.close(kill=True)
+                except Exception as exc:
+                    self._record_nonfatal_exception(
+                        "Failed to close detached contained simulation owner during closeEvent cleanup",
+                        exc,
+                    )
+                detached_active_owner = None
             if (not still_running) and getattr(self, "_simulation_worker", None) is worker:
                 self._simulation_worker = None
         self._shutdown_batch_executor(force_terminate=True)
@@ -1506,6 +1530,67 @@ class SimulationController(QtCore.QObject):
         self._cleanup_worker_safely(worker, "simulation worker", retain_if_running=True)
         if getattr(self, "_simulation_worker", None) is worker:
             self._simulation_worker = None
+
+    def _contained_owner_attr(self, *, fast_mode: bool) -> str:
+        return "_preview_simulation_owner" if bool(fast_mode) else "_ordinary_simulation_owner"
+
+    def _contained_simulation_owner(
+        self,
+        *,
+        fast_mode: bool,
+        simulation_plan_payload: Optional[Mapping[str, Any]] = None,
+    ):
+        attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
+        owner_plan_payload = dict(simulation_plan_payload or {})
+        owner = getattr(self, attr, None)
+        if owner is not None:
+            return owner
+        factory = getattr(self, "_contained_simulation_owner_factory", None)
+        if callable(factory):
+            try:
+                owner = factory(
+                    fast_mode=bool(fast_mode),
+                    simulation_plan_payload=owner_plan_payload,
+                )
+            except TypeError:
+                owner = factory(fast_mode=bool(fast_mode))
+        else:
+            from kindred.core.simulation_containment import WarmSimulationOwner
+
+            timeout_s = getattr(self, "_contained_simulation_timeout_s", None)
+            kwargs: Dict[str, Any] = {}
+            if timeout_s is not None:
+                kwargs["active_timeout_s"] = float(timeout_s)
+            owner = WarmSimulationOwner(owner_plan_payload, **kwargs)
+        setattr(self, attr, owner)
+        return owner
+
+    def _detach_contained_simulation_owner(self, *, fast_mode: bool):
+        attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
+        owner = getattr(self, attr, None)
+        setattr(self, attr, None)
+        return owner
+
+    def _close_contained_simulation_owner(
+        self,
+        *,
+        fast_mode: Optional[bool] = None,
+        kill: bool = False,
+    ) -> None:
+        modes = (False, True) if fast_mode is None else (bool(fast_mode),)
+        for mode in modes:
+            attr = self._contained_owner_attr(fast_mode=mode)
+            owner = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if owner is None or not hasattr(owner, "close"):
+                continue
+            try:
+                owner.close(kill=bool(kill))
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    f"Failed to close {'preview' if mode else 'ordinary'} contained simulation owner",
+                    exc,
+                )
 
     def _connect_simulation_worker_application_signals(
         self,
@@ -1741,6 +1826,7 @@ class SimulationController(QtCore.QObject):
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
         self._clear_preview_ownership()
+        self._close_contained_simulation_owner(fast_mode=True, kill=True)
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
         clear_preview = getattr(self._batch_cache, "clear_active_preview_selection_state", None)
@@ -2887,6 +2973,7 @@ class SimulationController(QtCore.QObject):
     # ------------------------------------------------------------------
     def _cancel_active_run_for_restart(self) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
+        active_fast = bool(isinstance(ctx, dict) and ctx.get("fast_mode"))
         if isinstance(ctx, dict) and ctx.get("active"):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
@@ -2898,6 +2985,11 @@ class SimulationController(QtCore.QObject):
                     worker.cancel()
             except Exception as exc:
                 self._record_nonfatal_exception("Failed to cancel active worker during restart", exc)
+        if self._worker_is_running(worker):
+            self._detach_contained_simulation_owner(fast_mode=active_fast)
+        else:
+            self._close_contained_simulation_owner(fast_mode=active_fast, kill=True)
+        if worker is not None:
             self._release_current_simulation_worker()
         self._simulation_running = False
         self._slider_simulation_active = False
@@ -3231,8 +3323,6 @@ class SimulationController(QtCore.QObject):
             except (TypeError, ValueError, IndexError):
                 t_end = float(t_end)
 
-        from kindred.gui.simulation_worker import SimulationWorker
-
         self._release_current_simulation_worker()
 
         self._run_sequence_id = int(getattr(self, "_run_sequence_id", 0)) + 1
@@ -3333,15 +3423,46 @@ class SimulationController(QtCore.QObject):
             context=ctx,
         )
 
-        self._simulation_worker = SimulationWorker(
-            mechanism_text=mechanism_text_for_worker,
-            initials=initials_dict,
-            t_span=(0.0, t_end),
-            solver_config=solver_config,
-            parent=self,
-            prepared=prepared_payload,
-            include_mechanism_in_result_payload=include_mechanism_in_result_payload,
-        )
+        if isinstance(plan_payload, dict):
+            try:
+                from kindred.core.simulation_containment import build_contained_simulation_plan_payload
+                from kindred.gui.simulation_worker import ContainedSimulationWorker
+
+                contained_plan_payload = build_contained_simulation_plan_payload(plan_payload)
+                contained_owner = self._contained_simulation_owner(
+                    fast_mode=bool(fast_mode),
+                    simulation_plan_payload=contained_plan_payload,
+                )
+                self._simulation_worker = ContainedSimulationWorker(
+                    owner=contained_owner,
+                    simulation_plan_payload=contained_plan_payload,
+                    include_mechanism_in_result_payload=include_mechanism_in_result_payload,
+                    parent=self,
+                )
+            except Exception as exc:
+                self._dispatch_simulation_error(
+                    simulation_failure_from_exception(exc, kind="simulation_containment_payload"),
+                    run_id=int(run_id),
+                    fast_mode=bool(fast_mode),
+                    request_id=int(request_id),
+                    owner_epoch=ctx.get("preview_owner_epoch"),
+                    batch_set=str(set_name),
+                    batch_set_id=str(set_id),
+                    cache_key=str(cache_key),
+                )
+                return
+        else:
+            from kindred.gui.simulation_worker import SimulationWorker
+
+            self._simulation_worker = SimulationWorker(
+                mechanism_text=mechanism_text_for_worker,
+                initials=initials_dict,
+                t_span=(0.0, t_end),
+                solver_config=solver_config,
+                parent=self,
+                prepared=prepared_payload,
+                include_mechanism_in_result_payload=include_mechanism_in_result_payload,
+            )
         self._simulation_worker._run_id = run_id  # type: ignore[attr-defined]
         self._simulation_worker._request_id = int(request_id)  # type: ignore[attr-defined]
         self._simulation_worker._fast_mode = bool(fast_mode)  # type: ignore[attr-defined]
@@ -4992,6 +5113,8 @@ class SimulationController(QtCore.QObject):
                     if not shutdown_requested:
                         self._schedule_deferred_preview_replay_handoff_once()
                 self._clear_shutdown_request_after_close_cleanup()
+                if not bool(is_preview):
+                    self._close_contained_simulation_owner(fast_mode=False, kill=False)
 
     def _on_simulation_error(
         self,
@@ -5104,6 +5227,26 @@ class SimulationController(QtCore.QObject):
                             exc,
                         )
             return
+        preview_failure_kind = str(error_payload.get("kind") or "").strip().lower()
+        preview_failure_details = error_payload.get("details")
+        preview_failure_source = (
+            str(preview_failure_details.get("source") or "").strip().lower()
+            if isinstance(preview_failure_details, Mapping)
+            else ""
+        )
+        status_only_preview_failure = (
+            preview_failure_kind == "timeout"
+            or preview_failure_kind.startswith("simulation_containment")
+            or preview_failure_source == "simulation_containment"
+        )
+        if bool(fast_mode) and not cancelled and status_only_preview_failure:
+            self._handle_current_preview_simulation_failure(
+                error_payload,
+                error_text=error_text,
+                error_detail_text=error_detail_text,
+                context=ctx if isinstance(ctx, Mapping) else None,
+            )
+            return
         logger.warning("Simulation error surfaced to UI: %s", error_text)
 
         if isinstance(ctx, dict) and ctx.get("active"):
@@ -5111,6 +5254,7 @@ class SimulationController(QtCore.QObject):
             self._batch_run_context = dict(ctx)
         self._release_current_simulation_worker()
         self._shutdown_batch_executor(force_terminate=True)
+        self._close_contained_simulation_owner(fast_mode=bool(fast_mode), kill=True)
         self._clear_shutdown_request_after_close_cleanup()
 
         if not cancelled:
@@ -5151,6 +5295,62 @@ class SimulationController(QtCore.QObject):
             ctx=ctx if isinstance(ctx, Mapping) else None,
         )
 
+    def _handle_current_preview_simulation_failure(
+        self,
+        error_payload: Mapping[str, Any],
+        *,
+        error_text: str,
+        error_detail_text: str,
+        context: Optional[Mapping[str, Any]],
+    ) -> None:
+        kind = str(error_payload.get("kind") or "").strip().lower()
+        if error_detail_text:
+            logger.warning("%s", error_detail_text)
+        if kind == "timeout":
+            status_text = "Preview timed out. Adjust sliders or run again."
+        else:
+            status_text = "Preview unavailable. Adjust sliders or run again."
+        logger.warning("Preview simulation failed without modal: %s", error_text)
+
+        ctx = dict(context or {})
+        if ctx.get("active"):
+            ctx["active"] = False
+            self._batch_run_context = dict(ctx)
+        self._release_current_simulation_worker()
+        self._shutdown_batch_executor(force_terminate=True)
+        self._close_contained_simulation_owner(fast_mode=True, kill=True)
+        self._clear_shutdown_request_after_close_cleanup()
+        self._clear_pending_preview_slider_plot_updates()
+        try:
+            self.ui.slider.set_slider_triggered_simulation(False)
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to clear slider-triggered state after preview failure",
+                exc,
+            )
+        self._simulation_running = False
+        self._slider_simulation_active = False
+        self.ui.run_ui.set_run_button_enabled(True)
+        self.ui.run_ui.set_stop_button_enabled(False)
+        self.ui.run_ui.set_sim_progress_value(0)
+        try:
+            self.ui.run_ui.set_algebra_status_text("")
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to clear algebra status label after preview failure",
+                exc,
+            )
+
+        try:
+            self.ui.slider.show_preview_unavailable_for_dirty_state(status_text)
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                "Failed to show dirty no-preview state after preview failure",
+                exc,
+            )
+            self.ui.run_ui.set_status_text(status_text)
+        self.ui.run_ui.set_status_text(status_text)
+
     def _stop_simulation(self):
         if not self._simulation_running:
             return
@@ -5162,12 +5362,15 @@ class SimulationController(QtCore.QObject):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
         self._shutdown_batch_executor(force_terminate=True)
+        active_fast = bool(isinstance(ctx, dict) and ctx.get("fast_mode"))
 
         if self._worker_is_running(self._simulation_worker):
             self._simulation_worker.cancel()
+            self._detach_contained_simulation_owner(fast_mode=active_fast)
             logger.info("Cancellation requested from simulation worker")
             self.ui.run_ui.set_status_text("Cancelling simulation...")
         else:
+            self._close_contained_simulation_owner(fast_mode=active_fast, kill=True)
             self._simulation_running = False
             self.ui.run_ui.set_run_button_enabled(True)
             self.ui.run_ui.set_stop_button_enabled(False)
