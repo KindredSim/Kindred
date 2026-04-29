@@ -70,7 +70,7 @@ def fixture_owned_main_window_teardown_probe(qt_app, tmp_path):
     cleanup_calls = {"shutdown": 0, "release": 0, "reset_preview": 0}
 
     original_delete_later = window.deleteLater
-    original_shutdown = window.simulation_controller.shutdown_batch_executor
+    original_shutdown = window.simulation_controller.shutdown_batch_lane_pool
     original_release = window.simulation_controller.release_current_simulation_worker
     original_reset_preview = window._preview_session.reset_preview_state
 
@@ -91,7 +91,7 @@ def fixture_owned_main_window_teardown_probe(qt_app, tmp_path):
         return original_reset_preview(*args, **kwargs)
 
     window.deleteLater = wrapped_delete_later
-    window.simulation_controller.shutdown_batch_executor = wrapped_shutdown
+    window.simulation_controller.shutdown_batch_lane_pool = wrapped_shutdown
     window.simulation_controller.release_current_simulation_worker = wrapped_release
     window._preview_session.reset_preview_state = wrapped_reset_preview
 

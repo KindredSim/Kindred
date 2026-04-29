@@ -49,10 +49,17 @@ __all__ = [
     "build_prepared_simulation_func",
     "coerce_prepared_simulation_metadata",
     "metadata_view_for_mechanism",
+    "prepared_simulation_run_for_execution_request",
     "prepare_fitting_objective_context",
     "prepare_bound_mechanism",
     "prepare_simulation_worker_run",
 ]
+
+
+@dataclass(frozen=True)
+class _ParameterOverrideApplication:
+    rebuild_rhs: bool
+    fully_applied: bool
 
 
 @dataclass
@@ -244,6 +251,7 @@ class SimulationExecutionRequest:
     solver_config: Dict[str, Any]
     mechanism_text: str = ""
     simulation_identity: Optional[Dict[str, Any]] = None
+    parameter_overrides: Optional[Dict[str, float]] = None
     version: int = 1
 
     @classmethod
@@ -268,6 +276,14 @@ class SimulationExecutionRequest:
                 if isinstance(payload.get("simulation_identity"), Mapping)
                 else None
             ),
+            parameter_overrides=(
+                {
+                    str(name): float(value)
+                    for name, value in dict(payload.get("parameter_overrides") or {}).items()
+                }
+                if isinstance(payload.get("parameter_overrides"), Mapping)
+                else None
+            ),
         )
 
     def to_payload(self) -> Dict[str, Any]:
@@ -276,7 +292,7 @@ class SimulationExecutionRequest:
             prepared_payload = dict(self.prepared_payload)
             if "y0" in prepared_payload:
                 prepared_payload["y0"] = np.array(prepared_payload["y0"], copy=True, dtype=float).reshape(-1)
-        return {
+        payload = {
             "version": int(self.version),
             "prepared_payload": prepared_payload,
             "initials": {str(name): float(value) for name, value in dict(self.initials or {}).items()},
@@ -285,6 +301,12 @@ class SimulationExecutionRequest:
             "mechanism_text": str(self.mechanism_text or ""),
             "simulation_identity": dict(self.simulation_identity or {}) if self.simulation_identity else None,
         }
+        if self.parameter_overrides:
+            payload["parameter_overrides"] = {
+                str(name): float(value)
+                for name, value in dict(self.parameter_overrides or {}).items()
+            }
+        return payload
 
 
 class SimulationWorkerPreparedPayloadV1(TypedDict):
@@ -533,6 +555,277 @@ def _validated_prepared_worker_payload(
     )
 
 
+def _coerce_parameter_override_items(
+    parameter_overrides: Mapping[str, Any] | None,
+) -> list[tuple[str, float]]:
+    if not isinstance(parameter_overrides, Mapping) or not parameter_overrides:
+        return []
+    items: list[tuple[str, float]] = []
+    for raw_name, raw_value in parameter_overrides.items():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not np.isfinite(value):
+            continue
+        items.append((name, value))
+    return items
+
+
+def _scalar_parameter_override_known(mechanism: Any, name: str) -> bool:
+    meta = getattr(mechanism, "metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    scalar_bindings = meta.get("scalar_param_bindings")
+    if isinstance(scalar_bindings, dict) and name in scalar_bindings:
+        setter = getattr(scalar_bindings.get(name), "set", None)
+        if callable(setter):
+            return True
+    scalar_info = meta.get("scalar_param_info")
+    if isinstance(scalar_info, Mapping) and name in scalar_info:
+        return True
+    scalar_params = meta.get("scalar_params")
+    if isinstance(scalar_params, dict) and name in scalar_params:
+        return True
+    return False
+
+
+def _prepared_parameter_override_can_apply(mechanism: Any, name: str) -> bool:
+    from kindred.core.simulator.step_indexing import lookup_step_param_target
+
+    target_name = _canonical_step_override_name(mechanism, name)
+    target = lookup_step_param_target(mechanism, target_name)
+    if target is None:
+        return _scalar_parameter_override_known(mechanism, name)
+    kind, idx, role, _entry = target
+    candidate = None
+    try:
+        if kind == "reaction" and role == "k":
+            candidate = getattr(mechanism.reactions[int(idx)], "rate", None)
+        elif kind == "equilibrium" and role in {"kf", "kr"}:
+            candidate = getattr(mechanism.equilibria[int(idx)], str(role), None)
+        elif kind == "equilibrium" and role == "Keq":
+            meta = getattr(mechanism.equilibria[int(idx)], "metadata", {}) or {}
+            if isinstance(meta, Mapping):
+                candidate = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+    except Exception:
+        candidate = None
+    setter = getattr(candidate, "set", None)
+    return callable(setter)
+
+
+def _apply_parameter_overrides_to_prepared_mechanism(
+    mechanism: Any,
+    parameter_overrides: Mapping[str, Any] | None,
+) -> _ParameterOverrideApplication:
+    """Apply slider-style values and report whether dependent runtime math changed."""
+    override_items = _coerce_parameter_override_items(parameter_overrides)
+    if not override_items:
+        return _ParameterOverrideApplication(rebuild_rhs=False, fully_applied=True)
+
+    for name, _value in override_items:
+        if not _prepared_parameter_override_can_apply(mechanism, name):
+            return _ParameterOverrideApplication(rebuild_rhs=False, fully_applied=False)
+
+    from kindred.core.simulator.step_indexing import lookup_step_param_target
+
+    override_applied = False
+    for name, value in override_items:
+        target_name = _canonical_step_override_name(mechanism, name)
+        target = lookup_step_param_target(mechanism, target_name)
+        if target is None:
+            override_applied = (
+                _apply_scalar_parameter_override_to_prepared_mechanism(
+                    mechanism,
+                    name,
+                    float(value),
+                )
+                or override_applied
+            )
+            continue
+        kind, idx, role, _entry = target
+        candidate = None
+        try:
+            if kind == "reaction" and role == "k":
+                candidate = getattr(mechanism.reactions[int(idx)], "rate", None)
+            elif kind == "equilibrium" and role in {"kf", "kr"}:
+                candidate = getattr(mechanism.equilibria[int(idx)], str(role), None)
+            elif kind == "equilibrium" and role == "Keq":
+                meta = getattr(mechanism.equilibria[int(idx)], "metadata", {}) or {}
+                if isinstance(meta, Mapping):
+                    candidate = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+        except Exception:
+            candidate = None
+
+        setter = getattr(candidate, "set", None)
+        if callable(setter):
+            setter(float(value))
+            override_applied = True
+    if override_applied:
+        from kindred.core.simulator.parameter_algebra import (
+            apply_parameter_algebra_spec_to_mechanism,
+            parameter_algebra_spec_from_mechanism,
+        )
+
+        spec = parameter_algebra_spec_from_mechanism(mechanism)
+        if spec is not None:
+            apply_parameter_algebra_spec_to_mechanism(
+                spec,
+                mechanism=mechanism,
+                require_mutable=False,
+            )
+    return _ParameterOverrideApplication(
+        rebuild_rhs=bool(override_applied),
+        fully_applied=True,
+    )
+
+
+def apply_parameter_overrides_to_prepared_mechanism(
+    mechanism: Any,
+    parameter_overrides: Mapping[str, Any] | None,
+) -> bool:
+    """Apply slider-style values and report whether dependent runtime math changed."""
+    return bool(
+        _apply_parameter_overrides_to_prepared_mechanism(
+            mechanism,
+            parameter_overrides,
+        ).rebuild_rhs
+    )
+
+
+def _canonical_step_override_name(mechanism: Any, name: str) -> str:
+    name_s = str(name or "").strip()
+    if not name_s:
+        return ""
+    try:
+        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+        resolution = build_namespace_from_mechanism(mechanism).resolve(name_s)
+    except Exception:
+        return name_s
+    if resolution.equilibrium_conflict_name is not None:
+        return name_s
+    return str(resolution.canonical_name or name_s)
+
+
+def _apply_scalar_parameter_override_to_prepared_mechanism(
+    mechanism: Any,
+    name: str,
+    value: float,
+) -> bool:
+    meta = getattr(mechanism, "metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    scalar_known = False
+    scalar_bindings = meta.get("scalar_param_bindings")
+    if isinstance(scalar_bindings, dict) and name in scalar_bindings:
+        setter = getattr(scalar_bindings.get(name), "set", None)
+        if callable(setter):
+            setter(float(value))
+            scalar_known = True
+    scalar_params = meta.get("scalar_params")
+    if not isinstance(scalar_params, dict):
+        scalar_params = {}
+        meta["scalar_params"] = scalar_params
+    scalar_info = meta.get("scalar_param_info")
+    if isinstance(scalar_info, Mapping) and name in scalar_info:
+        scalar_known = True
+    if name in scalar_params:
+        scalar_known = True
+    if not scalar_known:
+        return False
+    scalar_params[str(name)] = float(value)
+    return True
+
+
+def prepared_simulation_run_for_execution_request(
+    prepared: PreparedSimulationRun,
+    execution_request: SimulationExecutionRequest | Mapping[str, Any],
+) -> PreparedSimulationRun:
+    """Reuse a prepared runtime while applying request-local initials and slider values."""
+    request_payload = coerce_simulation_execution_request(execution_request)
+    if request_payload is None:
+        return prepared
+
+    override_application = _apply_parameter_overrides_to_prepared_mechanism(
+        prepared.mechanism,
+        request_payload.parameter_overrides,
+    )
+    if request_payload.parameter_overrides and not override_application.fully_applied:
+        return prepare_simulation_worker_run(execution_request=request_payload)
+    rebuild_rhs = bool(override_application.rebuild_rhs)
+    rhs = prepared.request.rhs
+    jacobian_func = prepared.request.jacobian_func
+    temperature_schedule = prepared.request.temperature_schedule
+    warnings = list(getattr(prepared, "warnings", None) or [])
+    if rebuild_rhs:
+        try:
+            from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+
+            rhs = build_ode_rhs_from_mechanism(prepared.mechanism)
+        except Exception as exc:
+            raise SimulationPreparationError("ode_build", str(exc)) from exc
+        try:
+            solver_config = _build_solver_config(
+                solver_input=str(prepared.request.solver),
+                rtol=float(prepared.request.rtol),
+                atol=float(prepared.request.atol),
+                grid=dict(prepared.request.grid or {}),
+                use_sparse_jacobian=bool(prepared.request.jacobian_func is not None),
+                wegscheider_cyclicity_enabled=bool(
+                    (getattr(prepared.mechanism, "metadata", {}) or {}).get(
+                        MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
+                        WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+                    )
+                ),
+            )
+            prepared_context = _build_prepared_run_context(
+                mechanism=prepared.mechanism,
+                solver_config=solver_config,
+                temperature_schedule_override=prepared.request.temperature_schedule,
+                jacobian_func_override=None,
+            )
+            jacobian_func = prepared_context.jacobian_func
+            temperature_schedule = prepared_context.temperature_schedule
+            warnings = list(prepared_context.warnings)
+        except Exception as exc:
+            raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
+
+    y0 = np.asarray(prepared.y0, dtype=float).reshape(-1).copy()
+    initials = dict(request_payload.initials or {})
+    if initials:
+        for idx, sp in enumerate(prepared.species_names):
+            if sp not in initials:
+                continue
+            try:
+                y0[idx] = float(initials[sp])
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+    request = replace(
+        prepared.request,
+        rhs=rhs,
+        t_span=(float(request_payload.t_span[0]), float(request_payload.t_span[1])),
+        y0=np.asarray(y0, dtype=float).reshape(-1),
+        jacobian_func=jacobian_func,
+        temperature_schedule=temperature_schedule,
+    )
+    initials_for_algebra = {
+        str(sp): float(y0[idx])
+        for idx, sp in enumerate(prepared.species_names)
+    }
+    return replace(
+        prepared,
+        y0=np.asarray(y0, dtype=float).reshape(-1),
+        initials_for_algebra=initials_for_algebra,
+        warnings=warnings,
+        request=request,
+    )
+
+
 def _build_prepared_run_context(
     *,
     mechanism: Any,
@@ -726,6 +1019,19 @@ def prepare_simulation_worker_run(
     except Exception as exc:
         raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
 
+    if request_payload is not None and request_payload.parameter_overrides:
+        try:
+            _bind_parameters_to_mechanism(
+                mechanism,
+                sorted(str(name) for name in request_payload.parameter_overrides.keys()),
+            )
+            apply_parameter_overrides_to_prepared_mechanism(
+                mechanism,
+                request_payload.parameter_overrides,
+            )
+        except Exception as exc:
+            raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
+
     if rhs is None:
         try:
             from kindred.core.ode_builder import build_ode_rhs_from_mechanism
@@ -789,7 +1095,7 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
     bindings: Dict[str, RateBinding] = {}
 
     for raw_name in names:
-        name = str(raw_name)
+        name = _canonical_step_override_name(mech, str(raw_name))
         target = lookup_step_param_target(mech, name)
         if target is None:
             continue

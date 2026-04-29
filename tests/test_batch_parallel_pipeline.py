@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
 
 pytestmark = [pytest.mark.gui]
@@ -19,48 +20,59 @@ class _Submission:
     fn: Any
     args: tuple[Any, ...]
     kwargs: Dict[str, Any]
-    future: Future
+    result_placeholder: Any = None
 
 
-class _FakeExecutor:
+class _FakeLanePool:
     def __init__(self, *, done_immediately: bool = False, value_marker: float = 1.0) -> None:
         self.done_immediately = bool(done_immediately)
         self.value_marker = float(value_marker)
         self.submissions: List[_Submission] = []
-        self.shutdown_calls: List[Dict[str, Any]] = []
+        self.close_calls: List[Dict[str, Any]] = []
 
-    def submit(self, fn, *args, **kwargs):
-        fut: Future = Future()
-        sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs), future=fut)
+    def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+        _ = active_timeout_s
+        args = (dict(task or {}),)
+        sub = _Submission(fn=run_batch_simulation_task, args=args, kwargs={}, result_placeholder=None)
         self.submissions.append(sub)
-        if fn is not run_batch_simulation_task:
-            fut.set_result(True)
-        elif self.done_immediately:
-            task = dict(args[0] if args else {})
-            sid = str(task.get("set_id") or task.get("batch_set_id") or "")
-            fut.set_result(
-                {
-                    "run_id": int(task.get("run_id") or 0),
-                    "set_id": sid,
-                    "set_name": str(task.get("set_name") or sid or "set"),
-                    "t": np.array([0.0, 1.0]),
-                    "Y": np.array([[self.value_marker, self.value_marker]]),
-                    "species_names": ["A"],
-                    "algebra_scalars": {},
-                    "mechanism": None,
-                    "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
-                    "solver_config": dict(task.get("solver_config") or {}),
-                    "fallback_occurred": False,
-                    "fallback_message": None,
-                }
-            )
-        return fut
+        sid = str(task.get("set_id") or task.get("batch_set_id") or set_id or "")
+        payload = {
+            "run_id": int(task.get("run_id") or run_id or 0),
+            "request_id": int(task.get("request_id") or request_id or 0),
+            "set_id": sid,
+            "set_name": str(task.get("set_name") or sid or "set"),
+            "t": np.array([0.0, 1.0]),
+            "Y": np.array([[self.value_marker, self.value_marker]]),
+            "species_names": ["A"],
+            "algebra_scalars": {},
+            "mechanism": None,
+            "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
+            "solver_config": dict(task.get("solver_config") or {}),
+            "fallback_occurred": False,
+            "fallback_message": None,
+        }
+        return BatchLaneOutcome(
+            lane_id="fake-lane",
+            run_id=int(run_id),
+            request_id=int(request_id),
+            set_id=sid,
+            owner_epoch=1,
+            success=True,
+            payload=payload,
+        )
 
-    def shutdown(self, wait=True, cancel_futures=False):
-        self.shutdown_calls.append(
+    def _close_requests(self, *, kill: bool = False):
+        self.close_calls.append(
             {
-                "wait": bool(wait),
-                "cancel_futures": bool(cancel_futures),
+                "kill": bool(kill),
+            }
+        )
+
+    def close(self, *, kill: bool = False):
+        self.close_calls.append(
+            {
+                "wait": False,
+                "kill": bool(kill),
             }
         )
 
@@ -96,8 +108,16 @@ def _prime_three_batch_sets(main_window) -> list[str]:
     return names[:3]
 
 
-def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:
-    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+def _simulation_submissions(lane_pool: _FakeLanePool) -> list[_Submission]:
+    return [sub for sub in lane_pool.submissions if sub.fn is run_batch_simulation_task]
+
+
+def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_s: float = 1.0) -> None:
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if len(_simulation_submissions(lane_pool)) >= int(expected):
+            return
+        time.sleep(0.005)
 
 
 
@@ -118,12 +138,12 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 
-    fake = _FakeExecutor(done_immediately=True, value_marker=2.0)
+    fake = _FakeLanePool(done_immediately=True, value_marker=2.0)
 
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(
         main_window.simulation_controller.parallel_batch,
-        "executor_factory",
+        "lane_pool_factory",
         lambda max_workers, limit_blas_threads: fake,
         raising=True,
     )
@@ -131,45 +151,48 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
     # "Run All" was intentionally removed; emulate it via Select All + Run Selected.
     _select_rows(main_window, [0, 1, 2])
     main_window.simulation_controller.run_simulation()
+    _wait_for_submission_count(fake, len(names))
     qtbot.wait(40)
 
     assert len(_simulation_submissions(fake)) == len(names)
 
 
 
-def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, monkeypatch):
+def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, monkeypatch):
     if hasattr(main_window, "set_simulation_cache_caps"):
         main_window.set_simulation_cache_caps(result_cap=20, preview_cap=20)
     _prime_three_batch_sets(main_window)
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 
-    executors: List[_FakeExecutor] = []
+    lane_pools: List[_FakeLanePool] = []
 
     def _factory(max_workers, limit_blas_threads):
-        fake = _FakeExecutor(done_immediately=False, value_marker=float(len(executors) + 1))
-        executors.append(fake)
+        fake = _FakeLanePool(done_immediately=False, value_marker=float(len(lane_pools) + 1))
+        lane_pools.append(fake)
         return fake
 
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
-    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "executor_factory", _factory, raising=True)
+    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "lane_pool_factory", _factory, raising=True)
     req1 = main_window.simulation_controller.next_sim_request_id()
     main_window.simulation_controller.run_simulation_internal(fast_mode=False, request_id=int(req1), batch_rows=[0, 1, 2])
-    assert len(executors) == 1
+    assert len(lane_pools) == 1
+    _wait_for_submission_count(lane_pools[0], 3)
 
     req2 = main_window.simulation_controller.next_sim_request_id()
     main_window.simulation_controller.run_simulation_internal(fast_mode=False, request_id=int(req2), batch_rows=[0, 1, 2])
-    assert len(executors) == 2
+    assert len(lane_pools) == 2
+    _wait_for_submission_count(lane_pools[1], 3)
 
-    old_exec = executors[0]
-    new_exec = executors[1]
+    old_pool = lane_pools[0]
+    new_pool = lane_pools[1]
 
-    assert old_exec.shutdown_calls
+    assert old_pool.close_calls
 
     cache_key = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     assert cache_key
 
-    stale_task = dict(_simulation_submissions(old_exec)[0].args[0] if _simulation_submissions(old_exec)[0].args else {})
+    stale_task = dict(_simulation_submissions(old_pool)[0].args[0] if _simulation_submissions(old_pool)[0].args else {})
     stale_sid = str(stale_task.get("set_id") or "")
     main_window.simulation_controller.on_simulation_complete(
         {
@@ -196,7 +219,7 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
 
     assert main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{stale_sid}") is None
 
-    for sub in _simulation_submissions(new_exec):
+    for sub in _simulation_submissions(new_pool):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
         main_window.simulation_controller.on_simulation_complete(
@@ -223,7 +246,7 @@ def test_new_run_cancels_old_executor_and_rejects_stale_results(main_window, mon
         )
 
     cached_payloads = []
-    for sub in _simulation_submissions(new_exec):
+    for sub in _simulation_submissions(new_pool):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
         payload = main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{sid}")

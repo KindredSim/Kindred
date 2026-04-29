@@ -12,7 +12,7 @@ from kindred.core.containment_kernel import (
 
 
 class SimulationRuntimeOwner:
-    """Non-GUI owner facade for simulation containment lifecycle."""
+    """Non-GUI owner for simulation containment lifecycle."""
 
     def __init__(
         self,
@@ -43,6 +43,10 @@ class SimulationRuntimeOwner:
     @property
     def is_running(self) -> bool:
         return bool(self._kernel_owner.is_running)
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._kernel_owner.is_ready)
 
     def drain_events(self) -> list[ContainmentKernelEvent]:
         return self._kernel_owner.drain_events()

@@ -24,7 +24,7 @@ def qt_app():
 
 
 def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
-    """Saving then loading restores reactions (including `# Algebra`), notes, and state-network DSL."""
+    """Saving then loading restores reactions/algebra and migrates inline initials to batch sets."""
     reactions_text = "\n".join(
         [
             "reaction: A -> B; k=0.2",
@@ -77,10 +77,20 @@ def test_project_round_trip_includes_all_dsl(tmp_path, monkeypatch, qt_app):
         )
         loader.project_controller.load_project()
 
-        assert loader._mechanism_editor._reactions_text.toPlainText() == reactions_text
+        expected_reactions_text = "\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "# Initial concentrations moved to Batch Initial Conditions table (set1). Edit there.",
+                "# Algebra",
+                "let rate_ratio = [B] / max([A], 1e-6)",
+            ]
+        )
+        assert loader._mechanism_editor._reactions_text.toPlainText() == expected_reactions_text
         assert loader._mechanism_editor._reactions_text.isReadOnly() is True
         assert loader._mechanism_editor._notes_text.toPlainText() == notes_text
         assert loader._mechanism_editor._state_network_editor.get_state_network_dsl() == state_network_text
+        assert loader._batch_store.set_names()[:1] == ["set1"]
+        assert loader._batch_store.values_for_set("set1") == {"A": "1", "B": "0"}
     finally:
         loader.close()
 

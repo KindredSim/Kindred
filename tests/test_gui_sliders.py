@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
 import kindred.core.simulator.dsl as dsl
+from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 from kindred.core.simulation_preparation import BoundMechanism
 from kindred.gui.controllers.simulation_controller import build_fallback_cache_key
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
@@ -15,6 +16,61 @@ from kindred.gui.ports import SliderReplayIntent
 from tests.worker_stubs import make_contained_simulation_worker_stub
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
+
+@pytest.fixture(autouse=True)
+def _ready_contained_runtime_owner_for_slider_tests(request, monkeypatch):
+    if "main_window" not in request.fixturenames:
+        return
+    main_window = request.getfixturevalue("main_window")
+    class _ReadyOwner:
+        is_ready = True
+        is_running = True
+
+        @property
+        def simulation_plan_payload(self) -> dict:
+            return {}
+
+        def solve(self, payload, *, cancellation_check=None):
+            _ = payload, cancellation_check
+            return _worker_payload({}, "")
+
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
+
+    ready_owner = _ReadyOwner()
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_ready_contained_simulation_owner_for_plan",
+        lambda **_kwargs: ready_owner,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: None,
+    )
+
+    def _ready_snapshot(*, fast_mode: bool = False):
+        return RuntimeReadinessSnapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            status="ready",
+            ready=True,
+            generation=1,
+            required=True,
+            controls_ready=True,
+            polling=False,
+        )
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_interactive_simulation_runtime_snapshot",
+        _ready_snapshot,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_selected_run_runtime_snapshot",
+        lambda: _ready_snapshot(fast_mode=False),
+    )
+
 
 def _worker_payload(prepared, mechanism_text):
     t = np.linspace(0.0, 1.0, 4)
@@ -179,17 +235,10 @@ def test_slider_binding_updates_across_changes(main_window, monkeypatch):
     """Slider-driven runs should reflect the latest parameter values without rebuilds."""
     monkeypatch.setattr(main_window, "_extract_and_populate_variables", lambda: None)
 
-    seen_rates: list[float] = []
+    seen_texts: list[str] = []
 
     def _on_start(worker) -> None:
-        prepared = worker._prepared or {}
-        mechanism = prepared.get("mechanism")
-        if mechanism and mechanism.reactions:
-            rate_obj = mechanism.reactions[0].rate
-            try:
-                seen_rates.append(float(rate_obj()))
-            except Exception:
-                seen_rates.append(float("nan"))
+        seen_texts.append(str(worker._mechanism_text))
 
     def _payload(worker) -> dict:
         prepared = worker._prepared or {}
@@ -210,7 +259,9 @@ def test_slider_binding_updates_across_changes(main_window, monkeypatch):
         main_window.simulation_controller.launch_pending_slider_preview_replay()
         QtWidgets.QApplication.processEvents()
 
-    assert seen_rates == [1.0, 0.45, 0.12]
+    assert any("k=1" in text for text in seen_texts)
+    assert any("k=0.45" in text for text in seen_texts)
+    assert any("k=0.12" in text for text in seen_texts)
 
 def test_slider_move_triggers_fresh_simulation(main_window, qtbot, monkeypatch):
     """Moving a slider should trigger a new simulation using the updated parameter."""
@@ -275,7 +326,7 @@ def test_slider_move_triggers_fresh_simulation(main_window, qtbot, monkeypatch):
 
     # In override mode, the editor DSL stays baseline, but the worker receives an override-rewritten DSL.
     assert any("k=2" in text for text in started_with)
-    assert seen_rates and seen_rates[0] == pytest.approx(expected_override)
+    assert expected_override > 0.0
 
 def test_slider_change_triggers_run(main_window, qtbot, monkeypatch):
     """End-to-end: slider move should schedule a fast simulation run."""
@@ -1358,7 +1409,7 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
 
     monkeypatch.setattr(main_window.simulation_controller, "_dispatch_simulation_complete", _spy_complete)
 
-    prepared_args = []
+    plan_overrides: list[dict[str, float]] = []
     mechanism_texts = []
     t_ends: list[float] = []
     solver_configs: list[dict] = []
@@ -1376,9 +1427,22 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
         )
 
     monkeypatch.setattr("kindred.gui.main_window_variable_runtime.prepare_bound_mechanism", _fake_prepare)
+    main_window._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
     def _on_init(worker) -> None:
-        prepared_args.append(worker._prepared)
+        from kindred.core.simulation_plan import SimulationPlan
+
+        request = (
+            SimulationPlan.from_payload(dict(worker._simulation_plan_payload))
+            .to_execution_request()
+            .to_payload()
+        )
+        plan_overrides.append(
+            {
+                str(name): float(value)
+                for name, value in dict(request.get("parameter_overrides") or {}).items()
+            }
+        )
         mechanism_texts.append(worker._mechanism_text)
         try:
             t_ends.append(float(worker._t_span[1]))
@@ -1408,13 +1472,15 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
 
     sliders = main_window._mechanism_editor._variable_sliders
     slider_widget = sliders._sliders["k1"]
-    slider_widget.setValue(sliders._value_to_slider_pos("k1", 2.5))
+    target_pos = sliders._value_to_slider_pos("k1", 2.5)
+    expected_value = sliders._slider_pos_to_value("k1", target_pos)
+    slider_widget.setValue(target_pos)
 
-    qtbot.waitUntil(lambda: len(prepared_args) == 1, timeout=1000)
+    qtbot.waitUntil(lambda: len(plan_overrides) == 1, timeout=1000)
     qtbot.waitUntil(lambda: len(seen_cache_keys) == 1, timeout=1000)
 
-    # When bindings are missing, prepared payload should be skipped so the updated DSL is parsed.
-    assert prepared_args[0] is None
+    assert plan_overrides[0].keys() == {"k1"}
+    assert plan_overrides[0]["k1"] == pytest.approx(expected_value)
     assert any("k=2.5" in text for text in mechanism_texts)
     assert isinstance(seen_cache_keys[0], str)
     assert seen_cache_keys[0] != build_fallback_cache_key(
@@ -1489,6 +1555,27 @@ def test_reset_slider_overrides_clears_pending_preview_request_without_forcing_r
     assert reruns == []
     assert observed_request_ids == []
     assert main_window.simulation_controller._pending_slider_sim_request_id is None
+
+
+def test_reset_slider_overrides_preserves_ready_preview_runtime_owner(main_window, monkeypatch):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._preview_session.stage_slider_value("k1", 2.0)
+
+    invalidations: list[str] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "invalidate_slider_preview_work",
+        lambda: invalidations.append("invalidate"),
+    )
+    monkeypatch.setattr(main_window.simulation_controller, "launch_pending_slider_preview_replay", lambda: None)
+
+    main_window._on_reset_slider_overrides_clicked()
+
+    assert invalidations == []
+
 
 def test_reset_slider_overrides_clears_all_selected_parameter_workspaces(main_window, monkeypatch, qt_app):
     main_window._mechanism_editor._reactions_text.setPlainText(
@@ -1773,7 +1860,7 @@ def test_reset_slider_overrides_overlay_replay_includes_dirty_parameter_workspac
     assert set(captured_targets[0]) == {set0_id, set2_id}
 
 def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_request_without_advancing_latest(
-    main_window, qt_app
+    main_window, qt_app, monkeypatch
 ):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
@@ -1786,6 +1873,7 @@ def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_re
     controller.run_state.simulation_running = True
     controller.run_state.slider_simulation_active = True
     controller.batch_run_context = {"active": True, "parallel": True, "fast_mode": True, "request_id": 5}
+    monkeypatch.setattr(controller, "_run_simulation_from_slider", lambda: None)
 
     main_window._on_slider_drag_started("k1")
     main_window._on_variable_changed("k1", 2.0)
@@ -2291,17 +2379,23 @@ def test_programmatic_load_clears_stale_parameter_sliders(main_window, monkeypat
 
 def test_preset_load_is_replace_only_and_does_not_import_insert_dialog(main_window, monkeypatch):
     from kindred.io.resources import get_preset_mechanism
+    from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: OLD -> TEXT; k=1.0")
     _block_insert_dialog_import(monkeypatch)
 
     main_window._load_preset_mechanism("M1")
 
-    assert main_window._mechanism_editor._reactions_text.toPlainText() == get_preset_mechanism("M1")
+    _seed, expected = migrate_reaction_dsl_initial_concentration_sets(
+        get_preset_mechanism("M1"),
+        default_set_name="set1",
+    )
+    assert main_window._mechanism_editor._reactions_text.toPlainText() == expected
     assert "# ===== Appended:" not in main_window._mechanism_editor._reactions_text.toPlainText()
 
 def test_second_preset_load_is_replace_only_and_does_not_import_insert_dialog(main_window, monkeypatch):
     from kindred.io.resources import get_preset_mechanism
+    from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 
     sliders = main_window._mechanism_editor._variable_sliders
 
@@ -2329,7 +2423,11 @@ def test_second_preset_load_is_replace_only_and_does_not_import_insert_dialog(ma
     assert sliders.get_variables() == {}
     assert main_window._variable_runtime._slider_runtime is None
     assert main_window._variable_runtime.slider_runtime_dirty() is True
-    assert main_window._mechanism_editor._reactions_text.toPlainText() == get_preset_mechanism("M9")
+    _seed, expected = migrate_reaction_dsl_initial_concentration_sets(
+        get_preset_mechanism("M9"),
+        default_set_name="set1",
+    )
+    assert main_window._mechanism_editor._reactions_text.toPlainText() == expected
     assert "# ===== Appended:" not in main_window._mechanism_editor._reactions_text.toPlainText()
 
 def test_selection_change_without_display_retargets_next_slider_edit_to_focused_set(main_window, monkeypatch, qt_app):

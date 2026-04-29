@@ -4,6 +4,7 @@ import importlib
 import multiprocessing
 import os
 import queue
+import threading
 import time
 import traceback
 from collections import deque
@@ -285,15 +286,30 @@ def _containment_child_main(
         )
 
 
+def _process_was_started(proc: multiprocessing.Process) -> bool:
+    try:
+        return getattr(proc, "pid", None) is not None
+    except Exception:
+        return False
+
+
+def _join_started_process(proc: multiprocessing.Process, *, timeout: float) -> None:
+    if not _process_was_started(proc):
+        return
+    proc.join(timeout=timeout)
+
+
 def _terminate_process(proc: multiprocessing.Process, *, join_timeout_s: float = _PROCESS_JOIN_TIMEOUT_S) -> None:
+    if not _process_was_started(proc):
+        return
     if not proc.is_alive():
-        proc.join(timeout=join_timeout_s)
+        _join_started_process(proc, timeout=join_timeout_s)
         return
     proc.terminate()
-    proc.join(timeout=join_timeout_s)
+    _join_started_process(proc, timeout=join_timeout_s)
     if proc.is_alive() and hasattr(proc, "kill"):
         proc.kill()
-        proc.join(timeout=join_timeout_s)
+        _join_started_process(proc, timeout=join_timeout_s)
 
 
 class ContainmentKernelOwner:
@@ -320,6 +336,7 @@ class ContainmentKernelOwner:
         self._request_id = 0
         self._ready = False
         self._events: deque[ContainmentKernelEvent] = deque(maxlen=self._event_history_limit)
+        self._lifecycle_lock = threading.RLock()
 
     @property
     def owner_epoch(self) -> int:
@@ -334,6 +351,10 @@ class ContainmentKernelOwner:
         proc = self._process
         return bool(proc is not None and proc.is_alive())
 
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._ready and self.is_running)
+
     def drain_events(self) -> list[ContainmentKernelEvent]:
         events = list(self._events)
         self._events.clear()
@@ -345,27 +366,29 @@ class ContainmentKernelOwner:
         wait: bool = True,
         cancellation_check: Optional[Callable[[], bool]] = None,
     ) -> None:
-        if self._process is not None and self._process.is_alive():
-            if wait and not self._ready:
-                self._wait_for_ready(cancellation_check=cancellation_check)
-            return
-        self.close(kill=True)
-        self._owner_epoch += 1
-        self._ready = False
-        self._input_queue = self._mp_context.Queue()
-        self._output_queue = self._mp_context.Queue()
-        self._process = self._mp_context.Process(
-            target=_containment_child_main,
-            args=(
-                self._handler_spec,
-                dict(self._startup_payload),
-                self._input_queue,
-                self._output_queue,
-                int(self._owner_epoch),
-            ),
-        )
-        self._events.append(ContainmentKernelEvent(kind="owner_starting", owner_epoch=int(self._owner_epoch)))
-        self._process.start()
+        with self._lifecycle_lock:
+            if self._process is not None and self._process.is_alive():
+                if wait and not self._ready:
+                    self._wait_for_ready(cancellation_check=cancellation_check)
+                return
+            self.close(kill=True)
+            self._owner_epoch += 1
+            self._ready = False
+            self._input_queue = self._mp_context.Queue()
+            self._output_queue = self._mp_context.Queue()
+            process = self._mp_context.Process(
+                target=_containment_child_main,
+                args=(
+                    self._handler_spec,
+                    dict(self._startup_payload),
+                    self._input_queue,
+                    self._output_queue,
+                    int(self._owner_epoch),
+                ),
+            )
+            self._process = process
+            self._events.append(ContainmentKernelEvent(kind="owner_starting", owner_epoch=int(self._owner_epoch)))
+            process.start()
         if wait:
             self._wait_for_ready(cancellation_check=cancellation_check)
 
@@ -411,25 +434,26 @@ class ContainmentKernelOwner:
         )
 
     def close(self, *, kill: bool = False) -> None:
-        proc = self._process
-        input_queue = self._input_queue
-        output_queue = self._output_queue
-        self._process = None
-        self._input_queue = None
-        self._output_queue = None
-        self._ready = False
+        with self._lifecycle_lock:
+            proc = self._process
+            input_queue = self._input_queue
+            output_queue = self._output_queue
+            self._process = None
+            self._input_queue = None
+            self._output_queue = None
+            self._ready = False
 
-        if proc is not None:
+        if proc is not None and _process_was_started(proc):
             if not kill and proc.is_alive() and input_queue is not None:
                 try:
                     input_queue.put({"kind": "close", "owner_epoch": int(self._owner_epoch)})
-                    proc.join(timeout=_PROCESS_JOIN_TIMEOUT_S)
+                    _join_started_process(proc, timeout=_PROCESS_JOIN_TIMEOUT_S)
                 except (OSError, EOFError, BrokenPipeError, ValueError):
                     pass
             if proc.is_alive():
                 _terminate_process(proc)
             else:
-                proc.join(timeout=_PROCESS_JOIN_TIMEOUT_S)
+                _join_started_process(proc, timeout=_PROCESS_JOIN_TIMEOUT_S)
 
         for owned_queue in (input_queue, output_queue):
             if owned_queue is None:
@@ -615,9 +639,11 @@ class ContainmentKernelOwner:
         proc = self._process
         if proc is None:
             raise ContainmentKernelProtocolError("Contained child is not running.")
+        if not _process_was_started(proc):
+            raise ContainmentKernelProtocolError("Contained child has not started.")
         if proc.is_alive():
             return
-        proc.join(timeout=0.1)
+        _join_started_process(proc, timeout=0.1)
         raise ContainmentKernelProtocolError(f"Contained child exited unexpectedly with code {proc.exitcode}.")
 
     @staticmethod

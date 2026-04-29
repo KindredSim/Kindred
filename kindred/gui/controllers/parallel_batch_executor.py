@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import suppress
-from dataclasses import dataclass, field
-from queue import Empty, SimpleQueue
-from time import perf_counter
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from kindred.core.batch_parallel import prewarm_worker_imports
+from kindred.core.batch_containment import (
+    BatchLanePool,
+    BatchPolledCompletion,
+    BatchRequestHandle,
+    BatchRuntimeLaneOwner,
+)
+from kindred.core.batch_runtime_session import (
+    BatchRuntimeSession,
+    BatchRuntimeSessionRequest,
+    BatchRuntimeSessionSnapshot,
+)
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
@@ -16,176 +22,219 @@ def _noop_record_nonfatal_exception(_message: str, _exc: BaseException) -> None:
     return None
 
 
-@dataclass
+def _default_lane_pool_factory(max_lanes: int, limit_blas_threads: bool) -> BatchLanePool:
+    return BatchLanePool(
+        max_lanes=max(1, int(max_lanes)),
+        limit_blas_threads_per_worker=bool(limit_blas_threads),
+    )
+
+
 class ParallelBatchExecutor:
-    """
-    Owns process-pool lifecycle and per-run future bookkeeping for batch simulations.
+    """Temporary controller adapter over the non-GUI batch runtime session."""
 
-    This is kept Qt-free; SimulationController remains responsible for QTimer wiring
-    and UI updates.
-    """
+    __slots__ = ("_runtime_session",)
 
-    executor_factory: Callable[[int, bool], Any]
-    max_parallel_workers: int = int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
-    limit_blas_threads_per_worker: bool = bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])
-    record_nonfatal_exception: Callable[[str, BaseException], None] = _noop_record_nonfatal_exception
-    executor: Any = None
-    future_map: Dict[str, Any] = field(default_factory=dict)
-    future_meta: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    superseded_future_map: Dict[str, Any] = field(default_factory=dict)
-    superseded_future_meta: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    completed_queue: SimpleQueue[Tuple[str, float]] = field(default_factory=SimpleQueue)
-    _current_max_workers: Optional[int] = None
-    _pool_stale: bool = False
+    def __init__(
+        self,
+        lane_pool_factory: Callable[[int, bool], Any] | None = None,
+        *,
+        max_parallel_workers: int = int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+        limit_blas_threads_per_worker: bool = bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
+        record_nonfatal_exception: Callable[[str, BaseException], None] = _noop_record_nonfatal_exception,
+        lane_pool: Any = None,
+    ) -> None:
+        runtime_owner = BatchRuntimeLaneOwner(
+            lane_pool_factory=lane_pool_factory or _default_lane_pool_factory,
+            max_parallel_workers=int(max_parallel_workers),
+            limit_blas_threads_per_worker=bool(limit_blas_threads_per_worker),
+            record_nonfatal_exception=record_nonfatal_exception,
+            lane_pool=lane_pool,
+        )
+        self._runtime_session = BatchRuntimeSession(runtime_owner)
+
+    @property
+    def _runtime_owner(self) -> BatchRuntimeLaneOwner:
+        return self._runtime_session.lane_owner
+
+    @property
+    def lane_pool_factory(self) -> Callable[[int, bool], Any]:
+        return self._runtime_owner.lane_pool_factory
+
+    @lane_pool_factory.setter
+    def lane_pool_factory(self, value: Callable[[int, bool], Any]) -> None:
+        previous = self._runtime_owner.lane_pool_factory
+        self._runtime_owner.lane_pool_factory = value
+        if value is not previous and self._runtime_session.has_lane_pool():
+            self._runtime_owner.mark_pool_stale()
+
+    @property
+    def max_parallel_workers(self) -> int:
+        return int(self._runtime_owner.max_parallel_workers)
+
+    @max_parallel_workers.setter
+    def max_parallel_workers(self, value: int) -> None:
+        self._runtime_owner.max_parallel_workers = int(value)
+
+    @property
+    def limit_blas_threads_per_worker(self) -> bool:
+        return bool(self._runtime_owner.limit_blas_threads_per_worker)
+
+    @limit_blas_threads_per_worker.setter
+    def limit_blas_threads_per_worker(self, value: bool) -> None:
+        self._runtime_owner.limit_blas_threads_per_worker = bool(value)
+
+    @property
+    def record_nonfatal_exception(self) -> Callable[[str, BaseException], None]:
+        return self._runtime_owner.record_nonfatal_exception
+
+    @record_nonfatal_exception.setter
+    def record_nonfatal_exception(self, value: Callable[[str, BaseException], None]) -> None:
+        self._runtime_owner.record_nonfatal_exception = value
+
+    @property
+    def current_max_workers(self) -> Optional[int]:
+        return self._runtime_session.current_max_workers
+
+    def begin_run(
+        self,
+        *,
+        run_id: int,
+        request_id: int,
+        fast_mode: bool,
+        queue_ids: tuple[str, ...] | list[str],
+        queue_names: tuple[str, ...] | list[str],
+        keep_lane_pool_alive: bool,
+        preview_owner_epoch: int | None = None,
+        active_timeout_s: float = 60.0,
+        cache_key: str = "",
+    ) -> None:
+        self._runtime_session.begin(
+            BatchRuntimeSessionRequest(
+                run_id=int(run_id),
+                request_id=int(request_id),
+                fast_mode=bool(fast_mode),
+                queue_ids=tuple(str(item) for item in queue_ids),
+                queue_names=tuple(str(item) for item in queue_names),
+                keep_lane_pool_alive=bool(keep_lane_pool_alive),
+                preview_owner_epoch=preview_owner_epoch,
+                active_timeout_s=float(active_timeout_s),
+                cache_key=str(cache_key or ""),
+            )
+        )
+
+    def runtime_snapshot(self) -> BatchRuntimeSessionSnapshot:
+        return self._runtime_session.snapshot()
+
+    def active_request_count(self) -> int:
+        return self._runtime_session.active_request_count()
+
+    def has_active_requests(self) -> bool:
+        return self._runtime_session.has_active_requests()
+
+    def request_worker_count(self) -> int:
+        return self._runtime_session.request_worker_count()
+
+    def join_active_requests(self, *, timeout_s: float = 2.0) -> None:
+        self._runtime_session.join_active_requests(timeout_s=float(timeout_s))
+
+    def has_lane_pool(self) -> bool:
+        return self._runtime_session.has_lane_pool()
+
+    def has_ready_lane_pool(self, *, max_lanes: int) -> bool:
+        requested_lanes = min(
+            int(MAX_PARALLEL_WORKERS_CEILING),
+            max(1, int(max_lanes)),
+        )
+        return self._runtime_session.has_ready_lane_pool(max_lanes=requested_lanes)
+
+    def lane_pool_token(self) -> int | None:
+        return self._runtime_session.lane_pool_token()
+
+    def active_request_metadata(self, set_id: str) -> Dict[str, Any]:
+        return self._runtime_session.active_request_metadata(set_id)
+
+    def discard_request(self, set_id: str) -> None:
+        self._runtime_session.discard_request(set_id)
 
     def reset_active_run_state(self) -> None:
-        self.future_map = {}
-        self.future_meta = {}
+        self._runtime_owner.reset_active_run_state()
 
     def reset_run_state(self) -> None:
-        self.reset_active_run_state()
-        self.superseded_future_map = {}
-        self.superseded_future_meta = {}
-        self.drain_completion_queue()
+        self._runtime_owner.reset_run_state()
 
     def drain_completion_queue(self) -> None:
-        while True:
-            try:
-                self.completed_queue.get_nowait()
-            except Empty:
-                break
-            except Exception:
-                break
+        self._runtime_session.drain_completion_queue()
 
     def enqueue_completion(self, set_id: str) -> None:
-        sid = str(set_id or "")
-        if not sid:
-            return
-        ts = float(perf_counter())
-        with suppress(Exception):
-            self.completed_queue.put((sid, ts))
+        self._runtime_session.enqueue_completion(set_id)
 
-    def ensure_executor(self, *, max_workers: int) -> Any:
-        requested_workers = min(
+    def clear_stale_requests(self) -> None:
+        self._runtime_session.clear_stale_requests()
+
+    def poll_completed_records(self) -> list[BatchPolledCompletion]:
+        return self._runtime_session.poll_completed_records()
+
+    def ensure_lane_pool(self, *, max_lanes: int) -> Any:
+        requested_lanes = min(
             int(MAX_PARALLEL_WORKERS_CEILING),
-            max(1, int(max_workers)),
+            max(1, int(max_lanes)),
         )
-        executor = self.executor
-        if executor is None:
-            return self._create_and_prewarm_executor(max_workers=requested_workers)
+        return self._runtime_owner.ensure_lane_pool(max_lanes=requested_lanes)
 
-        current_workers = self._current_max_workers
-        if current_workers is None:
-            return executor
-
-        if requested_workers <= current_workers:
-            return executor
-
-        self.shutdown(
-            force_terminate=True,
-            record_nonfatal_exception=self.record_nonfatal_exception,
+    def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True) -> Any:
+        requested_lanes = min(
+            int(MAX_PARALLEL_WORKERS_CEILING),
+            max(1, int(max_lanes)),
         )
-        return self._create_and_prewarm_executor(max_workers=requested_workers)
+        return self._runtime_owner.ensure_warm_lane_pool(
+            max_lanes=requested_lanes,
+            wait=bool(wait),
+        )
 
-    def _create_and_prewarm_executor(self, *, max_workers: int) -> Any:
-        try:
-            executor = self.executor_factory(int(max_workers), bool(self.limit_blas_threads_per_worker))
-            self.executor = executor
-            self._current_max_workers = int(max_workers)
-            self._pool_stale = False
-            self._submit_prewarm_tasks(executor, max_workers=int(max_workers))
-        except Exception as exc:
-            self.shutdown(
-                force_terminate=True,
-                record_nonfatal_exception=self.record_nonfatal_exception,
-            )
-            self.executor = None
-            self.record_nonfatal_exception("Failed to create and prewarm batch executor", exc)
-            raise
-        return self.executor
+    def submit_task(
+        self,
+        task,
+        *,
+        set_id: str,
+        set_name: str,
+        expected_owner_epoch: object = None,
+    ) -> BatchRequestHandle:
+        expected_lane_owner_epoch = None if expected_owner_epoch is None else int(expected_owner_epoch)
+        return self._runtime_session.submit_task(
+            task,
+            set_id=str(set_id or ""),
+            set_name=str(set_name or set_id or ""),
+            expected_owner_epoch=expected_lane_owner_epoch,
+        )
 
-    def _submit_prewarm_tasks(self, executor: Any, *, max_workers: int) -> None:
-        for _ in range(max(1, int(max_workers))):
-            executor.submit(prewarm_worker_imports)
-
-    def shutdown(self, *, force_terminate: bool, record_nonfatal_exception: Callable[[str, BaseException], None]) -> None:
-        prior_futures = int(len(self.future_map or {}))
-        self.reset_run_state()
-        self._current_max_workers = None
-        self._pool_stale = False
-        executor = self.executor
-        self.executor = None
-        if executor is None:
-            return
-        terminate_target = ()
-        if bool(force_terminate):
-            processes = getattr(executor, "_processes", None)
-            if isinstance(processes, dict):
-                terminate_target = tuple(processes.values())
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            with suppress(Exception):
-                executor.shutdown(wait=False)
-        except Exception as exc:
-            record_nonfatal_exception("Failed executor.shutdown during batch executor shutdown", exc)
-
-        if terminate_target:
-            self._terminate_processes_best_effort(terminate_target, record_nonfatal_exception)
-
-        _ = prior_futures
+    def shutdown(
+        self,
+        *,
+        force_terminate: bool,
+        record_nonfatal_exception: Callable[[str, BaseException], None],
+    ) -> None:
+        self._runtime_session.shutdown(
+            force_terminate=bool(force_terminate),
+            record_nonfatal_exception=record_nonfatal_exception,
+        )
 
     def soft_supersede(self) -> tuple[int, int]:
-        cancelled = 0
-        running = 0
-        active_futures = dict(self.future_map or {})
-        active_meta = dict(self.future_meta or {})
-        for set_id, fut in active_futures.items():
-            try:
-                if fut.cancel():
-                    cancelled += 1
-                else:
-                    running += 1
-                    retained_key = self._reserve_superseded_key(str(set_id or ""))
-                    meta = dict(active_meta.get(str(set_id or "")) or {})
-                    meta["superseded"] = "1"
-                    meta["set_id"] = str(set_id or "")
-                    self.superseded_future_map[retained_key] = fut
-                    self.superseded_future_meta[retained_key] = meta
-            except Exception:
-                running += 1
-                retained_key = self._reserve_superseded_key(str(set_id or ""))
-                meta = dict(active_meta.get(str(set_id or "")) or {})
-                meta["superseded"] = "1"
-                meta["set_id"] = str(set_id or "")
-                self.superseded_future_map[retained_key] = fut
-                self.superseded_future_meta[retained_key] = meta
-        self.reset_active_run_state()
-        return cancelled, running
+        return self._runtime_session.soft_supersede_active_run()
+
+    def finish_after_run(
+        self,
+        *,
+        keep_lane_pool_alive: bool,
+        record_nonfatal_exception: Callable[[str, BaseException], None],
+    ) -> None:
+        self._runtime_session.finish_after_run(
+            keep_lane_pool_alive=bool(keep_lane_pool_alive),
+            record_nonfatal_exception=record_nonfatal_exception,
+        )
 
     @property
     def is_pool_stale(self) -> bool:
-        return bool(self._pool_stale)
+        return bool(self._runtime_owner.is_pool_stale)
 
     def mark_pool_stale(self) -> None:
-        self._pool_stale = True
-
-    def _reserve_superseded_key(self, set_id: str) -> str:
-        sid = str(set_id or "").strip() or "superseded"
-        if sid not in self.superseded_future_map:
-            return sid
-        suffix = 2
-        while True:
-            candidate = f"{sid}#superseded#{suffix}"
-            if candidate not in self.superseded_future_map:
-                return candidate
-            suffix += 1
-
-    @staticmethod
-    def _terminate_processes_best_effort(processes: tuple[Any, ...], record_nonfatal_exception: Callable[[str, BaseException], None]) -> None:
-        for proc in tuple(processes):
-            try:
-                if proc is not None and hasattr(proc, "is_alive") and proc.is_alive():
-                    proc.terminate()
-            except Exception as exc:
-                record_nonfatal_exception("Failed to terminate batch executor process", exc)
+        self._runtime_owner.mark_pool_stale()

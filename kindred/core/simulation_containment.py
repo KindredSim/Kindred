@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import pickle
 import queue
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from kindred.core.simulation_plan import SimulationPlan
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     SimulationPreparationError,
+    prepared_simulation_run_for_execution_request,
     prepare_simulation_worker_run,
 )
 from kindred.core.simulation_result_finalization import build_finalized_simulation_result_payload
@@ -210,6 +212,25 @@ def contained_payloads_equal(left: Any, right: Any) -> bool:
         return False
 
 
+def contained_owner_identity_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the runtime-owner identity carried by a contained simulation plan payload."""
+    if not isinstance(payload, Mapping):
+        return {}
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        identity = metadata.get("contained_owner_identity")
+        if isinstance(identity, Mapping):
+            return validate_contained_simulation_payload(dict(identity))
+    return validate_contained_simulation_payload(dict(payload))
+
+
+def contained_owner_payloads_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Compare the owner lifecycle identity for contained simulation reuse."""
+    left_identity = contained_owner_identity_payload(left)
+    right_identity = contained_owner_identity_payload(right)
+    return contained_payloads_equal(left_identity, right_identity)
+
+
 def validate_contained_simulation_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(payload, (SimulationRequest, SimulationExecutionRequest)):
         raise SimulationContainmentPayloadError(
@@ -265,6 +286,7 @@ def _terminate_process(proc: multiprocessing.Process, *, join_timeout_s: float =
 @dataclass(frozen=True)
 class _PreparedContainedSimulationRequest:
     request_payload: dict[str, Any]
+    plan_payload: dict[str, Any]
     plan: SimulationPlan
     execution_request: dict[str, Any]
     prepared: Any
@@ -280,6 +302,13 @@ class _SimulationChildHandler:
             startup_plan = SimulationPlan.from_payload(self._startup_plan_payload)
             startup_execution_request = startup_plan.to_execution_request().to_payload()
             self._startup_prepared = prepare_simulation_worker_run(execution_request=startup_execution_request)
+            self._prewarm_solver_imports()
+
+    @staticmethod
+    def _prewarm_solver_imports() -> None:
+        from kindred.core.scipy_integrate import load_scipy_integrate
+
+        load_scipy_integrate()
 
     def _prepare_request(self, request_payload: Mapping[str, Any]) -> _PreparedContainedSimulationRequest:
         payload = dict(request_payload or {})
@@ -288,8 +317,19 @@ class _SimulationChildHandler:
             plan_payload = validate_contained_simulation_payload(request_plan_payload)
             plan = SimulationPlan.from_payload(plan_payload)
             execution_request = plan.to_execution_request().to_payload()
-            prepared = prepare_simulation_worker_run(execution_request=execution_request)
+            if (
+                self._startup_prepared is not None
+                and self._startup_plan_payload is not None
+                and contained_owner_payloads_match(self._startup_plan_payload, plan_payload)
+            ):
+                prepared = prepared_simulation_run_for_execution_request(
+                    self._startup_prepared,
+                    execution_request,
+                )
+            else:
+                prepared = prepare_simulation_worker_run(execution_request=execution_request)
         elif self._startup_prepared is not None and self._startup_plan_payload is not None:
+            plan_payload = dict(self._startup_plan_payload)
             plan = SimulationPlan.from_payload(self._startup_plan_payload)
             execution_request = plan.to_execution_request().to_payload()
             prepared = self._startup_prepared
@@ -299,6 +339,7 @@ class _SimulationChildHandler:
             )
         return _PreparedContainedSimulationRequest(
             request_payload=payload,
+            plan_payload=dict(plan_payload),
             plan=plan,
             execution_request=execution_request,
             prepared=prepared,
@@ -333,6 +374,11 @@ class _SimulationChildHandler:
             prepared_request = self._prepared_by_request_id.pop(request_id, None)
             if prepared_request is None:
                 prepared_request = self._prepare_request(request_payload)
+            if bool(prepared_request.request_payload.get("prepare_only")):
+                self._startup_plan_payload = dict(prepared_request.plan_payload)
+                self._startup_prepared = prepared_request.prepared
+                self._prewarm_solver_imports()
+                return {"success": True, "prepared": True}
 
             result = solve_ode(prepared_request.prepared.request)
             include_mechanism = bool(prepared_request.request_payload.get("include_mechanism_in_result_payload"))
@@ -401,6 +447,7 @@ def _simulation_owner_child(
             startup_plan = SimulationPlan.from_payload(startup_plan_payload)
             startup_execution_request = startup_plan.to_execution_request().to_payload()
             startup_prepared = prepare_simulation_worker_run(execution_request=startup_execution_request)
+            _SimulationChildHandler._prewarm_solver_imports()
         output_queue.put(
             {
                 "kind": "ready",
@@ -427,6 +474,7 @@ def _simulation_owner_child(
                     execution_request = plan.to_execution_request().to_payload()
                     prepared = prepare_simulation_worker_run(execution_request=execution_request)
                 elif startup_prepared is not None and startup_plan_payload is not None:
+                    plan_payload = dict(startup_plan_payload)
                     plan = SimulationPlan.from_payload(startup_plan_payload)
                     execution_request = plan.to_execution_request().to_payload()
                     prepared = startup_prepared
@@ -441,6 +489,19 @@ def _simulation_owner_child(
                         "request_id": request_id,
                     }
                 )
+                if bool(request_payload.get("prepare_only")):
+                    startup_plan_payload = dict(plan_payload)
+                    startup_prepared = prepared
+                    _SimulationChildHandler._prewarm_solver_imports()
+                    output_queue.put(
+                        {
+                            "kind": "result",
+                            "owner_epoch": int(owner_epoch),
+                            "request_id": request_id,
+                            "payload": {"success": True, "prepared": True},
+                        }
+                    )
+                    continue
                 result = solve_ode(prepared.request)
                 include_mechanism = bool(request_payload.get("include_mechanism_in_result_payload"))
                 payload = build_finalized_simulation_result_payload(
@@ -547,6 +608,7 @@ class WarmSimulationOwner:
         self._owner_epoch = 0
         self._request_id = 0
         self._runtime_owner: Optional[SimulationRuntimeOwner] = None
+        self._lock = threading.RLock()
         if child_target is None:
             self._runtime_owner = SimulationRuntimeOwner(
                 handler_import_path="kindred.core.simulation_containment:create_simulation_child_handler",
@@ -573,26 +635,70 @@ class WarmSimulationOwner:
         proc = self._process
         return bool(proc is not None and proc.is_alive())
 
+    @property
+    def is_ready(self) -> bool:
+        if self._runtime_owner is not None:
+            return bool(getattr(self._runtime_owner, "is_ready", False))
+        return bool(self.is_running)
+
     def start(
         self,
         *,
         wait: bool = False,
         cancellation_check: Optional[Callable[[], bool]] = None,
     ) -> None:
-        if self._runtime_owner is not None:
-            try:
-                self._runtime_owner.warm(wait=bool(wait), cancellation_check=cancellation_check)
-            except ContainmentKernelCancelled as exc:
-                raise SimulationCancelled() from exc
-            except ContainmentKernelStartupTimeout as exc:
-                raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
-            except ContainmentKernelChildFailure as exc:
-                raise SimulationContainmentChildFailure(exc.failure) from exc
-            except ContainmentKernelProtocolError as exc:
-                raise SimulationContainmentProtocolError(str(exc)) from exc
-            return
-        if bool(wait):
-            self._ensure_started(cancellation_check=cancellation_check)
+        with self._lock:
+            if self._runtime_owner is not None:
+                try:
+                    self._runtime_owner.warm(wait=bool(wait), cancellation_check=cancellation_check)
+                except ContainmentKernelCancelled as exc:
+                    raise SimulationCancelled() from exc
+                except ContainmentKernelStartupTimeout as exc:
+                    raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
+                except ContainmentKernelChildFailure as exc:
+                    raise SimulationContainmentChildFailure(exc.failure) from exc
+                except ContainmentKernelProtocolError as exc:
+                    raise SimulationContainmentProtocolError(str(exc)) from exc
+                return
+            if bool(wait):
+                self._ensure_started(cancellation_check=cancellation_check)
+
+    def prepare_runtime_payload(
+        self,
+        simulation_plan_payload: Mapping[str, Any],
+        *,
+        wait: bool = True,
+    ) -> None:
+        plan_payload = validate_contained_simulation_payload(dict(simulation_plan_payload or {}))
+        with self._lock:
+            if self._runtime_owner is not None:
+                try:
+                    self._runtime_owner.solve(
+                        {
+                            "simulation_plan_payload": dict(plan_payload),
+                            "prepare_only": True,
+                        },
+                        active_timeout_s=self._active_timeout_s,
+                    )
+                except ContainmentKernelStartupTimeout as exc:
+                    raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
+                except ContainmentKernelAcceptTimeout as exc:
+                    raise SimulationContainmentAcceptTimeout(exc.timeout_s) from exc
+                except ContainmentKernelActiveTimeout as exc:
+                    raise SimulationContainmentTimeout(exc.timeout_s) from exc
+                except ContainmentKernelChildFailure as exc:
+                    raise SimulationContainmentChildFailure(exc.failure) from exc
+                except ContainmentKernelProtocolError as exc:
+                    raise SimulationContainmentProtocolError(str(exc)) from exc
+                self._simulation_plan_payload = dict(plan_payload)
+                return
+            if not self.is_running:
+                self._simulation_plan_payload = dict(plan_payload)
+                if bool(wait):
+                    self._ensure_started(cancellation_check=None)
+                return
+            self.solve({"simulation_plan_payload": dict(plan_payload), "prepare_only": True})
+            self._simulation_plan_payload = dict(plan_payload)
 
     def solve(
         self,
@@ -600,89 +706,90 @@ class WarmSimulationOwner:
         *,
         cancellation_check: Optional[Callable[[], bool]] = None,
     ) -> dict[str, Any]:
-        if self._runtime_owner is not None:
+        with self._lock:
+            if self._runtime_owner is not None:
+                if self._cancel_requested(cancellation_check):
+                    self.close(kill=True)
+                    raise SimulationCancelled()
+                try:
+                    return self._runtime_owner.solve(
+                        dict(payload or {}),
+                        active_timeout_s=self._active_timeout_s,
+                        cancellation_check=cancellation_check,
+                    )
+                except ContainmentKernelCancelled as exc:
+                    raise SimulationCancelled() from exc
+                except ContainmentKernelStartupTimeout as exc:
+                    raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
+                except ContainmentKernelAcceptTimeout as exc:
+                    raise SimulationContainmentAcceptTimeout(exc.timeout_s) from exc
+                except ContainmentKernelActiveTimeout as exc:
+                    raise SimulationContainmentTimeout(exc.timeout_s) from exc
+                except ContainmentKernelChildFailure as exc:
+                    raise SimulationContainmentChildFailure(exc.failure) from exc
+                except ContainmentKernelProtocolError as exc:
+                    raise SimulationContainmentProtocolError(str(exc)) from exc
             if self._cancel_requested(cancellation_check):
                 self.close(kill=True)
                 raise SimulationCancelled()
-            try:
-                return self._runtime_owner.solve(
-                    dict(payload or {}),
-                    active_timeout_s=self._active_timeout_s,
-                    cancellation_check=cancellation_check,
-                )
-            except ContainmentKernelCancelled as exc:
-                raise SimulationCancelled() from exc
-            except ContainmentKernelStartupTimeout as exc:
-                raise SimulationContainmentStartupTimeout(exc.timeout_s) from exc
-            except ContainmentKernelAcceptTimeout as exc:
-                raise SimulationContainmentAcceptTimeout(exc.timeout_s) from exc
-            except ContainmentKernelActiveTimeout as exc:
-                raise SimulationContainmentTimeout(exc.timeout_s) from exc
-            except ContainmentKernelChildFailure as exc:
-                raise SimulationContainmentChildFailure(exc.failure) from exc
-            except ContainmentKernelProtocolError as exc:
-                raise SimulationContainmentProtocolError(str(exc)) from exc
-        if self._cancel_requested(cancellation_check):
-            self.close(kill=True)
-            raise SimulationCancelled()
-        self._ensure_started(cancellation_check=cancellation_check)
-        if self._input_queue is None or self._output_queue is None:
-            raise SimulationContainmentProtocolError("Contained simulation owner queues are unavailable.")
+            self._ensure_started(cancellation_check=cancellation_check)
+            if self._input_queue is None or self._output_queue is None:
+                raise SimulationContainmentProtocolError("Contained simulation owner queues are unavailable.")
 
-        self._request_id += 1
-        request_id = int(self._request_id)
-        gate = SimulationReplyGate(owner_epoch=int(self._owner_epoch), request_id=request_id)
-        self._input_queue.put(
-            {
-                "kind": "solve",
-                "owner_epoch": int(self._owner_epoch),
-                "request_id": request_id,
-                "payload": dict(payload or {}),
-            }
-        )
-        self._wait_for_acceptance(
-            gate,
-            cancellation_check=cancellation_check,
-        )
-
-        deadline = time.monotonic() + self._active_timeout_s
-        while True:
-            if self._cancel_requested(cancellation_check):
-                self.close(kill=True)
-                raise SimulationCancelled()
-            if time.monotonic() >= deadline:
-                self.close(kill=True)
-                raise SimulationContainmentTimeout(self._active_timeout_s)
-            try:
-                message = self._output_queue.get(timeout=_OWNER_POLL_INTERVAL_S)
-            except queue.Empty:
-                self._raise_if_process_exited()
-                continue
-            if not isinstance(message, Mapping):
-                raise SimulationContainmentProtocolError("Contained simulation owner returned a non-mapping reply.")
-            if not gate.is_current(message):
-                continue
-            kind = str(message.get("kind") or "")
-            if kind == "progress":
-                continue
-            if kind == "accepted":
-                continue
-            if kind == "result":
-                result_payload = message.get("payload")
-                if isinstance(result_payload, Mapping):
-                    return dict(result_payload)
-                raise SimulationContainmentProtocolError("Contained simulation owner returned malformed result payload.")
-            if kind == "cancelled":
-                raise SimulationCancelled()
-            if kind == "error":
-                failure = message.get("failure")
-                raise SimulationContainmentChildFailure(failure if isinstance(failure, Mapping) else {})
-            if kind == "fatal":
-                failure = message.get("failure")
-                raise SimulationContainmentChildFailure(failure if isinstance(failure, Mapping) else {})
-            raise SimulationContainmentProtocolError(
-                f"Contained simulation owner returned unexpected reply kind: {kind!r}."
+            self._request_id += 1
+            request_id = int(self._request_id)
+            gate = SimulationReplyGate(owner_epoch=int(self._owner_epoch), request_id=request_id)
+            self._input_queue.put(
+                {
+                    "kind": "solve",
+                    "owner_epoch": int(self._owner_epoch),
+                    "request_id": request_id,
+                    "payload": dict(payload or {}),
+                }
             )
+            self._wait_for_acceptance(
+                gate,
+                cancellation_check=cancellation_check,
+            )
+
+            deadline = time.monotonic() + self._active_timeout_s
+            while True:
+                if self._cancel_requested(cancellation_check):
+                    self.close(kill=True)
+                    raise SimulationCancelled()
+                if time.monotonic() >= deadline:
+                    self.close(kill=True)
+                    raise SimulationContainmentTimeout(self._active_timeout_s)
+                try:
+                    message = self._output_queue.get(timeout=_OWNER_POLL_INTERVAL_S)
+                except queue.Empty:
+                    self._raise_if_process_exited()
+                    continue
+                if not isinstance(message, Mapping):
+                    raise SimulationContainmentProtocolError("Contained simulation owner returned a non-mapping reply.")
+                if not gate.is_current(message):
+                    continue
+                kind = str(message.get("kind") or "")
+                if kind == "progress":
+                    continue
+                if kind == "accepted":
+                    continue
+                if kind == "result":
+                    result_payload = message.get("payload")
+                    if isinstance(result_payload, Mapping):
+                        return dict(result_payload)
+                    raise SimulationContainmentProtocolError("Contained simulation owner returned malformed result payload.")
+                if kind == "cancelled":
+                    raise SimulationCancelled()
+                if kind == "error":
+                    failure = message.get("failure")
+                    raise SimulationContainmentChildFailure(failure if isinstance(failure, Mapping) else {})
+                if kind == "fatal":
+                    failure = message.get("failure")
+                    raise SimulationContainmentChildFailure(failure if isinstance(failure, Mapping) else {})
+                raise SimulationContainmentProtocolError(
+                    f"Contained simulation owner returned unexpected reply kind: {kind!r}."
+                )
 
     def cancel(self) -> dict[str, Any]:
         self.close(kill=True)

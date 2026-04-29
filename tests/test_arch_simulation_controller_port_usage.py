@@ -61,7 +61,6 @@ RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS = {
 
 RUN_UI_ENTRY_PROGRESS_TARGET_METHODS_BY_METHOD = {
     "_run_simulation_from_slider": {
-        "run_button_is_enabled",
         "set_run_button_enabled",
         "set_stop_button_enabled",
         "set_status_text",
@@ -206,6 +205,7 @@ REMAINING_SOLVER_TARGET_METHODS = {
 
 MECHANISM_TARGET_METHODS = {
     "slider_overrides",
+    "variable_slider_values",
     "apply_parameter_overrides_to_dsl",
     "auto_lock_for_run",
     "is_mechanism_ready_for_run",
@@ -535,6 +535,20 @@ def test_simulation_controller_non_completion_solver_clusters_use_explicit_solve
 @pytest.mark.parametrize(
     ("method_name", "expected_methods"),
     (
+        (
+            "_slider_execution_parameter_values",
+            {
+                "slider_overrides",
+                "variable_slider_values",
+            },
+        ),
+        (
+            "_slider_runtime_parameter_names",
+            {
+                "slider_overrides",
+                "variable_slider_values",
+            },
+        ),
         (
             "_start_next_batch_simulation",
             {
@@ -1000,9 +1014,10 @@ def test_run_simulation_internal_runtime_cluster_uses_explicit_runtime_port() ->
         methods=RUNTIME_TARGET_METHODS,
     )
 
-    assert explicit_methods == RUNTIME_TARGET_METHODS, (
-        "Guardrail expectation changed: `SimulationController._run_simulation_internal` must route preview-runtime "
-        f"calls through `self.ui.runtime`, but only found {sorted(explicit_methods)}."
+    assert explicit_methods == set(), (
+        "Guardrail expectation changed: `SimulationController._run_simulation_internal` should not perform "
+        "GUI-thread preview-runtime preparation. Runtime readiness is now owned by the runtime/application "
+        f"readiness path, but found runtime-port calls {sorted(explicit_methods)}."
     )
 
     assert flattened_hits == [], (

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
+import re
 from typing import Any, Mapping, Optional, Sequence
 
 from kindred.core.runtime_defaults import (
@@ -14,6 +16,7 @@ __all__ = [
     "SimulationIdentity",
     "SimulationScopeIdentity",
     "SimulationSolverIdentity",
+    "contained_simulation_owner_identity",
     "coerce_simulation_identity",
     "coerce_simulation_scope_identity",
 ]
@@ -29,6 +32,163 @@ def _try_float(value: object, default: float) -> float:
 def _canonical_json_bytes(payload: object) -> bytes:
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
     return serialized.encode("utf-8", "ignore")
+
+
+def _sha256_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+_DSL_PARAMETER_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>(?:^|[;,])\s*)"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*|Keq[0-9]*)"
+    r"(?P<equals>\s*=\s*)"
+    r"(?P<value>[^;,#\n]+)"
+)
+_DSL_PARAM_STATEMENT_RE = re.compile(
+    r"^(?P<prefix>\s*param\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*)(?P<value>.+)$",
+    re.IGNORECASE,
+)
+_DSL_REACTION_ARROW_RE = re.compile(r"(<->|<=>|->|=>|⇌|→|↔)")
+_DSL_SEMICOLON_KEY_ALIASES = {
+    "a": "A",
+    "ea": "Ea",
+    "dg_act": "dG_act",
+    "dg_eq": "dG_eq",
+    "k": "k",
+    "kf": "kf",
+    "kr": "kr",
+    "keq": "Keq",
+    "k_eq": "Keq",
+}
+_STRUCTURAL_SEMICOLON_DIRECTIVES = {
+    "A",
+    "Ea",
+    "dG_act",
+    "dG_eq",
+    "fast",
+}
+_MUTABLE_REACTION_RATE_DIRECTIVES = {"k", "kf", "kr"}
+_MUTABLE_EQUILIBRIUM_DIRECTIVES = {"Keq"}
+_MECHANISM_PARAMETER_NAME_RE = re.compile(r"^(?:k|kf|kr|keq|K)[1-9][0-9]*$", re.IGNORECASE)
+
+
+def _mutable_preview_parameter_names(parameter_names: Sequence[str] | object) -> set[str]:
+    return {str(name) for name in (parameter_names or ()) if str(name)}
+
+
+def _canonical_semicolon_directive_key(name: str) -> str:
+    name_s = str(name or "").strip()
+    if name_s == "K":
+        return "Keq"
+    return _DSL_SEMICOLON_KEY_ALIASES.get(name_s.lower(), name_s)
+
+
+def _is_mechanism_parameter_name(name: str) -> bool:
+    return _MECHANISM_PARAMETER_NAME_RE.fullmatch(str(name or "").strip()) is not None
+
+
+def _mutable_preview_assignment_token(
+    name: str,
+    parameter_names: set[str],
+    *,
+    step_index: int | None = None,
+) -> str | None:
+    name_s = str(name or "")
+    if not name_s:
+        return None
+    if step_index is None:
+        if name_s in parameter_names and not _is_mechanism_parameter_name(name_s):
+            return name_s
+        return None
+
+    canonical_name = _canonical_semicolon_directive_key(name_s)
+    if canonical_name in _STRUCTURAL_SEMICOLON_DIRECTIVES:
+        return None
+    if canonical_name in _MUTABLE_EQUILIBRIUM_DIRECTIVES:
+        indexed_keq = f"Keq{int(step_index)}"
+        if indexed_keq in parameter_names:
+            return "Keq"
+        return None
+    if canonical_name in _MUTABLE_REACTION_RATE_DIRECTIVES:
+        indexed_k = f"k{int(step_index)}"
+        if canonical_name in {"k", "kf"} and indexed_k in parameter_names:
+            return "k"
+        indexed_name = f"{canonical_name}{int(step_index)}"
+        if indexed_name in parameter_names:
+            return canonical_name
+    return None
+
+
+def _is_mutable_preview_assignment(name: str, parameter_names: set[str]) -> bool:
+    return _mutable_preview_assignment_token(name, parameter_names) is not None
+
+
+_NUMERIC_LITERAL_RE = re.compile(
+    r"[-+]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][-+]?\d+)?"
+)
+
+
+def _is_preview_mutable_numeric_value(value: object) -> bool:
+    value_text = str(value or "").split("#", 1)[0].strip()
+    if not _NUMERIC_LITERAL_RE.fullmatch(value_text):
+        return False
+    try:
+        return math.isfinite(float(value_text))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _preview_structural_mechanism_digest(
+    text: object,
+    *,
+    parameter_names: Sequence[str] = (),
+) -> str:
+    """Hash preview runtime structure while ignoring mutable parameter values."""
+
+    mutable_names = _mutable_preview_parameter_names(parameter_names)
+
+    def _mask_mutable_assignment(match: re.Match[str], *, step_index: int | None) -> str:
+        name = str(match.group("name") or "")
+        mutable_token = _mutable_preview_assignment_token(name, mutable_names, step_index=step_index)
+        if mutable_token is None:
+            return match.group(0)
+        if not _is_preview_mutable_numeric_value(match.group("value")):
+            return match.group(0)
+        prefix = str(match.group("prefix") or "")
+        if prefix.strip() in {";", ","}:
+            prefix = "; "
+        return f"{prefix}{mutable_token}=<param-value>"
+
+    normalized_lines: list[str] = []
+    step_index = 0
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        current_step_index: int | None = None
+        if _DSL_REACTION_ARROW_RE.search(line):
+            step_index += 1
+            current_step_index = step_index
+        param_statement = _DSL_PARAM_STATEMENT_RE.match(line)
+        if param_statement is not None:
+            prefix = str(param_statement.group("prefix") or "")
+            name_match = re.match(r"\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*", prefix, re.IGNORECASE)
+            name = str(name_match.group(1)) if name_match is not None else ""
+            if _is_mutable_preview_assignment(name, mutable_names) and _is_preview_mutable_numeric_value(
+                param_statement.group("value")
+            ):
+                normalized_lines.append(f"{prefix}<param-value>")
+            else:
+                normalized_lines.append(line)
+            continue
+        normalized_lines.append(
+            _DSL_PARAMETER_ASSIGNMENT_RE.sub(
+                lambda match: _mask_mutable_assignment(match, step_index=current_step_index),
+                line,
+            )
+        )
+    return _sha256_text("\n".join(normalized_lines))
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +393,55 @@ class SimulationScopeIdentity:
         if len(self.entries) == 1:
             return self.entries[0][1].cache_key()
         return hashlib.sha256(_canonical_json_bytes(self.to_payload())).hexdigest()
+
+
+def contained_simulation_owner_identity(
+    *,
+    execution_mode: str,
+    owner_mechanism_text: str,
+    solver_config: Mapping[str, Any] | None,
+    t_end: float,
+    set_id: str,
+    parameter_names: Sequence[str] = (),
+    simulation_identity: SimulationIdentity | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the payload identity that decides contained runtime owner reuse.
+
+    Preview owners may reuse a prepared mechanism across slider value changes,
+    because slider values are applied as request-local parameter overrides.  The
+    identity therefore includes structural mechanism/runtime dimensions and the
+    parameter namespace, but not the current preview parameter values.
+    """
+    mode = "preview" if str(execution_mode or "").lower() == "preview" else "explicit"
+    identity = coerce_simulation_identity(simulation_identity)
+    solver_identity = (
+        identity.solver
+        if identity is not None
+        else SimulationSolverIdentity.from_solver_config(solver_config)
+    )
+    payload: dict[str, Any] = {
+        "version": 4,
+        "execution_mode": mode,
+        "solver": solver_identity.to_payload(),
+        "t_end": float(t_end),
+        "set_id": str(set_id or ""),
+    }
+    if mode == "preview":
+        payload["structural_mechanism_digest"] = _preview_structural_mechanism_digest(
+            owner_mechanism_text,
+            parameter_names=parameter_names,
+        )
+    elif identity is None:
+        payload["mechanism_digest"] = _sha256_text(owner_mechanism_text)
+    if identity is not None:
+        if mode != "preview":
+            payload["schema_id"] = str(identity.schema_id)
+            payload["simulation_identity_key"] = identity.cache_key()
+    if mode == "preview":
+        payload["parameter_names"] = sorted(
+            {str(name) for name in (parameter_names or ()) if str(name)}
+        )
+    return payload
 
 
 def coerce_simulation_identity(value: object) -> Optional[SimulationIdentity]:

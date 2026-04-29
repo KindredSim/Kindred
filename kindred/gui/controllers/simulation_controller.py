@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 from contextlib import suppress
 import hashlib
+import json
 import logging
 import os
 import platform
+import threading
 from datetime import datetime
-from queue import Empty
 from time import perf_counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -19,23 +20,25 @@ from kindred import __version__ as KINDRED_VERSION
 from kindred.core.batch_parallel import (
     batch_mechanism_signature,
     compute_effective_batch_workers,
-    initialize_batch_worker,
-    run_batch_simulation_task,
 )
+from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome, BatchLanePool
 from kindred.core.simulation_identity import (
     SimulationIdentity,
     SimulationScopeIdentity,
+    contained_simulation_owner_identity,
     coerce_simulation_identity,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot, SimulationRuntimeApplication
 from kindred.core.simulation_failure import (
+    build_simulation_failure,
     coerce_simulation_failure,
     is_cancelled_failure,
     simulation_failure_from_exception,
     simulation_failure_detail_text,
     simulation_failure_user_message,
 )
-from kindred.core.simulation_preparation import BoundMechanism, SimulationExecutionRequest
+from kindred.core.simulation_preparation import SimulationExecutionRequest
 from kindred.gui.controllers.cache_contracts import build_batch_cache_entry
 from kindred.gui.controllers.simulation_completion_policy import (
     CacheAuthorityState,
@@ -52,6 +55,7 @@ from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
 from kindred.gui.controllers.simulation_run_state import (
+    PendingRunAfterRuntimeReadyState,
     PendingSliderPreviewLaunchState,
     PreviewOwnershipState,
     SimulationRunState,
@@ -169,6 +173,46 @@ def _safe_int(value: object, *, default: int = 0) -> int:
         return int(default)
 
 
+def _runtime_readiness_snapshot(
+    *,
+    mode: str,
+    status: str,
+    ready: bool = False,
+    generation: int = 0,
+    failure: Optional[str] = None,
+    message: Optional[str] = None,
+    required: bool = True,
+    controls_ready: Optional[bool] = None,
+    polling: Optional[bool] = None,
+) -> RuntimeReadinessSnapshot:
+    status_text = str(status or "missing")
+    ready_value = bool(ready)
+    required_value = bool(required)
+    if controls_ready is None:
+        controls_ready_value = bool(ready_value or not required_value)
+    else:
+        controls_ready_value = bool(controls_ready)
+    if polling is None:
+        polling_value = bool(
+            required_value
+            and not ready_value
+            and status_text in {"missing", "warming", "not_ready", "stale", "rebuilding"}
+        )
+    else:
+        polling_value = bool(polling)
+    return RuntimeReadinessSnapshot(
+        mode=str(mode or "ordinary"),
+        status=status_text,
+        ready=ready_value,
+        generation=int(generation),
+        failure=failure,
+        message=message,
+        required=required_value,
+        controls_ready=controls_ready_value,
+        polling=polling_value,
+    )
+
+
 def build_fallback_cache_key(
     mechanism_text: str = "",
     t_end: float = 0.0,
@@ -236,18 +280,11 @@ def build_fast_preview_solver_grid_context(
     }
 
 
-def _default_batch_executor_factory(max_workers: int, limit_blas_threads: bool):
-    """Create a process pool for batch simulations (injectable in tests)."""
-    # Keep multiprocessing/process-pool imports lazy so startup paths never
-    # touch process-launch machinery until an actual parallel batch run.
-    import multiprocessing as _mp
-    from concurrent.futures import ProcessPoolExecutor as _ProcessPoolExecutor
-
-    return _ProcessPoolExecutor(
-        max_workers=max(1, int(max_workers)),
-        initializer=initialize_batch_worker,
-        initargs=(bool(limit_blas_threads),),
-        mp_context=_mp.get_context("spawn"),
+def _default_batch_lane_pool_factory(max_workers: int, limit_blas_threads: bool):
+    """Create a warm lane pool for batch simulations (injectable in tests)."""
+    return BatchLanePool(
+        max_lanes=max(1, int(max_workers)),
+        limit_blas_threads_per_worker=bool(limit_blas_threads),
     )
 
 
@@ -281,17 +318,17 @@ class SimulationController(QtCore.QObject):
         )
         self._batch_run_context: Dict[str, Any] = {}
 
-        # Parallel batch orchestration (process pool + futures bookkeeping)
+        # Parallel batch orchestration (warm lane owner adapter)
         self._batch_parallel = ParallelBatchExecutor(
-            executor_factory=_default_batch_executor_factory,
+            lane_pool_factory=_default_batch_lane_pool_factory,
             max_parallel_workers=int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
             limit_blas_threads_per_worker=bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
 
-        self._batch_future_poll_timer = QtCore.QTimer(self)
-        self._batch_future_poll_timer.setInterval(20)
-        self._batch_future_poll_timer.timeout.connect(self._poll_parallel_batch_futures)
+        self._batch_completion_poll_timer = QtCore.QTimer(self)
+        self._batch_completion_poll_timer.setInterval(20)
+        self._batch_completion_poll_timer.timeout.connect(self._poll_parallel_batch_completions)
 
         self._plot_coalescer = SliderPlotCoalescer(
             on_timeout=self._flush_slider_plot_updates,
@@ -309,9 +346,10 @@ class SimulationController(QtCore.QObject):
         self._shutdown_requested_for_close: bool = False
         self._discarded_slider_preview_generation_id: Optional[int] = None
         self._pool_eagerly_created: bool = False
+        self._pool_eager_creation_thread: Optional[threading.Thread] = None
+        self._pool_eager_creation_lock = threading.RLock()
         self._completion_policy = SimulationCompletionPolicy()
-        self._ordinary_simulation_owner = None
-        self._preview_simulation_owner = None
+        self._runtime_application = SimulationRuntimeApplication()
 
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
@@ -331,6 +369,22 @@ class SimulationController(QtCore.QObject):
     @_simulation_worker.setter
     def _simulation_worker(self, value) -> None:
         self._run_state.simulation_worker = value
+
+    @property
+    def _ordinary_simulation_owner(self):
+        return self._runtime_application.current_owner(mode="ordinary")
+
+    @_ordinary_simulation_owner.setter
+    def _ordinary_simulation_owner(self, value) -> None:
+        self._runtime_application.adopt_owner(mode="ordinary", owner=value)
+
+    @property
+    def _preview_simulation_owner(self):
+        return self._runtime_application.current_owner(mode="preview")
+
+    @_preview_simulation_owner.setter
+    def _preview_simulation_owner(self, value) -> None:
+        self._runtime_application.adopt_owner(mode="preview", owner=value)
 
     @property
     def _processing_progress(self) -> bool:
@@ -469,6 +523,135 @@ class SimulationController(QtCore.QObject):
         normalized = PendingSliderPreviewLaunchState()
         self._run_state.pending_slider_preview_launch = normalized
         return normalized
+
+    @property
+    def _pending_run_after_runtime_ready(self) -> PendingRunAfterRuntimeReadyState:
+        pending = getattr(self._run_state, "pending_run_after_runtime_ready", None)
+        if isinstance(pending, PendingRunAfterRuntimeReadyState):
+            return pending
+        normalized = PendingRunAfterRuntimeReadyState()
+        self._run_state.pending_run_after_runtime_ready = normalized
+        return normalized
+
+    def _run_target_set_ids_for_rows(self, rows: Sequence[int]) -> Tuple[str, ...]:
+        target_set_ids: list[str] = []
+        seen: set[str] = set()
+        for row in rows or ():
+            try:
+                set_id = self.ui.batch.batch_set_id_for_row(int(row))
+            except Exception:
+                set_id = None
+            set_id_s = str(set_id or "").strip()
+            if not set_id_s or set_id_s in seen:
+                continue
+            seen.add(set_id_s)
+            target_set_ids.append(set_id_s)
+        return tuple(target_set_ids)
+
+    def _run_intent_signature_for_rows(self, rows: Sequence[int]) -> str:
+        rows_tuple = tuple(int(row) for row in rows or ())
+        try:
+            payloads = self._build_runtime_readiness_plan_payloads(
+                fast_mode=False,
+                batch_rows=rows_tuple,
+            )
+        except Exception as exc:
+            payloads = [{"error": type(exc).__name__, "message": str(exc)}]
+        material = {
+            "rows": list(rows_tuple),
+            "target_set_ids": list(self._run_target_set_ids_for_rows(rows_tuple)),
+            "parallel_batch_runtime": bool(self._selected_run_uses_parallel_batch_runtime()),
+            "payloads": payloads,
+        }
+        try:
+            return json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            return repr(material)
+
+    def _clear_pending_run_after_runtime_ready(self) -> None:
+        self._run_state.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState()
+
+    def _ensure_selected_run_runtime_warming(self) -> None:
+        if self._selected_run_uses_parallel_batch_runtime():
+            self._ensure_parallel_batch_pool_eagerly_created(wait=False)
+        else:
+            self._ensure_interactive_simulation_runtime_available_for_mode(fast_mode=False, wait=False)
+
+    def _queue_run_after_runtime_ready(
+        self,
+        *,
+        rows_to_run: Sequence[int],
+        runtime_snapshot: RuntimeReadinessSnapshot,
+    ) -> None:
+        if not bool(runtime_snapshot.should_poll):
+            self._clear_pending_run_after_runtime_ready()
+            return
+        self._run_state.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState(
+            active=True,
+            rows=tuple(int(row) for row in rows_to_run or ()),
+            target_set_ids=self._run_target_set_ids_for_rows(rows_to_run),
+            intent_signature=self._run_intent_signature_for_rows(rows_to_run),
+        )
+        QtCore.QTimer.singleShot(50, self._retry_pending_run_after_runtime_ready)
+
+    def _restore_run_controls_after_pending_run_cancelled(self) -> None:
+        runtime_snapshot = self._selected_run_runtime_snapshot()
+        if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
+            self._ensure_selected_run_runtime_warming()
+            runtime_snapshot = self._selected_run_runtime_snapshot()
+        if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
+            self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+            self.ui.run_ui.set_run_button_enabled(True)
+            self.ui.run_ui.set_stop_button_enabled(False)
+            self.ui.run_ui.set_status_text(
+                str(runtime_snapshot.message or "Preparing simulation runtime...")
+            )
+            if bool(runtime_snapshot.should_poll):
+                self.ui.run_ui.schedule_runtime_availability_refresh()
+            return
+        self.ui.run_ui.set_runtime_backed_run_controls_ready(True)
+        self.ui.run_ui.set_run_button_enabled(True)
+        self.ui.run_ui.set_stop_button_enabled(False)
+        self.ui.run_ui.set_status_text("Ready.")
+
+    def _retry_pending_run_after_runtime_ready(self) -> None:
+        pending = self._pending_run_after_runtime_ready
+        if not pending.active:
+            return
+        if bool(getattr(self, "_simulation_running", False)) or self._has_running_owned_simulation_workers():
+            QtCore.QTimer.singleShot(50, self._retry_pending_run_after_runtime_ready)
+            return
+        current_rows = tuple(self.ui.batch.batch_rows_for_scope("selected") or ())
+        if current_rows != tuple(pending.rows) or self._run_target_set_ids_for_rows(current_rows) != tuple(
+            pending.target_set_ids
+        ) or self._run_intent_signature_for_rows(current_rows) != str(
+            pending.intent_signature or ""
+        ):
+            self._clear_pending_run_after_runtime_ready()
+            self._restore_run_controls_after_pending_run_cancelled()
+            return
+
+        runtime_snapshot = self._selected_run_runtime_snapshot()
+        if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
+            self._ensure_selected_run_runtime_warming()
+            runtime_snapshot = self._selected_run_runtime_snapshot()
+            if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
+                self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+                self.ui.run_ui.set_run_button_enabled(True)
+                self.ui.run_ui.set_stop_button_enabled(False)
+                self.ui.run_ui.set_status_text(
+                    str(runtime_snapshot.message or "Preparing simulation runtime...")
+                )
+                if bool(runtime_snapshot.should_poll):
+                    self.ui.run_ui.schedule_runtime_availability_refresh()
+                    QtCore.QTimer.singleShot(50, self._retry_pending_run_after_runtime_ready)
+                else:
+                    self._clear_pending_run_after_runtime_ready()
+                return
+
+        self._clear_pending_run_after_runtime_ready()
+        self.ui.run_ui.set_runtime_backed_run_controls_ready(True)
+        self._run_simulation()
 
     def _has_deferred_preview_replay_intent(
         self,
@@ -796,7 +979,7 @@ class SimulationController(QtCore.QObject):
             run_id=ctx.get("run_id"),
             fast_mode=ctx.get("fast_mode"),
             parallel=ctx.get("parallel"),
-            keep_executor_alive=ctx.get("keep_executor_alive"),
+            keep_lane_pool_alive=ctx.get("keep_lane_pool_alive"),
             queue_ids=ctx.get("queue_ids"),
             queue_names=ctx.get("queue_names"),
             total=ctx.get("total"),
@@ -828,7 +1011,7 @@ class SimulationController(QtCore.QObject):
         raw["run_id"] = context.run_id
         raw["fast_mode"] = bool(context.fast_mode)
         raw["parallel"] = bool(context.parallel)
-        raw["keep_executor_alive"] = bool(context.keep_executor_alive)
+        raw["keep_lane_pool_alive"] = bool(context.keep_lane_pool_alive)
         raw["queue_ids"] = list(context.queue_ids)
         raw["queue_names"] = list(context.queue_names)
         raw["total"] = int(context.total)
@@ -1008,8 +1191,40 @@ class SimulationController(QtCore.QObject):
     def stop_simulation(self) -> None:
         self._stop_simulation()
 
+    def ensure_interactive_simulation_runtimes_available(self, *, wait: bool = False) -> None:
+        for fast_mode in (False, True):
+            try:
+                self._ensure_interactive_simulation_runtime_available_for_mode(
+                    fast_mode=bool(fast_mode),
+                    wait=bool(wait),
+                )
+            except Exception as exc:
+                mode_label = "preview" if bool(fast_mode) else "ordinary"
+                self._record_nonfatal_exception(
+                    f"Failed to make {mode_label} contained simulation runtime available",
+                    exc,
+                )
+
+    def invalidate_interactive_simulation_runtimes(self, *, kill: bool = False) -> None:
+        self._runtime_application.close(kill=bool(kill))
+
+    def interactive_simulation_runtimes_ready(self) -> bool:
+        return bool(
+            self.interactive_simulation_runtime_ready(fast_mode=False)
+            and self.interactive_simulation_runtime_ready(fast_mode=True)
+        )
+
+    def interactive_simulation_runtime_snapshot(self, *, fast_mode: bool) -> RuntimeReadinessSnapshot:
+        return self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode))
+
+    def interactive_simulation_runtime_ready(self, *, fast_mode: bool) -> bool:
+        return bool(self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode)).ready)
+
     def invalidate_slider_preview_work(self) -> None:
         self._invalidate_slider_preview_work()
+
+    def discard_slider_preview_work_preserving_runtime_owner(self) -> None:
+        self._invalidate_slider_preview_work(close_runtime_owner=False)
 
     def invalidate_active_explicit_simulation_for_authoritative_change(self) -> None:
         self._invalidate_active_explicit_simulation_for_authoritative_change()
@@ -1020,26 +1235,38 @@ class SimulationController(QtCore.QObject):
         fast_mode: bool = False,
         request_id: Optional[int] = None,
         batch_rows: Optional[Sequence[int]] = None,
-        reuse_parallel_executor: bool = False,
+        reuse_parallel_lane_pool: bool = False,
     ) -> None:
         self._run_simulation_internal(
             fast_mode=fast_mode,
             request_id=request_id,
             batch_rows=batch_rows,
-            reuse_parallel_executor=reuse_parallel_executor,
+            reuse_parallel_lane_pool=reuse_parallel_lane_pool,
         )
 
-    def poll_parallel_batch_futures(self) -> None:
-        self._poll_parallel_batch_futures()
+    def poll_parallel_batch_completions(self) -> None:
+        self._poll_parallel_batch_completions()
 
-    def shutdown_batch_executor(self, *, force_terminate: bool) -> None:
-        self._shutdown_batch_executor(force_terminate=force_terminate)
+    def shutdown_batch_lane_pool(self, *, force_terminate: bool) -> None:
+        self._shutdown_batch_lane_pool(force_terminate=force_terminate)
 
     def parallel_batch_pool_settings_changed(self) -> None:
         self._parallel_batch_pool_settings_changed()
 
-    def ensure_parallel_batch_pool_eagerly_created(self) -> None:
-        self._ensure_parallel_batch_pool_eagerly_created()
+    def ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
+        self._ensure_parallel_batch_pool_eagerly_created(wait=bool(wait))
+
+    def parallel_batch_runtime_ready(self) -> bool:
+        return self._parallel_batch_runtime_ready()
+
+    def selected_run_uses_parallel_batch_runtime(self) -> bool:
+        return bool(self._selected_run_uses_parallel_batch_runtime())
+
+    def selected_run_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
+        return self._selected_run_runtime_snapshot()
+
+    def selected_run_runtime_ready(self) -> bool:
+        return bool(self._selected_run_runtime_snapshot().ready)
 
     def release_current_simulation_worker(self) -> None:
         self._release_current_simulation_worker()
@@ -1219,7 +1446,7 @@ class SimulationController(QtCore.QObject):
         return self._cache_admin.purge_all_caches()
 
     # ------------------------------------------------------------------
-    # Worker / executor lifecycle
+    # Worker / lane-pool lifecycle
     # ------------------------------------------------------------------
     @staticmethod
     def _worker_is_valid(worker) -> bool:
@@ -1447,7 +1674,7 @@ class SimulationController(QtCore.QObject):
                 detached_active_owner = None
             if (not still_running) and getattr(self, "_simulation_worker", None) is worker:
                 self._simulation_worker = None
-        self._shutdown_batch_executor(force_terminate=True)
+        self._shutdown_batch_lane_pool(force_terminate=True)
         self._prune_stopped_owned_simulation_workers()
         has_running_workers = self._has_running_owned_simulation_workers()
         if has_running_workers:
@@ -1534,67 +1761,445 @@ class SimulationController(QtCore.QObject):
     def _contained_owner_attr(self, *, fast_mode: bool) -> str:
         return "_preview_simulation_owner" if bool(fast_mode) else "_ordinary_simulation_owner"
 
+    def _contained_owner_mode(self, *, fast_mode: bool) -> str:
+        return "preview" if bool(fast_mode) else "ordinary"
+
+    def _new_contained_simulation_owner(
+        self,
+        *,
+        fast_mode: bool,
+        simulation_plan_payload: Mapping[str, Any],
+    ):
+        owner_plan_payload = dict(simulation_plan_payload or {})
+        factory = getattr(self, "_contained_simulation_owner_factory", None)
+        if callable(factory):
+            try:
+                return factory(
+                    fast_mode=bool(fast_mode),
+                    simulation_plan_payload=owner_plan_payload,
+                )
+            except TypeError:
+                return factory(fast_mode=bool(fast_mode))
+        from kindred.core.simulation_containment import WarmSimulationOwner
+
+        timeout_s = getattr(self, "_contained_simulation_timeout_s", None)
+        kwargs: Dict[str, Any] = {}
+        if timeout_s is not None:
+            kwargs["active_timeout_s"] = float(timeout_s)
+        return WarmSimulationOwner(owner_plan_payload, **kwargs)
+
     def _contained_simulation_owner(
         self,
         *,
         fast_mode: bool,
         simulation_plan_payload: Optional[Mapping[str, Any]] = None,
     ):
-        attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
+        mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
         owner_plan_payload = dict(simulation_plan_payload or {})
-        owner = getattr(self, attr, None)
+        owner = self._runtime_application.current_owner(mode=mode)
         if owner is not None:
             return owner
-        factory = getattr(self, "_contained_simulation_owner_factory", None)
-        if callable(factory):
-            try:
-                owner = factory(
-                    fast_mode=bool(fast_mode),
-                    simulation_plan_payload=owner_plan_payload,
-                )
-            except TypeError:
-                owner = factory(fast_mode=bool(fast_mode))
-        else:
-            from kindred.core.simulation_containment import WarmSimulationOwner
-
-            timeout_s = getattr(self, "_contained_simulation_timeout_s", None)
-            kwargs: Dict[str, Any] = {}
-            if timeout_s is not None:
-                kwargs["active_timeout_s"] = float(timeout_s)
-            owner = WarmSimulationOwner(owner_plan_payload, **kwargs)
-        setattr(self, attr, owner)
+        owner = self._new_contained_simulation_owner(
+            fast_mode=bool(fast_mode),
+            simulation_plan_payload=owner_plan_payload,
+        )
+        self._runtime_application.adopt_owner(mode=mode, owner=owner, payload=owner_plan_payload)
         return owner
+
+    def _ready_contained_simulation_owner_for_plan(
+        self,
+        *,
+        fast_mode: bool,
+        simulation_plan_payload: Mapping[str, Any],
+    ):
+        plan_payload = dict(simulation_plan_payload or {})
+        if not plan_payload:
+            return None
+        mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
+        return self._runtime_application.ready_owner(mode=mode, payload=plan_payload)
 
     def _warm_contained_simulation_owner_for_plan(
         self,
         *,
         fast_mode: bool,
         simulation_plan_payload: Mapping[str, Any],
+        wait: bool = True,
     ) -> None:
         plan_payload = dict(simulation_plan_payload or {})
         if not plan_payload:
             return
-        from kindred.core.simulation_containment import contained_payloads_equal
+        mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
 
-        attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
-        existing_owner = getattr(self, attr, None)
-        if existing_owner is not None:
-            existing_payload = getattr(existing_owner, "simulation_plan_payload", None)
-            if not isinstance(existing_payload, Mapping) or not contained_payloads_equal(dict(existing_payload), plan_payload):
-                self._close_contained_simulation_owner(fast_mode=bool(fast_mode), kill=False)
-        owner = self._contained_simulation_owner(
-            fast_mode=bool(fast_mode),
-            simulation_plan_payload=plan_payload,
+        def _owner_factory(payload: Mapping[str, object]):
+            owner = self._new_contained_simulation_owner(
+                fast_mode=bool(fast_mode),
+                simulation_plan_payload=dict(payload),
+            )
+            return owner
+
+        self._runtime_application.ensure_ready(
+            mode=mode,
+            payload=plan_payload,
+            owner_factory=_owner_factory,
+            wait=bool(wait),
         )
-        start = getattr(owner, "start", None)
-        if callable(start):
-            start(wait=False)
+
+    def _interactive_runtime_rows(self) -> list[int]:
+        try:
+            rows = list(self.ui.batch.batch_rows_for_scope("selected"))
+        except Exception:
+            rows = []
+        if not rows:
+            try:
+                row_count = int(self.ui.batch.batch_store_row_count())
+            except Exception:
+                row_count = 0
+            if row_count > 0:
+                rows = [0]
+        return [int(row) for row in rows]
+
+    def _interactive_runtime_plan_payloads_for_mode(self, *, fast_mode: bool) -> list[dict[str, Any]]:
+        return self._build_runtime_readiness_plan_payloads(
+            fast_mode=bool(fast_mode),
+            batch_rows=self._interactive_runtime_rows(),
+        )
+
+    def _interactive_simulation_runtime_snapshot(self, *, fast_mode: bool) -> RuntimeReadinessSnapshot:
+        mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
+        payloads = self._interactive_runtime_plan_payloads_for_mode(fast_mode=bool(fast_mode))
+        if not payloads:
+            return _runtime_readiness_snapshot(
+                mode=mode,
+                status="not_applicable",
+                ready=False,
+                required=False,
+                controls_ready=True,
+                polling=False,
+                message="No runnable simulation runtime is required for the current state.",
+            )
+        app_snapshot = self._runtime_application.snapshot(mode=mode)
+        all_ready = True
+        for payload in payloads:
+            if self._runtime_application.ready_owner(mode=mode, payload=payload) is None:
+                all_ready = False
+                break
+        if all_ready:
+            return _runtime_readiness_snapshot(
+                mode=mode,
+                status="ready",
+                ready=True,
+                generation=int(app_snapshot.generation),
+                required=True,
+                controls_ready=True,
+                polling=False,
+            )
+        status = str(app_snapshot.status or "missing")
+        failure = app_snapshot.failure
+        if status == "failed":
+            message = f"{'Preview' if bool(fast_mode) else 'Simulation'} runtime failed to start."
+            if failure:
+                message = f"{message} {failure}"
+            return _runtime_readiness_snapshot(
+                mode=mode,
+                status="failed",
+                ready=False,
+                generation=int(app_snapshot.generation),
+                failure=failure,
+                message=message,
+                required=True,
+                controls_ready=False,
+                polling=False,
+            )
+        return _runtime_readiness_snapshot(
+            mode=mode,
+            status=status if status else "warming",
+            ready=False,
+            generation=int(app_snapshot.generation),
+            failure=failure,
+            message=f"Preparing {'preview' if bool(fast_mode) else 'simulation'} runtime...",
+            required=True,
+            controls_ready=False,
+            polling=True,
+        )
+
+    def _build_runtime_readiness_plan_payloads(
+        self,
+        *,
+        fast_mode: bool,
+        batch_rows: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        try:
+            row_count = int(self.ui.batch.batch_store_row_count())
+        except Exception:
+            row_count = 0
+        rows = [int(row) for row in (batch_rows or []) if 0 <= int(row) < int(row_count)]
+        if not rows and row_count > 0:
+            rows = [0]
+        if not rows:
+            return []
+        try:
+            invalid = self.ui.batch.batch_model_validate_rows(rows)
+        except Exception:
+            invalid = set()
+        if invalid:
+            return []
+
+        any_slider_workspace = bool(self.ui.mechanism.has_slider_overrides())
+        has_slider_overrides = bool(fast_mode) and bool(any_slider_workspace)
+        primary = self.ui.batch.batch_preferred_primary_set_id(rows)
+        primary_set_id = str(primary) if primary is not None else None
+
+        owner_reactions_text_raw = self.ui.mechanism.mechanism_reactions_text_raw()
+        owner_state_network_dsl_raw = self.ui.mechanism.mechanism_state_network_dsl_raw()
+        reactions_text_raw = owner_reactions_text_raw
+        if has_slider_overrides:
+            reactions_text_raw = self.ui.mechanism.apply_overrides_to_text(
+                reactions_text_raw,
+                set_id=primary_set_id,
+            )
+
+        pending_init_seed: Dict[str, Dict[str, float]] = {}
+        migrated = reactions_text_raw
+        try:
+            pending_init_seed, migrated = migrate_reaction_dsl_initial_concentration_sets(
+                reactions_text_raw,
+                default_set_name="set1",
+            )
+        except Exception:
+            pending_init_seed = {}
+            migrated = reactions_text_raw
+
+        names = list(self.ui.batch.batch_store_set_names())
+        queue_names = [str(names[row]) for row in rows if 0 <= int(row) < len(names)]
+        queue_ids = [
+            str(self.ui.batch.batch_set_id_for_row(int(row)) or str(names[int(row)]))
+            for row in rows
+            if 0 <= int(row) < len(names)
+        ]
+        if not queue_ids:
+            return []
+
+        reactions_text = strip_reaction_dsl_initial_concentrations(migrated)
+        state_network_dsl = owner_state_network_dsl_raw
+        if has_slider_overrides:
+            state_network_dsl = self.ui.mechanism.apply_overrides_to_state_network_dsl(
+                state_network_dsl,
+                set_id=primary_set_id,
+            )
+        full_dsl = reactions_text
+        if state_network_dsl.strip():
+            full_dsl += "\n\n# State Network\n" + state_network_dsl
+        if has_slider_overrides:
+            full_dsl = self._apply_parameter_override_fallback_to_dsl(full_dsl, set_id=primary_set_id)
+        if not full_dsl.strip():
+            return []
+
+        owner_reactions_text = strip_reaction_dsl_initial_concentrations(owner_reactions_text_raw)
+        owner_full_dsl = owner_reactions_text
+        if owner_state_network_dsl_raw.strip():
+            owner_full_dsl += "\n\n# State Network\n" + owner_state_network_dsl_raw
+
+        solver_grid_context = build_fast_preview_solver_grid_context(
+            initial_solver_name=self.ui.solver.initial_solver_name(),
+            num_points=int(self.ui.solver.num_points_spinbox_value()),
+            fast_mode=bool(fast_mode),
+            slider_points_override=self.ui.mechanism.mechanism_slider_points_value(),
+            slider_solver_override=self.ui.mechanism.mechanism_slider_solver_value(),
+            slider_drag_active=bool(self.ui.slider.slider_drag_active()),
+            last_slider_change_name=str(self.ui.slider.last_slider_change_name() or ""),
+        )
+        solver_label = str(solver_grid_context.get("solver_label") or "")
+        solver = str(solver_grid_context.get("solver") or "")
+        solver_warning = solver_grid_context.get("solver_warning")
+        rtol = self.ui.solver.initial_rtol() or 1e-6
+        atol = self.ui.solver.initial_atol() or 1e-12
+        temperature_K = float(self.ui.solver.temperature_spinbox_value())
+        T_override = self.ui.solver.dsl_global_temperature_K(full_dsl)
+        if T_override is not None:
+            temperature_K = float(T_override)
+        solver_config = {
+            "solver": solver,
+            "solver_label": solver_label,
+            "solver_warning": str(solver_warning) if solver_warning else None,
+            "rtol": rtol,
+            "atol": atol,
+            "grid": {"N": int((solver_grid_context.get("grid") or {}).get("N") or 0)},
+            "temperature_K": temperature_K,
+            "use_sparse_jacobian": bool(self.ui.solver.use_sparse_jacobian()),
+            "wegscheider_cyclicity_enabled": bool(self.ui.solver.wegscheider_cyclicity_enabled()),
+        }
+        try:
+            t_end = float(self.ui.solver.parse_sim_time_seconds())
+        except ValueError:
+            return []
+
+        preview_batch_cache_token_by_set_id: Dict[str, str] = {}
+        for index, set_id in enumerate(queue_ids):
+            token = ""
+            if bool(fast_mode) and index < len(rows):
+                try:
+                    token = self.ui.slider.preview_batch_cache_token([int(rows[index])])
+                except Exception:
+                    token = ""
+            preview_batch_cache_token_by_set_id[str(set_id)] = str(token or "")
+
+        simulation_identity_by_set_id: Dict[str, dict[str, Any]] = {}
+        simulation_plan_by_set_id: Dict[str, Dict[str, Any]] = {}
+        owner_parameter_names_by_set_id: Dict[str, list[str]] = {}
+        for index, set_id in enumerate(queue_ids):
+            identity = self._simulation_identity_for_set(
+                set_id=str(set_id),
+                solver_config=solver_config,
+                t_end=float(t_end),
+                preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(str(set_id), ""),
+                fast_mode=bool(fast_mode),
+            )
+            simulation_identity_by_set_id[str(set_id)] = identity.to_payload()
+            if index >= len(rows):
+                continue
+            row = int(rows[index])
+            set_name = str(queue_names[index]) if index < len(queue_names) else str(set_id)
+            request_mechanism_text = self._request_mechanism_text_for_set(
+                set_id=str(set_id),
+                has_slider_overrides=has_slider_overrides,
+            )
+            try:
+                initials_dict = self._resolved_initials_for_batch_row(
+                    row=row,
+                    set_name=set_name,
+                    pending_init_seed=pending_init_seed,
+                    pending_init_applied=False,
+                    include_preview_initials=bool(fast_mode),
+                )
+            except Exception:
+                return []
+            request_payload = SimulationExecutionRequest(
+                prepared_payload=None,
+                initials=dict(initials_dict),
+                t_span=(0.0, float(t_end)),
+                solver_config=dict(solver_config),
+                mechanism_text=str(request_mechanism_text),
+                simulation_identity=identity.to_payload(),
+                parameter_overrides=(
+                    self._slider_execution_parameter_values(set_id=str(set_id))
+                    if bool(fast_mode)
+                    else None
+                ),
+            ).to_payload()
+            preview_token = preview_batch_cache_token_by_set_id.get(str(set_id), "")
+            cache_identity_payload: Dict[str, Any] = {
+                "cache_key": "",
+                "simulation_identity": identity.to_payload(),
+            }
+            if preview_token:
+                cache_identity_payload["preview_batch_cache_token"] = str(preview_token)
+            simulation_plan_by_set_id[str(set_id)] = _new_simulation_plan_payload(
+                request_payload,
+                execution_mode="preview" if bool(fast_mode) else "explicit",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                cache_identity_payload=cache_identity_payload,
+                metadata={
+                    "set_id": str(set_id),
+                    "set_name": set_name,
+                    "fast_mode": bool(fast_mode),
+                },
+            )
+            if bool(fast_mode):
+                owner_parameter_names_by_set_id[str(set_id)] = self._slider_runtime_parameter_names(set_id=str(set_id))
+
+        scope_identity = SimulationScopeIdentity.build(
+            queue_ids=queue_ids,
+            identity_by_set_id={
+                set_id: payload
+                for set_id, payload in simulation_identity_by_set_id.items()
+            },
+        )
+        cache_key = self.ui.batch.batch_cache_key(scope_identity=scope_identity)
+        set_name_by_set_id = {
+            str(set_id): str(queue_names[index]) if index < len(queue_names) else str(set_id)
+            for index, set_id in enumerate(queue_ids)
+        }
+        for set_id, plan_payload in list(simulation_plan_by_set_id.items()):
+            request_payload = _execution_request_payload_from_plan(plan_payload)
+            if request_payload is None:
+                continue
+            preview_token = preview_batch_cache_token_by_set_id.get(str(set_id), "")
+            cache_identity_payload = {
+                "cache_key": cache_key,
+                "simulation_identity": dict(simulation_identity_by_set_id.get(str(set_id)) or {}),
+            }
+            if preview_token:
+                cache_identity_payload["preview_batch_cache_token"] = str(preview_token)
+            metadata: Dict[str, Any] = {
+                "set_id": str(set_id),
+                "set_name": set_name_by_set_id.get(str(set_id), str(set_id)),
+                "fast_mode": bool(fast_mode),
+            }
+            if bool(fast_mode):
+                metadata["contained_owner_identity"] = self._preview_contained_owner_identity(
+                    owner_mechanism_text=str(request_payload.get("mechanism_text") or owner_full_dsl),
+                    solver_config=solver_config,
+                    t_end=float(t_end),
+                    set_id=str(set_id),
+                    parameter_names=owner_parameter_names_by_set_id.get(str(set_id), []),
+                    simulation_identity=simulation_identity_by_set_id.get(str(set_id)),
+                )
+            else:
+                metadata["contained_owner_identity"] = self._ordinary_contained_owner_identity(
+                    owner_mechanism_text=owner_full_dsl,
+                    solver_config=solver_config,
+                    t_end=float(t_end),
+                    set_id=str(set_id),
+                    simulation_identity=simulation_identity_by_set_id.get(str(set_id)),
+                )
+            simulation_plan_by_set_id[str(set_id)] = _new_simulation_plan_payload(
+                request_payload,
+                execution_mode="preview" if bool(fast_mode) else "explicit",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                cache_identity_payload=cache_identity_payload,
+                cache_scope_payload={
+                    "scope_identity": scope_identity.to_payload(),
+                    "queue_ids": [str(queue_id) for queue_id in queue_ids],
+                },
+                metadata=metadata,
+            )
+
+        from kindred.core.simulation_containment import build_contained_simulation_plan_payload
+
+        return [
+            build_contained_simulation_plan_payload(simulation_plan_by_set_id[str(set_id)])
+            for set_id in queue_ids
+            if str(set_id) in simulation_plan_by_set_id
+        ]
+
+    def _ensure_interactive_simulation_runtime_available_for_mode(
+        self,
+        *,
+        fast_mode: bool,
+        wait: bool = False,
+    ) -> None:
+        payloads = self._interactive_runtime_plan_payloads_for_mode(fast_mode=bool(fast_mode))
+        if not payloads:
+            return
+        mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
+
+        def _owner_factory(payload: Mapping[str, object]):
+            return self._new_contained_simulation_owner(
+                fast_mode=bool(fast_mode),
+                simulation_plan_payload=dict(payload),
+            )
+
+        self._runtime_application.ensure_ready_many(
+            mode=mode,
+            payloads=[dict(payload) for payload in payloads],
+            owner_factory=_owner_factory,
+            wait=bool(wait),
+        )
 
     def _detach_contained_simulation_owner(self, *, fast_mode: bool):
-        attr = self._contained_owner_attr(fast_mode=bool(fast_mode))
-        owner = getattr(self, attr, None)
-        setattr(self, attr, None)
-        return owner
+        return self._runtime_application.detach_owner(
+            mode=self._contained_owner_mode(fast_mode=bool(fast_mode))
+        )
 
     def _close_contained_simulation_owner(
         self,
@@ -1604,13 +2209,11 @@ class SimulationController(QtCore.QObject):
     ) -> None:
         modes = (False, True) if fast_mode is None else (bool(fast_mode),)
         for mode in modes:
-            attr = self._contained_owner_attr(fast_mode=mode)
-            owner = getattr(self, attr, None)
-            setattr(self, attr, None)
-            if owner is None or not hasattr(owner, "close"):
-                continue
             try:
-                owner.close(kill=bool(kill))
+                self._runtime_application.close(
+                    mode=self._contained_owner_mode(fast_mode=mode),
+                    kill=bool(kill),
+                )
             except Exception as exc:
                 self._record_nonfatal_exception(
                     f"Failed to close {'preview' if mode else 'ordinary'} contained simulation owner",
@@ -1718,14 +2321,95 @@ class SimulationController(QtCore.QObject):
             )
         )
 
-    def _shutdown_batch_executor(self, *, force_terminate: bool) -> None:
-        timer = getattr(self, "_batch_future_poll_timer", None)
+    def _selected_run_uses_parallel_batch_runtime(self) -> bool:
+        rows = self._interactive_runtime_rows()
+        if len(rows) <= 1:
+            return False
+        return bool(self._effective_batch_worker_count(len(rows)) > 1)
+
+    def _selected_run_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
+        if self._selected_run_uses_parallel_batch_runtime():
+            return self._parallel_batch_runtime_snapshot()
+        return self._interactive_simulation_runtime_snapshot(fast_mode=False)
+
+    def _parallel_batch_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
+        rows = self._interactive_runtime_rows()
+        if len(rows) <= 1 or self._effective_batch_worker_count(len(rows)) <= 1:
+            return _runtime_readiness_snapshot(
+                mode="batch",
+                status="not_applicable",
+                ready=False,
+                required=False,
+                controls_ready=True,
+                polling=False,
+                message="Parallel batch runtime is not required for the current selection.",
+            )
+        required_lanes = max(1, int(self._effective_batch_worker_count(len(rows))))
+        try:
+            ready = bool(self._batch_parallel.has_ready_lane_pool(max_lanes=required_lanes))
+            snapshot = self._batch_parallel.runtime_snapshot()
+        except Exception as exc:
+            return _runtime_readiness_snapshot(
+                mode="batch",
+                status="failed",
+                ready=False,
+                failure=f"{type(exc).__name__}: {exc}",
+                message=f"Batch runtime readiness check failed: {exc}",
+                required=True,
+                controls_ready=False,
+                polling=False,
+            )
+        if ready:
+            self._pool_eagerly_created = True
+            return _runtime_readiness_snapshot(
+                mode="batch",
+                status="ready",
+                ready=True,
+                generation=int(getattr(snapshot, "current_generation", 0) or 0),
+                required=True,
+                controls_ready=True,
+                polling=False,
+            )
+        self._pool_eagerly_created = False
+        failure = getattr(snapshot, "warm_failure", None)
+        if failure:
+            return _runtime_readiness_snapshot(
+                mode="batch",
+                status="failed",
+                ready=False,
+                generation=int(getattr(snapshot, "current_generation", 0) or 0),
+                failure=str(failure),
+                message=f"Batch runtime failed to prepare. {failure}",
+                required=True,
+                controls_ready=False,
+                polling=False,
+            )
+        if bool(getattr(snapshot, "pool_stale", False)):
+            status = "stale"
+            message = "Rebuilding batch runtime..."
+        elif bool(getattr(snapshot, "has_lane_pool", False)):
+            status = "warming"
+            message = "Preparing batch runtime..."
+        else:
+            status = "missing"
+            message = "Preparing batch runtime..."
+        return _runtime_readiness_snapshot(
+            mode="batch",
+            status=status,
+            ready=False,
+            generation=int(getattr(snapshot, "current_generation", 0) or 0),
+            message=message,
+            required=True,
+            controls_ready=False,
+            polling=True,
+        )
+
+    def _shutdown_batch_lane_pool(self, *, force_terminate: bool) -> None:
+        timer = getattr(self, "_batch_completion_poll_timer", None)
         if timer is not None and timer.isActive():
             timer.stop()
         self._clear_pending_slider_plot_updates()
-        prior_futures = int(len(self._batch_parallel.future_map or {})) + int(
-            len(self._batch_parallel.superseded_future_map or {})
-        )
+        prior_requests = int(self._batch_parallel.active_request_count())
         self._batch_parallel.shutdown(
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=self._record_nonfatal_exception,
@@ -1733,50 +2417,96 @@ class SimulationController(QtCore.QObject):
         self._pool_eagerly_created = False
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
-                "BATCH_PAR shutdown executor force=%s pending_futures=%s",
+                "BATCH_PAR shutdown lane owner force=%s pending_requests=%s",
                 bool(force_terminate),
-                int(prior_futures),
+                int(prior_requests),
             )
 
     def _has_active_parallel_batch_work(self) -> bool:
-        ctx = getattr(self, "_batch_run_context", {}) or {}
-        if isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"):
+        runtime_snapshot = self._batch_parallel.runtime_snapshot()
+        if runtime_snapshot.active:
             return True
-        return bool(self._batch_parallel.future_map) or bool(self._batch_parallel.superseded_future_map)
+        return bool(self._batch_parallel.has_active_requests())
 
     def _parallel_batch_pool_settings_changed(self) -> None:
         if self._has_active_parallel_batch_work():
             self._batch_parallel.mark_pool_stale()
+            self._pool_eagerly_created = False
             return
-        self._shutdown_batch_executor(force_terminate=False)
+        self._shutdown_batch_lane_pool(force_terminate=False)
 
-    def _ensure_parallel_batch_pool_eagerly_created(self) -> None:
-        if self._pool_eagerly_created:
+    def _ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
+        effective_workers = self._interactive_batch_runtime_capacity()
+        try:
+            if self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers))):
+                self._pool_eagerly_created = True
+                return
+        except Exception:
+            self._pool_eagerly_created = False
+        self._pool_eagerly_created = False
+        if not bool(wait):
+            with self._pool_eager_creation_lock:
+                existing = self._pool_eager_creation_thread
+                if existing is not None and existing.is_alive():
+                    return
+                thread = threading.Thread(
+                    target=self._ensure_parallel_batch_pool_eagerly_created,
+                    kwargs={"wait": True},
+                    name="kindred-batch-runtime-readiness",
+                    daemon=True,
+                )
+                self._pool_eager_creation_thread = thread
+                thread.start()
             return
         try:
-            effective_workers = compute_effective_batch_workers(
-                num_sets=max(1, int(self._batch_parallel.max_parallel_workers)),
-                max_parallel_workers=max(1, int(self._batch_parallel.max_parallel_workers)),
-            )
-            self._batch_parallel.ensure_executor(
-                max_workers=max(1, int(effective_workers))
+            self._batch_parallel.ensure_warm_lane_pool(
+                max_lanes=max(1, int(effective_workers)),
+                wait=bool(wait),
             )
         except Exception:
             self._pool_eagerly_created = False
             return
-        self._pool_eagerly_created = True
+        self._pool_eagerly_created = bool(
+            self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers)))
+        )
 
-    def _cleanup_parallel_batch_executor_after_run(
+    def _interactive_batch_runtime_capacity(self) -> int:
+        max_workers = max(1, int(getattr(self._batch_parallel, "max_parallel_workers", 1) or 1))
+        return max(
+            1,
+            int(
+                compute_effective_batch_workers(
+                    num_sets=max_workers,
+                    max_parallel_workers=max_workers,
+                )
+            ),
+        )
+
+    def _parallel_batch_runtime_ready(self) -> bool:
+        effective_workers = self._interactive_batch_runtime_capacity()
+        try:
+            ready = bool(
+                self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers)))
+            )
+        except Exception:
+            ready = False
+        if ready:
+            self._pool_eagerly_created = True
+        else:
+            self._pool_eagerly_created = False
+        return ready
+
+    def _cleanup_parallel_batch_lane_pool_after_run(
         self,
         *,
-        keep_executor_alive: bool,
+        keep_lane_pool_alive: bool,
         clear_pending_plot_updates: bool = False,
         stale_fast_handoff_after_display: bool = False,
     ) -> None:
-        if bool(keep_executor_alive) and (not self._batch_parallel.is_pool_stale):
+        if bool(keep_lane_pool_alive) and (not self._batch_parallel.is_pool_stale):
             if stale_fast_handoff_after_display:
                 cancelled, running = self._batch_parallel.soft_supersede()
-                timer = getattr(self, "_batch_future_poll_timer", None)
+                timer = getattr(self, "_batch_completion_poll_timer", None)
                 if running > 0 and timer is not None:
                     timer.start()
                 if bool(getattr(self, "_debug_batch_parallel", False)):
@@ -1786,14 +2516,17 @@ class SimulationController(QtCore.QObject):
                         int(running),
                     )
             else:
-                self._batch_parallel.reset_active_run_state()
-            self._stop_batch_future_poll_timer_if_idle()
+                self._batch_parallel.finish_after_run(
+                    keep_lane_pool_alive=True,
+                    record_nonfatal_exception=self._record_nonfatal_exception,
+                )
+            self._stop_batch_completion_poll_timer_if_idle()
             if bool(clear_pending_plot_updates):
                 self._clear_pending_slider_plot_updates()
             if bool(getattr(self, "_debug_batch_parallel", False)):
-                logger.info("BATCH_PAR keeping executor alive after slider batch completion")
+                logger.info("BATCH_PAR keeping lane pool alive after slider batch completion")
             return
-        self._shutdown_batch_executor(force_terminate=False)
+        self._shutdown_batch_lane_pool(force_terminate=False)
 
     def _supersede_parallel_batch_run_soft(self) -> None:
         """
@@ -1807,7 +2540,7 @@ class SimulationController(QtCore.QObject):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
 
-        timer = getattr(self, "_batch_future_poll_timer", None)
+        timer = getattr(self, "_batch_completion_poll_timer", None)
         if timer is not None and timer.isActive():
             timer.stop()
 
@@ -1847,11 +2580,12 @@ class SimulationController(QtCore.QObject):
         if cache_kind in ("", "preview"):
             self._plot_coalescer.clear()
 
-    def _invalidate_slider_preview_work(self) -> None:
+    def _invalidate_slider_preview_work(self, *, close_runtime_owner: bool = True) -> None:
         invalidation_request_id = int(self._next_sim_request_id())
         self._discarded_slider_preview_generation_id = int(invalidation_request_id)
         self._clear_preview_ownership()
-        self._close_contained_simulation_owner(fast_mode=True, kill=True)
+        if bool(close_runtime_owner):
+            self._close_contained_simulation_owner(fast_mode=True, kill=True)
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
         clear_preview = getattr(self._batch_cache, "clear_active_preview_selection_state", None)
@@ -2011,28 +2745,25 @@ class SimulationController(QtCore.QObject):
         return bool(displayed)
 
     # ------------------------------------------------------------------
-    # Batch futures polling/consumption
+    # Batch lane outcome polling/consumption
     # ------------------------------------------------------------------
-    def _pop_all_stale_parallel_batch_futures(self) -> None:
-        self._batch_parallel.future_map.clear()
-        self._batch_parallel.future_meta.clear()
-        self._batch_parallel.superseded_future_map.clear()
-        self._batch_parallel.superseded_future_meta.clear()
+    def _clear_stale_parallel_batch_requests(self) -> None:
+        self._batch_parallel.clear_stale_requests()
 
-    def _reset_parallel_batch_run_and_shutdown_executor(self) -> None:
+    def _reset_parallel_batch_run_and_shutdown_lane_pool(self) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
         if isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
-        self.shutdown_batch_executor(force_terminate=True)
-        self._pop_all_stale_parallel_batch_futures()
+        self.shutdown_batch_lane_pool(force_terminate=True)
+        self._clear_stale_parallel_batch_requests()
         self._drain_batch_completion_queue()
 
     def _surface_current_parallel_batch_pool_failure_to_ui(self, error_msg: object) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
         if not (isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel")):
             return
-        if self._batch_parallel.executor is None:
+        if not self._batch_parallel.has_lane_pool():
             return
         self._dispatch_simulation_error(
             error_msg,
@@ -2291,8 +3022,8 @@ class SimulationController(QtCore.QObject):
         self._batch_run_context = dict(ctx)
         self._finalize_scoped_batch_success_subset(ctx)
         ctx = dict(getattr(self, "_batch_run_context", {}) or ctx)
-        self._cleanup_parallel_batch_executor_after_run(
-            keep_executor_alive=False,
+        self._cleanup_parallel_batch_lane_pool_after_run(
+            keep_lane_pool_alive=False,
             clear_pending_plot_updates=False,
         )
         self._simulation_running = False
@@ -2310,55 +3041,104 @@ class SimulationController(QtCore.QObject):
         self._apply_explicit_failure_pending_replay_policy(fast_mode=False)
         return True
 
-    def _consume_parallel_batch_future(
+    def _consume_parallel_batch_outcome(
         self,
         *,
         set_id: str,
-        fut: Any,
+        outcome: BatchLaneOutcome,
         run_id: int,
         request_id: int,
         fast_mode: bool,
         cache_key: str,
         source: str,
         completed_ts: Optional[float] = None,
+        completion_record: Optional[BatchCompletionRecord] = None,
     ) -> bool:
         sid = str(set_id or "")
-        meta = dict((self._batch_parallel.future_meta or {}).get(sid) or {})
+        if completion_record is not None:
+            meta = {
+                "set_name": completion_record.set_name,
+                "preview_owner_epoch": completion_record.preview_owner_epoch,
+                "owner_epoch": completion_record.expected_owner_epoch,
+                "generation": completion_record.generation,
+            }
+        else:
+            meta = self._batch_parallel.active_request_metadata(sid)
         meta["set_name"] = str(meta.get("set_name") or sid)
         set_name = meta["set_name"]
-        owner_epoch = meta.get("owner_epoch")
-        self._batch_parallel.future_map.pop(sid, None)
-        self._batch_parallel.future_meta.pop(sid, None)
+        owner_epoch = meta.get("preview_owner_epoch")
+        if owner_epoch is None:
+            owner_epoch = meta.get("owner_epoch")
+        self._batch_parallel.discard_request(sid)
 
-        try:
-            payload = fut.result()
-        except Exception as exc:
+        expected_owner_epoch = meta.get("owner_epoch")
+        owner_epoch_mismatch = False
+        if expected_owner_epoch is not None:
+            try:
+                owner_epoch_mismatch = int(outcome.owner_epoch) != int(expected_owner_epoch)
+            except Exception:
+                owner_epoch_mismatch = True
+
+        if (
+            int(outcome.run_id) != int(run_id)
+            or int(outcome.request_id) != int(request_id)
+            or str(outcome.set_id or "") != sid
+            or owner_epoch_mismatch
+        ):
             self._record_nonfatal_exception(
-                f"Parallel batch future failed while retrieving result (set_id={sid}, source={str(source)})",
-                exc,
+                (
+                    "Rejected stale batch lane outcome "
+                    f"(expected run_id={int(run_id)} request_id={int(request_id)} set_id={sid} owner_epoch={expected_owner_epoch}; "
+                    f"got run_id={int(outcome.run_id)} request_id={int(outcome.request_id)} "
+                    f"set_id={str(outcome.set_id or '')} owner_epoch={int(outcome.owner_epoch)})"
+                ),
+                RuntimeError("stale batch lane outcome"),
             )
-            self._dispatch_simulation_error(
-                f"Simulation failed:\n\n{exc}",
-                run_id=run_id,
-                fast_mode=fast_mode,
-                request_id=request_id,
-                owner_epoch=owner_epoch,
-                batch_set=set_name,
-                batch_set_id=sid,
-                cache_key=cache_key,
+            stale_failure = build_simulation_failure(
+                "stale_batch_lane_outcome",
+                "Rejected stale batch lane outcome.",
+                details={
+                    "expected_run_id": int(run_id),
+                    "expected_request_id": int(request_id),
+                    "expected_set_id": sid,
+                    "expected_owner_epoch": expected_owner_epoch,
+                    "actual_run_id": int(outcome.run_id),
+                    "actual_request_id": int(outcome.request_id),
+                    "actual_set_id": str(outcome.set_id or ""),
+                    "actual_owner_epoch": int(outcome.owner_epoch),
+                },
             )
-            self._reset_parallel_batch_run_and_shutdown_executor()
-            return False
-
-        if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
             if self._try_handle_scoped_batch_failure(
                 set_id=sid,
                 set_name=set_name,
-                error_payload=payload["error"],
+                error_payload=stale_failure,
+            ):
+                return True
+            self._reset_parallel_batch_run_and_shutdown_lane_pool()
+            self._simulation_running = False
+            self._slider_simulation_active = False
+            self.ui.slider.set_slider_triggered_simulation(False)
+            self.ui.run_ui.set_run_button_enabled(True)
+            self.ui.run_ui.set_stop_button_enabled(False)
+            return False
+
+        payload = dict(outcome.payload or {}) if outcome.payload is not None else None
+        if (not bool(outcome.success)) or (
+            isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict)
+        ):
+            error_payload = (
+                dict(payload["error"])
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+                else dict(outcome.failure or {})
+            )
+            if self._try_handle_scoped_batch_failure(
+                set_id=sid,
+                set_name=set_name,
+                error_payload=error_payload,
             ):
                 return True
             self._dispatch_simulation_error(
-                payload["error"],
+                error_payload,
                 run_id=run_id,
                 fast_mode=fast_mode,
                 request_id=request_id,
@@ -2367,7 +3147,7 @@ class SimulationController(QtCore.QObject):
                 batch_set_id=sid,
                 cache_key=cache_key,
             )
-            self._reset_parallel_batch_run_and_shutdown_executor()
+            self._reset_parallel_batch_run_and_shutdown_lane_pool()
             return False
 
         if bool(getattr(self, "_debug_batch_parallel", False)):
@@ -2393,7 +3173,7 @@ class SimulationController(QtCore.QObject):
             )
         except Exception as exc:
             self._record_nonfatal_exception(
-                f"Unhandled exception while handling completed batch future (set_id={sid}, source={str(source)})",
+                f"Unhandled exception while handling completed batch lane outcome (set_id={sid}, source={str(source)})",
                 exc,
             )
             try:
@@ -2412,150 +3192,64 @@ class SimulationController(QtCore.QObject):
                     "Failed to surface simulation-complete handling failure to UI",
                     ui_exc,
                 )
-            self._reset_parallel_batch_run_and_shutdown_executor()
+            self._reset_parallel_batch_run_and_shutdown_lane_pool()
             return False
         return True
 
-    def _consume_superseded_parallel_batch_future(
-        self,
-        *,
-        owner_key: str,
-        fut: Any,
-    ) -> bool:
-        owner = str(owner_key or "")
-        meta = dict((self._batch_parallel.superseded_future_meta or {}).get(owner) or {})
-        self._batch_parallel.superseded_future_map.pop(owner, None)
-        self._batch_parallel.superseded_future_meta.pop(owner, None)
-
-        set_id = str(meta.get("set_id") or owner)
-        set_name = str(meta.get("set_name") or set_id)
-        try:
-            payload = fut.result()
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                f"Superseded parallel batch future failed after soft supersede (set_id={set_id}, set_name={set_name})",
-                exc,
-            )
-            logger.debug(
-                "Stale superseded future failed after active run moved on (set_id=%s, set_name=%s)",
-                set_id,
-                set_name,
-                exc_info=True,
-            )
-            return True
-
-        if isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict):
-            error_payload = coerce_simulation_failure(payload["error"])
-            error_text = simulation_failure_user_message(error_payload) or "Unknown superseded batch error"
-            self._record_nonfatal_exception(
-                f"Superseded parallel batch future returned error payload after soft supersede (set_id={set_id}, set_name={set_name})",
-                RuntimeError(error_text),
-            )
-        return True
-
-    def _stop_batch_future_poll_timer_if_idle(self) -> None:
+    def _stop_batch_completion_poll_timer_if_idle(self) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
         active_parallel = bool(isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"))
-        if active_parallel or bool(self._batch_parallel.future_map) or bool(self._batch_parallel.superseded_future_map):
+        if active_parallel or self._batch_parallel.has_active_requests():
             return
-        timer = getattr(self, "_batch_future_poll_timer", None)
+        timer = getattr(self, "_batch_completion_poll_timer", None)
         if timer is not None and timer.isActive():
             timer.stop()
 
-    def _poll_parallel_batch_futures(self) -> None:
-        ctx = getattr(self, "_batch_run_context", {}) or {}
-        active_parallel = bool(isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"))
-        has_superseded = bool(self._batch_parallel.superseded_future_map)
-        if not active_parallel and not has_superseded:
-            self._stop_batch_future_poll_timer_if_idle()
+    def _poll_parallel_batch_completions(self) -> None:
+        runtime_snapshot = self._batch_parallel.runtime_snapshot()
+        active_parallel = bool(runtime_snapshot.active)
+        if not active_parallel and not self._batch_parallel.has_active_requests():
+            if self._batch_parallel.is_pool_stale:
+                self._shutdown_batch_lane_pool(force_terminate=False)
+            self._stop_batch_completion_poll_timer_if_idle()
             return
 
-        run_id = int(ctx.get("run_id") or 0) if active_parallel else 0
-        request_id = int(ctx.get("request_id") or 0) if active_parallel else 0
-        fast_mode = bool(ctx.get("fast_mode")) if active_parallel else False
-        cache_key = str(ctx.get("cache_key") or "") if active_parallel else ""
-        processed_ids: Set[str] = set()
+        run_id = int(runtime_snapshot.run_id) if active_parallel else 0
+        request_id = int(runtime_snapshot.request_id) if active_parallel else 0
+        fast_mode = bool(runtime_snapshot.fast_mode) if active_parallel else False
+        cache_key = str(runtime_snapshot.cache_key or "") if active_parallel else ""
 
         try:
-            completion_queue = self._batch_parallel.completed_queue
-            while True:
-                try:
-                    sid_raw, completed_ts = completion_queue.get_nowait()
-                except Empty:
-                    break
-                except Exception as exc:
-                    logger.debug("Failed reading batch completion queue: %s", exc, exc_info=True)
-                    break
-                sid = str(sid_raw or "")
-                if not sid or sid in processed_ids:
-                    continue
-                fut = (self._batch_parallel.future_map or {}).get(sid) if active_parallel else None
-                if fut is None or not fut.done():
-                    continue
-                processed_ids.add(sid)
-                if not self._consume_parallel_batch_future(
+            for polled in self._batch_parallel.poll_completed_records():
+                sid = str(polled.set_id or "")
+                completion_record = polled.record
+                if not self._consume_parallel_batch_outcome(
                     set_id=sid,
-                    fut=fut,
+                    outcome=completion_record.outcome,
                     run_id=run_id,
                     request_id=request_id,
                     fast_mode=fast_mode,
                     cache_key=cache_key,
-                    source="callback",
-                    completed_ts=float(completed_ts),
+                    source=polled.source,
+                    completed_ts=float(polled.completed_ts),
+                    completion_record=completion_record,
                 ):
                     return
-                ctx = getattr(self, "_batch_run_context", {}) or {}
-                active_parallel = bool(isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"))
-                if not active_parallel:
-                    run_id = 0
-                    request_id = 0
-                    fast_mode = False
-                    cache_key = ""
 
-            if active_parallel:
-                for set_id, fut in list((self._batch_parallel.future_map or {}).items()):
-                    sid = str(set_id or "")
-                    if not sid or sid in processed_ids:
-                        continue
-                    if not fut.done():
-                        continue
-                    processed_ids.add(sid)
-                    if not self._consume_parallel_batch_future(
-                        set_id=sid,
-                        fut=fut,
-                        run_id=run_id,
-                        request_id=request_id,
-                        fast_mode=fast_mode,
-                        cache_key=cache_key,
-                        source="scan",
-                    ):
-                        return
-
-                    ctx = getattr(self, "_batch_run_context", {}) or {}
-                    active_parallel = bool(isinstance(ctx, dict) and ctx.get("active") and ctx.get("parallel"))
-                    if not active_parallel:
-                        break
-
-            for owner_key, fut in list((self._batch_parallel.superseded_future_map or {}).items()):
-                if not fut.done():
-                    continue
-                if not self._consume_superseded_parallel_batch_future(owner_key=str(owner_key), fut=fut):
-                    return
             if (
                 self._batch_parallel.is_pool_stale
-                and (not self._batch_parallel.future_map)
-                and (not self._batch_parallel.superseded_future_map)
+                and (not self._batch_parallel.has_active_requests())
             ):
-                self._shutdown_batch_executor(force_terminate=False)
+                self._shutdown_batch_lane_pool(force_terminate=False)
         except Exception as exc:
             # Architecture note (polling safety net):
             # This broad catch is a last-resort guard for the QTimer-driven poll
             # loop. If polling raises unexpectedly, letting the exception escape
-            # can leave the GUI in a silent "stuck" state with a live executor
+            # can leave the GUI in a silent "stuck" state with a live lane owner
             # and no further timer ticks. We log, surface an error to the UI when
-            # possible, and forcefully terminate the parallel executor to keep
+            # possible, and forcefully terminate the parallel lane owner to keep
             # the application recoverable.
-            self._record_nonfatal_exception("Unhandled exception while polling parallel batch futures", exc)
+            self._record_nonfatal_exception("Unhandled exception while polling parallel batch completions", exc)
             try:
                 self._on_simulation_error(
                     f"Simulation failed:\n\n{exc}",
@@ -2568,10 +3262,10 @@ class SimulationController(QtCore.QObject):
                 )
             except Exception as ui_exc:
                 self._record_nonfatal_exception("Failed to surface polling exception to UI", ui_exc)
-            self._shutdown_batch_executor(force_terminate=True)
+            self._shutdown_batch_lane_pool(force_terminate=True)
             return
 
-        self._stop_batch_future_poll_timer_if_idle()
+        self._stop_batch_completion_poll_timer_if_idle()
 
     # ------------------------------------------------------------------
     # Simulation request ids
@@ -2800,6 +3494,121 @@ class SimulationController(QtCore.QObject):
             )
         return str(request_mechanism_text)
 
+    def _slider_runtime_parameter_names(self, *, set_id: Optional[str]) -> list[str]:
+        names: set[str] = set()
+        try:
+            names.update(str(name) for name in self.ui.mechanism.slider_overrides(set_id=set_id).keys())
+        except Exception:
+            pass
+        try:
+            names.update(str(name) for name in self.ui.mechanism.variable_slider_values().keys())
+        except Exception:
+            pass
+        try:
+            names.update(str(name) for name in self.ui.mechanism.variable_metadata().keys())
+        except Exception:
+            pass
+        if not names:
+            names.update(self._slider_parameter_names_from_current_mechanism())
+        return sorted(name for name in names if name)
+
+    def _slider_parameter_names_from_current_mechanism(self) -> list[str]:
+        try:
+            from kindred.core.batch_initial_conditions import strip_named_reaction_dsl_initial_concentration_sets
+            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
+            from kindred.core.units import UnitsModel
+            from kindred.gui.parameter_enumeration import enumerate_step_parameters_for_gui
+
+            reactions_text = strip_named_reaction_dsl_initial_concentration_sets(
+                self.ui.mechanism.mechanism_reactions_text_raw()
+            )
+            state_network_dsl = self.ui.mechanism.mechanism_state_network_dsl_raw()
+            full_dsl = str(reactions_text or "")
+            if str(state_network_dsl or "").strip():
+                full_dsl += "\n\n# State Network\n" + str(state_network_dsl).strip("\n")
+            if not full_dsl.strip():
+                return []
+            try:
+                temperature_K = float(self.ui.solver.temperature_spinbox_value())
+            except Exception:
+                temperature_K = 298.15
+            units = UnitsModel(temperature_K=float(temperature_K))
+            mechanism = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
+            if isinstance(getattr(mechanism, "metadata", None), dict):
+                mechanism.metadata["wegscheider_cyclicity_enabled"] = bool(
+                    self.ui.solver.wegscheider_cyclicity_enabled()
+                )
+            apply_parameter_algebra_to_mechanism(full_dsl, mechanism=mechanism, require_mutable=False)
+            variables, _metadata = enumerate_step_parameters_for_gui(mechanism)
+            names = {str(name) for name in dict(variables or {}).keys() if str(name)}
+            scalar_params = (getattr(mechanism, "metadata", {}) or {}).get("scalar_params") or {}
+            if isinstance(scalar_params, Mapping):
+                names.update(str(name) for name in scalar_params.keys() if str(name))
+            return sorted(names)
+        except Exception:
+            return []
+
+    def _slider_execution_parameter_values(self, *, set_id: Optional[str]) -> Dict[str, float]:
+        values: Dict[str, float] = {}
+        try:
+            values.update(
+                {
+                    str(name): float(value)
+                    for name, value in self.ui.mechanism.variable_slider_values().items()
+                }
+            )
+        except Exception:
+            pass
+        try:
+            values.update(
+                {
+                    str(name): float(value)
+                    for name, value in self.ui.mechanism.slider_overrides(set_id=set_id).items()
+                }
+            )
+        except Exception:
+            pass
+        return {name: value for name, value in values.items() if str(name)}
+
+    def _preview_contained_owner_identity(
+        self,
+        *,
+        owner_mechanism_text: str,
+        solver_config: Mapping[str, Any],
+        t_end: float,
+        set_id: str,
+        parameter_names: Sequence[str],
+        simulation_identity: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return contained_simulation_owner_identity(
+            execution_mode="preview",
+            owner_mechanism_text=str(owner_mechanism_text or ""),
+            solver_config=solver_config,
+            t_end=float(t_end),
+            set_id=str(set_id or ""),
+            parameter_names=parameter_names,
+            simulation_identity=simulation_identity,
+        )
+
+    def _ordinary_contained_owner_identity(
+        self,
+        *,
+        owner_mechanism_text: str,
+        solver_config: Mapping[str, Any],
+        t_end: float,
+        set_id: str,
+        simulation_identity: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return contained_simulation_owner_identity(
+            execution_mode="explicit",
+            owner_mechanism_text=str(owner_mechanism_text or ""),
+            solver_config=solver_config,
+            t_end=float(t_end),
+            set_id=str(set_id or ""),
+            simulation_identity=simulation_identity,
+        )
+
     def _run_simulation_from_slider(self):
         replay = self._pending_slider_preview_launch
         if not self._has_deferred_preview_replay_launch_state(replay):
@@ -2844,7 +3653,7 @@ class SimulationController(QtCore.QObject):
         self._discarded_slider_preview_generation_id = None
         self.ui.slider.set_slider_triggered_simulation(True)
 
-        if (not self.ui.run_ui.run_button_is_enabled()) and (
+        if self._has_active_explicit_simulation() and (
             worker is None or not getattr(worker, "_fast_mode", False)
         ):
             logger.debug("Full simulation in progress; deferring slider update")
@@ -2912,6 +3721,29 @@ class SimulationController(QtCore.QObject):
             self.clear_pending_slider_preview_replay(clear_plot_updates=False)
             return
 
+        preview_snapshot = self._interactive_simulation_runtime_snapshot(fast_mode=True)
+        if bool(preview_snapshot.required) and not bool(preview_snapshot.ready):
+            self._run_simulation_internal(
+                fast_mode=True,
+                request_id=0,
+                batch_rows=selected_rows,
+                reuse_parallel_lane_pool=False,
+                runtime_readiness_only=True,
+                runtime_readiness_wait=False,
+            )
+            self.ui.slider.set_slider_triggered_simulation(False)
+            self.ui.run_ui.set_status_text(str(preview_snapshot.message or "Preparing preview runtime..."))
+            self.ui.run_ui.schedule_runtime_availability_refresh()
+            if bool(preview_snapshot.should_poll):
+                QtCore.QTimer.singleShot(50, self._run_simulation_from_slider)
+            else:
+                self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                with suppress(Exception):
+                    self.ui.slider.show_preview_unavailable_for_dirty_state(
+                        str(preview_snapshot.message or "Preview runtime is not ready.")
+                    )
+            return
+
         self._run_state.pending_slider_preview_launch = PendingSliderPreviewLaunchState()
 
         self._simulation_running = True
@@ -2927,7 +3759,7 @@ class SimulationController(QtCore.QObject):
             fast_mode=True,
             request_id=int(request_id),
             batch_rows=selected_rows,
-            reuse_parallel_executor=True,
+            reuse_parallel_lane_pool=True,
         )
 
     def _run_simulation(self):
@@ -2964,6 +3796,26 @@ class SimulationController(QtCore.QObject):
             self.ui.dialogs.message_box_warning("Invalid t_end", f"Fix t_end before running:\n\n{exc}")
             return
 
+        runtime_snapshot = self._selected_run_runtime_snapshot()
+        if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
+            self._ensure_selected_run_runtime_warming()
+            runtime_snapshot = self._selected_run_runtime_snapshot()
+            if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
+                self._queue_run_after_runtime_ready(
+                    rows_to_run=rows_to_run,
+                    runtime_snapshot=runtime_snapshot,
+                )
+                self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+                self.ui.run_ui.set_run_button_enabled(True)
+                self.ui.run_ui.set_stop_button_enabled(False)
+                self.ui.run_ui.set_status_text(
+                    str(runtime_snapshot.message or "Preparing simulation runtime...")
+                )
+                if bool(runtime_snapshot.should_poll):
+                    self.ui.run_ui.schedule_runtime_availability_refresh()
+                return
+
+        self._clear_pending_run_after_runtime_ready()
         reset_set_ids: list[str] = []
         for row in rows_to_run:
             try:
@@ -2990,7 +3842,7 @@ class SimulationController(QtCore.QObject):
             fast_mode=False,
             request_id=int(request_id),
             batch_rows=rows_to_run,
-            reuse_parallel_executor=bool(len(rows_to_run) > 1),
+            reuse_parallel_lane_pool=bool(len(rows_to_run) > 1),
         )
 
     # ------------------------------------------------------------------
@@ -3002,7 +3854,7 @@ class SimulationController(QtCore.QObject):
         if isinstance(ctx, dict) and ctx.get("active"):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
-        self._shutdown_batch_executor(force_terminate=True)
+        self._shutdown_batch_lane_pool(force_terminate=True)
         worker = getattr(self, "_simulation_worker", None)
         if worker is not None:
             try:
@@ -3032,26 +3884,68 @@ class SimulationController(QtCore.QObject):
         run_id = int(ctx.get("run_id") or 0)
         max_workers = max(1, int(ctx.get("effective_workers") or 1))
 
-        executor = self._batch_parallel.executor
-        if executor is None:
-            try:
-                executor = self._batch_parallel.ensure_executor(max_workers=int(max_workers))
-            except Exception as exc:
-                logger.warning("Parallel batch executor unavailable; falling back to serial path: %s", exc)
-                ctx["parallel"] = False
-                self._batch_run_context = dict(ctx)
-                self._start_next_batch_simulation()
-                return
-            if bool(getattr(self, "_debug_batch_parallel", False)):
-                logger.info("BATCH_PAR executor created workers=%s run_id=%s", int(max_workers), int(run_id))
-        elif bool(getattr(self, "_debug_batch_parallel", False)):
-            logger.info("BATCH_PAR executor reused workers=%s run_id=%s", int(max_workers), int(run_id))
+        prior_lane_pool_token = self._batch_parallel.lane_pool_token()
+        try:
+            existing_capacity = self._batch_parallel.current_max_workers
+            pool_already_warmed = bool(
+                self._batch_parallel.has_lane_pool()
+                and (not self._batch_parallel.is_pool_stale)
+                and existing_capacity is not None
+                and int(existing_capacity) >= int(max_workers)
+                and self._batch_parallel.has_ready_lane_pool(max_lanes=int(max_workers))
+            )
+            if pool_already_warmed:
+                lane_pool = self._batch_parallel.ensure_lane_pool(max_lanes=int(max_workers))
+            else:
+                lane_pool = self._batch_parallel.ensure_warm_lane_pool(
+                    max_lanes=int(max_workers),
+                    wait=False,
+                )
+                if not self._batch_parallel.has_ready_lane_pool(max_lanes=int(max_workers)):
+                    ctx["runtime_waiting"] = True
+                    self._batch_run_context = dict(ctx)
+                    self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+                    self.ui.run_ui.set_run_button_enabled(True)
+                    self.ui.run_ui.set_stop_button_enabled(True)
+                    self.ui.run_ui.set_sim_progress_value(0)
+                    self.ui.run_ui.set_status_text("Preparing batch runtime...")
+                    self.ui.run_ui.schedule_runtime_availability_refresh()
+                    QtCore.QTimer.singleShot(50, self._start_parallel_batch_simulations)
+                    return
+        except Exception as exc:
+            logger.warning("Parallel batch lane pool unavailable; falling back to serial path: %s", exc)
+            ctx["parallel"] = False
+            self._batch_run_context = dict(ctx)
+            self._start_next_batch_simulation()
+            return
+        if ctx.get("runtime_waiting"):
+            ctx.pop("runtime_waiting", None)
+            self._batch_run_context = dict(ctx)
+        if bool(getattr(self, "_debug_batch_parallel", False)):
+            lane_pool_token = None if lane_pool is None else int(id(lane_pool))
+            if prior_lane_pool_token is None:
+                action = "created"
+            elif prior_lane_pool_token == lane_pool_token:
+                action = "reused"
+            else:
+                action = "resized"
+            logger.info("BATCH_PAR lane pool %s workers=%s run_id=%s", action, int(max_workers), int(run_id))
 
-        timer = getattr(self, "_batch_future_poll_timer", None)
+        timer = getattr(self, "_batch_completion_poll_timer", None)
         if timer is not None and timer.isActive():
             timer.stop()
         self._clear_pending_slider_plot_updates()
-        self._batch_parallel.reset_active_run_state()
+        self._batch_parallel.begin_run(
+            run_id=int(run_id),
+            request_id=int(ctx.get("request_id") or 0),
+            fast_mode=bool(ctx.get("fast_mode")),
+            queue_ids=[str(item) for item in queue_ids],
+            queue_names=[str(item) for item in queue_names],
+            keep_lane_pool_alive=bool(ctx.get("keep_lane_pool_alive")),
+            preview_owner_epoch=ctx.get("preview_owner_epoch"),
+            active_timeout_s=float(ctx.get("active_timeout_s") or 60.0),
+            cache_key=str(ctx.get("cache_key") or ""),
+        )
 
         mechanism_text = str(ctx.get("full_dsl") or "")
         solver_config = dict(ctx.get("solver_config") or {})
@@ -3092,7 +3986,7 @@ class SimulationController(QtCore.QObject):
                     self._clear_failed_fast_preview_ownership()
                 ctx["active"] = False
                 self._batch_run_context = dict(ctx)
-                self._shutdown_batch_executor(force_terminate=True)
+                self._shutdown_batch_lane_pool(force_terminate=True)
                 self._simulation_running = False
                 self.ui.run_ui.set_run_button_enabled(True)
                 self.ui.run_ui.set_stop_button_enabled(False)
@@ -3185,31 +4079,50 @@ class SimulationController(QtCore.QObject):
                         if plan_identity:
                             simulation_identity_by_set_id[str(set_id)] = plan_identity
                 task["simulation_plan"] = dict(plan_payload)
-            fut = executor.submit(run_batch_simulation_task, task)
             sid = str(set_id)
-            self._batch_parallel.future_map[sid] = fut
-            self._batch_parallel.future_meta[sid] = {
-                "set_name": str(set_name),
-                "owner_epoch": ctx.get("preview_owner_epoch"),
-            }
             try:
-                fut.add_done_callback(lambda _fut, sid=sid: self._enqueue_parallel_batch_completion(sid))
+                self._batch_parallel.submit_task(
+                    task,
+                    set_id=sid,
+                    set_name=str(set_name),
+                )
             except Exception as exc:
                 self._record_nonfatal_exception(
-                    f"Failed to attach completion callback for batch future (set_id={sid})",
+                    f"Failed to submit batch lane request (set_id={sid})",
                     exc,
                 )
+                error_payload = simulation_failure_from_exception(exc, kind="simulation_containment_submission")
+                details = dict(error_payload.get("details") or {})
+                details.setdefault("source", "simulation_containment")
+                error_payload["details"] = details
+                if self._try_handle_scoped_batch_failure(
+                    set_id=sid,
+                    set_name=str(set_name),
+                    error_payload=error_payload,
+                ):
+                    continue
+                self._dispatch_simulation_error(
+                    error_payload,
+                    run_id=int(run_id),
+                    fast_mode=bool(ctx.get("fast_mode")),
+                    request_id=int(request_id),
+                    owner_epoch=ctx.get("preview_owner_epoch"),
+                    batch_set=str(set_name),
+                    batch_set_id=sid,
+                    cache_key=str(ctx.get("cache_key") or ""),
+                )
+                return
 
-        if not self._batch_parallel.future_map:
+        if not self._batch_parallel.has_active_requests():
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
-            self._shutdown_batch_executor(force_terminate=False)
+            self._shutdown_batch_lane_pool(force_terminate=False)
             self._simulation_running = False
             self.ui.run_ui.set_run_button_enabled(True)
             self.ui.run_ui.set_stop_button_enabled(False)
             return
 
-        total = len(self._batch_parallel.future_map)
+        total = self._batch_parallel.active_request_count()
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
                 "BATCH_PAR submitted run_id=%s sets=%s workers=%s",
@@ -3219,8 +4132,30 @@ class SimulationController(QtCore.QObject):
             )
         self.ui.run_ui.set_sim_progress_value(0)
         self.ui.run_ui.set_status_text(f"Running {total} sets in parallel ({max_workers} workers)...")
-        if hasattr(self, "_batch_future_poll_timer"):
-            self._batch_future_poll_timer.start()
+        if hasattr(self, "_batch_completion_poll_timer"):
+            self._batch_completion_poll_timer.start()
+
+    def _abort_for_unready_interactive_runtime(self, *, fast_mode: bool, context: Mapping[str, Any]) -> None:
+        ctx = dict(context or {})
+        ctx["active"] = False
+        self._batch_run_context = ctx
+        self._simulation_running = False
+        self._slider_simulation_active = False
+        self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+        self.ui.run_ui.set_run_button_enabled(True)
+        self.ui.run_ui.set_stop_button_enabled(False)
+        self.ui.run_ui.set_sim_progress_value(0)
+        if bool(fast_mode):
+            message = "Preview runtime is not ready."
+            self._clear_failed_fast_preview_ownership()
+            self.ui.slider.set_slider_triggered_simulation(False)
+            with suppress(Exception):
+                self.ui.slider.show_preview_unavailable_for_dirty_state(message)
+        else:
+            message = "Simulation runtime is not ready."
+            self._requeue_preserved_pending_slider_replay_after_preflight_abort()
+        self.ui.run_ui.set_status_text(message)
+        self.ui.run_ui.schedule_runtime_availability_refresh()
 
     def _start_next_batch_simulation(self) -> None:
         ctx = getattr(self, "_batch_run_context", {}) or {}
@@ -3454,10 +4389,37 @@ class SimulationController(QtCore.QObject):
                 from kindred.gui.simulation_worker import ContainedSimulationWorker
 
                 contained_plan_payload = build_contained_simulation_plan_payload(plan_payload)
-                contained_owner = self._contained_simulation_owner(
+                contained_owner = self._ready_contained_simulation_owner_for_plan(
                     fast_mode=bool(fast_mode),
                     simulation_plan_payload=contained_plan_payload,
                 )
+                if contained_owner is None:
+                    runtime_snapshot = self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode))
+                    if bool(runtime_snapshot.required) and not bool(runtime_snapshot.should_poll):
+                        self._abort_for_unready_interactive_runtime(
+                            fast_mode=bool(fast_mode),
+                            context=ctx,
+                        )
+                        return
+                    try:
+                        self._warm_contained_simulation_owner_for_plan(
+                            fast_mode=bool(fast_mode),
+                            simulation_plan_payload=contained_plan_payload,
+                            wait=False,
+                        )
+                    except Exception:
+                        self._abort_for_unready_interactive_runtime(
+                            fast_mode=bool(fast_mode),
+                            context=ctx,
+                        )
+                        return
+                    self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+                    self.ui.run_ui.set_status_text(
+                        "Preparing preview runtime..." if bool(fast_mode) else "Preparing simulation runtime..."
+                    )
+                    self.ui.run_ui.schedule_runtime_availability_refresh()
+                    QtCore.QTimer.singleShot(50, self._start_next_batch_simulation)
+                    return
                 self._simulation_worker = ContainedSimulationWorker(
                     owner=contained_owner,
                     simulation_plan_payload=contained_plan_payload,
@@ -3520,7 +4482,9 @@ class SimulationController(QtCore.QObject):
         *,
         request_id: Optional[int] = None,
         batch_rows: Optional[Sequence[int]] = None,
-        reuse_parallel_executor: bool = False,
+        reuse_parallel_lane_pool: bool = False,
+        runtime_readiness_only: bool = False,
+        runtime_readiness_wait: bool = False,
     ):
         if bool(fast_mode):
             active_fast_worker = False
@@ -3534,6 +4498,8 @@ class SimulationController(QtCore.QObject):
             ctx = getattr(self, "_batch_run_context", {}) or {}
             active_fast_parallel = bool(isinstance(ctx, dict) and ctx.get("active") and ctx.get("fast_mode"))
             if active_fast_worker or active_fast_parallel:
+                if bool(runtime_readiness_only):
+                    return
                 logger.debug("Fast slider run already in flight; recording latest-only pending request")
                 self._pending_slider_simulation = True
                 deferred_target_set_ids: list[str] = []
@@ -3556,7 +4522,9 @@ class SimulationController(QtCore.QObject):
             if bool(fast_mode):
                 self.ui.slider.set_slider_triggered_simulation(False)
 
-        if request_id is None:
+        if bool(runtime_readiness_only):
+            request_id = int(request_id or 0)
+        elif request_id is None:
             request_id = self._next_sim_request_id()
         else:
             request_id = self._mark_request_started(int(request_id))
@@ -3568,6 +4536,8 @@ class SimulationController(QtCore.QObject):
             if int(row_count) > 0:
                 batch_rows = [0]
             else:
+                if bool(runtime_readiness_only):
+                    return
                 self.ui.dialogs.message_box_warning("No Sets", "Add at least one set before running.")
                 if bool(fast_mode):
                     self._clear_failed_fast_preview_ownership()
@@ -3580,6 +4550,8 @@ class SimulationController(QtCore.QObject):
                 return
         invalid = self.ui.batch.batch_model_validate_rows(batch_rows)
         if invalid:
+            if bool(runtime_readiness_only):
+                return
             examples = sorted(invalid)[:8]
             details = "\n".join(f"  • row {r+1}: {sp}" for r, sp in examples)
             more = "" if len(invalid) <= len(examples) else f"\n  • ... and {len(invalid) - len(examples)} more"
@@ -3607,7 +4579,9 @@ class SimulationController(QtCore.QObject):
         primary = self.ui.batch.batch_preferred_primary_set_id(batch_rows)
         primary_set_id = str(primary) if primary is not None else None
 
-        reactions_text_raw = self.ui.mechanism.mechanism_reactions_text_raw()
+        owner_reactions_text_raw = self.ui.mechanism.mechanism_reactions_text_raw()
+        owner_state_network_dsl_raw = self.ui.mechanism.mechanism_state_network_dsl_raw()
+        reactions_text_raw = owner_reactions_text_raw
         if has_slider_overrides:
             reactions_text_raw = self.ui.mechanism.apply_overrides_to_text(
                 reactions_text_raw,
@@ -3630,7 +4604,12 @@ class SimulationController(QtCore.QObject):
             pending_init_rewrite = None
             migrated = reactions_text_raw
 
-        if (not bool(fast_mode)) and pending_init_seed and pending_init_rewrite:
+        if (
+            (not bool(fast_mode))
+            and pending_init_seed
+            and pending_init_rewrite
+            and not bool(runtime_readiness_only)
+        ):
             try:
                 pending_init_applied = bool(
                     self.ui.mechanism_helpers.apply_pending_init_migration(
@@ -3664,18 +4643,18 @@ class SimulationController(QtCore.QObject):
             if 0 <= int(r) < len(names)
         ]
         preview_owner_epoch = None
-        if bool(fast_mode):
+        if bool(fast_mode) and not bool(runtime_readiness_only):
             preview_ownership = self._claim_preview_ownership(
                 request_id=int(request_id),
                 target_set_ids=queue_ids,
             )
             preview_owner_epoch = int(preview_ownership.epoch)
-        else:
+        elif (not bool(fast_mode)) and (not bool(runtime_readiness_only)):
             self._clear_preview_ownership()
         reactions_text = strip_reaction_dsl_initial_concentrations(
             reactions_text_raw if pending_init_applied else migrated
         )
-        state_network_dsl = self.ui.mechanism.mechanism_state_network_dsl_raw()
+        state_network_dsl = owner_state_network_dsl_raw
         if has_slider_overrides:
             state_network_dsl = self.ui.mechanism.apply_overrides_to_state_network_dsl(
                 state_network_dsl,
@@ -3687,8 +4666,14 @@ class SimulationController(QtCore.QObject):
             full_dsl += "\n\n# State Network\n" + state_network_dsl
         if has_slider_overrides:
             full_dsl = self._apply_parameter_override_fallback_to_dsl(full_dsl, set_id=primary_set_id)
+        owner_reactions_text = strip_reaction_dsl_initial_concentrations(owner_reactions_text_raw)
+        owner_full_dsl = owner_reactions_text
+        if owner_state_network_dsl_raw.strip():
+            owner_full_dsl += "\n\n# State Network\n" + owner_state_network_dsl_raw
 
         if not full_dsl.strip():
+            if bool(runtime_readiness_only):
+                return
             self._invalidate_preserved_pending_init_results_after_failed_run(
                 pending_init_applied=bool(pending_init_applied)
             )
@@ -3719,7 +4704,7 @@ class SimulationController(QtCore.QObject):
         solver_label = str(solver_grid_context.get("solver_label") or "")
         solver = str(solver_grid_context.get("solver") or "")
         solver_warning = solver_grid_context.get("solver_warning")
-        if solver_warning:
+        if solver_warning and not bool(runtime_readiness_only):
             logger.warning("Solver normalization: %s (requested=%r)", solver_warning, solver_label)
             with suppress(Exception):
                 self.ui.run_ui.set_status_text(str(solver_warning))
@@ -3733,48 +4718,23 @@ class SimulationController(QtCore.QObject):
         prepared_payload: Optional[Dict[str, Any]] = None
         prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
         execution_prepared_payload_by_set_id: Dict[str, Dict[str, Any]] = {}
-        slider_runtime: Optional[BoundMechanism] = None
+        owner_parameter_names_by_set_id: Dict[str, list[str]] = {}
+        slider_runtime = None
         if bool(fast_mode):
             target_runtime_set_ids = list(queue_ids)
             if (not target_runtime_set_ids) and primary_set_id:
                 target_runtime_set_ids = [str(primary_set_id)]
-            for index, set_id in enumerate(target_runtime_set_ids):
-                candidate_runtime = self.ui.runtime.prepare_slider_runtime(set_id=str(set_id))
-                if candidate_runtime is None:
-                    continue
-                if slider_runtime is None:
-                    slider_runtime = candidate_runtime
-                try:
-                    if self.ui.runtime.apply_slider_overrides_to_bindings(candidate_runtime, set_id=str(set_id)):
-                        try:
-                            worker_payload = dict(candidate_runtime.as_worker_payload())
-                            prepared_payload_by_set_id[str(set_id)] = worker_payload
-                            if hasattr(candidate_runtime, "as_serializable_execution_payload"):
-                                execution_payload = dict(candidate_runtime.as_serializable_execution_payload())
-                            else:
-                                execution_payload = dict(worker_payload)
-                                execution_payload.pop("rhs", None)
-                                execution_payload["version"] = 2
-                            execution_prepared_payload_by_set_id[str(set_id)] = execution_payload
-                        except Exception:
-                            prepared_payload_by_set_id.pop(str(set_id), None)
-                            execution_prepared_payload_by_set_id.pop(str(set_id), None)
-                    else:
-                        prepared_payload_by_set_id.pop(str(set_id), None)
-                        execution_prepared_payload_by_set_id.pop(str(set_id), None)
-                finally:
-                    # Mark dirty between iterations so each set gets a fresh
-                    # runtime, and also after the final iteration so later
-                    # single-set interactions do not reuse the last set's
-                    # bindings.
-                    if len(target_runtime_set_ids) > 1:
-                        self.ui.runtime.set_slider_runtime_dirty(True)
+            for set_id in target_runtime_set_ids:
+                runtime_parameter_names = self._slider_runtime_parameter_names(set_id=str(set_id))
+                owner_parameter_names_by_set_id[str(set_id)] = list(runtime_parameter_names)
             if primary_set_id:
                 prepared_payload = prepared_payload_by_set_id.get(str(primary_set_id))
             if prepared_payload is None and prepared_payload_by_set_id:
                 prepared_payload = dict(next(iter(prepared_payload_by_set_id.values())))
 
-        if (not bool(fast_mode)) or (not list(self.ui.batch.batch_store_visible_species())):
+        if (not bool(runtime_readiness_only)) and (
+            (not bool(fast_mode)) or (not list(self.ui.batch.batch_store_visible_species()))
+        ):
             species_for_sync: List[str] = []
             if fast_mode and slider_runtime is not None:
                 species_for_sync = list(getattr(slider_runtime, "species_names", []) or [])
@@ -3823,6 +4783,8 @@ class SimulationController(QtCore.QObject):
         try:
             t_end = float(self.ui.solver.parse_sim_time_seconds())
         except ValueError as exc:
+            if bool(runtime_readiness_only):
+                return
             self._invalidate_preserved_pending_init_results_after_failed_run(
                 pending_init_applied=bool(pending_init_applied)
             )
@@ -3888,6 +4850,8 @@ class SimulationController(QtCore.QObject):
                             include_preview_initials=True,
                         )
                     except Exception as exc:
+                        if bool(runtime_readiness_only):
+                            return
                         self.ui.dialogs.message_box_warning(
                             "Invalid Initial Conditions",
                             f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
@@ -3909,6 +4873,7 @@ class SimulationController(QtCore.QObject):
                         solver_config=dict(solver_config),
                         mechanism_text=str(request_mechanism_text),
                         simulation_identity=identity.to_payload(),
+                        parameter_overrides=self._slider_execution_parameter_values(set_id=str(set_id)),
                     ).to_payload()
                     preview_token = preview_batch_cache_token_by_set_id.get(str(set_id), "")
                     cache_identity_payload: Dict[str, Any] = {
@@ -3945,6 +4910,55 @@ class SimulationController(QtCore.QObject):
                             )
                         ),
                     )
+                    try:
+                        initials_dict = self._resolved_initials_for_batch_row(
+                            row=row,
+                            set_name=set_name,
+                            pending_init_seed=pending_init_seed,
+                            pending_init_applied=False,
+                            include_preview_initials=True,
+                        )
+                    except Exception as exc:
+                        if bool(runtime_readiness_only):
+                            return
+                        self.ui.dialogs.message_box_warning(
+                            "Invalid Initial Conditions",
+                            f"Set '{set_name}' has invalid initial conditions:\n\n{exc}",
+                        )
+                        self._clear_failed_fast_preview_ownership()
+                        self._simulation_running = False
+                        self.ui.run_ui.set_run_button_enabled(True)
+                        self.ui.run_ui.set_stop_button_enabled(False)
+                        self._slider_simulation_active = False
+                        _clear_slider_triggered_preflight_state()
+                        return
+                    request_payload = SimulationExecutionRequest(
+                        prepared_payload=None,
+                        initials=dict(initials_dict),
+                        t_span=(0.0, float(t_end)),
+                        solver_config=dict(solver_config),
+                        mechanism_text=str(request_mechanism_text),
+                        simulation_identity=identity.to_payload(),
+                        parameter_overrides=self._slider_execution_parameter_values(set_id=str(set_id)),
+                    ).to_payload()
+                    preview_token = preview_batch_cache_token_by_set_id.get(str(set_id), "")
+                    cache_identity_payload: Dict[str, Any] = {
+                        "cache_key": "",
+                        "simulation_identity": identity.to_payload(),
+                    }
+                    if preview_token:
+                        cache_identity_payload["preview_batch_cache_token"] = str(preview_token)
+                    simulation_plan_by_set_id[str(set_id)] = _new_simulation_plan_payload(
+                        request_payload,
+                        execution_mode="preview",
+                        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                        cache_identity_payload=cache_identity_payload,
+                        metadata={
+                            "set_id": str(set_id),
+                            "set_name": set_name,
+                            "fast_mode": True,
+                        },
+                    )
                 continue
 
             try:
@@ -3956,6 +4970,8 @@ class SimulationController(QtCore.QObject):
                     include_preview_initials=False,
                 )
             except Exception as exc:
+                if bool(runtime_readiness_only):
+                    return
                 self._invalidate_preserved_pending_init_results_after_failed_run(
                     pending_init_applied=bool(pending_init_applied)
                 )
@@ -4005,11 +5021,12 @@ class SimulationController(QtCore.QObject):
             },
         )
         cache_key = self.ui.batch.batch_cache_key(scope_identity=scope_identity)
-        if bool(fast_mode):
-            self._batch_cache.active_preview_cache_key = cache_key
-        else:
-            self._batch_cache.active_cache_key = cache_key
-            self._batch_cache.active_cache_preview_token = None
+        if not bool(runtime_readiness_only):
+            if bool(fast_mode):
+                self._batch_cache.active_preview_cache_key = cache_key
+            else:
+                self._batch_cache.active_cache_key = cache_key
+                self._batch_cache.active_cache_preview_token = None
 
         set_name_by_set_id = {
             str(set_id): str(queue_names[index]) if index < len(queue_names) else str(set_id)
@@ -4026,6 +5043,31 @@ class SimulationController(QtCore.QObject):
             request_payload = _execution_request_payload_from_plan(plan_payload)
             if request_payload is None:
                 continue
+            metadata: Dict[str, Any] = {
+                "set_id": str(set_id),
+                "set_name": set_name_by_set_id.get(str(set_id), str(set_id)),
+                "fast_mode": bool(fast_mode),
+            }
+            if bool(fast_mode):
+                parameter_names = owner_parameter_names_by_set_id.get(str(set_id))
+                if parameter_names is None:
+                    parameter_names = self._slider_runtime_parameter_names(set_id=str(set_id))
+                metadata["contained_owner_identity"] = self._preview_contained_owner_identity(
+                    owner_mechanism_text=str(request_payload.get("mechanism_text") or owner_full_dsl),
+                    solver_config=solver_config,
+                    t_end=float(t_end),
+                    set_id=str(set_id),
+                    parameter_names=parameter_names,
+                    simulation_identity=simulation_identity_by_set_id.get(str(set_id)),
+                )
+            else:
+                metadata["contained_owner_identity"] = self._ordinary_contained_owner_identity(
+                    owner_mechanism_text=owner_full_dsl,
+                    solver_config=solver_config,
+                    t_end=float(t_end),
+                    set_id=str(set_id),
+                    simulation_identity=simulation_identity_by_set_id.get(str(set_id)),
+                )
             simulation_plan_by_set_id[str(set_id)] = _new_simulation_plan_payload(
                 request_payload,
                 execution_mode="preview" if bool(fast_mode) else "explicit",
@@ -4035,17 +5077,46 @@ class SimulationController(QtCore.QObject):
                     "scope_identity": scope_identity.to_payload(),
                     "queue_ids": [str(queue_id) for queue_id in queue_ids],
                 },
-                metadata={
-                    "set_id": str(set_id),
-                    "set_name": set_name_by_set_id.get(str(set_id), str(set_id)),
-                    "fast_mode": bool(fast_mode),
-                },
+                metadata=metadata,
             )
 
-        if bool(reuse_parallel_executor):
+        if bool(runtime_readiness_only):
+            from kindred.core.simulation_containment import build_contained_simulation_plan_payload
+
+            contained_payloads = [
+                build_contained_simulation_plan_payload(plan_payload)
+                for plan_payload in simulation_plan_by_set_id.values()
+                if isinstance(plan_payload, dict)
+            ]
+            if contained_payloads:
+                mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
+
+                def _owner_factory(payload: Mapping[str, object]):
+                    return self._new_contained_simulation_owner(
+                        fast_mode=bool(fast_mode),
+                        simulation_plan_payload=dict(payload),
+                    )
+
+                if len(contained_payloads) == 1:
+                    self._runtime_application.ensure_ready(
+                        mode=mode,
+                        payload=dict(contained_payloads[0]),
+                        owner_factory=_owner_factory,
+                        wait=bool(runtime_readiness_wait),
+                    )
+                else:
+                    self._runtime_application.ensure_ready_many(
+                        mode=mode,
+                        payloads=[dict(payload) for payload in contained_payloads],
+                        owner_factory=_owner_factory,
+                        wait=bool(runtime_readiness_wait),
+                    )
+            return
+
+        if bool(reuse_parallel_lane_pool):
             self._supersede_parallel_batch_run_soft()
         else:
-            self._shutdown_batch_executor(force_terminate=True)
+            self._shutdown_batch_lane_pool(force_terminate=True)
 
         self._release_current_simulation_worker()
 
@@ -4089,8 +5160,8 @@ class SimulationController(QtCore.QObject):
             "request_id": int(request_id),
             "run_id": run_id,
             "fast_mode": bool(fast_mode),
-            "reuse_parallel_executor": bool(reuse_parallel_executor),
-            "keep_executor_alive": bool(reuse_parallel_executor and parallel_mode),
+            "reuse_parallel_lane_pool": bool(reuse_parallel_lane_pool),
+            "keep_lane_pool_alive": bool(reuse_parallel_lane_pool and parallel_mode),
             "parallel": bool(parallel_mode),
             "effective_workers": int(effective_workers),
             "prepared": (
@@ -4163,25 +5234,6 @@ class SimulationController(QtCore.QObject):
             "preview_batch_cache_token_by_set_id": dict(preview_batch_cache_token_by_set_id),
         }
 
-        if not bool(parallel_mode):
-            warm_plan_payload: Optional[Dict[str, Any]] = None
-            if primary_set_id:
-                candidate = simulation_plan_by_set_id.get(str(primary_set_id))
-                if isinstance(candidate, dict):
-                    warm_plan_payload = dict(candidate)
-            if warm_plan_payload is None and simulation_plan_by_set_id:
-                warm_plan_payload = dict(next(iter(simulation_plan_by_set_id.values())))
-            if isinstance(warm_plan_payload, dict):
-                try:
-                    from kindred.core.simulation_containment import build_contained_simulation_plan_payload
-
-                    self._warm_contained_simulation_owner_for_plan(
-                        fast_mode=bool(fast_mode),
-                        simulation_plan_payload=build_contained_simulation_plan_payload(warm_plan_payload),
-                    )
-                except Exception as exc:
-                    self._record_nonfatal_exception("Failed to eager-warm contained simulation owner", exc)
-
         self._slider_simulation_active = bool(fast_mode)
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
@@ -4191,7 +5243,7 @@ class SimulationController(QtCore.QObject):
                 int(len(queue_ids)),
                 int(effective_workers),
                 bool(parallel_mode),
-                bool(reuse_parallel_executor),
+                bool(reuse_parallel_lane_pool),
             )
         if parallel_mode:
             self._start_parallel_batch_simulations()
@@ -4453,9 +5505,9 @@ class SimulationController(QtCore.QObject):
                 if stale_fast_decision.deactivate_context_immediately:
                     self._release_current_simulation_worker()
 
-                    keep_executor_alive = bool(isinstance(ctx, dict) and ctx.get("parallel") and ctx.get("keep_executor_alive"))
-                    self._cleanup_parallel_batch_executor_after_run(
-                        keep_executor_alive=keep_executor_alive,
+                    keep_lane_pool_alive = bool(isinstance(ctx, dict) and ctx.get("parallel") and ctx.get("keep_lane_pool_alive"))
+                    self._cleanup_parallel_batch_lane_pool_after_run(
+                        keep_lane_pool_alive=keep_lane_pool_alive,
                         clear_pending_plot_updates=True,
                     )
 
@@ -5137,13 +6189,13 @@ class SimulationController(QtCore.QObject):
             if batch_queue_done:
                 self._release_current_simulation_worker()
                 ctx_for_cleanup = locals().get("ctx", {}) or {}
-                keep_executor_alive = bool(
+                keep_lane_pool_alive = bool(
                     isinstance(ctx_for_cleanup, dict)
                     and ctx_for_cleanup.get("parallel")
-                    and ctx_for_cleanup.get("keep_executor_alive")
+                    and ctx_for_cleanup.get("keep_lane_pool_alive")
                 )
-                self._cleanup_parallel_batch_executor_after_run(
-                    keep_executor_alive=keep_executor_alive,
+                self._cleanup_parallel_batch_lane_pool_after_run(
+                    keep_lane_pool_alive=keep_lane_pool_alive,
                     stale_fast_handoff_after_display=stale_fast_handoff_after_display,
                 )
                 self.ui.slider.set_slider_triggered_simulation(False)
@@ -5229,7 +6281,7 @@ class SimulationController(QtCore.QObject):
             if stale_fast_decision.deactivate_context_immediately:
 
                 self._release_current_simulation_worker()
-                self._shutdown_batch_executor(force_terminate=False)
+                self._shutdown_batch_lane_pool(force_terminate=False)
                 self._clear_shutdown_request_after_close_cleanup()
 
                 self.ui.slider.set_slider_triggered_simulation(False)
@@ -5278,6 +6330,7 @@ class SimulationController(QtCore.QObject):
         )
         status_only_preview_failure = (
             preview_failure_kind == "timeout"
+            or preview_failure_kind.endswith("_timeout")
             or preview_failure_kind.startswith("simulation_containment")
             or preview_failure_source == "simulation_containment"
         )
@@ -5295,7 +6348,7 @@ class SimulationController(QtCore.QObject):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
         self._release_current_simulation_worker()
-        self._shutdown_batch_executor(force_terminate=True)
+        self._shutdown_batch_lane_pool(force_terminate=True)
         self._close_contained_simulation_owner(fast_mode=bool(fast_mode), kill=True)
         self._clear_shutdown_request_after_close_cleanup()
 
@@ -5359,7 +6412,7 @@ class SimulationController(QtCore.QObject):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
         self._release_current_simulation_worker()
-        self._shutdown_batch_executor(force_terminate=True)
+        self._shutdown_batch_lane_pool(force_terminate=True)
         self._close_contained_simulation_owner(fast_mode=True, kill=True)
         self._clear_shutdown_request_after_close_cleanup()
         self._clear_pending_preview_slider_plot_updates()
@@ -5403,7 +6456,7 @@ class SimulationController(QtCore.QObject):
         if isinstance(ctx, dict) and ctx.get("active"):
             ctx["active"] = False
             self._batch_run_context = dict(ctx)
-        self._shutdown_batch_executor(force_terminate=True)
+        self._shutdown_batch_lane_pool(force_terminate=True)
         active_fast = bool(isinstance(ctx, dict) and ctx.get("fast_mode"))
 
         if self._worker_is_running(self._simulation_worker):

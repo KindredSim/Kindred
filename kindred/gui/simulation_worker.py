@@ -20,7 +20,6 @@ from kindred.core.simulation_failure import (
     build_simulation_failure,
     simulation_failure_from_exception,
 )
-from kindred.core.simulation_containment import contained_payloads_equal
 from kindred.core.simulation_result_finalization import evaluate_simulation_result_algebra
 from kindred.core.simulation_result_payload import (
     build_secondary_simulation_success_payload,
@@ -500,13 +499,8 @@ class ContainedSimulationWorker(QtCore.QThread):
                 "include_mechanism_in_result_payload": bool(
                     self._include_mechanism_in_result_payload
                 ),
+                "simulation_plan_payload": dict(self._simulation_plan_payload),
             }
-            owner_plan_payload = getattr(owner, "simulation_plan_payload", None)
-            if not isinstance(owner_plan_payload, Mapping) or not contained_payloads_equal(
-                dict(owner_plan_payload),
-                self._simulation_plan_payload,
-            ):
-                request_payload["simulation_plan_payload"] = dict(self._simulation_plan_payload)
             result = owner.solve(
                 request_payload,
                 cancellation_check=self.is_cancelled,

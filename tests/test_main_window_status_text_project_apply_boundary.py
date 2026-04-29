@@ -6,11 +6,33 @@ import shiboken6
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
+from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 pytestmark = pytest.mark.gui
+
+
+def _runtime_snapshot(
+    *,
+    mode: str,
+    ready: bool,
+    status: str | None = None,
+    required: bool = True,
+) -> RuntimeReadinessSnapshot:
+    ready_value = bool(ready)
+    required_value = bool(required)
+    status_value = str(status or ("ready" if ready_value else "warming"))
+    return RuntimeReadinessSnapshot(
+        mode=str(mode),
+        status=status_value,
+        ready=ready_value,
+        generation=1,
+        required=required_value,
+        controls_ready=bool(ready_value or not required_value),
+        polling=bool(required_value and not ready_value and status_value != "failed"),
+    )
 
 
 def _load_project_via_file_dialog(main_window, tmp_path, monkeypatch, payload) -> None:
@@ -997,3 +1019,376 @@ def test_bootstrap_window_state_suppresses_preference_updates(main_window):
     finally:
         main_window.config_controller.update_user_preference = original
     assert len(calls) == 0, f"update_user_preference called during bootstrap: {calls}"
+
+
+def test_bootstrap_window_state_schedules_runtime_warm_without_blocking_hidden_startup(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+    batch_prewarm_calls: list[bool] = []
+    interactive_prewarm_calls: list[bool] = []
+
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_prewarm_calls.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_prewarm_calls.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+
+    main_window._bootstrap_window_state()
+
+    assert scheduled == []
+    assert interactive_prewarm_calls == [False]
+    assert batch_prewarm_calls == []
+
+
+def test_project_apply_schedules_runtime_warm_without_blocking_visible_load(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+    interactive_prewarm_calls: list[bool] = []
+    apply_calls: list[str] = []
+
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window,
+        "_apply_project_payload_inner",
+        lambda data, *, record_undo=True: apply_calls.append("apply"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_prewarm_calls.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: None,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+
+    main_window.show()
+    main_window._apply_project_payload({}, record_undo=False)
+
+    assert apply_calls == ["apply"]
+    assert scheduled == []
+    assert interactive_prewarm_calls == [False]
+
+
+def test_startup_runtime_availability_callback_ignores_close_started_window(main_window, monkeypatch):
+    calls: list[str] = []
+    main_window._simulation_runtime_availability_shutdown_started = True
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: calls.append("interactive"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: calls.append("batch"),
+    )
+
+    main_window._make_simulation_runtime_available_after_startup()
+
+    assert calls == []
+
+
+def test_runtime_availability_refresh_schedules_exact_runtimes_without_blocking(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+    interactive_waits: list[bool] = []
+    batch_waits: list[bool] = []
+
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_ready",
+        lambda *, fast_mode: True,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(False)
+    main_window._schedule_simulation_runtime_availability_refresh(wait=False)
+
+    assert scheduled == []
+    assert interactive_waits
+    assert all(wait is False for wait in interactive_waits)
+    assert batch_waits
+    assert all(wait is False for wait in batch_waits)
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+
+
+def test_runtime_readiness_does_not_override_non_runtime_run_disabled_state(main_window, monkeypatch):
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_ready",
+        lambda *, fast_mode: True,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+
+    main_window.set_run_button_enabled(False)
+    main_window._set_runtime_backed_run_controls_ready(True)
+
+    assert not main_window._run_btn.isEnabled()
+
+
+def test_runtime_readiness_poll_enables_run_before_preview_sliders(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+    readiness_by_mode = {False: True, True: False}
+
+    main_window._set_runtime_backed_controls_ready(False)
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=bool(readiness_by_mode[bool(fast_mode)]),
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert not main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert not main_window._mechanism_editor.species_sliders_widget().isEnabled()
+    assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
+
+    readiness_by_mode[True] = True
+    scheduled.clear()
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert main_window._mechanism_editor.species_sliders_widget().isEnabled()
+    assert scheduled == []
+
+
+def test_runtime_readiness_poll_enables_single_set_run_without_batch_runtime(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+    batch_ready = {"value": False}
+    interactive_waits: list[bool] = []
+    batch_waits: list[bool] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(False)
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: bool(batch_ready["value"]),
+    )
+
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert interactive_waits == []
+    assert batch_waits
+    assert all(wait is False for wait in batch_waits)
+    assert scheduled == []
+
+    scheduled.clear()
+    batch_ready["value"] = True
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert scheduled == []
+
+
+def test_show_event_keeps_single_set_run_ready_after_hidden_serial_warm_without_batch(main_window, monkeypatch, qtbot):
+    scheduled: list[tuple[int, object]] = []
+    interactive_waits: list[bool] = []
+    batch_waits: list[bool] = []
+    batch_ready = {"value": False}
+
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtimes_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: bool(batch_ready["value"]),
+    )
+
+    main_window._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
+
+    assert interactive_waits
+    assert all(wait is False for wait in interactive_waits)
+    assert batch_waits == []
+    assert main_window._run_btn.isEnabled()
+
+    main_window.show()
+    qtbot.waitUntil(lambda: main_window.isVisible(), timeout=1000)
+
+    assert batch_waits
+    assert all(wait is False for wait in batch_waits)
+    assert main_window._run_btn.isEnabled()
+    assert scheduled == []
+
+
+def test_multiset_selection_gates_run_until_visible_batch_runtime_ready(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+    batch_ready = {"value": False}
+    interactive_waits: list[bool] = []
+    batch_waits: list[bool] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_ready",
+        lambda *, fast_mode: True,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_uses_parallel_batch_runtime",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="batch", ready=bool(batch_ready["value"])),
+    )
+
+    main_window._on_batch_selection_changed()
+
+    assert not main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert interactive_waits
+    assert all(wait is False for wait in interactive_waits)
+    assert batch_waits
+    assert all(wait is False for wait in batch_waits)
+    assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
+
+    scheduled.clear()
+    batch_ready["value"] = True
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert scheduled == []
+
+    scheduled.clear()
+    batch_ready["value"] = True
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert scheduled == []

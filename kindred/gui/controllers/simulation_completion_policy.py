@@ -109,7 +109,7 @@ class CompletionPolicyContext:
     run_id: Optional[int]
     fast_mode: bool
     parallel: bool
-    keep_executor_alive: bool
+    keep_lane_pool_alive: bool
     queue_ids: tuple[str, ...] = ()
     queue_names: tuple[str, ...] = ()
     total: int = 0
@@ -134,7 +134,7 @@ class CompletionPolicyContext:
         object.__setattr__(self, "active", _normalize_bool(self.active))
         object.__setattr__(self, "fast_mode", _normalize_bool(self.fast_mode))
         object.__setattr__(self, "parallel", _normalize_bool(self.parallel))
-        object.__setattr__(self, "keep_executor_alive", _normalize_bool(self.keep_executor_alive))
+        object.__setattr__(self, "keep_lane_pool_alive", _normalize_bool(self.keep_lane_pool_alive))
         object.__setattr__(self, "queue_ids", _normalize_set_ids(self.queue_ids))
         object.__setattr__(self, "queue_names", _normalize_name_sequence(self.queue_names))
         object.__setattr__(self, "total", _normalize_nonnegative_int(self.total, default=0))

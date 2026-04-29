@@ -20,7 +20,7 @@ def _context(**overrides) -> CompletionPolicyContext:
         run_id=7,
         fast_mode=True,
         parallel=False,
-        keep_executor_alive=False,
+        keep_lane_pool_alive=False,
         queue_ids=("id1",),
         queue_names=("set1",),
         total=1,
@@ -209,7 +209,7 @@ def test_completion_policy_context_normalizes_infinite_and_string_inputs() -> No
         run_id=float("-inf"),
         fast_mode="false",
         parallel="false",
-        keep_executor_alive="false",
+        keep_lane_pool_alive="false",
         queue_ids="id1",
         queue_names="set1",
         total="bad-total",
@@ -231,7 +231,7 @@ def test_completion_policy_context_normalizes_infinite_and_string_inputs() -> No
     assert context.active is False
     assert context.fast_mode is False
     assert context.parallel is False
-    assert context.keep_executor_alive is False
+    assert context.keep_lane_pool_alive is False
     assert context.request_id is None
     assert context.run_id is None
     assert context.queue_ids == ("id1",)

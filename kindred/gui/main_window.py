@@ -24,6 +24,7 @@ from PySide6.QtCore import Qt, QSettings
 
 from kindred import __version__ as KINDRED_VERSION
 from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
@@ -237,6 +238,9 @@ class MainWindow(
         self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
+        self._simulation_runtime_run_ready = True
+        self._simulation_runtime_preview_ready = True
+        self._run_button_requested_enabled = True
 
         # Registry of actions that support customizable shortcuts.
         self._shortcut_actions: Dict[str, Dict[str, Any]] = {}
@@ -987,6 +991,7 @@ class MainWindow(
         # self._init_ribbon_host()
         self._init_mixin_ports()
         self._connect_signals()
+        self._simulation_runtime_availability_shutdown_started = False
 
     def _bootstrap_window_state(self) -> None:
         """Apply launch overrides and persisted startup state after composition prerequisites exist."""
@@ -997,6 +1002,129 @@ class MainWindow(
         finally:
             self._suppress_preference_updates = False
         self._update_temperature_mode_indicator()
+        self._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
+
+    def _schedule_simulation_runtime_availability_refresh(
+        self,
+        *,
+        wait: bool = False,
+        force_when_hidden: bool = False,
+    ) -> None:
+        if (not bool(force_when_hidden)) and not self.isVisible():
+            return
+        self._make_simulation_runtime_available_after_startup(wait=bool(wait))
+
+    def _make_simulation_runtime_available_after_startup(self, *, wait: bool = False) -> None:
+        if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
+            return
+        try:
+            self._sim_controller.ensure_interactive_simulation_runtimes_available(wait=bool(wait))
+            if self.isVisible():
+                self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=bool(wait))
+            self._poll_interactive_runtime_readiness_after_refresh()
+        except Exception as exc:
+            record_gui_best_effort_failure(
+                self,
+                "simulation_runtime_startup_availability",
+                message="Failed to make simulation runtime available after startup",
+                exc=exc,
+                log=logger,
+            )
+
+    @staticmethod
+    def _runtime_snapshot_controls_ready(snapshot: object) -> bool:
+        return bool(getattr(snapshot, "controls_ready", bool(getattr(snapshot, "ready", False))))
+
+    @staticmethod
+    def _runtime_snapshot_should_poll(snapshot: object) -> bool:
+        should_poll = getattr(snapshot, "should_poll", None)
+        if should_poll is not None:
+            return bool(should_poll)
+        return bool(getattr(snapshot, "required", True) and not getattr(snapshot, "ready", False))
+
+    def _apply_runtime_readiness_failure_status(self, *snapshots: object) -> None:
+        for snapshot in snapshots:
+            if str(getattr(snapshot, "status", "")) != "failed":
+                continue
+            message = str(
+                getattr(snapshot, "message", None)
+                or getattr(snapshot, "failure", None)
+                or "Simulation runtime failed to prepare."
+            )
+            if message:
+                self._status_label.setText(message)
+            return
+
+    def _set_runtime_backed_controls_ready(self, ready: bool) -> None:
+        self._set_runtime_backed_run_controls_ready(bool(ready))
+        self._set_runtime_backed_preview_controls_ready(bool(ready))
+
+    def _set_runtime_backed_run_controls_ready(self, ready: bool) -> None:
+        ready_value = bool(ready)
+        self._simulation_runtime_run_ready = ready_value
+        self.set_run_button_enabled(bool(getattr(self, "_run_button_requested_enabled", True)))
+
+    def _set_runtime_backed_preview_controls_ready(self, ready: bool) -> None:
+        ready_value = bool(ready)
+        self._simulation_runtime_preview_ready = ready_value
+        try:
+            editor = getattr(self, "_mechanism_editor", None)
+            sliders = getattr(editor, "_variable_sliders", None)
+            if sliders is not None:
+                sliders.setEnabled(ready_value)
+            species_sliders = None
+            if editor is not None and hasattr(editor, "species_sliders_widget"):
+                species_sliders = editor.species_sliders_widget()
+            if species_sliders is not None:
+                species_sliders.setEnabled(ready_value)
+        except Exception:
+            logger.debug("Failed to update slider readiness state", exc_info=True)
+
+    def _poll_interactive_runtime_readiness_after_refresh(self) -> None:
+        if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
+            return
+        try:
+            ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
+            preview_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=True)
+            run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
+            if any(
+                self._runtime_snapshot_should_poll(snapshot)
+                for snapshot in (ordinary_snapshot, preview_snapshot, run_snapshot)
+            ):
+                self._sim_controller.ensure_interactive_simulation_runtimes_available(wait=False)
+                if self.isVisible():
+                    self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
+                ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
+                preview_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=True)
+                run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
+            elif self.isVisible():
+                self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
+            self._set_runtime_backed_run_controls_ready(
+                self._runtime_snapshot_controls_ready(run_snapshot)
+            )
+            self._set_runtime_backed_preview_controls_ready(
+                self._runtime_snapshot_controls_ready(preview_snapshot)
+            )
+            self._apply_runtime_readiness_failure_status(
+                ordinary_snapshot,
+                preview_snapshot,
+                run_snapshot,
+            )
+            if not any(
+                self._runtime_snapshot_should_poll(snapshot)
+                for snapshot in (ordinary_snapshot, preview_snapshot, run_snapshot)
+            ):
+                return
+        except Exception as exc:
+            record_gui_best_effort_failure(
+                self,
+                "simulation_runtime_readiness_poll",
+                message="Failed to poll simulation runtime readiness",
+                exc=exc,
+                log=logger,
+            )
+            return
+        QtCore.QTimer.singleShot(50, self._poll_interactive_runtime_readiness_after_refresh)
 
     def _init_mixin_ports(self) -> None:
         data_manager = getattr(getattr(self, "_right_panel", None), "_data_manager", None)
@@ -1040,13 +1168,31 @@ class MainWindow(
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         try:
+            self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
+        except Exception:
+            logger.debug("Failed to invalidate interactive simulation runtimes after programmatic load", exc_info=True)
+        try:
             self._mechanism_editor._variable_sliders.clear()
         except Exception:
             logger.debug("Failed to clear variable sliders after programmatic mechanism load", exc_info=True)
             self._preview_session.clear_pending_slider_values()
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
+        try:
+            seed_sets, migrated = migrate_reaction_dsl_initial_concentration_sets(
+                self.mechanism_reactions_text_raw(),
+                default_set_name="set1",
+            )
+            if seed_sets and migrated:
+                self.apply_pending_init_migration(
+                    seed_sets=dict(seed_sets),
+                    rewrite=str(migrated),
+                )
+        except Exception:
+            logger.debug("Failed to migrate inline initial concentrations during programmatic load", exc_info=True)
+
         self._dispatch_authoritative_mechanism_consumers()
+        self._invalidate_active_results_after_authoritative_mechanism_change()
         self._refresh_slider_transaction_button_state()
 
         try:
@@ -1566,6 +1712,10 @@ class MainWindow(
     def _invalidate_slider_runtime(self):
         """Mark the cached slider runtime as stale."""
         self._variable_runtime.invalidate_slider_runtime()
+        try:
+            self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
+        except Exception:
+            logger.debug("Failed to invalidate interactive simulation runtimes", exc_info=True)
 
     @staticmethod
     def _normalized_mechanism_text_for_invalidation_guard(text: str) -> str:
@@ -1600,6 +1750,7 @@ class MainWindow(
             ):
                 return
         self._invalidate_slider_runtime()
+        self._schedule_simulation_runtime_availability_refresh()
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
         has_active_cache = bool(
             batch_cache is not None
@@ -2240,8 +2391,16 @@ class MainWindow(
                 old_text,
                 f"Load preset {preset_id}"
             )
-            self._undo_stack.push(command)
+            previous_authoritative_suppress = bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+            )
+            self._suppress_authoritative_mechanism_input_change = True
+            try:
+                self._undo_stack.push(command)
+            finally:
+                self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
             self._on_programmatic_mechanism_load()
+            self._schedule_simulation_runtime_availability_refresh(wait=False)
             self._status_label.setText(f"Loaded preset mechanism: {preset_id}")
             logger.info(f"Loaded preset mechanism: {preset_id}")
 
@@ -2287,8 +2446,16 @@ class MainWindow(
             old_text,
             "Load template"
         )
-        self._undo_stack.push(command)
+        previous_authoritative_suppress = bool(
+            getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+        )
+        self._suppress_authoritative_mechanism_input_change = True
+        try:
+            self._undo_stack.push(command)
+        finally:
+            self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
         self._on_programmatic_mechanism_load()
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
@@ -3727,6 +3894,7 @@ class MainWindow(
             self._apply_project_payload_inner(data, record_undo=record_undo)
         finally:
             self._suppress_preference_updates = False
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         from kindred.core.batch_initial_conditions import (
@@ -3922,13 +4090,23 @@ class MainWindow(
     def run_button_is_enabled(self) -> bool:
         return bool(self._run_btn.isEnabled())
 
+    def set_runtime_backed_run_controls_ready(self, ready: bool) -> None:
+        self._set_runtime_backed_run_controls_ready(bool(ready))
+
+    def schedule_runtime_availability_refresh(self) -> None:
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
+
     def set_run_button_enabled(self, enabled: bool) -> None:
-        self._run_btn.setEnabled(bool(enabled))
+        requested_enabled = bool(enabled)
+        self._run_button_requested_enabled = requested_enabled
+        runtime_ready = bool(getattr(self, "_simulation_runtime_run_ready", True))
+        effective_enabled = bool(requested_enabled and runtime_ready)
+        self._run_btn.setEnabled(effective_enabled)
         editor = getattr(self, "_mechanism_editor", None)
         if editor is not None:
             if hasattr(editor, "set_run_gated"):
-                editor.set_run_gated(not bool(enabled))
-            elif enabled:
+                editor.set_run_gated(not effective_enabled)
+            elif effective_enabled:
                 editor.run_btn.setEnabled(editor.is_mechanism_valid())
             else:
                 editor.run_btn.setEnabled(False)
@@ -5997,6 +6175,7 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _on_batch_model_data_changed(
         self,
@@ -6021,6 +6200,7 @@ class MainWindow(
         self._ensure_focused_batch_set_visible()
         self._refresh_slider_edit_targets_summary()
         self._refresh_batch_display_from_focus_and_shown()
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _on_batch_show_membership_changed(self) -> None:
         focused_set_id = self._focused_batch_set_id_value()
@@ -6040,6 +6220,7 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
             self._species_panel_available = False
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _refresh_slider_edit_targets_summary(self) -> None:
         editor = getattr(self, "_mechanism_editor", None)
@@ -8079,7 +8260,7 @@ class MainWindow(
             replay_intent = self._preview_session.capture_reset_slider_replay_intent()
             self._discard_slider_transaction_for_invalidation()
         else:
-            self._sim_controller.invalidate_slider_preview_work()
+            self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
             self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
             target_set_ids = self._effective_slider_edit_target_set_ids()
             self._preview_session.reset_mechanism_workspaces(target_set_ids)
@@ -9019,11 +9200,21 @@ class MainWindow(
         P3 ENHANCEMENT: Save user preferences before closing.
         """
         logger.info("Window close event - cleaning up")
+        self._simulation_runtime_availability_shutdown_started = True
 
         # P3 ENHANCEMENT: Save user preferences
         self._save_settings()
 
-        close_ready = self._sim_controller.prepare_simulation_shutdown_for_close()
+        prepared_close_ready = getattr(
+            self,
+            "_simulation_close_prepared_before_close_event",
+            None,
+        )
+        self._simulation_close_prepared_before_close_event = None
+        if prepared_close_ready is None:
+            close_ready = self._sim_controller.prepare_simulation_shutdown_for_close()
+        else:
+            close_ready = bool(prepared_close_ready)
         if not close_ready:
             logger.warning("Deferring close event while simulation worker shutdown is still in progress")
             event.ignore()
@@ -9037,6 +9228,35 @@ class MainWindow(
 
         logger.info("Cleanup complete, accepting close event")
         event.accept()
+
+    def close(self) -> bool:
+        if not self.isVisible():
+            self._simulation_runtime_availability_shutdown_started = True
+            try:
+                self._simulation_close_prepared_before_close_event = (
+                    self._sim_controller.prepare_simulation_shutdown_for_close()
+                )
+            except Exception:
+                self._simulation_close_prepared_before_close_event = None
+                logger.debug("Failed to prepare simulation shutdown for hidden close", exc_info=True)
+        return bool(super().close())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        serial_ready = False
+        try:
+            serial_ready = bool(self._sim_controller.interactive_simulation_runtimes_ready())
+        except Exception:
+            serial_ready = False
+            logger.debug("Failed to inspect runtime readiness during show event", exc_info=True)
+        if not serial_ready:
+            self._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
+            return
+        try:
+            self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
+        except Exception:
+            logger.debug("Failed to schedule visible batch runtime readiness during show event", exc_info=True)
+        self._poll_interactive_runtime_readiness_after_refresh()
 
     def _prepare_fit_window_shutdown_for_close(self) -> bool:
         tracked_windows = list(getattr(self, "_active_fit_windows", []) or [])

@@ -8,7 +8,6 @@ import pytest
 
 from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +38,7 @@ class _FakeRuntimeHost:
         self._best_effort_failures: list[tuple[str, str]] = []
         self._sim_controller = SimpleNamespace(
             run_state=SimpleNamespace(),
-            ensure_parallel_batch_pool_eagerly_created=lambda: None,
+            ensure_parallel_batch_pool_eagerly_created=lambda *, wait=False: None,
         )
         self._slider_runtime_dirty = False
         self._slider_overrides: Dict[str, float] = {}
@@ -178,40 +177,15 @@ def test_runtime_extract_and_parameter_refresh_use_public_main_window_boundary()
 
 
 @pytest.mark.unit
-def test_runtime_extract_eagerly_creates_parallel_pool_after_first_successful_parse() -> None:
-    factory_calls: list[tuple[int, bool]] = []
-
-    class _FakeExecutor:
-        def __init__(self, max_workers: int) -> None:
-            self._max_workers = int(max_workers)
-
-        def submit(self, _fn, *_args, **_kwargs):
-            return object()
-
-        def shutdown(self, *args, **kwargs):
-            _ = args, kwargs
-            return None
-
+def test_runtime_extract_does_not_warm_parallel_pool_during_variable_refresh() -> None:
     class _FakePoolController:
         def __init__(self) -> None:
-            self.parallel_batch = ParallelBatchExecutor(
-                executor_factory=self._factory,
-                max_parallel_workers=4,
-            )
-            self._pool_eagerly_created = False
             self.calls = 0
             self.run_state = SimpleNamespace()
 
-        def _factory(self, max_workers: int, limit_blas_threads: bool) -> _FakeExecutor:
-            factory_calls.append((int(max_workers), bool(limit_blas_threads)))
-            return _FakeExecutor(max_workers)
-
-        def ensure_parallel_batch_pool_eagerly_created(self) -> None:
+        def ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
+            _ = wait
             self.calls += 1
-            if self._pool_eagerly_created:
-                return
-            self.parallel_batch.ensure_executor(max_workers=self.parallel_batch.max_parallel_workers)
-            self._pool_eagerly_created = True
 
     host = _FakeRuntimeHost(reactions_text="reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0")
     host._sim_controller = _FakePoolController()
@@ -220,9 +194,36 @@ def test_runtime_extract_eagerly_creates_parallel_pool_after_first_successful_pa
     runtime.extract_and_populate_variables()
     runtime.extract_and_populate_variables()
 
-    assert host._sim_controller.parallel_batch.executor is not None
-    assert factory_calls == [(4, True)]
-    assert host._sim_controller.calls == 2
+    assert host._sim_controller.calls == 0
+
+
+@pytest.mark.unit
+def test_runtime_extract_does_not_prepare_slider_runtime_on_gui_thread(monkeypatch) -> None:
+    host = _FakeRuntimeHost(reactions_text="reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0")
+    runtime = MainWindowVariableRuntime(host)
+    calls: list[dict[str, object]] = []
+
+    def _fake_prepare_bound_mechanism(*, mechanism_text, param_names, temperature_K, initials, **kwargs):
+        calls.append(
+            {
+                "mechanism_text": str(mechanism_text),
+                "param_names": list(param_names),
+                "temperature_K": float(temperature_K),
+                "initials": dict(initials),
+                "kwargs": dict(kwargs),
+            }
+        )
+        return SimpleNamespace(param_names=list(param_names), bindings={})
+
+    monkeypatch.setattr(
+        "kindred.gui.main_window_variable_runtime.prepare_bound_mechanism",
+        _fake_prepare_bound_mechanism,
+    )
+
+    runtime.extract_and_populate_variables()
+
+    assert calls == []
+    assert runtime.slider_runtime_dirty() is True
 
 
 @pytest.mark.unit

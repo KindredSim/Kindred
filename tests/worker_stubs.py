@@ -197,6 +197,35 @@ def make_contained_simulation_worker_stub(
             self._t_end = float(self._t_span[-1]) if len(self._t_span) >= 1 else 0.0
             self._solver_config = dict(execution_request.get("solver_config") or {})
             self._prepared = execution_request.get("prepared_payload")
+            if self._prepared is None:
+                try:
+                    from kindred.core.simulation_preparation import (
+                        prepare_simulation_worker_run,
+                        prepared_simulation_run_for_execution_request,
+                    )
+
+                    cached_prepared = getattr(owner, "_prepared_run_cache", None)
+                    if cached_prepared is None:
+                        prepared_run = prepare_simulation_worker_run(execution_request=execution_request)
+                        try:
+                            setattr(owner, "_prepared_run_cache", prepared_run)
+                        except Exception:
+                            pass
+                    else:
+                        prepared_run = prepared_simulation_run_for_execution_request(
+                            cached_prepared,
+                            execution_request,
+                        )
+                    self._prepared = {
+                        "mechanism": prepared_run.mechanism,
+                        "rhs": prepared_run.rhs,
+                        "y0": prepared_run.y0,
+                        "species_names": list(prepared_run.species_names),
+                        "temperature_schedule": prepared_run.temperature_schedule,
+                        "jacobian_func": prepared_run.jacobian_func,
+                    }
+                except Exception:
+                    self._prepared = None
             self._include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
             if on_init is not None:
                 on_init(self)

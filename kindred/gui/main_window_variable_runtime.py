@@ -252,8 +252,6 @@ class MainWindowVariableRuntime:
                 logger.warning("Could not parse mechanism for variable extraction: %s", exc)
                 return
 
-            mw._sim_controller.ensure_parallel_batch_pool_eagerly_created()
-
             unit_map = solver_parameter_units_from_mechanism(mechanism)
 
             variables, metadata = enumerate_step_parameters_for_gui(mechanism)

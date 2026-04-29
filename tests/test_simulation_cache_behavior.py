@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from queue import Queue
 
 import numpy as np
 import pytest
 
+from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 
@@ -125,32 +127,85 @@ def _current_preview_time_axis(main_window) -> np.ndarray:
     return np.linspace(0.0, float(main_window.parse_sim_time_seconds()), max(2, points), dtype=float)
 
 @dataclass
-class _FakeExecutorSubmission:
+class _FakeLanePoolSubmission:
     fn: object
     args: tuple[object, ...]
     kwargs: dict[str, object]
-    future: Future
+    _result_queue: Queue[object] = field(default_factory=Queue)
+    completed: bool = False
 
-class _FakeExecutor:
+    def complete(self, payload: object) -> None:
+        if self.completed:
+            return
+        self.completed = True
+        self._result_queue.put(payload)
+
+    def cancel(self) -> None:
+        self.complete({"success": False, "error": {"kind": "cancelled"}})
+
+    def wait_result(self, *, timeout_s: float) -> object:
+        return self._result_queue.get(timeout=float(timeout_s))
+
+class _FakeLanePool:
     def __init__(self) -> None:
-        self.submissions: list[_FakeExecutorSubmission] = []
+        self.submissions: list[_FakeLanePoolSubmission] = []
+
+    def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+        _ = run_id, request_id, set_id, active_timeout_s
+        sub = _FakeLanePoolSubmission(fn=run_batch_simulation_task, args=(dict(task),), kwargs={})
+        self.submissions.append(sub)
+        payload = sub.wait_result(timeout_s=5.0)
+        return BatchLaneOutcome(
+            lane_id="fake-lane",
+            run_id=int(run_id),
+            request_id=int(request_id),
+            set_id=str(set_id),
+            owner_epoch=1,
+            success=not (isinstance(payload, dict) and payload.get("success") is False),
+            payload=payload if isinstance(payload, dict) else {"payload": payload},
+        )
 
     def submit(self, fn, *args, **kwargs):
-        fut: Future = Future()
-        self.submissions.append(_FakeExecutorSubmission(fn=fn, args=args, kwargs=dict(kwargs), future=fut))
-        return fut
+        sub = _FakeLanePoolSubmission(fn=fn, args=args, kwargs=dict(kwargs))
+        self.submissions.append(sub)
+        return sub
 
-    def shutdown(self, wait=True, cancel_futures=False):
+    def _close_requests(self, *, kill: bool = False):
+        for sub in self.submissions:
+            if not sub.completed:
+                if bool(kill):
+                    sub.cancel()
+                else:
+                    task = dict(sub.args[0] if sub.args else {})
+                    sid = str(task.get("set_id") or "")
+                    sub.complete({"success": True, "run_id": int(task.get("run_id") or 0), "set_id": sid})
         return None
 
-def _simulation_submissions(executor: _FakeExecutor) -> list[_FakeExecutorSubmission]:
-    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+    def close(self, *, kill: bool = False):
+        self._close_requests(kill=bool(kill))
 
-def _clear_eager_parallel_executor(main_window) -> None:
+def _simulation_submissions(lane_pool: _FakeLanePool) -> list[_FakeLanePoolSubmission]:
+    return [sub for sub in lane_pool.submissions if sub.fn is run_batch_simulation_task]
+
+
+def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_s: float = 1.0) -> None:
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if len(_simulation_submissions(lane_pool)) >= int(expected):
+            return
+        time.sleep(0.005)
+
+
+def _join_batch_request(main_window, task: dict[str, object]) -> None:
+    _ = task
+    main_window.simulation_controller.parallel_batch.join_active_requests(timeout_s=1.0)
+
+
+def _clear_eager_parallel_pool(main_window) -> None:
     controller = main_window.simulation_controller
-    if controller.parallel_batch.executor is not None:
-        controller.shutdown_batch_executor(force_terminate=True)
-    assert controller.parallel_batch.executor is None
+    if controller.parallel_batch.has_lane_pool():
+        controller.shutdown_batch_lane_pool(force_terminate=True)
+    assert not controller.parallel_batch.has_lane_pool()
 
 def _current_preview_identity_payload(
     main_window,
@@ -1801,7 +1856,7 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
-    _clear_eager_parallel_executor(main_window)
+    _clear_eager_parallel_pool(main_window)
     main_window._batch_model.set_species(["A"])
 
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1817,11 +1872,11 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
     _set_edit_target_rows(main_window, [0, 1])
     qt_app.processEvents()
 
-    fake = _FakeExecutor()
+    fake = _FakeLanePool()
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(
         main_window.simulation_controller.parallel_batch,
-        "executor_factory",
+        "lane_pool_factory",
         lambda max_workers, limit_blas_threads: fake,
         raising=True,
     )
@@ -1838,13 +1893,14 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
     main_window.simulation_controller.launch_pending_slider_preview_replay()
     qt_app.processEvents()
 
-    assert main_window.simulation_controller.parallel_batch.executor is fake
+    assert main_window.simulation_controller.parallel_batch.lane_pool_token() == id(fake)
+    _wait_for_submission_count(fake, 2)
     simulation_submissions = _simulation_submissions(fake)
     assert len(simulation_submissions) >= 2
 
     first_task = dict(simulation_submissions[0].args[0])
     assert str(first_task.get("set_id") or "") == primary_id
-    simulation_submissions[0].future.set_result(
+    simulation_submissions[0].complete(
         {
             "run_id": int(first_task.get("run_id") or 0),
             "set_id": str(first_task.get("set_id") or ""),
@@ -1861,8 +1917,9 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
             "base_species_count": 1,
         }
     )
+    _join_batch_request(main_window, first_task)
 
-    main_window.simulation_controller.poll_parallel_batch_futures()
+    main_window.simulation_controller.poll_parallel_batch_completions()
     qt_app.processEvents()
 
     assert str(main_window.mechanism_reactions_text_raw() or "") == baseline_text
@@ -1884,6 +1941,37 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
 
 
 @pytest.mark.gui
+def test_simulation_schema_id_tracks_canonical_edit_while_dirty_workspace_exists(
+    main_window, qt_app
+):
+    set_id = str(main_window._batch_set_id_for_row(0) or "set1")
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1\n"
+        "initial: A=1.0\n"
+        "initial: B=0.0\n"
+    )
+    qt_app.processEvents()
+    baseline_schema_id = str(main_window.simulation_schema_id() or "")
+
+    param_store = main_window._preview_session.param_store
+    param_store.sync_shared_params({"k1": 1.0})
+    assert param_store.stage_override(set_id, "k1", 2.0) is True
+    assert main_window._preview_session.has_local_mechanism_workspace(set_id) is True
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> C; k=1\n"
+        "initial: A=1.0\n"
+        "initial: C=0.0\n"
+    )
+    qt_app.processEvents()
+    changed_schema_id = str(main_window.simulation_schema_id() or "")
+
+    assert changed_schema_id
+    assert changed_schema_id != baseline_schema_id
+    assert main_window._preview_session.local_mechanism_workspace(set_id) == {"k1": pytest.approx(2.0)}
+
+
+@pytest.mark.gui
 def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     main_window, monkeypatch, qt_app
 ):
@@ -1893,7 +1981,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
-    _clear_eager_parallel_executor(main_window)
+    _clear_eager_parallel_pool(main_window)
     main_window._batch_model.set_species(["A"])
 
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1909,11 +1997,11 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     _set_edit_target_rows(main_window, [0, 1])
     qt_app.processEvents()
 
-    fake = _FakeExecutor()
+    fake = _FakeLanePool()
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(
         main_window.simulation_controller.parallel_batch,
-        "executor_factory",
+        "lane_pool_factory",
         lambda max_workers, limit_blas_threads: fake,
         raising=True,
     )
@@ -1928,7 +2016,8 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     main_window.simulation_controller.launch_pending_slider_preview_replay()
     qt_app.processEvents()
 
-    assert main_window.simulation_controller.parallel_batch.executor is fake
+    assert main_window.simulation_controller.parallel_batch.lane_pool_token() == id(fake)
+    _wait_for_submission_count(fake, 2)
     simulation_submissions = _simulation_submissions(fake)
     assert len(simulation_submissions) == 2
 
@@ -1938,16 +2027,27 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     qt_app.processEvents()
 
     simulation_submissions = _simulation_submissions(fake)
+    assert len(simulation_submissions) == 2
+    for stale_submission in simulation_submissions:
+        stale_task = dict(stale_submission.args[0])
+        stale_submission.complete(
+            {
+                "success": True,
+                "run_id": int(stale_task.get("run_id") or 0),
+                "set_id": str(stale_task.get("set_id") or ""),
+                "set_name": str(stale_task.get("set_name") or ""),
+            }
+        )
+    _wait_for_submission_count(fake, 4)
+    simulation_submissions = _simulation_submissions(fake)
     assert len(simulation_submissions) == 4
-    assert simulation_submissions[0].future.cancelled() is True
-    assert simulation_submissions[1].future.cancelled() is True
 
     first_generation_task = dict(simulation_submissions[0].args[0])
     replay_submission = next(
         sub for sub in simulation_submissions[2:] if str(sub.args[0].get("set_id") or "") == str(primary_id)
     )
     replay_task = dict(replay_submission.args[0])
-    replay_submission.future.set_result(
+    replay_submission.complete(
         {
             "run_id": int(replay_task.get("run_id") or 0),
             "set_id": str(replay_task.get("set_id") or ""),
@@ -1964,8 +2064,9 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
             "base_species_count": 1,
         }
     )
+    _join_batch_request(main_window, replay_task)
 
-    main_window.simulation_controller.poll_parallel_batch_futures()
+    main_window.simulation_controller.poll_parallel_batch_completions()
     qt_app.processEvents()
     qt_app.processEvents()
     coalescer_timer = main_window.simulation_controller.plot_coalescer.timer

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from queue import Queue
 from typing import Any, Dict, List
 
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
 from kindred.core.simulation_plan import SimulationPlan
 
@@ -18,26 +20,64 @@ class _Submission:
     fn: Any
     args: tuple[Any, ...]
     kwargs: Dict[str, Any]
-    future: Future
+    _result_queue: Queue[Any] = field(default_factory=Queue)
+    completed: bool = False
+
+    def complete(self, payload: Any) -> None:
+        if self.completed:
+            return
+        self.completed = True
+        self._result_queue.put(payload)
+
+    def cancel(self) -> None:
+        self.complete({"success": False, "error": {"kind": "cancelled"}})
+
+    def wait_result(self, *, timeout_s: float) -> Any:
+        return self._result_queue.get(timeout=float(timeout_s))
 
 
-class _FakeExecutor:
+class _FakeLanePool:
     def __init__(self) -> None:
         self.submissions: List[_Submission] = []
-        self.shutdown_calls: List[Dict[str, Any]] = []
+        self.close_calls: List[Dict[str, Any]] = []
+
+    def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+        _ = run_id, request_id, set_id, active_timeout_s
+        sub = _Submission(fn=run_batch_simulation_task, args=(dict(task),), kwargs={})
+        self.submissions.append(sub)
+        payload = sub.wait_result(timeout_s=5.0)
+        return BatchLaneOutcome(
+            lane_id="fake-lane",
+            run_id=int(run_id),
+            request_id=int(request_id),
+            set_id=str(set_id),
+            owner_epoch=1,
+            success=not (isinstance(payload, dict) and payload.get("success") is False),
+            payload=payload if isinstance(payload, dict) else {"payload": payload},
+        )
 
     def submit(self, fn, *args, **kwargs):
-        fut: Future = Future()
-        self.submissions.append(_Submission(fn=fn, args=args, kwargs=dict(kwargs), future=fut))
-        return fut
+        sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs))
+        self.submissions.append(sub)
+        return sub
 
-    def shutdown(self, wait=True, cancel_futures=False):
-        self.shutdown_calls.append(
+    def _close_requests(self, *, kill: bool = False):
+        self.close_calls.append(
             {
-                "wait": bool(wait),
-                "cancel_futures": bool(cancel_futures),
+                "kill": bool(kill),
             }
         )
+        for sub in self.submissions:
+            if not sub.completed:
+                if bool(kill):
+                    sub.cancel()
+                else:
+                    task = dict(sub.args[0] if sub.args else {})
+                    sid = str(task.get("set_id") or "")
+                    sub.complete({"success": True, "run_id": int(task.get("run_id") or 0), "set_id": sid})
+
+    def close(self, *, kill: bool = False):
+        self._close_requests(kill=bool(kill))
 
 
 def _select_rows(main_window, rows: list[int]) -> None:
@@ -78,15 +118,23 @@ def _queue_slider_run(main_window) -> None:
     main_window.simulation_controller.launch_pending_slider_preview_replay()
 
 
-def _simulation_submissions(executor: _FakeExecutor) -> list[_Submission]:
-    return [sub for sub in executor.submissions if sub.fn is run_batch_simulation_task]
+def _simulation_submissions(lane_pool: _FakeLanePool) -> list[_Submission]:
+    return [sub for sub in lane_pool.submissions if sub.fn is run_batch_simulation_task]
 
 
-def _clear_eager_parallel_executor(main_window) -> None:
+def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_s: float = 1.0) -> None:
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if len(_simulation_submissions(lane_pool)) >= int(expected):
+            return
+        time.sleep(0.005)
+
+
+def _clear_eager_parallel_pool(main_window) -> None:
     controller = main_window.simulation_controller
-    if controller.parallel_batch.executor is not None:
-        controller.shutdown_batch_executor(force_terminate=True)
-    assert controller.parallel_batch.executor is None
+    if controller.parallel_batch.has_lane_pool():
+        controller.shutdown_batch_lane_pool(force_terminate=True)
+    assert not controller.parallel_batch.has_lane_pool()
 
 
 def test_slider_updates_coalesce_to_one_timer_fire(main_window, monkeypatch):
@@ -114,35 +162,36 @@ def test_slider_parallel_path_submits_all_selected_sets(main_window, monkeypatch
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 
-    fake = _FakeExecutor()
+    fake = _FakeLanePool()
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(
         main_window.simulation_controller.parallel_batch,
-        "executor_factory",
+        "lane_pool_factory",
         lambda max_workers, limit_blas_threads: fake,
         raising=True,
     )
 
     _queue_slider_run(main_window)
 
+    _wait_for_submission_count(fake, len(names))
     assert len(_simulation_submissions(fake)) == len(names)
     assert bool(main_window.simulation_controller.batch_run_context.get("parallel")) is True
     assert int(main_window.simulation_controller.batch_run_context.get("effective_workers") or 0) > 1
-    main_window.simulation_controller.shutdown_batch_executor(force_terminate=True)
+    main_window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
 
 
 def test_slider_parallel_path_uses_per_set_local_mechanism_workspaces(main_window, monkeypatch):
     _prime_three_batch_sets(main_window)
     main_window._extract_and_populate_variables()
-    _clear_eager_parallel_executor(main_window)
+    _clear_eager_parallel_pool(main_window)
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 
-    fake = _FakeExecutor()
+    fake = _FakeLanePool()
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(
         main_window.simulation_controller.parallel_batch,
-        "executor_factory",
+        "lane_pool_factory",
         lambda max_workers, limit_blas_threads: fake,
         raising=True,
     )
@@ -156,7 +205,8 @@ def test_slider_parallel_path_uses_per_set_local_mechanism_workspaces(main_windo
 
     _queue_slider_run(main_window)
 
-    assert main_window.simulation_controller.parallel_batch.executor is fake
+    assert main_window.simulation_controller.parallel_batch.lane_pool_token() == id(fake)
+    _wait_for_submission_count(fake, 3)
     submitted_by_set_id = {str(sub.args[0]["set_id"]): dict(sub.args[0]) for sub in _simulation_submissions(fake)}
     assert len(submitted_by_set_id) == 3
     submitted_text_by_set_id = {
@@ -166,27 +216,27 @@ def test_slider_parallel_path_uses_per_set_local_mechanism_workspaces(main_windo
     assert "k=0.5" in submitted_text_by_set_id[set0_id]
     assert "k=0.75" in submitted_text_by_set_id[set1_id]
     assert "k=0.25" in submitted_text_by_set_id[set2_id]
-    main_window.simulation_controller.shutdown_batch_executor(force_terminate=True)
+    main_window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
 
 
-def test_slider_parallel_supersession_reuses_executor(main_window, monkeypatch):
+def test_slider_parallel_supersession_reuses_lane_pool(main_window, monkeypatch):
     _prime_three_batch_sets(main_window)
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 
-    executors: List[_FakeExecutor] = []
+    lane_pools: List[_FakeLanePool] = []
 
     def _factory(max_workers, limit_blas_threads):
-        fake = _FakeExecutor()
-        executors.append(fake)
+        fake = _FakeLanePool()
+        lane_pools.append(fake)
         return fake
 
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
-    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "executor_factory", _factory, raising=True)
+    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "lane_pool_factory", _factory, raising=True)
 
     _queue_slider_run(main_window)
     _queue_slider_run(main_window)
 
-    assert len(executors) == 1
-    assert not executors[0].shutdown_calls
-    main_window.simulation_controller.shutdown_batch_executor(force_terminate=True)
+    assert len(lane_pools) == 1
+    assert lane_pools[0].close_calls == []
+    main_window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)

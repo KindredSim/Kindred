@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -237,8 +238,409 @@ def test_contained_payload_identity_distinguishes_different_numpy_y0_without_rai
     assert contained_payloads_equal(payload, different) is False
 
 
-def test_contained_worker_omits_plan_from_request_when_owner_has_matching_startup_payload(qt_app):
+def test_preview_owner_identity_matches_when_only_parameter_value_changes(monkeypatch):
+    import kindred.core.simulation_containment as containment
+    from kindred.core.simulation_containment import (
+        _SimulationChildHandler,
+        build_contained_simulation_plan_payload,
+        contained_owner_payloads_match,
+        contained_payloads_equal,
+    )
+
+    mechanism_text = "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    bound = prepare_bound_mechanism(
+        mechanism_text,
+        ["k1"],
+        temperature_K=298.15,
+        initials={"A": 1.0, "B": 0.0},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+    owner_identity = {
+        "version": 1,
+        "execution_mode": "preview",
+        "schema_id": "schema",
+        "mechanism_text": mechanism_text,
+        "solver_config": {"solver": "BDF", "grid": {"N": 5}, "use_sparse_jacobian": False},
+        "t_end": 1.0,
+        "set_id": "id1",
+        "parameter_names": ["k1"],
+    }
+
+    def _plan(value: float, fingerprint: str) -> dict[str, Any]:
+        request = SimulationExecutionRequest(
+            prepared_payload=bound.as_serializable_execution_payload(),
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 1.0),
+            solver_config={"solver": "BDF", "grid": {"N": 5}, "use_sparse_jacobian": False},
+            mechanism_text=f"reaction: A -> B; k={float(value):g}\ninitial: A=1.0\ninitial: B=0.0",
+            simulation_identity={"schema_id": "schema", "param_fingerprint": str(fingerprint)},
+            parameter_overrides={"k1": float(value)},
+        )
+        plan = SimulationPlan.from_execution_request(
+            request,
+            execution_mode="preview",
+            algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+            metadata={"contained_owner_identity": dict(owner_identity)},
+        )
+        return build_contained_simulation_plan_payload(plan)
+
+    startup_payload = _plan(1.0, "value-1")
+    changed_payload = _plan(2.0, "value-2")
+    prepare_calls = 0
+    real_prepare = containment.prepare_simulation_worker_run
+
+    def _counting_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(containment, "prepare_simulation_worker_run", _counting_prepare)
+    handler = _SimulationChildHandler(startup_payload)
+
+    prepared_request = handler._prepare_request({"simulation_plan_payload": changed_payload})
+
+    assert contained_payloads_equal(startup_payload, changed_payload) is False
+    assert contained_owner_payloads_match(startup_payload, changed_payload) is True
+    assert prepare_calls == 1
+    assert prepared_request.plan.to_execution_request().parameter_overrides == {"k1": 2.0}
+
+
+def test_contained_owner_identity_distinguishes_mechanism_but_not_preview_parameter_value():
+    from kindred.core.simulation_containment import contained_owner_payloads_match
+    from kindred.core.simulation_identity import contained_simulation_owner_identity
+
+    solver_config = {"solver": "BDF", "grid": {"N": 5}, "use_sparse_jacobian": False}
+    first_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A -> B ; k=1.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+        simulation_identity={
+            "version": 1,
+            "schema_id": "schema-a",
+            "param_fingerprint": "value-1",
+            "solver": {
+                "solver": "BDF",
+                "rtol": 1e-6,
+                "atol": 1e-12,
+                "grid_n": 5,
+                "temperature_K": 298.15,
+                "use_sparse_jacobian": False,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            "t_end": 1.0,
+            "preview_batch_cache_token": "",
+            "execution_flags": ["fast_mode"],
+        },
+    )
+    changed_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A -> B ; k=2.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+        simulation_identity={
+            "version": 1,
+            "schema_id": "schema-a-after-value-materialization",
+            "param_fingerprint": "value-2",
+            "solver": {
+                "solver": "BDF",
+                "rtol": 1e-6,
+                "atol": 1e-12,
+                "grid_n": 5,
+                "temperature_K": 298.15,
+                "use_sparse_jacobian": False,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            "t_end": 1.0,
+            "preview_batch_cache_token": "",
+            "execution_flags": ["fast_mode"],
+        },
+    )
+    changed_mechanism_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A -> C ; k=1.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+        simulation_identity={
+            "version": 1,
+            "schema_id": "schema-b",
+            "param_fingerprint": "value-1",
+            "solver": {
+                "solver": "BDF",
+                "rtol": 1e-6,
+                "atol": 1e-12,
+                "grid_n": 5,
+                "temperature_K": 298.15,
+                "use_sparse_jacobian": False,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            "t_end": 1.0,
+            "preview_batch_cache_token": "",
+            "execution_flags": ["fast_mode"],
+        },
+    )
+
+    first_payload = {"metadata": {"contained_owner_identity": first_identity}}
+    changed_value_payload = {"metadata": {"contained_owner_identity": changed_value_identity}}
+    changed_mechanism_payload = {"metadata": {"contained_owner_identity": changed_mechanism_identity}}
+
+    assert contained_owner_payloads_match(first_payload, changed_value_payload) is True
+    assert contained_owner_payloads_match(first_payload, changed_mechanism_payload) is False
+
+
+def test_preview_owner_identity_includes_structural_semicolon_directives():
+    from kindred.core.simulation_containment import contained_owner_payloads_match
+    from kindred.core.simulation_identity import contained_simulation_owner_identity
+
+    solver_config = {"solver": "BDF", "grid": {"N": 5}, "use_sparse_jacobian": False}
+    base_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; A=1e12; Ea=50; fast",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    changed_directive_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; A=1e11; Ea=50; fast",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    changed_mutable_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; k=2.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    original_mutable_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; k=1.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    alias_canonicalized_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A -> B ; kf = 1.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    action_canonicalized_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A -> B ; k=2.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    keq_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; kf=1.0; Keq=3.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["kf1", "kr1", "Keq1"],
+    )
+    changed_keq_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; kf=1.0; Keq=8.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["kf1", "kr1", "Keq1"],
+    )
+    uppercase_rate_alias_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; KF=1.0; Kr=0.01",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["kf1", "kr1"],
+    )
+    changed_uppercase_rate_alias_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; KF=2.0; Kr=0.01",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["kf1", "kr1"],
+    )
+    structural_alias_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; a=1e12; ea=50",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["a", "ea", "k1"],
+    )
+    changed_structural_alias_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; a=1e11; ea=50",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["a", "ea", "k1"],
+    )
+    scalar_param_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; kf=1.0; kr=0.01\nparam a = 5\nparam kr1 = a*kf1",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["a", "kf1", "kr1"],
+    )
+    changed_scalar_param_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; kf=1.0; kr=0.01\nparam a = 6\nparam kr1 = a*kf1",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["a", "kf1", "kr1"],
+    )
+    changed_derived_param_expression_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="A <-> B ; kf=1.0; kr=0.01\nparam a = 5\nparam kr1 = 2*a*kf1",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["a", "kf1", "kr1"],
+    )
+
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": base_identity}},
+        {"metadata": {"contained_owner_identity": changed_directive_identity}},
+    ) is False
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": original_mutable_value_identity}},
+        {"metadata": {"contained_owner_identity": changed_mutable_value_identity}},
+    ) is True
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": alias_canonicalized_value_identity}},
+        {"metadata": {"contained_owner_identity": action_canonicalized_value_identity}},
+    ) is True
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": keq_value_identity}},
+        {"metadata": {"contained_owner_identity": changed_keq_value_identity}},
+    ) is True
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": uppercase_rate_alias_identity}},
+        {"metadata": {"contained_owner_identity": changed_uppercase_rate_alias_identity}},
+    ) is True
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": structural_alias_identity}},
+        {"metadata": {"contained_owner_identity": changed_structural_alias_identity}},
+    ) is False
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": scalar_param_identity}},
+        {"metadata": {"contained_owner_identity": changed_scalar_param_value_identity}},
+    ) is True
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": scalar_param_identity}},
+        {"metadata": {"contained_owner_identity": changed_derived_param_expression_identity}},
+    ) is False
+
+
+def test_prepare_only_request_updates_child_startup_payload_without_solving(monkeypatch):
+    import kindred.core.simulation_containment as containment
+    from kindred.core.simulation_containment import _SimulationChildHandler
+
+    first_payload = _normal_plan().to_payload()
+    second_payload = _energy_scheduled_plan().to_payload()
+    prepare_calls = 0
+    solve_calls = 0
+    real_prepare = containment.prepare_simulation_worker_run
+
+    def _counting_prepare(*args, **kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return real_prepare(*args, **kwargs)
+
+    def _counting_solve(*args, **kwargs):
+        nonlocal solve_calls
+        solve_calls += 1
+        raise AssertionError("prepare-only request must not solve")
+
+    monkeypatch.setattr(containment, "prepare_simulation_worker_run", _counting_prepare)
+    monkeypatch.setattr(containment, "solve_ode", _counting_solve)
+    handler = _SimulationChildHandler(first_payload)
+
+    result = handler.handle_request(
+        {"simulation_plan_payload": second_payload, "prepare_only": True},
+        SimpleNamespace(request_id=1),
+    )
+    prepared_again = handler._prepare_request({"simulation_plan_payload": second_payload})
+
+    assert result == {"success": True, "prepared": True}
+    assert prepare_calls == 2
+    assert solve_calls == 0
+    assert prepared_again.execution_request["mechanism_text"] == second_payload["execution_request"]["mechanism_text"]
+    assert prepare_calls == 2
+
+
+def test_warm_simulation_owner_reprepares_running_runtime_without_replacing_process_owner():
+    from kindred.core.simulation_containment import WarmSimulationOwner
+
+    first_payload = _normal_plan().to_payload()
+    second_payload = _energy_scheduled_plan().to_payload()
+
+    class _RuntimeOwner:
+        owner_epoch = 1
+        is_running = True
+        is_ready = True
+
+        def __init__(self) -> None:
+            self.solve_calls: list[dict[str, object]] = []
+
+        def solve(self, payload, *, active_timeout_s, cancellation_check=None):
+            self.solve_calls.append(
+                {
+                    "payload": dict(payload),
+                    "active_timeout_s": float(active_timeout_s),
+                    "cancelled": cancellation_check,
+                }
+            )
+            return {"success": True, "prepared": True}
+
+        def close(self, *, kill: bool = False) -> None:
+            raise AssertionError("prepare must not replace or close the runtime owner")
+
+    owner = WarmSimulationOwner(first_payload, active_timeout_s=12.0)
+    runtime_owner = _RuntimeOwner()
+    owner._runtime_owner = runtime_owner
+
+    owner.prepare_runtime_payload(second_payload, wait=True)
+
+    assert owner.simulation_plan_payload == second_payload
+    assert runtime_owner.solve_calls == [
+        {
+            "payload": {
+                "simulation_plan_payload": second_payload,
+                "prepare_only": True,
+            },
+            "active_timeout_s": 12.0,
+            "cancelled": None,
+        }
+    ]
+
+
+def test_contained_worker_sends_exact_plan_even_when_owner_has_matching_startup_payload(qt_app):
     from kindred.gui.simulation_worker import ContainedSimulationWorker
+    from kindred.core.simulation_containment import contained_payloads_equal
 
     _ = qt_app
     startup_payload = _normal_plan().to_payload()
@@ -273,7 +675,7 @@ def test_contained_worker_omits_plan_from_request_when_owner_has_matching_startu
 
     assert captured_results
     assert captured["cancelled_before_solve"] is False
-    assert "simulation_plan_payload" not in captured["payload"]
+    assert contained_payloads_equal(captured["payload"]["simulation_plan_payload"], startup_payload)
     assert captured["payload"]["include_mechanism_in_result_payload"] is False
 
 
@@ -311,8 +713,9 @@ def test_contained_worker_warm_owner_does_not_emit_cold_initializing_status(qt_a
     assert progress_messages[0] == "Running simulation..."
 
 
-def test_contained_worker_omits_plan_for_equivalent_copied_numpy_y0(qt_app):
+def test_contained_worker_sends_exact_plan_for_equivalent_copied_numpy_y0(qt_app):
     from kindred.gui.simulation_worker import ContainedSimulationWorker
+    from kindred.core.simulation_containment import contained_payloads_equal
 
     _ = qt_app
     startup_payload = _normal_plan().to_payload()
@@ -342,7 +745,70 @@ def test_contained_worker_omits_plan_for_equivalent_copied_numpy_y0(qt_app):
 
     assert captured_errors == []
     assert captured_results == [{"success": True}]
-    assert "simulation_plan_payload" not in captured["payload"]
+    assert "simulation_plan_payload" in captured["payload"]
+    assert contained_payloads_equal(captured["payload"]["simulation_plan_payload"], worker_payload)
+
+
+def test_contained_worker_sends_changed_preview_plan_when_owner_identity_matches(qt_app):
+    from kindred.core.simulation_containment import build_contained_simulation_plan_payload, contained_payloads_equal
+    from kindred.gui.simulation_worker import ContainedSimulationWorker
+
+    _ = qt_app
+    owner_identity = {
+        "version": 1,
+        "execution_mode": "preview",
+        "mechanism_text": "A -> B ; k=1.0",
+        "solver_config": {"solver": "BDF", "grid": {"N": 5}, "use_sparse_jacobian": False},
+        "t_end": 1.0,
+        "set_id": "id1",
+        "parameter_names": ["k1"],
+    }
+
+    def _plan(value: float) -> dict[str, Any]:
+        request = SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 1.0),
+            solver_config={"solver": "BDF", "grid": {"N": 5}, "use_sparse_jacobian": False},
+            mechanism_text=f"A -> B ; k={float(value):g}\ninitial: A=1.0\ninitial: B=0.0",
+            simulation_identity={"schema_id": "schema", "param_fingerprint": str(value)},
+            parameter_overrides={"k1": float(value)},
+        )
+        return build_contained_simulation_plan_payload(
+            SimulationPlan.from_execution_request(
+                request,
+                execution_mode="preview",
+                algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+                metadata={"contained_owner_identity": dict(owner_identity)},
+            )
+        )
+
+    startup_payload = _plan(1.0)
+    changed_payload = _plan(2.0)
+    captured: dict[str, Any] = {}
+
+    class _Owner:
+        @property
+        def simulation_plan_payload(self) -> dict[str, Any]:
+            return dict(changed_payload)
+
+        def solve(self, payload, *, cancellation_check):
+            captured["payload"] = dict(payload)
+            return {"success": True}
+
+    worker = ContainedSimulationWorker(
+        owner=_Owner(),
+        simulation_plan_payload=changed_payload,
+        include_mechanism_in_result_payload=False,
+    )
+
+    worker.run()
+
+    sent_payload = captured["payload"]["simulation_plan_payload"]
+    sent_request = SimulationPlan.from_payload(sent_payload).to_execution_request().to_payload()
+    assert sent_request["mechanism_text"].startswith("A -> B ; k=2")
+    assert sent_request["parameter_overrides"] == {"k1": 2.0}
+    assert not contained_payloads_equal(sent_payload, startup_payload)
 
 
 def test_contained_worker_includes_plan_for_different_copied_numpy_y0(qt_app):

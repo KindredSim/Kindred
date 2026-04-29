@@ -7,6 +7,33 @@ import pytest
 pytestmark = pytest.mark.gui
 
 
+def test_hidden_main_window_close_prepares_simulation_shutdown(qt_app, tmp_path, monkeypatch):
+    from kindred.gui.main_window import MainWindow
+
+    templates_dir = tmp_path / "templates"
+    monkeypatch.setattr(
+        "kindred.config.templates.TemplateManager._get_templates_directory",
+        lambda _self: templates_dir,
+    )
+    monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
+    main_window = MainWindow()
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "prepare_simulation_shutdown_for_close",
+        lambda: calls.append(True) or True,
+    )
+
+    try:
+        assert main_window.isVisible() is False
+        main_window.close()
+    finally:
+        main_window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
+        main_window.simulation_controller.release_current_simulation_worker()
+
+    assert calls == [True]
+
+
 
 class _StubbornSimulationWorker(QtCore.QObject):
     finished = QtCore.Signal()

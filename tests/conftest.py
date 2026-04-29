@@ -101,6 +101,7 @@ def _clear_test_qsettings() -> None:
 def _patch_main_window_test_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    request: pytest.FixtureRequest | None = None,
 ) -> None:
     from PySide6 import QtWidgets
     from kindred.gui.main_window import MainWindow
@@ -115,6 +116,73 @@ def _patch_main_window_test_environment(
         _fake_templates_dir,
     )
     monkeypatch.setattr(MainWindow, "_add_to_recent_files", lambda self, path: None)
+    real_runtime_readiness = bool(
+        request is not None
+        and request.node.get_closest_marker("real_runtime_readiness") is not None
+    )
+    if not real_runtime_readiness:
+        from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
+
+        class _ReadyTestRuntimeOwner:
+            is_ready = True
+            is_running = True
+            owner_epoch = 1
+
+            @property
+            def simulation_plan_payload(self):
+                return {}
+
+            def solve(self, *_args, **_kwargs):
+                return {}
+
+            def close(self, *, kill: bool = False) -> None:
+                _ = kill
+
+        ready_owner = _ReadyTestRuntimeOwner()
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController.ensure_interactive_simulation_runtimes_available",
+            lambda self, *, wait=False: None,
+        )
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController.interactive_simulation_runtime_ready",
+            lambda self, *, fast_mode: True,
+        )
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController.interactive_simulation_runtimes_ready",
+            lambda self: True,
+        )
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController._ready_contained_simulation_owner_for_plan",
+            lambda self, **_kwargs: ready_owner,
+        )
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController._interactive_simulation_runtime_snapshot",
+            lambda self, *, fast_mode: RuntimeReadinessSnapshot(
+                mode="preview" if bool(fast_mode) else "ordinary",
+                status="ready",
+                ready=True,
+                generation=1,
+                required=True,
+                controls_ready=True,
+                polling=False,
+            ),
+        )
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController._selected_run_runtime_snapshot",
+            lambda self: RuntimeReadinessSnapshot(
+                mode="ordinary",
+                status="ready",
+                ready=True,
+                generation=1,
+                required=True,
+                controls_ready=True,
+                polling=False,
+            ),
+        )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.SimulationController.ensure_parallel_batch_pool_eagerly_created",
+        lambda self, *, wait=False: None,
+    )
 
     def _quiet_dialog(*_args, **_kwargs):
         return QtWidgets.QMessageBox.StandardButton.Ok
@@ -131,9 +199,9 @@ def _cleanup_main_window(window) -> None:
     from PySide6 import QtCore, QtWidgets
 
     try:
-        window.simulation_controller.shutdown_batch_executor(force_terminate=True)
+        window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
     except Exception as exc:
-        logger.debug("Failed to shutdown batch executor during test cleanup: %s", exc, exc_info=True)
+        logger.debug("Failed to shutdown batch lane pool during test cleanup: %s", exc, exc_info=True)
     try:
         window.simulation_controller.release_current_simulation_worker()
     except Exception as exc:
@@ -228,7 +296,7 @@ def _cleanup_main_window(window) -> None:
     assert not extra_visible, f"Visible top-level widgets leaked: {extra_visible!r}"
 
 @pytest.fixture
-def main_window(qt_app, monkeypatch, tmp_path):
+def main_window(qt_app, monkeypatch, tmp_path, request):
     """
     Provide a MainWindow with dialogs routed to temporary locations.
 
@@ -239,8 +307,19 @@ def main_window(qt_app, monkeypatch, tmp_path):
 
     _ = qt_app
     _clear_test_qsettings()
-    _patch_main_window_test_environment(monkeypatch, tmp_path)
+    _patch_main_window_test_environment(monkeypatch, tmp_path, request=request)
     window = MainWindow()
+    # Generic GUI tests stub startup runtime warming; keep controls usable unless
+    # the test explicitly reinstates the real readiness path.
+    real_runtime_readiness = (
+        request is not None
+        and request.node.get_closest_marker("real_runtime_readiness") is not None
+    )
+    if not real_runtime_readiness:
+        try:
+            window._set_runtime_backed_controls_ready(True)
+        except Exception as exc:
+            logger.debug("Failed to mark stubbed test runtime ready: %s", exc, exc_info=True)
     try:
         yield window
     finally:

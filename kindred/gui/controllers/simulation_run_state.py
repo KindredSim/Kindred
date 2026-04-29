@@ -52,6 +52,18 @@ def _normalize_preview_owner_target_set_ids(values: Sequence[str] | object) -> t
     return tuple(sorted(_normalize_preview_target_set_ids(values)))
 
 
+def _normalize_pending_run_rows(values: Sequence[int] | object) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes)):
+        values = ()
+    normalized: list[int] = []
+    for value in values or ():
+        try:
+            normalized.append(int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return tuple(normalized)
+
+
 @dataclass(frozen=True, slots=True)
 class PreviewOwnershipState:
     request_id: Optional[int] = None
@@ -86,6 +98,24 @@ class PendingSliderPreviewLaunchState:
         object.__setattr__(self, "handoff_queued", _normalize_preview_bool(self.handoff_queued))
 
 
+@dataclass(frozen=True, slots=True)
+class PendingRunAfterRuntimeReadyState:
+    active: bool = False
+    rows: tuple[int, ...] = ()
+    target_set_ids: tuple[str, ...] = ()
+    intent_signature: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "active", _normalize_preview_bool(self.active))
+        object.__setattr__(self, "rows", _normalize_pending_run_rows(self.rows))
+        object.__setattr__(
+            self,
+            "target_set_ids",
+            _normalize_preview_target_set_ids(self.target_set_ids),
+        )
+        object.__setattr__(self, "intent_signature", str(self.intent_signature or ""))
+
+
 class SimulationRunState(QtCore.QObject):
     """Owns per-run worker, request-id, progress-throttle, and preview-ownership state."""
 
@@ -102,6 +132,7 @@ class SimulationRunState(QtCore.QObject):
         self.progress_flush_timer.timeout.connect(on_progress_timeout)
         self.slider_simulation_active = False
         self.pending_slider_preview_launch = PendingSliderPreviewLaunchState()
+        self.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState()
         self.run_sequence_id = 0
         self.active_run_id = 0
         self.sim_request_id = 0
