@@ -98,7 +98,7 @@ def _mutable_preview_assignment_token(
     if not name_s:
         return None
     if step_index is None:
-        if name_s in parameter_names and not _is_mechanism_parameter_name(name_s):
+        if name_s in parameter_names:
             return name_s
         return None
 

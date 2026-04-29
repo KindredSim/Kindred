@@ -52,6 +52,16 @@ def _join_active_batch_requests(controller: SimulationController) -> None:
     controller.parallel_batch.join_active_requests(timeout_s=2.0)
 
 
+def _install_ready_batch_lane_pool(
+    controller: SimulationController,
+    pool: object,
+    *,
+    max_lanes: int,
+) -> object:
+    controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: pool
+    return controller.parallel_batch.ensure_lane_pool(max_lanes=max(1, int(max_lanes)))
+
+
 def _lane_outcome(
     set_id: str,
     payload: dict[str, Any] | None = None,
@@ -311,7 +321,7 @@ def _install_recording_contained_worker(
     if controller is not None:
         monkeypatch.setattr(
             controller,
-            "_ready_contained_simulation_owner_for_plan",
+            "_acquire_ready_contained_simulation_owner_for_plan",
             lambda **_kwargs: "ready-contained-owner",
         )
 
@@ -5135,6 +5145,7 @@ def test_consume_parallel_batch_outcome_exception_tears_down_pool_and_next_paral
     assert controller._pool_eagerly_created is False
 
     controller.parallel_batch.lane_pool_factory = _factory
+    controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     controller._batch_run_context = {
         "active": True,
         "parallel": True,
@@ -5578,6 +5589,7 @@ def test_run_simulation_from_slider_uses_snapshotted_target_rows(
     mw._batch_rows_for_scope.return_value = [2]
     mw._batch_store.row_count.return_value = 3
     mw._batch_set_id_for_row.side_effect = ["id1", "id2", "id3"]
+    controller._effective_batch_worker_count = MagicMock(return_value=1)
 
     controller._run_simulation_from_slider()
 
@@ -5586,6 +5598,39 @@ def test_run_simulation_from_slider_uses_snapshotted_target_rows(
     assert kwargs["fast_mode"] is True
     assert kwargs["request_id"] == int(rid)
     assert kwargs["batch_rows"] == [0, 1]
+
+
+@pytest.mark.unit
+def test_slider_preview_runtime_snapshot_uses_batch_runtime_for_parallel_preview(controller: SimulationController):
+    from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
+
+    batch_snapshot = RuntimeReadinessSnapshot(
+        mode="batch",
+        status="warming",
+        ready=False,
+        generation=4,
+        required=True,
+        controls_ready=False,
+        polling=True,
+    )
+    serial_snapshot = RuntimeReadinessSnapshot(
+        mode="preview",
+        status="ready",
+        ready=True,
+        generation=5,
+        required=True,
+        controls_ready=True,
+        polling=False,
+    )
+    controller._interactive_runtime_rows = MagicMock(return_value=[0, 1])
+    controller._effective_batch_worker_count = MagicMock(return_value=2)
+    controller._parallel_batch_runtime_snapshot = MagicMock(return_value=batch_snapshot)
+    controller._interactive_simulation_runtime_snapshot = MagicMock(return_value=serial_snapshot)
+
+    assert controller.slider_preview_runtime_snapshot() is batch_snapshot
+    controller._parallel_batch_runtime_snapshot.assert_called_once()
+    controller._interactive_simulation_runtime_snapshot.assert_not_called()
+
 
 @pytest.mark.unit
 def test_run_simulation_from_slider_ignores_stale_mechanism_snapshot_for_species_preview(
@@ -5747,6 +5792,11 @@ def test_run_simulation_reuses_parallel_lane_pool_for_explicit_multi_set_runs(
     mw: _FakeMainWindow, controller: SimulationController
 ):
     mw._batch_rows_for_scope.return_value = [0, 1]
+    _install_ready_batch_lane_pool(
+        controller,
+        _RecordingLanePool([]),
+        max_lanes=2,
+    )
     controller.run_simulation_internal = MagicMock()
 
     controller.run_simulation()
@@ -5800,6 +5850,39 @@ def test_batch_eager_readiness_wait_false_returns_without_warming_on_caller_thre
         if call["thread_id"] == caller_thread_id
     ]
 
+
+@pytest.mark.unit
+def test_interactive_batch_runtime_capacity_uses_configured_lane_budget(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    class _BatchParallel:
+        max_parallel_workers = 16
+
+        def __init__(self) -> None:
+            self.ensure_calls: list[dict[str, object]] = []
+
+        def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool):
+            self.ensure_calls.append({"max_lanes": int(max_lanes), "wait": bool(wait)})
+            return object()
+
+        def has_ready_lane_pool(self, *, max_lanes: int) -> bool:
+            return False
+
+        def active_request_count(self) -> int:
+            return 0
+
+        def shutdown(self, **_kwargs) -> None:
+            return None
+
+    fake_parallel = _BatchParallel()
+    controller._batch_parallel = fake_parallel
+    controller.batch_runtime_lane_budget = 6
+
+    controller.ensure_parallel_batch_pool_eagerly_created(wait=True)
+
+    assert fake_parallel.ensure_calls == [{"max_lanes": 6, "wait": True}]
+
 @pytest.mark.unit
 def test_run_auto_locks_editor(mw: _FakeMainWindow, controller: SimulationController):
     mw._batch_rows_for_scope.return_value = [0]
@@ -5823,24 +5906,91 @@ def test_run_aborts_if_mechanism_invalid_while_unlocked(mw: _FakeMainWindow, con
     assert mw._status_label.text == "Cannot run: mechanism has errors. Fix and try again."
 
 @pytest.mark.unit
-def test_start_parallel_batch_simulations_falls_back_to_serial_when_lane_pool_factory_fails(
-    mw: _FakeMainWindow, controller: SimulationController
+def test_start_parallel_batch_simulations_reports_unready_when_lane_pool_is_missing(
+    mw: _FakeMainWindow, controller: SimulationController, monkeypatch
 ):
-    controller.parallel_batch.lane_pool_factory = MagicMock(side_effect=RuntimeError("no lane pool"))
+    def _raise_runtime_snapshot(_self):
+        raise RuntimeError("no lane pool")
+
+    monkeypatch.setattr(controller._batch_parallel.__class__, "runtime_snapshot", _raise_runtime_snapshot)
     controller._start_next_batch_simulation = MagicMock()
+    controller._queue_run_after_runtime_ready = MagicMock()
+    controller._simulation_running = True
+    mw._stop_btn.setEnabled(True)
     controller._batch_run_context = {
         "active": True,
         "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
+        "rows": [0, 1],
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
         "run_id": 1,
         "effective_workers": 2,
     }
 
     controller._start_parallel_batch_simulations()
-    assert controller._batch_run_context["parallel"] is False
-    controller._start_next_batch_simulation.assert_called_once()
+    assert controller._batch_run_context["parallel"] is True
+    assert controller._batch_run_context["active"] is False
+    assert controller._batch_run_context["runtime_waiting"] is True
+    assert controller._simulation_running is False
+    controller._start_next_batch_simulation.assert_not_called()
+    controller._queue_run_after_runtime_ready.assert_not_called()
+    assert mw._stop_btn.isEnabled() is False
+    assert mw._status_label.text == "Batch runtime readiness check failed: no lane pool"
+
+
+@pytest.mark.unit
+def test_start_parallel_batch_simulations_requeues_unready_slider_preview_as_preview(
+    mw: _FakeMainWindow, controller: SimulationController, monkeypatch
+):
+    scheduled: list[tuple[int, object]] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    controller._queue_run_after_runtime_ready = MagicMock()
+    controller._ensure_parallel_batch_pool_eagerly_created = MagicMock()
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "rows": [0, 1],
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "run_id": 1,
+        "request_id": 4,
+        "effective_workers": 2,
+        "fast_mode": True,
+    }
+
+    controller._start_parallel_batch_simulations()
+
+    controller._queue_run_after_runtime_ready.assert_not_called()
+    controller._ensure_parallel_batch_pool_eagerly_created.assert_called_once_with(wait=False)
+    pending = controller._pending_slider_preview_launch
+    assert pending.active is True
+    assert pending.request_id == 4
+    assert pending.target_set_ids == ("id1", "id2")
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
+    assert scheduled == [(50, controller._run_simulation_from_slider)]
+
+
+@pytest.mark.unit
+def test_run_simulation_queues_unready_parallel_batch_runtime_without_fake_running(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    mw._batch_rows_for_scope.return_value = [0, 1]
+    mw._batch_set_id_for_row.side_effect = lambda row: f"id{int(row) + 1}"
+    controller.parallel_batch.max_parallel_workers = 2
+    controller._ensure_parallel_batch_pool_eagerly_created = MagicMock()
+    controller.run_simulation_internal = MagicMock()
+
+    controller.run_simulation()
+
+    controller.run_simulation_internal.assert_not_called()
+    controller._ensure_parallel_batch_pool_eagerly_created.assert_called()
+    assert controller._pending_run_after_runtime_ready.active is True
+    assert controller._simulation_running is False
+    assert mw._stop_btn.isEnabled() is False
+    assert "runtime" in mw._status_label.text.lower()
 
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_maps_submit_failure_to_affected_set(
@@ -5851,7 +6001,7 @@ def test_start_parallel_batch_simulations_maps_submit_failure_to_affected_set(
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     submitted: list[dict[str, object]] = []
     lane_pool = _RecordingLanePool(submitted)
-    controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: lane_pool
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=2)
     original_submit_task = controller._batch_parallel.submit_task
 
     def _submit_task(_adapter, _task, *, set_id: str, set_name: str, **kwargs):
@@ -5905,6 +6055,7 @@ def test_start_parallel_batch_simulations_resizes_retained_pool_before_submit(
     controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: old_pool
     controller._batch_parallel.ensure_lane_pool(max_lanes=2)
     controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: new_pool
+    controller._batch_parallel.ensure_lane_pool(max_lanes=4)
     controller._batch_run_context = {
         "active": True,
         "parallel": True,
@@ -6074,7 +6225,7 @@ def test_serial_single_set_run_uses_contained_owner_lane(monkeypatch, mw: _FakeM
         setattr(controller, controller._contained_owner_attr(fast_mode=bool(fast_mode)), owner)
         return owner
 
-    monkeypatch.setattr(controller, "_ready_contained_simulation_owner_for_plan", _ready_owner)
+    monkeypatch.setattr(controller, "_acquire_ready_contained_simulation_owner_for_plan", _ready_owner)
     monkeypatch.setattr(
         "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
@@ -6795,6 +6946,7 @@ def test_first_serial_actions_reuse_startup_ready_exact_contained_owners(
             parent=None,
         ) -> None:
             self.owner = owner
+            self._owner = owner
             self.simulation_plan_payload = dict(simulation_plan_payload)
             self.include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
             self.parent = parent
@@ -6865,6 +7017,7 @@ def test_first_serial_actions_reuse_startup_ready_exact_contained_owners(
         reuse_parallel_lane_pool=False,
     )
     ordinary_worker = created_workers[-1]
+    controller._release_runtime_owner_from_worker(ordinary_worker)
     controller._simulation_worker = None
     mw._slider_overrides = {"k1": 2.0}
     mw._simulation_param_fingerprints = {"id1": "params-slider-2"}
@@ -6875,6 +7028,7 @@ def test_first_serial_actions_reuse_startup_ready_exact_contained_owners(
         reuse_parallel_lane_pool=True,
     )
     first_preview_worker = created_workers[-1]
+    controller._release_runtime_owner_from_worker(first_preview_worker)
     controller._simulation_worker = None
     mw._slider_overrides = {"k1": 3.0}
     mw._simulation_param_fingerprints = {"id1": "params-slider-3"}
@@ -8282,11 +8436,14 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
 
     mw._batch_initials_for_row.side_effect = [{"A": 1.0}, {"A": 2.0}]
     mw.preview_initials_for_row = MagicMock(side_effect=[{"A": 1.0}, {"A": 2.0}])
-    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=_RecordingLanePool(submitted))
+    pool = _RecordingLanePool(submitted)
+    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.shutdown(
         force_terminate=True,
         record_nonfatal_exception=lambda _message, _exc: None,
     )
+    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
+    controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     controller._batch_run_context = {
         "active": True,
         "parallel": True,
@@ -8800,11 +8957,14 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
 
     mw._batch_initials_for_row.return_value = {"A": 0.25}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
-    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=_RecordingLanePool(submitted))
+    pool = _RecordingLanePool(submitted)
+    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.shutdown(
         force_terminate=True,
         record_nonfatal_exception=lambda _message, _exc: None,
     )
+    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
+    controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     controller._batch_run_context = {
         "active": True,
         "parallel": True,
@@ -9293,10 +9453,9 @@ def test_start_parallel_batch_uses_prewarmed_lane_pool_without_blocking_warm(
 
 @pytest.mark.unit
 def test_start_parallel_batch_does_not_submit_until_lane_pool_is_ready(
-    mw: _FakeMainWindow, controller: SimulationController
+    mw: _FakeMainWindow, controller: SimulationController, monkeypatch
 ):
     mw._batch_initials_for_row.return_value = {"A": 1.0}
-    allow_ready = threading.Event()
 
     class _WarmLedgerLanePool:
         def __init__(self) -> None:
@@ -9307,7 +9466,6 @@ def test_start_parallel_batch_does_not_submit_until_lane_pool_is_ready(
         def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None:
             self.warm_calls.append({"max_lanes": int(max_lanes), "wait": bool(wait)})
             if bool(wait):
-                allow_ready.wait(timeout=1.0)
                 self.ready_lane_count = int(max_lanes)
 
         def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
@@ -9326,10 +9484,13 @@ def test_start_parallel_batch_does_not_submit_until_lane_pool_is_ready(
             _ = kill
 
     pool = _WarmLedgerLanePool()
+    mw._batch_rows_for_scope.return_value = [0, 1]
+    mw._batch_set_id_for_row.side_effect = lambda row: f"id{int(row) + 1}"
     controller.parallel_batch.max_parallel_workers = 2
     controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: pool
+    monkeypatch.setattr(controller, "_ensure_selected_run_runtime_warming", MagicMock())
 
-    controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
+    controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     assert controller.parallel_batch.has_ready_lane_pool(max_lanes=2) is False
 
     controller._batch_run_context = {
@@ -9355,20 +9516,18 @@ def test_start_parallel_batch_does_not_submit_until_lane_pool_is_ready(
     controller._start_parallel_batch_simulations()
     controller.parallel_batch.join_active_requests(timeout_s=1.0)
 
-    nonblocking_warm_calls = [call for call in pool.warm_calls if call == {"max_lanes": 2, "wait": False}]
-    assert len(nonblocking_warm_calls) >= 1
     assert pool.run_calls == []
     assert "runtime" in mw._status_label.text.lower()
     assert mw._run_button_requested_enabled is True
     assert mw.run_button_is_enabled() is False
-    assert mw._runtime_availability_refresh_requests >= 1
-    allow_ready.set()
-    if controller._pool_eager_creation_thread is not None:
-        controller._pool_eager_creation_thread.join(timeout=1.0)
-    mw.set_runtime_backed_run_controls_ready(
-        controller.parallel_batch.has_ready_lane_pool(max_lanes=2)
-    )
-    assert mw.run_button_is_enabled() is True
+    assert mw._runtime_availability_refresh_requests == 1
+    pool.ready_lane_count = 2
+    controller._run_simulation = MagicMock()
+
+    controller._retry_pending_run_after_runtime_ready()
+
+    assert controller._pending_run_after_runtime_ready.active is False
+    controller._run_simulation.assert_called_once()
 
 
 @pytest.mark.unit
@@ -9455,7 +9614,7 @@ def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_mi
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
 
     mw._batch_initials_for_row.side_effect = ValueError("bad initials")
-    controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: _NoSubmitLanePool()
+    _install_ready_batch_lane_pool(controller, _NoSubmitLanePool(), max_lanes=2)
     controller._shutdown_batch_lane_pool = MagicMock()
     controller._batch_run_context = {
         "active": True,
@@ -10885,8 +11044,10 @@ def test_start_parallel_batch_simulations_submits_simulation_plan_payload(
     submitted_tasks: list[dict[str, object]] = []
 
     mw._batch_initials_for_row.return_value = {"A": 1.0}
-    controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: _RecordingLanePool(
-        submitted_tasks
+    _install_ready_batch_lane_pool(
+        controller,
+        _RecordingLanePool(submitted_tasks),
+        max_lanes=2,
     )
     controller._batch_run_context = {
         "active": True,
@@ -10935,8 +11096,10 @@ def test_start_parallel_batch_simulations_fast_fallback_submits_preview_plan_wit
 
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 4.0})
-    controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: _RecordingLanePool(
-        submitted_tasks
+    _install_ready_batch_lane_pool(
+        controller,
+        _RecordingLanePool(submitted_tasks),
+        max_lanes=2,
     )
     controller._batch_run_context = {
         "active": True,
@@ -11013,8 +11176,10 @@ def test_start_parallel_batch_simulations_fast_existing_gui_plan_submits_batch_p
 
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 4.0})
-    controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: _RecordingLanePool(
-        submitted_tasks
+    _install_ready_batch_lane_pool(
+        controller,
+        _RecordingLanePool(submitted_tasks),
+        max_lanes=2,
     )
     controller._batch_run_context = {
         "active": True,
@@ -11126,7 +11291,7 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "ordinary-owner"
     monkeypatch.setattr(
         controller,
-        "_ready_contained_simulation_owner_for_plan",
+        "_acquire_ready_contained_simulation_owner_for_plan",
         lambda **_kwargs: "ordinary-owner",
     )
 
@@ -11204,7 +11369,7 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "preview-owner"
     monkeypatch.setattr(
         controller,
-        "_ready_contained_simulation_owner_for_plan",
+        "_acquire_ready_contained_simulation_owner_for_plan",
         lambda **_kwargs: "preview-owner",
     )
 
@@ -11387,11 +11552,14 @@ def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentrat
 
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
-    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=_RecordingLanePool(submitted))
+    pool = _RecordingLanePool(submitted)
+    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.shutdown(
         force_terminate=True,
         record_nonfatal_exception=lambda _message, _exc: None,
     )
+    controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
+    controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     controller._batch_run_context = {
         "active": True,
         "parallel": True,
@@ -11851,11 +12019,12 @@ def test_run_simulation_replays_selected_run_after_runtime_becomes_ready(
         controls_ready=True,
         polling=False,
     )
-    snapshots = [warming, warming, ready]
+    snapshots = [warming, ready]
 
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
     controller._selected_run_runtime_snapshot = MagicMock(side_effect=lambda: snapshots.pop(0) if snapshots else ready)
     controller._ensure_interactive_simulation_runtime_available_for_mode = MagicMock()
+    controller._ensure_selected_run_runtime_warming = MagicMock()
     controller._run_intent_signature_for_rows = MagicMock(return_value="intent-a")
     controller.run_simulation_internal = MagicMock()
 
@@ -11869,11 +12038,8 @@ def test_run_simulation_replays_selected_run_after_runtime_becomes_ready(
     controller._run_simulation()
 
     controller.run_simulation_internal.assert_not_called()
-    controller._ensure_interactive_simulation_runtime_available_for_mode.assert_called_once_with(
-        fast_mode=False,
-        wait=False,
-    )
-    assert mw._runtime_availability_refresh_requests == 1
+    controller._ensure_selected_run_runtime_warming.assert_called_once()
+    assert mw._runtime_availability_refresh_requests == 0
     assert mw._status_label.text == "Preparing simulation runtime..."
     assert mw.run_button_is_enabled() is False
     assert len(scheduled) == 1
@@ -11929,6 +12095,7 @@ def test_run_simulation_replays_selected_run_after_failed_runtime_restarts(
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
     controller._selected_run_runtime_snapshot = MagicMock(side_effect=lambda: snapshots.pop(0) if snapshots else ready)
     controller._ensure_interactive_simulation_runtime_available_for_mode = MagicMock()
+    controller._ensure_selected_run_runtime_warming = MagicMock()
     controller._run_intent_signature_for_rows = MagicMock(return_value="intent-a")
     controller.run_simulation_internal = MagicMock()
 
@@ -11942,24 +12109,14 @@ def test_run_simulation_replays_selected_run_after_failed_runtime_restarts(
     controller._run_simulation()
 
     controller.run_simulation_internal.assert_not_called()
-    controller._ensure_interactive_simulation_runtime_available_for_mode.assert_called_once_with(
-        fast_mode=False,
-        wait=False,
-    )
-    assert mw._runtime_availability_refresh_requests == 1
-    assert mw._status_label.text == "Preparing simulation runtime..."
-    assert len(scheduled) == 1
-
-    scheduled.pop(0)()
-
-    controller.run_simulation_internal.assert_called_once()
-    _, kwargs = controller.run_simulation_internal.call_args
-    assert kwargs["fast_mode"] is False
-    assert kwargs["batch_rows"] == [0]
-    assert kwargs["reuse_parallel_lane_pool"] is False
+    controller._ensure_selected_run_runtime_warming.assert_not_called()
+    assert mw._runtime_availability_refresh_requests == 0
+    assert mw._status_label.text == "Simulation runtime failed to start. boom"
+    assert scheduled == []
+    assert not controller._pending_run_after_runtime_ready.active
 
 
-def test_run_simulation_starts_when_runtime_becomes_ready_during_warm_request(
+def test_run_simulation_replays_when_runtime_becomes_ready_during_existing_poll(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
     from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
@@ -11989,6 +12146,7 @@ def test_run_simulation_starts_when_runtime_becomes_ready_during_warm_request(
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
     controller._selected_run_runtime_snapshot = MagicMock(side_effect=lambda: snapshots.pop(0) if snapshots else ready)
     controller._ensure_interactive_simulation_runtime_available_for_mode = MagicMock()
+    controller._ensure_selected_run_runtime_warming = MagicMock()
     controller._run_intent_signature_for_rows = MagicMock(return_value="intent-a")
     controller.run_simulation_internal = MagicMock()
 
@@ -12001,12 +12159,14 @@ def test_run_simulation_starts_when_runtime_becomes_ready_during_warm_request(
 
     controller._run_simulation()
 
-    controller._ensure_interactive_simulation_runtime_available_for_mode.assert_called_once_with(
-        fast_mode=False,
-        wait=False,
-    )
+    controller._ensure_selected_run_runtime_warming.assert_called_once()
+    controller.run_simulation_internal.assert_not_called()
+    assert len(scheduled) == 1
+    assert controller._pending_run_after_runtime_ready.active
+
+    scheduled.pop(0)()
+
     controller.run_simulation_internal.assert_called_once()
-    assert scheduled == []
     assert not controller._pending_run_after_runtime_ready.active
 
 
@@ -12057,7 +12217,7 @@ def test_pending_run_after_runtime_ready_cancels_when_run_intent_changes(
 
     controller.run_simulation_internal.assert_not_called()
     assert not controller._pending_run_after_runtime_ready.active
-    assert mw._status_label.text == "Ready."
+    assert mw._status_label.text == "Preparing simulation runtime..."
 
 
 def test_pending_run_after_runtime_ready_cancel_keeps_runtime_controls_gated(

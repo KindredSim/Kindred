@@ -6,6 +6,7 @@ from queue import Queue
 
 import numpy as np
 import pytest
+from PySide6 import QtCore
 
 from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
@@ -191,6 +192,7 @@ def _simulation_submissions(lane_pool: _FakeLanePool) -> list[_FakeLanePoolSubmi
 def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_s: float = 1.0) -> None:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
+        QtCore.QCoreApplication.processEvents()
         if len(_simulation_submissions(lane_pool)) >= int(expected):
             return
         time.sleep(0.005)

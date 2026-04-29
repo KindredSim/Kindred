@@ -37,6 +37,62 @@ def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
     return handle.center()
 
 
+def test_initial_condition_add_select_reselect_is_passive_runtime_work(
+    main_window,
+    qtbot,
+    qt_app,
+    monkeypatch,
+):
+    runtime_ensures: list[bool] = []
+    batch_warms: list[bool] = []
+    scheduled: list[tuple[int, object]] = []
+    recomputes: list[dict[str, object]] = []
+
+    main_window.show()
+    qtbot.waitUntil(lambda: main_window.isVisible(), timeout=1000)
+    qt_app.processEvents()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: runtime_ensures.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda **kwargs: recomputes.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+
+    main_window._set_runtime_backed_controls_ready(True)
+    runtime_ensures.clear()
+    batch_warms.clear()
+    scheduled.clear()
+    recomputes.clear()
+
+    main_window._add_batch_set()
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [1])
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    main_window._on_batch_current_changed()
+    main_window._on_batch_selection_changed()
+    main_window._on_slider_edit_targets_changed()
+
+    assert runtime_ensures == []
+    assert batch_warms == []
+    assert scheduled == []
+    assert recomputes == []
+
+
 class _RecordingOwner:
     def __init__(self, payload: dict[str, object], *, fast_mode: bool) -> None:
         self.payload = dict(payload)
@@ -102,6 +158,7 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
         ) -> None:
             super().__init__(parent)
             self.owner = owner
+            self._owner = owner
             self.simulation_plan_payload = dict(simulation_plan_payload)
             self.include_mechanism_in_result_payload = bool(include_mechanism_in_result_payload)
             self.running = False
@@ -221,10 +278,10 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
     ordinary_start_calls = list(ordinary_owner.start_calls)
     preview_start_calls = list(preview_owner.start_calls)
     ready_checks: list[dict[str, object]] = []
-    real_ready_owner = main_window.simulation_controller._ready_contained_simulation_owner_for_plan
+    real_acquire_owner = main_window.simulation_controller._acquire_ready_contained_simulation_owner_for_plan
 
     def _record_ready_check(**kwargs):
-        owner = real_ready_owner(**kwargs)
+        owner = real_acquire_owner(**kwargs)
         ready_checks.append(
             {
                 "fast_mode": bool(kwargs.get("fast_mode")),
@@ -236,7 +293,7 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
 
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "_ready_contained_simulation_owner_for_plan",
+        "_acquire_ready_contained_simulation_owner_for_plan",
         _record_ready_check,
     )
 

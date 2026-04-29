@@ -279,6 +279,15 @@ def build_settings_and_controllers(main_window: MainWindow) -> SettingsControlle
                 max(1, int(value)),
             ),
         ),
+        batch_runtime_lane_budget=lambda: int(main_window.simulation_controller.batch_runtime_lane_budget),
+        set_batch_runtime_lane_budget=lambda value: setattr(
+            main_window.simulation_controller,
+            "batch_runtime_lane_budget",
+            min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(value)),
+            ),
+        ),
         limit_blas_threads_per_worker=lambda: bool(
             main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker
         ),

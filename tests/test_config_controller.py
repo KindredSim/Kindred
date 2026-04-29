@@ -222,6 +222,7 @@ def test_save_then_load_settings_round_trip(main_window):
     main_window._use_sparse_jacobian = True
     main_window._wegscheider_cyclicity_enabled = True
     main_window.simulation_controller.parallel_batch.max_parallel_workers = 4
+    main_window.simulation_controller.batch_runtime_lane_budget = 3
     main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker = False
     # save_settings writes from _user_preferences, so update them too.
     cc.update_user_preference("temperature_K", 310.0)
@@ -233,6 +234,7 @@ def test_save_then_load_settings_round_trip(main_window):
     cc.update_user_preference("use_sparse_jacobian", True)
     cc.update_user_preference("wegscheider_cyclicity_enabled", True)
     cc.update_user_preference("max_parallel_batch_workers", 4)
+    cc.update_user_preference("batch_runtime_lane_budget", 3)
     cc.update_user_preference("limit_blas_threads_per_worker", False)
 
     cc.save_settings()
@@ -245,6 +247,7 @@ def test_save_then_load_settings_round_trip(main_window):
     main_window._use_sparse_jacobian = False
     main_window._wegscheider_cyclicity_enabled = False
     main_window.simulation_controller.parallel_batch.max_parallel_workers = 1
+    main_window.simulation_controller.batch_runtime_lane_budget = 1
     main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker = True
 
     cc.load_settings()
@@ -257,6 +260,7 @@ def test_save_then_load_settings_round_trip(main_window):
     assert main_window._use_sparse_jacobian is True
     assert main_window._wegscheider_cyclicity_enabled is True
     assert main_window.simulation_controller.parallel_batch.max_parallel_workers == 4
+    assert main_window.simulation_controller.batch_runtime_lane_budget == 3
     assert main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker is False
 
 
@@ -266,9 +270,11 @@ def test_load_settings_clamps_parallel_batch_workers_to_shared_ceiling(main_wind
     settings = main_window._settings
     settings.clear()
     settings.setValue("simulation/max_parallel_batch_workers", 200)
+    settings.setValue("simulation/batch_runtime_lane_budget", 200)
     settings.sync()
 
     main_window.simulation_controller.parallel_batch.max_parallel_workers = 1
+    main_window.simulation_controller.batch_runtime_lane_budget = 1
 
     main_window.config_controller.load_settings()
 
@@ -278,6 +284,14 @@ def test_load_settings_clamps_parallel_batch_workers_to_shared_ceiling(main_wind
     )
     assert (
         main_window.config_controller.get_user_preference("max_parallel_batch_workers")
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+    assert (
+        main_window.simulation_controller.batch_runtime_lane_budget
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+    assert (
+        main_window.config_controller.get_user_preference("batch_runtime_lane_budget")
         == int(MAX_PARALLEL_WORKERS_CEILING)
     )
 
@@ -291,15 +305,25 @@ def test_programmatic_parallel_batch_worker_setter_clamps_to_shared_ceiling(main
         main_window.simulation_controller.parallel_batch.max_parallel_workers
         == int(MAX_PARALLEL_WORKERS_CEILING)
     )
+    main_window.config_controller._ui.set_batch_runtime_lane_budget(200)
+    assert (
+        main_window.simulation_controller.batch_runtime_lane_budget
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
 
 
 def test_update_user_preference_clamps_parallel_batch_workers_to_shared_ceiling(main_window):
     from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 
     main_window.config_controller.update_user_preference("max_parallel_batch_workers", 200)
+    main_window.config_controller.update_user_preference("batch_runtime_lane_budget", 200)
 
     assert (
         main_window.config_controller.get_user_preference("max_parallel_batch_workers")
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+    assert (
+        main_window.config_controller.get_user_preference("batch_runtime_lane_budget")
         == int(MAX_PARALLEL_WORKERS_CEILING)
     )
 
@@ -802,6 +826,7 @@ def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, cap
     settings = main_window._settings
     settings.clear()
     settings.setValue("simulation/max_parallel_batch_workers", "not-an-int")
+    settings.setValue("simulation/batch_runtime_lane_budget", "bad-lanes")
     settings.setValue("simulation/result_cache_cap", "bad-cap")
     settings.setValue("simulation/preview_cache_cap", "bad-preview")
     settings.sync()
@@ -816,9 +841,14 @@ def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, cap
         main_window.simulation_controller.parallel_batch.max_parallel_workers
         == PROJECT_DEFAULTS["max_parallel_batch_workers"]
     )
+    assert (
+        main_window.simulation_controller.batch_runtime_lane_budget
+        == PROJECT_DEFAULTS["batch_runtime_lane_budget"]
+    )
     assert int(main_window.simulation_controller.batch_cache.result_cache.max_entries()) == default_result_cap
     assert int(main_window.simulation_controller.batch_cache.preview_cache.max_entries()) == default_preview_cap
     assert "simulation/max_parallel_batch_workers='not-an-int'" in caplog.text
+    assert "simulation/batch_runtime_lane_budget='bad-lanes'" in caplog.text
     assert "simulation/result_cache_cap='bad-cap'" in caplog.text
     assert "simulation/preview_cache_cap='bad-preview'" in caplog.text
 

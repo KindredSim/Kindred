@@ -512,6 +512,22 @@ def test_preview_owner_identity_includes_structural_semicolon_directives():
         set_id="set-1",
         parameter_names=["a", "kf1", "kr1"],
     )
+    algebra_rate_param_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; k=k1\nparam k1 = 2.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
+    changed_algebra_rate_param_value_identity = contained_simulation_owner_identity(
+        execution_mode="preview",
+        owner_mechanism_text="reaction: A -> B; k=k1\nparam k1 = 3.0",
+        solver_config=solver_config,
+        t_end=1.0,
+        set_id="set-1",
+        parameter_names=["k1"],
+    )
     changed_derived_param_expression_identity = contained_simulation_owner_identity(
         execution_mode="preview",
         owner_mechanism_text="A <-> B ; kf=1.0; kr=0.01\nparam a = 5\nparam kr1 = 2*a*kf1",
@@ -548,6 +564,10 @@ def test_preview_owner_identity_includes_structural_semicolon_directives():
     assert contained_owner_payloads_match(
         {"metadata": {"contained_owner_identity": scalar_param_identity}},
         {"metadata": {"contained_owner_identity": changed_scalar_param_value_identity}},
+    ) is True
+    assert contained_owner_payloads_match(
+        {"metadata": {"contained_owner_identity": algebra_rate_param_identity}},
+        {"metadata": {"contained_owner_identity": changed_algebra_rate_param_value_identity}},
     ) is True
     assert contained_owner_payloads_match(
         {"metadata": {"contained_owner_identity": scalar_param_identity}},

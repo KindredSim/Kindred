@@ -27,9 +27,12 @@ class _RuntimeSlot:
     payload: dict[str, object]
     owner: object
     generation: int
+    mode_key: str
     status: str = "warming"
     failure: Optional[str] = None
     thread: Optional[threading.Thread] = None
+    active_count: int = 0
+    close_when_released: bool = False
 
 
 class SimulationRuntimeApplication:
@@ -39,6 +42,7 @@ class SimulationRuntimeApplication:
         self._lock = threading.RLock()
         self._slots: dict[str, _RuntimeSlot] = {}
         self._queue_slots: dict[str, list[_RuntimeSlot]] = {}
+        self._active_slots: dict[int, _RuntimeSlot] = {}
         self._generation = 0
 
     def request_warm(
@@ -63,9 +67,11 @@ class SimulationRuntimeApplication:
         if not payload_map:
             return None
         mode_key = self._mode_key(mode)
-        old_owner: Optional[object] = None
+        old_slot: Optional[_RuntimeSlot] = None
         stale_queue_slots: list[_RuntimeSlot] = []
         ready_owner: Optional[object] = None
+        thread: Optional[threading.Thread] = None
+        owner: Optional[object] = None
         with self._lock:
             queue_slots = self._queue_slots.pop(mode_key, [])
             if queue_slots:
@@ -74,12 +80,12 @@ class SimulationRuntimeApplication:
                     queue_slots.remove(queue_slot)
                     current_slot = self._slots.get(mode_key)
                     if current_slot is not None and current_slot.owner is not queue_slot.owner:
-                        old_owner = current_slot.owner
+                        old_slot = current_slot
                     self._slots[mode_key] = queue_slot
                 stale_queue_slots.extend(queue_slots)
             slot = self._slots.get(mode_key)
             if slot is not None and self._payloads_match(slot.payload, payload_map):
-                if self._owner_ready(slot.owner):
+                if self._slot_ready(slot):
                     slot.status = "ready"
                     slot.failure = None
                     ready_owner = slot.owner
@@ -87,12 +93,12 @@ class SimulationRuntimeApplication:
                     thread = slot.thread
                     owner = slot.owner
                     if thread is None or not thread.is_alive():
-                        old_owner = slot.owner
+                        old_slot = slot
                         del self._slots[mode_key]
                         thread = None
                         owner = None
                 elif slot.status == "failed":
-                    old_owner = slot.owner
+                    old_slot = slot
                     del self._slots[mode_key]
                     thread = None
                     owner = None
@@ -100,7 +106,13 @@ class SimulationRuntimeApplication:
                     thread = None
                     owner = slot.owner
             else:
-                if slot is not None:
+                active_match = self._active_matching_slot_locked(mode_key, payload_map)
+                if active_match is not None:
+                    active_match.close_when_released = False
+                    ready_owner = active_match.owner
+                    thread = active_match.thread
+                    owner = active_match.owner
+                elif slot is not None:
                     slot_thread = slot.thread
                     slot_warming = (
                         str(slot.status) == "warming"
@@ -108,18 +120,18 @@ class SimulationRuntimeApplication:
                         and slot_thread.is_alive()
                     )
                     if slot_warming:
-                        old_owner = slot.owner
+                        old_slot = slot
                     else:
-                        old_owner = slot.owner
+                        old_slot = slot
                     owner = None
                     del self._slots[mode_key]
                 else:
                     owner = None
-                thread = None
-        if old_owner is not None:
-            self._close_owner(old_owner, kill=False)
+                    thread = None
+        if old_slot is not None:
+            self._close_or_defer_retired_slot(old_slot, kill=False)
         for stale_slot in stale_queue_slots:
-            self._close_owner(stale_slot.owner, kill=False)
+            self._close_or_defer_retired_slot(stale_slot, kill=False)
         if ready_owner is not None:
             return ready_owner
         if owner is None:
@@ -132,6 +144,7 @@ class SimulationRuntimeApplication:
                     payload=dict(payload_map),
                     owner=owner,
                     generation=generation,
+                    mode_key=mode_key,
                     status="warming",
                 )
                 self._slots[mode_key] = slot
@@ -170,6 +183,12 @@ class SimulationRuntimeApplication:
             for payload_map in payload_maps:
                 slot = self._matching_slot(existing_slots, payload_map)
                 if slot is None:
+                    active_match = self._active_matching_slot_locked(mode_key, payload_map)
+                    if active_match is not None:
+                        active_match.close_when_released = False
+                        owners_and_threads.append((active_match.owner, active_match.thread))
+                        continue
+                if slot is None:
                     owner = owner_factory(payload_map)
                     self._generation += 1
                     generation = int(self._generation)
@@ -177,6 +196,7 @@ class SimulationRuntimeApplication:
                         payload=dict(payload_map),
                         owner=owner,
                         generation=generation,
+                        mode_key=mode_key,
                         status="warming",
                     )
                     thread = threading.Thread(
@@ -189,7 +209,7 @@ class SimulationRuntimeApplication:
                     thread.start()
                 else:
                     existing_slots.remove(slot)
-                    if self._owner_ready(slot.owner):
+                    if self._slot_ready(slot):
                         slot.status = "ready"
                         slot.failure = None
                     elif slot.status == "failed":
@@ -201,6 +221,7 @@ class SimulationRuntimeApplication:
                             payload=dict(payload_map),
                             owner=owner,
                             generation=generation,
+                            mode_key=mode_key,
                             status="warming",
                         )
                         thread = threading.Thread(
@@ -229,8 +250,13 @@ class SimulationRuntimeApplication:
                 owners_and_threads.append((slot.owner, slot.thread))
             stale_slots.extend(existing_slots)
             self._queue_slots[mode_key] = next_slots
+            for active_slot in self._active_slots.values():
+                if str(active_slot.mode_key) != mode_key:
+                    continue
+                if not any(self._payloads_match(active_slot.payload, payload_map) for payload_map in payload_maps):
+                    active_slot.close_when_released = True
         for slot in stale_slots:
-            self._close_owner(slot.owner, kill=False)
+            self._close_or_defer_retired_slot(slot, kill=False)
         if wait:
             current_thread = threading.current_thread()
             for _owner, thread in owners_and_threads:
@@ -271,6 +297,7 @@ class SimulationRuntimeApplication:
                 payload=payload_map,
                 owner=owner,
                 generation=int(self._generation),
+                mode_key=mode_key,
                 status="ready" if self._owner_ready(owner) else "missing",
             )
 
@@ -293,11 +320,68 @@ class SimulationRuntimeApplication:
                 slot = self._matching_slot(self._queue_slots.get(mode_key, []), payload_map)
                 if slot is None:
                     return None
-            if self._owner_ready(slot.owner):
+            if self._slot_ready(slot):
                 slot.status = "ready"
                 slot.failure = None
                 return slot.owner
             return None
+
+    def acquire_ready_owner(self, *, mode: str, payload: Mapping[str, object]) -> Optional[object]:
+        payload_map = dict(payload or {})
+        if not payload_map:
+            return None
+        mode_key = self._mode_key(mode)
+        with self._lock:
+            slot = self._slots.get(mode_key)
+            if slot is not None and self._payloads_match(slot.payload, payload_map):
+                if self._slot_ready(slot) and int(slot.active_count) <= 0:
+                    slot.status = "ready"
+                    slot.failure = None
+                    del self._slots[mode_key]
+                    slot.active_count += 1
+                    self._active_slots[id(slot.owner)] = slot
+                    return slot.owner
+                return None
+            queue_slots = self._queue_slots.get(mode_key, [])
+            slot = self._matching_slot(queue_slots, payload_map)
+            if slot is None:
+                return None
+            if (not self._slot_ready(slot)) or int(slot.active_count) > 0:
+                return None
+            slot.status = "ready"
+            slot.failure = None
+            slot.active_count += 1
+            self._active_slots[id(slot.owner)] = slot
+            queue_slots.remove(slot)
+            if queue_slots:
+                self._queue_slots[mode_key] = queue_slots
+            else:
+                self._queue_slots.pop(mode_key, None)
+            return slot.owner
+
+    def release_owner(self, owner: object, *, kill: bool = False) -> None:
+        if owner is None:
+            return
+        close_owner = False
+        with self._lock:
+            slot = self._active_slots.get(id(owner))
+            if slot is None:
+                return
+            slot.active_count = max(0, int(slot.active_count) - 1)
+            if slot.active_count <= 0:
+                self._active_slots.pop(id(owner), None)
+                close_owner = bool(slot.close_when_released)
+                if not close_owner and self._owner_ready(slot.owner):
+                    slot.close_when_released = False
+                    existing = self._slots.get(slot.mode_key)
+                    if existing is None:
+                        self._slots[slot.mode_key] = slot
+                    else:
+                        queue_slots = self._queue_slots.setdefault(slot.mode_key, [])
+                        if all(candidate.owner is not slot.owner for candidate in queue_slots):
+                            queue_slots.append(slot)
+        if close_owner:
+            self._close_owner(owner, kill=bool(kill))
 
     def snapshot(self, *, mode: str) -> RuntimeReadinessSnapshot:
         mode_key = self._mode_key(mode)
@@ -320,7 +404,7 @@ class SimulationRuntimeApplication:
                 failure = None
                 for queue_slot in queue_slots:
                     latest_generation = max(latest_generation, int(queue_slot.generation))
-                    if self._owner_ready(queue_slot.owner):
+                    if self._slot_ready(queue_slot):
                         queue_slot.status = "ready"
                         queue_slot.failure = None
                         ready_count += 1
@@ -340,7 +424,7 @@ class SimulationRuntimeApplication:
                     controls_ready=bool(all_ready),
                     polling=str(status) not in {"failed"},
                 )
-            ready = self._owner_ready(slot.owner)
+            ready = self._slot_ready(slot)
             if ready:
                 slot.status = "ready"
                 slot.failure = None
@@ -364,18 +448,32 @@ class SimulationRuntimeApplication:
             mode_keys = [self._mode_key(mode)]
         owners: list[object] = []
         threads: list[threading.Thread] = []
+        seen_owner_ids: set[int] = set()
         with self._lock:
             for mode_key in mode_keys:
                 slot = self._slots.pop(mode_key, None)
                 if slot is not None:
-                    owners.append(slot.owner)
+                    if id(slot.owner) not in seen_owner_ids:
+                        owners.append(slot.owner)
+                        seen_owner_ids.add(id(slot.owner))
                     if slot.thread is not None:
                         threads.append(slot.thread)
                 queue_slots = self._queue_slots.pop(mode_key, [])
                 for queue_slot in queue_slots:
-                    owners.append(queue_slot.owner)
+                    if id(queue_slot.owner) not in seen_owner_ids:
+                        owners.append(queue_slot.owner)
+                        seen_owner_ids.add(id(queue_slot.owner))
                     if queue_slot.thread is not None:
                         threads.append(queue_slot.thread)
+                for owner_id, active_slot in list(self._active_slots.items()):
+                    if str(active_slot.mode_key) != mode_key:
+                        continue
+                    self._active_slots.pop(owner_id, None)
+                    if id(active_slot.owner) not in seen_owner_ids:
+                        owners.append(active_slot.owner)
+                        seen_owner_ids.add(id(active_slot.owner))
+                    if active_slot.thread is not None:
+                        threads.append(active_slot.thread)
         for owner in owners:
             self._close_owner(owner, kill=bool(kill))
         current_thread = threading.current_thread()
@@ -413,11 +511,20 @@ class SimulationRuntimeApplication:
                     if candidate.owner is owner and int(candidate.generation) == int(generation):
                         queue_match = candidate
                         break
+            active_match = self._active_slots.get(id(owner))
+            if (
+                active_match is not None
+                and active_match.owner is owner
+                and str(active_match.mode_key) == str(mode_key)
+                and int(active_match.generation) == int(generation)
+            ):
+                active_match.status = status
+                active_match.failure = failure
+                return
             if (
                 (slot is None or slot.owner is not owner or int(slot.generation) != int(generation))
                 and queue_match is None
             ):
-                self._close_owner(owner, kill=True)
                 return
             if queue_match is not None:
                 slot = queue_match
@@ -434,6 +541,16 @@ class SimulationRuntimeApplication:
                 return slot
         return None
 
+    def _active_matching_slot_locked(
+        self,
+        mode_key: str,
+        payload: Mapping[str, object],
+    ) -> Optional[_RuntimeSlot]:
+        for active_slot in self._active_slots.values():
+            if str(active_slot.mode_key) == mode_key and self._payloads_match(active_slot.payload, payload):
+                return active_slot
+        return None
+
     def _payloads_match(self, left: Mapping[str, object], right: Mapping[str, object]) -> bool:
         try:
             from kindred.core.simulation_containment import contained_owner_payloads_match
@@ -441,6 +558,9 @@ class SimulationRuntimeApplication:
             return bool(contained_owner_payloads_match(dict(left), dict(right)))
         except Exception:
             return False
+
+    def _slot_ready(self, slot: _RuntimeSlot) -> bool:
+        return bool(str(slot.status) == "ready" and self._owner_ready(slot.owner))
 
     @staticmethod
     def _owner_ready(owner: object) -> bool:
@@ -457,6 +577,14 @@ class SimulationRuntimeApplication:
                 close(kill=bool(kill))
             except TypeError:
                 close()
+
+    def _close_or_defer_retired_slot(self, slot: _RuntimeSlot, *, kill: bool) -> None:
+        if int(getattr(slot, "active_count", 0) or 0) > 0:
+            slot.close_when_released = True
+            with self._lock:
+                self._active_slots[id(slot.owner)] = slot
+            return
+        self._close_owner(slot.owner, kill=bool(kill))
 
     @staticmethod
     def _mode_key(mode: str) -> str:

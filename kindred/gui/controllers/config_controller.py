@@ -56,6 +56,8 @@ class ConfigControllerPort:
     wegscheider_cyclicity_enabled: Callable[[], bool]
     max_parallel_batch_workers: Callable[[], int]
     set_max_parallel_batch_workers: Callable[[int], None]
+    batch_runtime_lane_budget: Callable[[], int]
+    set_batch_runtime_lane_budget: Callable[[int], None]
     limit_blas_threads_per_worker: Callable[[], bool]
     set_limit_blas_threads_per_worker: Callable[[bool], None]
     result_cache_cap: Callable[[], int]
@@ -99,7 +101,7 @@ class ConfigController(QtCore.QObject):
         from kindred.gui.project_schema import QSETTINGS_KEY_MAP
         if key not in QSETTINGS_KEY_MAP:
             raise ValueError(f"Unknown user preference key: {key!r}")
-        if key == "max_parallel_batch_workers":
+        if key in {"max_parallel_batch_workers", "batch_runtime_lane_budget"}:
             value = min(
                 int(MAX_PARALLEL_WORKERS_CEILING),
                 max(1, int(value)),
@@ -248,6 +250,19 @@ class ConfigController(QtCore.QObject):
                         settings,
                         "simulation/max_parallel_batch_workers",
                         int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
+                    ),
+                ),
+            )
+        )
+        self._ui.set_batch_runtime_lane_budget(
+            min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(
+                    1,
+                    self._read_int_setting(
+                        settings,
+                        "simulation/batch_runtime_lane_budget",
+                        int(PROJECT_DEFAULTS["batch_runtime_lane_budget"]),
                     ),
                 ),
             )

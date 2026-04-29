@@ -62,6 +62,7 @@ from kindred.gui.controllers.simulation_run_state import (
 )
 from kindred.gui.controllers.slider_plot_coalescer import SliderPlotCoalescer
 from kindred.gui.project_schema import PROJECT_DEFAULTS
+from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.batch_initial_conditions import (
     migrate_reaction_dsl_initial_concentration_sets,
     strip_reaction_dsl_initial_concentrations,
@@ -348,6 +349,7 @@ class SimulationController(QtCore.QObject):
         self._pool_eagerly_created: bool = False
         self._pool_eager_creation_thread: Optional[threading.Thread] = None
         self._pool_eager_creation_lock = threading.RLock()
+        self._batch_runtime_lane_budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
         self._completion_policy = SimulationCompletionPolicy()
         self._runtime_application = SimulationRuntimeApplication()
 
@@ -586,6 +588,7 @@ class SimulationController(QtCore.QObject):
         if not bool(runtime_snapshot.should_poll):
             self._clear_pending_run_after_runtime_ready()
             return
+        self._ensure_selected_run_runtime_warming()
         self._run_state.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState(
             active=True,
             rows=tuple(int(row) for row in rows_to_run or ()),
@@ -598,8 +601,6 @@ class SimulationController(QtCore.QObject):
         runtime_snapshot = self._selected_run_runtime_snapshot()
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
             self._ensure_selected_run_runtime_warming()
-            runtime_snapshot = self._selected_run_runtime_snapshot()
-        if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
             self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
             self.ui.run_ui.set_run_button_enabled(True)
             self.ui.run_ui.set_stop_button_enabled(False)
@@ -634,20 +635,17 @@ class SimulationController(QtCore.QObject):
         runtime_snapshot = self._selected_run_runtime_snapshot()
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
             self._ensure_selected_run_runtime_warming()
-            runtime_snapshot = self._selected_run_runtime_snapshot()
-            if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
-                self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
-                self.ui.run_ui.set_run_button_enabled(True)
-                self.ui.run_ui.set_stop_button_enabled(False)
-                self.ui.run_ui.set_status_text(
-                    str(runtime_snapshot.message or "Preparing simulation runtime...")
-                )
-                if bool(runtime_snapshot.should_poll):
-                    self.ui.run_ui.schedule_runtime_availability_refresh()
-                    QtCore.QTimer.singleShot(50, self._retry_pending_run_after_runtime_ready)
-                else:
-                    self._clear_pending_run_after_runtime_ready()
-                return
+            self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+            self.ui.run_ui.set_run_button_enabled(True)
+            self.ui.run_ui.set_stop_button_enabled(False)
+            self.ui.run_ui.set_status_text(
+                str(runtime_snapshot.message or "Preparing simulation runtime...")
+            )
+            if bool(runtime_snapshot.should_poll):
+                QtCore.QTimer.singleShot(50, self._retry_pending_run_after_runtime_ready)
+            else:
+                self._clear_pending_run_after_runtime_ready()
+            return
 
         self._clear_pending_run_after_runtime_ready()
         self.ui.run_ui.set_runtime_backed_run_controls_ready(True)
@@ -955,6 +953,21 @@ class SimulationController(QtCore.QObject):
         return self._batch_parallel
 
     @property
+    def batch_runtime_lane_budget(self) -> int:
+        return max(1, int(getattr(self, "_batch_runtime_lane_budget", 1) or 1))
+
+    @batch_runtime_lane_budget.setter
+    def batch_runtime_lane_budget(self, value: object) -> None:
+        try:
+            parsed = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            parsed = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
+        self._batch_runtime_lane_budget = min(
+            int(MAX_PARALLEL_WORKERS_CEILING),
+            max(1, int(parsed)),
+        )
+
+    @property
     def plot_coalescer(self) -> SliderPlotCoalescer:
         return self._plot_coalescer
 
@@ -1219,6 +1232,9 @@ class SimulationController(QtCore.QObject):
 
     def interactive_simulation_runtime_ready(self, *, fast_mode: bool) -> bool:
         return bool(self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode)).ready)
+
+    def slider_preview_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
+        return self._slider_preview_runtime_snapshot()
 
     def invalidate_slider_preview_work(self) -> None:
         self._invalidate_slider_preview_work()
@@ -1518,6 +1534,7 @@ class SimulationController(QtCore.QObject):
 
     def _on_retained_simulation_worker_finished(self, worker, worker_name: str = "simulation worker") -> None:
         self._forget_retained_simulation_worker(worker)
+        self._release_runtime_owner_from_worker(worker)
         if getattr(self, "_simulation_worker", None) is worker:
             self._simulation_worker = None
         shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
@@ -1754,9 +1771,26 @@ class SimulationController(QtCore.QObject):
         worker = getattr(self, "_simulation_worker", None)
         if worker is None:
             return
-        self._cleanup_worker_safely(worker, "simulation worker", retain_if_running=True)
+        still_running = self._cleanup_worker_safely(worker, "simulation worker", retain_if_running=True)
+        if not bool(still_running):
+            self._release_runtime_owner_from_worker(worker)
         if getattr(self, "_simulation_worker", None) is worker:
             self._simulation_worker = None
+
+    def _release_runtime_owner_from_worker(self, worker) -> None:
+        if worker is None or bool(getattr(worker, "_kindred_runtime_owner_released", False)):
+            return
+        owner = getattr(worker, "_owner", None)
+        if owner is None:
+            return
+        try:
+            self._runtime_application.release_owner(
+                owner,
+                kill=bool(getattr(worker, "_owner_closed", False)),
+            )
+            setattr(worker, "_kindred_runtime_owner_released", True)
+        except Exception as exc:
+            self._record_nonfatal_exception("Failed to release active simulation runtime owner", exc)
 
     def _contained_owner_attr(self, *, fast_mode: bool) -> str:
         return "_preview_simulation_owner" if bool(fast_mode) else "_ordinary_simulation_owner"
@@ -1817,6 +1851,18 @@ class SimulationController(QtCore.QObject):
             return None
         mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
         return self._runtime_application.ready_owner(mode=mode, payload=plan_payload)
+
+    def _acquire_ready_contained_simulation_owner_for_plan(
+        self,
+        *,
+        fast_mode: bool,
+        simulation_plan_payload: Mapping[str, Any],
+    ):
+        plan_payload = dict(simulation_plan_payload or {})
+        if not plan_payload:
+            return None
+        mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
+        return self._runtime_application.acquire_ready_owner(mode=mode, payload=plan_payload)
 
     def _warm_contained_simulation_owner_for_plan(
         self,
@@ -2314,11 +2360,14 @@ class SimulationController(QtCore.QObject):
         setattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, tuple(remaining_connections))
 
     def _effective_batch_worker_count(self, num_sets: int) -> int:
-        return int(
-            compute_effective_batch_workers(
-                num_sets=max(0, int(num_sets)),
-                max_parallel_workers=max(1, int(self._batch_parallel.max_parallel_workers)),
-            )
+        return min(
+            int(self.batch_runtime_lane_budget),
+            int(
+                compute_effective_batch_workers(
+                    num_sets=max(0, int(num_sets)),
+                    max_parallel_workers=max(1, int(self._batch_parallel.max_parallel_workers)),
+                )
+            ),
         )
 
     def _selected_run_uses_parallel_batch_runtime(self) -> bool:
@@ -2332,8 +2381,21 @@ class SimulationController(QtCore.QObject):
             return self._parallel_batch_runtime_snapshot()
         return self._interactive_simulation_runtime_snapshot(fast_mode=False)
 
-    def _parallel_batch_runtime_snapshot(self) -> RuntimeReadinessSnapshot:
-        rows = self._interactive_runtime_rows()
+    def _slider_preview_uses_parallel_batch_runtime(self, rows: Optional[Sequence[int]] = None) -> bool:
+        if rows is None:
+            rows = self._interactive_runtime_rows()
+        row_count = len(list(rows or ()))
+        return bool(row_count > 1 and self._effective_batch_worker_count(row_count) > 1)
+
+    def _slider_preview_runtime_snapshot(self, rows: Optional[Sequence[int]] = None) -> RuntimeReadinessSnapshot:
+        if self._slider_preview_uses_parallel_batch_runtime(rows):
+            return self._parallel_batch_runtime_snapshot(rows=rows)
+        return self._interactive_simulation_runtime_snapshot(fast_mode=True)
+
+    def _parallel_batch_runtime_snapshot(self, rows: Optional[Sequence[int]] = None) -> RuntimeReadinessSnapshot:
+        if rows is None:
+            rows = self._interactive_runtime_rows()
+        rows = list(rows or ())
         if len(rows) <= 1 or self._effective_batch_worker_count(len(rows)) <= 1:
             return _runtime_readiness_snapshot(
                 mode="batch",
@@ -2474,11 +2536,14 @@ class SimulationController(QtCore.QObject):
         max_workers = max(1, int(getattr(self._batch_parallel, "max_parallel_workers", 1) or 1))
         return max(
             1,
-            int(
-                compute_effective_batch_workers(
-                    num_sets=max_workers,
-                    max_parallel_workers=max_workers,
-                )
+            min(
+                int(self.batch_runtime_lane_budget),
+                int(
+                    compute_effective_batch_workers(
+                        num_sets=max_workers,
+                        max_parallel_workers=max_workers,
+                    )
+                ),
             ),
         )
 
@@ -2528,7 +2593,7 @@ class SimulationController(QtCore.QObject):
             return
         self._shutdown_batch_lane_pool(force_terminate=False)
 
-    def _supersede_parallel_batch_run_soft(self) -> None:
+    def _supersede_parallel_batch_run_soft(self) -> tuple[int, int]:
         """
         Supersede the active parallel run without destroying the process pool.
 
@@ -2555,6 +2620,7 @@ class SimulationController(QtCore.QObject):
                 int(cancelled),
                 int(running),
             )
+        return int(cancelled), int(running)
 
     # ------------------------------------------------------------------
     # Parallel completion queue helpers
@@ -3212,6 +3278,8 @@ class SimulationController(QtCore.QObject):
             if self._batch_parallel.is_pool_stale:
                 self._shutdown_batch_lane_pool(force_terminate=False)
             self._stop_batch_completion_poll_timer_if_idle()
+            if self._has_deferred_preview_replay_intent():
+                self._schedule_deferred_preview_replay_handoff_once()
             return
 
         run_id = int(runtime_snapshot.run_id) if active_parallel else 0
@@ -3653,11 +3721,27 @@ class SimulationController(QtCore.QObject):
         self._discarded_slider_preview_generation_id = None
         self.ui.slider.set_slider_triggered_simulation(True)
 
+        def _defer_current_slider_replay() -> None:
+            target_set_ids = [str(set_id) for set_id in pending_target_set_ids if str(set_id)]
+            if not target_set_ids:
+                try:
+                    target_set_ids = [
+                        str(set_id)
+                        for set_id in (self.ui.batch.batch_set_ids_for_scope("selected") or ())
+                        if str(set_id)
+                    ]
+                except Exception:
+                    target_set_ids = []
+            self.queue_pending_slider_preview_replay(
+                target_set_ids=target_set_ids,
+                request_id=int(request_id),
+            )
+
         if self._has_active_explicit_simulation() and (
             worker is None or not getattr(worker, "_fast_mode", False)
         ):
             logger.debug("Full simulation in progress; deferring slider update")
-            self._pending_slider_simulation = True
+            _defer_current_slider_replay()
             return
 
         # Guard against a race where a fast-mode worker has been constructed but has not yet
@@ -3675,30 +3759,42 @@ class SimulationController(QtCore.QObject):
                     active_fast_request_id,
                     request_id,
                 )
-                self._supersede_parallel_batch_run_soft()
+                _defer_current_slider_replay()
+                supersede_result = self._supersede_parallel_batch_run_soft()
+                try:
+                    _cancelled, running = supersede_result
+                except (TypeError, ValueError):
+                    running = 0
                 self._simulation_running = False
                 self._slider_simulation_active = False
+                if int(running) > 0:
+                    return
                 ctx = getattr(self, "_batch_run_context", {}) or {}
             else:
                 logger.debug("Simulation already active; deferring slider update")
-                self._pending_slider_simulation = True
+                _defer_current_slider_replay()
                 return
 
         if self._worker_is_running(worker):
             logger.debug("Simulation currently running; deferring slider update")
-            self._pending_slider_simulation = True
+            _defer_current_slider_replay()
             return
 
-        if isinstance(ctx, dict) and ctx.get("active") and bool(ctx.get("fast_mode")):
+        active_fast_batch_work = bool(
+            isinstance(ctx, dict)
+            and bool(ctx.get("fast_mode"))
+            and (bool(ctx.get("active")) or self._has_active_parallel_batch_work())
+        )
+        if active_fast_batch_work:
             logger.debug("Fast slider run currently running; deferring slider update")
-            self._pending_slider_simulation = True
+            _defer_current_slider_replay()
             return
         self._prune_stopped_owned_simulation_workers()
         if self._has_running_owned_simulation_workers():
             logger.warning(
                 "Slider-triggered run blocked while previous simulation worker shutdown remains in progress"
             )
-            self._pending_slider_simulation = True
+            _defer_current_slider_replay()
             self.ui.slider.set_slider_triggered_simulation(False)
             self._simulation_running = False
             self._slider_simulation_active = False
@@ -3721,19 +3817,30 @@ class SimulationController(QtCore.QObject):
             self.clear_pending_slider_preview_replay(clear_plot_updates=False)
             return
 
-        preview_snapshot = self._interactive_simulation_runtime_snapshot(fast_mode=True)
+        uses_parallel_batch_runtime = self._slider_preview_uses_parallel_batch_runtime(selected_rows)
+        preview_snapshot = self._slider_preview_runtime_snapshot(selected_rows)
         if bool(preview_snapshot.required) and not bool(preview_snapshot.ready):
-            self._run_simulation_internal(
+            if uses_parallel_batch_runtime:
+                self._ensure_parallel_batch_pool_eagerly_created(wait=False)
+                self.ui.slider.set_slider_triggered_simulation(False)
+                self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+                self.ui.run_ui.set_status_text(str(preview_snapshot.message or "Preparing batch runtime..."))
+                if bool(preview_snapshot.should_poll):
+                    self.ui.run_ui.schedule_runtime_availability_refresh()
+                    QtCore.QTimer.singleShot(50, self._run_simulation_from_slider)
+                else:
+                    self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                    with suppress(Exception):
+                        self.ui.slider.show_preview_unavailable_for_dirty_state(
+                            str(preview_snapshot.message or "Batch runtime is not ready.")
+                        )
+                return
+            self._ensure_interactive_simulation_runtime_available_for_mode(
                 fast_mode=True,
-                request_id=0,
-                batch_rows=selected_rows,
-                reuse_parallel_lane_pool=False,
-                runtime_readiness_only=True,
-                runtime_readiness_wait=False,
+                wait=False,
             )
             self.ui.slider.set_slider_triggered_simulation(False)
             self.ui.run_ui.set_status_text(str(preview_snapshot.message or "Preparing preview runtime..."))
-            self.ui.run_ui.schedule_runtime_availability_refresh()
             if bool(preview_snapshot.should_poll):
                 QtCore.QTimer.singleShot(50, self._run_simulation_from_slider)
             else:
@@ -3798,22 +3905,17 @@ class SimulationController(QtCore.QObject):
 
         runtime_snapshot = self._selected_run_runtime_snapshot()
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
-            self._ensure_selected_run_runtime_warming()
-            runtime_snapshot = self._selected_run_runtime_snapshot()
-            if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
-                self._queue_run_after_runtime_ready(
-                    rows_to_run=rows_to_run,
-                    runtime_snapshot=runtime_snapshot,
-                )
-                self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
-                self.ui.run_ui.set_run_button_enabled(True)
-                self.ui.run_ui.set_stop_button_enabled(False)
-                self.ui.run_ui.set_status_text(
-                    str(runtime_snapshot.message or "Preparing simulation runtime...")
-                )
-                if bool(runtime_snapshot.should_poll):
-                    self.ui.run_ui.schedule_runtime_availability_refresh()
-                return
+            self._queue_run_after_runtime_ready(
+                rows_to_run=rows_to_run,
+                runtime_snapshot=runtime_snapshot,
+            )
+            self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+            self.ui.run_ui.set_run_button_enabled(True)
+            self.ui.run_ui.set_stop_button_enabled(False)
+            self.ui.run_ui.set_status_text(
+                str(runtime_snapshot.message or "Preparing simulation runtime...")
+            )
+            return
 
         self._clear_pending_run_after_runtime_ready()
         reset_set_ids: list[str] = []
@@ -3897,26 +3999,62 @@ class SimulationController(QtCore.QObject):
             if pool_already_warmed:
                 lane_pool = self._batch_parallel.ensure_lane_pool(max_lanes=int(max_workers))
             else:
-                lane_pool = self._batch_parallel.ensure_warm_lane_pool(
-                    max_lanes=int(max_workers),
-                    wait=False,
+                batch_runtime_state = self._batch_parallel.runtime_snapshot()
+                runtime_snapshot = _runtime_readiness_snapshot(
+                    mode="batch",
+                    status="warming",
+                    ready=False,
+                    generation=int(getattr(batch_runtime_state, "current_generation", 0) or 0),
+                    message="Preparing batch runtime...",
+                    required=True,
+                    controls_ready=False,
+                    polling=True,
                 )
-                if not self._batch_parallel.has_ready_lane_pool(max_lanes=int(max_workers)):
-                    ctx["runtime_waiting"] = True
-                    self._batch_run_context = dict(ctx)
-                    self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
-                    self.ui.run_ui.set_run_button_enabled(True)
-                    self.ui.run_ui.set_stop_button_enabled(True)
-                    self.ui.run_ui.set_sim_progress_value(0)
-                    self.ui.run_ui.set_status_text("Preparing batch runtime...")
-                    self.ui.run_ui.schedule_runtime_availability_refresh()
-                    QtCore.QTimer.singleShot(50, self._start_parallel_batch_simulations)
-                    return
+                ctx["runtime_waiting"] = True
+                ctx["active"] = False
+                self._batch_run_context = dict(ctx)
+                self._simulation_running = False
+                self._slider_simulation_active = False
+                if bool(ctx.get("fast_mode")):
+                    self._ensure_parallel_batch_pool_eagerly_created(wait=False)
+                    self.queue_pending_slider_preview_replay(
+                        target_set_ids=[str(set_id) for set_id in queue_ids if str(set_id)],
+                        request_id=int(ctx.get("request_id") or self._next_slider_preview_request_id()),
+                    )
+                    if bool(runtime_snapshot.should_poll):
+                        QtCore.QTimer.singleShot(50, self._run_simulation_from_slider)
+                    else:
+                        self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                else:
+                    self._queue_run_after_runtime_ready(
+                        rows_to_run=rows,
+                        runtime_snapshot=runtime_snapshot,
+                    )
+                self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+                self.ui.run_ui.set_run_button_enabled(True)
+                self.ui.run_ui.set_stop_button_enabled(False)
+                self.ui.run_ui.set_sim_progress_value(0)
+                self.ui.run_ui.set_status_text("Batch runtime is not ready.")
+                self.ui.run_ui.schedule_runtime_availability_refresh()
+                return
         except Exception as exc:
-            logger.warning("Parallel batch lane pool unavailable; falling back to serial path: %s", exc)
-            ctx["parallel"] = False
+            logger.warning("Parallel batch lane pool unavailable: %s", exc)
+            ctx["runtime_waiting"] = True
+            ctx["active"] = False
             self._batch_run_context = dict(ctx)
-            self._start_next_batch_simulation()
+            self._simulation_running = False
+            self._slider_simulation_active = False
+            self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
+            self.ui.run_ui.set_run_button_enabled(True)
+            self.ui.run_ui.set_stop_button_enabled(False)
+            self.ui.run_ui.set_sim_progress_value(0)
+            self.ui.run_ui.set_status_text(f"Batch runtime readiness check failed: {exc}")
+            if bool(ctx.get("fast_mode")):
+                self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+                with suppress(Exception):
+                    self.ui.slider.show_preview_unavailable_for_dirty_state(
+                        f"Batch runtime readiness check failed: {exc}"
+                    )
             return
         if ctx.get("runtime_waiting"):
             ctx.pop("runtime_waiting", None)
@@ -4389,36 +4527,15 @@ class SimulationController(QtCore.QObject):
                 from kindred.gui.simulation_worker import ContainedSimulationWorker
 
                 contained_plan_payload = build_contained_simulation_plan_payload(plan_payload)
-                contained_owner = self._ready_contained_simulation_owner_for_plan(
+                contained_owner = self._acquire_ready_contained_simulation_owner_for_plan(
                     fast_mode=bool(fast_mode),
                     simulation_plan_payload=contained_plan_payload,
                 )
                 if contained_owner is None:
-                    runtime_snapshot = self._interactive_simulation_runtime_snapshot(fast_mode=bool(fast_mode))
-                    if bool(runtime_snapshot.required) and not bool(runtime_snapshot.should_poll):
-                        self._abort_for_unready_interactive_runtime(
-                            fast_mode=bool(fast_mode),
-                            context=ctx,
-                        )
-                        return
-                    try:
-                        self._warm_contained_simulation_owner_for_plan(
-                            fast_mode=bool(fast_mode),
-                            simulation_plan_payload=contained_plan_payload,
-                            wait=False,
-                        )
-                    except Exception:
-                        self._abort_for_unready_interactive_runtime(
-                            fast_mode=bool(fast_mode),
-                            context=ctx,
-                        )
-                        return
-                    self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
-                    self.ui.run_ui.set_status_text(
-                        "Preparing preview runtime..." if bool(fast_mode) else "Preparing simulation runtime..."
+                    self._abort_for_unready_interactive_runtime(
+                        fast_mode=bool(fast_mode),
+                        context=ctx,
                     )
-                    self.ui.run_ui.schedule_runtime_availability_refresh()
-                    QtCore.QTimer.singleShot(50, self._start_next_batch_simulation)
                     return
                 self._simulation_worker = ContainedSimulationWorker(
                     owner=contained_owner,

@@ -15,6 +15,7 @@ EXPECTED_KEYS = {
     "use_sparse_jacobian",
     "wegscheider_cyclicity_enabled",
     "max_parallel_batch_workers",
+    "batch_runtime_lane_budget",
     "limit_blas_threads_per_worker",
     "temperature_K",
     "simulation_time",
@@ -64,6 +65,7 @@ class TestProjectDefaults:
         assert isinstance(p["use_sparse_jacobian"], bool)
         assert isinstance(p["wegscheider_cyclicity_enabled"], bool)
         assert isinstance(p["max_parallel_batch_workers"], int)
+        assert isinstance(p["batch_runtime_lane_budget"], int)
         assert isinstance(p["limit_blas_threads_per_worker"], bool)
         assert isinstance(p["temperature_K"], float)
         assert isinstance(p["simulation_time"], str)
@@ -89,6 +91,10 @@ class TestProjectDefaults:
             max(1, (os.cpu_count() or 1) - 1),
             16,
         )
+        assert (
+            PROJECT_DEFAULTS["batch_runtime_lane_budget"]
+            == PROJECT_DEFAULTS["max_parallel_batch_workers"]
+        )
 
     def test_runtime_default_batch_workers_caps_high_cpu_count(self):
         from kindred.core import runtime_defaults
@@ -108,6 +114,7 @@ EXPECTED_DUAL_PERSISTED_KEYS = {
     "use_sparse_jacobian",
     "wegscheider_cyclicity_enabled",
     "max_parallel_batch_workers",
+    "batch_runtime_lane_budget",
     "limit_blas_threads_per_worker",
     "temperature_K",
     "simulation_time",

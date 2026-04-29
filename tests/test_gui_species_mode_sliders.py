@@ -725,6 +725,25 @@ def test_concentration_surface_shows_mixed_value_before_edit_for_multi_selection
     assert model.setData(model.index(1, 1), "0.25")
     assert model.setData(model.index(1, 2), "0.75")
 
+    ready_snapshot = SimpleNamespace(
+        required=True,
+        ready=True,
+        controls_ready=True,
+        should_poll=False,
+        status="ready",
+        message="",
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: ready_snapshot,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: ready_snapshot,
+    )
+
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
     main_window.set_slider_edit_target_set_ids(
         [
@@ -1224,6 +1243,25 @@ def test_species_mode_reset_restores_all_explicit_edit_targets_even_if_only_one_
     assert model.setData(model.index(0, 2), "2.0")
     assert model.setData(model.index(1, 1), "0.25")
     assert model.setData(model.index(1, 2), "0.75")
+
+    ready_snapshot = SimpleNamespace(
+        required=True,
+        ready=True,
+        controls_ready=True,
+        should_poll=False,
+        status="ready",
+        message="",
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: ready_snapshot,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: ready_snapshot,
+    )
 
     _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
     main_window.set_slider_edit_target_set_ids(

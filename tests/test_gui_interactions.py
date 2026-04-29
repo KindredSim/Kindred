@@ -109,7 +109,9 @@ def test_solver_settings_dialog_factory_defaults_match_schema_and_cache_defaults
     assert dialog._sparse_checkbox.isChecked() is bool(PROJECT_DEFAULTS["use_sparse_jacobian"])
     assert dialog._wegscheider_checkbox.isChecked() is bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"])
     assert dialog._max_parallel_workers_spin.value() == int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
+    assert dialog._batch_runtime_lane_budget_spin.value() == int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
     assert dialog._max_parallel_workers_spin.maximum() == int(MAX_PARALLEL_WORKERS_CEILING)
+    assert dialog._batch_runtime_lane_budget_spin.maximum() == int(MAX_PARALLEL_WORKERS_CEILING)
     assert dialog._limit_blas_checkbox.isChecked() is bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])
     assert dialog._spin_result_cache_cap.value() == int(BatchSimulationCache.result_cache_cap)
     assert dialog._spin_preview_cache_cap.value() == int(BatchSimulationCache.preview_cache_cap)
@@ -121,8 +123,10 @@ def test_solver_settings_dialog_caps_worker_count_at_shared_ceiling(qt_app):
 
     dialog = SolverSettingsDialog()
 
-    dialog.set_settings({"max_parallel_batch_workers": 400})
+    dialog.set_settings({"max_parallel_batch_workers": 400, "batch_runtime_lane_budget": 400})
 
     assert solver_settings._MAX_PARALLEL_WORKERS_SPIN_MAX == int(MAX_PARALLEL_WORKERS_CEILING)
     assert dialog._max_parallel_workers_spin.maximum() == int(MAX_PARALLEL_WORKERS_CEILING)
     assert dialog._max_parallel_workers_spin.value() == int(MAX_PARALLEL_WORKERS_CEILING)
+    assert dialog._batch_runtime_lane_budget_spin.maximum() == int(MAX_PARALLEL_WORKERS_CEILING)
+    assert dialog._batch_runtime_lane_budget_spin.value() == int(MAX_PARALLEL_WORKERS_CEILING)

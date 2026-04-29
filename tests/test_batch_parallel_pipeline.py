@@ -147,6 +147,8 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
         lambda max_workers, limit_blas_threads: fake,
         raising=True,
     )
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
+    main_window.set_runtime_backed_run_controls_ready(True)
 
     # "Run All" was intentionally removed; emulate it via Select All + Run Selected.
     _select_rows(main_window, [0, 1, 2])
@@ -161,7 +163,7 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
 def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, monkeypatch):
     if hasattr(main_window, "set_simulation_cache_caps"):
         main_window.set_simulation_cache_caps(result_cap=20, preview_cap=20)
-    _prime_three_batch_sets(main_window)
+    names = _prime_three_batch_sets(main_window)
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 
@@ -174,15 +176,28 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
 
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
     monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "lane_pool_factory", _factory, raising=True)
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
     req1 = main_window.simulation_controller.next_sim_request_id()
-    main_window.simulation_controller.run_simulation_internal(fast_mode=False, request_id=int(req1), batch_rows=[0, 1, 2])
+    main_window.simulation_controller.run_simulation_internal(
+        fast_mode=False,
+        request_id=int(req1),
+        batch_rows=[0, 1, 2],
+        reuse_parallel_lane_pool=True,
+    )
     assert len(lane_pools) == 1
-    _wait_for_submission_count(lane_pools[0], 3)
+    _wait_for_submission_count(lane_pools[0], len(names))
 
+    main_window.simulation_controller._shutdown_batch_lane_pool(force_terminate=True)
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
     req2 = main_window.simulation_controller.next_sim_request_id()
-    main_window.simulation_controller.run_simulation_internal(fast_mode=False, request_id=int(req2), batch_rows=[0, 1, 2])
+    main_window.simulation_controller.run_simulation_internal(
+        fast_mode=False,
+        request_id=int(req2),
+        batch_rows=[0, 1, 2],
+        reuse_parallel_lane_pool=True,
+    )
     assert len(lane_pools) == 2
-    _wait_for_submission_count(lane_pools[1], 3)
+    _wait_for_submission_count(lane_pools[1], len(names))
 
     old_pool = lane_pools[0]
     new_pool = lane_pools[1]

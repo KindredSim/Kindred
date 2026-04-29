@@ -11,6 +11,7 @@ import copy
 from typing import TYPE_CHECKING
 
 from kindred.core.runtime_defaults import (
+    BATCH_RUNTIME_LANE_BUDGET_DEFAULT,
     LIMIT_BLAS_THREADS_PER_WORKER_DEFAULT,
     MAX_PARALLEL_BATCH_WORKERS_DEFAULT,
     MAX_PARALLEL_WORKERS_CEILING,
@@ -45,6 +46,7 @@ PROJECT_DEFAULTS: dict[str, object] = {
     "use_sparse_jacobian": USE_SPARSE_JACOBIAN_DEFAULT,
     "wegscheider_cyclicity_enabled": WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
     "max_parallel_batch_workers": MAX_PARALLEL_BATCH_WORKERS_DEFAULT,
+    "batch_runtime_lane_budget": BATCH_RUNTIME_LANE_BUDGET_DEFAULT,
     "limit_blas_threads_per_worker": LIMIT_BLAS_THREADS_PER_WORKER_DEFAULT,
     "temperature_K": 298.15,
     "simulation_time": "10.0",
@@ -68,6 +70,7 @@ QSETTINGS_KEY_MAP: dict[str, str] = {
     "use_sparse_jacobian": "simulation/use_sparse_jacobian",
     "wegscheider_cyclicity_enabled": "simulation/wegscheider_cyclicity_enabled",
     "max_parallel_batch_workers": "simulation/max_parallel_batch_workers",
+    "batch_runtime_lane_budget": "simulation/batch_runtime_lane_budget",
     "limit_blas_threads_per_worker": "simulation/limit_blas_threads_per_worker",
     "temperature_K": "simulation/temperature",
     "simulation_time": "simulation/time",
@@ -117,7 +120,7 @@ def get_user_preference_payload(settings: QSettings) -> dict[str, object]:
                 result[key] = settings.value(qs_key, default, type=float)
             elif isinstance(default, int):
                 raw = settings.value(qs_key, default, type=int)
-                if key == "max_parallel_batch_workers":
+                if key in {"max_parallel_batch_workers", "batch_runtime_lane_budget"}:
                     raw = min(
                         int(MAX_PARALLEL_WORKERS_CEILING),
                         max(1, raw),

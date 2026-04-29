@@ -20,6 +20,7 @@ Returned schema
   "use_sparse_jacobian": bool,
   "wegscheider_cyclicity_enabled": bool,
   "max_parallel_batch_workers": int,
+  "batch_runtime_lane_budget": int,
   "limit_blas_threads_per_worker": bool,
   "slider_preview_solver": str,
   "slider_preview_points": int,
@@ -154,6 +155,17 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Max parallel workers:", self))
         row.addWidget(self._max_parallel_workers_spin)
+        row.addStretch(1)
+        solver_section_layout.addLayout(row)
+
+        self._batch_runtime_lane_budget_spin = QtWidgets.QSpinBox(self)
+        self._batch_runtime_lane_budget_spin.setRange(1, _MAX_PARALLEL_WORKERS_SPIN_MAX)
+        self._batch_runtime_lane_budget_spin.setValue(int(PROJECT_DEFAULTS["batch_runtime_lane_budget"]))
+        self._batch_runtime_lane_budget_spin.setMaximumWidth(max_input_width)
+        self._batch_runtime_lane_budget_spin.setMinimumWidth(80)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Batch runtime lanes:", self))
+        row.addWidget(self._batch_runtime_lane_budget_spin)
         row.addStretch(1)
         solver_section_layout.addLayout(row)
 
@@ -454,6 +466,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             "use_sparse_jacobian": bool(self._sparse_checkbox.isChecked()),
             "wegscheider_cyclicity_enabled": bool(self._wegscheider_checkbox.isChecked()),
             "max_parallel_batch_workers": int(self._max_parallel_workers_spin.value()),
+            "batch_runtime_lane_budget": int(self._batch_runtime_lane_budget_spin.value()),
             "limit_blas_threads_per_worker": bool(self._limit_blas_checkbox.isChecked()),
             "slider_preview_solver": str(self._combo_slider_preview_solver.currentText()),
             "slider_preview_points": int(self._spin_slider_preview_points.value()),
@@ -495,6 +508,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]),
         )
         cfg.setdefault("max_parallel_batch_workers", int(PROJECT_DEFAULTS["max_parallel_batch_workers"]))
+        cfg.setdefault("batch_runtime_lane_budget", int(PROJECT_DEFAULTS["batch_runtime_lane_budget"]))
         cfg.setdefault(
             "limit_blas_threads_per_worker",
             bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
@@ -519,6 +533,13 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             workers = int(PROJECT_DEFAULTS["max_parallel_batch_workers"])
         self._ensure_parallel_worker_spin_capacity(workers)
         self._max_parallel_workers_spin.setValue(max(1, workers))
+        try:
+            lane_budget = int(cfg.get("batch_runtime_lane_budget", int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])))
+        except Exception:
+            lane_budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
+        self._batch_runtime_lane_budget_spin.setValue(
+            max(1, min(_MAX_PARALLEL_WORKERS_SPIN_MAX, lane_budget))
+        )
         self._limit_blas_checkbox.setChecked(
             _coerce_bool(cfg.get("limit_blas_threads_per_worker", bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"])))
         )

@@ -125,6 +125,7 @@ def _simulation_submissions(lane_pool: _FakeLanePool) -> list[_Submission]:
 def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_s: float = 1.0) -> None:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
+        QtCore.QCoreApplication.processEvents()
         if len(_simulation_submissions(lane_pool)) >= int(expected):
             return
         time.sleep(0.005)

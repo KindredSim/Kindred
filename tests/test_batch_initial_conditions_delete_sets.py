@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.batch_containment import BatchLaneOutcome
 from tests.worker_stubs import make_contained_simulation_worker_stub
 
 
@@ -29,7 +31,10 @@ def _run_all_and_wait(main_window, qt_app, timeout_s: float = 5.0) -> None:
     deadline = time.time() + float(timeout_s)
     while time.time() < deadline:
         qt_app.processEvents()
-        if not bool(getattr(main_window, "_simulation_running", False)):
+        if (
+            not bool(getattr(main_window, "_simulation_running", False))
+            and not main_window.simulation_controller.parallel_batch.has_active_requests()
+        ):
             qt_app.processEvents()
             return
         QtCore.QThread.msleep(5)
@@ -291,7 +296,6 @@ def test_delete_selected_batch_sets_delete_confirm_cancel_keeps_dirty_transactio
 
 @pytest.mark.gui
 def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_window, qt_app, monkeypatch):
-    main_window.simulation_controller.parallel_batch.max_parallel_workers = 1
     if hasattr(main_window, "set_simulation_cache_caps"):
         main_window.set_simulation_cache_caps(result_cap=20, preview_cap=20)
 
@@ -320,6 +324,37 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
     _StubWorker = make_contained_simulation_worker_stub(payload_factory=_payload)
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _StubWorker)
 
+    class _ReadyLanePool:
+        def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+            _ = active_timeout_s
+            task_map = dict(task or {})
+            worker = SimpleNamespace(
+                _solver_config=dict(task_map.get("solver_config") or {}),
+                _initials=dict(task_map.get("initials") or {}),
+                _mechanism_text=str(task_map.get("mechanism_text") or ""),
+            )
+            payload = dict(_payload(worker))
+            payload.update(
+                {
+                    "run_id": int(run_id),
+                    "request_id": int(request_id),
+                    "set_id": str(set_id),
+                    "set_name": str(task_map.get("set_name") or set_id),
+                }
+            )
+            return BatchLaneOutcome(
+                lane_id=f"test-lane-{set_id}",
+                run_id=int(run_id),
+                request_id=int(request_id),
+                set_id=str(set_id),
+                owner_epoch=int(task_map.get("owner_epoch") or run_id),
+                success=True,
+                payload=payload,
+            )
+
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
+
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B ; k=0.5")
     main_window._batch_model.set_species(["A", "B"])
 
@@ -334,8 +369,18 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
         main_window._batch_store.set_value(int(row), "A", f"{1.0 + idx:.6g}")
         main_window._batch_store.set_value(int(row), "B", "0.0")
 
+    main_window.simulation_controller.parallel_batch.max_parallel_workers = int(
+        main_window._batch_store.row_count()
+    )
     _select_rows(main_window, [0, 1, 2])
+    main_window.simulation_controller.parallel_batch.lane_pool_factory = (
+        lambda _max_lanes, _limit_blas_threads: _ReadyLanePool()
+    )
 
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(
+        max_lanes=int(main_window._batch_store.row_count())
+    )
+    main_window.set_runtime_backed_run_controls_ready(True)
     _run_all_and_wait(main_window, qt_app)
     key1 = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     prefix1 = f"{key1}::"
@@ -348,6 +393,10 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
     workers_1 = len(main_window.findChildren(_StubWorker))
     marker_count_1 = main_window._mechanism_editor._reactions_text.toPlainText().count("Computational Mode")
 
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(
+        max_lanes=int(main_window._batch_store.row_count())
+    )
+    main_window.set_runtime_backed_run_controls_ready(True)
     _run_all_and_wait(main_window, qt_app)
     key2 = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     prefix2 = f"{key2}::"

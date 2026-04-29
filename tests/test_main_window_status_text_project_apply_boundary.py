@@ -679,6 +679,7 @@ def test_apply_project_payload_legacy_file_resets_leaky_keys(main_window):
     main_window._use_sparse_jacobian = True
     main_window._wegscheider_cyclicity_enabled = True
     main_window._sim_controller.parallel_batch.max_parallel_workers = 99
+    main_window._sim_controller.batch_runtime_lane_budget = 99
     main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker = False
 
     # Minimal legacy payload — only mechanism and batch
@@ -700,6 +701,10 @@ def test_apply_project_payload_legacy_file_resets_leaky_keys(main_window):
         == PROJECT_DEFAULTS["max_parallel_batch_workers"]
     )
     assert (
+        main_window._sim_controller.batch_runtime_lane_budget
+        == PROJECT_DEFAULTS["batch_runtime_lane_budget"]
+    )
+    assert (
         main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker
         == PROJECT_DEFAULTS["limit_blas_threads_per_worker"]
     )
@@ -712,6 +717,7 @@ def test_apply_project_payload_missing_simulation_keys_use_user_preferences(main
     main_window.config_controller.update_user_preference("use_sparse_jacobian", False)
     main_window.config_controller.update_user_preference("wegscheider_cyclicity_enabled", False)
     main_window.config_controller.update_user_preference("max_parallel_batch_workers", 7)
+    main_window.config_controller.update_user_preference("batch_runtime_lane_budget", 5)
     main_window.config_controller.update_user_preference("limit_blas_threads_per_worker", False)
 
     legacy_payload = {
@@ -730,6 +736,7 @@ def test_apply_project_payload_missing_simulation_keys_use_user_preferences(main
         main_window._sim_controller.parallel_batch.max_parallel_workers
         == 7
     )
+    assert main_window._sim_controller.batch_runtime_lane_budget == 5
     assert (
         main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker
         is False
@@ -740,18 +747,21 @@ def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_ch
     calls: list[None] = []
     main_window._sim_controller.parallel_batch_pool_settings_changed = lambda: calls.append(None)
     main_window._sim_controller.parallel_batch.max_parallel_workers = 2
+    main_window._sim_controller.batch_runtime_lane_budget = 2
     main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker = True
 
     payload = {
         "mechanism": "A -> B; k=1",
         "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
         "max_parallel_batch_workers": 7,
+        "batch_runtime_lane_budget": 5,
         "limit_blas_threads_per_worker": False,
     }
 
     main_window._apply_project_payload(payload, record_undo=False)
 
     assert int(main_window._sim_controller.parallel_batch.max_parallel_workers) == 7
+    assert int(main_window._sim_controller.batch_runtime_lane_budget) == 5
     assert bool(main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker) is False
     assert calls == [None]
 
@@ -763,12 +773,17 @@ def test_apply_project_payload_clamps_parallel_workers_to_shared_ceiling(main_wi
         "mechanism": "A -> B; k=1",
         "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
         "max_parallel_batch_workers": 200,
+        "batch_runtime_lane_budget": 200,
     }
 
     main_window._apply_project_payload(payload, record_undo=False)
 
     assert (
         main_window._sim_controller.parallel_batch.max_parallel_workers
+        == int(MAX_PARALLEL_WORKERS_CEILING)
+    )
+    assert (
+        main_window._sim_controller.batch_runtime_lane_budget
         == int(MAX_PARALLEL_WORKERS_CEILING)
     )
 
@@ -1183,6 +1198,35 @@ def test_runtime_readiness_does_not_override_non_runtime_run_disabled_state(main
     assert not main_window._run_btn.isEnabled()
 
 
+def test_authoritative_dsl_typing_invalidates_runtime_controls_without_warming(main_window, monkeypatch):
+    interactive_warms: list[bool] = []
+    batch_warms: list[bool] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window.set_run_button_enabled(True)
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_warms.append(bool(wait)),
+    )
+
+    main_window._on_authoritative_mechanism_input_changed()
+
+    assert not main_window._run_btn.isEnabled()
+    assert not main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert interactive_warms == []
+    assert batch_warms == []
+
+
 def test_runtime_readiness_poll_enables_run_before_preview_sliders(main_window, monkeypatch):
     scheduled: list[tuple[int, object]] = []
     readiness_by_mode = {False: True, True: False}
@@ -1196,6 +1240,11 @@ def test_runtime_readiness_poll_enables_run_before_preview_sliders(main_window, 
             mode="preview" if bool(fast_mode) else "ordinary",
             ready=bool(readiness_by_mode[bool(fast_mode)]),
         ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=bool(readiness_by_mode[True])),
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
@@ -1254,6 +1303,11 @@ def test_runtime_readiness_poll_enables_single_set_run_without_batch_runtime(mai
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
         "selected_run_runtime_snapshot",
         lambda: _runtime_snapshot(mode="ordinary", ready=True),
     )
@@ -1308,6 +1362,11 @@ def test_show_event_keeps_single_set_run_ready_after_hidden_serial_warm_without_
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
         "ensure_parallel_batch_pool_eagerly_created",
         lambda *, wait=False: batch_waits.append(bool(wait)),
     )
@@ -1333,7 +1392,7 @@ def test_show_event_keeps_single_set_run_ready_after_hidden_serial_warm_without_
     assert scheduled == []
 
 
-def test_multiset_selection_gates_run_until_visible_batch_runtime_ready(main_window, monkeypatch):
+def test_multiset_selection_gates_run_and_schedules_runtime_readiness(main_window, monkeypatch):
     scheduled: list[tuple[int, object]] = []
     batch_ready = {"value": False}
     interactive_waits: list[bool] = []
@@ -1359,6 +1418,16 @@ def test_multiset_selection_gates_run_until_visible_batch_runtime_ready(main_win
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="batch", ready=bool(batch_ready["value"])),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
         "selected_run_uses_parallel_batch_runtime",
         lambda: True,
     )
@@ -1370,11 +1439,12 @@ def test_multiset_selection_gates_run_until_visible_batch_runtime_ready(main_win
 
     main_window._on_batch_selection_changed()
 
+    main_window.set_run_button_enabled(True)
     assert not main_window._run_btn.isEnabled()
-    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert not main_window._mechanism_editor._variable_sliders.isEnabled()
     assert interactive_waits
-    assert all(wait is False for wait in interactive_waits)
     assert batch_waits
+    assert all(wait is False for wait in interactive_waits)
     assert all(wait is False for wait in batch_waits)
     assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
 
@@ -1386,9 +1456,28 @@ def test_multiset_selection_gates_run_until_visible_batch_runtime_ready(main_win
     assert main_window._mechanism_editor._variable_sliders.isEnabled()
     assert scheduled == []
 
-    scheduled.clear()
-    batch_ready["value"] = True
-    main_window._poll_interactive_runtime_readiness_after_refresh()
 
-    assert main_window._run_btn.isEnabled()
+def test_batch_selection_applies_failed_runtime_status_without_polling(main_window, monkeypatch):
+    scheduled: list[tuple[int, object]] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window.set_run_button_enabled(True)
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="batch", ready=False, status="failed"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+
+    main_window._on_batch_selection_changed()
+
+    assert not main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert "Simulation runtime failed to prepare" in main_window._status_label.text()
     assert scheduled == []

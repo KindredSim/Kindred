@@ -742,6 +742,7 @@ def test_new_project_payload_uses_explicit_user_preference_payload(controller_an
         "solver": "Radau",
         "use_sparse_jacobian": False,
         "max_parallel_batch_workers": 7,
+        "batch_runtime_lane_budget": 5,
         "limit_blas_threads_per_worker": False,
     }
     mw.config_controller.get_user_preference.side_effect = (
@@ -761,6 +762,7 @@ def test_new_project_payload_uses_explicit_user_preference_payload(controller_an
     assert payload["solver"] == "Radau"
     assert payload["use_sparse_jacobian"] is False
     assert payload["max_parallel_batch_workers"] == 7
+    assert payload["batch_runtime_lane_budget"] == 5
     assert payload["limit_blas_threads_per_worker"] is False
     for key in FITTING_DEFAULTS_KEYS:
         assert key not in payload
@@ -772,12 +774,14 @@ def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and
         "solver": "Radau",
         "use_sparse_jacobian": False,
         "max_parallel_batch_workers": 9,
+        "batch_runtime_lane_budget": 6,
         "limit_blas_threads_per_worker": False,
     }.get(key)
     mw._settings.value.side_effect = lambda key, default=None, type=None: {
         "simulation/solver": "BDF",
         "simulation/use_sparse_jacobian": True,
         "simulation/max_parallel_batch_workers": 3,
+        "simulation/batch_runtime_lane_budget": 2,
         "simulation/limit_blas_threads_per_worker": True,
     }.get(key, default)
 
@@ -791,6 +795,7 @@ def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and
     assert payload["solver"] == "Radau"
     assert payload["use_sparse_jacobian"] is False
     assert payload["max_parallel_batch_workers"] == 9
+    assert payload["batch_runtime_lane_budget"] == 6
     assert payload["limit_blas_threads_per_worker"] is False
     assert "fitting_parallel_enabled" not in payload
 

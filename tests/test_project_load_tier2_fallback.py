@@ -14,6 +14,7 @@ _NON_FITTING_PAYLOAD_VALUES = {
     "use_sparse_jacobian": True,
     "wegscheider_cyclicity_enabled": True,
     "max_parallel_batch_workers": 9,
+    "batch_runtime_lane_budget": 6,
     "limit_blas_threads_per_worker": True,
     "temperature_K": 345.0,
     "simulation_time": "42.5",
@@ -27,6 +28,7 @@ _NON_FITTING_PREF_VALUES = {
     "use_sparse_jacobian": False,
     "wegscheider_cyclicity_enabled": False,
     "max_parallel_batch_workers": 7,
+    "batch_runtime_lane_budget": 5,
     "limit_blas_threads_per_worker": False,
     "temperature_K": 321.0,
     "simulation_time": "27.5",
@@ -68,6 +70,8 @@ def _read_loaded_value(main_window, key: str) -> object:
         return bool(main_window._wegscheider_cyclicity_enabled)
     if key == "max_parallel_batch_workers":
         return int(main_window._sim_controller.parallel_batch.max_parallel_workers)
+    if key == "batch_runtime_lane_budget":
+        return int(main_window._sim_controller.batch_runtime_lane_budget)
     if key == "limit_blas_threads_per_worker":
         return bool(main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker)
     if key == "temperature_K":

@@ -1085,7 +1085,7 @@ class MainWindow(
             return
         try:
             ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
-            preview_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=True)
+            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
             run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
             if any(
                 self._runtime_snapshot_should_poll(snapshot)
@@ -1095,7 +1095,7 @@ class MainWindow(
                 if self.isVisible():
                     self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
                 ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
-                preview_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=True)
+                preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
                 run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
             elif self.isVisible():
                 self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
@@ -1712,6 +1712,7 @@ class MainWindow(
     def _invalidate_slider_runtime(self):
         """Mark the cached slider runtime as stale."""
         self._variable_runtime.invalidate_slider_runtime()
+        self._set_runtime_backed_controls_ready(False)
         try:
             self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
         except Exception:
@@ -1742,15 +1743,14 @@ class MainWindow(
         if pending_init_rewrite is not None or pending_init_state_network is not None:
             self._pending_init_migration_rewrite_for_invalidation = None
             self._pending_init_migration_state_network_for_invalidation = None
-            if (
-                self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_reactions_text_raw())
-                == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_rewrite))
-                and self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_state_network_dsl_raw())
-                == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_state_network))
-            ):
-                return
+        if (
+            self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_reactions_text_raw())
+            == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_rewrite))
+            and self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_state_network_dsl_raw())
+            == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_state_network))
+        ):
+            return
         self._invalidate_slider_runtime()
-        self._schedule_simulation_runtime_availability_refresh()
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
         has_active_cache = bool(
             batch_cache is not None
@@ -3820,6 +3820,7 @@ class MainWindow(
             'use_sparse_jacobian': bool(self._use_sparse_jacobian),
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
+            'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
         }
 
@@ -3842,6 +3843,7 @@ class MainWindow(
             'use_sparse_jacobian': bool(self._use_sparse_jacobian),
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
+            'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
             'temperature_K': (
                 self._pre_dsl_temperature
@@ -3998,6 +4000,7 @@ class MainWindow(
             data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
         )
         previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
+        previous_batch_runtime_lane_budget = int(self._sim_controller.batch_runtime_lane_budget)
         previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
             self._sim_controller.parallel_batch.max_parallel_workers = min(
@@ -4006,11 +4009,19 @@ class MainWindow(
             )
         except Exception:
             self._sim_controller.parallel_batch.max_parallel_workers = int(PROJECT_DEFAULTS['max_parallel_batch_workers'])
+        try:
+            self._sim_controller.batch_runtime_lane_budget = min(
+                int(MAX_PARALLEL_WORKERS_CEILING),
+                max(1, int(data.get('batch_runtime_lane_budget', _pref('batch_runtime_lane_budget')))),
+            )
+        except Exception:
+            self._sim_controller.batch_runtime_lane_budget = int(PROJECT_DEFAULTS['batch_runtime_lane_budget'])
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
             data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
         if (
             previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
+            or previous_batch_runtime_lane_budget != int(self._sim_controller.batch_runtime_lane_budget)
             or previous_limit_blas_threads
             != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         ):
@@ -6175,7 +6186,20 @@ class MainWindow(
 
     def _on_batch_selection_changed(self, *_args) -> None:
         self._update_batch_row_controls_state()
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
+        try:
+            run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
+            preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
+            self._set_runtime_backed_run_controls_ready(
+                self._runtime_snapshot_controls_ready(run_snapshot)
+            )
+            self._set_runtime_backed_preview_controls_ready(
+                self._runtime_snapshot_controls_ready(preview_snapshot)
+            )
+            self._apply_runtime_readiness_failure_status(run_snapshot, preview_snapshot)
+            if self._runtime_snapshot_should_poll(run_snapshot) or self._runtime_snapshot_should_poll(preview_snapshot):
+                self._schedule_simulation_runtime_availability_refresh(wait=False)
+        except Exception:
+            logger.debug("Failed to refresh selected-run runtime readiness after batch selection change", exc_info=True)
 
     def _on_batch_model_data_changed(
         self,
@@ -6200,7 +6224,6 @@ class MainWindow(
         self._ensure_focused_batch_set_visible()
         self._refresh_slider_edit_targets_summary()
         self._refresh_batch_display_from_focus_and_shown()
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _on_batch_show_membership_changed(self) -> None:
         focused_set_id = self._focused_batch_set_id_value()
@@ -6220,7 +6243,6 @@ class MainWindow(
         except RuntimeError as exc:
             logger.debug("Failed to rebuild species panel after slider target change: %s", exc, exc_info=True)
             self._species_panel_available = False
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _refresh_slider_edit_targets_summary(self) -> None:
         editor = getattr(self, "_mechanism_editor", None)
@@ -8989,6 +9011,7 @@ class MainWindow(
             'use_sparse_jacobian': self._use_sparse_jacobian,
             'wegscheider_cyclicity_enabled': bool(self._wegscheider_cyclicity_enabled),
             'max_parallel_batch_workers': int(self._sim_controller.parallel_batch.max_parallel_workers),
+            'batch_runtime_lane_budget': int(self._sim_controller.batch_runtime_lane_budget),
             'limit_blas_threads_per_worker': bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker),
             'slider_preview_solver': str(current_slider_preview_solver),
             'slider_preview_points': int(current_slider_preview_points),
@@ -9060,6 +9083,7 @@ class MainWindow(
             if 'wegscheider_cyclicity_enabled' in settings:
                 self._wegscheider_cyclicity_enabled = bool(settings['wegscheider_cyclicity_enabled'])
             previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
+            previous_batch_runtime_lane_budget = int(self._sim_controller.batch_runtime_lane_budget)
             previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             if 'max_parallel_batch_workers' in settings:
                 try:
@@ -9074,12 +9098,26 @@ class MainWindow(
                     self._sim_controller.parallel_batch.max_parallel_workers = int(
                         PROJECT_DEFAULTS["max_parallel_batch_workers"]
                     )
+            if 'batch_runtime_lane_budget' in settings:
+                try:
+                    self._sim_controller.batch_runtime_lane_budget = min(
+                        int(MAX_PARALLEL_WORKERS_CEILING),
+                        max(
+                            1,
+                            int(settings['batch_runtime_lane_budget']),
+                        ),
+                    )
+                except Exception:
+                    self._sim_controller.batch_runtime_lane_budget = int(
+                        PROJECT_DEFAULTS["batch_runtime_lane_budget"]
+                    )
             if 'limit_blas_threads_per_worker' in settings:
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
                     settings['limit_blas_threads_per_worker']
                 )
             if (
                 previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
+                or previous_batch_runtime_lane_budget != int(self._sim_controller.batch_runtime_lane_budget)
                 or previous_limit_blas_threads
                 != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             ):
@@ -9135,6 +9173,10 @@ class MainWindow(
             self.config_controller.update_user_preference(
                 "max_parallel_batch_workers",
                 self._sim_controller.parallel_batch.max_parallel_workers,
+            )
+            self.config_controller.update_user_preference(
+                "batch_runtime_lane_budget",
+                self._sim_controller.batch_runtime_lane_budget,
             )
             self.config_controller.update_user_preference(
                 "limit_blas_threads_per_worker",

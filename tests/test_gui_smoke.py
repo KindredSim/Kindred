@@ -260,6 +260,7 @@ def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window
     editor = main_window._mechanism_editor
     editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
     editor._validate_dsl()
+    main_window.set_runtime_backed_run_controls_ready(True)
 
     assert editor.run_btn.isEnabled() is True
 

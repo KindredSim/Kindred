@@ -14,6 +14,7 @@ class _Owner:
         self.ready = False
         self.start_calls: list[dict[str, object]] = []
         self.close_calls: list[bool] = []
+        self.close_thread_ids: list[int] = []
 
     @property
     def simulation_plan_payload(self) -> dict[str, object]:
@@ -31,6 +32,7 @@ class _Owner:
 
     def close(self, *, kill: bool = False) -> None:
         self.close_calls.append(bool(kill))
+        self.close_thread_ids.append(threading.get_ident())
 
 
 class _PrepareCapableOwner(_Owner):
@@ -162,7 +164,7 @@ def test_readiness_service_does_not_reuse_prepare_capable_owner_while_old_prepar
 
 
 @pytest.mark.unit
-def test_readiness_service_closes_owner_when_warm_reply_is_stale_after_close():
+def test_readiness_service_does_not_close_stale_owner_again_from_warm_thread():
     service = SimulationRuntimeApplication()
     payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=1"}}
     release_start = threading.Event()
@@ -186,11 +188,13 @@ def test_readiness_service_closes_owner_when_warm_reply_is_stale_after_close():
     thread = service._slots["preview"].thread
 
     service.close(mode="preview", kill=True)
+    close_thread_id = threading.get_ident()
     release_start.set()
     assert thread is not None
     thread.join(timeout=2.0)
 
-    assert owners[0].close_calls == [True, True]
+    assert owners[0].close_calls == [True]
+    assert owners[0].close_thread_ids == [close_thread_id]
     assert service.snapshot(mode="preview").status == "missing"
 
 
@@ -263,3 +267,201 @@ def test_readiness_service_reconciles_single_and_serial_queue_owner_families():
     assert owners[1].close_calls == []
     assert service.ready_owner(mode="ordinary", payload=first_payload) is None
     assert service.ready_owner(mode="ordinary", payload=second_payload) is owners[1]
+
+
+@pytest.mark.unit
+def test_readiness_service_defers_closing_active_owner_until_released():
+    service = SimulationRuntimeApplication()
+    first_payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=1"}}
+    second_payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=2"}}
+    owners: list[_Owner] = []
+
+    def _factory(owner_payload):
+        owner = _Owner(dict(owner_payload))
+        owners.append(owner)
+        return owner
+
+    first = service.ensure_ready(
+        mode="ordinary",
+        payload=first_payload,
+        owner_factory=_factory,
+        wait=True,
+    )
+    acquired = service.acquire_ready_owner(mode="ordinary", payload=first_payload)
+
+    assert acquired is first
+
+    service.ensure_ready_many(
+        mode="ordinary",
+        payloads=[second_payload],
+        owner_factory=_factory,
+        wait=True,
+    )
+
+    assert owners[0].close_calls == []
+    assert service.ready_owner(mode="ordinary", payload=first_payload) is None
+    assert service.ready_owner(mode="ordinary", payload=second_payload) is owners[1]
+
+    service.release_owner(first)
+
+    assert owners[0].close_calls == [False]
+    assert owners[1].close_calls == []
+
+
+@pytest.mark.unit
+def test_readiness_refresh_reuses_active_matching_owner_after_release():
+    service = SimulationRuntimeApplication()
+    payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=1"}}
+    owners: list[_Owner] = []
+
+    def _factory(owner_payload):
+        owner = _Owner(dict(owner_payload))
+        owners.append(owner)
+        return owner
+
+    first = service.ensure_ready(
+        mode="ordinary",
+        payload=payload,
+        owner_factory=_factory,
+        wait=True,
+    )
+    acquired = service.acquire_ready_owner(mode="ordinary", payload=payload)
+
+    assert acquired is first
+
+    refreshed = service.ensure_ready_many(
+        mode="ordinary",
+        payloads=[payload],
+        owner_factory=_factory,
+        wait=True,
+    )
+
+    assert refreshed == [first]
+    assert owners == [first]
+    assert service.ready_owner(mode="ordinary", payload=payload) is None
+
+    service.release_owner(first)
+
+    assert owners == [first]
+    assert owners[0].close_calls == []
+    assert service.ready_owner(mode="ordinary", payload=payload) is first
+
+
+@pytest.mark.unit
+def test_single_readiness_refresh_reuses_active_matching_owner_after_release():
+    service = SimulationRuntimeApplication()
+    payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=1"}}
+    owners: list[_Owner] = []
+
+    def _factory(owner_payload):
+        owner = _Owner(dict(owner_payload))
+        owners.append(owner)
+        return owner
+
+    first = service.ensure_ready(
+        mode="ordinary",
+        payload=payload,
+        owner_factory=_factory,
+        wait=True,
+    )
+    acquired = service.acquire_ready_owner(mode="ordinary", payload=payload)
+
+    assert acquired is first
+
+    refreshed = service.ensure_ready(
+        mode="ordinary",
+        payload=payload,
+        owner_factory=_factory,
+        wait=True,
+    )
+
+    assert refreshed is first
+    assert owners == [first]
+    assert service.ready_owner(mode="ordinary", payload=payload) is None
+
+    service.release_owner(first)
+
+    assert owners == [first]
+    assert owners[0].close_calls == []
+    assert service.ready_owner(mode="ordinary", payload=payload) is first
+
+
+@pytest.mark.unit
+def test_readiness_refresh_clears_active_owner_retirement_when_payload_becomes_desired_again():
+    service = SimulationRuntimeApplication()
+    first_payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=1"}}
+    second_payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=2"}}
+    owners: list[_Owner] = []
+
+    def _factory(owner_payload):
+        owner = _Owner(dict(owner_payload))
+        owners.append(owner)
+        return owner
+
+    first = service.ensure_ready(
+        mode="ordinary",
+        payload=first_payload,
+        owner_factory=_factory,
+        wait=True,
+    )
+    acquired = service.acquire_ready_owner(mode="ordinary", payload=first_payload)
+
+    assert acquired is first
+
+    service.ensure_ready_many(
+        mode="ordinary",
+        payloads=[second_payload],
+        owner_factory=_factory,
+        wait=True,
+    )
+    service.ensure_ready_many(
+        mode="ordinary",
+        payloads=[first_payload],
+        owner_factory=_factory,
+        wait=True,
+    )
+
+    service.release_owner(first)
+
+    assert len(owners) == 2
+    assert first.close_calls == []
+    assert service.ready_owner(mode="ordinary", payload=first_payload) is first
+
+
+@pytest.mark.unit
+def test_readiness_service_does_not_acquire_owner_until_warm_thread_finishes():
+    service = SimulationRuntimeApplication()
+    payload = {"execution_request": {"mechanism_text": "reaction: A -> B; k=1"}}
+    start_entered = threading.Event()
+    finish_start = threading.Event()
+    owners: list[_Owner] = []
+
+    class _ReadyBeforeReturnOwner(_Owner):
+        def start(self, *, wait: bool = True) -> None:
+            self.start_calls.append({"wait": bool(wait)})
+            self.ready = True
+            start_entered.set()
+            finish_start.wait(timeout=2.0)
+
+    def _factory(owner_payload):
+        owner = _ReadyBeforeReturnOwner(dict(owner_payload))
+        owners.append(owner)
+        return owner
+
+    service.request_warm(mode="ordinary", payload=payload, owner_factory=_factory, wait=False)
+    assert start_entered.wait(timeout=1.0)
+
+    assert owners[0].is_ready is True
+    assert service.ready_owner(mode="ordinary", payload=payload) is None
+    assert service.acquire_ready_owner(mode="ordinary", payload=payload) is None
+    assert owners[0].close_calls == []
+
+    thread = service._slots["ordinary"].thread
+    finish_start.set()
+    assert thread is not None
+    thread.join(timeout=2.0)
+
+    acquired = service.acquire_ready_owner(mode="ordinary", payload=payload)
+
+    assert acquired is owners[0]
+    assert owners[0].close_calls == []
