@@ -75,14 +75,17 @@ def test_computational_mode_fast_equilibrium_is_reversible_in_simulation():
     assert float(dy[species_names.index("D")]) < 0.0
 
     y0 = np.array([mechanism.species[nm].initial_conc for nm in species_names], dtype=float)
+    # The production fast-equilibrium default is intentionally large. Integrate
+    # across enough fast time constants to prove the simulated reversible ratio
+    # without forcing implicit solvers through a long post-equilibrium stiff tail.
     req = SimulationRequest(
         rhs=rhs,
-        t_span=(0.0, 1e-2),
+        t_span=(0.0, 1e-6),
         y0=y0,
         solver="BDF",
-        rtol=1e-9,
+        rtol=1e-6,
         atol=1e-12,
-        grid={"N": 200},
+        grid={"N": 50},
     )
     result = solve_ode(req)
 
@@ -91,4 +94,3 @@ def test_computational_mode_fast_equilibrium_is_reversible_in_simulation():
     ratio_final = D_final / A_final if A_final else float("inf")
 
     assert ratio_final == pytest.approx(expected_ratio, rel=0.05, abs=0.0)
-

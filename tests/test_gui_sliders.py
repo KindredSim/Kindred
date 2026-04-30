@@ -89,6 +89,49 @@ def _worker_payload(prepared, mechanism_text):
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
+
+class _SliderCommitTransitionWorker(QtCore.QObject):
+    def __init__(self, *, running: bool = True) -> None:
+        super().__init__()
+        self._running = bool(running)
+        self.cancel_calls = 0
+        self.terminate_calls = 0
+        self.close_calls: list[bool] = []
+
+    def isRunning(self) -> bool:
+        return bool(self._running)
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        self._running = False
+
+    def wait(self, _ms: int | None = None) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._running = False
+
+    def close(self, *, kill: bool = False) -> None:
+        self.close_calls.append(bool(kill))
+        self._running = False
+
+
+def _completion_payload_with_a_series(values: list[float] | np.ndarray) -> dict[str, object]:
+    series_a = np.asarray(values, dtype=float).reshape(-1)
+    t = np.linspace(0.0, 1.0, series_a.size, dtype=float)
+    return {
+        "t": t,
+        "Y": np.vstack([series_a, np.zeros_like(series_a)]),
+        "species_names": ["A", "B"],
+        "algebra_scalars": {},
+        "mechanism": None,
+        "mechanism_text": "A -> B ; k=1.0",
+        "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
+        "fallback_occurred": False,
+        "fallback_message": None,
+    }
+
 def _find_slider_visibility_action(main_window, entry_kind: str, name: str):
     picker = main_window.findChild(QtWidgets.QToolButton, "sliderVisibilityPickerButton")
     assert picker is not None
@@ -3113,6 +3156,184 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
     assert cache.active_cache_invalidated_set_ids == tuple(selected_ids)
     assert main_window.active_batch_selection() == ("", "")
     _assert_selection_plot_cleared(main_window)
+
+
+def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_explicit_completion(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("commit triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    selected_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(selected_ids) == 1
+    set_id = selected_ids[0]
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot()
+    )
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "species-only-commit-preserves-preview-old-explicit-key"
+    old_explicit_series = np.asarray([1.0, 0.5], dtype=float)
+    cache.result_cache[f"{explicit_key}::{set_id}"] = {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "series": {"A": old_explicit_series},
+        "algebra_scalars": {},
+    }
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = (set_id,)
+
+    old_run_id = 41
+    old_request_id = 211
+    controller = main_window.simulation_controller
+    worker = _SliderCommitTransitionWorker(running=True)
+    controller._run_sequence_id = old_run_id
+    controller._active_run_id = old_run_id
+    controller._latest_sim_request_id = old_request_id
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = worker
+    preview_owner = _SliderCommitTransitionWorker(running=True)
+    controller._preview_simulation_owner = preview_owner
+
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
+    preview_key = "species-only-commit-preserves-preview-key"
+    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
+    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        set_id=set_id,
+        mechanism_text=mechanism_text,
+    )
+    cache.preview_cache[f"{preview_key}::{set_id}"] = {
+        "t": preview_t,
+        "series": {"A": preview_series},
+        "algebra_scalars": {},
+        "mechanism_text": mechanism_text,
+        "solver_config": dict(solver_config),
+        "preview_batch_cache_token": str(preview_token or ""),
+    }
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (set_id,)
+    assert main_window.display_cached_batch_selection(
+        cache_key=preview_key,
+        selected_sets=[set_id],
+        cache_store=cache.preview_cache,
+        allow_fallback=False,
+    )
+
+    main_window._on_commit_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
+    assert controller._active_run_id != old_run_id
+    assert worker.cancel_calls == 1
+    assert controller._preview_simulation_owner is preview_owner
+    assert preview_owner.close_calls == []
+    assert cache.active_cache_invalidated_set_ids == (set_id,)
+    plot = main_window._plot_tabs._main_plot
+    assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), preview_series)
+
+    controller.on_simulation_complete(
+        _completion_payload_with_a_series([42.0, 43.0]),
+        run_id=old_run_id,
+        fast_mode=False,
+        request_id=old_request_id,
+        batch_set_id=set_id,
+        cache_key=explicit_key,
+    )
+
+    assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), preview_series)
+
+
+def test_species_only_commit_invalidates_stale_explicit_but_preserves_unaffected_selection_cache(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("A -> B ; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "4.0")
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection or commit triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    set_a = str(main_window._batch_set_id_for_row(0) or "")
+    set_b = str(main_window._batch_set_id_for_row(1) or "")
+    assert set_a and set_b and set_a != set_b
+
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "species-only-commit-selection-switch-explicit-key"
+    series_a = np.asarray([7.0, 14.0], dtype=float)
+    series_b = np.asarray([3.0, 6.0], dtype=float)
+    for set_id, series in ((set_a, series_a), (set_b, series_b)):
+        cache.result_cache[f"{explicit_key}::{set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": series},
+            "algebra_scalars": {},
+        }
+    cache.active_cache_key = explicit_key
+    cache.active_cache_valid_set_ids = (set_a, set_b)
+    assert main_window.display_cached_batch_selection(
+        cache_key=explicit_key,
+        selected_sets=[set_a],
+        prefer_set=set_a,
+        allow_fallback=False,
+    )
+    plot = main_window._plot_tabs._main_plot
+    assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), series_a)
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot()
+    )
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
+    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_a).entry is None
+
+    main_window._on_commit_slider_overrides_clicked()
+    qt_app.processEvents()
+
+    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
+    assert cache.active_cache_invalidated_set_ids == (set_a,)
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+    _select_batch_rows(main_window, [1])
+    qt_app.processEvents()
+    assert main_window.active_batch_selection()[0] == set_b
+    assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), series_b)
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    assert not np.allclose(np.asarray((getattr(plot, "_series", {}) or {}).get("A", []), dtype=float), series_a)
+    assert main_window.active_batch_selection()[0] != set_a
+
 
 def test_workspace_aware_preview_display_clears_stale_pending_status_after_success(
     main_window,

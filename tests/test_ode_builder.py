@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import numpy as np
 import pytest
 
@@ -33,9 +35,9 @@ def test_equilibrium_net_rates_avoid_inf_minus_inf_cancellation():
     assert dy.shape == y0.shape
     assert np.all(np.isfinite(dy))
 
-    expected_r = np.longdouble(kf) * np.longdouble(a0) - np.longdouble(kr) * np.longdouble(b0)
-    expected = np.array([-expected_r, expected_r], dtype=np.longdouble)
-    assert np.allclose(dy, expected.astype(float), rtol=1e-9, atol=0.0)
+    expected_r = Decimal(str(kf)) * Decimal(str(a0)) - Decimal(str(kr)) * Decimal(str(b0))
+    expected = np.array([-float(expected_r), float(expected_r)], dtype=float)
+    assert np.allclose(dy, expected, rtol=1e-9, atol=0.0)
 
 
 def test_fast_equilibrium_K_only_derives_rates_via_common_policy():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import math
@@ -14,6 +15,12 @@ if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ConcentrationOverlayCommitResult:
+    touched_rows: tuple[int, ...] = ()
+    touched_set_ids: tuple[str, ...] = ()
 
 
 class MainWindowPreviewSession:
@@ -689,16 +696,16 @@ class MainWindowPreviewSession:
     def has_dirty_transaction(self) -> bool:
         return bool(self.has_local_mechanism_workspaces()) or bool(self.has_staged_concentration_overlays())
 
-    def apply_staged_concentration_overlays(self, model: object) -> list[int]:
+    def apply_staged_concentration_overlays(self, model: object) -> ConcentrationOverlayCommitResult:
         if model is None or not self._staged_concentration_overlays_by_set_id:
-            return []
+            return ConcentrationOverlayCommitResult()
         touched_rows: list[int] = []
         touched_set_ids: list[str] = []
         try:
             store = model.store()
             species_list = list(store.visible_species())
         except Exception:
-            return []
+            return ConcentrationOverlayCommitResult()
         for row in range(int(model.rowCount())):
             set_id = self._set_id_for_row(int(row))
             overlay = self._staged_concentration_overlays_by_set_id.get(set_id or "")
@@ -720,7 +727,10 @@ class MainWindowPreviewSession:
         self._bump_dirty_state_generation(touched_set_ids)
         self._prune_current_species_slider_replay_intent()
         self._refresh_transaction_button_state()
-        return touched_rows
+        return ConcentrationOverlayCommitResult(
+            touched_rows=tuple(touched_rows),
+            touched_set_ids=tuple(touched_set_ids),
+        )
 
     def clear_working_transaction(
         self,

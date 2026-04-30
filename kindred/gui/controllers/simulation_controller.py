@@ -25,6 +25,7 @@ from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutco
 from kindred.core.simulation_identity import (
     SimulationIdentity,
     SimulationScopeIdentity,
+    canonical_initials_fingerprint,
     contained_simulation_owner_identity,
     coerce_simulation_identity,
 )
@@ -1245,6 +1246,19 @@ class SimulationController(QtCore.QObject):
     def invalidate_active_explicit_simulation_for_authoritative_change(self) -> None:
         self._invalidate_active_explicit_simulation_for_authoritative_change()
 
+    def supersede_active_work_for_authoritative_mechanism_transition(
+        self,
+        *,
+        epoch: int,
+        affected_set_ids: Sequence[str] = (),
+        close_preview_runtime_owner: bool = True,
+    ) -> None:
+        self._supersede_active_work_for_authoritative_mechanism_transition(
+            epoch=int(epoch),
+            affected_set_ids=affected_set_ids,
+            close_preview_runtime_owner=bool(close_preview_runtime_owner),
+        )
+
     def run_simulation_internal(
         self,
         *,
@@ -2119,6 +2133,15 @@ class SimulationController(QtCore.QObject):
                 )
             except Exception:
                 return []
+            identity = self._simulation_identity_for_set(
+                set_id=str(set_id),
+                solver_config=solver_config,
+                t_end=float(t_end),
+                canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
+                preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(str(set_id), ""),
+                fast_mode=bool(fast_mode),
+            )
+            simulation_identity_by_set_id[str(set_id)] = identity.to_payload()
             request_payload = SimulationExecutionRequest(
                 prepared_payload=None,
                 initials=dict(initials_dict),
@@ -2683,6 +2706,21 @@ class SimulationController(QtCore.QObject):
         self._run_sequence_id = int(getattr(self, "_run_sequence_id", 0)) + 1
         self._active_run_id = int(self._run_sequence_id)
         self._cancel_active_run_for_restart()
+
+    def _supersede_active_work_for_authoritative_mechanism_transition(
+        self,
+        *,
+        epoch: int,
+        affected_set_ids: Sequence[str] = (),
+        close_preview_runtime_owner: bool = True,
+    ) -> None:
+        self._authoritative_mechanism_transition_epoch = int(epoch)
+        self._authoritative_runtime_input_epoch = int(epoch)
+        self._authoritative_runtime_input_invalidated_set_ids = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
+        )
+        self._invalidate_active_explicit_simulation_for_authoritative_change()
+        self._invalidate_slider_preview_work(close_runtime_owner=bool(close_preview_runtime_owner))
 
     def _queue_slider_plot_update(
         self,
@@ -3443,6 +3481,7 @@ class SimulationController(QtCore.QObject):
         set_id: str,
         solver_config: Mapping[str, Any],
         t_end: float,
+        canonical_initials_fingerprint: str = "",
         preview_batch_cache_token: str = "",
         fast_mode: bool,
     ) -> SimulationIdentity:
@@ -3454,6 +3493,7 @@ class SimulationController(QtCore.QObject):
         return SimulationIdentity.build(
             schema_id=self.ui.mechanism.simulation_schema_id(),
             param_fingerprint=param_fingerprint,
+            canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
             solver_config=solver_config,
             t_end=float(t_end),
             preview_batch_cache_token=preview_token,
@@ -4521,6 +4561,7 @@ class SimulationController(QtCore.QObject):
             context=ctx,
         )
 
+        contained_owner = None
         if isinstance(plan_payload, dict):
             try:
                 from kindred.core.simulation_containment import build_contained_simulation_plan_payload
@@ -4544,6 +4585,14 @@ class SimulationController(QtCore.QObject):
                     parent=self,
                 )
             except Exception as exc:
+                if contained_owner is not None:
+                    try:
+                        self._runtime_application.release_owner(contained_owner, kill=False)
+                    except Exception as release_exc:
+                        self._record_nonfatal_exception(
+                            "Failed to release acquired simulation runtime owner after worker construction failure",
+                            release_exc,
+                        )
                 self._dispatch_simulation_error(
                     simulation_failure_from_exception(exc, kind="simulation_containment_payload"),
                     run_id=int(run_id),
@@ -4980,6 +5029,15 @@ class SimulationController(QtCore.QObject):
                         self._slider_simulation_active = False
                         _clear_slider_triggered_preflight_state()
                         return
+                    identity = self._simulation_identity_for_set(
+                        set_id=str(set_id),
+                        solver_config=solver_config,
+                        t_end=float(t_end),
+                        canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
+                        preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(str(set_id), ""),
+                        fast_mode=bool(fast_mode),
+                    )
+                    simulation_identity_by_set_id[str(set_id)] = identity.to_payload()
                     mechanism_signature_by_set_id[str(set_id)] = batch_mechanism_signature(
                         simulation_identity=identity,
                     )
@@ -5049,6 +5107,15 @@ class SimulationController(QtCore.QObject):
                         self._slider_simulation_active = False
                         _clear_slider_triggered_preflight_state()
                         return
+                    identity = self._simulation_identity_for_set(
+                        set_id=str(set_id),
+                        solver_config=solver_config,
+                        t_end=float(t_end),
+                        canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
+                        preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(str(set_id), ""),
+                        fast_mode=bool(fast_mode),
+                    )
+                    simulation_identity_by_set_id[str(set_id)] = identity.to_payload()
                     request_payload = SimulationExecutionRequest(
                         prepared_payload=None,
                         initials=dict(initials_dict),
@@ -5103,6 +5170,15 @@ class SimulationController(QtCore.QObject):
                 self._requeue_preserved_pending_slider_replay_after_preflight_abort()
                 return
 
+            identity = self._simulation_identity_for_set(
+                set_id=str(set_id),
+                solver_config=solver_config,
+                t_end=float(t_end),
+                canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
+                preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(str(set_id), ""),
+                fast_mode=bool(fast_mode),
+            )
+            simulation_identity_by_set_id[str(set_id)] = identity.to_payload()
             mechanism_signature_by_set_id[str(set_id)] = batch_mechanism_signature(
                 simulation_identity=identity,
             )
@@ -5276,6 +5352,7 @@ class SimulationController(QtCore.QObject):
             "active": True,
             "request_id": int(request_id),
             "run_id": run_id,
+            "runtime_input_epoch": int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0),
             "fast_mode": bool(fast_mode),
             "reuse_parallel_lane_pool": bool(reuse_parallel_lane_pool),
             "keep_lane_pool_alive": bool(reuse_parallel_lane_pool and parallel_mode),
@@ -5569,6 +5646,19 @@ class SimulationController(QtCore.QObject):
             return
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
         ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, Mapping) and ctx.get("runtime_input_epoch") is not None:
+            try:
+                completion_runtime_input_epoch = int(ctx.get("runtime_input_epoch") or 0)
+            except Exception:
+                completion_runtime_input_epoch = 0
+            current_runtime_input_epoch = int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0)
+            if completion_runtime_input_epoch != current_runtime_input_epoch:
+                logger.debug(
+                    "Ignoring stale simulation completion (runtime_input_epoch=%s, current=%s)",
+                    completion_runtime_input_epoch,
+                    current_runtime_input_epoch,
+                )
+                return
         policy_context = self._completion_policy_context_from_raw(ctx)
         callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,

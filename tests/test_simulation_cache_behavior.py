@@ -215,30 +215,11 @@ def _current_preview_identity_payload(
     set_id: str,
     preview_batch_cache_token: str | None = None,
 ) -> dict:
-    solver_config = _current_preview_solver_config(main_window)
-    schema_text = str(main_window.mechanism_reactions_text_raw() or "")
-    state_network_dsl = str(main_window.mechanism_state_network_dsl_raw() or "")
-    if state_network_dsl.strip():
-        schema_text += "\n\n# State Network\n" + state_network_dsl
-    param_store = main_window._preview_session.param_store
-    param_store.set_schema(schema_text)
-    return {
-        "version": 1,
-        "schema_id": str(param_store.schema_id or ""),
-        "param_fingerprint": str(main_window.simulation_param_fingerprint(str(set_id)) or ""),
-        "solver": {
-            "solver": str(solver_config.get("solver") or ""),
-            "rtol": float(solver_config.get("rtol", 1e-6)),
-            "atol": float(solver_config.get("atol", 1e-12)),
-            "grid_n": int((solver_config.get("grid") or {}).get("N") or 0),
-            "temperature_K": float(solver_config.get("temperature_K") or 298.15),
-            "use_sparse_jacobian": bool(solver_config.get("use_sparse_jacobian")),
-            "wegscheider_cyclicity_enabled": bool(solver_config.get("wegscheider_cyclicity_enabled")),
-        },
-        "t_end": float(main_window.parse_sim_time_seconds()),
-        "preview_batch_cache_token": str(preview_batch_cache_token or ""),
-        "execution_flags": ("fast_mode",),
-    }
+    identity = main_window._current_workspace_preview_identity(set_id=str(set_id))
+    payload = identity.to_payload()
+    if preview_batch_cache_token is not None:
+        assert str(payload.get("preview_batch_cache_token") or "") == str(preview_batch_cache_token or "")
+    return payload
 
 def _workspace_preview_payload(
     main_window,

@@ -2929,6 +2929,75 @@ def test_invalidate_active_explicit_simulation_for_authoritative_change_cancels_
     mw.set_data.assert_not_called()
 
 @pytest.mark.unit
+def test_supersede_active_work_for_authoritative_mechanism_transition_rejects_old_explicit_completion(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._run_sequence_id = 11
+    controller._active_run_id = 11
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": 101,
+    }
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    explicit_worker = _FakeWorker(running=True, wait_returns=False)
+    explicit_worker._request_id = 101  # type: ignore[attr-defined]
+    explicit_worker._fast_mode = False  # type: ignore[attr-defined]
+    controller._simulation_worker = explicit_worker
+    mw.set_data.reset_mock()
+
+    controller.supersede_active_work_for_authoritative_mechanism_transition(epoch=4)
+
+    assert controller._active_run_id == 12
+    assert explicit_worker._cancelled is True
+    assert controller._simulation_running is False
+    assert mw._stop_btn.isEnabled() is False
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=11,
+        fast_mode=False,
+        request_id=101,
+    )
+
+    mw.set_data.assert_not_called()
+
+
+@pytest.mark.unit
+def test_runtime_input_supersede_preserves_preview_owner_when_runtime_identity_is_unchanged(
+    controller: SimulationController,
+):
+    class _FakeOwner:
+        def __init__(self) -> None:
+            self.close_calls: list[bool] = []
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    preview_owner = _FakeOwner()
+    controller._preview_simulation_owner = preview_owner
+    controller._preview_ownership = PreviewOwnershipState(request_id=4, epoch=2)
+    controller._latest_sim_request_id = 4
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+
+    controller.supersede_active_work_for_authoritative_mechanism_transition(
+        epoch=8,
+        affected_set_ids=("id1",),
+        close_preview_runtime_owner=False,
+    )
+
+    assert controller._authoritative_runtime_input_epoch == 8
+    assert controller._authoritative_runtime_input_invalidated_set_ids == ("id1",)
+    assert controller._preview_simulation_owner is preview_owner
+    assert preview_owner.close_calls == []
+    assert controller.run_state.preview_ownership.request_id is None
+
+
+@pytest.mark.unit
 def test_nonowning_stale_fast_error_does_not_reset_explicit_run_status_progress(
     monkeypatch,
     mw: _FakeMainWindow,
@@ -7124,6 +7193,174 @@ def test_first_ordinary_action_requires_ready_exact_contained_owner(
     assert not mw._run_btn.isEnabled()
     assert "runtime" in mw._status_label.text.lower()
     assert "ready" in mw._status_label.text.lower()
+
+
+@pytest.mark.unit
+def test_contained_worker_construction_failure_releases_acquired_runtime_owner(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    class _Owner:
+        def __init__(self, payload: dict[str, object], *, fast_mode: bool) -> None:
+            self.payload = dict(payload)
+            self.fast_mode = bool(fast_mode)
+            self.ready = False
+            self.start_calls: list[dict[str, object]] = []
+            self.close_calls: list[bool] = []
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, object]:
+            return dict(self.payload)
+
+        @property
+        def is_ready(self) -> bool:
+            return bool(self.ready)
+
+        def start(self, *, wait: bool = True) -> None:
+            self.start_calls.append({"wait": bool(wait)})
+            if bool(wait):
+                self.ready = True
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    created_owners: list[_Owner] = []
+
+    def _owner_factory(*, fast_mode: bool, simulation_plan_payload: dict[str, object]) -> _Owner:
+        owner = _Owner(dict(simulation_plan_payload), fast_mode=bool(fast_mode))
+        created_owners.append(owner)
+        return owner
+
+    def _raising_worker_factory(**_kwargs):
+        raise RuntimeError("worker construction failed")
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _raising_worker_factory)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        lambda text, default_set_name="set1": ({}, text),
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    mw._get_mechanism_text.return_value = "reaction: A -> B; k=1"
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
+    controller._contained_simulation_owner_factory = _owner_factory
+    controller._dispatch_simulation_error = MagicMock()
+
+    controller.ensure_interactive_simulation_runtimes_available(wait=True)
+    ordinary_owner = controller._ordinary_simulation_owner
+    assert ordinary_owner is created_owners[0]
+    assert ordinary_owner.is_ready
+
+    controller._run_simulation_internal(
+        fast_mode=False,
+        request_id=11,
+        batch_rows=[0],
+        reuse_parallel_lane_pool=False,
+    )
+
+    assert controller._simulation_worker is None
+    assert controller._ordinary_simulation_owner is ordinary_owner
+    assert ordinary_owner.close_calls == []
+
+
+@pytest.mark.unit
+def test_contained_worker_construction_failure_release_error_preserves_original_failure(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    class _Owner:
+        def __init__(self, payload: dict[str, object], *, fast_mode: bool) -> None:
+            self.payload = dict(payload)
+            self.fast_mode = bool(fast_mode)
+            self.ready = False
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, object]:
+            return dict(self.payload)
+
+        @property
+        def is_ready(self) -> bool:
+            return bool(self.ready)
+
+        def start(self, *, wait: bool = True) -> None:
+            if bool(wait):
+                self.ready = True
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    created_owners: list[_Owner] = []
+
+    def _owner_factory(*, fast_mode: bool, simulation_plan_payload: dict[str, object]) -> _Owner:
+        owner = _Owner(dict(simulation_plan_payload), fast_mode=bool(fast_mode))
+        created_owners.append(owner)
+        return owner
+
+    def _raising_worker_factory(**_kwargs):
+        raise RuntimeError("worker construction failed")
+
+    def _raising_release_owner(_owner, *, kill: bool = False) -> None:
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _raising_worker_factory)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        lambda text, default_set_name="set1": ({}, text),
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    mw._get_mechanism_text.return_value = "reaction: A -> B; k=1"
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
+    controller._contained_simulation_owner_factory = _owner_factory
+    controller._dispatch_simulation_error = MagicMock()
+
+    controller.ensure_interactive_simulation_runtimes_available(wait=True)
+    assert created_owners
+    monkeypatch.setattr(controller._runtime_application, "release_owner", _raising_release_owner)
+
+    controller._run_simulation_internal(
+        fast_mode=False,
+        request_id=11,
+        batch_rows=[0],
+        reuse_parallel_lane_pool=False,
+    )
+
+    error_payload = controller._dispatch_simulation_error.call_args.args[0]
+    assert error_payload["message"] == "worker construction failed"
+    assert error_payload["exc_type"] == "RuntimeError"
+    assert "release failed" in str(controller._last_nonfatal_exception)
 
 
 @pytest.mark.unit

@@ -252,9 +252,17 @@ class MainWindowVariableRuntime:
                 logger.warning("Could not parse mechanism for variable extraction: %s", exc)
                 return
 
+            variables, metadata = enumerate_step_parameters_for_gui(mechanism)
+            if not variables and self.is_energy_mode_mechanism(mechanism):
+                self.populate_energy_mode_variables_from_mechanism(
+                    mechanism,
+                    refresh_sliders=True,
+                    preserve_visibility=bool(preserve_visibility),
+                )
+                return
+
             unit_map = solver_parameter_units_from_mechanism(mechanism)
 
-            variables, metadata = enumerate_step_parameters_for_gui(mechanism)
             for name, meta in list(metadata.items()):
                 if isinstance(meta, dict) and meta.get("value_valid") is False:
                     mw._record_best_effort_failure(

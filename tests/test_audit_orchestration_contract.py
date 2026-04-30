@@ -18,9 +18,30 @@ STRICT_STAGES = "A B C D E F G H"
 EXHAUSTIVE_STAGES = "A B C D E F G H I J K L"
 
 
+def _bash_path(path: Path) -> str:
+    resolved = Path(path).resolve()
+    text = str(resolved)
+    if os.name != "nt":
+        return text
+    normalized = text.replace("\\", "/")
+    lower = normalized.lower()
+    for prefix in ("//wsl.localhost/", "//wsl$/"):
+        if lower.startswith(prefix):
+            parts = normalized.split("/")
+            if len(parts) >= 5:
+                return "/" + "/".join(parts[4:])
+    if len(normalized) >= 3 and normalized[1:3] == ":/":
+        return f"/mnt/{normalized[0].lower()}/{normalized[3:]}"
+    return normalized
+
+
+def _quote_bash_path(path: Path) -> str:
+    return shlex.quote(_bash_path(path))
+
+
 def _list_stages(*args: str) -> list[str]:
     result = subprocess.run(  # nosec B603 - controlled local script invocation
-        ["bash", str(RUN_ALL), *args, "--list-stages"],
+        ["bash", _bash_path(RUN_ALL), *args, "--list-stages"],
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -32,7 +53,7 @@ def _list_stages(*args: str) -> list[str]:
 
 def _run_script(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # nosec B603 - controlled local script invocation
-        ["bash", str(script), *args],
+        ["bash", _bash_path(script), *args],
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -66,7 +87,7 @@ def test_run_strict_executes_run_all_strict_and_accepts_clean_summary(tmp_path):
     audit_dir.mkdir(parents=True)
 
     run_strict = audit_dir / "run_strict.sh"
-    run_strict.write_text(RUN_STRICT.read_text(encoding="utf-8"), encoding="utf-8")
+    run_strict.write_text(RUN_STRICT.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
     run_strict.chmod(0o755)
 
     report_dir = tmp_path / "fake_report"
@@ -77,8 +98,8 @@ def test_run_strict_executes_run_all_strict_and_accepts_clean_summary(tmp_path):
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f"args_file={shlex.quote(str(args_file))}",
-                f"report_dir={shlex.quote(str(report_dir))}",
+                f"args_file={_quote_bash_path(args_file)}",
+                f"report_dir={_quote_bash_path(report_dir)}",
                 'printf "%s\\n" "$@" > "${args_file}"',
                 'mkdir -p "${report_dir}"',
                 'printf "%s\\n" "Kindred Audit Summary" "Audit A: PASS" > "${report_dir}/SUMMARY.txt"',
@@ -88,6 +109,7 @@ def test_run_strict_executes_run_all_strict_and_accepts_clean_summary(tmp_path):
             ]
         ),
         encoding="utf-8",
+        newline="\n",
     )
     fake_run_all.chmod(0o755)
 
@@ -130,7 +152,7 @@ def test_run_ci_skips_pytest_when_strict_gate_fails(tmp_path):
     audit_dir.mkdir(parents=True)
 
     run_ci = audit_dir / "run_ci.sh"
-    run_ci.write_text(RUN_CI.read_text(encoding="utf-8"), encoding="utf-8")
+    run_ci.write_text(RUN_CI.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
     run_ci.chmod(0o755)
 
     report_dir = tmp_path / "fake_report"
@@ -140,7 +162,7 @@ def test_run_ci_skips_pytest_when_strict_gate_fails(tmp_path):
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f"report_dir={shlex.quote(str(report_dir))}",
+                f"report_dir={_quote_bash_path(report_dir)}",
                 'mkdir -p "${report_dir}"',
                 'printf "%s\\n" "Kindred Audit Summary" > "${report_dir}/SUMMARY.txt"',
                 'echo "AUDIT_REPORT_DIR|${report_dir}"',
@@ -149,6 +171,7 @@ def test_run_ci_skips_pytest_when_strict_gate_fails(tmp_path):
             ]
         ),
         encoding="utf-8",
+        newline="\n",
     )
     fake_strict.chmod(0o755)
 
@@ -160,19 +183,20 @@ def test_run_ci_skips_pytest_when_strict_gate_fails(tmp_path):
         "\n".join(
             [
                 "#!/usr/bin/env bash",
-                f"touch {shlex.quote(str(pytest_marker))}",
+                f"touch {_quote_bash_path(pytest_marker)}",
                 "exit 0",
                 "",
             ]
         ),
         encoding="utf-8",
+        newline="\n",
     )
     fake_pytest.chmod(0o755)
 
     env = os.environ.copy()
-    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["PATH"] = f"{_bash_path(bin_dir)}{os.pathsep}{env['PATH']}"
     result = subprocess.run(  # nosec B603 - controlled local script invocation
-        ["bash", str(run_ci)],
+        ["bash", _bash_path(run_ci)],
         cwd=tmp_path,
         env=env,
         text=True,

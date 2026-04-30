@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import subprocess  # nosec B404 - controlled local test subprocesses
 import textwrap
@@ -18,6 +19,23 @@ pytestmark = [pytest.mark.unit]
 def _write(path: Path, text: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _bash_path(path: Path) -> str:
+    resolved = Path(path).resolve()
+    text = str(resolved)
+    if os.name != "nt":
+        return text
+    normalized = text.replace("\\", "/")
+    lower = normalized.lower()
+    for prefix in ("//wsl.localhost/", "//wsl$/"):
+        if lower.startswith(prefix):
+            parts = normalized.split("/")
+            if len(parts) >= 5:
+                return "/" + "/".join(parts[4:])
+    if len(normalized) >= 3 and normalized[1:3] == ":/":
+        return f"/mnt/{normalized[0].lower()}/{normalized[3:]}"
+    return normalized
 
 
 def _build_repo_tree(tmp_path: Path) -> Path:
@@ -64,9 +82,34 @@ def _make_fake_python3(fake_dir: Path, *, banner: str, counts_line: str) -> Path
             """
         ),
         encoding="utf-8",
+        newline="\n",
     )
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return script
+
+
+def _run_wrapper_with_fake_python(
+    *,
+    wrapper: Path,
+    fake_dir: Path,
+    report_dir: Path,
+    summary: Path,
+    repo_root: Path,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    command = (
+        f"PATH={shlex.quote(_bash_path(fake_dir))}:\"$PATH\" "
+        f"exec {shlex.quote(_bash_path(wrapper))} "
+        f"{shlex.quote(_bash_path(report_dir))} "
+        f"{shlex.quote(_bash_path(summary))}"
+    )
+    return subprocess.run(  # nosec B603 - controlled local wrapper invocation
+        ["bash", "-c", command],
+        cwd=str(repo_root),
+        env=env,
+        text=True,
+        capture_output=True,
+    )
 
 
 def test_iter_module_targets_preserves_exclusions_and_deterministic_order(tmp_path):
@@ -171,14 +214,14 @@ def test_audit_e_wrapper_preserves_filename_and_summary_contract(tmp_path):
     report_dir.mkdir(parents=True, exist_ok=True)
     summary = report_dir / "SUMMARY.txt"
     env = dict(os.environ)
-    env["PATH"] = str(fake_dir) + os.pathsep + env["PATH"]
 
-    res = subprocess.run(  # nosec B603 - controlled local wrapper invocation
-        ["bash", str(wrapper), str(report_dir), str(summary)],
-        cwd=str(repo_root),
+    res = _run_wrapper_with_fake_python(
+        wrapper=wrapper,
+        fake_dir=fake_dir,
+        report_dir=report_dir,
+        summary=summary,
+        repo_root=repo_root,
         env=env,
-        text=True,
-        capture_output=True,
     )
     assert res.returncode == 0, res.stderr or res.stdout
     assert (report_dir / "E_import_sweep.txt").exists()
@@ -200,14 +243,14 @@ def test_audit_h_wrapper_preserves_filename_and_summary_contract(tmp_path):
     report_dir.mkdir(parents=True, exist_ok=True)
     summary = report_dir / "SUMMARY.txt"
     env = dict(os.environ)
-    env["PATH"] = str(fake_dir) + os.pathsep + env["PATH"]
 
-    res = subprocess.run(  # nosec B603 - controlled local wrapper invocation
-        ["bash", str(wrapper), str(report_dir), str(summary)],
-        cwd=str(repo_root),
+    res = _run_wrapper_with_fake_python(
+        wrapper=wrapper,
+        fake_dir=fake_dir,
+        report_dir=report_dir,
+        summary=summary,
+        repo_root=repo_root,
         env=env,
-        text=True,
-        capture_output=True,
     )
     assert res.returncode == 0, res.stderr or res.stdout
     assert (report_dir / "H_warnings.txt").exists()

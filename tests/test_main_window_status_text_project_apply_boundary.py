@@ -6,6 +6,7 @@ import shiboken6
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
+from kindred.core.simulation_identity import canonical_initials_fingerprint
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
@@ -33,6 +34,44 @@ def _runtime_snapshot(
         controls_ready=bool(ready_value or not required_value),
         polling=bool(required_value and not ready_value and status_value != "failed"),
     )
+
+
+class _TransitionTestWorker(QtCore.QObject):
+    def __init__(self, *, running: bool = True, fast_mode: bool = False, request_id: int = 0) -> None:
+        super().__init__()
+        self._running = bool(running)
+        self._fast_mode = bool(fast_mode)
+        self._request_id = int(request_id)
+        self.cancel_calls = 0
+        self.terminate_calls = 0
+
+    def isRunning(self) -> bool:
+        return bool(self._running)
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        self._running = False
+
+    def wait(self, _ms: int | None = None) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._running = False
+
+
+def _completion_payload() -> dict[str, object]:
+    return {
+        "t": np.asarray([0.0, 1.0], dtype=float),
+        "Y": np.asarray([[1.0, 0.5], [0.0, 0.5]], dtype=float),
+        "species_names": ["A", "B"],
+        "algebra_scalars": {},
+        "mechanism": None,
+        "mechanism_text": "reaction: A -> B; k=1.0",
+        "solver_config": {},
+        "fallback_occurred": False,
+        "fallback_message": None,
+    }
 
 
 def _load_project_via_file_dialog(main_window, tmp_path, monkeypatch, payload) -> None:
@@ -1198,7 +1237,7 @@ def test_runtime_readiness_does_not_override_non_runtime_run_disabled_state(main
     assert not main_window._run_btn.isEnabled()
 
 
-def test_authoritative_dsl_typing_invalidates_runtime_controls_without_warming(main_window, monkeypatch):
+def test_draft_reactions_typing_does_not_schedule_runtime_warm(main_window, monkeypatch):
     interactive_warms: list[bool] = []
     batch_warms: list[bool] = []
 
@@ -1219,12 +1258,545 @@ def test_authoritative_dsl_typing_invalidates_runtime_controls_without_warming(m
         lambda *, wait=False: batch_warms.append(bool(wait)),
     )
 
-    main_window._on_authoritative_mechanism_input_changed()
+    main_window._set_mechanism_edit_locked(False)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._on_reactions_text_changed_for_main_window()
+
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert interactive_warms == []
+    assert batch_warms == []
+
+
+def test_authoritative_mechanism_commit_schedules_runtime_rewarm_after_invalidating_controls(
+    main_window,
+    monkeypatch,
+):
+    interactive_warms: list[bool] = []
+    batch_warms: list[bool] = []
+    scheduled: list[tuple[int, object]] = []
+    readiness_by_mode = {False: False, True: False}
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window.set_run_button_enabled(True)
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=bool(readiness_by_mode[bool(fast_mode)]),
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=bool(readiness_by_mode[True])),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=bool(readiness_by_mode[False])),
+    )
+
+    main_window._set_mechanism_edit_locked(False)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    assert main_window._try_lock_mechanism_editor()
 
     assert not main_window._run_btn.isEnabled()
     assert not main_window._mechanism_editor._variable_sliders.isEnabled()
-    assert interactive_warms == []
-    assert batch_warms == []
+    assert interactive_warms
+    assert all(wait is False for wait in interactive_warms)
+    assert batch_warms
+    assert all(wait is False for wait in batch_warms)
+    assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
+
+    readiness_by_mode[False] = True
+    readiness_by_mode[True] = True
+    scheduled.clear()
+    main_window._poll_interactive_runtime_readiness_after_refresh()
+
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert main_window._mechanism_editor.species_sliders_widget().isEnabled()
+    assert scheduled == []
+
+
+def test_authoritative_mechanism_commit_invalidates_display_before_scheduling_rewarm(
+    main_window,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window.set_run_button_enabled(True)
+    main_window.simulation_controller.batch_cache.active_cache_key = "active-result"
+
+    monkeypatch.setattr(
+        main_window,
+        "_invalidate_active_results_after_authoritative_mechanism_change",
+        lambda **_kwargs: events.append("invalidate_display"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "supersede_active_work_for_authoritative_mechanism_transition",
+        lambda *, epoch: events.append(f"supersede:{int(epoch)}"),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_authoritative_mechanism_derived_ui",
+        lambda: events.append("refresh_derived"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: events.append("schedule_rewarm"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: None,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+
+    main_window._set_mechanism_edit_locked(False)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    assert main_window._try_lock_mechanism_editor()
+
+    assert events[:4] == ["supersede:1", "invalidate_display", "refresh_derived", "schedule_rewarm"]
+
+
+def test_programmatic_mechanism_load_invalidates_display_before_scheduling_rewarm(
+    main_window,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window.set_run_button_enabled(True)
+    main_window.simulation_controller.batch_cache.active_cache_key = "active-result"
+
+    monkeypatch.setattr(
+        main_window,
+        "_invalidate_active_results_after_authoritative_mechanism_change",
+        lambda **_kwargs: events.append("invalidate_display"),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_authoritative_mechanism_derived_ui",
+        lambda: events.append("refresh_derived"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: events.append("schedule_rewarm"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: None,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+
+    main_window._on_programmatic_mechanism_load()
+
+    assert events[-1] == "schedule_rewarm"
+    assert "invalidate_display" in events[:-1]
+    assert "refresh_derived" in events[:-1]
+    assert events.index("invalidate_display") < events.index("refresh_derived")
+    assert "schedule_rewarm" not in events[:-1]
+
+
+def test_programmatic_mechanism_load_supersedes_in_flight_work_without_active_display(
+    main_window,
+    monkeypatch,
+):
+    controller = main_window.simulation_controller
+    events: list[str] = []
+
+    monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
+    monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
+    monkeypatch.setattr(main_window, "_refresh_authoritative_mechanism_derived_ui", lambda: None)
+    monkeypatch.setattr(
+        controller,
+        "supersede_active_work_for_authoritative_mechanism_transition",
+        lambda *, epoch: events.append(f"supersede:{int(epoch)}"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: None,
+    )
+
+    main_window._apply_authoritative_mechanism_transition(
+        force_runtime_invalidation=True,
+    )
+
+    assert events == ["supersede:1"]
+
+
+def test_direct_authoritative_editor_rewrite_supersedes_no_display_explicit_completion(
+    main_window,
+    monkeypatch,
+):
+    controller = main_window.simulation_controller
+    worker = _TransitionTestWorker(running=True, fast_mode=False, request_id=21)
+    published: list[object] = []
+    old_run_id = 7
+    old_request_id = 21
+
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    controller._run_sequence_id = old_run_id
+    controller._active_run_id = old_run_id
+    controller._latest_sim_request_id = old_request_id
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = worker
+
+    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
+    monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
+
+    main_window._set_authoritative_mechanism_editor_texts(
+        reactions_text="reaction: A -> C; k=2.0",
+        state_network_dsl="",
+        description="Test direct authoritative rewrite",
+    )
+    controller.on_simulation_complete(
+        _completion_payload(),
+        run_id=old_run_id,
+        fast_mode=False,
+        request_id=old_request_id,
+    )
+
+    assert worker.cancel_calls == 1
+    assert controller._active_run_id != old_run_id
+    assert published == []
+
+
+def test_authoritative_transition_rejects_old_preview_completion_without_active_display(
+    main_window,
+    monkeypatch,
+):
+    controller = main_window.simulation_controller
+    set_id, old_request_id = _arm_pending_preview_state(main_window)
+    old_run_id = int(controller._active_run_id)
+    worker = _TransitionTestWorker(running=True, fast_mode=True, request_id=old_request_id)
+    published: list[object] = []
+
+    controller._simulation_worker = worker
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+
+    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
+    monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
+
+    main_window._apply_authoritative_mechanism_transition(
+        force_runtime_invalidation=True,
+        transition_source="test_preview_stale_rejection",
+    )
+    controller.on_simulation_complete(
+        _completion_payload(),
+        run_id=old_run_id,
+        fast_mode=True,
+        request_id=old_request_id,
+        batch_set_id=set_id,
+        cache_key="project-apply-pending-preview-cache",
+    )
+
+    assert controller.run_state.latest_sim_request_id > old_request_id
+    assert controller.run_state.preview_ownership.request_id is None
+    assert controller.run_state.simulation_running is False
+    assert controller.run_state.slider_simulation_active is False
+    assert published == []
+
+
+def test_template_load_supersedes_no_display_explicit_completion(
+    main_window,
+    monkeypatch,
+):
+    controller = main_window.simulation_controller
+    worker = _TransitionTestWorker(running=True, fast_mode=False, request_id=31)
+    published: list[object] = []
+    old_run_id = 9
+    old_request_id = 31
+
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    controller._run_sequence_id = old_run_id
+    controller._active_run_id = old_run_id
+    controller._latest_sim_request_id = old_request_id
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = worker
+
+    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
+    monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
+
+    main_window._load_template_from_manager("reaction: A -> C; k=3.0")
+    controller.on_simulation_complete(
+        _completion_payload(),
+        run_id=old_run_id,
+        fast_mode=False,
+        request_id=old_request_id,
+    )
+
+    assert worker.cancel_calls == 1
+    assert controller._active_run_id != old_run_id
+    assert published == []
+
+
+def test_slider_materialization_supersedes_no_display_explicit_completion(
+    main_window,
+    monkeypatch,
+):
+    controller = main_window.simulation_controller
+    worker = _TransitionTestWorker(running=True, fast_mode=False, request_id=41)
+    published: list[object] = []
+    events: list[str] = []
+    old_run_id = 13
+    old_request_id = 41
+    original_supersede = controller.supersede_active_work_for_authoritative_mechanism_transition
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    controller._run_sequence_id = old_run_id
+    controller._active_run_id = old_run_id
+    controller._latest_sim_request_id = old_request_id
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = worker
+
+    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
+    monkeypatch.setattr(
+        controller,
+        "supersede_active_work_for_authoritative_mechanism_transition",
+        lambda *, epoch: (events.append(f"supersede:{int(epoch)}"), original_supersede(epoch=epoch)),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False: events.append("schedule_rewarm"),
+    )
+
+    main_window._apply_effective_slider_values_to_mechanism_editors(
+        {"k1": 2.0},
+        description="Test slider materialization",
+    )
+    main_window._sync_after_authoritative_slider_materialization()
+    controller.on_simulation_complete(
+        _completion_payload(),
+        run_id=old_run_id,
+        fast_mode=False,
+        request_id=old_request_id,
+    )
+
+    assert worker.cancel_calls == 1
+    assert events[0].startswith("supersede:")
+    assert events[-1] == "schedule_rewarm"
+    assert published == []
+
+
+def test_project_apply_state_network_transition_defers_rewarm_until_payload_finishes(
+    main_window,
+    monkeypatch,
+):
+    events: list[str] = []
+    payload = main_window._serialize_project_state()
+    payload["mechanism"] = "reaction: A -> C; k=2.0"
+    payload["state_network"] = "\n".join(
+        [
+            "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
+            "state: C, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "edge: A,TS1",
+            "edge: TS1,C",
+        ]
+    )
+    original_programmatic_load = main_window._on_programmatic_mechanism_load
+
+    def _record_programmatic_load(*, schedule_runtime_refresh: bool = True) -> None:
+        events.append("programmatic_load_start")
+        original_programmatic_load(schedule_runtime_refresh=schedule_runtime_refresh)
+        events.append("programmatic_load_done")
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot()
+    )
+    monkeypatch.setattr(main_window, "_on_programmatic_mechanism_load", _record_programmatic_load)
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "supersede_active_work_for_authoritative_mechanism_transition",
+        lambda *, epoch: events.append(f"supersede:{int(epoch)}"),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False: events.append("schedule_rewarm"),
+    )
+
+    main_window._apply_project_payload(payload, record_undo=False)
+
+    assert "programmatic_load_done" in events
+    assert "schedule_rewarm" in events
+    assert events.index("schedule_rewarm") > events.index("programmatic_load_done")
+    assert any(event.startswith("supersede:") for event in events[: events.index("schedule_rewarm")])
+
+
+def test_programmatic_load_resets_transition_canonical_batch_initials_baseline(
+    main_window,
+    monkeypatch,
+):
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "2.5")
+    set_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert set_id
+
+    captured: list[dict[str, object]] = []
+    original_apply = main_window._mechanism_runtime_transition.apply_authoritative_transition
+
+    def _capture_transition(snapshot, **kwargs):
+        captured.append(dict(kwargs))
+        return original_apply(snapshot, **kwargs)
+
+    monkeypatch.setattr(
+        main_window._mechanism_runtime_transition,
+        "apply_authoritative_transition",
+        _capture_transition,
+    )
+
+    main_window._on_programmatic_mechanism_load(schedule_runtime_refresh=False)
+
+    assert captured
+    canonical_map = captured[-1].get("canonical_batch_initials_by_set_id")
+    assert isinstance(canonical_map, dict)
+    assert canonical_map[set_id] == canonical_initials_fingerprint({"A": 2.5})
+
+
+def test_project_apply_defers_authoritative_rewarm_until_payload_finishes(
+    main_window,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    main_window.show()
+    monkeypatch.setattr(
+        main_window,
+        "_refresh_authoritative_mechanism_derived_ui",
+        lambda: events.append("refresh_derived"),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_apply_project_payload_inner",
+        lambda data, *, record_undo=True: (
+            events.append("apply_inner_start"),
+            main_window._apply_authoritative_mechanism_transition(schedule_runtime_refresh=False),
+            events.append("apply_inner_done"),
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: events.append("schedule_rewarm"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: None,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+
+    main_window._apply_project_payload({}, record_undo=False)
+
+    assert events == [
+        "apply_inner_start",
+        "refresh_derived",
+        "apply_inner_done",
+        "schedule_rewarm",
+    ]
 
 
 def test_runtime_readiness_poll_enables_run_before_preview_sliders(main_window, monkeypatch):

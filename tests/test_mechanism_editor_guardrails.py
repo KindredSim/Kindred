@@ -48,6 +48,32 @@ def _consumer_call_recorder(main_window, monkeypatch):
     return calls
 
 
+def _transition_effect_recorder(main_window, monkeypatch):
+    calls: list[str] = []
+    original_temperature = main_window._update_temperature_mode_indicator
+    original_overlay = main_window._refresh_overlay_swatches_for_current_mechanism
+
+    def _record_temperature() -> None:
+        calls.append("temperature")
+        original_temperature()
+
+    def _record_overlay() -> None:
+        calls.append("overlay")
+        original_overlay()
+
+    def _record_supersede(*, epoch: int) -> None:
+        calls.append(f"supersede:{int(epoch)}")
+
+    monkeypatch.setattr(main_window, "_update_temperature_mode_indicator", _record_temperature)
+    monkeypatch.setattr(main_window, "_refresh_overlay_swatches_for_current_mechanism", _record_overlay)
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "supersede_active_work_for_authoritative_mechanism_transition",
+        _record_supersede,
+    )
+    return calls
+
+
 def _set_invalid_reactions_text(main_window, qt_app) -> None:
     main_window._mechanism_editor._reactions_text.setPlainText("this line does not parse")
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
@@ -429,7 +455,7 @@ def test_state_network_change_suppressed_while_unlocked(main_window, monkeypatch
 
 def test_consumer_guards_resume_main_window_work_after_successful_lock(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    calls = _consumer_call_recorder(main_window, monkeypatch)
+    calls = _transition_effect_recorder(main_window, monkeypatch)
     original_validate = main_window._mechanism_editor._validate_dsl
 
     def _validate_and_record() -> None:
@@ -450,16 +476,16 @@ def test_consumer_guards_resume_main_window_work_after_successful_lock(main_wind
     assert main_window.mechanism_editing_locked() is True
     assert calls[0] == "validate"
     assert calls.count("temperature") == 1
-    assert calls.count("authoritative") == 1
     assert calls.count("overlay") == 1
+    assert any(call.startswith("supersede:") for call in calls)
     assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
 
     calls.clear()
     main_window._mechanism_editor._reactions_text.setPlainText("T=410\nreaction: A -> B; k=1.0")
     qt_app.processEvents()
     assert "temperature" in calls
-    assert "authoritative" in calls
     assert "overlay" in calls
+    assert any(call.startswith("supersede:") for call in calls)
 
 
 def test_failed_lock_preserves_all_cached_state(main_window, monkeypatch, qt_app):
@@ -1075,13 +1101,13 @@ def test_load_preset_updates_reactions_while_locked(main_window):
 
 def test_load_preset_while_unlocked_relocks_and_invalidates(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    calls = _consumer_call_recorder(main_window, monkeypatch)
+    calls = _transition_effect_recorder(main_window, monkeypatch)
 
     main_window._load_preset_mechanism("M1")
     qt_app.processEvents()
 
     assert main_window.mechanism_editing_locked() is True
-    assert "authoritative" in calls
+    assert any(call.startswith("supersede:") for call in calls)
     assert "overlay" in calls
     assert main_window._mechanism_editor._reactions_text.toPlainText().strip()
 
@@ -1168,7 +1194,7 @@ def test_programmatic_load_while_unlocked_does_not_hit_validation_gate(main_wind
 
 def test_programmatic_load_while_unlocked_restores_guarded_main_window_work(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
-    calls = _consumer_call_recorder(main_window, monkeypatch)
+    calls = _transition_effect_recorder(main_window, monkeypatch)
 
     main_window.set_mechanism_reactions_text_with_optional_undo(
         "reaction: A -> B; k=1.0",
@@ -1180,15 +1206,15 @@ def test_programmatic_load_while_unlocked_restores_guarded_main_window_work(main
 
     assert main_window.mechanism_editing_locked() is True
     assert calls.count("temperature") == 1
-    assert calls.count("authoritative") == 1
     assert calls.count("overlay") == 1
+    assert any(call.startswith("supersede:") for call in calls)
 
     calls.clear()
     main_window._mechanism_editor._reactions_text.setPlainText("T=410\nreaction: A -> B; k=1.0")
     qt_app.processEvents()
     assert "temperature" in calls
-    assert "authoritative" in calls
     assert "overlay" in calls
+    assert any(call.startswith("supersede:") for call in calls)
 
 
 def test_validation_label_stays_live_while_unlocked(main_window, monkeypatch, qt_app):
@@ -1283,7 +1309,7 @@ def test_pending_init_migration_while_unlocked_dispatches_consumers_and_refreshe
     qt_app,
 ):
     _unlock_reactions_editing(main_window, monkeypatch)
-    calls = _consumer_call_recorder(main_window, monkeypatch)
+    calls = _transition_effect_recorder(main_window, monkeypatch)
     main_window._temperature_spinbox.setValue(298.15)
 
     applied = main_window.apply_pending_init_migration(
@@ -1293,7 +1319,7 @@ def test_pending_init_migration_while_unlocked_dispatches_consumers_and_refreshe
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
 
     assert applied is True
-    assert calls == ["temperature", "authoritative", "overlay"]
+    assert calls == ["temperature", "overlay"]
     assert main_window._temperature_spinbox.value() == pytest.approx(400.0)
 
 
@@ -1301,16 +1327,21 @@ def test_pending_init_migration_dispatches_consumers_after_force_lock(main_windo
     _unlock_reactions_editing(main_window, monkeypatch)
     events: list[str] = []
     original_set_locked = main_window._set_mechanism_edit_locked
+    original_refresh = main_window._refresh_authoritative_mechanism_derived_ui
 
     def _record_set_locked(locked: bool) -> bool:
         events.append(f"lock:{bool(locked)}")
         return original_set_locked(bool(locked))
 
+    def _record_transition_refresh() -> None:
+        events.append("transition_refresh")
+        original_refresh()
+
     monkeypatch.setattr(main_window, "_set_mechanism_edit_locked", _record_set_locked)
     monkeypatch.setattr(
         main_window,
-        "_dispatch_authoritative_mechanism_consumers",
-        lambda: events.append("dispatch"),
+        "_refresh_authoritative_mechanism_derived_ui",
+        _record_transition_refresh,
     )
 
     applied = main_window.apply_pending_init_migration(
@@ -1321,8 +1352,8 @@ def test_pending_init_migration_dispatches_consumers_after_force_lock(main_windo
 
     assert applied is True
     assert "lock:True" in events
-    assert "dispatch" in events
-    assert events.index("lock:True") < events.index("dispatch")
+    assert "transition_refresh" in events
+    assert events.index("lock:True") < events.index("transition_refresh")
 
 
 def test_unlock_warning_and_state_network_banner_describe_draft_semantics(main_window, monkeypatch):

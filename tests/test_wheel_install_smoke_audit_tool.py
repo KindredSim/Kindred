@@ -38,13 +38,18 @@ def test_subprocess_cwd_rejects_tmp_dir_inside_repo_root(tmp_path):
         wheel_install_smoke_audit._subprocess_cwd(tmp_run_dir=tmp_run_dir, repo_root=repo_root)
 
 
-def test_scan_case_conflicts_detects_casefold_duplicates(tmp_path):
+def test_scan_case_conflicts_detects_casefold_duplicates(tmp_path, monkeypatch):
     purelib = tmp_path / "purelib"
     pkg = purelib / "kindred"
     pkg.mkdir(parents=True, exist_ok=True)
 
     (pkg / "x.py").write_text("# lower\n", encoding="utf-8")
-    (pkg / "X.py").write_text("# upper\n", encoding="utf-8")
+
+    def fake_walk(root):
+        assert root == pkg
+        yield str(pkg), [], ["x.py", "X.py"]
+
+    monkeypatch.setattr(wheel_install_smoke_audit.os, "walk", fake_walk)
 
     count, groups = wheel_install_smoke_audit._scan_case_conflicts(purelib)
     assert count == 1

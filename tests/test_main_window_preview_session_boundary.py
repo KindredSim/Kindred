@@ -982,9 +982,9 @@ def test_main_window_preview_session_apply_staged_concentration_overlays_clears_
     _submit_current_species_replay_intent(main_window)
     assert controller.run_state.pending_slider_preview_launch.active is True
 
-    touched_rows = owner.apply_staged_concentration_overlays(main_window._batch_model)
+    commit_result = owner.apply_staged_concentration_overlays(main_window._batch_model)
 
-    assert touched_rows == [0]
+    assert commit_result.touched_rows == (0,)
     assert owner.current_slider_replay_intent() is None
     pending_launch = controller.run_state.pending_slider_preview_launch
     assert pending_launch.active is False

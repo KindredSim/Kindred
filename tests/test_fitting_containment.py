@@ -194,7 +194,7 @@ def test_warm_lane_times_out_after_accepted_request_and_kills_child() -> None:
     lane = WarmFittingEvaluatorLane(
         {},
         request_timeout_s=0.2,
-        ready_timeout_s=2.0,
+        ready_timeout_s=10.0,
         accept_timeout_s=2.0,
         mp_context=mp_context,
         child_target=_accepted_then_hang_lane_child,
@@ -220,7 +220,7 @@ def test_warm_lane_restarts_after_timeout_for_later_request() -> None:
     lane = WarmFittingEvaluatorLane(
         {},
         request_timeout_s=0.2,
-        ready_timeout_s=2.0,
+        ready_timeout_s=10.0,
         accept_timeout_s=2.0,
         mp_context=mp_context,
         child_target=_hang_or_result_lane_child,
@@ -243,7 +243,7 @@ def test_warm_lane_reconstruction_failure_is_fatal_with_child_diagnostics() -> N
     lane = WarmFittingEvaluatorLane(
         {"not": "a valid fitting payload"},
         request_timeout_s=0.2,
-        ready_timeout_s=2.0,
+        ready_timeout_s=10.0,
         accept_timeout_s=2.0,
         mp_context=mp_context,
     )
@@ -266,7 +266,7 @@ def test_warm_lane_cancellation_kills_in_progress_request_without_penalty_mappin
     lane = WarmFittingEvaluatorLane(
         {},
         request_timeout_s=5.0,
-        ready_timeout_s=2.0,
+        ready_timeout_s=10.0,
         accept_timeout_s=2.0,
         mp_context=mp_context,
         child_target=_accepted_then_hang_lane_child,

@@ -25,7 +25,12 @@ from PySide6.QtCore import Qt, QSettings
 from kindred import __version__ as KINDRED_VERSION
 from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
+from kindred.core.mechanism_runtime_transition import (
+    AuthoritativeMechanismSnapshot,
+    MechanismRuntimeTransitionService,
+)
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.core.simulation_identity import canonical_initials_fingerprint
 from kindred.core.simulator.dsl_text_update import (
     analyze_step_parameter_update,
     build_current_text_step_analysis_context,
@@ -34,6 +39,7 @@ from kindred.core.simulator.dsl_text_update import (
 )
 from kindred.core.validation import try_parse_finite_float
 from kindred.gui.controllers.cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
+from kindred.gui.controllers.simulation_completion_policy import pending_initial_seed_for_set
 from kindred.gui.project_schema import (
     FITTING_DEFAULTS_KEYS,
     PROJECT_DEFAULTS,
@@ -211,6 +217,8 @@ class MainWindow(
         self._preview_session = MainWindowPreviewSession(self)
         self._variable_runtime = MainWindowVariableRuntime(self)
         self._mechanism_helpers = MainWindowMechanismHelpers(self)
+        self._mechanism_runtime_transition = MechanismRuntimeTransitionService()
+        self._authoritative_mechanism_runtime_refresh_defer_depth = 0
 
         # Simulation execution, batch orchestration, caching, and worker lifecycle.
         plumbing = build_simulation_plumbing(self)
@@ -320,6 +328,10 @@ class MainWindow(
             topology_validator=self._mechanism_session_topology_is_valid,
         )
         self._sync_mechanism_session_owner_from_widgets(authoritative=True)
+        self._mechanism_runtime_transition.reset_current_snapshot(
+            self._authoritative_mechanism_transition_snapshot(),
+            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
+        )
         self._force_lock_editor()
         self._sliders_panel = self._mechanism_editor.detach_slider_pane_for_dock()
         self._species_panel_available = True
@@ -450,10 +462,99 @@ class MainWindow(
             raise RuntimeError("Mechanism session owner is unavailable.")
         self._sync_mechanism_session_owner_from_widgets(authoritative=not bool(owner.edit_session_active))
 
-    def _dispatch_authoritative_mechanism_consumers(self) -> None:
+    def _refresh_authoritative_mechanism_derived_ui(self) -> None:
         self._update_temperature_mode_indicator()
-        self._on_authoritative_mechanism_input_changed()
         self._refresh_overlay_swatches_for_current_mechanism()
+
+    def _authoritative_mechanism_transition_snapshot(self) -> AuthoritativeMechanismSnapshot:
+        return AuthoritativeMechanismSnapshot.from_texts(
+            reactions_text=self.mechanism_reactions_text_raw(),
+            state_network_text=self.mechanism_state_network_dsl_raw(),
+        )
+
+    def _authoritative_mechanism_runtime_refresh_deferred(self) -> bool:
+        return int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) > 0
+
+    def _canonical_batch_initials_identity_by_set_id(self) -> Dict[str, str]:
+        identities: Dict[str, str] = {}
+        store = getattr(self, "_batch_store", None)
+        if store is None:
+            return identities
+        try:
+            row_count = int(store.row_count())
+        except Exception:
+            return identities
+        for row in range(row_count):
+            set_id = str(self._batch_set_id_for_row(int(row)) or "").strip()
+            if not set_id:
+                continue
+            try:
+                identities[set_id] = canonical_initials_fingerprint(self.batch_initials_for_row(int(row)))
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.runtime_transition.canonical_initials_identity",
+                    message="Failed to fingerprint canonical batch initials for runtime transition",
+                    exc=exc,
+                )
+        return identities
+
+    def _apply_authoritative_mechanism_transition(
+        self,
+        *,
+        schedule_runtime_refresh: Optional[bool] = None,
+        force_runtime_invalidation: bool = False,
+        transition_source: str = "authoritative_change",
+        preserve_current_display: Optional[Dict[str, Any]] = None,
+        canonical_batch_initials_by_set_id: Optional[Mapping[str, object]] = None,
+        affected_set_ids: Sequence[str] = (),
+    ) -> None:
+        if schedule_runtime_refresh is None:
+            schedule_runtime_refresh = not self._authoritative_mechanism_runtime_refresh_deferred()
+        owner = getattr(self, "_mechanism_session_owner", None)
+        outcome = self._mechanism_runtime_transition.apply_authoritative_transition(
+            self._authoritative_mechanism_transition_snapshot(),
+            source=str(transition_source or "authoritative_change"),
+            force_runtime_invalidation=bool(force_runtime_invalidation),
+            edit_session_active=bool(getattr(owner, "edit_session_active", False)),
+            input_suppressed=bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)),
+            slider_runtime_invalidation_suppressed=bool(
+                self._variable_runtime.suppress_slider_runtime_invalidation()
+            ),
+            schedule_runtime_refresh=bool(schedule_runtime_refresh),
+            canonical_batch_initials_by_set_id=canonical_batch_initials_by_set_id,
+            affected_set_ids=tuple(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)),
+        )
+        if outcome.runtime_invalidation_required:
+            self._invalidate_slider_runtime()
+        if outcome.active_work_supersede_required:
+            if outcome.affected_set_ids:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(outcome.epoch),
+                    affected_set_ids=outcome.affected_set_ids,
+                    close_preview_runtime_owner=bool(outcome.runtime_invalidation_required),
+                )
+            else:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(outcome.epoch)
+                )
+        if outcome.display_cache_invalidation_allowed and (
+            self._authoritative_mechanism_has_active_display() or bool(outcome.affected_set_ids)
+        ):
+            self._invalidate_active_results_after_authoritative_mechanism_change(
+                preserve_current_display=preserve_current_display,
+                supersede_active_work=False,
+                affected_set_ids=outcome.affected_set_ids,
+            )
+        self._refresh_authoritative_mechanism_derived_ui()
+        if outcome.readiness_schedule_required:
+            self._schedule_simulation_runtime_availability_refresh(wait=False)
+
+    def _schedule_pending_authoritative_mechanism_runtime_refresh(self) -> bool:
+        pending_epoch = self._mechanism_runtime_transition.consume_pending_readiness_epoch()
+        if pending_epoch is None:
+            return False
+        self._schedule_simulation_runtime_availability_refresh(wait=False)
+        return True
 
     def _sync_mechanism_session_owner_after_authoritative_widget_write(
         self,
@@ -469,7 +570,7 @@ class MainWindow(
             return
         self._set_mechanism_edit_locked(True)
         if bool(dispatch_consumers):
-            self._dispatch_authoritative_mechanism_consumers()
+            self._apply_authoritative_mechanism_transition()
 
     def _restore_mechanism_widgets_from_owner_canonical(self) -> None:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -509,14 +610,14 @@ class MainWindow(
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None or bool(owner.edit_session_active):
             return
-        self._dispatch_authoritative_mechanism_consumers()
+        self._apply_authoritative_mechanism_transition()
 
     def _on_state_network_changed_for_main_window(self) -> None:
         self._sync_mechanism_session_owner_from_widget_signal()
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None or bool(owner.edit_session_active):
             return
-        self._dispatch_authoritative_mechanism_consumers()
+        self._apply_authoritative_mechanism_transition()
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
@@ -594,7 +695,7 @@ class MainWindow(
                 return False
         elif not self.is_mechanism_ready_for_run():
             return False
-        self._dispatch_authoritative_mechanism_consumers()
+        self._apply_authoritative_mechanism_transition()
         self._refresh_mechanism_edit_lock_ui()
         return True
 
@@ -1158,7 +1259,7 @@ class MainWindow(
             return
         logger.warning(f"Startup profile '{self._initial_profile}' not found")
 
-    def _on_programmatic_mechanism_load(self) -> None:
+    def _on_programmatic_mechanism_load(self, *, schedule_runtime_refresh: bool = True) -> None:
         """
         Invalidate slider runtime and clear variable sliders/overrides.
 
@@ -1167,10 +1268,6 @@ class MainWindow(
         """
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
-        try:
-            self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
-        except Exception:
-            logger.debug("Failed to invalidate interactive simulation runtimes after programmatic load", exc_info=True)
         try:
             self._mechanism_editor._variable_sliders.clear()
         except Exception:
@@ -1191,8 +1288,12 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to migrate inline initial concentrations during programmatic load", exc_info=True)
 
-        self._dispatch_authoritative_mechanism_consumers()
-        self._invalidate_active_results_after_authoritative_mechanism_change()
+        self._apply_authoritative_mechanism_transition(
+            schedule_runtime_refresh=bool(schedule_runtime_refresh),
+            force_runtime_invalidation=True,
+            transition_source="programmatic_load",
+            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
+        )
         self._refresh_slider_transaction_button_state()
 
         try:
@@ -1718,39 +1819,7 @@ class MainWindow(
         except Exception:
             logger.debug("Failed to invalidate interactive simulation runtimes", exc_info=True)
 
-    @staticmethod
-    def _normalized_mechanism_text_for_invalidation_guard(text: str) -> str:
-        return "\n".join(" ".join(str(line).split()) for line in str(text or "").splitlines()).strip()
-
-    def _on_authoritative_mechanism_input_changed(self) -> None:
-        """Invalidate stale displayed results when the authoritative mechanism changes."""
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is not None and bool(owner.edit_session_active):
-            return
-        if bool(getattr(self, "_suppress_authoritative_mechanism_input_change", False)):
-            return
-        # Pending-init rewrite normalizes the DSL after a successful explicit run;
-        # it should not be treated like a new authoritative mechanism edit that
-        # evicts the result that just produced the rewrite.
-        if self._variable_runtime.suppress_slider_runtime_invalidation():
-            return
-        pending_init_rewrite = getattr(self, "_pending_init_migration_rewrite_for_invalidation", None)
-        pending_init_state_network = getattr(
-            self,
-            "_pending_init_migration_state_network_for_invalidation",
-            None,
-        )
-        if pending_init_rewrite is not None or pending_init_state_network is not None:
-            self._pending_init_migration_rewrite_for_invalidation = None
-            self._pending_init_migration_state_network_for_invalidation = None
-        if (
-            self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_reactions_text_raw())
-            == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_rewrite))
-            and self._normalized_mechanism_text_for_invalidation_guard(self.mechanism_state_network_dsl_raw())
-            == self._normalized_mechanism_text_for_invalidation_guard(str(pending_init_state_network))
-        ):
-            return
-        self._invalidate_slider_runtime()
+    def _authoritative_mechanism_has_active_display(self) -> bool:
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
         has_active_cache = bool(
             batch_cache is not None
@@ -1767,9 +1836,11 @@ class MainWindow(
                 or batch_cache.last_display_selection
             )
         )
-        if not (has_active_cache or has_displayed_selection or self.main_plot_has_data()):
-            return
-        self._invalidate_active_results_after_authoritative_mechanism_change()
+        return bool(has_active_cache or has_displayed_selection or self.main_plot_has_data())
+
+    def _on_authoritative_mechanism_input_changed(self) -> None:
+        """Apply the ordered lifecycle for an authoritative mechanism transition."""
+        self._apply_authoritative_mechanism_transition()
 
     def _parse_sim_time_seconds(self) -> float:
         raw = ""
@@ -2400,7 +2471,6 @@ class MainWindow(
             finally:
                 self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
             self._on_programmatic_mechanism_load()
-            self._schedule_simulation_runtime_availability_refresh(wait=False)
             self._status_label.setText(f"Loaded preset mechanism: {preset_id}")
             logger.info(f"Loaded preset mechanism: {preset_id}")
 
@@ -2455,7 +2525,6 @@ class MainWindow(
         finally:
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
         self._on_programmatic_mechanism_load()
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
 
         self._status_label.setText("Loaded template from Template Manager")
         logger.info("Loaded template from Template Manager")
@@ -3602,11 +3671,21 @@ class MainWindow(
         self,
         *,
         preserve_current_display: Optional[Dict[str, Any]] = None,
+        supersede_active_work: bool = True,
+        affected_set_ids: Sequence[str] = (),
     ) -> None:
         """Drop stale displayed results after the authoritative mechanism changes."""
         self._clear_last_mechanism()
-        self._sim_controller.invalidate_active_explicit_simulation_for_authoritative_change()
-        self._sim_controller.invalidate_slider_preview_work()
+        if bool(supersede_active_work):
+            if affected_set_ids:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(self._mechanism_runtime_transition.current_epoch),
+                    affected_set_ids=tuple(str(set_id) for set_id in affected_set_ids if str(set_id)),
+                )
+            else:
+                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+                    epoch=int(self._mechanism_runtime_transition.current_epoch)
+                )
 
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
         if batch_cache is None:
@@ -3614,6 +3693,8 @@ class MainWindow(
 
         active_cache_key = str(batch_cache.active_cache_key or "").strip()
         selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
+        affected_scope = tuple(dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)))
+        display_cleared = False
         if active_cache_key:
             fallback_scope = ()
             cached_scope_ids: list[str] = []
@@ -3640,14 +3721,23 @@ class MainWindow(
             else:
                 active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
                 fallback_scope = (active_batch_set_id,) if active_batch_set_id else ()
-            batch_cache.active_cache_invalidated_set_ids = fallback_scope or None
-            clear_display = getattr(batch_cache, "clear_display_selection_state", None)
-            if callable(clear_display):
-                clear_display()
-            else:
-                batch_cache.last_display_selection = []
-                batch_cache.active_batch_set = None
-                batch_cache.active_batch_set_id = None
+            invalidated_scope = affected_scope or fallback_scope
+            batch_cache.active_cache_invalidated_set_ids = invalidated_scope or None
+            visible_scope = set(selected_ids)
+            visible_scope.update(str(set_id) for set_id in (batch_cache.last_display_selection or ()) if str(set_id))
+            active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
+            if active_batch_set_id:
+                visible_scope.add(active_batch_set_id)
+            should_clear_display = not affected_scope or bool(set(affected_scope) & visible_scope)
+            if should_clear_display:
+                clear_display = getattr(batch_cache, "clear_display_selection_state", None)
+                if callable(clear_display):
+                    clear_display()
+                else:
+                    batch_cache.last_display_selection = []
+                    batch_cache.active_batch_set = None
+                    batch_cache.active_batch_set_id = None
+                display_cleared = True
         if preserve_current_display and self.main_plot_has_data():
             preserved_set_id = str(preserve_current_display.get("set_id") or "").strip()
             preserved_set_name = str(preserve_current_display.get("set_name") or "").strip()
@@ -3732,7 +3822,7 @@ class MainWindow(
                 except RuntimeError:
                     self._status_label = None
             return
-        if active_cache_key and batch_cache.active_cache_invalidated_set_ids:
+        if active_cache_key and batch_cache.active_cache_invalidated_set_ids and display_cleared:
             self._clear_batch_selection_display_state()
             label = getattr(self, "_status_label", None)
             if label is not None:
@@ -3892,11 +3982,19 @@ class MainWindow(
     def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         """Populate the UI from serialized project data."""
         self._suppress_preference_updates = True
+        self._authoritative_mechanism_runtime_refresh_defer_depth = (
+            int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) + 1
+        )
         try:
             self._apply_project_payload_inner(data, record_undo=record_undo)
         finally:
+            self._authoritative_mechanism_runtime_refresh_defer_depth = max(
+                0,
+                int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) - 1,
+            )
             self._suppress_preference_updates = False
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
+        if not self._schedule_pending_authoritative_mechanism_runtime_refresh():
+            self._schedule_simulation_runtime_availability_refresh(wait=False)
 
     def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         from kindred.core.batch_initial_conditions import (
@@ -3986,7 +4084,7 @@ class MainWindow(
         else:
             if current_state_network.strip():
                 state_editor.clear()
-        self._on_programmatic_mechanism_load()
+        self._on_programmatic_mechanism_load(schedule_runtime_refresh=False)
 
         _pref = self.config_controller.get_user_preference
         solver_value = data.get('solver', _pref('solver'))
@@ -4911,10 +5009,14 @@ class MainWindow(
                     record_undo=True,
                 )
                 self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
-                self._pending_init_migration_rewrite_for_invalidation = str(rewrite)
-                self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
+                self._mechanism_runtime_transition.arm_pending_init_result_guard(
+                    rewrite=str(rewrite),
+                    state_network_text=self.mechanism_state_network_dsl_raw(),
+                )
                 self._set_mechanism_edit_locked(True)
-                self._dispatch_authoritative_mechanism_consumers()
+                self._apply_authoritative_mechanism_transition(
+                    transition_source="pending_init_migration",
+                )
                 restore_deferred = True
                 def _restore_pending_init_rewrite_suppression() -> None:
                     self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
@@ -4932,19 +5034,14 @@ class MainWindow(
 
     def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
         rewrite_text = str(self.mechanism_reactions_text_raw() or "") if rewrite is None else str(rewrite or "")
-        self._pending_init_migration_rewrite_for_invalidation = rewrite_text
-        self._pending_init_migration_state_network_for_invalidation = self.mechanism_state_network_dsl_raw()
+        self._mechanism_runtime_transition.arm_pending_init_result_guard(
+            rewrite=rewrite_text,
+            state_network_text=self.mechanism_state_network_dsl_raw(),
+        )
 
     def invalidate_pending_init_preserved_results_after_failed_run(self) -> None:
-        pending_init_rewrite = getattr(self, "_pending_init_migration_rewrite_for_invalidation", None)
-        pending_init_state_network = getattr(
-            self,
-            "_pending_init_migration_state_network_for_invalidation",
-            None,
-        )
-        self._pending_init_migration_rewrite_for_invalidation = None
-        self._pending_init_migration_state_network_for_invalidation = None
-        if pending_init_rewrite is None and pending_init_state_network is None:
+        pending_snapshot = self._mechanism_runtime_transition.consume_pending_init_result_guard()
+        if pending_snapshot is None:
             return
         self._invalidate_slider_runtime()
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
@@ -6602,9 +6699,40 @@ class MainWindow(
             set_id=str(set_id),
             mechanism_text=self._mechanism_text_for_workspace_selection(set_id=str(set_id)),
         )
+        initials_fingerprint = ""
+        row = self._batch_row_for_set_id(str(set_id))
+        if row is not None:
+            try:
+                baseline_initials = self.batch_initials_for_row(int(row))
+                reactions_text_raw = self.mechanism_reactions_text_raw()
+                if self.has_slider_overrides():
+                    reactions_text_raw = self._apply_overrides_to_text(
+                        reactions_text_raw,
+                        set_id=str(set_id),
+                    )
+                try:
+                    pending_init_seed, _migrated = migrate_reaction_dsl_initial_concentration_sets(
+                        reactions_text_raw,
+                        default_set_name="set1",
+                    )
+                except Exception:
+                    pending_init_seed = {}
+                set_name = str(self.batch_set_name_for_id(str(set_id)) or "")
+                for species, value in pending_initial_seed_for_set(
+                    pending_init_seed,
+                    set_name=set_name,
+                ).items():
+                    parsed, ok = try_parse_finite_float(value)
+                    if ok:
+                        baseline_initials[str(species)] = float(parsed)
+                preview_initials = self._preview_session.preview_initials_for_row(int(row), baseline_initials)
+                initials_fingerprint = canonical_initials_fingerprint(preview_initials)
+            except Exception:
+                initials_fingerprint = ""
         return SimulationIdentity.build(
             schema_id=self.simulation_schema_id(),
             param_fingerprint=self.simulation_param_fingerprint(set_id=str(set_id)),
+            canonical_initials_fingerprint=initials_fingerprint,
             solver_config=expected_solver_config,
             t_end=expected_t_end,
             preview_batch_cache_token=expected_overlay_token,
@@ -8022,18 +8150,20 @@ class MainWindow(
         except Exception:
             return False
 
-    def _commit_species_slider_values_to_selected_batch_rows(self) -> None:
+    def _commit_species_slider_values_to_selected_batch_rows(self) -> tuple[str, ...]:
         model = getattr(self, "_batch_model", None)
         if model is None:
-            return
+            return ()
         try:
-            self._preview_session.apply_staged_concentration_overlays(model)
+            result = self._preview_session.apply_staged_concentration_overlays(model)
+            return tuple(str(set_id) for set_id in getattr(result, "touched_set_ids", ()) if str(set_id))
         except Exception as exc:
             self._record_best_effort_failure(
                 "main_window.species_mode.commit_species.apply",
                 message="Failed to apply staged species-mode concentration overlays",
                 exc=exc,
             )
+        return ()
 
     def _materialized_mechanism_editor_texts_for_effective_slider_values(
         self,
@@ -8095,9 +8225,12 @@ class MainWindow(
         reactions_text: str,
         state_network_dsl: str,
         description: str,
+        apply_transition: bool = True,
+        transition_source: str = "authoritative_editor_rewrite",
     ) -> None:
         from kindred.gui.undo_commands import SetMechanismEditorTextsCommand
 
+        transition_required = False
         previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
         previous_authoritative_suppress = bool(
             getattr(self, "_suppress_authoritative_mechanism_input_change", False)
@@ -8134,9 +8267,14 @@ class MainWindow(
             )
             self._undo_stack.push(command)
             self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+            transition_required = True
         finally:
             self._variable_runtime.set_suppress_slider_runtime_invalidation(previous_suppress)
             self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
+        if bool(apply_transition) and bool(transition_required):
+            self._apply_authoritative_mechanism_transition(
+                transition_source=str(transition_source or "authoritative_editor_rewrite")
+            )
 
     def _materialize_direct_slider_commit_to_authoritative_editors(self, name: str, value: float) -> None:
         focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "")
@@ -8170,14 +8308,29 @@ class MainWindow(
             reactions_text=reactions_text,
             state_network_dsl=state_network_dsl,
             description=str(description),
+            apply_transition=False,
         )
 
     def _sync_after_authoritative_slider_materialization(
         self,
         *,
         preserve_current_display: Optional[Dict[str, Any]] = None,
+        affected_canonical_initial_set_ids: Sequence[str] = (),
     ) -> None:
-        self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
+        affected_set_ids_t = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_canonical_initial_set_ids or ()) if str(set_id))
+        )
+        canonical_initials_identity = (
+            self._canonical_batch_initials_identity_by_set_id()
+            if affected_set_ids_t
+            else None
+        )
+        self._apply_authoritative_mechanism_transition(
+            transition_source="slider_materialization",
+            preserve_current_display=preserve_current_display,
+            canonical_batch_initials_by_set_id=canonical_initials_identity,
+            affected_set_ids=affected_set_ids_t,
+        )
         try:
             self._extract_and_populate_variables(preserve_visibility=True)
         except Exception:
@@ -8189,9 +8342,6 @@ class MainWindow(
                 panel.rebuild_from_current_row()
         except Exception:
             logger.exception("Failed to rebuild species panel after slider materialization")
-        self._invalidate_active_results_after_authoritative_mechanism_change(
-            preserve_current_display=preserve_current_display
-        )
         self._refresh_slider_transaction_button_state()
 
     def _finalize_authoritative_slider_materialization(
@@ -8202,7 +8352,7 @@ class MainWindow(
         apply_species_overlays: bool,
     ) -> None:
         preserve_current_display = self._active_workspace_preview_display_snapshot()
-        self._sim_controller.invalidate_slider_preview_work()
+        self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._preview_session.stop_variable_update_timer()
         self._preview_session.stop_slider_release_commit_timer()
@@ -8210,11 +8360,13 @@ class MainWindow(
             effective_values,
             description=str(description),
         )
+        affected_canonical_initial_set_ids: tuple[str, ...] = ()
         if bool(apply_species_overlays):
-            self._commit_species_slider_values_to_selected_batch_rows()
+            affected_canonical_initial_set_ids = self._commit_species_slider_values_to_selected_batch_rows()
         self._preview_session.commit_current_mechanism_workspace(invalidate_preview_work=False)
         self._sync_after_authoritative_slider_materialization(
-            preserve_current_display=preserve_current_display
+            preserve_current_display=preserve_current_display,
+            affected_canonical_initial_set_ids=affected_canonical_initial_set_ids,
         )
 
     def _sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None:

@@ -16,6 +16,7 @@ __all__ = [
     "SimulationIdentity",
     "SimulationScopeIdentity",
     "SimulationSolverIdentity",
+    "canonical_initials_fingerprint",
     "contained_simulation_owner_identity",
     "coerce_simulation_identity",
     "coerce_simulation_scope_identity",
@@ -37,6 +38,28 @@ def _canonical_json_bytes(payload: object) -> bytes:
 def _sha256_text(value: object) -> str:
     text = "" if value is None else str(value)
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def canonical_initials_fingerprint(initials: Mapping[str, Any] | None) -> str:
+    if not isinstance(initials, Mapping):
+        return ""
+    payload: dict[str, float | str] = {}
+    for raw_name, raw_value in initials.items():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            payload[name] = str(raw_value)
+            continue
+        if math.isfinite(value):
+            payload[name] = float(value)
+        else:
+            payload[name] = str(raw_value)
+    if not payload:
+        return ""
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
 _DSL_PARAMETER_ASSIGNMENT_RE = re.compile(
@@ -260,11 +283,12 @@ class SimulationSolverIdentity:
 class SimulationIdentity:
     schema_id: str
     param_fingerprint: str
+    canonical_initials_fingerprint: str
     solver: SimulationSolverIdentity
     t_end: float
     preview_batch_cache_token: str = ""
     execution_flags: tuple[str, ...] = ()
-    version: int = 1
+    version: int = 2
 
     @classmethod
     def build(
@@ -274,6 +298,7 @@ class SimulationIdentity:
         param_fingerprint: str,
         solver_config: Mapping[str, Any] | None,
         t_end: float,
+        canonical_initials_fingerprint: str = "",
         preview_batch_cache_token: str = "",
         execution_flags: Sequence[str] = (),
     ) -> "SimulationIdentity":
@@ -281,6 +306,7 @@ class SimulationIdentity:
         return cls(
             schema_id=str(schema_id or ""),
             param_fingerprint=str(param_fingerprint or ""),
+            canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
             solver=SimulationSolverIdentity.from_solver_config(solver_config),
             t_end=float(t_end),
             preview_batch_cache_token=str(preview_batch_cache_token or ""),
@@ -298,6 +324,7 @@ class SimulationIdentity:
             version=int(payload.get("version") or 1),
             schema_id=str(payload.get("schema_id") or ""),
             param_fingerprint=str(payload.get("param_fingerprint") or ""),
+            canonical_initials_fingerprint=str(payload.get("canonical_initials_fingerprint") or ""),
             solver=SimulationSolverIdentity.from_payload(solver_payload),
             t_end=_try_float(payload.get("t_end", 0.0), 0.0),
             preview_batch_cache_token=str(payload.get("preview_batch_cache_token") or ""),
@@ -309,6 +336,7 @@ class SimulationIdentity:
             "version": int(self.version),
             "schema_id": str(self.schema_id),
             "param_fingerprint": str(self.param_fingerprint),
+            "canonical_initials_fingerprint": str(self.canonical_initials_fingerprint),
             "solver": self.solver.to_payload(),
             "t_end": float(self.t_end),
             "preview_batch_cache_token": str(self.preview_batch_cache_token),
@@ -436,7 +464,7 @@ def contained_simulation_owner_identity(
     if identity is not None:
         if mode != "preview":
             payload["schema_id"] = str(identity.schema_id)
-            payload["simulation_identity_key"] = identity.cache_key()
+            payload["simulation_identity_key"] = identity.prepared_runtime_key()
     if mode == "preview":
         payload["parameter_names"] = sorted(
             {str(name) for name in (parameter_names or ()) if str(name)}
