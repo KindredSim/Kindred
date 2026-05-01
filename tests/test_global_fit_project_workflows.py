@@ -127,9 +127,12 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
         ds1_settings = main_window._dataset_manager.get_fit_settings("ds1")
         ds2_settings = main_window._dataset_manager.get_fit_settings("ds2")
         ds1_row = main_window._batch_store.row_for_set_id(str(ds1_settings.batch_set_id))
+        ds2_row = main_window._batch_store.row_for_set_id(str(ds2_settings.batch_set_id))
         assert ds1_row is not None
+        assert ds2_row is not None
         set_id, set_name = _show_only_batch_set(main_window, row=int(ds1_row), qt_app=qt_app)
         ds2_set_id = str(ds2_settings.batch_set_id)
+        ds2_set_name = str(main_window._batch_store.set_name_for_row(int(ds2_row)))
 
         cache = main_window.simulation_controller.batch_cache
         cache_key = "fit-apply-ic-stale-cache"
@@ -138,10 +141,17 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
             "series": {"A": np.asarray([1.0, 0.5], dtype=float)},
             "algebra_scalars": {},
         }
+        cache.result_cache[f"{cache_key}::{ds2_set_id}"] = {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "series": {"A": np.asarray([4.0, 3.5], dtype=float)},
+            "algebra_scalars": {},
+        }
         cache.active_cache_key = cache_key
-        cache.active_cache_valid_set_ids = (set_id,)
+        cache.active_cache_valid_set_ids = (set_id, ds2_set_id)
         cache.active_cache_invalidated_set_ids = None
-        main_window.set_active_batch_selection(set_id, set_name, [set_id])
+        main_window._batch_model.set_row_shown(int(ds1_row), True)
+        main_window._batch_model.set_row_shown(int(ds2_row), True)
+        main_window.set_active_batch_selection(set_id, set_name, [set_id, ds2_set_id])
 
         main_window._refresh_batch_display_from_focus_and_shown()
         qt_app.processEvents()
@@ -153,7 +163,7 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
             {
                 "result": _make_fit_result(
                     k_value=0.44,
-                    dataset_initials={"ds1": {"init:A": 2.5}, "ds2": {"init:A": 1.7}},
+                    dataset_initials={"ds1": {"init:A": 2.5}},
                 )
             }
         )
@@ -166,9 +176,84 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
         button.click()
         qt_app.processEvents()
 
-        assert set(cache.active_cache_invalidated_set_ids or ()) == {set_id, ds2_set_id}
-        assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-        assert main_window.active_batch_selection() == ("", "")
-        assert main_window._plot_tabs._main_plot.export_payload() is None
+        assert cache.active_cache_invalidated_set_ids == (set_id,)
+
+        main_window._batch_model.set_row_shown(int(ds1_row), False)
+        main_window._batch_model.set_row_shown(int(ds2_row), True)
+        main_window.set_active_batch_selection(ds2_set_id, ds2_set_name, [ds2_set_id])
+        main_window._refresh_batch_display_from_focus_and_shown()
+        qt_app.processEvents()
+
+        plot = main_window._plot_tabs._main_plot
+        assert main_window.active_batch_selection()[0] == ds2_set_id
+        assert np.allclose(
+            np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+            np.asarray([4.0, 3.5], dtype=float),
+        )
+    finally:
+        window.close()
+
+
+def test_global_fit_apply_to_project_initial_conditions_discards_only_affected_dirty_preview(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    from PySide6 import QtWidgets
+
+    _seed_two_datasets(main_window)
+    _seed_simple_mechanism(main_window)
+    monkeypatch.setattr(
+        main_window._dataset_manager,
+        "scan_mechanism_parameters",
+        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+    )
+    _patch_message_box_exec(monkeypatch)
+
+    main_window._run_global_fit()
+    window = _latest_fit_window(main_window)
+    try:
+        ds1_settings = main_window._dataset_manager.get_fit_settings("ds1")
+        ds2_settings = main_window._dataset_manager.get_fit_settings("ds2")
+        ds1_row = main_window._batch_store.row_for_set_id(str(ds1_settings.batch_set_id))
+        ds2_row = main_window._batch_store.row_for_set_id(str(ds2_settings.batch_set_id))
+        assert ds1_row is not None
+        assert ds2_row is not None
+        ds1_set_id = str(ds1_settings.batch_set_id)
+        ds2_set_id = str(ds2_settings.batch_set_id)
+
+        assert main_window._preview_session.stage_concentration_value_for_rows(
+            [int(ds1_row)],
+            species="A",
+            value=6.5,
+        ) is True
+        assert main_window._preview_session.stage_concentration_value_for_rows(
+            [int(ds2_row)],
+            species="A",
+            value=7.5,
+        ) is True
+        assert main_window._preview_session.has_dirty_state_for_set(ds1_set_id) is True
+        assert main_window._preview_session.has_dirty_state_for_set(ds2_set_id) is True
+
+        window._handle_global_fit_complete(
+            {
+                "result": _make_fit_result(
+                    k_value=0.44,
+                    dataset_initials={"ds1": {"init:A": 2.5}},
+                )
+            }
+        )
+
+        combo = window.findChild(QtWidgets.QComboBox, "global_fit_apply_scope_combo")
+        button = window.findChild(QtWidgets.QPushButton, "global_fit_apply_to_project_button")
+        assert combo is not None
+        assert button is not None
+        combo.setCurrentText("Initial conditions only")
+        button.click()
+        qt_app.processEvents()
+
+        assert float(main_window._batch_store.get_value(int(ds1_row), "A")) == pytest.approx(2.5)
+        assert main_window._preview_session.has_dirty_state_for_set(ds1_set_id) is False
+        assert main_window._preview_session.has_dirty_state_for_set(ds2_set_id) is True
     finally:
         window.close()

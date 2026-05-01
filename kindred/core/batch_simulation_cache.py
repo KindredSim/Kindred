@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from kindred.core.lru_cache import LRUCache
 from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACHE_CAP_DEFAULT
@@ -42,6 +42,57 @@ class BatchSimulationCache:
     @staticmethod
     def entry_key(cache_key: str, set_id: str) -> str:
         return f"{str(cache_key)}::{str(set_id)}"
+
+    @staticmethod
+    def normalize_set_ids(set_ids: Sequence[str] | None) -> tuple[str, ...]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for raw_set_id in set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id or set_id in seen:
+                continue
+            seen.add(set_id)
+            ordered.append(set_id)
+        return tuple(ordered)
+
+    def active_result_cache_set_ids(self) -> tuple[str, ...]:
+        active_key = str(self.active_cache_key or "").strip()
+        if not active_key:
+            return ()
+        prefix = f"{active_key}::"
+        cached_ids: list[str] = []
+        try:
+            for raw_key in self.result_cache:
+                key_s = str(raw_key or "")
+                if not key_s.startswith(prefix):
+                    continue
+                set_id = str(key_s[len(prefix):] or "").strip()
+                if set_id and set_id not in cached_ids:
+                    cached_ids.append(set_id)
+        except Exception:
+            cached_ids = []
+        if cached_ids:
+            return tuple(cached_ids)
+        return self.normalize_set_ids(self.active_cache_valid_set_ids)
+
+    def record_active_result_cache_staleness(
+        self,
+        *,
+        set_ids: Sequence[str] = (),
+        is_global: bool = False,
+    ) -> tuple[str, ...]:
+        active_scope = self.active_result_cache_set_ids()
+        if bool(is_global):
+            stale_scope = active_scope
+        else:
+            stale_scope = self.normalize_set_ids(
+                (*self.normalize_set_ids(self.active_cache_invalidated_set_ids), *self.normalize_set_ids(set_ids))
+            )
+            if active_scope:
+                active_ids = set(active_scope)
+                stale_scope = tuple(set_id for set_id in stale_scope if set_id in active_ids)
+        self.active_cache_invalidated_set_ids = stale_scope or None
+        return stale_scope
 
     def set_caps(self, *, result_cap: int, preview_cap: int) -> None:
         self.result_cache_cap = max(0, int(result_cap))

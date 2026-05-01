@@ -211,6 +211,7 @@ if PYQTGRAPH_AVAILABLE:
             self._visible: Dict[str, bool] = {}
             self._colors: Dict[str, tuple] = {}
             self._owned_species_keys: Set[str] = set()
+            self._owned_species_roster_explicit: bool = False
             self._plot_items: Dict[str, pg.PlotDataItem] = {}
             self._dataset_scatter_items: Dict[str, pg.ScatterPlotItem] = {}
             self._dataset_model_items: Dict[str, pg.PlotDataItem] = {}
@@ -218,8 +219,12 @@ if PYQTGRAPH_AVAILABLE:
             self._overlay_datasets: Dict[str, Dict[str, np.ndarray]] = {}
             self._overlay_symbols: Dict[str, str] = {}
             self._active_overlay_series: List[_OverlaySeries] = []
+            self._visible_overlay_series: List[_OverlaySeries] = []
+            self._export_all_overlay_series_unfiltered: List[_OverlaySeries] = []
             self._export_all_overlay_series: List[_OverlaySeries] = []
             self._active_overlay_warnings: List[str] = []
+            self._visible_overlay_warnings: List[str] = []
+            self._export_all_overlay_warnings_unfiltered: List[str] = []
             self._export_all_overlay_warnings: List[str] = []
             self._export_all_overlay_cache_dirty: bool = True
             self._dark_mode = False
@@ -477,11 +482,11 @@ if PYQTGRAPH_AVAILABLE:
             series_keys = {str(name).strip() for name in self._series.keys() if str(name).strip()}
             if provided_owned:
                 self._owned_species_keys = set(provided_owned)
+                self._owned_species_roster_explicit = True
                 color_manager.set_species_roster(sorted(self._owned_species_keys))
-            elif self._owned_species_keys and self._owned_species_keys.issubset(series_keys):
-                self._owned_species_keys = {name for name in self._owned_species_keys if name in series_keys}
             else:
                 self._owned_species_keys = set(series_keys)
+                self._owned_species_roster_explicit = False
                 if self._owned_species_keys:
                     color_manager.seed_species(sorted(self._owned_species_keys))
 
@@ -529,6 +534,14 @@ if PYQTGRAPH_AVAILABLE:
             self._update_plot()
 
             logger.debug(f"Data set: {len(self._t)} points, {len(self._series)} series")
+
+        def owned_species_for_replay(self) -> Optional[Tuple[str, ...]]:
+            if not bool(getattr(self, "_owned_species_roster_explicit", False)):
+                return None
+            owned_species = tuple(
+                sorted(str(name) for name in (self._owned_species_keys or set()) if str(name))
+            )
+            return owned_species or None
 
         def render_dataset_layers(
             self,
@@ -888,7 +901,7 @@ if PYQTGRAPH_AVAILABLE:
             x_label: str,
         ) -> List[List[Tuple[str, np.ndarray]]]:
             blocks: List[List[Tuple[str, np.ndarray]]] = []
-            for overlay in list(self._active_overlay_series or []):
+            for overlay in list(self._visible_overlay_series or []):
                 x_overlay_array = _try_1d_float_array(overlay.x)
                 y_overlay_array = _try_1d_float_array(overlay.y)
                 if x_overlay_array.size == 0 or y_overlay_array.size == 0:
@@ -1392,12 +1405,99 @@ if PYQTGRAPH_AVAILABLE:
         def refresh_overlay_presentation_for_current_roster(self) -> None:
             """Keep visible overlay markers aligned with current-roster swatch semantics."""
             self._overlay_panel.refresh_color_swatches()
+            self._refresh_visible_overlay_warnings_for_current_roster()
+            if not self._export_all_overlay_cache_dirty:
+                self._refresh_export_all_overlay_roster_view()
+            self._overlay_panel.set_status_messages(self._visible_overlay_warnings)
             self._draw_overlay_series(list(self._active_overlay_series))
+
+        def _overlay_series_for_current_roster(
+            self,
+            overlays: Sequence[_OverlaySeries],
+        ) -> List[_OverlaySeries]:
+            return [
+                entry
+                for entry in list(overlays or [])
+                if self._overlay_entry_matches_current_roster(entry)
+            ]
+
+        def _refresh_visible_overlay_warnings_for_current_roster(self) -> None:
+            self._visible_overlay_warnings = [
+                warning
+                for warning in self._active_overlay_warnings
+                if self._overlay_warning_matches_current_roster(warning)
+            ]
+
+        def _overlay_entry_matches_current_roster(self, entry: _OverlaySeries) -> bool:
+            color_manager = ColorManager.instance()
+            current_roster = set(color_manager.registered_species_names())
+            if not current_roster:
+                return True
+            owned_species = tuple(str(name) for name in (self._owned_species_keys or set()) if str(name))
+            if not owned_species or not bool(getattr(self, "_owned_species_roster_explicit", False)):
+                return True
+            owned_species_key = self._overlay_entry_owned_species_key(entry, owned_species)
+            if owned_species_key is not None:
+                return color_manager.resolve_current_species_key(owned_species_key) is not None
+            if color_manager.resolve_current_species_key(entry.resolved_y_column) is not None:
+                return True
+            return str(entry.resolved_y_column or "") in self._series
+
+        def _overlay_entry_owned_species_key(
+            self,
+            entry: _OverlaySeries,
+            owned_species: Sequence[str],
+        ) -> Optional[str]:
+            color_manager = ColorManager.instance()
+            species_key = color_manager.resolve_known_species_key(entry.species, owned_species)
+            if species_key is not None:
+                return species_key
+            return color_manager.resolve_known_species_key(entry.resolved_y_column, owned_species)
+
+        def _overlay_warning_matches_current_roster(self, warning: str) -> bool:
+            color_manager = ColorManager.instance()
+            current_roster = set(color_manager.registered_species_names())
+            if not current_roster:
+                return True
+            owned_species = tuple(str(name) for name in (self._owned_species_keys or set()) if str(name))
+            if not owned_species or not bool(getattr(self, "_owned_species_roster_explicit", False)):
+                return True
+            species_name = self._overlay_warning_species_name(str(warning or ""))
+            if not species_name:
+                return True
+            if species_name == "t":
+                return True
+            owned_species_key = color_manager.resolve_known_species_key(species_name, owned_species)
+            if owned_species_key is not None:
+                return color_manager.resolve_current_species_key(owned_species_key) is not None
+            if color_manager.resolve_current_species_key(species_name) is not None:
+                return True
+            return str(species_name or "") in self._series
+
+        @staticmethod
+        def _overlay_warning_species_name(warning_text: str) -> Optional[str]:
+            marker = "species '"
+            start = warning_text.find(marker)
+            if start >= 0:
+                start += len(marker)
+            else:
+                start = warning_text.find("'")
+                if start < 0:
+                    return None
+                start += len("'")
+            end = warning_text.find("'", start)
+            if end < 0:
+                return None
+            return str(warning_text[start:end] or "").strip() or None
 
         def _clear_overlay_series_caches(self) -> None:
             self._active_overlay_series = []
+            self._visible_overlay_series = []
+            self._export_all_overlay_series_unfiltered = []
             self._export_all_overlay_series = []
             self._active_overlay_warnings = []
+            self._visible_overlay_warnings = []
+            self._export_all_overlay_warnings_unfiltered = []
             self._export_all_overlay_warnings = []
             self._export_all_overlay_cache_dirty = True
 
@@ -1427,19 +1527,34 @@ if PYQTGRAPH_AVAILABLE:
             """
             axis_candidate_names = list(axis_scope_series or [])
             self._active_overlay_series, self._active_overlay_warnings = self._build_overlay_series(axis_candidate_names)
+            self._refresh_visible_overlay_warnings_for_current_roster()
 
         def _ensure_export_all_overlay_cache(self) -> None:
             if not self._export_all_overlay_cache_dirty:
+                self._refresh_export_all_overlay_roster_view()
                 return
             overlay_series, raw_warnings = self._build_overlay_series(
                 list(self._series.keys())
             )
-            self._export_all_overlay_series = overlay_series
-            self._export_all_overlay_warnings = [
+            self._export_all_overlay_series_unfiltered = list(overlay_series)
+            self._export_all_overlay_warnings_unfiltered = [
                 msg for msg in raw_warnings
                 if ": no column matching species " not in msg
             ]
+            self._refresh_export_all_overlay_roster_view()
             self._export_all_overlay_cache_dirty = False
+
+        def _refresh_export_all_overlay_roster_view(self) -> None:
+            self._export_all_overlay_series = [
+                entry
+                for entry in self._export_all_overlay_series_unfiltered
+                if self._overlay_entry_matches_current_roster(entry)
+            ]
+            self._export_all_overlay_warnings = [
+                warning
+                for warning in self._export_all_overlay_warnings_unfiltered
+                if self._overlay_warning_matches_current_roster(warning)
+            ]
 
         def _get_sampling_indices(self, length: int):
             """Return slice or index array for downsampling plots."""
@@ -1752,8 +1867,8 @@ if PYQTGRAPH_AVAILABLE:
             self._prune_curve_items(active_curve_keys)
 
             self._rebuild_overlay_series_caches(axis_scope_series)
-            self._overlay_panel.set_status_messages(self._active_overlay_warnings)
             self._draw_overlay_series(list(self._active_overlay_series))
+            self._overlay_panel.set_status_messages(self._visible_overlay_warnings)
             self._refresh_view_after_plot_update()
 
         def _refresh_view_after_plot_update(self) -> None:
@@ -1852,11 +1967,12 @@ if PYQTGRAPH_AVAILABLE:
 
         def _draw_overlay_series(self, overlays: List[_OverlaySeries]) -> None:
             """Render overlay scatter markers using species-owned colors and dataset markers."""
+            self._visible_overlay_series = self._overlay_series_for_current_roster(overlays)
             # Get current dataset styling from overlay panel (size and opacity)
             style = self._overlay_panel.dataset_style()
             active_overlay_keys: Set[Tuple[str, str]] = set()
 
-            for entry in overlays:
+            for entry in self._visible_overlay_series:
                 color = self._overlay_display_color(entry.resolved_y_column)
                 symbol = self._overlay_symbols.get(entry.dataset, 'o')
 
@@ -1905,8 +2021,8 @@ if PYQTGRAPH_AVAILABLE:
                 candidate_names = self._axis_scope_series_names()
                 if not candidate_names:
                     raise ValueError("Select at least one Y-series before exporting.")
-                overlay_series = list(self._active_overlay_series)
-                warnings = list(self._active_overlay_warnings)
+                overlay_series = list(self._visible_overlay_series)
+                warnings = list(self._visible_overlay_warnings)
             else:
                 self._ensure_export_all_overlay_cache()
                 candidate_names = list(series.keys())
@@ -2234,8 +2350,12 @@ if PYQTGRAPH_AVAILABLE:
             self._dataset_model_items = {}
             self._overlay_items = {}
             self._active_overlay_series = []
+            self._visible_overlay_series = []
+            self._export_all_overlay_series_unfiltered = []
             self._export_all_overlay_series = []
             self._active_overlay_warnings = []
+            self._visible_overlay_warnings = []
+            self._export_all_overlay_warnings_unfiltered = []
             self._export_all_overlay_warnings = []
             self._export_all_overlay_cache_dirty = True
             self._annotations = []

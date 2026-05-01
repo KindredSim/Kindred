@@ -236,9 +236,13 @@ class _PlanHost(QtWidgets.QWidget, FittingMixin):
         self._preview_session = SimpleNamespace(param_store=DocumentParameterStore())
         self._preview_session.param_store.sync_shared_params(dict(authoritative_params))
         self._batch_store = _PlanBatchStore(batch_rows)
+        self.canonical_initial_transition_calls: list[dict[str, object]] = []
 
     def _get_solver_settings(self) -> dict[str, object]:
         return dict(self._solver_settings)
+
+    def _apply_canonical_batch_initials_transition(self, **kwargs) -> None:
+        self.canonical_initial_transition_calls.append(dict(kwargs))
 
 
 class _NoRewritePlanHost(_PlanHost):

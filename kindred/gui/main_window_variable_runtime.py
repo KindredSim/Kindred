@@ -240,14 +240,44 @@ class MainWindowVariableRuntime:
 
             state_network_dsl = mw.mechanism_state_network_dsl_raw()
             parse_mechanism_text = strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
-            full_dsl = parse_mechanism_text
-            if state_network_dsl.strip():
-                full_dsl += "\n\n# State Network\n" + state_network_dsl.strip("\n")
             try:
-                mechanism = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
-                if isinstance(getattr(mechanism, "metadata", None), dict):
-                    mechanism.metadata["wegscheider_cyclicity_enabled"] = bool(mw.wegscheider_cyclicity_enabled())
-                _ = apply_parameter_algebra_to_mechanism(full_dsl, mechanism=mechanism, require_mutable=False)
+                wegscheider_enabled = bool(mw.wegscheider_cyclicity_enabled())
+
+                def _build_structure_snapshot(full_dsl: str) -> object:
+                    mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
+                    if isinstance(getattr(mechanism_obj, "metadata", None), dict):
+                        mechanism_obj.metadata["wegscheider_cyclicity_enabled"] = wegscheider_enabled
+                    _ = apply_parameter_algebra_to_mechanism(
+                        full_dsl,
+                        mechanism=mechanism_obj,
+                        require_mutable=False,
+                    )
+                    return mechanism_obj
+
+                mechanism_helpers = getattr(mw, "_mechanism_helpers", None)
+                authoritative_structure_snapshot = getattr(
+                    mechanism_helpers,
+                    "authoritative_structure_snapshot",
+                    None,
+                )
+                if callable(authoritative_structure_snapshot):
+                    structure_snapshot = authoritative_structure_snapshot(
+                        reactions_text=parse_mechanism_text,
+                        state_network_text=state_network_dsl,
+                        units_identity=(
+                            "temperature_K",
+                            f"{float(temperature_k):.17g}",
+                            "wegscheider",
+                            str(wegscheider_enabled),
+                        ),
+                        builder=_build_structure_snapshot,
+                    )
+                    mechanism = structure_snapshot.mechanism
+                else:
+                    full_dsl = str(parse_mechanism_text or "")
+                    if str(state_network_dsl or "").strip():
+                        full_dsl += "\n\n# State Network\n" + str(state_network_dsl).strip("\n")
+                    mechanism = _build_structure_snapshot(full_dsl)
             except Exception as exc:
                 logger.warning("Could not parse mechanism for variable extraction: %s", exc)
                 return

@@ -469,6 +469,45 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         impacted_rows = sorted({int(r) for r, _c in changed})
         model.validate_rows(impacted_rows)
 
-        top_left = model.index(min(r for r, _c in changed), min(c for _r, c in changed))
-        bottom_right = model.index(max(r for r, _c in changed), max(c for _r, c in changed))
-        model.dataChanged.emit(top_left, bottom_right, [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole])
+        changed_set_owner = model.parent()
+        pending_changed_set_ids = getattr(changed_set_owner, "_pending_canonical_batch_initials_changed_set_ids", None)
+        previous_pending_set = pending_changed_set_ids if isinstance(pending_changed_set_ids, list) else None
+        if changed_set_owner is not None:
+            try:
+                setattr(changed_set_owner, "_pending_canonical_batch_initials_changed_set_ids", [])
+            except Exception:
+                changed_set_owner = None
+        try:
+            for row, column in changed:
+                changed_index = model.index(int(row), int(column))
+                if changed_index.isValid():
+                    model.dataChanged.emit(
+                        changed_index,
+                        changed_index,
+                        [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
+                    )
+        finally:
+            affected_set_ids: tuple[str, ...] = ()
+            if changed_set_owner is not None:
+                pending_set = getattr(
+                    changed_set_owner,
+                    "_pending_canonical_batch_initials_changed_set_ids",
+                    set(),
+                )
+                if isinstance(pending_set, list):
+                    affected_set_ids = tuple(str(set_id) for set_id in pending_set if str(set_id))
+                try:
+                    setattr(
+                        changed_set_owner,
+                        "_pending_canonical_batch_initials_changed_set_ids",
+                        previous_pending_set,
+                    )
+                except Exception:
+                    pass
+            transition = getattr(changed_set_owner, "_apply_canonical_batch_initials_transition", None)
+            if callable(transition) and affected_set_ids:
+                transition(
+                    affected_set_ids=affected_set_ids,
+                    transition_source="batch_initials_table_paste",
+                    discard_dirty_preview=True,
+                )

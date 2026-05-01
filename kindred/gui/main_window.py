@@ -27,6 +27,7 @@ from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 from kindred.core.mechanism_runtime_transition import (
     AuthoritativeMechanismSnapshot,
+    MechanismTransitionOutcome,
     MechanismRuntimeTransitionService,
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
@@ -219,6 +220,8 @@ class MainWindow(
         self._mechanism_helpers = MainWindowMechanismHelpers(self)
         self._mechanism_runtime_transition = MechanismRuntimeTransitionService()
         self._authoritative_mechanism_runtime_refresh_defer_depth = 0
+        self._suppress_canonical_batch_initials_transition = False
+        self._pending_canonical_batch_initials_changed_set_ids: list[str] | None = None
 
         # Simulation execution, batch orchestration, caching, and worker lifecycle.
         plumbing = build_simulation_plumbing(self)
@@ -507,7 +510,7 @@ class MainWindow(
         preserve_current_display: Optional[Dict[str, Any]] = None,
         canonical_batch_initials_by_set_id: Optional[Mapping[str, object]] = None,
         affected_set_ids: Sequence[str] = (),
-    ) -> None:
+    ) -> MechanismTransitionOutcome:
         if schedule_runtime_refresh is None:
             schedule_runtime_refresh = not self._authoritative_mechanism_runtime_refresh_deferred()
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -527,27 +530,140 @@ class MainWindow(
         if outcome.runtime_invalidation_required:
             self._invalidate_slider_runtime()
         if outcome.active_work_supersede_required:
-            if outcome.affected_set_ids:
+            if outcome.runtime_invalidation_required:
                 self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
                     epoch=int(outcome.epoch),
-                    affected_set_ids=outcome.affected_set_ids,
-                    close_preview_runtime_owner=bool(outcome.runtime_invalidation_required),
                 )
             else:
                 self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
-                    epoch=int(outcome.epoch)
+                    epoch=int(outcome.epoch),
+                    affected_set_ids=outcome.active_work_supersede_set_ids,
+                    close_preview_runtime_owner=False,
                 )
         if outcome.display_cache_invalidation_allowed and (
-            self._authoritative_mechanism_has_active_display() or bool(outcome.affected_set_ids)
+            self._authoritative_mechanism_has_active_display()
+            or bool(outcome.cache_stale_scope_is_global)
+            or bool(outcome.cache_stale_set_ids)
         ):
-            self._invalidate_active_results_after_authoritative_mechanism_change(
+            self._apply_authoritative_result_truth_effects(
                 preserve_current_display=preserve_current_display,
-                supersede_active_work=False,
-                affected_set_ids=outcome.affected_set_ids,
+                cache_stale_set_ids=outcome.cache_stale_set_ids,
+                cache_stale_scope_is_global=outcome.cache_stale_scope_is_global,
+                display_clear_set_ids=outcome.display_clear_set_ids,
+                display_clear_scope_is_global=outcome.display_clear_scope_is_global,
+                clear_cached_mechanism=bool(outcome.runtime_invalidation_required),
             )
-        self._refresh_authoritative_mechanism_derived_ui()
+        if not (outcome.runtime_input_invalidation_required and not outcome.runtime_invalidation_required):
+            self._refresh_authoritative_mechanism_derived_ui()
         if outcome.readiness_schedule_required:
             self._schedule_simulation_runtime_availability_refresh(wait=False)
+        return outcome
+
+    def _apply_canonical_batch_initials_transition(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        transition_source: str,
+        discard_dirty_preview: bool = True,
+    ) -> None:
+        affected_set_ids_t = tuple(
+            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
+        )
+        if not affected_set_ids_t:
+            return
+        outcome = self._apply_authoritative_mechanism_transition(
+            transition_source=str(transition_source or "canonical_batch_initials_change"),
+            canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
+            affected_set_ids=affected_set_ids_t,
+        )
+        if bool(discard_dirty_preview) and (
+            bool(outcome.runtime_input_invalidation_required)
+            or bool(outcome.runtime_invalidation_required)
+        ):
+            dirty_preview_reset_set_ids = (
+                affected_set_ids_t
+                if bool(outcome.dirty_preview_reset_scope_is_global)
+                else outcome.dirty_preview_reset_set_ids
+            )
+            displayed_dirty_preview_set_ids = []
+            for set_id in dirty_preview_reset_set_ids:
+                try:
+                    if self._displayed_workspace_preview_provenance_matches_current_workspace(set_id=str(set_id)):
+                        displayed_dirty_preview_set_ids.append(str(set_id))
+                except Exception:
+                    continue
+            preview_state_changed = False
+            try:
+                preview_state_changed = bool(
+                    self._preview_session.reset_mechanism_workspaces(dirty_preview_reset_set_ids)
+                )
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.canonical_initials.reset_dirty_workspaces",
+                    message="Failed to discard dirty slider workspaces after canonical batch initial edit",
+                    exc=exc,
+                )
+            try:
+                preview_state_changed = bool(
+                    self._preview_session.discard_concentration_overlays_for_set_ids(dirty_preview_reset_set_ids)
+                ) or preview_state_changed
+            except Exception as exc:
+                self._record_best_effort_failure(
+                    "main_window.canonical_initials.discard_dirty_overlays",
+                    message="Failed to discard dirty species overlays after canonical batch initial edit",
+                    exc=exc,
+                )
+            if preview_state_changed:
+                if displayed_dirty_preview_set_ids and self.main_plot_has_data():
+                    batch_cache = getattr(self._sim_controller, "batch_cache", None)
+                    clear_preview = getattr(batch_cache, "clear_active_preview_selection_state", None)
+                    if callable(clear_preview):
+                        clear_preview()
+                    self._clear_batch_selection_display_state()
+                self._refresh_species_sliders_after_canonical_initials_transition(dirty_preview_reset_set_ids)
+
+    def _refresh_species_sliders_after_canonical_initials_transition(
+        self,
+        affected_set_ids: Sequence[str],
+    ) -> None:
+        affected = {str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)}
+        if not affected:
+            return
+        focused_set_id = str(self._preview_session.focused_mechanism_workspace_set_id() or "").strip()
+        current_set_id = ""
+        try:
+            current_row = self._batch_current_row()
+            if current_row is not None:
+                current_set_id = str(self._batch_set_id_for_row(int(current_row)) or "").strip()
+        except Exception:
+            current_set_id = ""
+        effective_slider_target_ids: set[str] = set()
+        try:
+            effective_slider_target_ids = {
+                str(set_id)
+                for set_id in (self._effective_slider_edit_target_set_ids() or ())
+                if str(set_id)
+            }
+        except Exception:
+            effective_slider_target_ids = set()
+        if (
+            focused_set_id not in affected
+            and current_set_id not in affected
+            and not bool(affected & effective_slider_target_ids)
+        ):
+            return
+        try:
+            panel = self._mechanism_editor.species_sliders_widget()
+            if panel is not None and hasattr(panel, "refresh_current_row_from_model"):
+                panel.refresh_current_row_from_model(recompute_ranges=True)
+            elif panel is not None and hasattr(panel, "rebuild_from_current_row"):
+                panel.rebuild_from_current_row()
+        except Exception as exc:
+            self._record_best_effort_failure(
+                "main_window.canonical_initials.refresh_species_sliders",
+                message="Failed to refresh species sliders after canonical batch initial edit",
+                exc=exc,
+            )
 
     def _schedule_pending_authoritative_mechanism_runtime_refresh(self) -> bool:
         pending_epoch = self._mechanism_runtime_transition.consume_pending_readiness_epoch()
@@ -1326,14 +1442,18 @@ class MainWindow(
             strip_named_reaction_dsl_initial_concentration_sets,
         )
 
-        mechanism_text = str(self._get_mechanism_text() or "")
-        if not mechanism_text.strip():
+        reactions_text = str(self.mechanism_reactions_text_raw() or "")
+        state_network_text = str(self.mechanism_state_network_dsl_raw() or "")
+        if not reactions_text.strip() and not state_network_text.strip():
             return ()
         try:
-            mechanism_text = strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
+            reactions_text = strip_named_reaction_dsl_initial_concentration_sets(reactions_text)
         except Exception:
             logger.debug("Failed to parse current mechanism species roster for color sync", exc_info=True)
             return None
+        mechanism_text = str(reactions_text or "")
+        if state_network_text.strip():
+            mechanism_text += "\n\n# State Network\n" + state_network_text.strip("\n")
 
         def _clean(names: Any) -> tuple[str, ...]:
             return tuple(str(name).strip() for name in (names or ()) if str(name).strip())
@@ -1348,10 +1468,35 @@ class MainWindow(
 
         try:
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
             from kindred.core.units import UnitsModel
 
-            units = UnitsModel(temperature_K=float(self._temperature_spinbox.value()))
-            mechanism = parse_dsl_to_mechanism(mechanism_text, initials={}, units=units)
+            temperature_k = float(self._temperature_spinbox.value())
+            units = UnitsModel(temperature_K=temperature_k)
+            wegscheider_enabled = bool(self.wegscheider_cyclicity_enabled())
+
+            def _build_structure_snapshot(full_dsl: str) -> object:
+                mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
+                if isinstance(getattr(mechanism_obj, "metadata", None), dict):
+                    mechanism_obj.metadata["wegscheider_cyclicity_enabled"] = wegscheider_enabled
+                _ = apply_parameter_algebra_to_mechanism(
+                    full_dsl,
+                    mechanism=mechanism_obj,
+                    require_mutable=False,
+                )
+                return mechanism_obj
+
+            mechanism = self._mechanism_helpers.authoritative_structure_snapshot(
+                reactions_text=reactions_text,
+                state_network_text=state_network_text,
+                units_identity=(
+                    "temperature_K",
+                    f"{temperature_k:.17g}",
+                    "wegscheider",
+                    str(wegscheider_enabled),
+                ),
+                builder=_build_structure_snapshot,
+            ).mechanism
             return _clean(mechanism.species_names())
         except Exception:
             logger.debug("Failed to parse current mechanism species roster for color sync", exc_info=True)
@@ -3667,77 +3812,86 @@ class MainWindow(
             "preserved_overlays": preserved_overlays,
         }
 
-    def _invalidate_active_results_after_authoritative_mechanism_change(
+    def _visible_result_display_set_ids(self, batch_cache: Any) -> set[str]:
+        visible_scope = {str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)}
+        visible_scope.update(str(set_id) for set_id in (batch_cache.last_display_selection or ()) if str(set_id))
+        active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
+        if active_batch_set_id:
+            visible_scope.add(active_batch_set_id)
+        return visible_scope
+
+    def _display_clear_scope_affects_visible_results(
         self,
         *,
-        preserve_current_display: Optional[Dict[str, Any]] = None,
-        supersede_active_work: bool = True,
-        affected_set_ids: Sequence[str] = (),
-    ) -> None:
-        """Drop stale displayed results after the authoritative mechanism changes."""
-        self._clear_last_mechanism()
-        if bool(supersede_active_work):
-            if affected_set_ids:
-                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
-                    epoch=int(self._mechanism_runtime_transition.current_epoch),
-                    affected_set_ids=tuple(str(set_id) for set_id in affected_set_ids if str(set_id)),
-                )
-            else:
-                self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
-                    epoch=int(self._mechanism_runtime_transition.current_epoch)
-                )
+        batch_cache: Any,
+        display_clear_set_ids: Sequence[str],
+        display_clear_scope_is_global: bool,
+    ) -> bool:
+        if bool(display_clear_scope_is_global):
+            return True
+        clear_scope = set(
+            str(set_id) for set_id in (display_clear_set_ids or ()) if str(set_id)
+        )
+        return bool(clear_scope & self._visible_result_display_set_ids(batch_cache))
 
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is None:
-            return
+    def _clear_visible_results_for_authoritative_transition(
+        self,
+        *,
+        batch_cache: Any,
+        display_clear_set_ids: Sequence[str],
+        display_clear_scope_is_global: bool,
+    ) -> bool:
+        if not self._display_clear_scope_affects_visible_results(
+            batch_cache=batch_cache,
+            display_clear_set_ids=display_clear_set_ids,
+            display_clear_scope_is_global=display_clear_scope_is_global,
+        ):
+            return False
+        clear_display = getattr(batch_cache, "clear_display_selection_state", None)
+        if callable(clear_display):
+            clear_display()
+        else:
+            batch_cache.last_display_selection = []
+            batch_cache.active_batch_set = None
+            batch_cache.active_batch_set_id = None
+        return True
 
+    def _clear_orphaned_visible_results_for_authoritative_transition(
+        self,
+        *,
+        batch_cache: Any,
+        preserve_current_display: Optional[Dict[str, Any]],
+        display_clear_set_ids: Sequence[str],
+        display_clear_scope_is_global: bool,
+    ) -> bool:
         active_cache_key = str(batch_cache.active_cache_key or "").strip()
-        selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
-        affected_scope = tuple(dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id)))
-        display_cleared = False
-        if active_cache_key:
-            fallback_scope = ()
-            cached_scope_ids: list[str] = []
-            try:
-                for raw_key in batch_cache.result_cache:
-                    key_s = str(raw_key or "")
-                    prefix = f"{active_cache_key}::"
-                    if not key_s.startswith(prefix):
-                        continue
-                    set_id = str(key_s[len(prefix):] or "").strip()
-                    if set_id and set_id not in cached_scope_ids:
-                        cached_scope_ids.append(set_id)
-            except Exception:
-                cached_scope_ids = []
-            active_valid_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id))
-            if cached_scope_ids:
-                fallback_scope = tuple(cached_scope_ids)
-            elif active_valid_ids:
-                fallback_scope = active_valid_ids
-            elif selected_ids:
-                fallback_scope = tuple(selected_ids)
-            elif batch_cache.last_display_selection:
-                fallback_scope = tuple(str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id))
-            else:
-                active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
-                fallback_scope = (active_batch_set_id,) if active_batch_set_id else ()
-            invalidated_scope = affected_scope or fallback_scope
-            batch_cache.active_cache_invalidated_set_ids = invalidated_scope or None
-            visible_scope = set(selected_ids)
-            visible_scope.update(str(set_id) for set_id in (batch_cache.last_display_selection or ()) if str(set_id))
-            active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
-            if active_batch_set_id:
-                visible_scope.add(active_batch_set_id)
-            should_clear_display = not affected_scope or bool(set(affected_scope) & visible_scope)
-            if should_clear_display:
-                clear_display = getattr(batch_cache, "clear_display_selection_state", None)
-                if callable(clear_display):
-                    clear_display()
-                else:
-                    batch_cache.last_display_selection = []
-                    batch_cache.active_batch_set = None
-                    batch_cache.active_batch_set_id = None
-                display_cleared = True
+        if active_cache_key or preserve_current_display or not self.main_plot_has_data():
+            return False
+        display_selection = tuple(
+            str(set_id) for set_id in (batch_cache.last_display_selection or ()) if str(set_id)
+        )
+        has_display_provenance = bool(
+            str(batch_cache.active_batch_set_id or "").strip()
+            or str(batch_cache.active_batch_set or "").strip()
+            or display_selection
+        )
+        if has_display_provenance:
+            return False
+        if not self._display_clear_scope_affects_visible_results(
+            batch_cache=batch_cache,
+            display_clear_set_ids=display_clear_set_ids,
+            display_clear_scope_is_global=display_clear_scope_is_global,
+        ):
+            return False
+        self._clear_batch_selection_display_state()
+        return True
+
+    def _restore_preserved_authoritative_display(
+        self,
+        *,
+        batch_cache: Any,
+        preserve_current_display: Optional[Dict[str, Any]],
+    ) -> bool:
         if preserve_current_display and self.main_plot_has_data():
             preserved_set_id = str(preserve_current_display.get("set_id") or "").strip()
             preserved_set_name = str(preserve_current_display.get("set_name") or "").strip()
@@ -3752,7 +3906,11 @@ class MainWindow(
             plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
             plot_t = np.asarray(getattr(plot, "_t", None) if plot is not None else [], dtype=float).reshape(-1)
             plot_series = dict(getattr(plot, "_series", {}) or {}) if plot is not None else {}
-            plot_owned_species = getattr(plot, "_owned_species", None) if plot is not None else None
+            plot_owned_species = None
+            if plot is not None:
+                owned_species_for_replay = getattr(plot, "owned_species_for_replay", None)
+                if callable(owned_species_for_replay):
+                    plot_owned_species = owned_species_for_replay()
             plot_has_overlays = bool(getattr(plot, "_simulation_overlays", []) or []) if plot is not None else False
             preserve_multiselect_overlays = bool(preserved_overlays)
             if preserved_set_id:
@@ -3821,20 +3979,95 @@ class MainWindow(
                         label.setText("Ready")
                 except RuntimeError:
                     self._status_label = None
-            return
+            return True
+        return False
+
+    def _set_authoritative_transition_cache_miss_status(self) -> None:
+        label = getattr(self, "_status_label", None)
+        if label is not None:
+            try:
+                label.setText("Result not cached (evicted). Press Run to compute.")
+            except RuntimeError:
+                self._status_label = None
+
+    def _finish_authoritative_result_display_update(
+        self,
+        *,
+        batch_cache: Any,
+        active_cache_key: str,
+        selected_ids: Sequence[str],
+        display_cleared: bool,
+    ) -> None:
         if active_cache_key and batch_cache.active_cache_invalidated_set_ids and display_cleared:
             self._clear_batch_selection_display_state()
-            label = getattr(self, "_status_label", None)
-            if label is not None:
-                try:
-                    label.setText("Result not cached (evicted). Press Run to compute.")
-                except RuntimeError:
-                    self._status_label = None
+            self._set_authoritative_transition_cache_miss_status()
             return
-        if selected_ids:
+        if selected_ids and (
+            active_cache_key
+            or bool(batch_cache.active_batch_set_id)
+            or bool(batch_cache.last_display_selection)
+        ):
             self._refresh_batch_display_from_focus_and_shown()
             return
+        if selected_ids:
+            return
         self._clear_batch_selection_display_state()
+
+    def _apply_authoritative_result_truth_effects(
+        self,
+        *,
+        preserve_current_display: Optional[Dict[str, Any]] = None,
+        cache_stale_set_ids: Sequence[str] = (),
+        cache_stale_scope_is_global: bool = True,
+        display_clear_set_ids: Sequence[str] = (),
+        display_clear_scope_is_global: bool = True,
+        clear_cached_mechanism: bool = True,
+    ) -> None:
+        if bool(clear_cached_mechanism):
+            self._clear_last_mechanism()
+        batch_cache = getattr(self._sim_controller, "batch_cache", None)
+        if batch_cache is None:
+            return
+
+        active_cache_key = str(batch_cache.active_cache_key or "").strip()
+        selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
+        display_cleared = False
+        if active_cache_key:
+            batch_cache.record_active_result_cache_staleness(
+                set_ids=cache_stale_set_ids,
+                is_global=bool(cache_stale_scope_is_global),
+            )
+            display_cleared = self._clear_visible_results_for_authoritative_transition(
+                batch_cache=batch_cache,
+                display_clear_set_ids=display_clear_set_ids,
+                display_clear_scope_is_global=display_clear_scope_is_global,
+            )
+        display_cleared = self._clear_orphaned_visible_results_for_authoritative_transition(
+            batch_cache=batch_cache,
+            preserve_current_display=preserve_current_display,
+            display_clear_set_ids=display_clear_set_ids,
+            display_clear_scope_is_global=display_clear_scope_is_global,
+        ) or display_cleared
+        if self._restore_preserved_authoritative_display(
+            batch_cache=batch_cache,
+            preserve_current_display=preserve_current_display,
+        ):
+            return
+        self._finish_authoritative_result_display_update(
+            batch_cache=batch_cache,
+            active_cache_key=active_cache_key,
+            selected_ids=selected_ids,
+            display_cleared=display_cleared,
+        )
+
+    def _invalidate_active_results_for_global_authoritative_change(self) -> None:
+        self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
+            epoch=int(self._mechanism_runtime_transition.current_epoch)
+        )
+        self._apply_authoritative_result_truth_effects(
+            cache_stale_scope_is_global=True,
+            display_clear_scope_is_global=True,
+        )
 
     def _reset_project_apply_dirty_session_state(self) -> None:
         """Clear non-serialized session state before applying a project payload."""
@@ -4975,26 +5208,33 @@ class MainWindow(
         if not seed_sets or not rewrite:
             return False
         try:
-            migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
-            for row_idx in migrated_rows:
-                try:
-                    top_left = self._batch_model.index(int(row_idx), 0)
-                    bottom_right = self._batch_model.index(
-                        int(row_idx),
-                        max(0, int(self._batch_model.columnCount()) - 1),
-                    )
-                    self._batch_model.dataChanged.emit(
-                        top_left,
-                        bottom_right,
-                        [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to emit batch model dataChanged after migrating pending init seed row %s: %s",
-                        int(row_idx),
-                        exc,
-                        exc_info=True,
-                    )
+            previous_batch_initials_suppress = bool(
+                getattr(self, "_suppress_canonical_batch_initials_transition", False)
+            )
+            self._suppress_canonical_batch_initials_transition = True
+            try:
+                migrated_rows = self._materialize_migrated_initial_concentration_sets(seed_sets=seed_sets)
+                for row_idx in migrated_rows:
+                    try:
+                        top_left = self._batch_model.index(int(row_idx), 0)
+                        bottom_right = self._batch_model.index(
+                            int(row_idx),
+                            max(0, int(self._batch_model.columnCount()) - 1),
+                        )
+                        self._batch_model.dataChanged.emit(
+                            top_left,
+                            bottom_right,
+                            [QtCore.Qt.DisplayRole, QtCore.Qt.BackgroundRole],
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to emit batch model dataChanged after migrating pending init seed row %s: %s",
+                            int(row_idx),
+                            exc,
+                            exc_info=True,
+                        )
+            finally:
+                self._suppress_canonical_batch_initials_transition = previous_batch_initials_suppress
             previous_suppress = self._variable_runtime.suppress_slider_runtime_invalidation()
             previous_authoritative_suppress = bool(
                 getattr(self, "_suppress_authoritative_mechanism_input_change", False)
@@ -5016,6 +5256,7 @@ class MainWindow(
                 self._set_mechanism_edit_locked(True)
                 self._apply_authoritative_mechanism_transition(
                     transition_source="pending_init_migration",
+                    canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
                 )
                 restore_deferred = True
                 def _restore_pending_init_rewrite_suppression() -> None:
@@ -5062,7 +5303,7 @@ class MainWindow(
         )
         if not (has_active_cache or has_displayed_selection or self.main_plot_has_data()):
             return
-        self._invalidate_active_results_after_authoritative_mechanism_change()
+        self._invalidate_active_results_for_global_authoritative_change()
 
     def _apply_parameter_overrides_to_dsl(
         self,
@@ -6303,16 +6544,46 @@ class MainWindow(
         top_left: QtCore.QModelIndex,
         bottom_right: QtCore.QModelIndex,
         roles: Sequence[int] | None = None,
-    ) -> None:
+        ) -> None:
         if not top_left.isValid() or not bottom_right.isValid():
-            return
-        if not (int(top_left.column()) <= 0 <= int(bottom_right.column())):
             return
         display_role = int(getattr(QtCore.Qt.DisplayRole, "value", QtCore.Qt.DisplayRole))
         normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}
         if normalized_roles and display_role not in normalized_roles:
             return
-        self._sync_main_plot_copy_labels_for_cached_batch_selection()
+        if int(top_left.column()) <= 0 <= int(bottom_right.column()):
+            self._sync_main_plot_copy_labels_for_cached_batch_selection()
+        if bool(getattr(self, "_suppress_canonical_batch_initials_transition", False)):
+            return
+        first_species_col = 1
+        try:
+            last_species_col = first_species_col + len(list(self._batch_store.visible_species())) - 1
+        except Exception:
+            last_species_col = 0
+        if last_species_col < first_species_col:
+            return
+        if int(bottom_right.column()) < first_species_col or int(top_left.column()) > last_species_col:
+            return
+        affected_set_ids: list[str] = []
+        for row in range(int(top_left.row()), int(bottom_right.row()) + 1):
+            try:
+                set_id = str(self._batch_set_id_for_row(int(row)) or "").strip()
+            except Exception:
+                set_id = ""
+            if set_id and set_id not in affected_set_ids:
+                affected_set_ids.append(set_id)
+        pending_set = getattr(self, "_pending_canonical_batch_initials_changed_set_ids", None)
+        if isinstance(pending_set, list):
+            for set_id in affected_set_ids:
+                set_id_s = str(set_id)
+                if set_id_s and set_id_s not in pending_set:
+                    pending_set.append(set_id_s)
+            return
+        self._apply_canonical_batch_initials_transition(
+            affected_set_ids=tuple(affected_set_ids),
+            transition_source="batch_initials_table_edit",
+            discard_dirty_preview=True,
+        )
 
     def _on_batch_current_changed(self, *_args) -> None:
         focused_set_id = self._update_focused_batch_set_id()
@@ -8154,6 +8425,8 @@ class MainWindow(
         model = getattr(self, "_batch_model", None)
         if model is None:
             return ()
+        previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
+        self._suppress_canonical_batch_initials_transition = True
         try:
             result = self._preview_session.apply_staged_concentration_overlays(model)
             return tuple(str(set_id) for set_id in getattr(result, "touched_set_ids", ()) if str(set_id))
@@ -8163,6 +8436,8 @@ class MainWindow(
                 message="Failed to apply staged species-mode concentration overlays",
                 exc=exc,
             )
+        finally:
+            self._suppress_canonical_batch_initials_transition = previous_suppress
         return ()
 
     def _materialized_mechanism_editor_texts_for_effective_slider_values(

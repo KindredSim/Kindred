@@ -53,4 +53,6 @@ def test_scan_case_conflicts_detects_casefold_duplicates(tmp_path, monkeypatch):
 
     count, groups = wheel_install_smoke_audit._scan_case_conflicts(purelib)
     assert count == 1
-    assert groups
+    assert len(groups) == 1
+    assert groups[0].casefold_key == "kindred/x.py"
+    assert groups[0].members == ("kindred/X.py", "kindred/x.py")

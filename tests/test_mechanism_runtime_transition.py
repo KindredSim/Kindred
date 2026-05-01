@@ -122,6 +122,53 @@ def test_canonical_batch_initial_change_advances_runtime_input_epoch_without_tex
     assert changed.display_cache_invalidation_allowed is True
     assert changed.readiness_schedule_required is False
     assert changed.affected_set_ids == ("set-a",)
+    assert changed.cache_stale_scope_is_global is False
+    assert changed.cache_stale_set_ids == ("set-a",)
+    assert changed.display_clear_scope_is_global is False
+    assert changed.display_clear_set_ids == ("set-a",)
+    assert changed.active_work_supersede_scope_is_global is False
+    assert changed.active_work_supersede_set_ids == ("set-a",)
+    assert changed.dirty_preview_reset_scope_is_global is False
+    assert changed.dirty_preview_reset_set_ids == ("set-a",)
+    assert changed.epoch == 1
+
+
+def test_pending_init_guard_does_not_swallow_later_canonical_initial_edit():
+    service = MechanismRuntimeTransitionService(
+        initial_snapshot=_snapshot("reaction: A -> B; k=1.0")
+    )
+    service.arm_pending_init_result_guard(
+        rewrite="reaction: A -> B; k=1.0",
+        state_network_text="",
+    )
+
+    pending_init = service.apply_authoritative_transition(
+        _snapshot("reaction: A -> B; k=1.0"),
+        source="pending_init_migration",
+        canonical_batch_initials_by_set_id={"set-a": "initials:A=1"},
+    )
+    changed = service.apply_authoritative_transition(
+        _snapshot("reaction: A -> B; k=1.0"),
+        source="batch_initials_table_edit",
+        canonical_batch_initials_by_set_id={"set-a": "initials:A=2"},
+        affected_set_ids=("set-a",),
+    )
+
+    assert pending_init.pending_init_preservation is True
+    assert pending_init.runtime_input_invalidation_required is False
+    assert changed.pending_init_preservation is False
+    assert changed.runtime_invalidation_required is False
+    assert changed.runtime_input_invalidation_required is True
+    assert changed.active_work_supersede_required is True
+    assert changed.affected_set_ids == ("set-a",)
+    assert changed.cache_stale_scope_is_global is False
+    assert changed.cache_stale_set_ids == ("set-a",)
+    assert changed.display_clear_scope_is_global is False
+    assert changed.display_clear_set_ids == ("set-a",)
+    assert changed.active_work_supersede_scope_is_global is False
+    assert changed.active_work_supersede_set_ids == ("set-a",)
+    assert changed.dirty_preview_reset_scope_is_global is False
+    assert changed.dirty_preview_reset_set_ids == ("set-a",)
     assert changed.epoch == 1
 
 
@@ -151,6 +198,16 @@ def test_forced_transition_without_initials_baseline_does_not_retain_stale_canon
 
     assert first_commit.runtime_input_invalidation_required is True
     assert programmatic_load.runtime_invalidation_required is True
+    assert programmatic_load.cache_stale_scope_is_global is True
+    assert programmatic_load.cache_stale_set_ids == ()
+    assert programmatic_load.display_clear_scope_is_global is True
+    assert programmatic_load.display_clear_set_ids == ()
+    assert programmatic_load.active_work_supersede_scope_is_global is True
+    assert programmatic_load.active_work_supersede_set_ids == ()
+    assert programmatic_load.dirty_preview_reset_scope_is_global is True
+    assert programmatic_load.dirty_preview_reset_set_ids == ()
     assert reused_id_commit.runtime_input_invalidation_required is True
     assert reused_id_commit.active_work_supersede_required is True
     assert reused_id_commit.affected_set_ids == ("set-a",)
+    assert reused_id_commit.cache_stale_scope_is_global is False
+    assert reused_id_commit.cache_stale_set_ids == ("set-a",)

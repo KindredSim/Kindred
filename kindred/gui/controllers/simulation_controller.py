@@ -319,6 +319,10 @@ class SimulationController(QtCore.QObject):
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
         self._batch_run_context: Dict[str, Any] = {}
+        self._authoritative_mechanism_transition_epoch = 0
+        self._authoritative_runtime_input_epoch = 0
+        self._authoritative_runtime_input_global_epoch = 0
+        self._authoritative_runtime_input_set_epoch_by_set_id: Dict[str, int] = {}
 
         # Parallel batch orchestration (warm lane owner adapter)
         self._batch_parallel = ParallelBatchExecutor(
@@ -2707,6 +2711,136 @@ class SimulationController(QtCore.QObject):
         self._active_run_id = int(self._run_sequence_id)
         self._cancel_active_run_for_restart()
 
+    @staticmethod
+    def _normalize_runtime_input_set_ids(set_ids: Sequence[str] | None) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(str(set_id) for set_id in (set_ids or ()) if str(set_id)))
+
+    def _runtime_input_set_epoch(self, set_id: str) -> int:
+        set_id_s = str(set_id or "").strip()
+        if not set_id_s:
+            return 0
+        epochs = getattr(self, "_authoritative_runtime_input_set_epoch_by_set_id", {}) or {}
+        try:
+            return int(epochs.get(set_id_s, 0) or 0)
+        except Exception:
+            return 0
+
+    def _runtime_input_context_set_epochs(self, set_ids: Sequence[str]) -> Dict[str, int]:
+        return {
+            str(set_id): self._runtime_input_set_epoch(str(set_id))
+            for set_id in self._normalize_runtime_input_set_ids(set_ids)
+        }
+
+    def _active_explicit_worker_set_id(self) -> str:
+        worker = getattr(self, "_simulation_worker", None)
+        if worker is None:
+            return ""
+        return str(getattr(worker, "_batch_set_id", "") or "").strip()
+
+    def _runtime_input_context_stale_for_set(
+        self,
+        context: Mapping[str, Any],
+        *,
+        batch_set_id: Optional[str],
+    ) -> bool:
+        set_id = str(batch_set_id or "").strip()
+        current_global_epoch = int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0)
+        context_has_global_epoch = "runtime_input_global_epoch" in context
+        try:
+            context_global_epoch = int(context.get("runtime_input_global_epoch", 0) or 0)
+        except Exception:
+            context_global_epoch = 0
+        if context_has_global_epoch and context_global_epoch != current_global_epoch:
+            return True
+        if set_id:
+            raw_set_epochs = context.get("runtime_input_set_epoch_by_set_id")
+            if isinstance(raw_set_epochs, Mapping):
+                try:
+                    context_set_epoch = int(raw_set_epochs.get(set_id, 0) or 0)
+                except Exception:
+                    context_set_epoch = 0
+                return context_set_epoch != self._runtime_input_set_epoch(set_id)
+            if context_has_global_epoch:
+                return False
+        if context.get("runtime_input_epoch") is not None:
+            try:
+                return int(context.get("runtime_input_epoch") or 0) != int(
+                    getattr(self, "_authoritative_runtime_input_epoch", 0) or 0
+                )
+            except Exception:
+                return True
+        return False
+
+    def _mark_stale_runtime_input_callback_consumed(
+        self,
+        *,
+        batch_set_id: Optional[str],
+        context: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(context, dict):
+            return
+        set_id = str(batch_set_id or "").strip()
+        if not set_id or not context.get("active"):
+            return
+        if not bool(context.get("parallel")):
+            return
+        context = self._mark_stale_runtime_input_set_consumed_in_context(
+            context,
+            set_id=set_id,
+        )
+        completed_ids = {
+            str(item) for item in (context.get("completed_set_ids") or ()) if str(item)
+        }
+        total = _safe_int(context.get("total"), default=len(context.get("queue_ids") or ()))
+        total = max(1, int(total or len(context.get("queue_ids") or ()) or 1))
+        if len(completed_ids) >= total:
+            context["active"] = False
+        self._batch_run_context = dict(context)
+        if not bool(context.get("active")):
+            self._finalize_batch_queue_done_without_result(context)
+
+    def _preview_work_intersects_runtime_input_scope(self, affected_set_ids: Sequence[str]) -> bool:
+        affected_scope = set(self._normalize_runtime_input_set_ids(affected_set_ids))
+        if not affected_scope:
+            return True
+
+        preview_ownership = self._preview_ownership
+        if preview_ownership.request_id is not None:
+            owner_targets = set(preview_ownership.target_set_ids)
+            if not owner_targets:
+                return True
+            if affected_scope & owner_targets:
+                return True
+
+        pending_preview = self._pending_slider_preview_launch
+        if pending_preview.active:
+            pending_targets = set(pending_preview.target_set_ids)
+            if not pending_targets:
+                return True
+            if affected_scope & pending_targets:
+                return True
+
+        if self._pending_slider_plot_cache_kind == "preview":
+            pending_plot_targets = set(self._pending_slider_plot_set_ids)
+            if not pending_plot_targets:
+                return True
+            if affected_scope & pending_plot_targets:
+                return True
+
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, Mapping) and ctx.get("active") and bool(ctx.get("fast_mode")):
+            context_targets = {
+                str(set_id)
+                for set_id in (ctx.get("queue_ids") or ctx.get("preview_scope_set_ids") or ())
+                if str(set_id)
+            }
+            if not context_targets:
+                return True
+            if affected_scope & context_targets:
+                return True
+
+        return False
+
     def _supersede_active_work_for_authoritative_mechanism_transition(
         self,
         *,
@@ -2716,11 +2850,23 @@ class SimulationController(QtCore.QObject):
     ) -> None:
         self._authoritative_mechanism_transition_epoch = int(epoch)
         self._authoritative_runtime_input_epoch = int(epoch)
-        self._authoritative_runtime_input_invalidated_set_ids = tuple(
-            dict.fromkeys(str(set_id) for set_id in (affected_set_ids or ()) if str(set_id))
-        )
-        self._invalidate_active_explicit_simulation_for_authoritative_change()
-        self._invalidate_slider_preview_work(close_runtime_owner=bool(close_preview_runtime_owner))
+        affected_scope = self._normalize_runtime_input_set_ids(affected_set_ids)
+        if affected_scope:
+            epochs = dict(getattr(self, "_authoritative_runtime_input_set_epoch_by_set_id", {}) or {})
+            for set_id in affected_scope:
+                epochs[str(set_id)] = int(epoch)
+            self._authoritative_runtime_input_set_epoch_by_set_id = epochs
+            active_set_id = self._active_explicit_worker_set_id()
+            if active_set_id and active_set_id in set(affected_scope):
+                if not self._try_supersede_active_serial_runtime_input_set(
+                    affected_set_ids=affected_scope,
+                ):
+                    self._invalidate_active_explicit_simulation_for_authoritative_change()
+        else:
+            self._authoritative_runtime_input_global_epoch = int(epoch)
+            self._invalidate_active_explicit_simulation_for_authoritative_change()
+        if (not affected_scope) or self._preview_work_intersects_runtime_input_scope(affected_scope):
+            self._invalidate_slider_preview_work(close_runtime_owner=bool(close_preview_runtime_owner))
 
     def _queue_slider_plot_update(
         self,
@@ -2988,15 +3134,69 @@ class SimulationController(QtCore.QObject):
             )
             return []
 
-    def _finalize_scoped_batch_success_subset(self, ctx: Mapping[str, Any]) -> tuple[str, ...]:
-        if not isinstance(ctx, Mapping):
-            return ()
+    @staticmethod
+    def _remove_pending_dirty_reset_set_ids_from_context(
+        ctx: Mapping[str, Any],
+        set_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        updated = dict(ctx or {})
+        remove_ids = {str(set_id) for set_id in set_ids if str(set_id)}
+        if not remove_ids:
+            return updated
+        updated["pending_workspace_reset_set_ids"] = [
+            str(item)
+            for item in (updated.get("pending_workspace_reset_set_ids") or ())
+            if str(item) and str(item) not in remove_ids
+        ]
+        pending_generations = dict(updated.get("pending_dirty_reset_generation_by_set_id") or {})
+        for set_id in remove_ids:
+            pending_generations.pop(str(set_id), None)
+        updated["pending_dirty_reset_generation_by_set_id"] = pending_generations
+        return updated
+
+    def _mark_stale_runtime_input_set_consumed_in_context(
+        self,
+        ctx: Mapping[str, Any],
+        *,
+        set_id: str,
+        next_pos: Optional[int] = None,
+    ) -> dict[str, Any]:
+        sid = str(set_id or "").strip()
+        updated = dict(ctx or {})
+        if not sid:
+            return updated
+        completed_ids = {
+            str(item) for item in (updated.get("completed_set_ids") or ()) if str(item)
+        }
+        completed_ids.add(sid)
+        updated["completed_set_ids"] = sorted(completed_ids)
+        stale_ids = {
+            str(item)
+            for item in (updated.get("stale_runtime_input_set_ids") or ())
+            if str(item)
+        }
+        stale_ids.add(sid)
+        updated["stale_runtime_input_set_ids"] = sorted(stale_ids)
+        if next_pos is not None:
+            updated["pos"] = int(next_pos)
+        updated = self._remove_pending_dirty_reset_set_ids_from_context(updated, (sid,))
+        return updated
+
+    def _finalize_explicit_batch_dirty_reset(
+        self,
+        ctx: Mapping[str, Any],
+        *,
+        mechanism: object = None,
+        species_names: Sequence[str] = (),
+    ) -> dict[str, Any]:
         policy_context = self._completion_policy_context_from_raw(ctx)
-        if policy_context is None:
-            return ()
-        reset_target_set_ids = tuple(policy_context.pending_workspace_reset_set_ids)
+        reset_target_set_ids = (
+            tuple(policy_context.pending_workspace_reset_set_ids)
+            if policy_context is not None
+            else tuple(str(set_id) for set_id in (ctx.get("pending_workspace_reset_set_ids") or ()) if str(set_id))
+        )
         dirty_reset_decision = self._completion_policy.resolve_explicit_dirty_reset(
-            context=policy_context,
+            context=policy_context or self._completion_policy_context_from_raw(ctx),
             dirty_state_by_set_id=self._capture_dirty_state_by_set_id(reset_target_set_ids),
         )
         eligible_reset_set_ids = list(dirty_reset_decision.eligible_reset_set_ids)
@@ -3008,7 +3208,7 @@ class SimulationController(QtCore.QObject):
                 )
             except Exception as exc:
                 self._record_nonfatal_exception(
-                    "Failed to clear targeted slider workspaces after partial canonical explicit run",
+                    "Failed to clear targeted slider workspaces after canonical explicit run",
                     exc,
                 )
         overlays_cleared = False
@@ -3021,28 +3221,32 @@ class SimulationController(QtCore.QObject):
                 )
             except Exception as exc:
                 self._record_nonfatal_exception(
-                    "Failed to clear staged concentration overlays after partial canonical explicit run",
+                    "Failed to clear staged concentration overlays after canonical explicit run",
                     exc,
                 )
-        updated_context = self._apply_completion_policy_state_patch(
+        policy_context = self._apply_completion_policy_state_patch(
             dirty_reset_decision.state_patch,
-            base_context=ctx,
-        )
-        if updated_context is not None:
+            base_context=ctx if isinstance(ctx, Mapping) else None,
+        ) or policy_context
+        if policy_context is not None:
             ctx = self._batch_run_context
         if overlays_cleared:
-            species_for_sync = self._current_mechanism_species_for_batch_sync()
-            if species_for_sync:
-                try:
+            try:
+                species_for_sync = (
+                    list(mechanism.species_names())
+                    if mechanism is not None and hasattr(mechanism, "species_names")
+                    else list(species_names)
+                )
+                if species_for_sync:
                     self.ui.batch.sync_batch_species_columns(
                         species_for_sync,
                         preserve_active_cache=True,
                     )
-                except Exception as exc:
-                    self._record_nonfatal_exception(
-                        "Failed to refresh batch/species surfaces after partial staged overlay reset",
-                        exc,
-                    )
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    "Failed to refresh batch/species surfaces after clearing staged concentration overlays",
+                    exc,
+                )
         if workspaces_cleared or overlays_cleared:
             pending_replay_directive = self._completion_policy.resolve_pending_replay_after_canonical_reset(
                 pending_replay=self._completion_policy_pending_replay_state(),
@@ -3051,6 +3255,18 @@ class SimulationController(QtCore.QObject):
             self._apply_completion_policy_state_patch(
                 PolicyStatePatch(pending_replay=pending_replay_directive)
             )
+            if pending_replay_directive.action == "clear":
+                for stop_fn, timer_name in (
+                    (self.ui.slider.stop_variable_update_timer, "_variable_update_timer"),
+                    (self.ui.slider.stop_species_slider_update_timer, "_species_slider_update_timer"),
+                ):
+                    try:
+                        stop_fn()
+                    except Exception as exc:
+                        self._record_nonfatal_exception(
+                            f"Failed to stop debounce timer {str(timer_name)} after canonical explicit reset",
+                            exc,
+                        )
         if eligible_reset_set_ids:
             try:
                 self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
@@ -3058,9 +3274,169 @@ class SimulationController(QtCore.QObject):
                 )
             except Exception as exc:
                 self._record_nonfatal_exception(
-                    "Failed to resync focused mechanism controls after partial canonical explicit run",
+                    "Failed to resync focused mechanism controls after canonical explicit run",
                     exc,
                 )
+        return dict(self._batch_run_context if isinstance(self._batch_run_context, Mapping) else ctx)
+
+    def _finalize_batch_queue_done_without_result(
+        self,
+        ctx: Mapping[str, Any],
+        *,
+        status_text: str = "Simulation complete",
+    ) -> None:
+        shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
+        ctx = dict(ctx or {})
+        ctx["active"] = False
+        self._batch_run_context = dict(ctx)
+        try:
+            if not bool(ctx.get("fast_mode")):
+                ctx = self._finalize_explicit_batch_dirty_reset(
+                    ctx,
+                    species_names=self._current_mechanism_species_for_batch_sync(),
+                )
+            completed_ids = {
+                str(set_id) for set_id in (ctx.get("completed_set_ids") or ()) if str(set_id)
+            }
+            stale_ids = {
+                str(set_id) for set_id in (ctx.get("stale_runtime_input_set_ids") or ()) if str(set_id)
+            }
+            has_truthful_success = bool(completed_ids - stale_ids)
+            failed_set_ids = [
+                str(set_id) for set_id in (ctx.get("failed_set_ids") or ()) if str(set_id)
+            ]
+            raw_failed_errors = ctx.get("failed_set_errors")
+            failed_errors = raw_failed_errors if isinstance(raw_failed_errors, Mapping) else {}
+            if failed_set_ids and not bool(ctx.get("fast_mode")):
+                self.ui.run_ui.set_sim_progress_value(100)
+                failed_count = len(failed_set_ids)
+                self.ui.run_ui.set_status_text(f"Batch completed with {failed_count} failed set(s)")
+                self._show_scoped_batch_failure_summary(
+                    failed_set_ids=failed_set_ids,
+                    failed_errors=failed_errors,
+                )
+            elif has_truthful_success:
+                self.ui.run_ui.set_sim_progress_value(100)
+                self.ui.run_ui.set_status_text(str(status_text))
+            else:
+                self.ui.run_ui.set_sim_progress_value(0)
+                self.ui.run_ui.set_status_text("Ready")
+            self.ui.run_ui.repaint_simulation_widgets()
+        finally:
+            self._release_current_simulation_worker()
+            keep_lane_pool_alive = bool(ctx.get("parallel") and ctx.get("keep_lane_pool_alive"))
+            self._cleanup_parallel_batch_lane_pool_after_run(
+                keep_lane_pool_alive=keep_lane_pool_alive,
+            )
+            self.ui.slider.set_slider_triggered_simulation(False)
+            self._simulation_running = False
+            self.ui.run_ui.set_run_button_enabled(True)
+            self.ui.run_ui.set_stop_button_enabled(False)
+            self._slider_simulation_active = False
+            if self._has_deferred_preview_replay_intent():
+                logger.debug("Processing pending slider update after completion")
+                if not shutdown_requested:
+                    self._schedule_deferred_preview_replay_handoff_once()
+            self._clear_shutdown_request_after_close_cleanup()
+
+    def _continue_or_finish_serial_batch_after_stale_runtime_input(
+        self,
+        ctx: Mapping[str, Any],
+    ) -> None:
+        ctx = dict(ctx or {})
+        rows = list(ctx.get("rows") or [])
+        queue_ids = list(ctx.get("queue_ids") or [])
+        try:
+            pos = int(ctx.get("pos", 0))
+        except Exception:
+            pos = 0
+
+        while pos < len(queue_ids) and pos < len(rows) and self._runtime_input_context_stale_for_set(
+            ctx,
+            batch_set_id=str(queue_ids[pos]),
+        ):
+            pos += 1
+            ctx = self._mark_stale_runtime_input_set_consumed_in_context(
+                ctx,
+                set_id=str(queue_ids[pos - 1]),
+                next_pos=pos,
+            )
+
+        self._batch_run_context = dict(ctx)
+        if pos >= len(queue_ids) or pos >= len(rows):
+            self._finalize_batch_queue_done_without_result(ctx)
+            return
+
+        if len(queue_ids) > 1:
+            total = max(1, _safe_int(ctx.get("total"), default=len(queue_ids)) or len(queue_ids))
+            overall = int((pos / float(total)) * 100.0)
+            self.ui.run_ui.set_sim_progress_value(max(0, min(100, overall)))
+        QtCore.QTimer.singleShot(0, self._start_next_batch_simulation)
+
+    def _try_supersede_active_serial_runtime_input_set(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+    ) -> bool:
+        affected_scope = set(self._normalize_runtime_input_set_ids(affected_set_ids))
+        if not affected_scope:
+            return False
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if not (
+            isinstance(ctx, dict)
+            and ctx.get("active")
+            and (not bool(ctx.get("parallel")))
+            and (not bool(ctx.get("fast_mode")))
+        ):
+            return False
+        active_set_id = self._active_explicit_worker_set_id()
+        if not active_set_id or active_set_id not in affected_scope:
+            return False
+        queue_ids = [str(item) for item in (ctx.get("queue_ids") or [])]
+        try:
+            pos = int(ctx.get("pos", 0))
+        except Exception:
+            pos = 0
+        if 0 <= pos < len(queue_ids) and str(queue_ids[pos]) == active_set_id:
+            next_pos = pos + 1
+        else:
+            try:
+                next_pos = queue_ids.index(active_set_id) + 1
+            except ValueError:
+                next_pos = pos
+        updated = self._mark_stale_runtime_input_set_consumed_in_context(
+            ctx,
+            set_id=active_set_id,
+            next_pos=next_pos,
+        )
+        self._batch_run_context = dict(updated)
+        worker = getattr(self, "_simulation_worker", None)
+        if worker is not None:
+            try:
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    "Failed to cancel stale serial worker during scoped runtime-input supersede",
+                    exc,
+                )
+        self._release_current_simulation_worker()
+        self._simulation_running = True
+        self._slider_simulation_active = False
+        self._continue_or_finish_serial_batch_after_stale_runtime_input(updated)
+        return True
+
+    def _finalize_scoped_batch_success_subset(self, ctx: Mapping[str, Any]) -> tuple[str, ...]:
+        if not isinstance(ctx, Mapping):
+            return ()
+        policy_context = self._completion_policy_context_from_raw(ctx)
+        if policy_context is None:
+            return ()
+        eligible_reset_set_ids = tuple(policy_context.pending_workspace_reset_set_ids)
+        ctx = self._finalize_explicit_batch_dirty_reset(
+            ctx,
+            species_names=self._current_mechanism_species_for_batch_sync(),
+        )
         self.flush_slider_plot_updates(
             force=True,
             cache_key=str(ctx.get("cache_key") or ""),
@@ -3227,6 +3603,10 @@ class SimulationController(QtCore.QObject):
             return False
 
         payload = dict(outcome.payload or {}) if outcome.payload is not None else None
+        ctx = getattr(self, "_batch_run_context", {}) or {}
+        if isinstance(ctx, dict) and self._runtime_input_context_stale_for_set(ctx, batch_set_id=sid):
+            self._mark_stale_runtime_input_callback_consumed(batch_set_id=sid, context=ctx)
+            return True
         if (not bool(outcome.success)) or (
             isinstance(payload, dict) and payload.get("success") is False and isinstance(payload.get("error"), dict)
         ):
@@ -3642,12 +4022,39 @@ class SimulationController(QtCore.QObject):
             except Exception:
                 temperature_K = 298.15
             units = UnitsModel(temperature_K=float(temperature_K))
-            mechanism = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
-            if isinstance(getattr(mechanism, "metadata", None), dict):
-                mechanism.metadata["wegscheider_cyclicity_enabled"] = bool(
-                    self.ui.solver.wegscheider_cyclicity_enabled()
+            wegscheider_enabled = bool(self.ui.solver.wegscheider_cyclicity_enabled())
+
+            def _build_structure_snapshot(full_text: str) -> object:
+                mechanism_obj = parse_dsl_to_mechanism(full_text, initials={}, units=units)
+                if isinstance(getattr(mechanism_obj, "metadata", None), dict):
+                    mechanism_obj.metadata["wegscheider_cyclicity_enabled"] = wegscheider_enabled
+                apply_parameter_algebra_to_mechanism(
+                    full_text,
+                    mechanism=mechanism_obj,
+                    require_mutable=False,
                 )
-            apply_parameter_algebra_to_mechanism(full_dsl, mechanism=mechanism, require_mutable=False)
+                return mechanism_obj
+
+            authoritative_structure_snapshot = getattr(
+                self.ui.mechanism_helpers,
+                "authoritative_structure_snapshot",
+                None,
+            )
+            if callable(authoritative_structure_snapshot):
+                structure_snapshot = authoritative_structure_snapshot(
+                    reactions_text=str(reactions_text or ""),
+                    state_network_text=state_network_dsl,
+                    units_identity=(
+                        "temperature_K",
+                        f"{float(temperature_K):.17g}",
+                        "wegscheider",
+                        str(wegscheider_enabled),
+                    ),
+                    builder=_build_structure_snapshot,
+                )
+                mechanism = structure_snapshot.mechanism
+            else:
+                mechanism = _build_structure_snapshot(full_dsl)
             variables, _metadata = enumerate_step_parameters_for_gui(mechanism)
             names = {str(name) for name in dict(variables or {}).keys() if str(name)}
             scalar_params = (getattr(mechanism, "metadata", {}) or {}).get("scalar_params") or {}
@@ -4348,7 +4755,20 @@ class SimulationController(QtCore.QObject):
         except Exception:
             pos = 0
 
+        while pos < len(queue_ids) and pos < len(rows) and self._runtime_input_context_stale_for_set(
+            ctx,
+            batch_set_id=str(queue_ids[pos]),
+        ):
+            pos += 1
+            ctx = self._mark_stale_runtime_input_set_consumed_in_context(
+                ctx,
+                set_id=str(queue_ids[pos - 1]),
+                next_pos=pos,
+            )
+            self._batch_run_context = dict(ctx)
+
         if pos >= len(queue_ids) or pos >= len(rows):
+            self._finalize_batch_queue_done_without_result(ctx)
             return
 
         set_id = str(queue_ids[pos])
@@ -5353,6 +5773,10 @@ class SimulationController(QtCore.QObject):
             "request_id": int(request_id),
             "run_id": run_id,
             "runtime_input_epoch": int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0),
+            "runtime_input_global_epoch": int(
+                getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0
+            ),
+            "runtime_input_set_epoch_by_set_id": self._runtime_input_context_set_epochs(queue_ids),
             "fast_mode": bool(fast_mode),
             "reuse_parallel_lane_pool": bool(reuse_parallel_lane_pool),
             "keep_lane_pool_alive": bool(reuse_parallel_lane_pool and parallel_mode),
@@ -5646,19 +6070,31 @@ class SimulationController(QtCore.QObject):
             return
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
         ctx = getattr(self, "_batch_run_context", {}) or {}
-        if isinstance(ctx, Mapping) and ctx.get("runtime_input_epoch") is not None:
+        if (batch_set is None or batch_set_id is None) and isinstance(ctx, Mapping) and ctx.get("active"):
+            queue_names = list(ctx.get("queue_names") or [])
+            queue_ids = list(ctx.get("queue_ids") or [])
             try:
-                completion_runtime_input_epoch = int(ctx.get("runtime_input_epoch") or 0)
+                pos_hint = int(ctx.get("pos", 0))
             except Exception:
-                completion_runtime_input_epoch = 0
-            current_runtime_input_epoch = int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0)
-            if completion_runtime_input_epoch != current_runtime_input_epoch:
-                logger.debug(
-                    "Ignoring stale simulation completion (runtime_input_epoch=%s, current=%s)",
-                    completion_runtime_input_epoch,
-                    current_runtime_input_epoch,
-                )
-                return
+                pos_hint = 0
+            if batch_set is None and 0 <= pos_hint < len(queue_names):
+                batch_set = str(queue_names[pos_hint])
+            if batch_set_id is None and 0 <= pos_hint < len(queue_ids):
+                batch_set_id = str(queue_ids[pos_hint])
+        if batch_set_id is None and isinstance(batch_set, str):
+            batch_set_id = self.ui.batch.batch_set_id_for_name(batch_set)
+        if isinstance(ctx, Mapping) and self._runtime_input_context_stale_for_set(
+            ctx,
+            batch_set_id=batch_set_id,
+        ):
+            logger.debug(
+                "Ignoring stale simulation completion (batch_set_id=%s, context_global_epoch=%s, current_global_epoch=%s)",
+                str(batch_set_id or ""),
+                ctx.get("runtime_input_global_epoch"),
+                int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0),
+            )
+            self._mark_stale_runtime_input_callback_consumed(batch_set_id=batch_set_id, context=ctx)
+            return
         policy_context = self._completion_policy_context_from_raw(ctx)
         callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
@@ -6261,93 +6697,11 @@ class SimulationController(QtCore.QObject):
 
             if batch_queue_done:
                 if (not is_preview) and isinstance(ctx, dict):
-                    policy_context = self._completion_policy_context_from_raw(ctx)
-                    reset_target_set_ids = (
-                        tuple(policy_context.pending_workspace_reset_set_ids)
-                        if policy_context is not None
-                        else tuple(str(set_id) for set_id in (ctx.get("pending_workspace_reset_set_ids") or ()) if str(set_id))
+                    ctx = self._finalize_explicit_batch_dirty_reset(
+                        ctx,
+                        mechanism=mechanism,
+                        species_names=species_names,
                     )
-                    dirty_reset_decision = self._completion_policy.resolve_explicit_dirty_reset(
-                        context=policy_context or self._completion_policy_context_from_raw(ctx),
-                        dirty_state_by_set_id=self._capture_dirty_state_by_set_id(reset_target_set_ids),
-                    )
-                    eligible_reset_set_ids = list(dirty_reset_decision.eligible_reset_set_ids)
-                    workspaces_cleared = False
-                    if eligible_reset_set_ids:
-                        try:
-                            workspaces_cleared = bool(
-                                self.ui.slider.reset_mechanism_workspaces(eligible_reset_set_ids)
-                            )
-                        except Exception as exc:
-                            self._record_nonfatal_exception(
-                                "Failed to clear targeted slider workspaces after canonical explicit run",
-                                exc,
-                            )
-                    overlays_cleared = False
-                    if eligible_reset_set_ids:
-                        try:
-                            overlays_cleared = bool(
-                                self.ui.slider.discard_concentration_overlays_for_set_ids(
-                                    eligible_reset_set_ids
-                                )
-                            )
-                        except Exception as exc:
-                            self._record_nonfatal_exception(
-                                "Failed to clear staged concentration overlays after canonical explicit run",
-                                exc,
-                            )
-                    policy_context = self._apply_completion_policy_state_patch(
-                        dirty_reset_decision.state_patch,
-                        base_context=ctx if isinstance(ctx, Mapping) else None,
-                    ) or policy_context
-                    if policy_context is not None:
-                        ctx = self._batch_run_context
-                    if overlays_cleared:
-                        try:
-                            species_for_sync = (
-                                list(mechanism.species_names())
-                                if mechanism is not None and hasattr(mechanism, "species_names")
-                                else list(species_names)
-                            )
-                            self.ui.batch.sync_batch_species_columns(
-                                species_for_sync,
-                                preserve_active_cache=True,
-                            )
-                        except Exception as exc:
-                            self._record_nonfatal_exception(
-                                "Failed to refresh batch/species surfaces after clearing staged concentration overlays",
-                                exc,
-                            )
-                    if workspaces_cleared or overlays_cleared:
-                        pending_replay_directive = self._completion_policy.resolve_pending_replay_after_canonical_reset(
-                            pending_replay=self._completion_policy_pending_replay_state(),
-                            reset_set_ids=tuple(eligible_reset_set_ids),
-                        )
-                        self._apply_completion_policy_state_patch(
-                            PolicyStatePatch(pending_replay=pending_replay_directive)
-                        )
-                        if pending_replay_directive.action == "clear":
-                            for stop_fn, timer_name in (
-                                (self.ui.slider.stop_variable_update_timer, "_variable_update_timer"),
-                                (self.ui.slider.stop_species_slider_update_timer, "_species_slider_update_timer"),
-                            ):
-                                try:
-                                    stop_fn()
-                                except Exception as exc:
-                                    self._record_nonfatal_exception(
-                                        f"Failed to stop debounce timer {str(timer_name)} after canonical explicit reset",
-                                        exc,
-                                    )
-                    if eligible_reset_set_ids:
-                        try:
-                            self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
-                                use_workspace=True
-                            )
-                        except Exception as exc:
-                            self._record_nonfatal_exception(
-                                "Failed to resync focused mechanism controls after canonical explicit run",
-                                exc,
-                            )
                 if slider_triggered or explicit_batch_coalescing:
                     self.flush_slider_plot_updates(
                         force=bool(explicit_batch_coalescing),
@@ -6444,6 +6798,32 @@ class SimulationController(QtCore.QObject):
             return
         latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
         ctx = getattr(self, "_batch_run_context", {}) or {}
+        if (batch_set is None or batch_set_id is None) and isinstance(ctx, Mapping) and ctx.get("active"):
+            queue_names = list(ctx.get("queue_names") or [])
+            queue_ids = list(ctx.get("queue_ids") or [])
+            try:
+                pos_hint = int(ctx.get("pos", 0))
+            except Exception:
+                pos_hint = 0
+            if batch_set is None and 0 <= pos_hint < len(queue_names):
+                batch_set = str(queue_names[pos_hint])
+            if batch_set_id is None and 0 <= pos_hint < len(queue_ids):
+                batch_set_id = str(queue_ids[pos_hint])
+        if batch_set_id is None and isinstance(batch_set, str):
+            batch_set_id = self.ui.batch.batch_set_id_for_name(batch_set)
+        if isinstance(ctx, Mapping) and self._runtime_input_context_stale_for_set(
+            ctx,
+            batch_set_id=batch_set_id,
+        ):
+            logger.debug(
+                "Ignoring stale simulation error (batch_set_id=%s, context_global_epoch=%s, current_global_epoch=%s): %s",
+                str(batch_set_id or ""),
+                ctx.get("runtime_input_global_epoch"),
+                int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0),
+                error_text,
+            )
+            self._mark_stale_runtime_input_callback_consumed(batch_set_id=batch_set_id, context=ctx)
+            return
         policy_context = self._completion_policy_context_from_raw(ctx)
         callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,

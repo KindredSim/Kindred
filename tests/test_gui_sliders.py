@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
 import kindred.core.simulator.dsl as dsl
+import kindred.core.simulator.dsl_build as dsl_build
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 from kindred.core.simulation_preparation import BoundMechanism
 from kindred.gui.controllers.simulation_controller import build_fallback_cache_key
@@ -131,6 +132,25 @@ def _completion_payload_with_a_series(values: list[float] | np.ndarray) -> dict[
         "fallback_occurred": False,
         "fallback_message": None,
     }
+
+
+def _seed_explicit_batch_cache(
+    main_window,
+    *,
+    cache_key: str,
+    series_by_set_id: dict[str, list[float] | np.ndarray],
+) -> None:
+    cache = main_window.simulation_controller.batch_cache
+    for set_id, values in series_by_set_id.items():
+        series_a = np.asarray(values, dtype=float).reshape(-1)
+        cache.result_cache[f"{cache_key}::{set_id}"] = {
+            "t": np.linspace(0.0, 1.0, series_a.size, dtype=float),
+            "series": {"A": series_a},
+            "algebra_scalars": {},
+        }
+    cache.active_cache_key = str(cache_key)
+    cache.active_cache_valid_set_ids = tuple(series_by_set_id)
+
 
 def _find_slider_visibility_action(main_window, entry_kind: str, name: str):
     picker = main_window.findChild(QtWidgets.QToolButton, "sliderVisibilityPickerButton")
@@ -2420,6 +2440,30 @@ def test_programmatic_load_clears_stale_parameter_sliders(main_window, monkeypat
     assert main_window._variable_runtime.slider_runtime_dirty() is True
     assert prompt_calls == ["prompt"]
 
+def test_m9_structure_snapshot_reuse_bounds_color_roster_slider_extraction_builds(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    build_calls: list[str] = []
+    real_build = dsl_build.build_mechanism_from_ir
+
+    def recording_build(*args, **kwargs):
+        build_calls.append("build")
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(dsl_build, "build_mechanism_from_ir", recording_build)
+
+    main_window._load_preset_mechanism("M9")
+    qt_app.processEvents()
+    baseline_builds = len(build_calls)
+
+    for _ in range(5):
+        main_window._sync_color_manager_authoritative_roster()
+        main_window._extract_and_populate_variables(preserve_visibility=True)
+
+    assert len(build_calls) - baseline_builds <= 2
+
 def test_preset_load_is_replace_only_and_does_not_import_insert_dialog(main_window, monkeypatch):
     from kindred.io.resources import get_preset_mechanism
     from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
@@ -3153,9 +3197,19 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
     assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(3.5, rel=1e-6, abs=1e-9)
     assert main_window._preview_session.has_staged_concentration_overlays() is False
     assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
-    assert cache.active_cache_invalidated_set_ids == tuple(selected_ids)
+    assert cache.active_cache_invalidated_set_ids == (secondary_set_id,)
     assert main_window.active_batch_selection() == ("", "")
     _assert_selection_plot_cleared(main_window)
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    assert main_window.active_batch_selection()[0] == primary_set_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray([7.0, 14.0], dtype=float),
+    )
 
 
 def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_explicit_completion(
@@ -3206,6 +3260,7 @@ def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_ex
     controller._simulation_running = True
     controller._slider_simulation_active = False
     controller._simulation_worker = worker
+    controller._simulation_worker._batch_set_id = set_id  # type: ignore[attr-defined]
     preview_owner = _SliderCommitTransitionWorker(running=True)
     controller._preview_simulation_owner = preview_owner
 
@@ -3257,6 +3312,657 @@ def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_ex
     )
 
     assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), preview_series)
+
+
+def test_direct_species_cell_edit_clears_visible_multiset_without_invalidating_unaffected_cache(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "4.0")
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cell edit triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+    set_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(set_ids) == 2
+    edited_set_id, unaffected_set_id = set_ids
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    controller = main_window.simulation_controller
+    before_epoch = int(controller._authoritative_runtime_input_epoch)
+    cache = controller.batch_cache
+    explicit_key = "direct-cell-cache-display-split"
+    _seed_explicit_batch_cache(
+        main_window,
+        cache_key=explicit_key,
+        series_by_set_id={
+            edited_set_id: [1.0, 2.0],
+            unaffected_set_id: [7.0, 14.0],
+        },
+    )
+    assert main_window.display_cached_batch_selection(
+        cache_key=explicit_key,
+        selected_sets=set_ids,
+        cache_store=cache.result_cache,
+        allow_fallback=False,
+    )
+
+    old_run_id = 43
+    old_request_id = 213
+    controller._run_sequence_id = old_run_id
+    controller._active_run_id = old_run_id
+    controller._latest_sim_request_id = old_request_id
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _SliderCommitTransitionWorker(running=True)
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": old_request_id,
+        "runtime_input_epoch": before_epoch,
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {
+            edited_set_id: 0,
+            unaffected_set_id: 0,
+        },
+        "cache_key": explicit_key,
+        "queue_ids": [edited_set_id, unaffected_set_id],
+        "queue_names": ["edited", "unaffected"],
+        "rows": [0, 1],
+        "pos": 0,
+        "total": 2,
+    }
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
+    qt_app.processEvents()
+
+    assert int(controller._authoritative_runtime_input_epoch) == before_epoch + 1
+    assert cache.active_cache_invalidated_set_ids == (edited_set_id,)
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+    controller.on_simulation_complete(
+        _completion_payload_with_a_series([42.0, 43.0]),
+        run_id=old_run_id,
+        fast_mode=False,
+        request_id=old_request_id,
+        batch_set_id=edited_set_id,
+        cache_key=explicit_key,
+    )
+    _assert_selection_plot_cleared(main_window)
+
+    _select_batch_rows(main_window, [1])
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    assert main_window.active_batch_selection()[0] == unaffected_set_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray([7.0, 14.0], dtype=float),
+    )
+
+
+def test_sequential_species_cell_edits_accumulate_stale_cache_scope_without_recompute(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 3)
+    for row, value in enumerate(("1.0", "2.0", "3.0")):
+        assert main_window._batch_model.setData(main_window._batch_model.index(row, 1), value)
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0, 1, 2])
+    qt_app.processEvents()
+    set_ids = [str(main_window._batch_set_id_for_row(row) or "") for row in range(3)]
+    assert all(set_ids)
+    first_set_id, second_set_id, clean_set_id = set_ids
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "sequential-canonical-initial-cache-staleness"
+    _seed_explicit_batch_cache(
+        main_window,
+        cache_key=explicit_key,
+        series_by_set_id={
+            first_set_id: [1.0, 10.0],
+            second_set_id: [2.0, 20.0],
+            clean_set_id: [3.0, 30.0],
+        },
+    )
+    assert main_window.display_cached_batch_selection(
+        cache_key=explicit_key,
+        selected_sets=set_ids,
+        cache_store=cache.result_cache,
+        allow_fallback=False,
+    )
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.5")
+    qt_app.processEvents()
+    assert cache.active_cache_invalidated_set_ids == (first_set_id,)
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "2.5")
+    qt_app.processEvents()
+    assert cache.active_cache_invalidated_set_ids == (first_set_id, second_set_id)
+
+    _select_batch_rows(main_window, [2])
+    qt_app.processEvents()
+    plot = main_window._plot_tabs._main_plot
+    assert main_window.active_batch_selection()[0] == clean_set_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray([3.0, 30.0], dtype=float),
+    )
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    assert main_window.active_batch_selection()[0] == clean_set_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray([3.0, 30.0], dtype=float),
+    )
+
+
+def test_direct_species_cell_edit_advances_runtime_input_and_discards_affected_dirty_preview(
+    main_window,
+    qt_app,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "4.0")
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+    set_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(set_ids) == 2
+    edited_set_id, untouched_set_id = set_ids
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = "direct-cell-edit-runtime-input"
+    cache.active_cache_valid_set_ids = tuple(set_ids)
+
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
+    assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=5.5) is True
+    assert main_window._preview_session.has_dirty_state_for_set(edited_set_id) is True
+    assert main_window._preview_session.has_dirty_state_for_set(untouched_set_id) is True
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
+    qt_app.processEvents()
+
+    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(3.0)
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch + 1
+    assert cache.active_cache_invalidated_set_ids == (edited_set_id,)
+    assert main_window._preview_session.has_dirty_state_for_set(edited_set_id) is False
+    assert main_window._preview_session.has_dirty_state_for_set(untouched_set_id) is True
+
+
+def test_direct_species_cell_edit_advances_runtime_input_while_mechanism_editor_unlocked(
+    main_window,
+    qt_app,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    set_ids = [str(set_id) for set_id in main_window._batch_set_ids_for_scope("selected") if str(set_id)]
+    assert len(set_ids) == 1
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+
+    main_window._set_mechanism_edit_locked(False)
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
+    qt_app.processEvents()
+
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch + 1
+
+
+def test_direct_species_cell_noop_preserves_dirty_preview_without_runtime_input_transition(
+    main_window,
+    qt_app,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    set_id = str(main_window._batch_set_ids_for_scope("selected")[0])
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
+    assert main_window._preview_session.has_dirty_state_for_set(set_id) is True
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.00")
+    qt_app.processEvents()
+
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch
+    assert main_window._preview_session.has_dirty_state_for_set(set_id) is True
+
+
+def test_species_cell_paste_advances_runtime_input_for_changed_initials(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+
+    table = getattr(main_window, "_batch_table", None)
+    assert table is not None
+    table.setCurrentIndex(main_window._batch_model.index(0, 1))
+    clipboard = QtWidgets.QApplication.clipboard()
+    assert clipboard is not None
+    clipboard.setText("4.0")
+    table._handle_paste()
+    qt_app.processEvents()
+
+    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(4.0)
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch + 1
+
+
+def test_species_cell_paste_clears_visible_multiset_without_invalidating_unaffected_cache(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "4.0")
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("paste triggered run")),
+        raising=True,
+    )
+
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+    first_set_id = str(main_window._batch_set_id_for_row(0) or "")
+    changed_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_set_id and changed_set_id
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+    cache = main_window.simulation_controller.batch_cache
+    explicit_key = "paste-cache-display-split"
+    _seed_explicit_batch_cache(
+        main_window,
+        cache_key=explicit_key,
+        series_by_set_id={
+            first_set_id: [8.0, 16.0],
+            changed_set_id: [4.0, 5.0],
+        },
+    )
+    assert main_window.display_cached_batch_selection(
+        cache_key=explicit_key,
+        selected_sets=[first_set_id, changed_set_id],
+        cache_store=cache.result_cache,
+        allow_fallback=False,
+    )
+
+    table = getattr(main_window, "_batch_table", None)
+    assert table is not None
+    table.setCurrentIndex(main_window._batch_model.index(1, 1))
+    clipboard = QtWidgets.QApplication.clipboard()
+    assert clipboard is not None
+    clipboard.setText("9.0")
+    table._handle_paste()
+    qt_app.processEvents()
+
+    assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(9.0)
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch + 1
+    assert cache.active_cache_invalidated_set_ids == (changed_set_id,)
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    plot = main_window._plot_tabs._main_plot
+    assert main_window.active_batch_selection()[0] == first_set_id
+    assert np.allclose(
+        np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
+        np.asarray([8.0, 16.0], dtype=float),
+    )
+
+
+def test_sparse_species_cell_paste_discards_only_rows_with_changed_initials(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "2.0")
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+    first_set_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_set_id and second_set_id
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=4.5) is True
+    assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=5.5) is True
+
+    table = getattr(main_window, "_batch_table", None)
+    assert table is not None
+    table.setCurrentIndex(main_window._batch_model.index(0, 0))
+    clipboard = QtWidgets.QApplication.clipboard()
+    assert clipboard is not None
+    second_name = str(main_window.batch_set_name_for_id(second_set_id) or "")
+    clipboard.setText(f"renamed\t1.0\n{second_name}\t3.0")
+    table._handle_paste()
+    qt_app.processEvents()
+
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch + 1
+    assert main_window._preview_session.has_dirty_state_for_set(first_set_id) is True
+    assert main_window._preview_session.has_dirty_state_for_set(second_set_id) is False
+
+
+def test_multirow_species_cell_paste_transitions_all_changed_initial_rows(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    qt_app.processEvents()
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "2.0")
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+    first_set_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_set_id and second_set_id
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    before_epoch = int(main_window.simulation_controller._authoritative_runtime_input_epoch)
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=4.5) is True
+    assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=5.5) is True
+
+    table = getattr(main_window, "_batch_table", None)
+    assert table is not None
+    table.setCurrentIndex(main_window._batch_model.index(0, 1))
+    clipboard = QtWidgets.QApplication.clipboard()
+    assert clipboard is not None
+    clipboard.setText("6.0\n7.0")
+    table._handle_paste()
+    qt_app.processEvents()
+
+    assert int(main_window.simulation_controller._authoritative_runtime_input_epoch) == before_epoch + 1
+    assert main_window._preview_session.has_dirty_state_for_set(first_set_id) is False
+    assert main_window._preview_session.has_dirty_state_for_set(second_set_id) is False
+
+def test_species_cell_paste_refreshes_focused_species_slider_after_dirty_discard(main_window, qt_app):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    set_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert set_id
+
+    panel = main_window._mechanism_editor.species_sliders_widget()
+    assert panel is not None
+    panel.rebuild_from_current_row()
+    qt_app.processEvents()
+    assert panel._rows["A"].value_label.text() == "1.000"
+
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
+    panel.rebuild_from_current_row()
+    qt_app.processEvents()
+    assert panel._rows["A"].value_label.text() == "2.500"
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+
+    table = getattr(main_window, "_batch_table", None)
+    assert table is not None
+    table.setCurrentIndex(main_window._batch_model.index(0, 1))
+    clipboard = QtWidgets.QApplication.clipboard()
+    assert clipboard is not None
+    clipboard.setText("1.5")
+    table._handle_paste()
+    qt_app.processEvents()
+
+    assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(1.5)
+    assert main_window._preview_session.has_dirty_state_for_set(set_id) is False
+    assert panel._rows["A"].value_label.text() == "1.500"
+
+
+def test_deferred_species_cell_paste_refreshes_slider_edit_targets_after_dirty_discard(
+    main_window,
+    qt_app,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    _ensure_batch_rows(main_window, 2)
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "4.0")
+    _select_batch_rows(main_window, [0])
+    _set_edit_target_rows(main_window, [1])
+    qt_app.processEvents()
+    first_set_id = str(main_window._batch_set_id_for_row(0) or "")
+    second_set_id = str(main_window._batch_set_id_for_row(1) or "")
+    assert first_set_id and second_set_id and first_set_id != second_set_id
+
+    panel = main_window._mechanism_editor.species_sliders_widget()
+    assert panel is not None
+    panel.rebuild_from_current_row()
+    qt_app.processEvents()
+    assert panel._rows["A"].value_label.text() == "Multiple values"
+
+    assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=1.0) is True
+    panel.rebuild_from_current_row()
+    qt_app.processEvents()
+    assert panel._rows["A"].value_label.text() == "1.000"
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+
+    main_window._pending_canonical_batch_initials_changed_set_ids = []
+    try:
+        main_window._batch_store.set_value(1, "A", "2.0")
+        changed_index = main_window._batch_model.index(1, 1)
+        main_window._batch_model.dataChanged.emit(
+            changed_index,
+            changed_index,
+            [QtCore.Qt.DisplayRole, QtCore.Qt.EditRole],
+        )
+        qt_app.processEvents()
+        affected_set_ids = tuple(main_window._pending_canonical_batch_initials_changed_set_ids or ())
+    finally:
+        main_window._pending_canonical_batch_initials_changed_set_ids = None
+
+    assert affected_set_ids == (second_set_id,)
+    assert panel._rows["A"].value_label.text() == "1.000"
+
+    main_window._apply_canonical_batch_initials_transition(
+        affected_set_ids=affected_set_ids,
+        transition_source="batch_initials_table_paste",
+    )
+    qt_app.processEvents()
+
+    assert main_window._preview_session.has_dirty_state_for_set(second_set_id) is False
+    assert panel._rows["A"].value_label.text() == "Multiple values"
+
+
+def test_species_initial_edit_clears_stale_preview_only_plot_after_dirty_discard(
+    main_window,
+    qt_app,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    set_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert set_id
+
+    assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
+    preview_t = _current_preview_time_axis(main_window)
+    preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
+    preview_key = "species-initial-edit-clears-preview-only-plot"
+    cache = main_window.simulation_controller.batch_cache
+    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
+    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        set_id=set_id,
+        mechanism_text=mechanism_text,
+    )
+    cache.preview_cache[f"{preview_key}::{set_id}"] = {
+        "t": preview_t,
+        "series": {"A": preview_series},
+        "algebra_scalars": {},
+        "mechanism_text": mechanism_text,
+        "solver_config": dict(solver_config),
+        "preview_batch_cache_token": str(preview_token or ""),
+    }
+    cache.active_preview_cache_key = preview_key
+    cache.active_preview_scope_set_ids = (set_id,)
+    assert main_window.display_cached_batch_selection(
+        cache_key=preview_key,
+        selected_sets=[set_id],
+        cache_store=cache.preview_cache,
+        allow_fallback=False,
+    )
+    cache.active_cache_key = None
+    assert main_window.main_plot_has_data()
+    assert main_window._displayed_workspace_preview_provenance_matches_current_workspace(set_id=set_id) is True
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.5")
+    qt_app.processEvents()
+
+    assert main_window._preview_session.has_dirty_state_for_set(set_id) is False
+    assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+
+def test_direct_species_cell_edit_does_not_rebuild_authoritative_structure(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    real_parse = dsl.parse_dsl_to_mechanism
+    parse_calls: list[str] = []
+
+    def recording_parse(text, *args, **kwargs):
+        parse_calls.append(str(text))
+        return real_parse(text, *args, **kwargs)
+
+    monkeypatch.setattr(dsl, "parse_dsl_to_mechanism", recording_parse)
+    main_window._extract_and_populate_variables()
+    baseline_parse_count = len(parse_calls)
+    assert baseline_parse_count >= 1
+
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
+    qt_app.processEvents()
+    main_window._extract_and_populate_variables()
+
+    assert len(parse_calls) == baseline_parse_count
 
 
 def test_species_only_commit_invalidates_stale_explicit_but_preserves_unaffected_selection_cache(
@@ -4007,6 +4713,63 @@ def test_pending_init_migration_rewrite_does_not_invalidate_displayed_explicit_r
     assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
     assert dict(getattr(main_window._plot_tabs._main_plot, "_series", {}) or {}) != {}
 
+def test_pending_init_materialization_suppresses_ordinary_batch_initial_transition(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A", "B"])
+    qt_app.processEvents()
+
+    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+        main_window._mechanism_editor._reactions_text.toPlainText(),
+        set_name="set1",
+    )
+    assert seed == {"A": 1.0, "B": 0.0}
+
+    canonical_sources: list[str] = []
+    authoritative_sources: list[str] = []
+    original_canonical = main_window._apply_canonical_batch_initials_transition
+    original_authoritative = main_window._apply_authoritative_mechanism_transition
+
+    def recording_canonical(*args, **kwargs):
+        canonical_sources.append(str(kwargs.get("transition_source") or ""))
+        return original_canonical(*args, **kwargs)
+
+    def recording_authoritative(*args, **kwargs):
+        authoritative_sources.append(str(kwargs.get("transition_source") or ""))
+        return original_authoritative(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main_window,
+        "_apply_canonical_batch_initials_transition",
+        recording_canonical,
+        raising=True,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_apply_authoritative_mechanism_transition",
+        recording_authoritative,
+        raising=True,
+    )
+
+    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    qt_app.processEvents()
+
+    assert "batch_initials_table_edit" not in canonical_sources
+    assert "pending_init_migration" in authoritative_sources
+    expected_canonical_identity = tuple(
+        sorted(
+            (str(set_id), str(identity or ""))
+            for set_id, identity in main_window._canonical_batch_initials_identity_by_set_id().items()
+        )
+    )
+    assert main_window._mechanism_runtime_transition._current_canonical_batch_initials_identity == expected_canonical_identity
+
 def test_pending_init_failed_run_reinvalidates_preserved_result(main_window, qt_app, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
@@ -4125,6 +4888,50 @@ def test_pending_init_guard_does_not_suppress_next_real_mechanism_edit(
     assert cache.active_cache_invalidated_set_ids == (selected_ids[0], second_set_id)
     assert main_window._status_label.text() == "Result not cached (evicted). Press Run to compute."
     assert main_window.active_batch_selection() == ("", "")
+    _assert_selection_plot_cleared(main_window)
+
+def test_direct_mechanism_edit_clears_orphaned_visible_plot_without_cache_metadata(
+    main_window,
+    qt_app,
+    monkeypatch,
+):
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
+    main_window._extract_and_populate_variables()
+    main_window._batch_model.set_species(["A"])
+    assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+    set_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert set_id
+
+    cache = main_window.simulation_controller.batch_cache
+    cache.active_cache_key = ""
+    cache.active_batch_set_id = None
+    cache.active_batch_set = None
+    cache.last_display_selection = []
+    cache.active_cache_valid_set_ids = ()
+    main_window._mechanism_runtime_transition.reset_current_snapshot(
+        main_window._authoritative_mechanism_transition_snapshot(),
+        canonical_batch_initials_by_set_id=main_window._canonical_batch_initials_identity_by_set_id(),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "run_simulation_internal",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("mechanism edit triggered run")),
+        raising=True,
+    )
+
+    main_window.set_data(
+        np.asarray([0.0, 1.0], dtype=float),
+        {"A": np.asarray([1.0, 0.5], dtype=float)},
+        label="orphaned",
+        overlays=[],
+    )
+    assert main_window.main_plot_has_data() is True
+
+    main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=2.0")
+    qt_app.processEvents()
+
     _assert_selection_plot_cleared(main_window)
 
 def test_pending_init_guard_does_not_suppress_next_real_state_network_edit(

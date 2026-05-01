@@ -683,9 +683,14 @@ class BatchInitialConditionsStore:
                 target_row = start_row + r
                 target_col = start_col + c
                 if target_col == 0:
+                    next_name = str(val or "").strip()
+                    if self._sets[target_row].name == next_name:
+                        continue
                     self.set_set_name(target_row, val)
                 else:
                     sp = self._visible_species[target_col - 1]
+                    if self.get_value(target_row, sp) == str(val):
+                        continue
                     self.set_value(target_row, sp, val)
                 changed.append((target_row, target_col))
         return changed

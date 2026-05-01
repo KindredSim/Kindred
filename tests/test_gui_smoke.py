@@ -149,6 +149,24 @@ def test_color_roster_refresh_handles_malformed_named_set_block(main_window):
     assert roster is None
 
 
+def test_color_roster_refresh_uses_reactions_only_snapshot_input_for_state_network(main_window):
+    state_network = "\n".join(
+        [
+            "state: A, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "state: TS1, kind=TS, energy=10, energy_unit=kJ/mol, degeneracy=1",
+            "state: B, kind=GS, energy=0, energy_unit=kJ/mol, degeneracy=1",
+            "edge: A,TS1",
+            "edge: TS1,B",
+        ]
+    )
+    main_window._mechanism_session_owner.apply_authoritative_update("", state_network)
+    main_window._mechanism_helpers.clear_last_mechanism()
+
+    roster = main_window._current_mechanism_species_roster_for_colors()
+
+    assert roster == ("A", "B")
+
+
 def test_species_registry_reports_parse_failure(main_window):
     """Invalid DSL surfaces a helpful error instead of crashing."""
     main_window._mechanism_editor._reactions_text.setPlainText("this line does not parse")

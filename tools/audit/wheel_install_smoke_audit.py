@@ -29,6 +29,15 @@ class CmdResult:
     stderr_tail: str
 
 
+@dataclass(frozen=True)
+class CaseConflictGroup:
+    casefold_key: str
+    members: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return f"casefold_key={self.casefold_key} members={list(self.members)!r}"
+
+
 def _default_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -558,7 +567,7 @@ def _get_purelib(*, python_path: Path, timeout_seconds: float) -> Path | None:
     return Path(line).resolve()
 
 
-def _scan_case_conflicts(purelib: Path) -> tuple[int, list[str]]:
+def _scan_case_conflicts(purelib: Path) -> tuple[int, list[CaseConflictGroup]]:
     candidates: list[Path] = []
     pkg = purelib / "kindred"
     if pkg.exists():
@@ -592,11 +601,11 @@ def _scan_case_conflicts(purelib: Path) -> tuple[int, list[str]]:
                 rel_posix = str(rel_under).replace("\\", "/")
                 seen.setdefault(rel_posix.casefold(), set()).add(rel_posix)
 
-    groups: list[str] = []
+    groups: list[CaseConflictGroup] = []
     for key in sorted(seen):
         members = sorted(seen[key])
         if len(members) > 1:
-            groups.append(f"casefold_key={key} members={members!r}")
+            groups.append(CaseConflictGroup(casefold_key=str(key), members=tuple(members)))
     return (len(groups), groups)
 
 
@@ -782,7 +791,7 @@ def _render_report(
     purelib: Path | None,
     resource_on_disk_ok: int,
     case_conflicts: int,
-    case_conflict_groups: list[str],
+    case_conflict_groups: list[CaseConflictGroup],
     smoke: list[tuple[str, CmdResult]],
     smoke_failures: int,
     smoke_timeouts: int,
@@ -938,7 +947,7 @@ def main(argv: list[str]) -> int:
     purelib: Path | None = None
     resource_on_disk_ok = 0
     case_conflicts = 0
-    case_conflict_groups: list[str] = []
+    case_conflict_groups: list[CaseConflictGroup] = []
     smoke: list[tuple[str, CmdResult]] = []
     smoke_failures = 0
     smoke_timeouts = 0

@@ -948,23 +948,27 @@ class FittingMixin:
             applied_any = bool(parameter_outcome.applied_any)
             parameter_apply_failed = bool(parameter_outcome.rewrite_failed)
         if plan.initial_condition_items:
-            self._apply_fit_initial_condition_project_updates(plan.initial_condition_items)
+            previous_suppress = bool(getattr(self, "_suppress_canonical_batch_initials_transition", False))
+            if hasattr(self, "_suppress_canonical_batch_initials_transition"):
+                setattr(self, "_suppress_canonical_batch_initials_transition", True)
+            try:
+                self._apply_fit_initial_condition_project_updates(plan.initial_condition_items)
+            finally:
+                if hasattr(self, "_suppress_canonical_batch_initials_transition"):
+                    setattr(self, "_suppress_canonical_batch_initials_transition", previous_suppress)
+            if plan.canonical_ic_affected_set_ids:
+                self._apply_canonical_batch_initials_transition(
+                    affected_set_ids=plan.canonical_ic_affected_set_ids,
+                    transition_source="fitting_project_apply_initial_conditions",
+                    discard_dirty_preview=True,
+                )
             applied_any = True
 
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        if batch_cache is not None and active_cache_key and plan.canonical_ic_affected_set_ids:
-            merged_invalidated: list[str] = [
-                str(set_id)
-                for set_id in (getattr(batch_cache, "active_cache_invalidated_set_ids", None) or ())
-                if str(set_id)
-            ]
-            for set_id in plan.canonical_ic_affected_set_ids:
-                if set_id not in merged_invalidated:
-                    merged_invalidated.append(str(set_id))
-            batch_cache.active_cache_invalidated_set_ids = tuple(merged_invalidated) or None
-
-        if plan.needs_display_refresh and callable(getattr(self, "_refresh_batch_display_from_focus_and_shown", None)):
+        if (
+            plan.needs_display_refresh
+            and applied_any
+            and callable(getattr(self, "_refresh_batch_display_from_focus_and_shown", None))
+        ):
             self._refresh_batch_display_from_focus_and_shown()
         if parameter_apply_failed and applied_any:
             parameter_warnings.append(

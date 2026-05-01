@@ -863,6 +863,7 @@ def test_simulation_complete_mechanism_helpers_cluster_uses_explicit_mechanism_h
     tree = ast.parse(source, filename=str(target))
     lines = source.splitlines()
     method_names = (
+        "_finalize_explicit_batch_dirty_reset",
         "_on_simulation_complete",
         "_update_primary_result_materialization_contract",
         "_remember_primary_result_mechanism",

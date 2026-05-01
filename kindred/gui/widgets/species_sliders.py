@@ -360,6 +360,14 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._sync_visibility_state()
         self.contentStateChanged.emit(True)
 
+    def refresh_current_row_from_model(self, *, recompute_ranges: bool = True) -> None:
+        if not self._active or self._table is None or self._model is None:
+            return
+        if not self._rows:
+            self.rebuild_from_current_row()
+            return
+        self._refresh_from_model(recompute_ranges=bool(recompute_ranges))
+
     def _refresh_from_model(self, *, recompute_ranges: bool) -> None:
         model = self._model
         if model is None or self._current_row is None:

@@ -2979,7 +2979,11 @@ def test_runtime_input_supersede_preserves_preview_owner_when_runtime_identity_i
 
     preview_owner = _FakeOwner()
     controller._preview_simulation_owner = preview_owner
-    controller._preview_ownership = PreviewOwnershipState(request_id=4, epoch=2)
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=4,
+        epoch=2,
+        target_set_ids=("id2",),
+    )
     controller._latest_sim_request_id = 4
     controller._simulation_running = True
     controller._slider_simulation_active = True
@@ -2991,10 +2995,176 @@ def test_runtime_input_supersede_preserves_preview_owner_when_runtime_identity_i
     )
 
     assert controller._authoritative_runtime_input_epoch == 8
-    assert controller._authoritative_runtime_input_invalidated_set_ids == ("id1",)
+    assert controller._authoritative_runtime_input_set_epoch_by_set_id == {"id1": 8}
     assert controller._preview_simulation_owner is preview_owner
     assert preview_owner.close_calls == []
+    assert controller.run_state.preview_ownership.request_id == 4
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_accepts_unaffected_preview_completion(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 4
+    controller._active_run_id = 10
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=4,
+        epoch=2,
+        target_set_ids=("id2",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 4,
+        "run_id": 10,
+        "cache_key": "preview-cache",
+        "queue_ids": ["id2"],
+        "queue_names": ["set2"],
+        "total": 1,
+        "pos": 0,
+        "preview_scope_set_ids": ("id2",),
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id2": 0},
+    }
+    mw._batch_set_ids_for_scope.return_value = ["id2"]
+    mw._shown_batch_set_ids.return_value = ["id2"]
+    mw._batch_current_row.return_value = 0
+    mw._batch_set_id_for_row.return_value = "id2"
+    mw._batch_set_name_for_id.return_value = "set2"
+    mw._display_cached_batch_selection.return_value = True
+
+    controller.supersede_active_work_for_authoritative_mechanism_transition(
+        epoch=8,
+        affected_set_ids=("id1",),
+        close_preview_runtime_owner=False,
+    )
+
+    assert controller.run_state.preview_ownership.request_id == 4
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=10,
+        fast_mode=True,
+        request_id=4,
+        owner_epoch=2,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="preview-cache",
+    )
+
+    assert mw._display_cached_batch_selection.call_count == 1
+    assert controller._batch_run_context["active"] is False
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_rejects_affected_preview_completion(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 4
+    controller._active_run_id = 10
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=4,
+        epoch=2,
+        target_set_ids=("id1",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 4,
+        "run_id": 10,
+        "cache_key": "preview-cache",
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "total": 1,
+        "pos": 0,
+        "preview_scope_set_ids": ("id1",),
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 0},
+    }
+    mw._display_cached_batch_selection.return_value = True
+
+    controller.supersede_active_work_for_authoritative_mechanism_transition(
+        epoch=8,
+        affected_set_ids=("id1",),
+        close_preview_runtime_owner=False,
+    )
+
     assert controller.run_state.preview_ownership.request_id is None
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=10,
+        fast_mode=True,
+        request_id=4,
+        owner_epoch=2,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="preview-cache",
+    )
+
+    mw._display_cached_batch_selection.assert_not_called()
+    mw.set_data.assert_not_called()
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_rejects_affected_preview_error(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 4
+    controller._active_run_id = 10
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=4,
+        epoch=2,
+        target_set_ids=("id1",),
+    )
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": True,
+        "request_id": 4,
+        "run_id": 10,
+        "cache_key": "preview-cache",
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "total": 1,
+        "pos": 0,
+        "preview_scope_set_ids": ("id1",),
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 0},
+    }
+    mw.message_box_critical = MagicMock()
+    mw._status_label.setText("Running preview")
+
+    controller.supersede_active_work_for_authoritative_mechanism_transition(
+        epoch=8,
+        affected_set_ids=("id1",),
+        close_preview_runtime_owner=False,
+    )
+
+    controller._on_simulation_error(
+        {"kind": "simulation_error", "message": "stale preview failed"},
+        run_id=10,
+        fast_mode=True,
+        request_id=4,
+        owner_epoch=2,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="preview-cache",
+    )
+
+    mw.message_box_critical.assert_not_called()
+    assert mw._status_label.text == "Ready"
 
 
 @pytest.mark.unit
@@ -10688,6 +10858,198 @@ def test_on_simulation_error_non_cancelled_explicit_requeues_preserved_pending_s
 
 
 @pytest.mark.unit
+def test_on_simulation_error_ignores_stale_runtime_input_epoch_before_ui_publication(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    critical = MagicMock(return_value=QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", critical)
+
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._authoritative_runtime_input_epoch = 2
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": 5,
+        "runtime_input_epoch": 1,
+    }
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+
+    controller._on_simulation_error(
+        "stale boom",
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    critical.assert_not_called()
+    assert mw._status_label.text != "Simulation failed"
+    assert controller._batch_run_context["active"] is True
+    assert controller._simulation_running is True
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_rejects_affected_completion_but_accepts_unaffected(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
+    base_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": 5,
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 1, "id2": 0},
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "rows": [0, 1],
+        "pos": 0,
+        "total": 2,
+        "primary_set_id": "id1",
+    }
+
+    controller._batch_run_context = dict(base_context)
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+    mw.set_data.assert_not_called()
+    assert "ck::id1" not in controller.batch_cache.result_cache
+
+    controller._batch_run_context = dict(base_context, pos=1, primary_set_id="id2")
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    mw.set_data.assert_called_once()
+    assert "ck::id2" in controller.batch_cache.result_cache
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_rejects_affected_error_but_surfaces_unaffected(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
+    base_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": 5,
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 1, "id2": 0},
+    }
+    mw.message_box_critical = MagicMock()
+
+    controller._batch_run_context = dict(base_context)
+    controller._on_simulation_error(
+        "affected boom",
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+    mw.message_box_critical.assert_not_called()
+    assert controller._batch_run_context["active"] is True
+    assert controller._simulation_running is True
+
+    controller._batch_run_context = dict(base_context)
+    controller._on_simulation_error(
+        "unaffected boom",
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    mw.message_box_critical.assert_called_once()
+
+
+@pytest.mark.unit
+def test_global_authoritative_supersede_rejects_unaffected_completion_and_error(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 2
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {}
+    context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "request_id": 5,
+        "runtime_input_global_epoch": 1,
+        "runtime_input_set_epoch_by_set_id": {"id2": 0},
+    }
+    mw.message_box_critical = MagicMock()
+
+    controller._batch_run_context = dict(context)
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    mw.set_data.assert_not_called()
+    assert "ck::id2" not in controller.batch_cache.result_cache
+
+    controller._batch_run_context = dict(context)
+    controller._on_simulation_error(
+        "global stale boom",
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    mw.message_box_critical.assert_not_called()
+
+
+@pytest.mark.unit
 def test_on_simulation_error_non_cancelled_explicit_replays_existing_owned_pending_slider_request(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
@@ -10804,6 +11166,342 @@ def test_consume_parallel_batch_outcome_error_payload_calls_on_error(controller:
 
     assert ok is False
     controller._on_simulation_error.assert_called_once()
+
+
+@pytest.mark.unit
+def test_parallel_batch_stale_runtime_input_error_is_consumed_without_failure_publication(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    outcome = _timeout_failure_outcome("id1")
+
+    _install_active_lane_outcomes(controller, {"id1": outcome}, set_names={"id1": "set1"})
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 4, "id2": 0}
+    controller._batch_cache.active_cache_key = "ck"
+    controller._batch_cache.active_cache_valid_set_ids = ("id1", "id2")
+    controller._batch_cache.active_cache_invalidated_set_ids = None
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "fast_mode": False,
+        "run_id": 1,
+        "request_id": 2,
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "total": 2,
+        "completed_set_ids": [],
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 0, "id2": 0},
+        "explicit_cache_valid_set_ids": ("id1", "id2"),
+        "explicit_cache_invalidated_set_ids": None,
+        "pending_workspace_reset_set_ids": ["id1", "id2"],
+        "pending_dirty_reset_generation_by_set_id": {"id1": 1, "id2": 2},
+    }
+    mw._dirty_state_generations = {"id1": 1, "id2": 2}
+    controller._on_simulation_error = MagicMock()
+    mw.message_box_critical = MagicMock()
+    mw._status_label.setText("Running 2 sets in parallel")
+
+    ok = _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="id1",
+        outcome=outcome,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="test",
+    )
+
+    assert ok is True
+    ctx = dict(controller._batch_run_context)
+    assert ctx["completed_set_ids"] == ["id1"]
+    assert "failed_set_ids" not in ctx
+    assert "failed_set_errors" not in ctx
+    assert ctx["pending_workspace_reset_set_ids"] == ["id2"]
+    assert ctx["pending_dirty_reset_generation_by_set_id"] == {"id2": 2}
+    assert controller._batch_cache.active_cache_valid_set_ids == ("id1", "id2")
+    assert controller._batch_cache.active_cache_invalidated_set_ids is None
+    controller._on_simulation_error.assert_not_called()
+    mw.message_box_critical.assert_not_called()
+    assert mw._status_label.text == "Running 2 sets in parallel"
+
+    controller._active_run_id = 1
+    controller._latest_sim_request_id = 2
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=1,
+        fast_mode=False,
+        request_id=2,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+
+    mw.reset_mechanism_workspaces.assert_called_once_with(["id2"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id2"])
+    assert controller._batch_run_context["pending_workspace_reset_set_ids"] == []
+    assert controller._batch_run_context["pending_dirty_reset_generation_by_set_id"] == {}
+
+
+@pytest.mark.unit
+def test_parallel_batch_all_stale_runtime_input_callbacks_finish_run_cleanly(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    outcome = _timeout_failure_outcome("id1")
+
+    _install_active_lane_outcomes(controller, {"id1": outcome}, set_names={"id1": "set1"})
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 4}
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    mw._run_btn.setEnabled(False)
+    mw._stop_btn.setEnabled(True)
+    mw._sim_progress.setValue(42)
+    mw._status_label.setText("Running 1 set in parallel")
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "fast_mode": False,
+        "run_id": 1,
+        "request_id": 2,
+        "cache_key": "ck",
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "total": 1,
+        "completed_set_ids": [],
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 0},
+    }
+    controller.queue_pending_slider_preview_replay(target_set_ids=("id2",), request_id=9)
+    controller._on_simulation_error = MagicMock()
+    mw.message_box_critical = MagicMock()
+
+    ok = _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="id1",
+        outcome=outcome,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="test",
+    )
+
+    assert ok is True
+    assert controller._batch_run_context["active"] is False
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
+    assert mw._run_btn.isEnabled() is True
+    assert mw._stop_btn.isEnabled() is False
+    assert mw._sim_progress.value == 0
+    assert mw._status_label.text == "Ready"
+    assert scheduled == [controller._run_simulation_from_slider]
+    assert _pending_slider_preview_launch(controller).handoff_queued is True
+    assert _pending_slider_preview_launch(controller).request_id == 9
+    controller._on_simulation_error.assert_not_called()
+    mw.message_box_critical.assert_not_called()
+
+
+@pytest.mark.unit
+def test_parallel_batch_multiset_all_stale_runtime_input_callbacks_finish_run_cleanly(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    id1_outcome = _timeout_failure_outcome("id1")
+    id2_outcome = _timeout_failure_outcome("id2")
+
+    _install_active_lane_outcomes(
+        controller,
+        {"id1": id1_outcome, "id2": id2_outcome},
+        set_names={"id1": "set1", "id2": "set2"},
+    )
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 4, "id2": 4}
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    mw._run_btn.setEnabled(False)
+    mw._stop_btn.setEnabled(True)
+    mw._sim_progress.setValue(42)
+    mw._status_label.setText("Running 2 sets in parallel")
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": True,
+        "fast_mode": False,
+        "run_id": 1,
+        "request_id": 2,
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "total": 2,
+        "completed_set_ids": [],
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 0, "id2": 0},
+    }
+    controller._on_simulation_error = MagicMock()
+    mw.message_box_critical = MagicMock()
+
+    assert _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="id1",
+        outcome=id1_outcome,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="test",
+    ) is True
+
+    assert controller._batch_run_context["active"] is True
+    assert controller._simulation_running is True
+    assert mw._status_label.text == "Running 2 sets in parallel"
+
+    assert _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="id2",
+        outcome=id2_outcome,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        source="test",
+    ) is True
+
+    assert controller._batch_run_context["active"] is False
+    assert sorted(controller._batch_run_context["completed_set_ids"]) == ["id1", "id2"]
+    assert "failed_set_ids" not in controller._batch_run_context
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
+    assert mw._run_btn.isEnabled() is True
+    assert mw._stop_btn.isEnabled() is False
+    assert mw._sim_progress.value == 0
+    assert mw._status_label.text == "Ready"
+    controller._on_simulation_error.assert_not_called()
+    mw.message_box_critical.assert_not_called()
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_preserves_unaffected_serial_queue_tail(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    created: dict[str, object] = {}
+    scheduled: list[object] = []
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
+    _install_recording_contained_worker(monkeypatch, created, controller)
+
+    active_worker = _FakeWorker(running=True, wait_returns=True)
+    active_worker._batch_set_id = "id1"
+    active_worker._fast_mode = False
+    controller._simulation_worker = active_worker
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    mw._batch_initials_for_row.side_effect = lambda row: {0: {"A": 1.0}, 1: {"A": 2.0}}[int(row)]
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "run_id": 3,
+        "request_id": 5,
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "rows": [0, 1],
+        "pos": 0,
+        "total": 2,
+        "full_dsl": "reaction: A -> B; k=1",
+        "solver_config": {"solver": "BDF"},
+        "t_end": 10.0,
+        "completed_set_ids": [],
+        "pending_workspace_reset_set_ids": ["id1", "id2"],
+        "pending_dirty_reset_generation_by_set_id": {"id1": 1, "id2": 2},
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 1, "id2": 0},
+    }
+
+    controller._supersede_active_work_for_authoritative_mechanism_transition(
+        epoch=2,
+        affected_set_ids=("id1",),
+    )
+
+    assert active_worker._cancelled is True
+    assert controller._batch_run_context["active"] is True
+    assert controller._batch_run_context["pos"] == 1
+    assert controller._batch_run_context["completed_set_ids"] == ["id1"]
+    assert controller._batch_run_context["pending_workspace_reset_set_ids"] == ["id2"]
+    assert controller._batch_run_context["pending_dirty_reset_generation_by_set_id"] == {"id2": 2}
+    assert scheduled == [controller._start_next_batch_simulation]
+
+    scheduled[0]()
+
+    assert created["started"] is True
+    assert created["initials"] == {"A": 2.0}
+    assert controller._simulation_worker._batch_set_id == "id2"
+
+
+@pytest.mark.unit
+def test_start_next_batch_simulation_stale_serial_tail_uses_completion_cleanup(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id2": 4}
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    mw.set_slider_triggered_simulation(True)
+    mw._run_btn.setEnabled(False)
+    mw._stop_btn.setEnabled(True)
+    mw._sim_progress.setValue(50)
+    mw._status_label.setText("Completed set1 (1/2)")
+    mw._dirty_state_generations = {"id1": 1, "id2": 2}
+    mw.reset_mechanism_workspaces.return_value = True
+    mw.discard_concentration_overlays_for_set_ids.return_value = True
+    controller._batch_run_context = {
+        "active": True,
+        "parallel": False,
+        "fast_mode": False,
+        "run_id": 3,
+        "request_id": 5,
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "rows": [0, 1],
+        "pos": 1,
+        "total": 2,
+        "completed_set_ids": ["id1"],
+        "pending_workspace_reset_set_ids": ["id1", "id2"],
+        "pending_dirty_reset_generation_by_set_id": {"id1": 1, "id2": 2},
+        "runtime_input_global_epoch": 0,
+        "runtime_input_set_epoch_by_set_id": {"id1": 0, "id2": 0},
+    }
+
+    controller._start_next_batch_simulation()
+
+    assert controller._batch_run_context["active"] is False
+    assert controller._batch_run_context["completed_set_ids"] == ["id1", "id2"]
+    assert controller._batch_run_context["pending_workspace_reset_set_ids"] == []
+    assert controller._batch_run_context["pending_dirty_reset_generation_by_set_id"] == {}
+    mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
+    mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
+    assert mw.slider_triggered_simulation() is False
+    assert mw._run_btn.isEnabled() is True
+    assert mw._stop_btn.isEnabled() is False
+    assert mw._sim_progress.value == 100
+    assert mw._status_label.text == "Simulation complete"
+
 
 @pytest.mark.unit
 def test_has_running_workers_is_pure_query(controller: SimulationController):

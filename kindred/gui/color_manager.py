@@ -136,7 +136,21 @@ class ColorManager:
         if not roster:
             return None
 
-        known = [str(name).strip() for name in roster if str(name).strip()]
+        return self.resolve_known_species_key(raw, roster)
+
+    def resolve_known_species_key(
+        self,
+        species_name: str,
+        known_species: Sequence[str],
+    ) -> str | None:
+        """Resolve a name against only the supplied roster, ignoring global state."""
+        raw = str(species_name or "").strip()
+        if not raw:
+            return None
+
+        known = [str(name).strip() for name in (known_species or ()) if str(name).strip()]
+        if not known:
+            return None
         exact = {name: name for name in known}
         if raw in exact:
             return exact[raw]

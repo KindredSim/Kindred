@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Set, Tuple
 
 
 def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
@@ -367,6 +367,15 @@ class SimulationMechanismHelpersPort(Protocol):
     ) -> None: ...
 
     def extract_and_populate_variables(self, *, preserve_visibility: bool = False) -> None: ...
+
+    def authoritative_structure_snapshot(
+        self,
+        *,
+        reactions_text: str,
+        state_network_text: str = "",
+        units_identity: Sequence[object] = (),
+        builder: Callable[[str], object],
+    ) -> object: ...
 
     def sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None: ...
 

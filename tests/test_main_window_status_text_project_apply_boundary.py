@@ -1353,7 +1353,7 @@ def test_authoritative_mechanism_commit_invalidates_display_before_scheduling_re
 
     monkeypatch.setattr(
         main_window,
-        "_invalidate_active_results_after_authoritative_mechanism_change",
+        "_apply_authoritative_result_truth_effects",
         lambda **_kwargs: events.append("invalidate_display"),
     )
     monkeypatch.setattr(
@@ -1417,7 +1417,7 @@ def test_programmatic_mechanism_load_invalidates_display_before_scheduling_rewar
 
     monkeypatch.setattr(
         main_window,
-        "_invalidate_active_results_after_authoritative_mechanism_change",
+        "_apply_authoritative_result_truth_effects",
         lambda **_kwargs: events.append("invalidate_display"),
     )
     monkeypatch.setattr(

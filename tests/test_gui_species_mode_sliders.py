@@ -176,6 +176,8 @@ def test_unified_surface_builds_species_sliders_and_syncs_with_batch_table(main_
 
     # With row_max=4.0, slider_max for A becomes 20.0, so 4/20*10000 = 2000.
     qtbot.waitUntil(lambda: slider_a.value() == 2000, timeout=1500)
+    set_id = str(main_window._batch_set_id_for_row(0) or "")
+    assert main_window._preview_session.has_dirty_state_for_set(set_id) is False
 
     # The unified Reset button is context-aware; the legacy "Reset row" button is removed.
     legacy_reset_btn = main_window.findChild(QtWidgets.QPushButton, "resetSpeciesRowButton")
@@ -186,7 +188,7 @@ def test_unified_surface_builds_species_sliders_and_syncs_with_batch_table(main_
     prev_calls = int(calls["n"])
     qtbot.mouseClick(reset_btn, QtCore.Qt.LeftButton)
     QtWidgets.QApplication.processEvents()
-    assert calls["n"] == prev_calls + 1
+    assert calls["n"] == prev_calls
     assert reset_runs["n"] == 0
     assert float(main_window._batch_store.get_value(0, "A")) == pytest.approx(4.0, rel=1e-6, abs=1e-9)
     assert float(main_window._batch_store.get_value(0, "B")) == pytest.approx(2.0, rel=1e-6, abs=1e-9)

@@ -3,6 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
+from kindred.core.mechanism_structure_snapshot import (
+    MechanismStructureSnapshot,
+    MechanismStructureSnapshotOwner,
+)
+
 if TYPE_CHECKING:
     from kindred.gui.main_window import MainWindow
     from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
@@ -34,6 +39,7 @@ class MainWindowMechanismHelpers:
         )
         self._last_mechanism: object | None = None
         self._last_mechanism_context: dict[str, Any] = {}
+        self._structure_owner = MechanismStructureSnapshotOwner()
 
     def _runtime_owner(self) -> "MainWindowVariableRuntime":
         runtime = self._runtime
@@ -58,6 +64,21 @@ class MainWindowMechanismHelpers:
             "solver_config": dict(solver_config or {}),
             "timestamp": datetime.now().isoformat(),
         }
+
+    def authoritative_structure_snapshot(
+        self,
+        *,
+        reactions_text: str,
+        state_network_text: str = "",
+        units_identity: tuple[object, ...] = (),
+        builder: Callable[[str], object],
+    ) -> MechanismStructureSnapshot:
+        return self._structure_owner.snapshot_for(
+            reactions_text=str(reactions_text or ""),
+            state_network_text=str(state_network_text or ""),
+            units_identity=units_identity,
+            builder=builder,
+        )
 
     def is_energy_mode_mechanism(self, mechanism: object) -> bool:
         return bool(self._runtime_owner().is_energy_mode_mechanism(mechanism))
@@ -128,3 +149,4 @@ class MainWindowMechanismHelpers:
     def clear_last_mechanism(self) -> None:
         self._last_mechanism = None
         self._last_mechanism_context = {}
+        self._structure_owner.clear()

@@ -96,6 +96,54 @@ class MechanismTransitionOutcome:
     def stale_result_epoch(self) -> int:
         return int(self.epoch)
 
+    @property
+    def cache_stale_scope_is_global(self) -> bool:
+        """Whether scientific result-cache staleness is global for this transition."""
+        return bool(self.runtime_invalidation_required)
+
+    @property
+    def cache_stale_set_ids(self) -> tuple[str, ...]:
+        """Set IDs stale for scoped cache invalidation; empty when global or none."""
+        if self.cache_stale_scope_is_global or not self.runtime_input_invalidation_required:
+            return ()
+        return _normalize_set_ids(self.affected_set_ids)
+
+    @property
+    def display_clear_scope_is_global(self) -> bool:
+        """Whether visible display clearing is global for this transition."""
+        return bool(self.runtime_invalidation_required)
+
+    @property
+    def display_clear_set_ids(self) -> tuple[str, ...]:
+        """Set IDs whose visible display is untruthful; empty when global or none."""
+        if self.display_clear_scope_is_global or not self.runtime_input_invalidation_required:
+            return ()
+        return _normalize_set_ids(self.affected_set_ids)
+
+    @property
+    def active_work_supersede_scope_is_global(self) -> bool:
+        """Whether active-work publication rejection is global for this transition."""
+        return bool(self.runtime_invalidation_required)
+
+    @property
+    def active_work_supersede_set_ids(self) -> tuple[str, ...]:
+        """Set IDs whose in-flight work is stale; empty when global or none."""
+        if self.active_work_supersede_scope_is_global or not self.runtime_input_invalidation_required:
+            return ()
+        return _normalize_set_ids(self.affected_set_ids)
+
+    @property
+    def dirty_preview_reset_scope_is_global(self) -> bool:
+        """Whether dirty preview reset is global for this transition."""
+        return bool(self.runtime_invalidation_required)
+
+    @property
+    def dirty_preview_reset_set_ids(self) -> tuple[str, ...]:
+        """Set IDs whose dirty preview state is obsolete; empty when global or none."""
+        if self.dirty_preview_reset_scope_is_global or not self.runtime_input_invalidation_required:
+            return ()
+        return _normalize_set_ids(self.affected_set_ids)
+
 
 class MechanismRuntimeTransitionService:
     """Owns non-GUI state for authoritative mechanism/runtime transitions."""
@@ -201,7 +249,14 @@ class MechanismRuntimeTransitionService:
         else:
             pending_snapshot = self._pending_init_snapshot
             if pending_snapshot is not None:
-                if snapshot.matches(pending_snapshot) and not runtime_input_invalidation_required:
+                pending_init_source = source_s in {
+                    "pending_init_migration",
+                    "authoritative_change",
+                    "authoritative_editor_rewrite",
+                }
+                if snapshot.matches(pending_snapshot) and (
+                    pending_init_source or not runtime_input_invalidation_required
+                ):
                     pending_init_preservation = True
                     self._current_snapshot = snapshot
                     if canonical_identity_supplied:
@@ -219,7 +274,15 @@ class MechanismRuntimeTransitionService:
                         affected_set_ids=(),
                     )
                 self._pending_init_snapshot = None
-            if bool(edit_session_active) or bool(input_suppressed) or bool(slider_runtime_invalidation_suppressed):
+            runtime_invalidation_required = not snapshot.matches(self._current_snapshot)
+            edit_session_blocks_transition = bool(edit_session_active) and (
+                runtime_invalidation_required or not runtime_input_invalidation_required
+            )
+            if (
+                edit_session_blocks_transition
+                or bool(input_suppressed)
+                or bool(slider_runtime_invalidation_suppressed)
+            ):
                 return MechanismTransitionOutcome(
                     epoch=int(self._epoch),
                     source=source_s,
@@ -232,7 +295,6 @@ class MechanismRuntimeTransitionService:
                     pending_init_preservation=False,
                     affected_set_ids=(),
                 )
-            runtime_invalidation_required = not snapshot.matches(self._current_snapshot)
 
         if runtime_invalidation_required:
             self._epoch += 1

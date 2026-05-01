@@ -8,6 +8,7 @@ from kindred.gui.widgets.pyqtgraph_plot_panel_impl import (
     PYQTGRAPH_AVAILABLE,
     PyQtGraphPlotPanel,
 )
+from kindred.gui.color_manager import ColorManager
 
 pytestmark = pytest.mark.gui
 
@@ -1184,6 +1185,174 @@ def test_species_x_dataset_overlay_enabled_subset_skips_simulation_only_species_
     assert any(header.startswith("ds1::") and header.endswith("::A") for header in all_header)
     assert all(not (header.startswith("ds1::") and header.endswith("::C")) for header in all_header)
 
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_inferred_local_roster_preserves_dataset_overlay_despite_stale_global_roster(qtbot, monkeypatch):
+    ColorManager.reset_for_tests()
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    clipboard = _DummyClipboard()
+    monkeypatch.setattr(panel, "_get_clipboard", lambda: clipboard)
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "B": np.array([1.0, 2.0, 3.0], dtype=float),
+            "C": np.array([7.0, 8.0, 9.0], dtype=float),
+        },
+        label="set1",
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "B": np.array([21.0, 22.0, 23.0], dtype=float),
+                    "C": np.array([170.0, 180.0, 190.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"C"}
+    panel.set_selected_series(["C"])
+    panel._on_x_axis_changed("B")
+    QtWidgets.QApplication.processEvents()
+
+    assert ColorManager.instance().registered_species_names() == ("B",)
+    assert any(entry.dataset == "ds1" and entry.species == "C" for entry in panel._active_overlay_series)
+    assert any(entry.dataset == "ds1" and entry.species == "C" for entry in panel._visible_overlay_series)
+    assert ("ds1", "C") in panel._overlay_items
+
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert any(header.startswith("ds1::") and header.endswith("::C") for header in axis_header)
+
+    all_header, all_rows = panel.build_visible_export("all")
+    assert all_rows
+    assert any(header.startswith("ds1::") and header.endswith("::C") for header in all_header)
+
+    panel._copy_visible_data()
+    rows = _split_tsv(clipboard.last_text)
+    assert rows
+    assert any(cell.startswith("ds1::") and cell.endswith("::C") for cell in rows[0])
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_explicit_roster_drops_stale_alias_overlay_even_when_resolved_column_is_local_series(qtbot):
+    ColorManager.reset_for_tests()
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "A_conc": np.array([11.0, 21.0, 31.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "A_conc": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A_conc"}
+    panel.set_selected_series(["A"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "A") in panel._overlay_items
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "A") not in panel._overlay_items
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert not any(header.startswith("ds1::") and header.endswith("::A") for header in axis_header)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_explicit_roster_drops_stale_x_source_warning_from_axis_export(qtbot):
+    ColorManager.reset_for_tests()
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "signal": np.array([1.0, 1.5, 2.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "signal": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"signal"}
+    panel.set_selected_series(["signal"])
+    panel._on_x_axis_changed("A")
+    QtWidgets.QApplication.processEvents()
+
+    assert any("missing 'A' values" in warning for warning in panel._active_overlay_warnings)
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert not any("missing 'A' values" in warning for warning in panel._visible_overlay_warnings)
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert not any(header.startswith("ds1::") for header in axis_header)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_plot_panel_exposes_explicit_owned_species_for_display_replay(qtbot):
+    ColorManager.reset_for_tests()
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0], dtype=float),
+        {"A": np.array([1.0, 2.0], dtype=float), "signal": np.array([3.0, 4.0], dtype=float)},
+        owned_species=["A"],
+    )
+    assert panel.owned_species_for_replay() == ("A",)
+
+    panel.set_data(
+        np.array([0.0, 1.0], dtype=float),
+        {"A": np.array([1.0, 2.0], dtype=float), "signal": np.array([3.0, 4.0], dtype=float)},
+    )
+    assert panel.owned_species_for_replay() is None
+
+
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_dataset_overlay_cache_refreshes_on_enabled_species_change_and_later_consumers_do_not_reresolve(
     qtbot,
@@ -1381,6 +1550,256 @@ def test_time_axis_dataset_overlay_enabled_alias_remains_visible_and_exported(
     assert any(header.startswith("ds1::") and header.endswith("::A") for header in all_header)
 
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_roster_refresh_keeps_valid_non_species_overlay_visible_and_axis_exported(qtbot):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "signal": np.array([1.0, 1.5, 2.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "signal": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"signal"}
+    panel.set_selected_series(["signal"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "signal") in panel._overlay_items
+    assert any(entry.dataset == "ds1" and entry.species == "signal" for entry in panel._active_overlay_series)
+
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "signal") in panel._overlay_items
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in axis_header)
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_roster_refresh_drops_stale_species_overlay_warning_from_axis_export(qtbot):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "signal": np.array([1.0, 1.5, 2.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "signal": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"signal"}
+    panel.set_selected_series(["A", "signal"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    assert any("species 'A'" in warning for warning in panel._active_overlay_warnings)
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "signal") in panel._overlay_items
+    assert not any("species 'A'" in warning for warning in panel._visible_overlay_warnings)
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in axis_header)
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_roster_refresh_invalidates_all_export_overlay_cache_for_stale_species(qtbot):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "signal": np.array([1.0, 1.5, 2.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "A_conc": np.array([201.0, 202.0, 203.0], dtype=float),
+                    "signal": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A_conc", "signal"}
+    panel.set_selected_series(["A", "signal"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    all_header_before, all_rows_before = panel.build_visible_export("all")
+    assert all_rows_before
+    assert any(header.startswith("ds1::") and header.endswith("::A") for header in all_header_before)
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in all_header_before)
+
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "A") not in panel._overlay_items
+    assert ("ds1", "signal") in panel._overlay_items
+    all_header_after, all_rows_after = panel.build_visible_export("all")
+    assert all_rows_after
+    assert not any(header.startswith("ds1::") and header.endswith("::A") for header in all_header_after)
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in all_header_after)
+    ColorManager.instance().set_current_species_roster(["A"])
+
+    ColorManager.instance().set_current_species_roster(["A"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    all_header_restored, all_rows_restored = panel.build_visible_export("all")
+    assert all_rows_restored
+    assert any(header.startswith("ds1::") and header.endswith("::A") for header in all_header_restored)
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in all_header_restored)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_roster_filtering_persists_across_ordinary_overlay_redraw(qtbot):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "signal": np.array([1.0, 1.5, 2.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "A_conc": np.array([201.0, 202.0, 203.0], dtype=float),
+                    "signal": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A_conc", "signal"}
+    panel.set_selected_series(["A", "signal"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "A") in panel._overlay_items
+    assert ("ds1", "signal") in panel._overlay_items
+
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "A") not in panel._overlay_items
+    assert ("ds1", "signal") in panel._overlay_items
+
+    panel.set_selected_series(["A", "signal"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    assert ("ds1", "A") not in panel._overlay_items
+    assert ("ds1", "signal") in panel._overlay_items
+    axis_header, axis_rows = panel.build_visible_export("axis")
+    assert axis_rows
+    assert not any(header.startswith("ds1::") and header.endswith("::A") for header in axis_header)
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in axis_header)
+    ColorManager.instance().set_current_species_roster(["A"])
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_roster_refresh_drops_stale_resolved_column_warning_from_all_export(qtbot):
+    panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+
+    panel.set_data(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        {
+            "A": np.array([10.0, 20.0, 30.0], dtype=float),
+            "signal": np.array([1.0, 1.5, 2.0], dtype=float),
+        },
+        label="set1",
+        owned_species=["A"],
+    )
+    panel.set_overlay_catalog(
+        {
+            "ds1": {
+                "t": np.array([0.0, 1.0, 2.0], dtype=float),
+                "species": {
+                    "A_conc": np.array([201.0, 202.0], dtype=float),
+                    "signal": np.array([101.0, 102.0, 103.0], dtype=float),
+                },
+            }
+        }
+    )
+    panel._overlay_panel._selected["ds1"] = True
+    panel._overlay_panel._enabled_species["ds1"] = {"A_conc", "signal"}
+    panel.set_selected_series(["A", "signal"])
+    panel._on_x_axis_changed("t")
+    QtWidgets.QApplication.processEvents()
+
+    with pytest.raises(ValueError, match="Cannot export overlay datasets until issues are resolved"):
+        panel.build_visible_export("all")
+    assert any("'A_conc' length" in warning for warning in panel._export_all_overlay_warnings_unfiltered)
+
+    ColorManager.instance().set_current_species_roster(["B"])
+    panel.refresh_overlay_presentation_for_current_roster()
+    QtWidgets.QApplication.processEvents()
+
+    assert not any("'A_conc' length" in warning for warning in panel._export_all_overlay_warnings)
+    all_header_after, all_rows_after = panel.build_visible_export("all")
+    assert all_rows_after
+    assert not any(header.startswith("ds1::") and header.endswith("::A") for header in all_header_after)
+    assert any(header.startswith("ds1::") and header.endswith("::signal") for header in all_header_after)
+
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_time_axis_dataset_overlay_filtered_subset_still_warns_and_blocks_export_for_missing_series(
     qtbot,
 ):
@@ -1428,6 +1847,7 @@ def test_time_axis_dataset_overlay_filtered_subset_still_warns_and_blocks_export
 def test_species_x_dataset_overlay_enabled_column_still_warns_and_blocks_export_for_real_mismatch(
     qtbot,
 ):
+    ColorManager.instance().set_species_roster(["A", "B"])
     panel = PyQtGraphPlotPanel(enable_copy_visible_data_action=True)
     qtbot.addWidget(panel)
     panel.show()
