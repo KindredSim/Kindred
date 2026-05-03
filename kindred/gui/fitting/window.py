@@ -39,9 +39,13 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
+    SerialFittingEvaluator,
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
+from kindred.core.batch_parallel import compute_effective_batch_workers
+from kindred.core.fitting_runtime_session import FittingRuntimeLedger, FittingRuntimeSession
+from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
@@ -484,6 +488,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_plot_model_x = {}
         self._last_result = None
         self._active_fit_dataset_ids: List[str] = []
+        self._fit_runtime_session: Optional[FittingRuntimeSession] = None
+        self._fit_runtime_session_hash = ""
+        self._fit_runtime_session_lane_budget: Optional[int] = None
+        self._fit_runtime_ledger: Optional[FittingRuntimeLedger] = None
         self._closing = False
         self._pending_best_payload = None
         self._pending_best_worker = None
@@ -2175,6 +2183,76 @@ class FittingWindow(QtWidgets.QDialog):
                 continue
         return out
 
+    def _fit_runtime_lane_budget(self, dataset_count: int) -> int:
+        budget = None
+        parent = self.parent()
+        simulation_controller = None
+        for owner in (parent, getattr(parent, "_sim_controller", None), getattr(parent, "simulation_controller", None)):
+            if owner is None:
+                continue
+            if hasattr(owner, "batch_runtime_lane_budget"):
+                simulation_controller = owner
+                break
+        if simulation_controller is not None:
+            try:
+                budget = int(getattr(simulation_controller, "batch_runtime_lane_budget"))
+            except Exception:
+                budget = None
+        if budget is None:
+            try:
+                budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
+            except Exception:
+                budget = 1
+        return compute_effective_batch_workers(
+            num_sets=max(1, int(dataset_count)),
+            max_parallel_workers=max(1, int(budget)),
+        )
+
+    def _discard_fit_runtime_session(self, *, kill: bool = False) -> None:
+        session = getattr(self, "_fit_runtime_session", None)
+        self._fit_runtime_session = None
+        self._fit_runtime_session_hash = ""
+        self._fit_runtime_session_lane_budget = None
+        self._fit_runtime_ledger = None
+        close = getattr(session, "close", None)
+        if callable(close):
+            try:
+                close(kill=bool(kill))
+            except Exception as exc:
+                self._best_effort_failures.add("fit_runtime_session.close")
+                logger.debug("Failed to close fitting runtime session: %s", exc, exc_info=True)
+
+    def _fit_runtime_session_for_run(
+        self,
+        *,
+        fit_evaluator,
+        stamp_hash: str,
+        dataset_count: int,
+    ) -> Optional[FittingRuntimeSession]:
+        if type(fit_evaluator) is not SerialFittingEvaluator:
+            self._discard_fit_runtime_session(kill=False)
+            return None
+        normalized_hash = str(stamp_hash or "")
+        lane_budget = self._fit_runtime_lane_budget(int(dataset_count))
+        if (
+            self._fit_runtime_session is not None
+            and self._fit_runtime_session_hash == normalized_hash
+            and self._fit_runtime_session_lane_budget == int(lane_budget)
+        ):
+            return self._fit_runtime_session
+        self._discard_fit_runtime_session(kill=False)
+        ledger = FittingRuntimeLedger()
+        session = FittingRuntimeSession.from_serial_evaluator(
+            fit_evaluator,
+            max_lanes=int(lane_budget),
+            ledger=ledger,
+        )
+        self._fit_runtime_session = session
+        self._fit_runtime_session_hash = normalized_hash
+        self._fit_runtime_session_lane_budget = int(lane_budget)
+        self._fit_runtime_ledger = ledger
+        return session
+
     def _start_global_fit_worker(
         self,
         *,
@@ -2190,6 +2268,11 @@ class FittingWindow(QtWidgets.QDialog):
         stamp_hash: str,
         stamp_short: str,
     ) -> None:
+        runtime_session = self._fit_runtime_session_for_run(
+            fit_evaluator=fit_evaluator,
+            stamp_hash=str(stamp_hash),
+            dataset_count=len(datasets),
+        )
         worker = GlobalFitWorker(
             datasets,
             dict(config["parameters"]),
@@ -2203,6 +2286,9 @@ class FittingWindow(QtWidgets.QDialog):
             seed=config.get("seed"),
             log10_params=config.get("log10_params"),
             fit_evaluator=fit_evaluator,
+            fit_runtime_session=runtime_session,
+            fit_runtime_max_lanes=self._fit_runtime_lane_budget(len(datasets)),
+            fit_runtime_ledger=self._fit_runtime_ledger,
             fit_func=self._fit_func,
             solver=requested_solver,
             rtol=float(requested_rtol),
@@ -2333,27 +2419,15 @@ class FittingWindow(QtWidgets.QDialog):
             running = False
         if not running:
             return
-        if hasattr(worker, "cancel"):
-            try:
-                worker.cancel()
-            except Exception as exc:
-                self._best_effort_failures.add("cancel_fit.worker_cancel")
-                logger.debug("Failed to cancel worker: %s", exc, exc_info=True)
+        self._clear_pending_best_update_state()
+        self._hard_teardown_worker(reason="Fit cancelled", disable_ui=False)
+        self._discard_fit_runtime_session(kill=True)
         try:
-            self._status_label.setText("Cancelling... (requested)")
+            self._set_running_state(False)
+            self._status_label.setText("Fit cancelled")
         except Exception as exc:
             self._best_effort_failures.add("cancel_fit.status_label")
             logger.debug("Failed to set cancellation status label: %s", exc, exc_info=True)
-        for attr in ("_stop_button", "_pause_button", "_resume_button"):
-            btn = getattr(self, attr, None)
-            if btn is None:
-                continue
-            try:
-                btn.setEnabled(False)
-            except Exception as exc:
-                self._teardown_disable_failures.add(attr)
-                logger.debug("Failed to disable FitDialog button '%s' during cancellation: %s", attr, exc, exc_info=True)
-                continue
 
     def _pause_fit(self) -> None:
         if self._worker and self._worker.isRunning() and not self._paused:
@@ -3117,8 +3191,12 @@ class FittingWindow(QtWidgets.QDialog):
             return
         if self._results_rebuild_pending:
             self._results_rebuild_pending = False
-        self._clear_failed_run_visual_state()
         payload = coerce_simulation_failure(error)
+        if str(payload.get("kind") or "") == "cancelled":
+            self._set_running_state(False)
+            self._status_label.setText("Fit cancelled")
+            return
+        self._clear_failed_run_visual_state()
         stack_trace = simulation_failure_detail_text(payload)
         has_stack_trace = bool(stack_trace)
         message = simulation_failure_user_message(payload)
@@ -3184,6 +3262,7 @@ class FittingWindow(QtWidgets.QDialog):
                 logger.debug("Failed to stop pending-best timer during closeEvent: %s", exc, exc_info=True)
         self._pending_best_payload = None
         self._hard_teardown_worker(reason="Cancelling...", disable_ui=True)
+        self._discard_fit_runtime_session(kill=True)
         event.accept()
         try:
             super().closeEvent(event)

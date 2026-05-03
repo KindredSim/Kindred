@@ -312,6 +312,9 @@ class WarmFittingEvaluatorLane:
                 continue
             raise FittingLaneProtocolError(f"Contained fitting lane returned unexpected reply kind: {kind!r}.")
 
+    def warm(self, *, cancellation_check: Optional[Callable[[], bool]] = None) -> None:
+        self._ensure_started(cancellation_check=cancellation_check)
+
     def close(self, *, kill: bool = False) -> None:
         self._closed = True
         proc = self._process

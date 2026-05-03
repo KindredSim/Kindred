@@ -197,3 +197,160 @@ def test_global_fit_worker_best_payload_accepts_evaluate_series_only_evaluator(q
     assert payload["plot_model_series"]["ds1"]["A"].shape == t_obs.shape
     np.testing.assert_allclose(payload["plot_model_x"]["ds1"], t_obs)
     assert payload["dataset_stats"]["ds1"]["chi_squared"] == pytest.approx(0.0)
+
+
+def test_global_fit_worker_passes_runtime_session_to_fit_boundary(qt_app):
+    seen: dict[str, object] = {}
+    events: list[str] = []
+
+    class _RuntimeSession:
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            assert cancellation_check is not None
+            assert cancellation_check() is False
+            events.append(f"warm:{lane_count}")
+
+    runtime_session = _RuntimeSession()
+
+    def fake_fit_global(*_args, **kwargs):
+        events.append("fit")
+        seen["runtime_session"] = kwargs.get("runtime_session")
+        seen["max_runtime_lanes"] = kwargs.get("max_runtime_lanes")
+        return GlobalFitResult(
+            shared_params={"k": 1.0},
+            dataset_params={"ds": {}},
+            uncertainties=None,
+            global_chi_squared=0.0,
+            global_r_squared=1.0,
+            dataset_info=[],
+            nfev=1,
+            message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
+        )
+
+    t_obs = np.asarray([0.0, 1.0], dtype=float)
+    worker = GlobalFitWorker(
+        [{"id": "ds", "t": t_obs, "y": np.zeros_like(t_obs), "species": "A"}],
+        {"k": 1.0},
+        fit_evaluator=lambda _params: {"t": t_obs, "species": {"A": np.zeros_like(t_obs)}},
+        fit_runtime_session=runtime_session,
+        fit_runtime_max_lanes=3,
+        fit_func=fake_fit_global,
+    )
+
+    worker._execute()
+
+    assert events == ["warm:3", "fit"]
+    assert seen == {"runtime_session": runtime_session, "max_runtime_lanes": 3}
+
+
+def test_global_fit_worker_cancel_notifies_runtime_session(qt_app):
+    events: list[str] = []
+
+    class _RuntimeSession:
+        def cancel_run(self):
+            events.append("runtime:cancel")
+
+    worker = GlobalFitWorker(
+        [{"id": "ds", "t": np.asarray([0.0]), "y": np.asarray([0.0]), "species": "A"}],
+        {"k": 1.0},
+        fit_evaluator=lambda _params: {"t": np.asarray([0.0]), "species": {"A": np.asarray([0.0])}},
+        fit_runtime_session=_RuntimeSession(),
+        fit_func=lambda *_args, **_kwargs: None,
+    )
+
+    worker.cancel()
+
+    assert worker._cancelled is True
+    assert events == ["runtime:cancel"]
+
+
+def test_global_fit_worker_best_payload_uses_runtime_session_evaluator_when_available(qt_app):
+    calls: list[dict[str, float]] = []
+
+    class _RuntimeEvaluator:
+        def evaluate_series(self, params):
+            calls.append(dict(params))
+            t = np.asarray([0.0, 1.0], dtype=float)
+            return {"t": t, "species": {"A": np.asarray([2.0, 3.0], dtype=float)}}
+
+    class _RuntimeSession:
+        def evaluator(self, *, cancellation_check=None):
+            assert cancellation_check is not None
+            return _RuntimeEvaluator()
+
+    t_obs = np.asarray([0.0, 1.0], dtype=float)
+
+    def direct_evaluator(_params):
+        raise AssertionError("best payload must use the runtime-session evaluator")
+
+    worker = GlobalFitWorker(
+        [{"id": "ds", "t": t_obs, "y": np.asarray([2.0, 3.0], dtype=float), "species": "A"}],
+        {"k": 1.0},
+        fit_evaluator=direct_evaluator,
+        fit_runtime_session=_RuntimeSession(),
+        fit_func=lambda *_args, **_kwargs: None,
+    )
+
+    model_series, residual_series, _plot_model_series, _plot_model_x, dataset_stats = worker._build_best_payload_series(
+        shared_params={"k": 1.0},
+        dataset_params={},
+    )
+
+    assert calls == [{"k": 1.0}]
+    np.testing.assert_allclose(model_series["ds"]["A"], np.asarray([2.0, 3.0], dtype=float))
+    np.testing.assert_allclose(residual_series["ds"]["A"], np.asarray([0.0, 0.0], dtype=float))
+    assert dataset_stats["ds"]["chi_squared"] == pytest.approx(0.0)
+
+
+def test_parametric_x_time_guided_best_payload_uses_penalized_alignment_like_final_replay(qt_app):
+    from kindred.core.fitting_evaluation import CallableFittingEvaluator
+
+    t_obs = np.linspace(0.0, 1.0, 41, dtype=float)
+    x_obs = t_obs * (1.0 - t_obs)
+    y_obs = t_obs.copy()
+    t_sim = np.linspace(0.0, 1.0, 401, dtype=float)
+
+    def simulation(params):
+        a = float(params.get("a", 0.5))
+        return {
+            "t": t_sim.copy(),
+            "species": {
+                "X": a * t_sim * (1.0 - t_sim),
+                "Y": t_sim.copy(),
+            },
+        }
+
+    worker = GlobalFitWorker(
+        [
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": y_obs.copy(),
+                "species": "Y",
+                "x_name": "X",
+                "x_obs": x_obs.copy(),
+                "x_mapping_mode": "time_guided",
+            }
+        ],
+        {"a": 0.5},
+        fit_evaluator=CallableFittingEvaluator(simulation),
+        best_update_interval_s=0.0,
+        plot_update_interval_s=0.0,
+    )
+
+    model_series, residual_series, plot_model_series, plot_model_x, dataset_stats = worker._build_best_payload_series(
+        shared_params={"a": 0.5},
+        dataset_params={},
+    )
+
+    assert set(model_series) == {"ds1"}
+    assert set(residual_series) == {"ds1"}
+    assert set(plot_model_series) == {"ds1"}
+    assert set(plot_model_x) == {"ds1"}
+    assert set(dataset_stats) == {"ds1"}
+    assert model_series["ds1"]["Y"].shape == t_obs.shape
+    assert residual_series["ds1"]["Y"].shape == t_obs.shape

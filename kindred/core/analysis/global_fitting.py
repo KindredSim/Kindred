@@ -46,6 +46,7 @@ from kindred.core.fitting_evaluation import (
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
+from kindred.core.fitting_runtime_session import FittingRuntimeRequest, FittingRuntimeSession
 from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.simulation_failure import (
     SimulationFailure,
@@ -775,12 +776,196 @@ def _evaluate_dataset_simulations(
 ) -> List[_DatasetSimulationEvaluation]:
     if not items:
         return []
+    runtime_batch = getattr(fit_evaluator, "evaluate_fitting_runtime_batch", None)
+    if callable(runtime_batch):
+        return _evaluate_dataset_simulations_runtime_batch(
+            fit_evaluator,
+            items,
+            cancellation_check=cancellation_check,
+        )
     return _evaluate_dataset_simulations_serial(
         fit_evaluator,
         items,
         cancellation_check=cancellation_check,
         stop_on_fatal=stop_on_fatal,
     )
+
+
+def _evaluation_from_runtime_value(
+    item: _ObjectiveDatasetInput,
+    value: object,
+    *,
+    cancellation_check: Optional[Callable[[], bool]],
+) -> _DatasetSimulationEvaluation:
+    if isinstance(value, BaseException):
+        exc = value
+        if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+            raise FittingCancelled() from exc
+        if isinstance(exc, FitSimulationError):
+            return _DatasetSimulationEvaluation(
+                index=int(item.index),
+                sim_time=None,
+                sim_species={},
+                error=exc,
+                error_provenance={"dataset": item.payload.dataset_id, "provenance": getattr(exc, "provenance", None)},
+                final_error_message=str(exc),
+            )
+        if exc.__class__.__name__ == "FittingLaneProtocolError":
+            fatal = FitSimulationError(
+                str(exc),
+                failed_params=item.failed_param_snapshot,
+                details={
+                    "fatal": True,
+                    "failure": build_simulation_failure(
+                        "fitting_containment_protocol",
+                        str(exc),
+                        exc_type=exc.__class__.__name__,
+                    ),
+                },
+                context=getattr(exc, "context", None),
+            )
+            return _DatasetSimulationEvaluation(
+                index=int(item.index),
+                sim_time=None,
+                sim_species={},
+                error=fatal,
+                error_provenance={"dataset": item.payload.dataset_id},
+                final_error_message=str(exc),
+            )
+        preferred_failed_params = getattr(exc, "failed_params", None) or item.failed_param_snapshot
+        error_details = dict(getattr(exc, "details", None) or {})
+        if preferred_failed_params:
+            error_details.pop("parameters", None)
+        return _DatasetSimulationEvaluation(
+            index=int(item.index),
+            sim_time=None,
+            sim_species={},
+            error=FitSimulationError(
+                f"Simulation failed for dataset '{item.payload.dataset_id}': {exc}",
+                failed_params=preferred_failed_params,
+                details=error_details,
+                context=getattr(exc, "context", None),
+            ),
+            error_provenance={"dataset": item.payload.dataset_id},
+            final_error_message=str(exc),
+        )
+
+    _raise_if_fitting_cancel_requested(cancellation_check)
+    sim_time, sim_species = _extract_simulation_payload(value)
+    _raise_if_fitting_cancel_requested(cancellation_check)
+    return _DatasetSimulationEvaluation(
+        index=int(item.index),
+        sim_time=sim_time,
+        sim_species=sim_species,
+    )
+
+
+def _runtime_protocol_failure_evaluations(
+    exc: BaseException,
+    items: Sequence[_ObjectiveDatasetInput],
+) -> List[_DatasetSimulationEvaluation]:
+    fatal_failure = build_simulation_failure(
+        "fitting_containment_protocol",
+        str(exc),
+        exc_type=exc.__class__.__name__,
+    )
+    results: List[_DatasetSimulationEvaluation] = []
+    for item in items:
+        fatal = FitSimulationError(
+            str(exc),
+            failed_params=item.failed_param_snapshot,
+            details={
+                "fatal": True,
+                "failure": dict(fatal_failure),
+            },
+            context=getattr(exc, "context", None),
+        )
+        results.append(
+            _DatasetSimulationEvaluation(
+                index=int(item.index),
+                sim_time=None,
+                sim_species={},
+                error=fatal,
+                error_provenance={"dataset": item.payload.dataset_id},
+                final_error_message=str(exc),
+            )
+        )
+    return results
+
+
+def _fit_simulation_error_failure_kind(exc: FitSimulationError) -> str:
+    details = getattr(exc, "details", None)
+    if not isinstance(details, Mapping):
+        return ""
+    failure = details.get("failure")
+    if not isinstance(failure, Mapping):
+        return ""
+    return str(failure.get("kind") or "")
+
+
+def _fit_simulation_error_is_runtime_fatal(exc: FitSimulationError) -> bool:
+    details = getattr(exc, "details", None)
+    return (
+        isinstance(details, Mapping)
+        and bool(details.get("fatal"))
+        and _fit_simulation_error_failure_kind(exc).startswith("fitting_containment_")
+    )
+
+
+def _runtime_fit_failure_evaluations(
+    exc: FitSimulationError,
+    items: Sequence[_ObjectiveDatasetInput],
+) -> List[_DatasetSimulationEvaluation]:
+    return [
+        _DatasetSimulationEvaluation(
+            index=int(item.index),
+            sim_time=None,
+            sim_species={},
+            error=exc,
+            error_provenance={"dataset": item.payload.dataset_id, "provenance": getattr(exc, "provenance", None)},
+            final_error_message=str(exc),
+        )
+        for item in items
+    ]
+
+
+def _evaluate_dataset_simulations_runtime_batch(
+    fit_evaluator,
+    items: Sequence[_ObjectiveDatasetInput],
+    *,
+    cancellation_check: Optional[Callable[[], bool]],
+) -> List[_DatasetSimulationEvaluation]:
+    requests = [
+        FittingRuntimeRequest(
+            params=item.full_params,
+            origins=item.parameter_origins,
+            failed_params=item.failed_param_snapshot,
+        )
+        for item in items
+    ]
+    try:
+        values = fit_evaluator.evaluate_fitting_runtime_batch(
+            requests,
+            cancellation_check=cancellation_check,
+        )
+    except Exception as exc:
+        if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+            raise FittingCancelled() from exc
+        if isinstance(exc, FitSimulationError) and _fit_simulation_error_is_runtime_fatal(exc):
+            return _runtime_fit_failure_evaluations(exc, items)
+        if exc.__class__.__name__ == "FittingLaneProtocolError":
+            return _runtime_protocol_failure_evaluations(exc, items)
+        raise
+    if len(values) != len(items):
+        raise RuntimeError("Fitting runtime session returned the wrong number of dataset evaluations.")
+    return [
+        _evaluation_from_runtime_value(
+            item,
+            value,
+            cancellation_check=cancellation_check,
+        )
+        for item, value in zip(items, values)
+    ]
 
 
 def _evaluate_dataset_simulations_serial(
@@ -1585,6 +1770,9 @@ def fit_global(
     progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     dataset_overrides: Optional[List[object]] = None,
+    runtime_session: Optional[FittingRuntimeSession] = None,
+    max_runtime_lanes: Optional[int] = None,
+    runtime_ledger: Optional[object] = None,
 ) -> GlobalFitResult:
     """
     Fit single mechanism to multiple experimental datasets simultaneously.
@@ -1636,6 +1824,15 @@ def fit_global(
         `"{dataset_id}::{param_name}"` to avoid collisions across datasets.
     cancellation_check : callable, optional
         Function returning True when fitting should abort early.
+    runtime_session : FittingRuntimeSession, optional
+        Internal runtime-controller hook for callers that already own reusable
+        fitting evaluator lanes for this prepared runtime identity.
+    max_runtime_lanes : int, optional
+        Internal lane-budget hint used when this function creates its own
+        runtime session for an exact SerialFittingEvaluator.
+    runtime_ledger : object, optional
+        Internal deterministic ledger object used by runtime-session tests and
+        GUI controller diagnostics.
 
     Returns
     -------
@@ -1800,14 +1997,18 @@ def fit_global(
         )
 
     try:
-        if type(fit_evaluator) is SerialFittingEvaluator:
-            from kindred.core.fitting_containment import ContainedSerialFittingEvaluator
-
-            contained_fit_evaluator = ContainedSerialFittingEvaluator(
+        if runtime_session is not None:
+            runtime_session.begin_run()
+            fit_evaluator_for_run = runtime_session.evaluator(cancellation_check=cancellation_check)
+        elif type(fit_evaluator) is SerialFittingEvaluator:
+            lane_count = 1 if max_runtime_lanes is None else max(1, int(max_runtime_lanes))
+            contained_fit_evaluator = FittingRuntimeSession.from_serial_evaluator(
                 fit_evaluator,
-                cancellation_check=cancellation_check,
+                max_lanes=lane_count,
+                ledger=runtime_ledger,
             )
-            fit_evaluator_for_run = contained_fit_evaluator
+            contained_fit_evaluator.begin_run()
+            fit_evaluator_for_run = contained_fit_evaluator.evaluator(cancellation_check=cancellation_check)
         else:
             fit_evaluator_for_run = fit_evaluator
 
@@ -1946,4 +2147,4 @@ def fit_global(
         )
     finally:
         if contained_fit_evaluator is not None:
-            contained_fit_evaluator.close()
+            contained_fit_evaluator.close(kill=False)

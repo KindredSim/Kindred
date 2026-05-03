@@ -164,7 +164,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self._batch_runtime_lane_budget_spin.setMaximumWidth(max_input_width)
         self._batch_runtime_lane_budget_spin.setMinimumWidth(80)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Batch runtime lanes:", self))
+        row.addWidget(QtWidgets.QLabel("Batch and fitting runtime lanes:", self))
         row.addWidget(self._batch_runtime_lane_budget_spin)
         row.addStretch(1)
         solver_section_layout.addLayout(row)

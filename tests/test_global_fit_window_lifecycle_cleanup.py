@@ -738,6 +738,147 @@ def test_consecutive_fit_dispatch_cycles_leave_clean_state(qt_app, monkeypatch):
         window.close()
 
 
+def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_app, monkeypatch):
+    worker_ref: dict[str, object] = {}
+    cancel_events: list[str] = []
+
+    class _CancelableWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.wait_calls: list[int] = []
+            self.terminate_called = False
+            self.deleted = False
+            worker_ref["worker"] = self
+
+        def wait(self, msecs: int | None = None) -> bool:
+            self.wait_calls.append(int(msecs or 0))
+            self._running = False
+            return True
+
+        def cancel(self) -> None:
+            cancel_events.append("worker:cancel")
+            super().cancel()
+
+        def terminate(self) -> None:
+            self.terminate_called = True
+
+        def deleteLater(self) -> None:
+            self.deleted = True
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: fn())
+
+    window = _build_window()
+    try:
+        runtime_close_calls: list[bool] = []
+
+        class _BadCloseRuntimeSession:
+            def close(self, *, kill: bool = False):
+                cancel_events.append(f"runtime:close:{kill}")
+                runtime_close_calls.append(bool(kill))
+                raise RuntimeError("runtime close failed")
+
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+
+        window._set_running_state(True)
+        window._start_global_fit_worker(
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=lambda _params: {},
+            stamp={},
+            stamp_hash="cancel-run",
+            stamp_short="cancel-run",
+        )
+        worker = worker_ref["worker"]
+        window._fit_runtime_session = _BadCloseRuntimeSession()
+
+        window._cancel_fit()
+
+        assert runtime_close_calls == [True]
+        assert cancel_events == ["worker:cancel", "runtime:close:True"]
+        assert worker.cancel_called is True
+        assert worker.wait_calls == [2000]
+        assert worker.terminate_called is False
+        assert window._worker is None
+        assert window._run_button.isEnabled() is True
+        assert window._stop_button.isEnabled() is False
+        assert window._status_label.text() == "Fit cancelled"
+        worker.bestUpdated.emit({"cost": 99.0})
+        worker.error.emit({"kind": "cancelled", "message": "late cancelled"})
+        QtCore.QCoreApplication.processEvents()
+        assert window._status_label.text() == "Fit cancelled"
+    finally:
+        window.close()
+
+
+def test_fit_runtime_session_cache_invalidates_when_lane_budget_changes(qt_app, monkeypatch):
+    created: list[tuple[str, int]] = []
+
+    class _FakeSession:
+        def __init__(self, *, budget: int):
+            self.budget = int(budget)
+            self.closed: list[bool] = []
+
+        def close(self, *, kill: bool = False):
+            self.closed.append(bool(kill))
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        created.append(("create", int(max_lanes)))
+        return _FakeSession(budget=int(max_lanes))
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        _fake_from_serial,
+    )
+    budget = {"value": 2}
+    window = _build_window()
+    try:
+        monkeypatch.setattr(window, "_fit_runtime_lane_budget", lambda _dataset_count: int(budget["value"]))
+
+        class _Serial:
+            pass
+
+        monkeypatch.setattr("kindred.gui.fitting.window.SerialFittingEvaluator", _Serial)
+        evaluator = _Serial()
+
+        first = window._fit_runtime_session_for_run(
+            fit_evaluator=evaluator,
+            stamp_hash="same",
+            dataset_count=3,
+        )
+        second = window._fit_runtime_session_for_run(
+            fit_evaluator=evaluator,
+            stamp_hash="same",
+            dataset_count=3,
+        )
+        budget["value"] = 4
+        third = window._fit_runtime_session_for_run(
+            fit_evaluator=evaluator,
+            stamp_hash="same",
+            dataset_count=3,
+        )
+
+        assert first is second
+        assert third is not first
+        assert created == [("create", 2), ("create", 4)]
+        assert first.closed == [False]
+    finally:
+        window.close()
+
+
 def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeypatch):
     workers: list[_SignalWorker] = []
 

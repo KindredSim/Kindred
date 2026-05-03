@@ -348,18 +348,18 @@ def test_contained_evaluator_lane_protocol_error_is_fatal() -> None:
     assert exc_info.value.details["failure"]["kind"] == "fitting_containment_protocol"
 
 
-def test_fit_global_wraps_exact_serial_evaluator_with_contained_adapter_by_default(monkeypatch) -> None:
+def test_fit_global_wraps_exact_serial_evaluator_with_runtime_session_by_default(monkeypatch) -> None:
     from kindred.core.analysis import global_fitting
-    from kindred.core.fitting_containment import ContainedSerialFittingEvaluator
+    from kindred.core.fitting_runtime_session import FittingRuntimeSession
 
     wrapped = {"count": 0}
-    original_init = ContainedSerialFittingEvaluator.__init__
+    original_from_serial = FittingRuntimeSession.from_serial_evaluator
 
-    def _spy_init(self, evaluator, *args, **kwargs):
+    def _spy_from_serial(cls, evaluator, *args, **kwargs):
         wrapped["count"] += 1
-        original_init(self, evaluator, *args, **kwargs)
+        return original_from_serial(evaluator, *args, **kwargs)
 
-    monkeypatch.setattr(ContainedSerialFittingEvaluator, "__init__", _spy_init)
+    monkeypatch.setattr(FittingRuntimeSession, "from_serial_evaluator", classmethod(_spy_from_serial))
     monkeypatch.setattr(
         global_fitting,
         "fit_parameters",
@@ -400,7 +400,8 @@ def _fit_result_from_objective(objective_func, initial_params):
 
 def test_fit_global_candidate_timeout_uses_penalty_and_final_replay_keeps_other_dataset(monkeypatch) -> None:
     from kindred.core.analysis import global_fitting
-    from kindred.core.fitting_containment import ContainedSerialFittingEvaluator, FittingLaneTimeout
+    from kindred.core.fitting_containment import FittingLaneTimeout
+    from kindred.core.fitting_runtime_session import FittingRuntimeSession
 
     class _TimeoutDatasetReplayLane:
         def __init__(self):
@@ -419,22 +420,40 @@ def test_fit_global_candidate_timeout_uses_penalty_and_final_replay_keeps_other_
 
     lane = _TimeoutDatasetReplayLane()
 
-    def _contained_init(self, evaluator, *args, **kwargs):
-        self._base_evaluator = evaluator
-        self._lane = lane
+    class _RuntimeEvaluator:
+        def evaluate_fitting_runtime_batch(self, requests, *, cancellation_check=None):
+            out = []
+            for request in requests:
+                try:
+                    out.append(
+                        lane.evaluate_series_with_parameter_origins(
+                            request.params,
+                            request.origins,
+                            failed_params=request.failed_params,
+                        )
+                    )
+                except BaseException as exc:  # noqa: BLE001 - objective owns penalty/final policy
+                    out.append(exc)
+            return out
 
-    monkeypatch.setattr(ContainedSerialFittingEvaluator, "__init__", _contained_init)
+        def evaluate_series(self, params):
+            return lane.evaluate_series_with_parameter_origins(params)
+
+    class _RuntimeSession:
+        def begin_run(self):
+            return 1
+
+        def evaluator(self, *, cancellation_check=None):
+            return _RuntimeEvaluator()
+
+        def close(self, *, kill: bool = False):
+            return None
+
     monkeypatch.setattr(
-        ContainedSerialFittingEvaluator,
-        "evaluate_series_with_parameter_origins",
-        lambda self, params, origins=None, *, failed_params=None: self._lane.evaluate_series_with_parameter_origins(
-            params,
-            origins,
-            failed_params=failed_params,
-        ),
+        FittingRuntimeSession,
+        "from_serial_evaluator",
+        classmethod(lambda cls, *_args, **_kwargs: _RuntimeSession()),
     )
-    monkeypatch.setattr(ContainedSerialFittingEvaluator, "evaluate_series", lambda self, params: self.evaluate_series_with_parameter_origins(params))
-    monkeypatch.setattr(ContainedSerialFittingEvaluator, "close", lambda self: None)
     monkeypatch.setattr(
         global_fitting,
         "fit_parameters",

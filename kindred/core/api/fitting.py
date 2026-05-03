@@ -5,6 +5,8 @@ Authoritative fitting API.
 - `GlobalFitResult` and `DatasetFitInfo` are the supported result types for that API.
 - This module re-exports the current fitting implementation from
   `kindred.core.analysis.global_fitting`.
+- `runtime_session`, `max_runtime_lanes`, and `runtime_ledger` are optional
+  internal runtime-controller integration hooks used by the GUI fitting workflow.
 """
 
 from __future__ import annotations
@@ -48,7 +50,16 @@ def fit_global(
     progress_callback: Optional[Callable[[int, float, Dict[str, float]], None]] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     dataset_overrides: Optional[List[object]] = None,
+    runtime_session: Optional[Any] = None,
+    max_runtime_lanes: Optional[int] = None,
+    runtime_ledger: Optional[Any] = None,
 ) -> Any:
+    """Run global fitting through the authoritative core implementation.
+
+    The runtime integration arguments are optional internal hooks for callers
+    that already own a fitting runtime session. Ordinary callers should pass a
+    fitting evaluator as the first positional argument.
+    """
     from kindred.core.analysis.global_fitting import fit_global as _impl
 
     return _impl(
@@ -68,6 +79,9 @@ def fit_global(
         progress_callback=progress_callback,
         cancellation_check=cancellation_check,
         dataset_overrides=dataset_overrides,
+        runtime_session=runtime_session,
+        max_runtime_lanes=max_runtime_lanes,
+        runtime_ledger=runtime_ledger,
     )
 
 

@@ -93,6 +93,9 @@ class GlobalFitWorker(QtCore.QThread):
         seed: Optional[int] = None,
         log10_params: Optional[Dict[str, bool]] = None,
         fit_evaluator: Optional[object] = None,
+        fit_runtime_session: Optional[object] = None,
+        fit_runtime_max_lanes: Optional[int] = None,
+        fit_runtime_ledger: Optional[object] = None,
         fit_func: Optional[Callable[..., "GlobalFitResult"]] = None,
         solver: str = FITTING_DEFAULT_SOLVER,
         rtol: float = 1e-6,
@@ -140,6 +143,10 @@ class GlobalFitWorker(QtCore.QThread):
         self._seed = seed
         self._log10_params = {str(k): bool(v) for k, v in (log10_params or {}).items()}
         self._fit_evaluator = coerce_fitting_series_evaluator(fit_evaluator) if fit_evaluator is not None else None
+        self._fit_runtime_session = fit_runtime_session
+        self._fit_runtime_max_lanes = None if fit_runtime_max_lanes is None else max(1, int(fit_runtime_max_lanes))
+        self._fit_runtime_ledger = fit_runtime_ledger
+        self._fit_runtime_best_evaluator = None
         self._fit_func = fit_func or fit_global
         solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_method, _solver_warning = normalize_solver_name(solver_label)
@@ -174,6 +181,9 @@ class GlobalFitWorker(QtCore.QThread):
         """Request cancellation from the worker."""
         self._cancelled = True
         self._pause_event.set()
+        cancel_runtime = getattr(self._fit_runtime_session, "cancel_run", None)
+        if callable(cancel_runtime):
+            cancel_runtime()
 
     def pause(self) -> None:
         """Pause optimization at the next cooperative boundary."""
@@ -276,6 +286,16 @@ class GlobalFitWorker(QtCore.QThread):
         self._last_heavy_emit_ts = time.monotonic()
         self._last_best_emit_had_plot_payload = False
 
+        warm_runtime = getattr(self._fit_runtime_session, "warm", None)
+        if callable(warm_runtime):
+            self.progress.emit(5, "Preparing fitting runtime...")
+            warm_runtime(
+                cancellation_check=cancellation_check,
+                lane_count=self._fit_runtime_max_lanes,
+            )
+            if self._cancelled:
+                raise FittingCancelled()
+
         self.progress.emit(5, f"Running global fit... [{self._solver}]")
         result = self._fit_func(
             self._fit_evaluator,
@@ -292,6 +312,9 @@ class GlobalFitWorker(QtCore.QThread):
             log10_params=self._log10_params,
             progress_callback=progress_callback,
             cancellation_check=cancellation_check,
+            runtime_session=self._fit_runtime_session,
+            max_runtime_lanes=self._fit_runtime_max_lanes,
+            runtime_ledger=self._fit_runtime_ledger,
         )
         if self._cancelled:
             raise FittingCancelled()
@@ -530,13 +553,32 @@ class GlobalFitWorker(QtCore.QThread):
         self,
         full_params: dict[str, float],
     ) -> tuple[Optional[np.ndarray], dict[str, np.ndarray]]:
-        if self._fit_evaluator is None:
+        evaluator = self._best_payload_evaluator()
+        if evaluator is None:
             sim_result = {}
         else:
-            sim_result = self._fit_evaluator.evaluate_series(full_params)
+            sim_result = evaluator.evaluate_series(full_params)
         payload = coerce_simulation_series_payload(sim_result)
         sim_time = np.asarray(payload.t, dtype=float).reshape(-1)
         return (sim_time if sim_time.size else None), dict(payload.species)
+
+    def _best_payload_evaluator(self):
+        runtime_session = getattr(self, "_fit_runtime_session", None)
+        if runtime_session is None:
+            return self._fit_evaluator
+        cached = getattr(self, "_fit_runtime_best_evaluator", None)
+        if cached is not None:
+            return cached
+
+        def cancellation_check() -> bool:
+            return bool(self._cancelled)
+
+        cancellation_check._kindred_nonblocking_cancelled = lambda: bool(self._cancelled)
+        evaluator_factory = getattr(runtime_session, "evaluator", None)
+        if not callable(evaluator_factory):
+            return self._fit_evaluator
+        self._fit_runtime_best_evaluator = evaluator_factory(cancellation_check=cancellation_check)
+        return self._fit_runtime_best_evaluator
 
     def _best_payload_plot_x_and_mask(
         self,
@@ -681,7 +723,7 @@ class GlobalFitWorker(QtCore.QThread):
     ) -> np.ndarray:
         from kindred.core.analysis.parametric_alignment import (
             align_y_on_x_obs,
-            align_y_on_x_obs_time_guided,
+            align_y_on_x_obs_time_guided_penalized,
             is_non_monotone_in_sampled_window_error,
         )
         from kindred.core.exceptions import FitSimulationError
@@ -698,7 +740,7 @@ class GlobalFitWorker(QtCore.QThread):
                 y_name=species_name,
             )
         if x_mode == "time_guided":
-            return align_y_on_x_obs_time_guided(
+            return align_y_on_x_obs_time_guided_penalized(
                 t_obs=t_exp,
                 x_obs=x_obs,
                 t_sim=sim_time,
@@ -707,7 +749,7 @@ class GlobalFitWorker(QtCore.QThread):
                 dataset_label=ds_id,
                 x_name=x_name,
                 y_name=species_name,
-            )
+            ).y_aligned
         try:
             return align_y_on_x_obs(
                 t_obs=t_exp,
@@ -722,7 +764,7 @@ class GlobalFitWorker(QtCore.QThread):
         except FitSimulationError as exc:
             if not is_non_monotone_in_sampled_window_error(exc):
                 raise
-        return align_y_on_x_obs_time_guided(
+        return align_y_on_x_obs_time_guided_penalized(
             t_obs=t_exp,
             x_obs=x_obs,
             t_sim=sim_time,
@@ -731,4 +773,4 @@ class GlobalFitWorker(QtCore.QThread):
             dataset_label=ds_id,
             x_name=x_name,
             y_name=species_name,
-        )
+        ).y_aligned
