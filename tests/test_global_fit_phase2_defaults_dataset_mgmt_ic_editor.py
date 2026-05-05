@@ -1678,7 +1678,7 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
 
     captured_runs: list[dict[str, object]] = []
     monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _fake_warning)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_fake_warning))
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1887,6 +1887,70 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         assert len(captured_runs) == 2
         assert _parameter_table_names(window) == ["k2"]
         assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k2"]
+    finally:
+        window.close()
+
+
+def test_global_fit_refreshes_no_prepared_window_before_readiness_after_mechanism_edit(
+    main_window,
+    monkeypatch,
+    qt_app,
+    qtbot,
+):
+    from PySide6 import QtWidgets
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    _seed_two_datasets(main_window)
+    _seed_simple_mechanism(main_window)
+
+    def _scan_params(dsl: str):
+        text = str(dsl or "")
+        if "reaction: A -> C; k=0.4" in text:
+            return [{"name": "k2", "value": 0.4, "min": 0.01, "max": 1.0}]
+        return [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}]
+
+    monkeypatch.setattr(main_window._dataset_manager, "scan_mechanism_parameters", _scan_params)
+
+    main_window._run_global_fit()
+    window = _latest_fit_window(main_window)
+    try:
+        panel = window.findChild(QtWidgets.QGroupBox, "global_fit_unified_species_group")
+        assert panel is not None
+        apply_btn = panel.findChild(QtWidgets.QPushButton, "global_fit_species_table_apply")
+        assert apply_btn is not None
+
+        _set_fit_targets_pending(panel, dataset_id="ds1", enabled_species={"A"}, qt_app=qt_app)
+        _set_fit_targets_pending(panel, dataset_id="ds2", enabled_species={"A"}, qt_app=qt_app)
+        apply_btn.click()
+        qt_app.processEvents()
+
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            timeout=3000,
+        )
+        assert _parameter_table_names(window) == ["k1"]
+        assert getattr(window, "_simulation_func", None) is None
+
+        mechanism_b = "\n".join(
+            [
+                "reaction: A -> C; k=0.4",
+                "initial: A=1.0",
+                "initial: C=0.0",
+            ]
+        )
+        main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
+        qt_app.processEvents()
+
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            timeout=3000,
+        )
+
+        assert _parameter_table_names(window) == ["k2"]
+        ready_identity = window._fit_runtime_readiness.snapshot().identity
+        assert ready_identity is not None
+        assert set(ready_identity.config["parameters"]) == {"k2"}
+        assert ready_identity.stamp["parameters"]["fit"] == ["k2"]
     finally:
         window.close()
 

@@ -420,6 +420,211 @@ def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
         qt_app.processEvents()
 
 
+def test_fit_runtime_readiness_accepts_infinite_bounds_for_non_de_methods(qt_app):
+    window = _build_window()
+    try:
+        table = window._params_ics_tab._param_table
+        table.item(0, 4).setText("-inf")
+        table.item(0, 5).setText("inf")
+        window._params_ics_tab._method_combo.setCurrentText("trf")
+
+        identity = window._build_current_fit_runtime_identity()
+
+        assert identity is not None
+        assert identity.config["bounds"]["k"] == (float("-inf"), float("inf"))
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_fit_runtime_readiness_still_blocks_de_infinite_bounds(qt_app):
+    window = _build_window()
+    try:
+        table = window._params_ics_tab._param_table
+        table.item(0, 4).setText("-inf")
+        table.item(0, 5).setText("inf")
+        window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
+
+        assert window._build_current_fit_runtime_identity() is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_fit_runtime_readiness_rejects_nonfinite_initial_value(qt_app):
+    window = _build_window()
+    try:
+        table = window._params_ics_tab._param_table
+        table.item(0, 3).setText("inf")
+        table.item(0, 4).setText("-inf")
+        table.item(0, 5).setText("inf")
+        window._params_ics_tab._method_combo.setCurrentText("trf")
+
+        assert window._build_current_fit_runtime_identity() is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_explicit_parameter_collection_rejects_nonfinite_initial_value(qt_app, monkeypatch):
+    window = _build_window()
+    warnings: list[tuple[str, str]] = []
+
+    def _capture_warning(_parent, title, message, *_args, **_kwargs):
+        warnings.append((str(title), str(message)))
+        return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
+    try:
+        table = window._params_ics_tab._param_table
+        table.item(0, 3).setText("inf")
+        table.item(0, 4).setText("-inf")
+        table.item(0, 5).setText("inf")
+
+        assert window._params_ics_tab._collect_parameter_config() is None
+        assert warnings == [("Invalid Parameter", "Parameter 'k' initial value must be finite.")]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_fit_runtime_readiness_still_blocks_de_infinite_dataset_bounds(qt_app):
+    window = _build_dataset_variable_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        table = window._params_ics_tab._param_table
+        table.item(0, 0).setCheckState(QtCore.Qt.Unchecked)
+        dataset_row = 1
+        table.item(dataset_row, 4).setText("-inf")
+        table.item(dataset_row, 5).setText("inf")
+        window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
+
+        assert window._build_current_fit_runtime_identity() is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_fit_runtime_readiness_ignores_de_infinite_dataset_bounds_for_excluded_dataset(qt_app):
+    dataset_entries = [
+        {
+            "id": "ds1",
+            "label": "Dataset 1",
+            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+            "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+            "selected_species": ["A"],
+            "weight": 1.0,
+            "include": True,
+        },
+        {
+            "id": "ds2",
+            "label": "Dataset 2",
+            "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+            "species_data": {"A": np.asarray([1.0, 0.7, 0.4], dtype=float)},
+            "selected_species": ["A"],
+            "weight": 1.0,
+            "include": False,
+        },
+    ]
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_variable_params={
+            "ds1": {
+                "init:A": {"initial": 1.0, "min": 0.1, "max": 10.0, "log10": False},
+            },
+            "ds2": {
+                "init:A": {"initial": 1.0, "min": float("-inf"), "max": float("inf"), "log10": False},
+            },
+        },
+        dataset_entries=dataset_entries,
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"},
+            {"id": "ds2", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.7, 0.4]), "species": "A"},
+        ],
+        mechanism_species=["A"],
+        mechanism_text_getter=_basic_mechanism_text,
+        simulation_func=_basic_serial_fitting_evaluator(),
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._species_table._fit_targets_selection_applied["ds2"] = ["A"]
+        table = window._params_ics_tab._param_table
+        table.item(0, 0).setCheckState(QtCore.Qt.Unchecked)
+        window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
+
+        identity = window._build_current_fit_runtime_identity()
+
+        assert identity is not None
+        assert [override.dataset_id for override in identity.dataset_overrides] == ["ds1"]
+        assert "ds2" not in identity.stamp["dataset_variable_params"]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_passive_mechanism_refresh_does_not_reenter_identity_build(qt_app, monkeypatch):
+    refreshed_mechanism = "\n".join(
+        [
+            "reaction: A -> C; k=0.4",
+            "initial: A=1.0",
+            "initial: C=0.0",
+        ]
+    )
+
+    class _DatasetManagerStub:
+        @staticmethod
+        def scan_mechanism_parameters(mechanism_text: str) -> list[dict[str, object]]:
+            if "A -> C" in str(mechanism_text):
+                return [{"name": "k2", "value": 0.4, "min": 0.0, "max": 1.0}]
+            return [{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}]
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        dataset_manager=_DatasetManagerStub(),
+        simulation_func=_basic_serial_fitting_evaluator(),
+        simulation_builder=lambda *_args, **_kwargs: _basic_serial_fitting_evaluator(),
+        mechanism_text_getter=lambda: refreshed_mechanism,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        rebuild_calls = 0
+        original_rebuild = window._params_ics_tab.rebuild_for_mechanism
+
+        def _rebuild_for_mechanism(*args, **kwargs):
+            nonlocal rebuild_calls
+            rebuild_calls += 1
+            if rebuild_calls > 1:
+                raise AssertionError("mechanism refresh re-entered")
+            result = original_rebuild(*args, **kwargs)
+            window._refresh_run_button_enabled_state()
+            return result
+
+        monkeypatch.setattr(window._params_ics_tab, "rebuild_for_mechanism", _rebuild_for_mechanism)
+
+        assert window._build_current_fit_runtime_identity() is not None
+        assert rebuild_calls == 1
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
 def test_passive_fit_runtime_preparation_builds_evaluator_off_gui_thread(
     qt_app,
     qtbot,
@@ -1986,7 +2191,7 @@ def test_start_fit_reports_invalid_dataset_payload_on_launch(qt_app, monkeypatch
             return int(QtWidgets.QMessageBox.StandardButton.Ok)
 
         monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
-        monkeypatch.setattr(window, "_refresh_fit_window_state_for_current_mechanism", lambda: True)
+        monkeypatch.setattr(window, "_refresh_fit_window_state_for_current_mechanism", lambda **_kwargs: True)
         window._global_payload_results["ds1"] = FitDatasetPayloadResult.invalid("payload exploded")
 
         window._start_fit()
@@ -4221,7 +4426,7 @@ def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_pa
     try:
         window.show()
         qt_app.processEvents()
-        assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k1"]
+        assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k2"]
 
         monkeypatch.setattr(
             QtWidgets.QMessageBox,
@@ -4236,6 +4441,7 @@ def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_pa
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
+        assert set(config["parameters"]) == {"k2"}
 
         window._params_ics_tab._integration_solver_combo.setCurrentText("BDF")
         window._params_ics_tab._integration_rtol_edit.setText("1e-6")

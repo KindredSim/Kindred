@@ -335,7 +335,11 @@ class GlobalFitWorker(QtCore.QThread):
         if not callable(is_ready):
             return False
         try:
-            return bool(is_ready(lane_count=max(1, int(self._fit_runtime_max_lanes))))
+            if self._fit_runtime_max_lanes is None:
+                lane_count = None
+            else:
+                lane_count = max(1, int(self._fit_runtime_max_lanes))
+            return bool(is_ready(lane_count=lane_count))
         except Exception:
             return False
 

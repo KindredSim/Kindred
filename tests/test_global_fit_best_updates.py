@@ -329,6 +329,75 @@ def test_global_fit_worker_rejects_exact_serial_evaluator_with_unready_runtime_s
     assert called == []
 
 
+def test_global_fit_worker_accepts_ready_runtime_session_with_default_lane_count(qt_app):
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.ready_lane_counts: list[object] = []
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            self.ready_lane_counts.append(lane_count)
+            return lane_count is None
+
+    context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k"],
+        t_end=1.0,
+        num_points=2,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="initial:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    runtime_session = _ReadySession()
+    captured: dict[str, object] = {}
+
+    def fake_fit_global(*_args, **kwargs):
+        captured["runtime_session"] = kwargs.get("runtime_session")
+        captured["max_runtime_lanes"] = kwargs.get("max_runtime_lanes")
+        return GlobalFitResult(
+            shared_params={"k": 1.0},
+            dataset_params={"ds": {}},
+            uncertainties=None,
+            global_chi_squared=0.0,
+            global_r_squared=1.0,
+            dataset_info=[],
+            nfev=1,
+            message="ok",
+            completion=GlobalFitCompletion(
+                status="ok",
+                optimizer_converged=True,
+                nonfinite_metrics=False,
+            ),
+            covariance=None,
+            objective_residuals=np.zeros(1, dtype=float),
+            model_series={"ds": {}},
+            residual_series={"ds": {}},
+        )
+
+    worker = GlobalFitWorker(
+        [{"id": "ds", "t": np.asarray([0.0]), "y": np.asarray([0.0]), "species": "A"}],
+        {"k": 1.0},
+        fit_evaluator=evaluator,
+        fit_runtime_session=runtime_session,
+        fit_func=fake_fit_global,
+    )
+
+    payload = worker._execute()
+
+    assert payload is not None
+    assert runtime_session.ready_lane_counts == [None]
+    assert captured == {"runtime_session": runtime_session, "max_runtime_lanes": None}
+
+
 def test_global_fit_worker_cancel_notifies_runtime_session(qt_app):
     events: list[str] = []
 

@@ -1384,6 +1384,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     f"Parameter '{self._param_table.item(row, 2).text()}' contains non-numeric values.",
                 )
                 return None
+            if not np.isfinite(value):
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Invalid Parameter",
+                    f"Parameter '{self._param_table.item(row, 2).text()}' initial value must be finite.",
+                )
+                return None
             if not (min_val < max_val):
                 QtWidgets.QMessageBox.warning(
                     self.window(),

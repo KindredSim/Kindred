@@ -195,7 +195,11 @@ class _FitRuntimePreparationNotifier(QtCore.QObject):
 # VALIDATION FUNCTIONS
 # ============================================================================
 
-def validate_de_bounds(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def validate_de_bounds(
+    config: Dict[str, Any],
+    *,
+    dataset_variable_params: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None,
+) -> Tuple[bool, List[str]]:
     """
     Validate that differential_evolution has proper bounds for all parameters.
 
@@ -247,6 +251,29 @@ def validate_de_bounds(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 f"Parameter '{param_name}' has invalid bounds: "
                 f"min ({min_val:.6g}) >= max ({max_val:.6g})"
             )
+
+    for dataset_id, spec_map in (dataset_variable_params or {}).items():
+        if not isinstance(spec_map, Mapping):
+            continue
+        for param_name, spec in spec_map.items():
+            if not isinstance(spec, Mapping):
+                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has invalid bound format")
+                continue
+            try:
+                min_val = float(spec.get("min"))
+                max_val = float(spec.get("max"))
+            except (TypeError, ValueError):
+                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-numeric bounds")
+                continue
+            if not np.isfinite(min_val):
+                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-finite minimum bound: {min_val}")
+            if not np.isfinite(max_val):
+                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-finite maximum bound: {max_val}")
+            if np.isfinite(min_val) and np.isfinite(max_val) and min_val >= max_val:
+                errors.append(
+                    f"Dataset '{dataset_id}' parameter '{param_name}' has invalid bounds: "
+                    f"min ({min_val:.6g}) >= max ({max_val:.6g})"
+                )
 
     is_valid = len(errors) == 0
     return is_valid, errors
@@ -416,6 +443,9 @@ class FittingWindow(QtWidgets.QDialog):
         self._build_ui()
         # _apply_config_defaults and _populate_parameter_table are handled
         # internally by ParametersIcsTab during construction
+        self._mark_fit_window_state_mechanism_current(
+            self._safe_text_from_getter(self._mechanism_text_getter)
+        )
         self._init_sampling_state()
         self._populate_dataset_table()
         self._species_table.on_tab_activated(
@@ -510,6 +540,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._fit_runtime_prepare_refresh_pending = False
         self._close_after_fit_runtime_prepare = False
+        self._fit_window_state_refreshing = False
         self._fit_runtime_prepare_notifier.completed.connect(
             self._poll_fit_runtime_preparation,
             QtCore.Qt.ConnectionType.QueuedConnection,
@@ -1224,15 +1255,16 @@ class FittingWindow(QtWidgets.QDialog):
         integration_settings: Optional[tuple[str, float, float]] = None,
         show_dataset_messages: bool = False,
     ) -> Optional[FittingRuntimeIdentity]:
+        if getattr(self, "_fit_window_state_refreshing", False):
+            return None
+        if not self._refresh_fit_window_state_for_current_mechanism(show_errors=show_dataset_messages):
+            return None
         config_bundle = self._collect_parameter_config_snapshot_for_readiness()
         if config_bundle is None:
             return
         config, global_dataset_params, global_dataset_variable_params = config_bundle
         dataset_selection = self._collect_dataset_selection()
         if not dataset_selection.get("ids"):
-            return
-        ok, _errors = validate_de_bounds(config)
-        if not ok:
             return
         collect_integration_settings = getattr(
             self._params_ics_tab,
@@ -1282,6 +1314,12 @@ class FittingWindow(QtWidgets.QDialog):
             staged_params,
             global_dataset_variable_params=global_dataset_variable_params,
         )
+        ok, _errors = validate_de_bounds(
+            config,
+            dataset_variable_params=variable_params,
+        )
+        if not ok:
+            return
         dataset_overrides = coerce_fit_dataset_parameter_overrides(
             dataset_ids=list(dataset_selection.get("ids") or []),
             dataset_params=dataset_params_for_run,
@@ -1532,7 +1570,7 @@ class FittingWindow(QtWidgets.QDialog):
                 max_val = float(max_item.text())
             except (AttributeError, TypeError, ValueError, OverflowError):
                 return None
-            if not np.isfinite(value) or not np.isfinite(min_val) or not np.isfinite(max_val):
+            if not np.isfinite(value):
                 return None
             if not (min_val < max_val):
                 return None
@@ -2143,39 +2181,66 @@ class FittingWindow(QtWidgets.QDialog):
         self._best_effort_failures.clear()
         self._teardown_disable_failures.clear()
 
-    def _refresh_fit_window_state_for_current_mechanism(self) -> bool:
+    def _mark_fit_window_state_mechanism_current(self, mechanism_text: str) -> None:
+        text = str(mechanism_text or "")
+        self._fit_window_state_mechanism_text_sha256 = self._mechanism_text_sha256(text)
+        self._fit_window_state_mechanism_text_len = len(text)
+
+    def _fit_window_state_matches_mechanism(self, mechanism_text: str) -> bool:
+        expected_hash = str(getattr(self, "_fit_window_state_mechanism_text_sha256", "") or "")
+        if not expected_hash:
+            return False
+        try:
+            expected_len = int(getattr(self, "_fit_window_state_mechanism_text_len"))
+        except Exception:
+            return False
+        text = str(mechanism_text or "")
+        return expected_hash == self._mechanism_text_sha256(text) and expected_len == len(text)
+
+    def _refresh_fit_window_state_for_current_mechanism(self, *, show_errors: bool = True) -> bool:
         mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
         simulation_func = getattr(self, "_simulation_func", None)
         prepared_simulation = self._prepared_simulation_meta(simulation_func)
-        if simulation_func is None and prepared_simulation is None:
-            return True
         mechanism_matches = self._prepared_simulation_matches_mechanism(prepared_simulation, mechanism_text)
+        table_matches = self._fit_window_state_matches_mechanism(mechanism_text)
         if not callable(getattr(self, "_simulation_builder", None)):
             return True
         if not callable(getattr(self, "_mechanism_text_getter", None)):
             return True
-        if mechanism_matches:
+        if (prepared_simulation is None or mechanism_matches) and table_matches:
             return True
+        if getattr(self, "_fit_window_state_refreshing", False):
+            return False
         from kindred.gui.controllers.dataset_manager import DatasetManagerError
 
+        self._fit_window_state_refreshing = True
         try:
             self._params_ics_tab.rebuild_for_mechanism(mechanism_text, list(self._dataset_entries))
             self._species_table.set_mechanism_species(list(self._params_ics_tab.get_mechanism_species()))
             self._species_table.refresh_dataset_entries(list(self._dataset_entries))
             self._capture_failed_fit_restore_baseline()
+            self._mark_fit_window_state_mechanism_current(mechanism_text)
         except DatasetManagerError as exc:
-            self._clear_failed_run_visual_state()
-            QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
+            if show_errors:
+                self._clear_failed_run_visual_state()
+                QtWidgets.QMessageBox.warning(self, "Global Fit", str(exc))
+            elif hasattr(self, "_status_label"):
+                self._status_label.setText(f"Fitting runtime not ready: {exc}")
             return False
         except Exception as exc:
             logger.exception("Failed to refresh fit-window state before running fit.")
-            self._clear_failed_run_visual_state()
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Simulation Error",
-                f"Failed to refresh fit-window state:\n{exc}",
-            )
+            if show_errors:
+                self._clear_failed_run_visual_state()
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Simulation Error",
+                    f"Failed to refresh fit-window state:\n{exc}",
+                )
+            elif hasattr(self, "_status_label"):
+                self._status_label.setText(f"Fitting runtime not ready: {exc}")
             return False
+        finally:
+            self._fit_window_state_refreshing = False
         return True
 
     def _start_fit(self) -> None:
@@ -2203,7 +2268,15 @@ class FittingWindow(QtWidgets.QDialog):
                 + ".",
             )
             return
-        ok, errors = validate_de_bounds(config)
+        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
+        shared_param_keys = self._shared_param_keys_for_run(config)
+        variable_params = self._variable_params_for_run(
+            list(dataset_selection.get("ids") or []),
+            shared_param_keys,
+            staged_params,
+            global_dataset_variable_params=self._params_ics_tab.get_global_dataset_variable_params(),
+        )
+        ok, errors = validate_de_bounds(config, dataset_variable_params=variable_params)
         if not ok:
             QtWidgets.QMessageBox.warning(self, "Invalid Bounds", "\n".join(errors))
             return
@@ -2216,7 +2289,15 @@ class FittingWindow(QtWidgets.QDialog):
         config = self._params_ics_tab._collect_parameter_config()
         if not config:
             return
-        ok, errors = validate_de_bounds(config)
+        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
+        shared_param_keys = self._shared_param_keys_for_run(config)
+        variable_params = self._variable_params_for_run(
+            list(dataset_selection.get("ids") or []),
+            shared_param_keys,
+            staged_params,
+            global_dataset_variable_params=self._params_ics_tab.get_global_dataset_variable_params(),
+        )
+        ok, errors = validate_de_bounds(config, dataset_variable_params=variable_params)
         if not ok:
             QtWidgets.QMessageBox.warning(self, "Invalid Bounds", "\n".join(errors))
             return
