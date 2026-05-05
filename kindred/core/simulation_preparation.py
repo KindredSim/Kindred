@@ -11,7 +11,7 @@ import hashlib
 import logging
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, TypedDict
 
 import numpy as np
@@ -26,6 +26,13 @@ from kindred.core.mechanism_metadata import (
 )
 from kindred.core.simulation_series_payload import SimulationSeriesPayload
 from kindred.core.temperature import TemperatureScheduleProtocol, coerce_temperature_schedule
+from kindred.core.intervention_schedule import (
+    InterventionSchedule,
+    InterventionScheduleError,
+    coerce_intervention_schedule,
+    intervention_schedule_fingerprint_from_dsl_text,
+    parse_intervention_schedule_from_dsl,
+)
 from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
@@ -81,6 +88,7 @@ class BoundMechanism:
     ) -> "SimulationWorkerPreparedPayloadV1 | SimulationExecutionPreparedPayloadV2":
         """Return a structured execution payload for worker or batch execution."""
         metadata = metadata_view_for_mechanism(self.mechanism)
+        intervention_schedule = getattr(metadata, "intervention_schedule", None)
         payload: dict[str, Any] = {
             "version": 2,
             "mechanism": self.mechanism,
@@ -88,6 +96,11 @@ class BoundMechanism:
             "species_names": list(self.species_names),
             "mechanism_text": self.mechanism_text,
             "temperature_schedule": metadata.temperature_schedule,
+            "intervention_schedule": (
+                intervention_schedule.to_payload()
+                if intervention_schedule is not None
+                else None
+            ),
             "jacobian_func": None,
         }
         if include_rhs:
@@ -136,6 +149,7 @@ class PreparedSimulationRun:
     solver_input: str
     solver_warning: Optional[str]
     temperature_schedule: TemperatureScheduleProtocol | None
+    intervention_schedule: InterventionSchedule | None
     jacobian_func: Any
     initials_for_algebra: Optional[Dict[str, float]]
     warnings: List[str]
@@ -161,6 +175,7 @@ class PreparedSimulationMetadata:
     use_sparse_jacobian: bool
     wegscheider_cyclicity_enabled: bool
     initial_prefix: str
+    intervention_schedule_fingerprint: str = ""
 
     def to_serializable_dict(self) -> Dict[str, Any]:
         return {
@@ -181,6 +196,7 @@ class PreparedSimulationMetadata:
                 self.wegscheider_cyclicity_enabled
             ),
             "initial_prefix": str(self.initial_prefix),
+            "intervention_schedule_fingerprint": str(self.intervention_schedule_fingerprint or ""),
         }
 
     @classmethod
@@ -223,6 +239,7 @@ class PreparedSimulationMetadata:
                 )
             ),
             initial_prefix=str(meta.get("initial_prefix") or ""),
+            intervention_schedule_fingerprint=str(meta.get("intervention_schedule_fingerprint") or ""),
         )
 
 
@@ -241,7 +258,10 @@ class PreparedFittingObjectiveContext:
     temperature_K: float
 
 
-@dataclass(frozen=True)
+_INTERVENTION_SCHEDULE_UNSET = object()
+
+
+@dataclass(frozen=True, init=False)
 class SimulationExecutionRequest:
     """Structured execution handoff for worker and batch simulation paths."""
 
@@ -252,7 +272,52 @@ class SimulationExecutionRequest:
     mechanism_text: str = ""
     simulation_identity: Optional[Dict[str, Any]] = None
     parameter_overrides: Optional[Dict[str, float]] = None
+    intervention_schedule: InterventionSchedule | Mapping[str, Any] | None = None
     version: int = 1
+    _intervention_schedule_authority: bool = field(default=False, repr=False, compare=False)
+    _derive_intervention_schedule_on_payload: bool = field(default=True, repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        prepared_payload: Optional[Mapping[str, Any]],
+        initials: Mapping[str, Any],
+        t_span: Tuple[float, float],
+        solver_config: Mapping[str, Any],
+        mechanism_text: str = "",
+        simulation_identity: Optional[Mapping[str, Any]] = None,
+        parameter_overrides: Optional[Mapping[str, Any]] = None,
+        intervention_schedule: InterventionSchedule | Mapping[str, Any] | None | object = _INTERVENTION_SCHEDULE_UNSET,
+        version: int = 1,
+        _derive_intervention_schedule_on_payload: bool = True,
+    ) -> None:
+        schedule_authority = intervention_schedule is not _INTERVENTION_SCHEDULE_UNSET
+        stored_schedule = None if intervention_schedule is _INTERVENTION_SCHEDULE_UNSET else intervention_schedule
+        object.__setattr__(self, "prepared_payload", dict(prepared_payload) if isinstance(prepared_payload, Mapping) else None)
+        object.__setattr__(self, "initials", {str(name): float(value) for name, value in dict(initials or {}).items()})
+        object.__setattr__(self, "t_span", (float(t_span[0]), float(t_span[1])))
+        object.__setattr__(self, "solver_config", dict(solver_config or {}))
+        object.__setattr__(self, "mechanism_text", str(mechanism_text or ""))
+        object.__setattr__(self, "simulation_identity", dict(simulation_identity or {}) if simulation_identity else None)
+        object.__setattr__(
+            self,
+            "parameter_overrides",
+            {str(name): float(value) for name, value in dict(parameter_overrides or {}).items()}
+            if isinstance(parameter_overrides, Mapping)
+            else None,
+        )
+        object.__setattr__(self, "intervention_schedule", stored_schedule)
+        object.__setattr__(self, "version", int(version or 1))
+        object.__setattr__(self, "_intervention_schedule_authority", bool(schedule_authority))
+        object.__setattr__(
+            self,
+            "_derive_intervention_schedule_on_payload",
+            bool(_derive_intervention_schedule_on_payload),
+        )
+
+    @property
+    def has_intervention_schedule_authority(self) -> bool:
+        return bool(self._intervention_schedule_authority)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "SimulationExecutionRequest":
@@ -264,7 +329,15 @@ class SimulationExecutionRequest:
         prepared_payload = payload.get("prepared_payload")
         if prepared_payload is not None and not isinstance(prepared_payload, Mapping):
             raise SimulationPreparationError("execution_request", "Execution request prepared_payload must be a mapping.")
-        return cls(
+        intervention_schedule_present = "intervention_schedule" in payload
+        intervention_schedule = None
+        if intervention_schedule_present and payload.get("intervention_schedule") is not None:
+            try:
+                coerced_schedule = coerce_intervention_schedule(payload.get("intervention_schedule"))
+            except InterventionScheduleError as exc:
+                raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
+            intervention_schedule = payload.get("intervention_schedule") if coerced_schedule is None else coerced_schedule
+        kwargs: Dict[str, Any] = dict(
             version=int(payload.get("version") or 1),
             prepared_payload=dict(prepared_payload) if isinstance(prepared_payload, Mapping) else None,
             initials={str(name): float(value) for name, value in dict(payload.get("initials") or {}).items()},
@@ -284,7 +357,11 @@ class SimulationExecutionRequest:
                 if isinstance(payload.get("parameter_overrides"), Mapping)
                 else None
             ),
+            _derive_intervention_schedule_on_payload=False,
         )
+        if intervention_schedule_present:
+            kwargs["intervention_schedule"] = intervention_schedule
+        return cls(**kwargs)
 
     def to_payload(self) -> Dict[str, Any]:
         prepared_payload: Optional[Dict[str, Any]] = None
@@ -306,6 +383,19 @@ class SimulationExecutionRequest:
                 str(name): float(value)
                 for name, value in dict(self.parameter_overrides or {}).items()
             }
+        if self.has_intervention_schedule_authority:
+            if self.intervention_schedule is None:
+                payload["intervention_schedule"] = None
+                return payload
+            try:
+                schedule = coerce_intervention_schedule(self.intervention_schedule)
+            except InterventionScheduleError as exc:
+                raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
+            payload["intervention_schedule"] = schedule.to_payload() if schedule is not None else {}
+        elif self._derive_intervention_schedule_on_payload:
+            schedule = _execution_request_intervention_schedule(self)
+            if schedule is not None:
+                payload["intervention_schedule"] = schedule.to_payload()
         return payload
 
 
@@ -317,6 +407,7 @@ class SimulationWorkerPreparedPayloadV1(TypedDict):
     species_names: List[str]
     mechanism_text: str
     temperature_schedule: TemperatureScheduleProtocol | None
+    intervention_schedule: Mapping[str, Any] | None
     jacobian_func: Any
 
 
@@ -327,6 +418,7 @@ class SimulationExecutionPreparedPayloadV2(TypedDict):
     species_names: List[str]
     mechanism_text: str
     temperature_schedule: TemperatureScheduleProtocol | None
+    intervention_schedule: Mapping[str, Any] | None
     jacobian_func: Any
 
 
@@ -343,6 +435,23 @@ def coerce_simulation_execution_request(
     if isinstance(value, Mapping):
         return SimulationExecutionRequest.from_mapping(value)
     raise SimulationPreparationError("execution_request", "Execution request must be a mapping.")
+
+
+def _execution_request_intervention_schedule(
+    request_payload: SimulationExecutionRequest,
+) -> InterventionSchedule | None:
+    try:
+        if request_payload.has_intervention_schedule_authority:
+            if request_payload.intervention_schedule is None:
+                return None
+            schedule = coerce_intervention_schedule(request_payload.intervention_schedule)
+            return schedule
+        mechanism_text = str(request_payload.mechanism_text or "")
+        if not mechanism_text.strip():
+            return None
+        return parse_intervention_schedule_from_dsl(mechanism_text)
+    except InterventionScheduleError as exc:
+        raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
 
 
 def coerce_prepared_simulation_metadata(
@@ -477,7 +586,7 @@ def _fit_simulation_error_from_preparation_error(
 
 def _validated_prepared_worker_payload(
     prepared_payload: Mapping[str, Any],
-) -> tuple[Any, Callable[..., np.ndarray] | None, list[str], np.ndarray, object, Any]:
+) -> tuple[Any, Callable[..., np.ndarray] | None, list[str], np.ndarray, object, InterventionSchedule | None, Any]:
     try:
         version = int(prepared_payload.get("version", 1))
     except Exception as exc:
@@ -544,6 +653,16 @@ def _validated_prepared_worker_payload(
             raise _prepared_payload_failure(
                 f"Invalid prepared payload temperature_schedule: {exc}"
             ) from exc
+    intervention_schedule_override = None
+    if "intervention_schedule" in prepared_payload:
+        try:
+            intervention_schedule_override = coerce_intervention_schedule(
+                prepared_payload.get("intervention_schedule")
+            )
+        except Exception as exc:
+            raise _prepared_payload_failure(
+                f"Invalid prepared payload intervention_schedule: {exc}"
+            ) from exc
     jacobian_func_override = prepared_payload.get("jacobian_func")
     return (
         mechanism,
@@ -551,6 +670,7 @@ def _validated_prepared_worker_payload(
         species_names,
         y0,
         temperature_schedule_override,
+        intervention_schedule_override,
         jacobian_func_override,
     )
 
@@ -760,7 +880,18 @@ def prepared_simulation_run_for_execution_request(
     rhs = prepared.request.rhs
     jacobian_func = prepared.request.jacobian_func
     temperature_schedule = prepared.request.temperature_schedule
+    if request_payload.has_intervention_schedule_authority:
+        intervention_schedule = _execution_request_intervention_schedule(request_payload)
+    else:
+        intervention_schedule = prepared.request.intervention_schedule
+        if intervention_schedule is None:
+            intervention_schedule = _execution_request_intervention_schedule(request_payload)
     warnings = list(getattr(prepared, "warnings", None) or [])
+    if intervention_schedule is not None:
+        try:
+            intervention_schedule.validate_species(prepared.species_names)
+        except InterventionScheduleError as exc:
+            raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
     if rebuild_rhs:
         try:
             from kindred.core.ode_builder import build_ode_rhs_from_mechanism
@@ -812,6 +943,8 @@ def prepared_simulation_run_for_execution_request(
         y0=np.asarray(y0, dtype=float).reshape(-1),
         jacobian_func=jacobian_func,
         temperature_schedule=temperature_schedule,
+        intervention_schedule=intervention_schedule,
+        species_names=tuple(prepared.species_names),
     )
     initials_for_algebra = {
         str(sp): float(y0[idx])
@@ -822,6 +955,7 @@ def prepared_simulation_run_for_execution_request(
         y0=np.asarray(y0, dtype=float).reshape(-1),
         initials_for_algebra=initials_for_algebra,
         warnings=warnings,
+        intervention_schedule=intervention_schedule,
         request=request,
     )
 
@@ -938,6 +1072,7 @@ def prepare_simulation_worker_run(
     species_names: List[str]
     y0: np.ndarray
     temperature_schedule_override: object = _MISSING
+    intervention_schedule_override: InterventionSchedule | None = None
     jacobian_func_override = None
 
     if prepared_payload is not None:
@@ -948,6 +1083,7 @@ def prepare_simulation_worker_run(
                 species_names,
                 y0,
                 temperature_schedule_override,
+                intervention_schedule_override,
                 jacobian_func_override,
             ) = _validated_prepared_worker_payload(prepared_payload)
 
@@ -1032,6 +1168,24 @@ def prepare_simulation_worker_run(
         except Exception as exc:
             raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
 
+    intervention_schedule = None
+    try:
+        if request_payload is not None and request_payload.has_intervention_schedule_authority:
+            intervention_schedule = _execution_request_intervention_schedule(request_payload)
+        elif intervention_schedule_override is not None:
+            intervention_schedule = intervention_schedule_override
+        elif request_payload is not None:
+            intervention_schedule = _execution_request_intervention_schedule(request_payload)
+        else:
+            meta_schedule = (getattr(mechanism, "metadata", {}) or {}).get(
+                MechanismMetadataKeys.INTERVENTION_SCHEDULE
+            )
+            intervention_schedule = coerce_intervention_schedule(meta_schedule)
+        if intervention_schedule is not None:
+            intervention_schedule.validate_species(species_names)
+    except InterventionScheduleError as exc:
+        raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
+
     if rhs is None:
         try:
             from kindred.core.ode_builder import build_ode_rhs_from_mechanism
@@ -1069,6 +1223,8 @@ def prepare_simulation_worker_run(
         jacobian_func=jacobian_func,
         events=list(events) if events is not None else None,
         temperature_schedule=temperature_schedule,
+        intervention_schedule=intervention_schedule,
+        species_names=tuple(species_names),
         progress_callback=progress_callback,
     )
 
@@ -1080,6 +1236,7 @@ def prepare_simulation_worker_run(
         solver_input=str(prepared_solver_config.solver_input),
         solver_warning=str(prepared_solver_config.solver_warning) if prepared_solver_config.solver_warning else None,
         temperature_schedule=temperature_schedule,
+        intervention_schedule=intervention_schedule,
         jacobian_func=jacobian_func,
         initials_for_algebra=initials_for_algebra,
         warnings=list(prepared_context.warnings),
@@ -1622,6 +1779,14 @@ def prepare_fitting_objective_context(
         raise _fit_simulation_error_from_preparation_error(
             _prepare_preparation_failure("temperature_schedule", exc)
         ) from exc
+    try:
+        intervention_schedule = _metadata_view_for_mechanism(bound.mechanism).intervention_schedule
+        if intervention_schedule is not None:
+            intervention_schedule.validate_species(bound.species_names)
+    except Exception as exc:
+        raise _fit_simulation_error_from_preparation_error(
+            _prepare_preparation_failure("intervention_schedule", exc)
+        ) from exc
     compiled_algebra = None
     algebra_observables: set[str] = set()
     algebra_text = prepared_run_context.algebra_text
@@ -1660,6 +1825,8 @@ def prepare_fitting_objective_context(
         atol=float(prepared_solver_config.atol),
         t_eval=np.asarray(t_exp, dtype=float).reshape(-1),
         temperature_schedule=prepared_run_context.temperature_schedule,
+        intervention_schedule=intervention_schedule,
+        species_names=tuple(bound.species_names),
     )
     initials_for_algebra = {
         name: float(bound.y0[idx]) for idx, name in enumerate(bound.species_names)
@@ -1718,6 +1885,16 @@ def build_prepared_simulation_func(
     if prepared_solver_config.solver_warning:
         logger.warning(prepared_solver_config.solver_warning)
 
+    try:
+        intervention_schedule_fingerprint = intervention_schedule_fingerprint_from_dsl_text(
+            str(mechanism_text or "")
+        )
+    except InterventionScheduleError as exc:
+        raise FitSimulationError(
+            f"Intervention schedule failed during fitting simulation preparation: {exc}",
+            details={"fatal": True},
+        ) from exc
+
     prepared_meta = PreparedSimulationMetadata(
         version=1,
         mechanism_text_sha256=hashlib.sha256((mechanism_text or "").encode("utf-8")).hexdigest(),
@@ -1738,17 +1915,19 @@ def build_prepared_simulation_func(
         use_sparse_jacobian=bool(prepared_solver_config.use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         initial_prefix=str(initial_prefix),
+        intervention_schedule_fingerprint=str(intervention_schedule_fingerprint),
     )
 
     bound: Optional[BoundMechanism] = None
     species_index: Dict[str, int] = {}
     temperature_schedule: Optional[TemperatureScheduleProtocol] = None
+    intervention_schedule: Optional[InterventionSchedule] = None
     jacobian_func = None
     last_shared_fp: Optional[Tuple[Tuple[str, float], ...]] = None
     compiled_algebra: Optional[CompiledAlgebraSeries] = None
 
     def _ensure_prepared() -> None:
-        nonlocal bound, species_index, temperature_schedule, jacobian_func, compiled_algebra
+        nonlocal bound, species_index, temperature_schedule, intervention_schedule, jacobian_func, compiled_algebra
         if bound is not None:
             return
         bound = prepare_bound_mechanism(
@@ -1767,6 +1946,15 @@ def build_prepared_simulation_func(
         )
         temperature_schedule = prepared_context.temperature_schedule
         jacobian_func = prepared_context.jacobian_func
+        try:
+            intervention_schedule = _metadata_view_for_mechanism(bound.mechanism).intervention_schedule
+            if intervention_schedule is not None:
+                intervention_schedule.validate_species(bound.species_names)
+        except Exception as exc:
+            raise FitSimulationError(
+                f"Intervention schedule failed during fitting simulation preparation: {exc}",
+                details={"fatal": True},
+            ) from exc
         algebra_text = prepared_context.algebra_text
         if algebra_text:
             try:
@@ -1847,6 +2035,8 @@ def build_prepared_simulation_func(
             grid={"N": grid_n},
             jacobian_func=jacobian_func,
             temperature_schedule=temperature_schedule,
+            intervention_schedule=intervention_schedule,
+            species_names=tuple(bound.species_names),
         )
         result = _solve_request(request)
         species_payload = {name: result.Y[idx, :].copy() for idx, name in enumerate(bound.species_names)}

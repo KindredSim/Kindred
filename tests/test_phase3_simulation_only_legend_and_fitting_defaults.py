@@ -9,21 +9,13 @@ pytestmark = [pytest.mark.gui]
 
 def _make_parameters_tab(*, integration_defaults=("BDF", 1e-6, 1e-12)):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
-    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     entries = [{"id": "ds1", "label": "DS 1"}]
     species = ["A", "B"]
-    species_table = UnifiedSpeciesTable(
-        dataset_entries=list(entries),
-        mechanism_species=list(species),
-        dataset_entries_getter=lambda: list(entries),
-        included_dataset_ids_getter=lambda: [str(e["id"]) for e in entries],
-        dataset_label_getter=lambda ds_id: str(ds_id),
-        dataset_weight_getter=lambda _ds_id: 1.0,
-        persist_dataset_weight_callback=lambda _ds_id, _weight: None,
-        dataset_manager_getter=lambda: None,
-        worker_running_getter=lambda: False,
-    )
+
+    def initial_parameter_defaults_getter(_dataset_id, _species):
+        return False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
+
     tab = ParametersIcsTab(
         parameter_state=[],
         initial_parameter_snapshot=[],
@@ -41,9 +33,9 @@ def _make_parameters_tab(*, integration_defaults=("BDF", 1e-6, 1e-12)):
         reactions_text_getter=lambda: "",
         integration_defaults=integration_defaults,
         config_defaults={},
-        ic_panel=species_table,
+        initial_parameter_defaults_getter=initial_parameter_defaults_getter,
     )
-    return tab, species_table
+    return tab
 
 
 def test_grid_plot_view_legend_only_names_model_curves(qtbot):
@@ -92,7 +84,7 @@ def test_grid_plot_view_legend_only_names_model_curves(qtbot):
 
 
 def test_parameters_integration_controls_are_visible_without_expanding_section(qtbot):
-    tab, species_table = _make_parameters_tab()
+    tab = _make_parameters_tab()
     qtbot.addWidget(tab)
     tab.resize(900, 700)
     tab.show()
@@ -110,7 +102,6 @@ def test_parameters_integration_controls_are_visible_without_expanding_section(q
         assert rtol_edit.isVisible()
         assert atol_edit.isVisible()
     finally:
-        species_table.close()
         tab.close()
         QtWidgets.QApplication.processEvents()
 
@@ -120,7 +111,7 @@ def test_fitting_default_solver_constant_and_parameters_tab_default(qtbot):
 
     assert FITTING_DEFAULT_SOLVER == "BDF"
 
-    tab, species_table = _make_parameters_tab(
+    tab = _make_parameters_tab(
         integration_defaults=(FITTING_DEFAULT_SOLVER, 1e-6, 1e-12)
     )
     qtbot.addWidget(tab)
@@ -132,7 +123,6 @@ def test_fitting_default_solver_constant_and_parameters_tab_default(qtbot):
         collected = tab.collect_integration_settings()
         assert collected == (FITTING_DEFAULT_SOLVER, 1e-6, 1e-12)
     finally:
-        species_table.close()
         tab.close()
         QtWidgets.QApplication.processEvents()
 

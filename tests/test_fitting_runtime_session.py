@@ -274,6 +274,134 @@ def test_runtime_session_candidate_ledger_is_deterministic_for_concurrent_lanes(
     assert ledger.snapshot()["candidate_evaluations"] == 40
 
 
+def test_runtime_session_reuses_scheduler_across_multi_lane_batches_and_closes_it() -> None:
+    from kindred.core.fitting_runtime_session import (
+        FittingRuntimeLedger,
+        FittingRuntimeRequest,
+        FittingRuntimeSession,
+    )
+
+    events: list[str] = []
+
+    class _SuccessLane:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def warm(self, *, cancellation_check=None) -> None:
+            return None
+
+        def evaluate_series_with_parameter_origins(self, params, *_args, **_kwargs):
+            t = np.asarray([0.0], dtype=float)
+            return {"t": t, "species": {"A": np.asarray([float(params["value"])], dtype=float)}}
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    class _Executor:
+        def __init__(self, *, max_workers: int, thread_name_prefix: str):
+            events.append(f"executor:create:{max_workers}:{thread_name_prefix}")
+
+        def map(self, fn, iterable):
+            events.append("executor:map")
+            return [fn(item) for item in iterable]
+
+        def shutdown(self, *, wait: bool = True, cancel_futures: bool = False):
+            events.append(f"executor:shutdown:{wait}:{cancel_futures}")
+
+    ledger = FittingRuntimeLedger()
+    session = FittingRuntimeSession(
+        process_payload={"identity": "scheduler-runtime"},
+        max_lanes=3,
+        lane_factory=_SuccessLane,
+        ledger=ledger,
+        executor_factory=_Executor,
+    )
+
+    session.warm(lane_count=3)
+    first = session.evaluate_batch(
+        [
+            FittingRuntimeRequest(params={"value": 1.0}),
+            FittingRuntimeRequest(params={"value": 2.0}),
+            FittingRuntimeRequest(params={"value": 3.0}),
+        ]
+    )
+    second = session.evaluate_batch(
+        [
+            FittingRuntimeRequest(params={"value": 4.0}),
+            FittingRuntimeRequest(params={"value": 5.0}),
+            FittingRuntimeRequest(params={"value": 6.0}),
+        ]
+    )
+    session.close()
+
+    assert [float(result.species["A"][0]) for result in first] == [1.0, 2.0, 3.0]
+    assert [float(result.species["A"][0]) for result in second] == [4.0, 5.0, 6.0]
+    assert events.count("executor:create:3:kindred-fitting-runtime") == 1
+    assert events.count("executor:map") == 2
+    assert events[-1] == "executor:shutdown:True:False"
+    assert ledger.snapshot()["scheduler_creations"] == 1
+    assert ledger.snapshot()["scheduler_maps"] == 2
+    assert ledger.snapshot()["scheduler_shutdowns"] == 1
+
+
+def test_runtime_session_converts_scheduler_shutdown_during_cancel_to_fitting_cancelled() -> None:
+    from concurrent.futures import CancelledError
+
+    from kindred.core.exceptions import FittingCancelled
+    from kindred.core.fitting_runtime_session import (
+        FittingRuntimeLedger,
+        FittingRuntimeRequest,
+        FittingRuntimeSession,
+    )
+
+    session_holder: dict[str, FittingRuntimeSession] = {}
+
+    class _SuccessLane:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def warm(self, *, cancellation_check=None) -> None:
+            return None
+
+        def evaluate_series_with_parameter_origins(self, _params, *_args, **_kwargs):
+            return {"t": np.asarray([0.0], dtype=float), "species": {"A": np.asarray([1.0], dtype=float)}}
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    class _Executor:
+        def __init__(self, *, max_workers: int, thread_name_prefix: str):
+            self.max_workers = int(max_workers)
+            self.thread_name_prefix = str(thread_name_prefix)
+
+        def map(self, _fn, _iterable):
+            session_holder["session"].cancel_run()
+            raise CancelledError()
+
+        def shutdown(self, *, wait: bool = True, cancel_futures: bool = False):
+            return None
+
+    ledger = FittingRuntimeLedger()
+    session = FittingRuntimeSession(
+        process_payload={"identity": "scheduler-cancel-runtime"},
+        max_lanes=2,
+        lane_factory=_SuccessLane,
+        ledger=ledger,
+        executor_factory=_Executor,
+    )
+    session_holder["session"] = session
+
+    with pytest.raises(FittingCancelled):
+        session.evaluate_batch(
+            [
+                FittingRuntimeRequest(params={"value": 1.0}),
+                FittingRuntimeRequest(params={"value": 2.0}),
+            ]
+        )
+
+    assert ledger.snapshot()["run_cancellations"] == 1
+
+
 def test_runtime_session_payload_build_failure_preserves_containment_diagnostic() -> None:
     from kindred.core.exceptions import FitSimulationError
     from kindred.core.fitting_runtime_session import FittingRuntimeSession

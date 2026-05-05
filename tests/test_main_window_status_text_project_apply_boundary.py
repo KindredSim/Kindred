@@ -1270,6 +1270,56 @@ def test_draft_reactions_typing_does_not_schedule_runtime_warm(main_window, monk
     assert batch_warms == []
 
 
+def test_draft_reactions_typing_does_not_notify_active_fit_windows(main_window):
+    notifications: list[str] = []
+
+    class _FitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            notifications.append("notified")
+
+        def close(self) -> bool:
+            return True
+
+    main_window._active_fit_windows = [_FitWindow()]
+
+    main_window._set_mechanism_edit_locked(False)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._on_reactions_text_changed_for_main_window()
+
+    assert notifications == []
+
+
+def test_authoritative_mechanism_commit_notifies_active_fit_windows_once(main_window, monkeypatch):
+    notifications: list[str] = []
+
+    class _FitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            notifications.append("notified")
+
+        def close(self) -> bool:
+            return True
+
+    main_window._active_fit_windows = [_FitWindow()]
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False: None,
+    )
+
+    main_window._set_mechanism_edit_locked(False)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "reaction: A -> B; k=2.0\ninitial: A=1.0\ninitial: B=0.0"
+    )
+    main_window._on_reactions_text_changed_for_main_window()
+    assert notifications == []
+
+    assert main_window._try_lock_mechanism_editor()
+
+    assert notifications == ["notified"]
+
+
 def test_authoritative_mechanism_commit_schedules_runtime_rewarm_after_invalidating_controls(
     main_window,
     monkeypatch,
@@ -1461,6 +1511,34 @@ def test_programmatic_mechanism_load_invalidates_display_before_scheduling_rewar
     assert "refresh_derived" in events[:-1]
     assert events.index("invalidate_display") < events.index("refresh_derived")
     assert "schedule_rewarm" not in events[:-1]
+
+
+def test_programmatic_mechanism_load_notifies_active_fit_windows(main_window, monkeypatch):
+    notifications: list[str] = []
+
+    class _FitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            notifications.append("notified")
+
+        def close(self) -> bool:
+            return True
+
+    main_window._active_fit_windows = [_FitWindow()]
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False: None,
+    )
+    reactions_widget = main_window._mechanism_editor._reactions_text
+    reactions_widget.blockSignals(True)
+    try:
+        reactions_widget.setPlainText("reaction: A -> B; k=3.0\ninitial: A=1.0\ninitial: B=0.0")
+    finally:
+        reactions_widget.blockSignals(False)
+
+    main_window._on_programmatic_mechanism_load()
+
+    assert notifications == ["notified"]
 
 
 def test_programmatic_mechanism_load_supersedes_in_flight_work_without_active_display(

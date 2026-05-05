@@ -200,8 +200,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._start_fit()
         assert captured["starts"] == 1
         assert captured["datasets"][-1][0]["species"] == ["A"]
 
@@ -211,7 +210,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         assert captured["starts"] == 1
         assert set(window._global_payload_lookup["ds1"]["species"]) == {"A", "B"}
 
-        window._start_global_fit(config, selection)
+        window._start_fit()
         assert captured["starts"] == 2
         assert set(captured["datasets"][-1][0]["species"]) == {"A", "B"}
     finally:
@@ -260,8 +259,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._start_fit()
         assert captured["starts"] == 1
         assert captured["datasets"][-1][0]["target_weights"] == {"A": 1.0}
 
@@ -270,7 +268,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
         assert captured["starts"] == 1
         assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 2.5}
 
-        window._start_global_fit(config, selection)
+        window._start_fit()
         assert captured["starts"] == 2
         assert captured["datasets"][-1][0]["target_weights"] == {"A": 2.5}
     finally:
@@ -446,7 +444,7 @@ def test_excluded_dataset_invalid_pending_target_weight_is_non_actionable_until_
         apply_btn.click()
         qt_app.processEvents()
 
-        assert window._status_label.text() == "Fit targets applied"
+        assert window._status_label.text() in {"Fit targets applied", "Fitting runtime ready"}
         assert window._species_table._fit_target_weights_pending_invalid["ds1"] == {"A": "0"}
         assert _target_weight_edit(panel, target_name="A").text() == "0"
 

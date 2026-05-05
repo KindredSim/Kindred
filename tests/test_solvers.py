@@ -281,6 +281,177 @@ def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
     assert seen_T
 
 
+def test_solve_ode_intervention_interval_jacobian_uses_scheduled_rhs(monkeypatch):
+    custom_jacobian_calls = []
+    generated_jacobian_calls = []
+
+    def fake_compute_jacobian(rhs, t, y, *, cfg):
+        generated_jacobian_calls.append((float(t), np.asarray(rhs(t, y), dtype=float).copy()))
+        return np.eye(1), "dense"
+
+    def forbidden_custom_jacobian(_t: float, _y: np.ndarray):
+        custom_jacobian_calls.append(True)
+        raise AssertionError("custom jacobian does not include intervention interval semantics")
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        kwargs["jac"](t_span[0], np.asarray(y0, float))
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    monkeypatch.setattr(solvers, "compute_jacobian", fake_compute_jacobian)
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="BDF",
+            grid={"N": 2},
+            jacobian_func=forbidden_custom_jacobian,
+            species_names=("A",),
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 1.0, "rate": 2.0}]
+            },
+        )
+    )
+
+    assert custom_jacobian_calls == []
+    assert generated_jacobian_calls
+    assert out.provenance["has_intervention_schedule"] is True
+    assert out.provenance["intervention_custom_jacobian_disabled"] is True
+
+
+def test_solve_ode_empty_intervention_schedule_object_is_noop_without_species_names():
+    from kindred.core.intervention_schedule import InterventionSchedule
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        grid={"N": 2},
+        intervention_schedule=InterventionSchedule(),
+    )
+
+    out = solvers.solve_ode(request)
+
+    assert out.provenance["has_intervention_schedule"] is False
+    np.testing.assert_allclose(out.Y[0], np.array([1.0, 1.0]))
+
+
+def test_solve_ode_scheduled_terminal_event_stops_later_segments_and_preserves_events():
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    terminal_event.terminal = True  # type: ignore[attr-defined]
+    terminal_event.direction = 0  # type: ignore[attr-defined]
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 2.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0, 1.5, 2.0]),
+        events=[terminal_event],
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 1.0, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5]))
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
+def test_solve_ode_scheduled_event_terminal_flags_stop_inside_segment():
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        events=[terminal_event],
+        event_terminal=[True],
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 0.8, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.25, 0.5]))
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
+def test_solve_ode_scheduled_event_terminal_flags_accept_numpy_arrays():
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
+        events=[terminal_event],
+        event_terminal=np.array([True, False]),
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 0.8, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.25, 0.5]))
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
+def test_solve_ode_scheduled_terminal_before_first_requested_sample_returns_empty_truncated_output():
+    def terminal_event(t: float, _y: np.ndarray) -> float:
+        return float(t) - 0.5
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
+        t_span=(0.0, 1.0),
+        y0=np.array([1.0]),
+        solver="BDF",
+        t_eval=np.array([0.75, 1.0]),
+        events=[terminal_event],
+        event_terminal=[True],
+        species_names=("A",),
+        intervention_schedule={
+            "instant_events": [
+                {"op": "set", "species": "A", "time": 0.8, "value": 3.0}
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([], dtype=float))
+    assert out.Y.shape == (1, 0)
+    assert out.provenance["events"] == [[0.5]]
+    assert out.provenance["intervention_segments"] == 1
+
+
 def test_solve_ode_exercises_implicit_alternatives_and_raises_after_exhaustion(monkeypatch):
     class DummySolution:
         def __init__(self):
@@ -348,6 +519,49 @@ def test_solve_ode_records_successful_fallback_provenance(monkeypatch):
     assert out.provenance["solver_requested"] == "BDF"
     assert out.provenance["solver_used"] == "Radau"
     assert "solver" not in out.provenance
+
+
+def test_solve_ode_records_segmented_intervention_fallback_solver_used(monkeypatch):
+    class DummySolution:
+        def __init__(self, *, success: bool, message: str, t_eval: np.ndarray):
+            self.success = success
+            self.message = message
+            self.t = np.asarray(t_eval, float)
+            self.y = np.vstack([np.ones_like(self.t)])
+            self.t_events = []
+
+    calls = []
+
+    def fake_solve_ivp(*_a, **kwargs):
+        method = kwargs.get("method")
+        calls.append(method)
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        if method == "BDF":
+            return DummySolution(success=False, message="BDF failure", t_eval=t_eval[:1])
+        return DummySolution(success=True, message="ok", t_eval=t_eval)
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: -y,
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="BDF",
+            grid={"N": 2},
+            species_names=("A",),
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 1.0, "rate": 0.0}]
+            },
+        )
+    )
+
+    assert calls == ["BDF", "Radau"]
+    assert out.fallback_occurred is True
+    assert out.provenance["solver_alternative_used"] == "Radau"
+    assert out.provenance["solver_requested"] == "BDF"
+    assert out.provenance["solver_used"] == "Radau"
+    assert out.provenance["intervention_segment_solvers"] == ["Radau"]
 
 
 def test_simulation_request_rejects_deprecated_native_solver_params():

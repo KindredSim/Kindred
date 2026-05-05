@@ -25,6 +25,7 @@ from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
+from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
@@ -510,6 +511,7 @@ def prepare_fitting_execution_context(
     )
     prepared_payload = dict(bound.as_serializable_execution_payload())
     prepared_payload["bindings"] = dict(bound.bindings)
+    intervention_schedule = coerce_intervention_schedule(prepared_payload.get("intervention_schedule"))
 
     prepared_meta = PreparedSimulationMetadata(
         version=1,
@@ -531,6 +533,9 @@ def prepare_fitting_execution_context(
         use_sparse_jacobian=bool(prepared_solver_config.use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         initial_prefix=str(initial_prefix),
+        intervention_schedule_fingerprint=(
+            intervention_schedule.fingerprint if intervention_schedule is not None else ""
+        ),
     )
 
     execution_request = SimulationExecutionRequest(
@@ -549,6 +554,7 @@ def prepare_fitting_execution_context(
             MechanismMetadataKeys.TEMPERATURE_K: float(temperature_K),
         },
         mechanism_text=str(mechanism_text or ""),
+        intervention_schedule=intervention_schedule,
     )
     return PreparedFittingExecutionContext(
         execution_request=execution_request,
@@ -647,17 +653,45 @@ class SerialFittingEvaluator:
         simulation_plan = payload["simulation_plan"]
         if not isinstance(simulation_plan, Mapping):
             raise TypeError("Process payload simulation_plan must be a mapping.")
-        plan_payload = SimulationPlan.from_payload(simulation_plan).to_payload()
+        plan = SimulationPlan.from_payload(simulation_plan)
+        plan_payload = plan.to_payload()
+        prepared_metadata = PreparedSimulationMetadata.from_mapping(
+            dict(payload["prepared_metadata"])
+        )
+        requested_param_names = sorted(
+            {str(name) for name in list(payload["requested_param_names"] or []) if str(name).strip()}
+        )
+        metadata_param_names = sorted(str(name) for name in list(prepared_metadata.param_names or []))
+        if requested_param_names != metadata_param_names:
+            raise ValueError("Process payload requested_param_names conflict with simulation_plan metadata.")
+        request = plan.to_execution_request()
+        solver_config = dict(request.solver_config or {})
+        plan_temperature = float(
+            solver_config.get(
+                MechanismMetadataKeys.TEMPERATURE_K,
+                prepared_metadata.temperature_K,
+            )
+        )
+        if abs(float(payload["temperature_K"]) - plan_temperature) > 1e-12:
+            raise ValueError("Process payload temperature_K conflicts with simulation_plan.")
+        if abs(float(prepared_metadata.temperature_K) - plan_temperature) > 1e-12:
+            raise ValueError("Process payload prepared_metadata.temperature_K conflicts with simulation_plan.")
+        if str(payload["initial_prefix"] or "init:") != str(prepared_metadata.initial_prefix or "init:"):
+            raise ValueError("Process payload initial_prefix conflicts with prepared_metadata.")
+        request_schedule = coerce_intervention_schedule(request.to_payload().get("intervention_schedule"))
+        request_schedule_fingerprint = "" if request_schedule is None else str(request_schedule.fingerprint or "")
+        if str(prepared_metadata.intervention_schedule_fingerprint or "") != request_schedule_fingerprint:
+            raise ValueError(
+                "Process payload prepared_metadata.intervention_schedule_fingerprint conflicts with simulation_plan."
+            )
         return cls(
             PreparedFittingExecutionContext(
                 simulation_plan=plan_payload,
                 execution_request=None,
-                requested_param_names=list(payload["requested_param_names"]),
-                prepared_metadata=PreparedSimulationMetadata.from_mapping(
-                    dict(payload["prepared_metadata"])
-                ),
-                temperature_K=float(payload["temperature_K"]),
-                initial_prefix=str(payload["initial_prefix"]),
+                requested_param_names=list(metadata_param_names),
+                prepared_metadata=prepared_metadata,
+                temperature_K=float(plan_temperature),
+                initial_prefix=str(prepared_metadata.initial_prefix),
             ),
             fixed_params=dict(payload["fixed_params"]),
             fixed_param_origins=dict(payload["fixed_param_origins"]),
@@ -760,6 +794,8 @@ class SerialFittingEvaluator:
             grid=dict(prepared_run.request.grid or {}),
             jacobian_func=prepared_run.request.jacobian_func,
             temperature_schedule=prepared_run.request.temperature_schedule,
+            intervention_schedule=prepared_run.request.intervention_schedule,
+            species_names=tuple(prepared_run.species_names),
             events=tuple(events) if events else None,
         )
         try:

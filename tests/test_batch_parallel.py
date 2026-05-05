@@ -18,6 +18,38 @@ from kindred.gui.project_schema import PROJECT_DEFAULTS
 pytestmark = pytest.mark.unit
 
 
+def _batch_task_with_plan(task: dict) -> dict:
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    copied = dict(task)
+    t_span_raw = copied.get("t_span") or (0.0, float(copied.get("t_end") or 0.0))
+    t_span = (float(t_span_raw[0]), float(t_span_raw[1]))
+    execution_request = {
+        "prepared_payload": copied.get("prepared_payload"),
+        "initials": dict(copied.get("initials") or {}),
+        "t_span": t_span,
+        "solver_config": dict(copied.get("solver_config") or {}),
+        "mechanism_text": str(copied.get("mechanism_text") or ""),
+        "simulation_identity": (
+            dict(copied.get("simulation_identity") or {})
+            if isinstance(copied.get("simulation_identity"), dict)
+            else None
+        ),
+    }
+    if "intervention_schedule" in copied:
+        execution_request["intervention_schedule"] = copied.get("intervention_schedule")
+    copied["simulation_plan"] = SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+        metadata={
+            "set_id": str(copied.get("set_id") or ""),
+            "set_name": str(copied.get("set_name") or ""),
+        },
+    ).to_payload()
+    return copied
+
+
 def test_mechanism_clone_copies_mutable_containers_and_shares_rate_objects():
     rate_obj = object()
 
@@ -124,13 +156,13 @@ def test_run_batch_simulation_task_sanitizes_unpicklable_solve_ode_exceptions(mo
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _boom)
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert payload["success"] is False
@@ -173,13 +205,13 @@ def test_run_batch_simulation_task_returns_structured_error_payload_on_solver_fa
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: (_ for _ in ()).throw(RuntimeError("solver blew up")))
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert payload["success"] is False
@@ -192,13 +224,13 @@ def test_run_batch_simulation_task_returns_structured_error_payload_on_solver_fa
 
 def test_run_batch_simulation_task_uses_shared_preparation_failure_payload_for_invalid_solver_config():
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF", "rtol": "bad"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert payload["success"] is False
@@ -272,13 +304,13 @@ def test_run_batch_simulation_task_reports_algebra_errors_with_shared_schema(mon
     monkeypatch.setattr("kindred.core.algebra.simulation_series.evaluate_algebra_series_for_simulation", _boom)
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     errors = payload.get("algebra_errors")
@@ -421,13 +453,13 @@ def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(mon
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: _FakeResult())
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert payload["success"] is True
@@ -534,6 +566,108 @@ def test_run_batch_simulation_task_uses_text_path_for_plan_without_prepared_payl
     assert np.asarray(seen["request"].y0).tolist() == [4.0]  # type: ignore[union-attr]
 
 
+def test_run_batch_simulation_task_executes_intervention_schedule_from_plan_without_prepared_payload():
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": {"A": 1.0, "B": 0.0},
+            "t_span": (0.0, 1.0),
+            "solver_config": {"solver": "BDF", "grid": {"N": 3}},
+            "mechanism_text": mechanism_text,
+            "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+            "intervention_schedule": {
+                "instant_events": [{"op": "set", "species": "A", "time": 1.0, "value": 3.0}]
+            },
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    ).to_payload()
+
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "mechanism_text": "reaction: A -> B; k=STALE",
+            "simulation_plan": plan_payload,
+        }
+    )
+
+    species_names = list(payload["species_names"])
+    a_index = species_names.index("A")
+    assert payload["success"] is True
+    assert payload["mechanism_text"] == mechanism_text
+    assert payload["provenance"]["has_intervention_schedule"] is True
+    assert float(np.asarray(payload["Y"])[a_index, -1]) == pytest.approx(3.0)
+
+
+def test_run_batch_simulation_task_plan_schedule_removal_overrides_prepared_payload_schedule():
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+    from kindred.core.simulation_preparation import prepare_bound_mechanism
+
+    scheduled_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    unscheduled_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    bound = prepare_bound_mechanism(
+        scheduled_text,
+        [],
+        temperature_K=298.15,
+        initials={"A": 1.0, "B": 0.0},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": bound.as_serializable_execution_payload(),
+            "initials": {"A": 1.0, "B": 0.0},
+            "t_span": (0.0, 1.0),
+            "solver_config": {"solver": "BDF", "grid": {"N": 3}},
+            "mechanism_text": unscheduled_text,
+            "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+            "intervention_schedule": None,
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    ).to_payload()
+
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "simulation_plan": plan_payload,
+        }
+    )
+
+    species_names = list(payload["species_names"])
+    a_index = species_names.index("A")
+    assert payload["success"] is True
+    assert payload["mechanism_text"] == unscheduled_text
+    assert payload["provenance"]["has_intervention_schedule"] is False
+    assert float(np.asarray(payload["Y"])[a_index, 0]) == pytest.approx(1.0)
+
+
 def test_run_batch_simulation_task_rejects_legacy_execution_request_without_plan():
     payload = batch_parallel.run_batch_simulation_task(
         {
@@ -554,6 +688,33 @@ def test_run_batch_simulation_task_rejects_legacy_execution_request_without_plan
     assert payload["error"]["kind"] == "preparation_error"
     assert "simulation_plan" in payload["error"]["message"]
     assert payload["error"]["details"]["stage"] == "execution_request"
+
+
+def test_run_batch_simulation_task_rejects_legacy_top_level_inputs_with_structured_payload():
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "mechanism_text": "\n".join(
+                [
+                    "reaction: A -> B; k=1",
+                    "initial: A=1.0",
+                    "initial: B=0.0",
+                    "intervention: op=nonsense; species=A; time=0.5; value=2.0",
+                ]
+            ),
+            "solver_config": {"solver": "BDF", "grid": {"N": 3}},
+            "t_end": 1.0,
+        }
+    )
+
+    assert payload["success"] is False
+    assert payload["run_id"] == 1
+    assert payload["set_id"] == "id1"
+    assert payload["error"]["kind"] == "preparation_error"
+    assert payload["error"]["details"]["stage"] == "simulation_plan"
+    assert "simulation_plan" in payload["error"]["message"]
 
 
 def test_run_batch_simulation_task_secondary_payload_reports_base_species_count(monkeypatch):
@@ -606,13 +767,13 @@ def test_run_batch_simulation_task_secondary_payload_reports_base_species_count(
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: _FakeResult())
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert payload["success"] is True
@@ -805,7 +966,7 @@ def test_run_batch_simulation_task_can_include_mechanism_for_primary_completion_
     assert np.asarray(seen["request"].y0).tolist() == [3.0]  # type: ignore[union-attr]
 
 
-def test_run_batch_simulation_task_logs_warning_on_invalid_t_span_and_falls_back(monkeypatch, caplog):
+def test_run_batch_simulation_task_uses_plan_t_span_over_legacy_top_level_t_span(monkeypatch, caplog):
     import numpy as np
 
     class _FakeSpecies:
@@ -860,18 +1021,18 @@ def test_run_batch_simulation_task_logs_warning_on_invalid_t_span_and_falls_back
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _solve)
 
     caplog.set_level("WARNING")
-    payload = batch_parallel.run_batch_simulation_task(
-        {
-            "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "BDF"},
-            "t_span": "not-a-seq",
-            "t_end": 1.0,
-            "set_id": "id1",
-            "set_name": "set1",
-        }
-    )
+    task = _batch_task_with_plan({
+        "mechanism_text": "reaction: A -> A; k=1",
+        "solver_config": {"solver": "BDF"},
+        "t_span": (0.0, 1.0),
+        "t_end": 1.0,
+        "set_id": "id1",
+        "set_name": "set1",
+    })
+    task["t_span"] = "not-a-seq"
+    payload = batch_parallel.run_batch_simulation_task(task)
     assert payload["t"][0] == 0.0
-    assert any("Invalid t_span" in rec.getMessage() for rec in caplog.records)
+    assert not any("Invalid t_span" in rec.getMessage() for rec in caplog.records)
 
 
 def test_run_batch_simulation_task_normalizes_solver_config_defaults(monkeypatch):
@@ -924,13 +1085,13 @@ def test_run_batch_simulation_task_normalizes_solver_config_defaults(monkeypatch
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: _FakeResult())
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     solver_config = payload["solver_config"]
@@ -1007,24 +1168,24 @@ def test_run_batch_simulation_task_does_not_mutate_prepared_mechanism_and_avoids
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: _FakeResult())
 
     batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF", "use_sparse_jacobian": False, "wegscheider_cyclicity_enabled": True},
             "t_end": 1.0,
             "initials": {"A": 1.0},
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
     batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF", "use_sparse_jacobian": False, "wegscheider_cyclicity_enabled": False},
             "t_end": 1.0,
             "initials": {"A": 2.0},
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert len(seen_apply) == 2
@@ -1137,16 +1298,16 @@ def test_run_batch_simulation_task_non_structured_text_path_invalidates_worker_c
         batch_parallel._WORKER_PREPARED_CACHE.clear()
 
         first = batch_parallel.run_batch_simulation_task(
-            {
+            _batch_task_with_plan({
                 **base_task,
                 "mechanism_text": "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0\n",
-            }
+            })
         )
         second = batch_parallel.run_batch_simulation_task(
-            {
+            _batch_task_with_plan({
                 **base_task,
                 "mechanism_text": "reaction: A -> B; k=10.0\ninitial: A=1.0\ninitial: B=0.0\n",
-            }
+            })
         )
 
         assert first["success"] is True

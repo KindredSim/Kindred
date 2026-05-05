@@ -15,6 +15,26 @@ from kindred.core.batch_parallel import run_batch_simulation_task
 pytestmark = [pytest.mark.gui]
 
 
+def _batch_task_with_plan(task: dict[str, Any]) -> dict[str, Any]:
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    copied = dict(task)
+    t_span_raw = copied.get("t_span") or (0.0, float(copied.get("t_end") or 0.0))
+    execution_request = {
+        "prepared_payload": copied.get("prepared_payload"),
+        "initials": dict(copied.get("initials") or {}),
+        "t_span": (float(t_span_raw[0]), float(t_span_raw[1])),
+        "solver_config": dict(copied.get("solver_config") or {}),
+        "mechanism_text": str(copied.get("mechanism_text") or ""),
+    }
+    copied["simulation_plan"] = SimulationPlan.from_execution_request(
+        execution_request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    ).to_payload()
+    return copied
+
+
 @dataclass
 class _Submission:
     fn: Any
@@ -322,13 +342,13 @@ def test_batch_task_surfaces_solver_validation_from_preparation_owner(monkeypatc
     )
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF", "rtol": "bad"},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert seen["solver_config"]["rtol"] == "bad"
@@ -363,14 +383,14 @@ def test_batch_task_surfaces_solver_validation_from_preparation_owner_after_prep
     )
 
     payload = batch_parallel.run_batch_simulation_task(
-        {
+        _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
             "solver_config": {"solver": "BDF", "rtol": "bad"},
             "t_span": (2.0, 5.0),
             "initials": {"A": 3.0},
             "set_id": "id1",
             "set_name": "set1",
-        }
+        })
     )
 
     assert seen["solver_config"]["rtol"] == "bad"
@@ -428,6 +448,104 @@ def test_open_solver_settings_wires_parallel_batch_controls(main_window, monkeyp
     assert int(main_window.simulation_controller.parallel_batch.max_parallel_workers) == 7
     assert bool(main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker) is False
     main_window.simulation_controller.parallel_batch_pool_settings_changed.assert_called_once_with()
+
+
+def test_open_solver_settings_notifies_active_fit_windows_for_runtime_changes(main_window, monkeypatch):
+    class _FakeDialog:
+        def __init__(self, _parent, *, cache_port=None):
+            self._settings = {}
+            self._cache_port = cache_port
+
+        def set_settings(self, settings):
+            self._settings = dict(settings or {})
+
+        def exec(self):
+            return True
+
+        def get_settings(self):
+            updated = dict(self._settings)
+            updated["use_sparse_jacobian"] = not bool(updated.get("use_sparse_jacobian", False))
+            return updated
+
+    notifications: list[str] = []
+
+    class _FitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            notifications.append("notified")
+
+        def close(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
+        _FakeDialog,
+    )
+    main_window._active_fit_windows = [_FitWindow()]
+
+    main_window._open_solver_settings()
+
+    assert notifications == ["notified"]
+
+
+def test_open_solver_settings_does_not_notify_fit_windows_for_local_fit_integration_defaults(main_window, monkeypatch):
+    class _FakeDialog:
+        def __init__(self, _parent, *, cache_port=None):
+            self._settings = {}
+            self._cache_port = cache_port
+
+        def set_settings(self, settings):
+            self._settings = dict(settings or {})
+
+        def exec(self):
+            return True
+
+        def get_settings(self):
+            updated = dict(self._settings)
+            updated["rtol"] = 2e-6
+            return updated
+
+    notifications: list[str] = []
+
+    class _FitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            notifications.append("notified")
+
+        def close(self) -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
+        _FakeDialog,
+    )
+    main_window._active_fit_windows = [_FitWindow()]
+
+    main_window._open_solver_settings()
+
+    assert notifications == []
+
+
+def test_active_fit_window_runtime_notification_continues_after_stale_window_error(main_window):
+    notifications: list[str] = []
+
+    class _BadFitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            raise RuntimeError("deleted wrapper")
+
+        def close(self) -> bool:
+            return True
+
+    class _GoodFitWindow:
+        def handle_external_runtime_inputs_changed(self) -> None:
+            notifications.append("notified")
+
+        def close(self) -> bool:
+            return True
+
+    main_window._active_fit_windows = [_BadFitWindow(), _GoodFitWindow()]
+
+    main_window._notify_active_fit_windows_runtime_inputs_changed()
+
+    assert notifications == ["notified"]
 
 
 def test_open_solver_settings_persists_preview_debounce_controls(main_window, monkeypatch):

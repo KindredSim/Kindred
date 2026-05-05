@@ -423,8 +423,8 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         window._params_ics_tab._param_table.item(1, 3).setText("9.87")
 
         config = window._params_ics_tab._collect_parameter_config()
-        dataset_selection = window._collect_dataset_selection()
-        window._start_global_fit(config, dataset_selection)
+        assert config is not None
+        window._start_fit()
 
         assert captured["shared_params"] == {"k1": pytest.approx(0.2)}
 
@@ -505,8 +505,8 @@ def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, m
         window._params_ics_tab._param_table.item(1, 3).setText("9.87")
 
         config = window._params_ics_tab._collect_parameter_config()
-        dataset_selection = window._collect_dataset_selection()
-        window._start_global_fit(config, dataset_selection)
+        assert config is not None
+        window._start_fit()
 
         sim = captured["fit_evaluator"]
         assert callable(sim)

@@ -3855,6 +3855,28 @@ class SimulationController(QtCore.QObject):
     def _execution_identity_flags(self, *, fast_mode: bool) -> tuple[str, ...]:
         return ("fast_mode",) if bool(fast_mode) else ()
 
+    def _intervention_schedule_fingerprint_for_set(self, *, set_id: str, fast_mode: bool) -> str:
+        try:
+            mechanism_text = self._request_mechanism_text_for_set(
+                set_id=str(set_id),
+                has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+            )
+        except Exception as exc:
+            self._record_nonfatal_exception(
+                f"Failed to resolve intervention schedule identity text for set_id={str(set_id or '')}",
+                exc,
+            )
+            try:
+                mechanism_text = self.ui.mechanism.get_mechanism_text()
+            except Exception:
+                mechanism_text = ""
+        try:
+            from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+
+            return str(intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or "")
+        except Exception:
+            return hashlib.sha256(str(mechanism_text or "").encode("utf-8", "surrogatepass")).hexdigest()
+
     def _simulation_identity_for_set(
         self,
         *,
@@ -3876,6 +3898,10 @@ class SimulationController(QtCore.QObject):
             canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
             solver_config=solver_config,
             t_end=float(t_end),
+            intervention_schedule_fingerprint=self._intervention_schedule_fingerprint_for_set(
+                set_id=str(set_id),
+                fast_mode=bool(fast_mode),
+            ),
             preview_batch_cache_token=preview_token,
             execution_flags=self._execution_identity_flags(fast_mode=bool(fast_mode)),
         )

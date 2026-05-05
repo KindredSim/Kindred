@@ -6400,6 +6400,53 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
 
 
 @pytest.mark.unit
+def test_simulation_identity_for_set_records_intervention_schedule_fingerprint(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+
+    first_dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1",
+            "intervention: time=1.0; species=A; op=set; value=2.0",
+        ]
+    )
+    second_dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1",
+            "intervention: time=1.0; species=A; op=set; value=3.0",
+        ]
+    )
+    solver_config = {
+        "solver": "BDF",
+        "rtol": 1e-6,
+        "atol": 1e-12,
+        "grid_n": 100,
+        "temperature_K": 298.15,
+    }
+
+    mw._get_mechanism_text.return_value = first_dsl
+    first_identity = controller._simulation_identity_for_set(
+        set_id="id1",
+        solver_config=solver_config,
+        t_end=10.0,
+        fast_mode=False,
+    )
+    mw._get_mechanism_text.return_value = second_dsl
+    second_identity = controller._simulation_identity_for_set(
+        set_id="id1",
+        solver_config=solver_config,
+        t_end=10.0,
+        fast_mode=False,
+    )
+
+    assert first_identity.intervention_schedule_fingerprint == intervention_schedule_fingerprint_from_dsl_text(first_dsl)
+    assert second_identity.intervention_schedule_fingerprint == intervention_schedule_fingerprint_from_dsl_text(second_dsl)
+    assert first_identity.cache_key() != second_identity.cache_key()
+
+
+@pytest.mark.unit
 def test_serial_single_set_run_uses_contained_owner_lane(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
     class _Text:
         def toPlainText(self) -> str:

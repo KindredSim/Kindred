@@ -4,6 +4,20 @@ import numpy as np
 import pytest
 
 
+class _ReadyRuntimeSession:
+    def __init__(self) -> None:
+        self.ready = False
+
+    def is_ready(self, *, lane_count=None) -> bool:
+        return bool(self.ready)
+
+    def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+        self.ready = True
+
+    def close(self, *, kill: bool = False) -> None:
+        return None
+
+
 def _dataset_spec(dataset_id: str = "ds1"):
     from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 
@@ -183,8 +197,7 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
     try:
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._start_fit()
 
         datasets = captured.get("datasets")
         assert isinstance(datasets, list)
@@ -246,7 +259,7 @@ def test_fitting_window_preserves_invalid_payload_reason_during_rebuild(qt_app, 
 
 
 @pytest.mark.gui
-def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monkeypatch) -> None:
+def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, qtbot, monkeypatch) -> None:
     from PySide6 import QtCore, QtWidgets
 
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
@@ -300,6 +313,10 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monk
         return SerialFittingEvaluator(context)
 
     monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        lambda _evaluator, *, max_lanes, ledger=None: _ReadyRuntimeSession(),
+    )
 
     mechanism_text = "\n".join(
         [
@@ -329,10 +346,10 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, monk
         dataset_weights={"ds1": 1.0},
     )
     try:
-        config = window._params_ics_tab._collect_parameter_config()
-        assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=3000)
+        window._start_fit()
 
         assert build_calls
         assert warnings == []

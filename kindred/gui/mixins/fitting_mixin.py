@@ -186,6 +186,20 @@ class FittingMixin:
         window.raise_()
         window.activateWindow()
 
+    def _notify_active_fit_windows_runtime_inputs_changed(self) -> None:
+        windows = list(getattr(self, "_active_fit_windows", []) or [])
+        for window in windows:
+            try:
+                handler = getattr(window, "handle_external_runtime_inputs_changed", None)
+                if callable(handler):
+                    handler()
+            except Exception as exc:
+                self._record_fitting_best_effort_failure(
+                    "active_fit_window_runtime_inputs_changed",
+                    message="Failed to notify an active fitting window about runtime input changes",
+                    exc=exc,
+                )
+
     def _write_fit_results_to_mechanism(
         self,
         parameters: dict,

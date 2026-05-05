@@ -155,20 +155,12 @@ def _make_best_update_worker(
 
 def _make_params_tab(parameter_state: list[dict]) -> QtWidgets.QWidget:
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
-    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     entries = [{"id": "ds1", "label": "DS 1"}]
-    species_table = UnifiedSpeciesTable(
-        dataset_entries=list(entries),
-        mechanism_species=["A"],
-        dataset_entries_getter=lambda: list(entries),
-        included_dataset_ids_getter=lambda: [str(entry["id"]) for entry in entries],
-        dataset_label_getter=lambda ds_id: str(ds_id),
-        dataset_weight_getter=lambda ds_id: 1.0,
-        persist_dataset_weight_callback=lambda ds_id, w: None,
-        dataset_manager_getter=lambda: None,
-        worker_running_getter=lambda: False,
-    )
+
+    def initial_parameter_defaults_getter(_dataset_id, _species):
+        return False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
+
     return ParametersIcsTab(
         parameter_state=[dict(entry) for entry in parameter_state],
         initial_parameter_snapshot=[dict(entry) for entry in parameter_state],
@@ -186,7 +178,7 @@ def _make_params_tab(parameter_state: list[dict]) -> QtWidgets.QWidget:
         reactions_text_getter=lambda: "",
         integration_defaults=("BDF", 1e-6, 1e-12),
         config_defaults={},
-        ic_panel=species_table,
+        initial_parameter_defaults_getter=initial_parameter_defaults_getter,
     )
 
 
@@ -1114,22 +1106,37 @@ def test_results_tab_switching_uses_single_host_without_splitter(qt_app):
 class _FakeWorker:
     """Minimal stand-in for a running QThread worker."""
 
+    def __init__(self):
+        self.cancel_called = False
+        self._running = True
+
     def isRunning(self) -> bool:
+        return self._running
+
+    def cancel(self) -> None:
+        self.cancel_called = True
+        self._running = False
+
+    def wait(self, _timeout_ms: int) -> bool:
         return True
 
+    def quit(self) -> None:
+        self._running = False
 
-def test_rebuild_subtabs_not_called_during_fit(qt_app):
-    """rebuild_subtabs must be deferred while a fit is running."""
+    def terminate(self) -> None:
+        self._running = False
+
+
+def test_runtime_input_change_during_fit_supersedes_worker_and_rebuilds_subtabs(qt_app):
+    """Runtime input edits cancel active work, then rebuild against current state."""
     entries = _make_dataset_entries(2)
     window = _make_window(entries)
     try:
         window.show()
         qt_app.processEvents()
 
-        # Simulate a running fit by injecting a fake worker
-        window._worker = _FakeWorker()
-
-        # Record calls to rebuild_subtabs
+        worker = _FakeWorker()
+        window._worker = worker
         calls: list[tuple] = []
         orig = window._run_results_tab.rebuild_subtabs
 
@@ -1139,80 +1146,12 @@ def test_rebuild_subtabs_not_called_during_fit(qt_app):
 
         window._run_results_tab.rebuild_subtabs = tracking_rebuild
 
-        # Trigger include-changed (row 0, toggle off)
         window._on_data_tab_include_changed(0, str(entries[0]["id"]), False)
         qt_app.processEvents()
 
-        assert len(calls) == 0, "rebuild_subtabs must not fire while a fit is running"
-        assert window._results_rebuild_pending is True
-    finally:
-        window._worker = None
-        window.close()
-        qt_app.processEvents()
-
-
-def test_pending_rebuild_fires_on_fit_complete(qt_app):
-    """A pending rebuild must fire when the fit completes, before pushing results."""
-    entries = _make_dataset_entries(2)
-    window = _make_window(entries)
-    try:
-        window.show()
-        qt_app.processEvents()
-
-        # Simulate a running fit
-        window._worker = _FakeWorker()
-        window._on_data_tab_include_changed(0, str(entries[0]["id"]), False)
-        qt_app.processEvents()
-        assert window._results_rebuild_pending is True
-
-        # Record rebuild_subtabs calls
-        calls: list[tuple] = []
-        orig = window._run_results_tab.rebuild_subtabs
-
-        def tracking_rebuild(*a, **kw):
-            calls.append((a, kw))
-            return orig(*a, **kw)
-
-        window._run_results_tab.rebuild_subtabs = tracking_rebuild
-
-        # Simulate fit completion (hide window to suppress QMessageBox)
-        window._worker = None
-        window.hide()
-        result = GlobalFitResult(
-            shared_params={"k1": 1.0},
-            dataset_params={},
-            uncertainties=None,
-            global_chi_squared=0.01,
-            global_r_squared=0.99,
-            nfev=100,
-            dataset_info=[
-                DatasetFitInfo(
-                    dataset_id=str(e["id"]),
-                    chi_squared=0.01,
-                    r_squared=0.99,
-                    rmse=0.1,
-                    mae=0.05,
-                    n_points=5,
-                    residuals=np.zeros(5),
-                    weight=1.0,
-                )
-                for e in entries
-            ],
-            model_series={
-                str(e["id"]): {list(e["species_data"].keys())[0]: np.zeros(5)} for e in entries
-            },
-            objective_residuals=np.zeros(10),
-            message="ok",
-            completion=GlobalFitCompletion(
-                status="ok",
-                optimizer_converged=True,
-                nonfinite_metrics=False,
-            ),
-        )
-        window._handle_global_fit_complete({"result": result})
-        qt_app.processEvents()
-
-        assert len(calls) >= 1, "rebuild_subtabs must fire on fit completion when pending"
+        assert worker.cancel_called is True
+        assert window._worker is None
+        assert len(calls) >= 1
         assert window._results_rebuild_pending is False
     finally:
         window._worker = None
@@ -1220,20 +1159,14 @@ def test_pending_rebuild_fires_on_fit_complete(qt_app):
         qt_app.processEvents()
 
 
-def test_pending_rebuild_uses_current_dataset_state(qt_app):
-    """The deferred rebuild must use the post-toggle dataset entries, not stale state."""
+def test_runtime_input_change_rebuild_uses_current_dataset_state(qt_app):
+    """The immediate rebuild after supersede must use post-toggle dataset entries."""
     entries = _make_dataset_entries(3)
     window = _make_window(entries)
     try:
         window.show()
         qt_app.processEvents()
 
-        # Simulate a running fit and toggle dataset 0 off
-        window._worker = _FakeWorker()
-        window._on_data_tab_include_changed(0, str(entries[0]["id"]), False)
-        qt_app.processEvents()
-
-        # Capture the entries passed to rebuild_subtabs at completion
         captured_entries: list = []
         orig = window._run_results_tab.rebuild_subtabs
 
@@ -1243,48 +1176,14 @@ def test_pending_rebuild_uses_current_dataset_state(qt_app):
 
         window._run_results_tab.rebuild_subtabs = capture_rebuild
 
-        # Complete the fit (hide window to suppress QMessageBox)
-        window._worker = None
-        window.hide()
-        result = GlobalFitResult(
-            shared_params={"k1": 1.0},
-            dataset_params={},
-            uncertainties=None,
-            global_chi_squared=0.01,
-            global_r_squared=0.99,
-            nfev=100,
-            dataset_info=[
-                DatasetFitInfo(
-                    dataset_id=str(e["id"]),
-                    chi_squared=0.01,
-                    r_squared=0.99,
-                    rmse=0.1,
-                    mae=0.05,
-                    n_points=5,
-                    residuals=np.zeros(5),
-                    weight=1.0,
-                )
-                for e in entries
-            ],
-            model_series={
-                str(e["id"]): {list(e["species_data"].keys())[0]: np.zeros(5)} for e in entries
-            },
-            objective_residuals=np.zeros(15),
-            message="ok",
-            completion=GlobalFitCompletion(
-                status="ok",
-                optimizer_converged=True,
-                nonfinite_metrics=False,
-            ),
-        )
-        window._handle_global_fit_complete({"result": result})
+        window._worker = _FakeWorker()
+        window._on_data_tab_include_changed(0, str(entries[0]["id"]), False)
         qt_app.processEvents()
 
         assert len(captured_entries) >= 1
-        # The first dataset should reflect the toggled-off state
         rebuilt_first = captured_entries[0][0]
         assert rebuilt_first["include"] is False, (
-            "Deferred rebuild must use the current (post-toggle) dataset state"
+            "Rebuild after active-work supersede must use the current dataset state"
         )
     finally:
         window._worker = None
@@ -1292,8 +1191,8 @@ def test_pending_rebuild_uses_current_dataset_state(qt_app):
         qt_app.processEvents()
 
 
-def test_pending_rebuild_on_success_uses_current_applied_targets(qt_app):
-    """Deferred successful completion must rebuild the results tab with current applied targets."""
+def test_targets_apply_during_fit_supersedes_worker_and_rebuilds_current_targets(qt_app):
+    """Target edits during active work cancel the stale fit and rebuild immediately."""
     t = np.linspace(0.0, 1.0, 5)
     entries = [
         {
@@ -1316,48 +1215,16 @@ def test_pending_rebuild_on_success_uses_current_applied_targets(qt_app):
 
         assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["A"]
 
-        window._worker = _FakeWorker()
+        worker = _FakeWorker()
+        window._worker = worker
         window._species_table._fit_targets_selection_applied["ds1"] = ["B"]
         window._on_targets_applied()
         qt_app.processEvents()
-        assert window._results_rebuild_pending is True
-        assert window._results_fit_targets_by_dataset()["ds1"] == ["B"]
 
-        window._worker = None
-        window.hide()
-        result = GlobalFitResult(
-            shared_params={"k1": 1.0},
-            dataset_params={},
-            uncertainties=None,
-            global_chi_squared=0.01,
-            global_r_squared=0.99,
-            nfev=100,
-            dataset_info=[
-                DatasetFitInfo(
-                    dataset_id="ds1",
-                    chi_squared=0.01,
-                    r_squared=0.99,
-                    rmse=0.1,
-                    mae=0.05,
-                    n_points=5,
-                    residuals=np.zeros(5),
-                    weight=1.0,
-                )
-            ],
-            model_series={"ds1": {"B": np.zeros(5)}},
-            objective_residuals=np.zeros(5),
-            message="ok",
-            completion=GlobalFitCompletion(
-                status="ok",
-                optimizer_converged=True,
-                nonfinite_metrics=False,
-            ),
-        )
-
-        window._handle_global_fit_complete({"result": result})
-        qt_app.processEvents()
-
+        assert worker.cancel_called is True
+        assert window._worker is None
         assert window._results_rebuild_pending is False
+        assert window._results_fit_targets_by_dataset()["ds1"] == ["B"]
         assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["B"]
         payload = window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]
         assert payload["current_species"] == "B"

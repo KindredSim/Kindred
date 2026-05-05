@@ -67,7 +67,7 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
 
     monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
 
-    # Count session-level fitting execution-context construction at the launch boundary.
+    # Count session-level fitting execution-context construction at the deferred runtime boundary.
     import kindred.gui.fitting.launch as fitting_launch
     from kindred.core.fitting_evaluation import SerialFittingEvaluator
 
@@ -98,7 +98,20 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve)
 
     main_window._run_global_fit()
-    sim_func = captured["kwargs"]["simulation_func"]
+    assert captured["kwargs"]["simulation_func"] is None
+    assert counts["build_context"] == 0
+
+    simulation_builder = captured["kwargs"]["simulation_builder"]
+    sim_func = simulation_builder(
+        main_window._get_mechanism_text(),
+        ["k1"],
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        temperature_K=298.15,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+    )
     assert isinstance(sim_func, SerialFittingEvaluator)
     assert type(sim_func) is SerialFittingEvaluator
     assert counts["build_context"] == 1

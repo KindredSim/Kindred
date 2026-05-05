@@ -141,8 +141,7 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._start_fit()
 
         rrt = window._run_results_tab
         assert hasattr(rrt, "_last_run_stamp")
@@ -200,8 +199,7 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._start_fit()
 
         rrt = window._run_results_tab
         assert rrt._last_run_stamp["version"] == 3
@@ -299,6 +297,58 @@ def test_run_stamp_hash_stable_across_dataset_orderings():
     assert hash_global_fit_run_stamp(stamp_a) == hash_global_fit_run_stamp(stamp_b)
 
 
+def test_run_stamp_hash_changes_with_prepared_intervention_schedule_fingerprint():
+    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    def _prepared_meta(schedule_fingerprint: str) -> PreparedSimulationMetadata:
+        return PreparedSimulationMetadata(
+            version=1,
+            mechanism_text_sha256="abc",
+            mechanism_text_len=1,
+            param_names=["k1"],
+            t_end=1.0,
+            num_points=6,
+            temperature_K=298.15,
+            solver_requested="BDF",
+            solver_normalized="BDF",
+            solver_warning=None,
+            rtol=1e-6,
+            atol=1e-12,
+            use_sparse_jacobian=False,
+            wegscheider_cyclicity_enabled=False,
+            initial_prefix="init:",
+            intervention_schedule_fingerprint=str(schedule_fingerprint),
+        )
+
+    kwargs = {
+        "dataset_rows": [{"id": "ds1", "label": "ds1", "include": True, "weight": 1.0}],
+        "included_ids": ["ds1"],
+        "applied_fit_targets": {"ds1": ["A"]},
+        "weights_used": {"ds1": 1.0},
+        "weight_mode": "custom",
+        "fit_config": {
+            "parameters": {"k1": 0.2},
+            "bounds": {"k1": (0.01, 1.0)},
+            "log10_params": {"k1": False},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 10,
+            "seed": 42,
+            "parallel_starts": 4,
+        },
+        "mechanism_text": "rxn: A -> B; k=0.2",
+        "reactions_text": "rxn: A -> B; k=0.2",
+    }
+
+    first = build_global_fit_run_stamp(prepared_simulation=_prepared_meta("schedule-a"), **kwargs)
+    second = build_global_fit_run_stamp(prepared_simulation=_prepared_meta("schedule-b"), **kwargs)
+
+    assert first["prepared_simulation"]["intervention_schedule_fingerprint"] == "schedule-a"
+    assert second["prepared_simulation"]["intervention_schedule_fingerprint"] == "schedule-b"
+    assert hash_global_fit_run_stamp(first) != hash_global_fit_run_stamp(second)
+
+
 def test_build_global_fit_run_stamp_rejects_incomplete_prepared_simulation_mapping():
     from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp
 
@@ -323,3 +373,84 @@ def test_build_global_fit_run_stamp_rejects_incomplete_prepared_simulation_mappi
             reactions_text="rxn: A -> B; k=0.2",
             prepared_simulation={"solver_requested": "BDF"},
         )
+
+
+def test_global_fit_run_stamp_includes_dataset_payload_identity():
+    from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+    y = np.asarray([[1.0, 0.8, 0.6]], dtype=float)
+    x_obs = np.asarray([0.0, 0.25, 0.0], dtype=float)
+    common = {
+        "dataset_id": "ds1",
+        "t_exp": t,
+        "species_list": ("A",),
+        "y_matrix": y,
+        "point_count": int(y.size),
+        "x_name": "X",
+        "x_obs": x_obs,
+        "target_weights": {"A": 1.0},
+    }
+    monotone = FitDatasetSpec(**common, x_mode="monotone")
+    time_guided = FitDatasetSpec(**common, x_mode="time_guided")
+    kwargs = {
+        "dataset_rows": [{"id": "ds1", "label": "ds1", "include": True, "weight": 1.0}],
+        "included_ids": ["ds1"],
+        "applied_fit_targets": {"ds1": ["A"]},
+        "weights_used": {"ds1": 1.0},
+        "weight_mode": "custom",
+        "fit_config": {
+            "parameters": {"k1": 0.2},
+            "bounds": {"k1": (0.01, 1.0)},
+            "log10_params": {"k1": False},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 10,
+            "seed": 42,
+            "parallel_starts": 4,
+        },
+        "mechanism_text": "rxn: A -> B; k=0.2",
+        "reactions_text": "rxn: A -> B; k=0.2",
+    }
+
+    stamp_a = build_global_fit_run_stamp(**kwargs, dataset_specs=[monotone])
+    stamp_b = build_global_fit_run_stamp(**kwargs, dataset_specs=[time_guided])
+
+    assert stamp_a["dataset_payload_identity"] != stamp_b["dataset_payload_identity"]
+    assert hash_global_fit_run_stamp(stamp_a) != hash_global_fit_run_stamp(stamp_b)
+
+
+def test_global_fit_run_stamp_includes_optimizer_tolerances():
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    kwargs = {
+        "dataset_rows": [{"id": "ds1", "label": "ds1", "include": True, "weight": 1.0}],
+        "included_ids": ["ds1"],
+        "applied_fit_targets": {"ds1": ["A"]},
+        "weights_used": {"ds1": 1.0},
+        "weight_mode": "custom",
+        "fit_config": {
+            "parameters": {"k1": 0.2},
+            "bounds": {"k1": (0.01, 1.0)},
+            "log10_params": {"k1": False},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 10,
+            "seed": 42,
+            "parallel_starts": 4,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
+        },
+        "mechanism_text": "rxn: A -> B; k=0.2",
+        "reactions_text": "rxn: A -> B; k=0.2",
+    }
+
+    stamp_a = build_global_fit_run_stamp(**kwargs)
+    changed = dict(kwargs)
+    changed["fit_config"] = dict(kwargs["fit_config"], ftol=1e-8)
+    stamp_b = build_global_fit_run_stamp(**changed)
+
+    assert stamp_a["algorithm"]["ftol"] == "1e-10"
+    assert stamp_b["algorithm"]["ftol"] == "1e-08"
+    assert hash_global_fit_run_stamp(stamp_a) != hash_global_fit_run_stamp(stamp_b)

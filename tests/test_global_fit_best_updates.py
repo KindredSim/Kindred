@@ -205,9 +205,7 @@ def test_global_fit_worker_passes_runtime_session_to_fit_boundary(qt_app):
 
     class _RuntimeSession:
         def warm(self, *, cancellation_check=None, lane_count=None):
-            assert cancellation_check is not None
-            assert cancellation_check() is False
-            events.append(f"warm:{lane_count}")
+            raise AssertionError("runtime readiness must be established before worker execution")
 
     runtime_session = _RuntimeSession()
 
@@ -243,8 +241,92 @@ def test_global_fit_worker_passes_runtime_session_to_fit_boundary(qt_app):
 
     worker._execute()
 
-    assert events == ["warm:3", "fit"]
+    assert events == ["fit"]
     assert seen == {"runtime_session": runtime_session, "max_runtime_lanes": 3}
+
+
+def test_global_fit_worker_rejects_exact_serial_evaluator_without_runtime_session(qt_app):
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k"],
+        t_end=1.0,
+        num_points=2,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="initial:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    called: list[str] = []
+
+    def fake_fit_global(*_args, **_kwargs):
+        called.append("fit")
+        raise AssertionError("GUI worker must not fall through to core runtime-session creation")
+
+    worker = GlobalFitWorker(
+        [{"id": "ds", "t": np.asarray([0.0]), "y": np.asarray([0.0]), "species": "A"}],
+        {"k": 1.0},
+        fit_evaluator=evaluator,
+        fit_runtime_session=None,
+        fit_func=fake_fit_global,
+    )
+
+    with pytest.raises(RuntimeError, match="required fitting runtime session is not ready"):
+        worker._execute()
+
+    assert called == []
+
+
+def test_global_fit_worker_rejects_exact_serial_evaluator_with_unready_runtime_session(qt_app):
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    class _UnreadySession:
+        def is_ready(self, *, lane_count=None) -> bool:
+            return False
+
+    context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k"],
+        t_end=1.0,
+        num_points=2,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="initial:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    called: list[str] = []
+
+    def fake_fit_global(*_args, **_kwargs):
+        called.append("fit")
+        raise AssertionError("GUI worker must not warm an unready runtime session during fit execution")
+
+    worker = GlobalFitWorker(
+        [{"id": "ds", "t": np.asarray([0.0]), "y": np.asarray([0.0]), "species": "A"}],
+        {"k": 1.0},
+        fit_evaluator=evaluator,
+        fit_runtime_session=_UnreadySession(),
+        fit_func=fake_fit_global,
+    )
+
+    with pytest.raises(RuntimeError, match="required fitting runtime session is not ready"):
+        worker._execute()
+
+    assert called == []
 
 
 def test_global_fit_worker_cancel_notifies_runtime_session(qt_app):
@@ -354,3 +436,130 @@ def test_parametric_x_time_guided_best_payload_uses_penalized_alignment_like_fin
     assert set(dataset_stats) == {"ds1"}
     assert model_series["ds1"]["Y"].shape == t_obs.shape
     assert residual_series["ds1"]["Y"].shape == t_obs.shape
+
+
+def test_parametric_x_auto_best_payload_falls_back_for_out_of_range_x_like_final_replay(qt_app):
+    from kindred.core.fitting_evaluation import CallableFittingEvaluator
+
+    t_obs = np.asarray([0.0, 0.5, 1.0], dtype=float)
+    x_obs = np.asarray([-0.25, 0.5, 1.25], dtype=float)
+    y_obs = np.asarray([0.0, 0.5, 1.0], dtype=float)
+    t_sim = np.linspace(0.0, 1.0, 101, dtype=float)
+
+    def simulation(_params):
+        return {
+            "t": t_sim.copy(),
+            "species": {
+                "X": t_sim.copy(),
+                "Y": t_sim.copy(),
+            },
+        }
+
+    worker = GlobalFitWorker(
+        [
+            {
+                "id": "ds1",
+                "t": t_obs.copy(),
+                "y": y_obs.copy(),
+                "species": "Y",
+                "x_name": "X",
+                "x_obs": x_obs.copy(),
+                "x_mapping_mode": "auto",
+            }
+        ],
+        {},
+        fit_evaluator=CallableFittingEvaluator(simulation),
+        best_update_interval_s=0.0,
+        plot_update_interval_s=0.0,
+    )
+
+    model_series, residual_series, plot_model_series, plot_model_x, dataset_stats = worker._build_best_payload_series(
+        shared_params={},
+        dataset_params={},
+    )
+
+    assert set(model_series) == {"ds1"}
+    assert set(residual_series) == {"ds1"}
+    assert set(plot_model_series) == {"ds1"}
+    assert set(plot_model_x) == {"ds1"}
+    assert set(dataset_stats) == {"ds1"}
+    assert model_series["ds1"]["Y"].shape == t_obs.shape
+
+
+def test_parametric_x_best_payload_and_final_replay_use_ready_runtime_evaluator(qt_app):
+    from kindred.core.analysis.global_fitting import fit_global
+
+    t_obs = np.linspace(0.0, 1.0, 21, dtype=float)
+    x_obs = t_obs * (1.0 - t_obs)
+    y_obs = t_obs.copy()
+    t_sim = np.linspace(0.0, 1.0, 201, dtype=float)
+    calls: list[dict[str, float]] = []
+
+    class _RuntimeEvaluator:
+        def evaluate_series(self, params):
+            calls.append(dict(params))
+            a = float(params.get("a", 1.0))
+            return {
+                "t": t_sim.copy(),
+                "species": {
+                    "X": t_sim * (1.0 - t_sim),
+                    "Y": a * t_sim,
+                },
+            }
+
+    class _RuntimeSession:
+        def begin_run(self) -> None:
+            calls.append({"begin_run": 1.0})
+
+        def evaluator(self, *, cancellation_check=None):
+            assert cancellation_check is not None
+            return _RuntimeEvaluator()
+
+    def direct_evaluator(_params):
+        raise AssertionError("Parametric-X fitting must use the ready runtime evaluator")
+
+    dataset = {
+        "id": "ds1",
+        "t": t_obs.copy(),
+        "y": y_obs.copy(),
+        "species": "Y",
+        "x_name": "X",
+        "x_obs": x_obs.copy(),
+        "x_mapping_mode": "time_guided",
+    }
+    runtime_session = _RuntimeSession()
+    worker = GlobalFitWorker(
+        [dict(dataset)],
+        {"a": 1.0},
+        fit_evaluator=direct_evaluator,
+        fit_runtime_session=runtime_session,
+        best_update_interval_s=0.0,
+        plot_update_interval_s=0.0,
+    )
+
+    model_series, residual_series, plot_model_series, plot_model_x, dataset_stats = worker._build_best_payload_series(
+        shared_params={"a": 1.0},
+        dataset_params={},
+    )
+
+    result = fit_global(
+        direct_evaluator,
+        [dict(dataset)],
+        {"a": 1.0},
+        bounds={"a": (0.95, 1.05)},
+        method="trf",
+        max_nfev=1,
+        runtime_session=runtime_session,
+        max_runtime_lanes=1,
+        cancellation_check=lambda: False,
+    )
+
+    assert set(model_series) == {"ds1"}
+    assert set(residual_series) == {"ds1"}
+    assert set(plot_model_series) == {"ds1"}
+    assert set(plot_model_x) == {"ds1"}
+    assert set(dataset_stats) == {"ds1"}
+    assert set(result.model_series) == {"ds1"}
+    assert set(result.plot_model_x) == {"ds1"}
+    assert any("begin_run" in call for call in calls)
+    assert sum(1 for call in calls if "a" in call) >= 2

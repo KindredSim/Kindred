@@ -72,8 +72,7 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        dataset_selection = window._collect_dataset_selection()
-        window._start_global_fit(config, dataset_selection)
+        window._start_fit()
 
         assert captured["dataset_params"] is None
         assert captured["dataset_variable_params"] is None

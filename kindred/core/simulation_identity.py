@@ -20,6 +20,7 @@ __all__ = [
     "contained_simulation_owner_identity",
     "coerce_simulation_identity",
     "coerce_simulation_scope_identity",
+    "schedule_fingerprint_payload",
 ]
 
 
@@ -60,6 +61,16 @@ def canonical_initials_fingerprint(initials: Mapping[str, Any] | None) -> str:
     if not payload:
         return ""
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def schedule_fingerprint_payload(value: object) -> str:
+    try:
+        from kindred.core.intervention_schedule import coerce_intervention_schedule
+
+        schedule = coerce_intervention_schedule(value)
+    except Exception:
+        return str(value or "")
+    return "" if schedule is None else schedule.fingerprint
 
 
 _DSL_PARAMETER_ASSIGNMENT_RE = re.compile(
@@ -286,6 +297,7 @@ class SimulationIdentity:
     canonical_initials_fingerprint: str
     solver: SimulationSolverIdentity
     t_end: float
+    intervention_schedule_fingerprint: str = ""
     preview_batch_cache_token: str = ""
     execution_flags: tuple[str, ...] = ()
     version: int = 2
@@ -299,6 +311,7 @@ class SimulationIdentity:
         solver_config: Mapping[str, Any] | None,
         t_end: float,
         canonical_initials_fingerprint: str = "",
+        intervention_schedule_fingerprint: str = "",
         preview_batch_cache_token: str = "",
         execution_flags: Sequence[str] = (),
     ) -> "SimulationIdentity":
@@ -309,6 +322,7 @@ class SimulationIdentity:
             canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
             solver=SimulationSolverIdentity.from_solver_config(solver_config),
             t_end=float(t_end),
+            intervention_schedule_fingerprint=str(intervention_schedule_fingerprint or ""),
             preview_batch_cache_token=str(preview_batch_cache_token or ""),
             execution_flags=flags,
         )
@@ -327,6 +341,7 @@ class SimulationIdentity:
             canonical_initials_fingerprint=str(payload.get("canonical_initials_fingerprint") or ""),
             solver=SimulationSolverIdentity.from_payload(solver_payload),
             t_end=_try_float(payload.get("t_end", 0.0), 0.0),
+            intervention_schedule_fingerprint=str(payload.get("intervention_schedule_fingerprint") or ""),
             preview_batch_cache_token=str(payload.get("preview_batch_cache_token") or ""),
             execution_flags=tuple(str(flag) for flag in (payload.get("execution_flags") or ()) if str(flag)),
         )
@@ -339,6 +354,7 @@ class SimulationIdentity:
             "canonical_initials_fingerprint": str(self.canonical_initials_fingerprint),
             "solver": self.solver.to_payload(),
             "t_end": float(self.t_end),
+            "intervention_schedule_fingerprint": str(self.intervention_schedule_fingerprint or ""),
             "preview_batch_cache_token": str(self.preview_batch_cache_token),
             "execution_flags": list(self.execution_flags),
         }

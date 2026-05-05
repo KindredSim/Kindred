@@ -12,6 +12,8 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
     from PySide6 import QtCore
 
     from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
+    from kindred.core.analysis.dataset_parameter_overrides import coerce_fit_dataset_parameter_overrides
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeAcceptedLaunch, FittingRuntimeIdentity
     from kindred.gui.fitting.window import FittingWindow
     from kindred.gui.fitting.worker import GlobalFitWorker
 
@@ -75,13 +77,20 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
     )
     try:
         assert not hasattr(window, "_parallel_fit_runtime_settings_for_run")
-        window._start_global_fit_worker(
-            datasets=coerce_fit_dataset_specs(dataset_payloads),
-            config={
-                "parameters": {"k": 1.0},
-                "max_nfev": 5,
-            },
-            dataset_overrides=[],
+        dataset_specs = tuple(coerce_fit_dataset_specs(dataset_payloads))
+        config = {
+            "parameters": {"k": 1.0},
+            "max_nfev": 5,
+        }
+        identity = FittingRuntimeIdentity(
+            datasets=dataset_specs,
+            config=config,
+            dataset_overrides=tuple(
+                coerce_fit_dataset_parameter_overrides(
+                    dataset_ids=[spec.dataset_id for spec in dataset_specs],
+                    dataset_overrides=[],
+                )
+            ),
             weights={"ds1": 1.0},
             requested_solver="BDF",
             requested_rtol=1e-6,
@@ -90,7 +99,10 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
             stamp={},
             stamp_hash="stamp-hash",
             stamp_short="stamp",
+            lane_count=1,
+            readiness_required=False,
         )
+        window._start_accepted_fit_worker(FittingRuntimeAcceptedLaunch(identity=identity, session=None))
     finally:
         window.close()
 

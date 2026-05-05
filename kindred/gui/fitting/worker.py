@@ -25,7 +25,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     coerce_fit_dataset_parameter_overrides,
     split_fit_dataset_parameter_overrides,
 )
-from kindred.core.fitting_evaluation import coerce_fitting_series_evaluator
+from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.api.fitting import fit_global
@@ -217,35 +217,47 @@ class GlobalFitWorker(QtCore.QThread):
             self._run_thread_ident = None
 
     def _failure_payload_from_exception(self, exc: BaseException) -> dict[str, Any]:
+        def _with_run_stamp(payload: dict[str, Any]) -> dict[str, Any]:
+            payload["run_stamp"] = dict(self._run_stamp)
+            payload["run_stamp_hash"] = str(self._run_stamp_hash)
+            payload["run_stamp_short"] = str(self._run_stamp_short)
+            return payload
+
         if isinstance(exc, FitSimulationError):
             nested = exc.details.get("failure") if isinstance(getattr(exc, "details", None), Mapping) else None
             if isinstance(nested, Mapping) and "kind" in nested and "message" in nested:
-                return coerce_simulation_failure(nested)
-            return build_simulation_failure(
-                "fitting_error",
-                str(getattr(exc, "message", None) or str(exc)),
-                code=getattr(exc, "code", None),
-                context=getattr(exc, "context", None),
-                details=getattr(exc, "details", None),
-                exc_type=exc.__class__.__name__,
+                return _with_run_stamp(coerce_simulation_failure(nested))
+            return _with_run_stamp(
+                build_simulation_failure(
+                    "fitting_error",
+                    str(getattr(exc, "message", None) or str(exc)),
+                    code=getattr(exc, "code", None),
+                    context=getattr(exc, "context", None),
+                    details=getattr(exc, "details", None),
+                    exc_type=exc.__class__.__name__,
+                )
             )
         if isinstance(exc, FittingCancelled):
             details = dict(getattr(exc, "details", None) or {})
             original_message = str(getattr(exc, "message", None) or str(exc) or "")
             if original_message and original_message != "Fit cancelled by user":
                 details.setdefault("origin_message", original_message)
-            return build_simulation_failure(
-                "cancelled",
-                "Fit cancelled by user",
-                code=getattr(exc, "code", None),
-                context=getattr(exc, "context", None),
-                details=details,
+            return _with_run_stamp(
+                build_simulation_failure(
+                    "cancelled",
+                    "Fit cancelled by user",
+                    code=getattr(exc, "code", None),
+                    context=getattr(exc, "context", None),
+                    details=details,
+                    exc_type=exc.__class__.__name__,
+                )
+            )
+        return _with_run_stamp(
+            build_simulation_failure(
+                "fitting_error",
+                str(exc) or exc.__class__.__name__,
                 exc_type=exc.__class__.__name__,
             )
-        return build_simulation_failure(
-            "fitting_error",
-            str(exc) or exc.__class__.__name__,
-            exc_type=exc.__class__.__name__,
         )
 
     def _execute(self) -> Optional[GlobalFitFinishedPayloadV1]:
@@ -254,6 +266,8 @@ class GlobalFitWorker(QtCore.QThread):
             raise RuntimeError("No datasets were provided.")
         if self._fit_evaluator is None:
             raise RuntimeError("Fit evaluator is not configured.")
+        if type(self._fit_evaluator) is SerialFittingEvaluator and not self._runtime_session_ready_for_fit():
+            raise RuntimeError("A required fitting runtime session is not ready for this global fit worker.")
 
         def progress_callback(iteration: int, cost: float, params: Dict[str, float]) -> None:
             self._wait_if_paused()
@@ -286,16 +300,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._last_heavy_emit_ts = time.monotonic()
         self._last_best_emit_had_plot_payload = False
 
-        warm_runtime = getattr(self._fit_runtime_session, "warm", None)
-        if callable(warm_runtime):
-            self.progress.emit(5, "Preparing fitting runtime...")
-            warm_runtime(
-                cancellation_check=cancellation_check,
-                lane_count=self._fit_runtime_max_lanes,
-            )
-            if self._cancelled:
-                raise FittingCancelled()
-
         self.progress.emit(5, f"Running global fit... [{self._solver}]")
         result = self._fit_func(
             self._fit_evaluator,
@@ -322,6 +326,18 @@ class GlobalFitWorker(QtCore.QThread):
         self._flush_pending_best()
         self.progress.emit(100, "Fit complete")
         return self._build_finished_payload(result)
+
+    def _runtime_session_ready_for_fit(self) -> bool:
+        runtime_session = self._fit_runtime_session
+        if runtime_session is None:
+            return False
+        is_ready = getattr(runtime_session, "is_ready", None)
+        if not callable(is_ready):
+            return False
+        try:
+            return bool(is_ready(lane_count=max(1, int(self._fit_runtime_max_lanes))))
+        except Exception:
+            return False
 
     def _build_finished_payload(self, result: "GlobalFitResult") -> GlobalFitFinishedPayloadV1:
         return {
@@ -762,7 +778,8 @@ class GlobalFitWorker(QtCore.QThread):
                 y_name=species_name,
             )
         except FitSimulationError as exc:
-            if not is_non_monotone_in_sampled_window_error(exc):
+            msg = str(exc).lower()
+            if not (is_non_monotone_in_sampled_window_error(exc) or "fall outside model range" in msg):
                 raise
         return align_y_on_x_obs_time_guided_penalized(
             t_obs=t_exp,

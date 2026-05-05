@@ -151,6 +151,50 @@ def test_cache_hits_for_identical_requests():
     assert stats_after_variant.hits >= 1
 
 
+def test_simulation_request_fingerprint_includes_intervention_schedule_identity():
+    _, _, rhs, y0 = _simple_mechanism()
+    base_req = SimulationRequest(
+        rhs=rhs,
+        t_span=(0.0, 1.0),
+        y0=y0,
+        solver="BDF",
+        grid={"N": 3},
+        species_names=("A", "B"),
+    )
+
+    schedule_a = {
+        "instant_events": [{"op": "set", "species": "A", "time": 0.5, "value": 2.0}]
+    }
+    equivalent_schedule_a = {
+        "version": 1,
+        "intervals": [],
+        "instant_events": [{"species": "A", "op": "set", "value": 2.0, "time": 0.5}],
+    }
+    schedule_b = {
+        "instant_events": [{"op": "set", "species": "A", "time": 0.5, "value": 3.0}]
+    }
+
+    unscheduled_fp = fingerprint_simulation_request(base_req)
+    scheduled_a_fp = fingerprint_simulation_request(
+        replace(base_req, intervention_schedule=schedule_a)
+    )
+    scheduled_equivalent_fp = fingerprint_simulation_request(
+        replace(base_req, intervention_schedule=equivalent_schedule_a)
+    )
+    scheduled_b_fp = fingerprint_simulation_request(
+        replace(base_req, intervention_schedule=schedule_b)
+    )
+    reordered_species_fp = fingerprint_simulation_request(
+        replace(base_req, intervention_schedule=schedule_a, species_names=("B", "A"))
+    )
+
+    assert scheduled_a_fp is not None
+    assert scheduled_a_fp == scheduled_equivalent_fp
+    assert scheduled_a_fp != unscheduled_fp
+    assert scheduled_a_fp != scheduled_b_fp
+    assert scheduled_a_fp != reordered_species_fp
+
+
 def test_cache_registered_caches_does_not_retain_ephemeral_wrappers():
     import kindred.core.cache as cache_mod
 

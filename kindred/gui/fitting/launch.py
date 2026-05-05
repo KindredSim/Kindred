@@ -12,7 +12,6 @@ from PySide6 import QtWidgets
 
 from kindred.core.analysis.fit_dataset_payload import FitDatasetPayloadResult, read_fit_dataset_payload
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-from kindred.core.exceptions import FitSimulationError
 from kindred.gui.controllers.dataset_manager import DatasetManagerError
 from kindred.gui.fitting.batch_mapping import (
     T0_SEED_TOL_S,
@@ -396,36 +395,6 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
 
     grid_points = max(2, int(context.num_points_getter()), int(max_len))
     solver_settings = dict(context.get_solver_settings() or {})
-    wegscheider_enabled = bool(
-        solver_settings.get(
-            "wegscheider_cyclicity_enabled",
-            PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
-        )
-    )
-    param_names = [str(entry.get("name")) for entry in (parameter_defs or []) if entry.get("name")]
-
-    simulation_func = None
-    try:
-        fit_context = prepare_fitting_execution_context(
-            mechanism_text=mechanism_text,
-            param_names=param_names,
-            t_end=max_time,
-            num_points=grid_points,
-            temperature_K=float(context.temperature_getter()),
-            solver=str(solver_settings.get("solver") or FITTING_DEFAULT_SOLVER),
-            rtol=float(solver_settings.get("rtol") or 1e-6),
-            atol=float(solver_settings.get("atol") or 1e-12),
-            use_sparse_jacobian=bool(
-                solver_settings.get("use_sparse_jacobian", PROJECT_DEFAULTS["use_sparse_jacobian"])
-            ),
-            wegscheider_cyclicity_enabled=bool(wegscheider_enabled),
-            initial_prefix=initial_prefix,
-        )
-    except FitSimulationError:
-        logger.debug("Global-fit launch deferred fitting evaluator construction until run.", exc_info=True)
-    else:
-        simulation_func = SerialFittingEvaluator(fit_context)
-
     def _build_simulation(
         mechanism_text_for_run: str,
         param_names_for_run: List[str],
@@ -433,12 +402,23 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         solver: Optional[str] = None,
         rtol: Optional[float] = None,
         atol: Optional[float] = None,
+        temperature_K: Optional[float] = None,
+        use_sparse_jacobian: Optional[bool] = None,
+        wegscheider_cyclicity_enabled: Optional[bool] = None,
     ):
         current_solver_settings = solver_settings
-        try:
-            current_solver_settings = dict(context.get_solver_settings() or {})
-        except Exception:
-            current_solver_settings = solver_settings
+        needs_live_solver_settings = (
+            solver is None
+            or rtol is None
+            or atol is None
+            or use_sparse_jacobian is None
+            or wegscheider_cyclicity_enabled is None
+        )
+        if needs_live_solver_settings:
+            try:
+                current_solver_settings = dict(context.get_solver_settings() or {})
+            except Exception:
+                current_solver_settings = solver_settings
 
         current_solver_settings = dict(current_solver_settings or {})
         from kindred.core.simulator.solvers import normalize_solver_name
@@ -456,20 +436,49 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         solver_value, _solver_warning = normalize_solver_name(solver_label)
         rtol_value = float(rtol if rtol is not None else (current_solver_settings.get("rtol") or 1e-6))
         atol_value = float(atol if atol is not None else (current_solver_settings.get("atol") or 1e-12))
+        temperature_value = float(temperature_K) if temperature_K is not None else float(context.temperature_getter())
+        sparse_value = (
+            bool(use_sparse_jacobian)
+            if use_sparse_jacobian is not None
+            else bool(current_solver_settings.get("use_sparse_jacobian"))
+        )
+        wegscheider_value = (
+            bool(wegscheider_cyclicity_enabled)
+            if wegscheider_cyclicity_enabled is not None
+            else bool(current_solver_settings.get("wegscheider_cyclicity_enabled"))
+        )
         fit_context = prepare_fitting_execution_context(
             mechanism_text=str(mechanism_text_for_run or ""),
             param_names=[str(x) for x in (param_names_for_run or []) if str(x)],
             t_end=max_time,
             num_points=grid_points,
-            temperature_K=float(context.temperature_getter()),
+            temperature_K=temperature_value,
             solver=solver_value,
             rtol=rtol_value,
             atol=atol_value,
-            use_sparse_jacobian=bool(current_solver_settings.get("use_sparse_jacobian")),
-            wegscheider_cyclicity_enabled=bool(current_solver_settings.get("wegscheider_cyclicity_enabled")),
+            use_sparse_jacobian=sparse_value,
+            wegscheider_cyclicity_enabled=wegscheider_value,
             initial_prefix=initial_prefix,
         )
         return SerialFittingEvaluator(fit_context)
+
+    def _runtime_settings_for_fit_window() -> Dict[str, object]:
+        current_solver_settings = dict(context.get_solver_settings() or {})
+        return {
+            "temperature_K": float(context.temperature_getter()),
+            "use_sparse_jacobian": bool(
+                current_solver_settings.get(
+                    "use_sparse_jacobian",
+                    PROJECT_DEFAULTS["use_sparse_jacobian"],
+                )
+            ),
+            "wegscheider_cyclicity_enabled": bool(
+                current_solver_settings.get(
+                    "wegscheider_cyclicity_enabled",
+                    PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
+                )
+            ),
+        }
 
     window_factory = _resolve_window_factory(context)
     window = window_factory(
@@ -477,12 +486,13 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         parameter_defs=parameter_defs,
         dataset_entries=dataset_entries,
         dataset_manager=context.dataset_manager,
-        simulation_func=simulation_func,
+        simulation_func=None,
         mechanism_species=mechanism_species,
         mechanism_text_getter=context.mechanism_text_getter,
         reactions_text_getter=context.reactions_text_getter,
         reactions_text_setter=context.reactions_text_setter,
         simulation_builder=_build_simulation,
+        runtime_settings_getter=_runtime_settings_for_fit_window,
         dataset_params=dataset_params,
         dataset_variable_params=dataset_variable_params,
         dataset_payloads=dataset_payloads,

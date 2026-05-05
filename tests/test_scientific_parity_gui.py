@@ -76,3 +76,23 @@ def test_analysis_simulation_honors_temp_response_schedule_in_dsl(main_window):
 
     assert b_response > 0.0
     assert b_response < b_step
+
+
+@pytest.mark.integration
+def test_analysis_simulation_honors_intervention_schedule_in_dsl(main_window):
+    dsl_with_intervention = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=3.0",
+        ]
+    )
+
+    result = main_window._simulate_mechanism(dsl_with_intervention, t_end=2.0, num_points=5)
+
+    a_series = np.asarray(result["species"]["A"], dtype=float).reshape(-1)
+    b_series = np.asarray(result["species"]["B"], dtype=float).reshape(-1)
+    assert float(a_series[0]) == pytest.approx(3.0)
+    assert float(a_series[-1]) == pytest.approx(3.0)
+    assert float(b_series[-1]) == pytest.approx(0.0)

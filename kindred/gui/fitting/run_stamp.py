@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
+from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.dataset_parameter_overrides import (
     FitDatasetParameterOverrides,
     coerce_fit_dataset_parameter_overrides,
@@ -19,7 +21,11 @@ try:
 except Exception:  # pragma: no cover - defensive fallback
     KINDRED_VERSION = ""
 
-__all__ = ["build_global_fit_run_stamp", "hash_global_fit_run_stamp"]
+__all__ = [
+    "build_global_fit_run_stamp",
+    "finalize_global_fit_run_stamp_prepared_simulation",
+    "hash_global_fit_run_stamp",
+]
 
 _REQUIRED_PREPARED_SIMULATION_KEYS = frozenset(
     {
@@ -135,6 +141,43 @@ def _build_global_fit_datasets_block(
     return datasets_block
 
 
+def _array_identity_block(values: object) -> dict[str, Any]:
+    arr = np.asarray(values, dtype=float)
+    arr64 = np.ascontiguousarray(arr, dtype=np.float64)
+    return {
+        "shape": [int(x) for x in arr64.shape],
+        "sha256": hashlib.sha256(arr64.tobytes()).hexdigest(),
+    }
+
+
+def _normalize_dataset_specs_block(dataset_specs: Optional[Sequence[object]]) -> Optional[list[dict[str, Any]]]:
+    if not dataset_specs:
+        return None
+    normalized: list[dict[str, Any]] = []
+    for spec in dataset_specs:
+        if not isinstance(spec, FitDatasetSpec):
+            return None
+        x_obs_block = None if spec.x_obs is None else _array_identity_block(spec.x_obs)
+        normalized.append(
+            {
+                "id": str(spec.dataset_id),
+                "t": _array_identity_block(spec.t_exp),
+                "species": [str(name) for name in spec.species_list],
+                "y": _array_identity_block(spec.y_matrix),
+                "point_count": int(spec.point_count),
+                "x_name": str(spec.x_name),
+                "x_obs": x_obs_block,
+                "x_mapping_mode": str(spec.x_mode),
+                "target_weights": {
+                    str(name): _float_to_canonical_str(value)
+                    for name, value in sorted((spec.target_weights or {}).items())
+                    if str(name).strip()
+                },
+            }
+        )
+    return sorted(normalized, key=lambda item: str(item["id"]))
+
+
 def _normalize_global_fit_weights_used(weights_used: Optional[Dict[str, float]]) -> Optional[dict[str, str]]:
     if weights_used is None:
         return None
@@ -161,6 +204,8 @@ def _normalize_fit_config_dict(fit_config: Dict[str, Any]) -> tuple[dict[str, An
         config["parallel_starts"] = int(config.get("parallel_starts") or 0)
     except Exception:
         config["parallel_starts"] = 0
+    for key in ("ftol", "xtol"):
+        config[key] = _float_to_canonical_str(config.get(key, 0.0))
     return config, {"parameters": parameters, "fixed_params": fixed_params, "bounds": bounds, "log10_params": log10_params}
 
 
@@ -276,6 +321,7 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
         "use_sparse_jacobian": bool(serialized["use_sparse_jacobian"]),
         "wegscheider_cyclicity_enabled": bool(serialized["wegscheider_cyclicity_enabled"]),
         "initial_prefix": str(serialized.get("initial_prefix") or ""),
+        "intervention_schedule_fingerprint": str(serialized.get("intervention_schedule_fingerprint") or ""),
     }
 
 
@@ -291,6 +337,7 @@ def build_global_fit_run_stamp(
     mechanism_text: str,
     reactions_text: str,
     prepared_simulation: Optional[object] = None,
+    dataset_specs: Optional[Sequence[object]] = None,
     dataset_overrides: Optional[Sequence[object]] = None,
     dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
     dataset_variable_params: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
@@ -310,6 +357,7 @@ def build_global_fit_run_stamp(
         applied_targets=applied_norm,
         applied_target_weights=applied_target_weights_norm,
     )
+    dataset_specs_block = _normalize_dataset_specs_block(dataset_specs)
     weights_block = _normalize_global_fit_weights_used(weights_used)
 
     config, extracted = _normalize_fit_config_dict(fit_config)
@@ -342,6 +390,7 @@ def build_global_fit_run_stamp(
         "mode": "global",
         "kindred_version": str(KINDRED_VERSION or ""),
         "datasets": datasets_block,
+        "dataset_payload_identity": dataset_specs_block,
         "fit_targets_applied": {k: applied_norm[k] for k in ordered_ids if k in applied_norm},
         "target_weights_applied": {k: applied_target_weights_norm[k] for k in ordered_ids if k in applied_target_weights_norm},
         "weight_mode": str(weight_mode or ""),
@@ -351,6 +400,8 @@ def build_global_fit_run_stamp(
             "max_nfev": int(config.get("max_nfev") or 0),
             "seed": (int(config["seed"]) if config.get("seed") is not None else None),
             "parallel_starts": int(config.get("parallel_starts") or 0),
+            "ftol": str(config.get("ftol") or ""),
+            "xtol": str(config.get("xtol") or ""),
         },
         "parameters": {
             "fit": sorted({str(k) for k in parameters.keys() if str(k).strip()}),
@@ -364,6 +415,19 @@ def build_global_fit_run_stamp(
         "mechanism_sha256": _sha256_hex(mechanism_text),
         "reactions_sha256": _sha256_hex(reactions_text),
     }
+
+
+def finalize_global_fit_run_stamp_prepared_simulation(
+    stamp: Dict[str, Any],
+    prepared_simulation: Optional[object],
+) -> Dict[str, Any]:
+    prepared_block = _normalize_prepared_simulation_block(prepared_simulation)
+    finalized = deepcopy(dict(stamp or {}))
+    if prepared_block is None:
+        return finalized
+    finalized["prepared_simulation"] = prepared_block
+    finalized.pop("runtime_request", None)
+    return finalized
 
 
 def hash_global_fit_run_stamp(stamp: Dict[str, Any]) -> str:

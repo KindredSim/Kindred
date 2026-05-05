@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import threading
@@ -23,6 +23,10 @@ class FittingRuntimeLedger:
     lane_creations: int = 0
     lane_warms: int = 0
     candidate_evaluations: int = 0
+    scheduler_creations: int = 0
+    scheduler_reuses: int = 0
+    scheduler_maps: int = 0
+    scheduler_shutdowns: int = 0
     run_cancellations: int = 0
     lane_closes: int = 0
     lane_kills: int = 0
@@ -33,6 +37,10 @@ class FittingRuntimeLedger:
             "lane_creations": int(self.lane_creations),
             "lane_warms": int(self.lane_warms),
             "candidate_evaluations": int(self.candidate_evaluations),
+            "scheduler_creations": int(self.scheduler_creations),
+            "scheduler_reuses": int(self.scheduler_reuses),
+            "scheduler_maps": int(self.scheduler_maps),
+            "scheduler_shutdowns": int(self.scheduler_shutdowns),
             "run_cancellations": int(self.run_cancellations),
             "lane_closes": int(self.lane_closes),
             "lane_kills": int(self.lane_kills),
@@ -60,6 +68,7 @@ class FittingRuntimeSession:
         process_payload: Mapping[str, Any],
         max_lanes: int,
         lane_factory: Optional[Callable[..., Any]] = None,
+        executor_factory: Optional[Callable[..., Any]] = None,
         ledger: Optional[FittingRuntimeLedger] = None,
         request_timeout_s: Optional[float] = None,
     ) -> None:
@@ -68,11 +77,14 @@ class FittingRuntimeSession:
         self._process_payload = dict(process_payload)
         self._max_lanes = int(max_lanes)
         self._lane_factory = lane_factory
+        self._executor_factory = executor_factory
         self._request_timeout_s = request_timeout_s
         self._ledger = ledger if ledger is not None else FittingRuntimeLedger()
         self._ledger.payload_preparations += 1
         self._lanes: list[Optional[Any]] = []
         self._warmed_lane_ids: set[int] = set()
+        self._scheduler = None
+        self._scheduler_workers = 0
         self._lock = threading.RLock()
         self._closed = False
 
@@ -83,6 +95,7 @@ class FittingRuntimeSession:
         *,
         max_lanes: int,
         lane_factory: Optional[Callable[..., Any]] = None,
+        executor_factory: Optional[Callable[..., Any]] = None,
         ledger: Optional[FittingRuntimeLedger] = None,
         request_timeout_s: Optional[float] = None,
     ) -> "FittingRuntimeSession":
@@ -98,6 +111,7 @@ class FittingRuntimeSession:
             process_payload=process_payload,
             max_lanes=int(max_lanes),
             lane_factory=lane_factory,
+            executor_factory=executor_factory,
             ledger=ledger,
             request_timeout_s=request_timeout_s,
         )
@@ -114,8 +128,24 @@ class FittingRuntimeSession:
     def evaluator(self, *, cancellation_check: Optional[Callable[[], bool]] = None) -> "FittingRuntimeEvaluator":
         return FittingRuntimeEvaluator(self, cancellation_check=cancellation_check)
 
+    def is_ready(self, *, lane_count: Optional[int] = None) -> bool:
+        required = self._max_lanes if lane_count is None else min(self._max_lanes, max(1, int(lane_count)))
+        with self._lock:
+            if self._closed:
+                return False
+            lanes = list(self._lanes[:required])
+            if len(lanes) < required or any(lane is None for lane in lanes):
+                return False
+            if any(id(lane) not in self._warmed_lane_ids for lane in lanes if lane is not None):
+                return False
+            if required > 1 and (self._scheduler is None or self._scheduler_workers < required):
+                return False
+            return True
+
     def warm(self, *, cancellation_check: Optional[Callable[[], bool]] = None, lane_count: Optional[int] = None) -> None:
         lanes = self._ensure_lanes(lane_count=lane_count)
+        if len(lanes) > 1:
+            self._ensure_scheduler(worker_count=len(lanes))
         for lane in lanes:
             self._raise_if_cancelled(cancellation_check)
             lane_id = id(lane)
@@ -201,12 +231,19 @@ class FittingRuntimeSession:
                     for index, runtime_request in groups[group_index]
                 ]
 
-            with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="kindred-fitting-runtime") as executor:
+            executor = self._ensure_scheduler(worker_count=lane_count)
+            with self._lock:
+                self._ledger.scheduler_maps += 1
+            try:
                 ordered = [
                     item
                     for group_result in executor.map(_evaluate_group, range(lane_count))
                     for item in group_result
                 ]
+            except (CancelledError, RuntimeError) as exc:
+                if self._is_closed() or self._cancel_requested(cancellation_check):
+                    raise FittingCancelled() from exc
+                raise
         ordered.sort(key=lambda pair: int(pair[0]))
         return [value for _index, value in ordered]
 
@@ -220,7 +257,20 @@ class FittingRuntimeSession:
             lanes = [lane for lane in self._lanes if lane is not None]
             self._lanes = []
             self._warmed_lane_ids.clear()
+            scheduler = self._scheduler
+            self._scheduler = None
+            self._scheduler_workers = 0
             self._closed = True
+        if scheduler is not None:
+            shutdown = getattr(scheduler, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown(wait=not bool(kill), cancel_futures=bool(kill))
+                except TypeError:
+                    shutdown(wait=not bool(kill))
+                except Exception as exc:
+                    logger.debug("Failed to shutdown fitting runtime scheduler: %s", exc, exc_info=True)
+            self._ledger.scheduler_shutdowns += 1
         for lane in lanes:
             close = getattr(lane, "close", None)
             if callable(close):
@@ -258,6 +308,47 @@ class FittingRuntimeSession:
             kwargs["request_timeout_s"] = float(self._request_timeout_s)
         return factory(dict(self._process_payload), **kwargs)
 
+    def _ensure_scheduler(self, *, worker_count: int):
+        required = max(2, int(worker_count))
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Fitting runtime session is closed.")
+            if self._scheduler is not None and self._scheduler_workers >= required:
+                self._ledger.scheduler_reuses += 1
+                return self._scheduler
+            old_scheduler = self._scheduler
+            self._scheduler = None
+            self._scheduler_workers = 0
+        if old_scheduler is not None:
+            shutdown = getattr(old_scheduler, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown(wait=True, cancel_futures=False)
+                except TypeError:
+                    shutdown(wait=True)
+                except Exception as exc:
+                    logger.debug("Failed to shutdown superseded fitting runtime scheduler: %s", exc, exc_info=True)
+            with self._lock:
+                self._ledger.scheduler_shutdowns += 1
+        factory = self._executor_factory or ThreadPoolExecutor
+        scheduler = factory(
+            max_workers=required,
+            thread_name_prefix="kindred-fitting-runtime",
+        )
+        with self._lock:
+            if self._closed:
+                shutdown = getattr(scheduler, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown(wait=True, cancel_futures=False)
+                    except TypeError:
+                        shutdown(wait=True)
+                raise RuntimeError("Fitting runtime session is closed.")
+            self._scheduler = scheduler
+            self._scheduler_workers = required
+            self._ledger.scheduler_creations += 1
+            return self._scheduler
+
     def _lane_for_slot(
         self,
         slot_index: int,
@@ -294,6 +385,10 @@ class FittingRuntimeSession:
     def _raise_if_cancelled(self, cancellation_check: Optional[Callable[[], bool]]) -> None:
         if self._cancel_requested(cancellation_check):
             raise FittingCancelled()
+
+    def _is_closed(self) -> bool:
+        with self._lock:
+            return bool(self._closed)
 
 
 def _fatal_fit_runtime_error(

@@ -9,6 +9,18 @@ from kindred.core.simulator.solvers import SimulationOutput
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _clear_fitting_objective_cache():
+    from kindred.core import fitting_objective
+
+    clear_cache = getattr(fitting_objective._solve_request_cached, "cache_clear", None)
+    if callable(clear_cache):
+        clear_cache()
+    yield
+    if callable(clear_cache):
+        clear_cache()
+
+
 
 MECHANISM = "\n".join(
     [

@@ -46,27 +46,15 @@ def _make_data_tab(*, worker_running=False):
 def _make_params_tab(*, integration_defaults=("BDF", 1e-6, 1e-12),
                      entries=None, species=None):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
-    from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
     if entries is None:
         entries = [{"id": "ds1", "label": "DS 1"}]
     if species is None:
         species = ["A", "B"]
 
-    ic_panel = UnifiedSpeciesTable(
-        dataset_entries=list(entries),
-        mechanism_species=list(species),
-        dataset_entries_getter=lambda: list(entries),
-        included_dataset_ids_getter=lambda: [str(e["id"]) for e in entries],
-        dataset_label_getter=lambda ds_id: next(
-            (str(e.get("label") or ds_id) for e in entries if str(e.get("id")) == ds_id),
-            str(ds_id),
-        ),
-        dataset_weight_getter=lambda _ds_id: 1.0,
-        persist_dataset_weight_callback=lambda _ds_id, _weight: None,
-        dataset_manager_getter=lambda: None,
-        worker_running_getter=lambda: False,
-    )
+    def initial_parameter_defaults_getter(_dataset_id, _species):
+        return False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
+
     tab = ParametersIcsTab(
         parameter_state=[],
         initial_parameter_snapshot=[],
@@ -84,7 +72,7 @@ def _make_params_tab(*, integration_defaults=("BDF", 1e-6, 1e-12),
         reactions_text_getter=lambda: "",
         integration_defaults=integration_defaults,
         config_defaults={},
-        ic_panel=ic_panel,
+        initial_parameter_defaults_getter=initial_parameter_defaults_getter,
     )
     return tab
 
@@ -230,8 +218,8 @@ def test_push_best_update_empty_dataset_params_clears_staged(qt_app):
 # ITEM 18 — rebuild_for_mechanism updates entries before combo
 # ===================================================================
 
-def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
-    """rebuild_for_mechanism updates _dataset_entries before refreshing IC panel."""
+def test_rebuild_for_mechanism_updates_dataset_entries(qt_app):
+    """rebuild_for_mechanism updates the tab dataset entries without IC widget reach-through."""
     initial_entries = [{"id": "ds1", "label": "DS 1"}]
     tab = _make_params_tab(entries=initial_entries, species=["A"])
     try:
@@ -241,10 +229,9 @@ def test_rebuild_for_mechanism_updates_dataset_entries_before_combo(qt_app):
         ]
         tab.rebuild_for_mechanism("", new_entries)
 
-        # IC panel receives updated dataset entries via refresh_dataset_combo
-        ic_entry_ids = [str(e.get("id") or "") for e in tab._ic_panel._dataset_entries]
-        assert "ds1" in ic_entry_ids
-        assert "ds2" in ic_entry_ids
+        entry_ids = [str(e.get("id") or "") for e in tab._dataset_entries]
+        assert "ds1" in entry_ids
+        assert "ds2" in entry_ids
     finally:
         tab.close()
         qt_app.processEvents()

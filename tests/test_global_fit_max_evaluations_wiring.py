@@ -123,8 +123,7 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
         window._params_ics_tab._max_eval_spin.setValue(123)
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        dataset_selection = window._collect_dataset_selection()
-        window._start_global_fit(config, dataset_selection)
+        window._start_fit()
         assert captured["max_nfev"] == 123
     finally:
         window.close()

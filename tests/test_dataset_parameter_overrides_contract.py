@@ -175,8 +175,7 @@ def test_fitting_window_passes_typed_dataset_overrides_to_worker(qt_app, monkeyp
     try:
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
-        window._start_global_fit(config, selection)
+        window._start_fit()
 
         overrides = captured.get("dataset_overrides")
         assert isinstance(overrides, list)

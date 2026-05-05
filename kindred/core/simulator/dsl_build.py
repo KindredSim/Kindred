@@ -55,6 +55,7 @@ def build_mechanism_from_ir(
     steps = list(getattr(ir, "steps", []) or [])
     algebra_lines = list(getattr(ir, "algebra_lines", []) or [])
     temperature_schedule = getattr(ir, "temperature_schedule", None)
+    intervention_schedule = getattr(ir, "intervention_schedule", None)
 
     mechanism = Mechanism()
     MechanismMetadataView(
@@ -314,5 +315,7 @@ def build_mechanism_from_ir(
 
     if temperature_schedule is not None:
         mechanism.metadata[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule
+    if intervention_schedule is not None:
+        mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE] = intervention_schedule
 
     return mechanism

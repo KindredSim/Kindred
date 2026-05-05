@@ -114,6 +114,31 @@ def test_prepare_simulation_worker_run_disables_sparse_jacobian_for_temperature_
     ]
 
 
+def test_prepare_simulation_worker_run_reports_invalid_intervention_schedule_stage() -> None:
+    from kindred.core.simulation_preparation import (
+        SimulationPreparationError,
+        prepare_simulation_worker_run,
+    )
+
+    with pytest.raises(SimulationPreparationError) as excinfo:
+        prepare_simulation_worker_run(
+            mechanism_text="\n".join(
+                [
+                    "reaction: A -> B; k=0.2",
+                    "initial: A=1.0",
+                    "initial: B=0.0",
+                    "intervention: op=set; species=C; time=0.5; value=1.0",
+                ]
+            ),
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 1.0),
+            solver_config={"solver": "BDF", "grid": {"N": 5}},
+        )
+
+    assert excinfo.value.stage == "intervention_schedule"
+    assert "Unknown intervention species: C" in str(excinfo.value)
+
+
 def test_prepare_simulation_worker_run_rejects_unknown_prepared_payload_version(monkeypatch) -> None:
     from kindred.core.simulation_preparation import (
         SimulationPreparationError,

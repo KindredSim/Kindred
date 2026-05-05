@@ -257,13 +257,14 @@ def test_reactions_text_has_param_decl_detects_existing_param():
 
 # ---- Stale-applied-targets bug: empty apply must disable Run Fit ----
 
-def test_apply_empty_targets_disables_run_fit(qt_app):
+def test_apply_empty_targets_disables_run_fit(qt_app, qtbot):
     window = _make_window()
     try:
         st = window._species_table
 
         # Initially ds1 has applied target ["A"], Run Fit should be enabled
-        window._refresh_run_button_enabled_state()
+        window._prepare_fit_runtime_for_current_state()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
         assert window._run_button.isEnabled(), "Run Fit should start enabled with applied targets"
 
         # Uncheck all targets for ds1

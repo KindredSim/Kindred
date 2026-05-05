@@ -43,6 +43,29 @@ def test_direct_module_build_fitting_objective_rejects_nonmonotone_time_grid() -
 
 
 @pytest.mark.unit
+def test_direct_prepare_fitting_objective_context_preserves_intervention_schedule() -> None:
+    from kindred.core.simulation_preparation import prepare_fitting_objective_context
+
+    prepared = prepare_fitting_objective_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=set; species=A; time=0.0; value=3.0",
+            ]
+        ),
+        param_names=["k1"],
+        t_exp=np.array([0.0, 0.5, 1.0], dtype=float),
+        target_species="A",
+        solver="BDF",
+    )
+
+    assert prepared.request.intervention_schedule is not None
+    assert prepared.request.species_names == ("A", "B")
+
+
+@pytest.mark.unit
 def test_direct_module_prepared_objective_penalizes_nonfinite_model_series() -> None:
     prepared = PreparedFittingObjectiveContext(
         bound=BoundMechanism(

@@ -353,11 +353,22 @@ def test_fit_global_wraps_exact_serial_evaluator_with_runtime_session_by_default
     from kindred.core.fitting_runtime_session import FittingRuntimeSession
 
     wrapped = {"count": 0}
-    original_from_serial = FittingRuntimeSession.from_serial_evaluator
+    class _FakeRuntimeSession:
+        def __init__(self, evaluator):
+            self._evaluator = evaluator
+
+        def begin_run(self) -> None:
+            return None
+
+        def evaluator(self, *, cancellation_check=None):
+            return self._evaluator
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
 
     def _spy_from_serial(cls, evaluator, *args, **kwargs):
         wrapped["count"] += 1
-        return original_from_serial(evaluator, *args, **kwargs)
+        return _FakeRuntimeSession(evaluator)
 
     monkeypatch.setattr(FittingRuntimeSession, "from_serial_evaluator", classmethod(_spy_from_serial))
     monkeypatch.setattr(

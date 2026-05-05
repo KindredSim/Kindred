@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import replace
+import threading
 from unittest import mock
 
 import pytest
@@ -8,6 +10,7 @@ import numpy as np
 import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.core.analysis.fit_dataset_payload import FitDatasetPayloadResult
 from kindred.core.analysis.global_fitting import DatasetFitInfo, GlobalFitResult
 from kindred.core.fitting_completion import FitDetailSection, FitDiagnostic, GlobalFitCompletion
 from kindred.core.simulation_failure import build_simulation_failure
@@ -169,6 +172,66 @@ def _build_window(
     )
 
 
+def _build_dataset_variable_window(*, simulation_func=None) -> FittingWindow:
+    return FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_variable_params={
+            "ds1": {
+                "init:A": {
+                    "initial": 1.0,
+                    "min": 0.1,
+                    "max": 10.0,
+                    "log10": False,
+                }
+            }
+        },
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        simulation_func=simulation_func or _basic_serial_fitting_evaluator(),
+    )
+
+
+def _basic_mechanism_text() -> str:
+    return "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+
+
+def _basic_serial_fitting_evaluator(*, solver: str = "BDF", rtol: float = 1e-6, atol: float = 1e-12):
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    context = prepare_fitting_execution_context(
+        mechanism_text=_basic_mechanism_text(),
+        param_names=["k"],
+        t_end=2.0,
+        num_points=3,
+        solver=str(solver),
+        rtol=float(rtol),
+        atol=float(atol),
+        initial_prefix="initial:",
+    )
+    return SerialFittingEvaluator(context)
+
+
 class _DatasetPanelSignal:
     def connect(self, _callback) -> None:
         return None
@@ -214,6 +277,889 @@ class _SignalWorker(QtCore.QObject):
         self.cancel_called = True
 
 
+def _start_worker_from_accepted_launch(
+    window,
+    *,
+    datasets,
+    config,
+    dataset_overrides=None,
+    weights=None,
+    requested_solver="BDF",
+    requested_rtol=1e-6,
+    requested_atol=1e-12,
+    fit_evaluator=None,
+    stamp=None,
+    stamp_hash="test-run",
+    stamp_short=None,
+    runtime_session=None,
+):
+    from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
+    from kindred.core.analysis.dataset_parameter_overrides import coerce_fit_dataset_parameter_overrides
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeAcceptedLaunch, FittingRuntimeIdentity
+
+    raw_datasets = list(datasets or [])
+    if not raw_datasets:
+        raw_datasets = [dict(value) for value in getattr(window, "_global_payload_lookup", {}).values()]
+    dataset_specs = tuple(coerce_fit_dataset_specs(raw_datasets))
+    overrides = tuple(
+        coerce_fit_dataset_parameter_overrides(
+            dataset_ids=[spec.dataset_id for spec in dataset_specs],
+            dataset_overrides=list(dataset_overrides or []),
+        )
+    )
+    evaluator = fit_evaluator if fit_evaluator is not None else (lambda _params: {})
+    try:
+        readiness_required = type(coerce_fitting_series_evaluator(evaluator)) is SerialFittingEvaluator
+    except Exception:
+        readiness_required = False
+    identity = FittingRuntimeIdentity(
+        datasets=dataset_specs,
+        config=dict(config or {}),
+        dataset_overrides=overrides,
+        weights=dict(weights) if isinstance(weights, dict) else None,
+        requested_solver=str(requested_solver),
+        requested_rtol=float(requested_rtol),
+        requested_atol=float(requested_atol),
+        fit_evaluator=evaluator,
+        stamp=dict(stamp or {}),
+        stamp_hash=str(stamp_hash or ""),
+        stamp_short=str(stamp_short or stamp_hash or "")[:12],
+        lane_count=window._fit_runtime_lane_budget(len(dataset_specs)),
+        readiness_required=bool(readiness_required),
+    )
+    window._start_accepted_fit_worker(FittingRuntimeAcceptedLaunch(identity=identity, session=runtime_session))
+
+
+def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
+    qt_app,
+    qtbot,
+    monkeypatch,
+):
+    class _ReadyRuntimeSession:
+        def __init__(self) -> None:
+            self.warm_calls: list[int | None] = []
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            self.warm_calls.append(lane_count)
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.warm_calls)
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    sessions: list[_ReadyRuntimeSession] = []
+    builder_calls: list[tuple[str, tuple[str, ...], str, float, float]] = []
+
+    def _session_factory(_evaluator, *, max_lanes, ledger=None):
+        session = _ReadyRuntimeSession()
+        sessions.append(session)
+        return session
+
+    def _simulation_builder(mechanism_text, param_names, *, solver=None, rtol=None, atol=None):
+        builder_calls.append(
+            (
+                str(mechanism_text),
+                tuple(str(name) for name in param_names),
+                str(solver),
+                float(rtol),
+                float(atol),
+            )
+        )
+        return _basic_serial_fitting_evaluator(solver=str(solver), rtol=float(rtol), atol=float(atol))
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        _session_factory,
+    )
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=lambda: "\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=_simulation_builder,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._on_targets_applied()
+        window.show()
+        qtbot.waitUntil(lambda: bool(sessions) and sessions[-1].is_ready(), timeout=3000)
+
+        assert builder_calls
+        assert window._run_button.isEnabled() is True
+
+        warm_count = len(sessions[-1].warm_calls)
+        window._start_fit()
+
+        assert len(sessions[-1].warm_calls) == warm_count
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_passive_fit_runtime_preparation_builds_evaluator_off_gui_thread(
+    qt_app,
+    qtbot,
+    monkeypatch,
+):
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context, SerialFittingEvaluator
+
+    gui_thread_id = threading.get_ident()
+    builder_thread_ids: list[int] = []
+    runtime_getter_thread_ids: list[int] = []
+    runtime_settings_seen: list[dict[str, object]] = []
+
+    class _ReadyRuntimeSession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    def _session_factory(_evaluator, *, max_lanes, ledger=None):
+        return _ReadyRuntimeSession()
+
+    def _runtime_settings_getter():
+        runtime_getter_thread_ids.append(threading.get_ident())
+        return {
+            "temperature_K": 310.0,
+            "use_sparse_jacobian": False,
+            "wegscheider_cyclicity_enabled": False,
+        }
+
+    def _simulation_builder(
+        mechanism_text,
+        param_names,
+        *,
+        solver=None,
+        rtol=None,
+        atol=None,
+        temperature_K=None,
+        use_sparse_jacobian=None,
+        wegscheider_cyclicity_enabled=None,
+    ):
+        builder_thread_ids.append(threading.get_ident())
+        runtime_settings_seen.append(
+            {
+                "temperature_K": float(temperature_K),
+                "use_sparse_jacobian": bool(use_sparse_jacobian),
+                "wegscheider_cyclicity_enabled": bool(wegscheider_cyclicity_enabled),
+            }
+        )
+        context = prepare_fitting_execution_context(
+            mechanism_text=str(mechanism_text),
+            param_names=list(param_names),
+            t_end=2.0,
+            num_points=3,
+            temperature_K=float(temperature_K),
+            solver=str(solver),
+            rtol=float(rtol),
+            atol=float(atol),
+            use_sparse_jacobian=bool(use_sparse_jacobian),
+            wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
+            initial_prefix="initial:",
+        )
+        return SerialFittingEvaluator(context)
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        _session_factory,
+    )
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=_simulation_builder,
+        runtime_settings_getter=_runtime_settings_getter,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._prepare_fit_runtime_for_current_state()
+
+        qtbot.waitUntil(lambda: window._fit_runtime_readiness.snapshot().state.name == "READY", timeout=3000)
+        assert builder_thread_ids
+        assert gui_thread_id not in builder_thread_ids
+        assert runtime_getter_thread_ids
+        assert set(runtime_getter_thread_ids) == {gui_thread_id}
+        assert runtime_settings_seen == [
+            {
+                "temperature_K": 310.0,
+                "use_sparse_jacobian": False,
+                "wegscheider_cyclicity_enabled": False,
+            }
+        ]
+        assert window._run_button.isEnabled() is True
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_failed_fit_runtime_preparation_stays_failed_without_auto_retry(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
+
+    completed = threading.Event()
+    attempts = []
+
+    def _session_factory(_fit_evaluator, lane_count):
+        attempts.append(int(lane_count))
+        raise RuntimeError("factory boom")
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="factory-fail",
+        stamp_short="factory-fail",
+        lane_count=1,
+    )
+
+    controller.set_desired_identity(identity)
+    assert completed.wait(1.0)
+    controller.handle_worker_finished()
+
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.FAILED
+    assert "factory boom" in str(snapshot.error)
+    assert snapshot.desired_hash == ""
+    assert attempts == [1]
+    assert snapshot.ledger.preparation_starts == 1
+
+
+def test_required_fit_runtime_preparation_without_session_fails(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
+
+    completed = threading.Event()
+
+    def _session_factory(_fit_evaluator, lane_count):
+        return None
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="missing-required-session",
+        stamp_short="missing-required-session",
+        lane_count=1,
+        readiness_required=True,
+    )
+
+    controller.set_desired_identity(identity)
+    assert completed.wait(1.0)
+    controller.handle_worker_finished()
+
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.FAILED
+    assert "required fitting runtime session" in str(snapshot.error)
+    assert controller.is_ready_for(identity) is False
+    assert snapshot.ready_hash == ""
+
+
+def test_fit_runtime_poll_retries_completion_when_worker_is_still_unwinding(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessState,
+    )
+
+    class _RuntimeSession:
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    class _UnwindingWorker:
+        status = "prepared"
+        session_created = True
+
+        def __init__(self, identity: FittingRuntimeIdentity, session: _RuntimeSession) -> None:
+            self.prepared_identity = identity
+            self.prepared_session = session
+            self.running_checks = 0
+
+        def isRunning(self) -> bool:
+            self.running_checks += 1
+            return self.running_checks == 1
+
+        def cancel(self) -> None:
+            return None
+
+    window = _build_window()
+    try:
+        identity = FittingRuntimeIdentity(
+            datasets=(),
+            config={},
+            dataset_overrides=(),
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=_basic_serial_fitting_evaluator(),
+            stamp={},
+            stamp_hash="unwinding-worker",
+            stamp_short="unwinding-worker",
+            lane_count=1,
+            readiness_required=True,
+        )
+        session = _RuntimeSession()
+        worker = _UnwindingWorker(identity, session)
+        readiness = window._fit_runtime_readiness
+        readiness._desired_identity = identity
+        readiness._active_identity = identity
+        readiness._worker = worker
+        readiness._state = FittingRuntimeReadinessState.PREPARING
+
+        window._poll_fit_runtime_preparation()
+
+        assert readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING
+        qtbot.waitUntil(
+            lambda: readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            timeout=1000,
+        )
+        assert readiness.snapshot().session is session
+        assert worker.running_checks >= 2
+    finally:
+        window.close()
+
+
+def test_close_retries_fit_runtime_completion_when_worker_is_still_unwinding(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessState,
+    )
+
+    class _RuntimeSession:
+        def __init__(self) -> None:
+            self.close_calls: list[bool] = []
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    class _UnwindingWorker:
+        status = "prepared"
+        session_created = True
+
+        def __init__(self, identity: FittingRuntimeIdentity, session: _RuntimeSession) -> None:
+            self.prepared_identity = identity
+            self.prepared_session = session
+            self.running_checks = 0
+            self.cancelled = False
+
+        def isRunning(self) -> bool:
+            self.running_checks += 1
+            return self.running_checks <= 2
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    window = _build_window()
+    try:
+        identity = FittingRuntimeIdentity(
+            datasets=(),
+            config={},
+            dataset_overrides=(),
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=_basic_serial_fitting_evaluator(),
+            stamp={},
+            stamp_hash="closing-unwinding-worker",
+            stamp_short="closing-unwinding-worker",
+            lane_count=1,
+            readiness_required=True,
+        )
+        session = _RuntimeSession()
+        worker = _UnwindingWorker(identity, session)
+        readiness = window._fit_runtime_readiness
+        readiness._desired_identity = identity
+        readiness._active_identity = identity
+        readiness._worker = worker
+        readiness._state = FittingRuntimeReadinessState.PREPARING
+
+        window.close()
+        qt_app.processEvents()
+
+        assert shiboken6.isValid(window)
+        assert window._closing is True
+        assert window._close_after_fit_runtime_prepare is True
+        assert worker.cancelled is True
+
+        window._poll_fit_runtime_preparation()
+
+        assert readiness.snapshot().state is FittingRuntimeReadinessState.CLOSING
+        qtbot.waitUntil(lambda: not shiboken6.isValid(window), timeout=1000)
+        assert worker.running_checks >= 3
+        assert session.close_calls == [True]
+    finally:
+        if shiboken6.isValid(window):
+            window.close()
+
+
+def test_fit_runtime_identity_defensively_copies_mutable_inputs():
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
+
+    config = {"parameters": {"k": 1.0}}
+    weights = {"ds1": 1.0}
+    stamp = {"algorithm": {"method": "trf"}}
+
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config=config,
+        dataset_overrides=(),
+        weights=weights,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp=stamp,
+        stamp_hash="immutable-inputs",
+        stamp_short="immutable-inputs",
+        lane_count=1,
+    )
+
+    config["parameters"]["k"] = 2.0
+    weights["ds1"] = 3.0
+    stamp["algorithm"]["method"] = "lm"
+
+    assert identity.config["parameters"]["k"] == 1.0
+    assert identity.weights == {"ds1": 1.0}
+    assert identity.stamp["algorithm"]["method"] == "trf"
+
+
+def test_superseded_same_hash_different_lane_preparation_does_not_publish_ready(qt_app):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+    )
+
+    completed = threading.Event()
+    sessions: list[object] = []
+
+    class _RuntimeSession:
+        def __init__(self, lane_count: int) -> None:
+            self.lane_count = int(lane_count)
+            self.closed: list[bool] = []
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            return None
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return int(lane_count or 0) == self.lane_count
+
+        def cancel_run(self) -> None:
+            return None
+
+        def close(self, *, kill: bool = False) -> None:
+            self.closed.append(bool(kill))
+
+    def _session_factory(_fit_evaluator, lane_count):
+        session = _RuntimeSession(int(lane_count))
+        sessions.append(session)
+        return session
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    first = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="same-stamp",
+        stamp_short="same-stamp",
+        lane_count=1,
+    )
+    second = replace(first, lane_count=2)
+
+    controller.set_desired_identity(first)
+    assert completed.wait(1.0)
+    completed.clear()
+
+    controller.set_desired_identity(second)
+
+    snapshot = controller.snapshot()
+    assert snapshot.identity is None or snapshot.identity.lane_count != 1
+    assert controller.accepted_launch_for(second) is None
+    assert sessions[0].closed == [False]
+
+
+def test_fit_runtime_preparation_failure_is_visible_in_window(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    def _simulation_builder(*_args, **_kwargs):
+        raise RuntimeError("builder boom")
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=_simulation_builder,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._prepare_fit_runtime_for_current_state()
+
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.worker is None
+            or not window._fit_runtime_readiness.worker.isRunning(),
+            timeout=3000,
+        )
+        window._poll_fit_runtime_preparation()
+
+        assert window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.FAILED
+        assert "Fitting runtime preparation failed: builder boom" in window._status_label.text()
+        assert window._run_button.isEnabled() is False
+        assert window._stop_button.isEnabled() is False
+        assert getattr(window, "_fit_runtime_prepare_refresh_pending", False) is False
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_worker_rejects_missing_required_fit_runtime_session(qt_app):
+    from kindred.gui.fitting.worker import GlobalFitWorker
+
+    window = _build_window()
+    try:
+        dataset = dict(window._global_payload_lookup["ds1"])
+    finally:
+        window.close()
+    worker = GlobalFitWorker(
+        [dataset],
+        {"k": 1.0},
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        fit_runtime_session=None,
+        fit_runtime_max_lanes=1,
+    )
+    with pytest.raises(RuntimeError, match="required fitting runtime session"):
+        worker._execute()
+
+
+def test_cancelled_fit_runtime_preparation_returns_readiness_to_empty(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
+
+    release_warm = threading.Event()
+    completed = threading.Event()
+    sessions: list[object] = []
+
+    class _RuntimeSession:
+        def __init__(self) -> None:
+            self.closed: list[bool] = []
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            while not release_warm.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    return
+
+        def cancel_run(self) -> None:
+            release_warm.set()
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return False
+
+        def close(self, *, kill: bool = False) -> None:
+            self.closed.append(bool(kill))
+
+    def _session_factory(_fit_evaluator, lane_count):
+        session = _RuntimeSession()
+        sessions.append(session)
+        return session
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="cancel-prep",
+        stamp_short="cancel-prep",
+        lane_count=1,
+    )
+
+    controller.set_desired_identity(identity)
+    assert controller.snapshot().state is FittingRuntimeReadinessState.PREPARING
+
+    assert controller.cancel(kill=True) is False
+    assert completed.wait(1.0)
+    controller.handle_worker_finished()
+
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.EMPTY
+    assert snapshot.desired_hash == ""
+    assert snapshot.active_hash == ""
+    assert snapshot.ready_hash == ""
+    assert sessions
+    assert sessions[-1].closed == [True]
+
+
+def test_close_during_pre_session_fit_runtime_construction_defers_without_false_session_kill(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
+
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+    completed = threading.Event()
+
+    def _session_factory(_fit_evaluator, lane_count):
+        factory_entered.set()
+        release_factory.wait(1.0)
+        return None
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="close-before-session",
+        stamp_short="close-before-session",
+        lane_count=1,
+        readiness_required=True,
+    )
+
+    controller.set_desired_identity(identity)
+    assert factory_entered.wait(1.0)
+
+    assert controller.close(kill=True) is False
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.CLOSING
+    assert snapshot.ledger.session_creations == 0
+    assert snapshot.ledger.session_closes == 0
+
+    release_factory.set()
+    assert completed.wait(1.0)
+    controller.handle_worker_finished()
+
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.CLOSED
+    assert snapshot.ledger.session_creations == 0
+    assert snapshot.ledger.session_closes == 0
+    assert snapshot.ledger.close_completed == 1
+
+
+def test_close_during_failed_fit_runtime_preparation_completes_closed(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
+
+    completed = threading.Event()
+
+    def _session_factory(_fit_evaluator, lane_count):
+        raise RuntimeError("factory failed after close")
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="close-failed-prep",
+        stamp_short="close-failed-prep",
+        lane_count=1,
+        readiness_required=True,
+    )
+
+    controller.set_desired_identity(identity)
+    assert completed.wait(1.0)
+    assert controller.snapshot().state is FittingRuntimeReadinessState.PREPARING
+
+    assert controller.close(kill=True) is True
+
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.CLOSED
+    assert snapshot.error is None
+    assert snapshot.ledger.close_completed == 1
+
+
+def test_close_kills_prepared_fit_runtime_session_after_deferred_drain(qt_app, qtbot):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
+
+    completed = threading.Event()
+    close_calls: list[bool] = []
+
+    class _RuntimeSession:
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            return None
+
+        def cancel_run(self) -> None:
+            return None
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False) -> None:
+            close_calls.append(bool(kill))
+
+    def _session_factory(_fit_evaluator, lane_count):
+        return _RuntimeSession()
+
+    controller = FittingRuntimeReadinessController(
+        session_factory=_session_factory,
+        finished_callback=completed.set,
+    )
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=_basic_serial_fitting_evaluator(),
+        stamp={},
+        stamp_hash="prepared-before-close",
+        stamp_short="prepared-before-close",
+        lane_count=1,
+    )
+
+    controller.set_desired_identity(identity)
+    assert completed.wait(1.0)
+    assert controller.snapshot().state is FittingRuntimeReadinessState.PREPARING
+
+    assert controller.close(kill=True) is True
+
+    snapshot = controller.snapshot()
+    assert snapshot.state is FittingRuntimeReadinessState.CLOSED
+    assert close_calls == [True]
+
+
 def test_global_fit_window_close_deletes_dialog(qt_app, qtbot):
     dataset_entries = [
         {
@@ -235,7 +1181,6 @@ def test_global_fit_window_close_deletes_dialog(qt_app, qtbot):
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": np.asarray([0.0]), "species": {"A": np.asarray([0.0])}},
     )
-    qtbot.addWidget(window)
     destroyed = {"fired": False}
     window.destroyed.connect(lambda *_args: destroyed.__setitem__("fired", True))
 
@@ -307,18 +1252,7 @@ def test_global_fit_window_deletes_worker_after_run(qt_app, qtbot):
     )
     qtbot.addWidget(window)
 
-    config = {
-        "parameters": {"k": 1.0},
-        "bounds": {"k": (0.0, 2.0)},
-        "fixed_params": {},
-        "method": "trf",
-        "max_nfev": 1,
-        "seed": None,
-        "log10_params": {},
-    }
-    dataset_selection = {"rows": [{"id": "ds1", "label": "Dataset 1", "species": "A", "include": True, "weight": 1.0}], "ids": ["ds1"]}
-
-    window._start_global_fit(config, dataset_selection)
+    window._start_fit()
     worker = window._worker
     assert worker is not None
     qtbot.waitUntil(lambda: (not shiboken6.isValid(worker)) or worker.isFinished(), timeout=5000)
@@ -414,7 +1348,8 @@ def test_stale_finished_from_older_fit_worker_does_not_clear_newer_worker(qt_app
         }
 
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -431,7 +1366,8 @@ def test_stale_finished_from_older_fit_worker_does_not_clear_newer_worker(qt_app
         old_worker._running = False
 
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -452,6 +1388,53 @@ def test_stale_finished_from_older_fit_worker_does_not_clear_newer_worker(qt_app
 
         assert window._worker is new_worker
         assert window._stop_button.isEnabled() is True
+    finally:
+        window.close()
+
+
+def test_serial_fit_worker_start_requires_accepted_launch_even_with_ready_snapshot(qt_app, monkeypatch):
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+    )
+
+    workers: list[_SignalWorker] = []
+
+    class _FactoryWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            workers.append(self)
+
+    class _RuntimeSession:
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
+
+    window = _build_window()
+    try:
+        evaluator = _basic_serial_fitting_evaluator()
+        identity = FittingRuntimeIdentity(
+            datasets=(),
+            config={"parameters": {"k": 1.0}},
+            dataset_overrides=(),
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=evaluator,
+            stamp={},
+            stamp_hash="ready-but-not-accepted",
+            stamp_short="ready-but-not-accepted",
+            lane_count=1,
+            readiness_required=True,
+        )
+        assert window._fit_runtime_readiness.accepted_launch_for(identity) is None
+
+        assert workers == []
+        assert window._worker is None
     finally:
         window.close()
 
@@ -485,7 +1468,8 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
         }
 
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -502,7 +1486,8 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
         old_worker._running = False
 
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -544,6 +1529,1088 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
         assert warning_calls == []
     finally:
         window.close()
+
+
+def test_stale_terminal_payload_after_newer_completion_is_rejected_by_run_stamp(qt_app, monkeypatch):
+    workers: list[_SignalWorker] = []
+
+    class _FactoryWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            workers.append(self)
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: fn())
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+
+        window._set_running_state(True)
+        _start_worker_from_accepted_launch(
+            window,
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=lambda _params: {},
+            stamp={},
+            stamp_hash="old",
+            stamp_short="old",
+        )
+        old_worker = workers[-1]
+        old_worker._running = False
+
+        window._set_running_state(True)
+        _start_worker_from_accepted_launch(
+            window,
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=lambda _params: {},
+            stamp={},
+            stamp_hash="new",
+            stamp_short="new",
+        )
+        new_worker = workers[-1]
+        new_worker._running = False
+
+        new_worker.finished.emit(
+            {
+                "result": _build_success_result(value=2.0),
+                "run_stamp_hash": "new",
+            }
+        )
+        assert window._worker is None
+        assert window._last_result.shared_params == {"k": 2.0}
+
+        old_worker.finished.emit(
+            {
+                "result": _build_success_result(value=9.0),
+                "run_stamp_hash": "old",
+            }
+        )
+
+        assert window._last_result.shared_params == {"k": 2.0}
+    finally:
+        window.close()
+
+
+def test_runtime_input_change_supersedes_active_fit_worker_outputs(qt_app, monkeypatch):
+    workers: list[_SignalWorker] = []
+
+    class _CancelableWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.wait_calls: list[int] = []
+            workers.append(self)
+
+        def wait(self, msecs: int | None = None) -> bool:
+            self.wait_calls.append(int(msecs or 0))
+            self._running = False
+            return True
+
+        def terminate(self) -> None:
+            self._running = False
+
+        def deleteLater(self) -> None:
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "exec",
+        lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+    )
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+        prior_result = _build_success_result(value=1.0)
+        window._last_result = prior_result
+        window._set_running_state(True)
+        _start_worker_from_accepted_launch(
+            window,
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=lambda _params: {},
+            stamp={},
+            stamp_hash="active",
+            stamp_short="active",
+        )
+        worker = workers[-1]
+
+        window.handle_external_runtime_inputs_changed()
+
+        assert worker.cancel_called is True
+        assert worker.wait_calls == [2000]
+        assert window._worker is None
+        assert window._active_fit_run_stamp_hash == ""
+        assert window._run_button.isEnabled() is False
+
+        worker.bestUpdated.emit({"cost": 99.0, "shared_params": {"k": 99.0}, "dataset_params": {"ds1": {}}})
+        worker.finished.emit({"result": _build_success_result(value=99.0), "run_stamp_hash": "active"})
+        QtCore.QCoreApplication.processEvents()
+
+        assert window._last_result is prior_result
+        assert window._best_cost is None
+    finally:
+        window.close()
+
+
+def test_runtime_input_change_supersedes_stopped_worker_pending_terminal_signal(qt_app, monkeypatch):
+    workers: list[_SignalWorker] = []
+
+    class _FactoryWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            workers.append(self)
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "exec",
+        lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+    )
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+        prior_result = _build_success_result(value=1.0)
+        window._last_result = prior_result
+        window._best_cost = None
+        window._set_running_state(True)
+        _start_worker_from_accepted_launch(
+            window,
+            datasets=[],
+            config=config,
+            dataset_overrides=[],
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=lambda _params: {},
+            stamp={},
+            stamp_hash="active",
+            stamp_short="active",
+        )
+        worker = workers[-1]
+        worker._running = False
+
+        window.handle_external_runtime_inputs_changed()
+
+        assert window._worker is None
+        assert window._active_fit_run_superseded is True
+        assert window._active_fit_run_stamp_hash == ""
+
+        worker.bestUpdated.emit({"cost": 99.0, "shared_params": {"k": 99.0}, "dataset_params": {"ds1": {}}})
+        worker.finished.emit({"result": _build_success_result(value=99.0), "run_stamp_hash": "active"})
+        QtCore.QCoreApplication.processEvents()
+
+        assert window._last_result is prior_result
+        assert window._best_cost is None
+    finally:
+        window.close()
+
+
+def test_passive_fit_runtime_preparation_keeps_inputs_editable(qt_app, qtbot, monkeypatch):
+    release_warm = threading.Event()
+    events: list[str] = []
+
+    class _RuntimeSession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            events.append("runtime:warm")
+            while not release_warm.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    return
+            self.ready = True
+
+        def close(self, *, kill: bool = False):
+            release_warm.set()
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        return _RuntimeSession()
+
+    class _FactoryWorker(_SignalWorker):
+        def start(self) -> None:
+            events.append("worker:start")
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: "runtime:warm" in events, timeout=2000)
+
+        assert window._run_button.isEnabled() is False
+        assert window._stop_button.isEnabled() is True
+        assert window._params_ics_tab._param_table.isEnabled() is True
+        assert window._species_table._table.isEnabled() is True
+
+        release_warm.set()
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state.name == "READY",
+            timeout=2000,
+        )
+        assert "worker:start" not in events
+        assert window._params_ics_tab._param_table.isEnabled() is True
+        assert window._species_table._table.isEnabled() is True
+    finally:
+        release_warm.set()
+        window.close()
+
+
+def test_integration_setting_change_invalidates_ready_fit_runtime(qt_app, qtbot, monkeypatch):
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.closed: list[bool] = []
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            return None
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False):
+            self.closed.append(bool(kill))
+
+    sessions: list[_ReadySession] = []
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        session = _ReadySession()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator(solver="BDF")
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: bool(sessions) and window._run_button.isEnabled(), timeout=2000)
+        session = sessions[-1]
+        assert window._run_button.isEnabled() is True
+
+        window._params_ics_tab._integration_rtol_edit.setText("1e-5")
+        qt_app.processEvents()
+
+        assert session.closed == [False]
+        assert window._run_button.isEnabled() is False
+    finally:
+        window.close()
+
+
+def test_accepted_fixed_param_launch_does_not_poison_base_evaluator(qt_app, qtbot, monkeypatch):
+    class _ReadySession:
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            return None
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        lambda _evaluator, *, max_lanes, ledger=None: _ReadySession(),
+    )
+
+    window = _build_dataset_variable_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        table = window._params_ics_tab._param_table
+        shared_fit_item = table.item(0, 0)
+        shared_value_item = table.item(0, 3)
+        assert shared_fit_item is not None
+        assert shared_value_item is not None
+        shared_value_item.setText("1.23")
+        shared_fit_item.setCheckState(QtCore.Qt.Unchecked)
+        qt_app.processEvents()
+
+        fixed_identity = window._build_current_fit_runtime_identity()
+        assert fixed_identity is not None
+        assert getattr(fixed_identity.fit_evaluator, "_fixed_params", {}).get("k") == pytest.approx(1.23)
+        window._fit_runtime_readiness.set_desired_identity(fixed_identity)
+        qtbot.waitUntil(lambda: window._fit_runtime_readiness.is_ready_for(fixed_identity), timeout=2000)
+        monkeypatch.setattr(window, "_start_accepted_fit_worker", lambda _accepted_launch: None)
+
+        window._start_fit()
+
+        assert getattr(window._simulation_func, "_fixed_params", {}) == {}
+
+        shared_fit_item.setCheckState(QtCore.Qt.Checked)
+        qt_app.processEvents()
+        next_identity = window._build_current_fit_runtime_identity()
+
+        assert next_identity is not None
+        assert getattr(next_identity.fit_evaluator, "_fixed_params", {}) == {}
+    finally:
+        window.close()
+
+
+def test_dataset_scoped_readiness_uses_live_checked_fit_flag(qt_app):
+    window = _build_dataset_variable_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        shared_fit_item = window._params_ics_tab._param_table.item(0, 0)
+        assert shared_fit_item is not None
+        shared_fit_item.setCheckState(QtCore.Qt.Unchecked)
+        qt_app.processEvents()
+        dataset_row = 1
+        table = window._params_ics_tab._param_table
+        assert table.item(dataset_row, 0).checkState() == QtCore.Qt.Checked
+        window._params_ics_tab._parameter_state[dataset_row]["fit"] = False
+
+        identity = window._build_current_fit_runtime_identity()
+
+        assert identity is not None
+        assert "init:A" in identity.dataset_overrides[0].variable_params
+    finally:
+        window.close()
+
+
+def test_dataset_scoped_readiness_rejects_live_unchecked_fit_flag(qt_app):
+    window = _build_dataset_variable_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        shared_fit_item = window._params_ics_tab._param_table.item(0, 0)
+        assert shared_fit_item is not None
+        shared_fit_item.setCheckState(QtCore.Qt.Unchecked)
+        qt_app.processEvents()
+        dataset_row = 1
+        table = window._params_ics_tab._param_table
+        fit_item = table.item(dataset_row, 0)
+        assert fit_item is not None
+        table.blockSignals(True)
+        try:
+            fit_item.setCheckState(QtCore.Qt.Unchecked)
+        finally:
+            table.blockSignals(False)
+        window._params_ics_tab._parameter_state[dataset_row]["fit"] = True
+
+        identity = window._build_current_fit_runtime_identity()
+
+        assert identity is None
+    finally:
+        window.close()
+
+
+def test_fit_runtime_readiness_refresh_does_not_open_modal_for_partial_tolerance(qt_app, qtbot, monkeypatch):
+    window = _build_window()
+    dialogs: list[str] = []
+
+    def _capture_warning(*_args, **_kwargs):
+        dialogs.append("warning")
+        return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+    def _capture_information(*_args, **_kwargs):
+        dialogs.append("information")
+        return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information", staticmethod(_capture_information))
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        rtol_edit = window._params_ics_tab._integration_rtol_edit
+
+        rtol_edit.setText("1e-")
+        qtbot.waitUntil(
+            lambda: not getattr(window, "_fit_runtime_prepare_refresh_pending", False),
+            timeout=1000,
+        )
+
+        assert dialogs == []
+        assert window._run_button.isEnabled() is False
+    finally:
+        window.close()
+
+
+def test_start_fit_reports_invalid_dataset_payload_on_launch(qt_app, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        warnings: list[tuple[str, str]] = []
+
+        def _capture_warning(_parent, title, message, *_args, **_kwargs):
+            warnings.append((str(title), str(message)))
+            return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
+        monkeypatch.setattr(window, "_refresh_fit_window_state_for_current_mechanism", lambda: True)
+        window._global_payload_results["ds1"] = FitDatasetPayloadResult.invalid("payload exploded")
+
+        window._start_fit()
+
+        assert warnings
+        assert warnings[-1][0] == "Global Fit"
+        assert "Dataset 'ds1' has invalid payload:" in warnings[-1][1]
+        assert "payload exploded" in warnings[-1][1]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_run_fit_button_rejects_stale_ready_identity_with_current_lane_budget(qt_app, qtbot, monkeypatch):
+    created: list[tuple[str, int]] = []
+    budget = {"value": 2}
+
+    class _ReadySession:
+        def __init__(self, *, lane_count: int) -> None:
+            self.lane_count = int(lane_count)
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready) and int(lane_count or 1) <= self.lane_count
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        created.append(("create", int(max_lanes)))
+        return _ReadySession(lane_count=int(max_lanes))
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window()
+    try:
+        monkeypatch.setattr(window, "_fit_runtime_lane_budget", lambda _dataset_count: int(budget["value"]))
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
+
+        assert created == [("create", 2)]
+        assert window._run_button.isEnabled() is True
+
+        budget["value"] = 4
+        window._refresh_run_button_enabled_state()
+
+        assert window._run_button.isEnabled() is False
+        assert created == [("create", 2)]
+    finally:
+        window.close()
+
+
+def test_run_fit_button_rejects_stale_ready_identity_after_runtime_setting_change(qt_app, qtbot, monkeypatch):
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context, SerialFittingEvaluator
+
+    created_temperatures: list[float] = []
+    runtime_settings = {
+        "temperature_K": 298.15,
+        "use_sparse_jacobian": False,
+        "wegscheider_cyclicity_enabled": False,
+    }
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        return _ReadySession()
+
+    def _runtime_settings_getter():
+        return dict(runtime_settings)
+
+    def _simulation_builder(
+        mechanism_text,
+        param_names,
+        *,
+        solver,
+        rtol,
+        atol,
+        temperature_K=None,
+        use_sparse_jacobian=None,
+        wegscheider_cyclicity_enabled=None,
+    ):
+        created_temperatures.append(float(temperature_K))
+        context = prepare_fitting_execution_context(
+            mechanism_text=str(mechanism_text),
+            param_names=list(param_names),
+            t_end=2.0,
+            num_points=3,
+            temperature_K=float(temperature_K),
+            solver=str(solver),
+            rtol=float(rtol),
+            atol=float(atol),
+            use_sparse_jacobian=bool(use_sparse_jacobian),
+            wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
+            initial_prefix="initial:",
+        )
+        return SerialFittingEvaluator(context)
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=_simulation_builder,
+        runtime_settings_getter=_runtime_settings_getter,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._prepare_fit_runtime_for_current_state()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
+        assert created_temperatures == [298.15]
+
+        runtime_settings["temperature_K"] = 310.0
+        window._refresh_run_button_enabled_state()
+
+        assert window._run_button.isEnabled() is False
+        assert created_temperatures == [298.15]
+    finally:
+        window.close()
+
+
+def test_runtime_settings_getter_failure_blocks_fitting_readiness(qt_app, qtbot, monkeypatch):
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    def _runtime_settings_getter():
+        raise RuntimeError("settings unavailable")
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=lambda *_args, **_kwargs: _basic_serial_fitting_evaluator(),
+        runtime_settings_getter=_runtime_settings_getter,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+
+        window._prepare_fit_runtime_for_current_state()
+
+        snapshot = window._fit_runtime_readiness.snapshot()
+        assert snapshot.state is FittingRuntimeReadinessState.BLOCKED
+        assert "settings unavailable" in str(snapshot.error.__cause__)
+        assert window._run_button.isEnabled() is False
+        assert "Fitting runtime not ready" in window._status_label.text()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("change", ["dataset_weight", "weight_mode"])
+def test_run_fit_button_rejects_stale_ready_identity_after_weight_change(qt_app, qtbot, monkeypatch, change):
+    created: list[int] = []
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        created.append(int(max_lanes))
+        return _ReadySession()
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        if change == "dataset_weight":
+            window._species_table._weight_mode_combo.blockSignals(True)
+            window._species_table._weight_mode_combo.setCurrentIndex(1)
+            window._species_table._weight_mode_combo.blockSignals(False)
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
+
+        assert created == [1]
+        assert window._run_button.isEnabled() is True
+
+        if change == "dataset_weight":
+            created.clear()
+            window._persist_dataset_weight("ds1", 2.0)
+        else:
+            window._species_table._weight_mode_combo.setCurrentIndex(1)
+
+        assert window._run_button.isEnabled() is False
+        assert created == ([] if change == "dataset_weight" else [1])
+    finally:
+        window.close()
+
+
+def test_dataset_removal_reschedules_fit_runtime_preparation(qt_app, qtbot, monkeypatch):
+    created: list[int] = []
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        created.append(int(max_lanes))
+        return _ReadySession()
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window(
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+            {
+                "id": "ds2",
+                "label": "Dataset 2",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([0.9, 0.7, 0.5], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"},
+            {"id": "ds2", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([0.9, 0.7, 0.5]), "species": "A"},
+        ],
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._species_table._fit_targets_selection_applied["ds2"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
+        assert created == [2]
+
+        window._remove_datasets_from_session(["ds2"])
+
+        assert window._run_button.isEnabled() is False
+        qtbot.waitUntil(lambda: len(created) >= 2, timeout=2000)
+        assert created[-1] == 1
+    finally:
+        window.close()
+
+
+def test_deferred_fit_runtime_identity_remains_ready_after_acceptance(qt_app, qtbot, monkeypatch):
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context, SerialFittingEvaluator
+
+    created: list[int] = []
+    started: list[dict[str, object]] = []
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        return _ReadySession()
+
+    def _simulation_builder(
+        mechanism_text,
+        param_names,
+        *,
+        solver,
+        rtol,
+        atol,
+        temperature_K=None,
+        use_sparse_jacobian=None,
+        wegscheider_cyclicity_enabled=None,
+    ):
+        created.append(1)
+        context = prepare_fitting_execution_context(
+            mechanism_text=str(mechanism_text),
+            param_names=list(param_names),
+            t_end=2.0,
+            num_points=3,
+            temperature_K=float(temperature_K),
+            solver=str(solver),
+            rtol=float(rtol),
+            atol=float(atol),
+            use_sparse_jacobian=bool(use_sparse_jacobian),
+            wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
+            initial_prefix="initial:",
+        )
+        return SerialFittingEvaluator(context)
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=_simulation_builder,
+        runtime_settings_getter=lambda: {
+            "temperature_K": 298.15,
+            "use_sparse_jacobian": False,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._prepare_fit_runtime_for_current_state()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
+        identity = window._build_current_fit_runtime_identity()
+        assert identity is not None
+        assert window._fit_runtime_readiness.is_ready_for(identity)
+        monkeypatch.setattr(window, "_start_accepted_fit_worker", lambda accepted_launch: started.append(accepted_launch))
+
+        window._start_fit()
+        window._refresh_run_button_enabled_state()
+        current_identity = window._build_current_fit_runtime_identity()
+
+        assert started
+        assert current_identity is not None
+        assert window._fit_runtime_readiness.is_ready_for(current_identity)
+        assert window._run_button.isEnabled() is True
+        assert len(created) == 1
+    finally:
+        window.close()
+
+
+def test_fit_runtime_input_change_restarts_preparation_after_old_worker_exits(qt_app, qtbot, monkeypatch):
+    window = _build_window()
+    try:
+        release_warm = threading.Event()
+        warm_hashes: list[str] = []
+
+        class _RuntimeSession:
+            def __init__(self) -> None:
+                self.ready = False
+
+            def warm(self, *, cancellation_check=None, lane_count=None):
+                warm_hashes.append(window._fit_runtime_readiness.snapshot().active_hash)
+                while not release_warm.wait(0.01):
+                    if cancellation_check is not None and cancellation_check():
+                        return
+                self.ready = True
+
+            def is_ready(self, *, lane_count=None) -> bool:
+                return bool(self.ready)
+
+            def cancel_run(self):
+                return None
+
+            def close(self, *, kill: bool = False):
+                return None
+
+        monkeypatch.setattr(
+            "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+            lambda _evaluator, *, max_lanes, ledger=None: _RuntimeSession(),
+        )
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator(solver="BDF")
+        window._simulation_builder = (
+            lambda _mechanism_text, _param_names, *, solver, rtol, atol, **_runtime_settings: _basic_serial_fitting_evaluator(
+                solver=str(solver),
+                rtol=float(rtol),
+                atol=float(atol),
+            )
+        )
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: bool(warm_hashes), timeout=2000)
+        old_hash = warm_hashes[-1]
+
+        window._params_ics_tab._integration_rtol_edit.setText("1e-5")
+        window._on_fit_runtime_inputs_changed()
+
+        assert window._fit_runtime_prepare_refresh_pending is True
+
+        release_warm.set()
+        qtbot.waitUntil(lambda: len(warm_hashes) >= 2, timeout=2000)
+        assert warm_hashes[-1] != old_hash
+    finally:
+        release_warm.set()
+        window.close()
+
+
+def test_ic_apply_schedules_fit_runtime_preparation_refresh(qt_app):
+    window = _build_window()
+    try:
+        window._fit_runtime_prepare_refresh_pending = False
+        assert window._fit_runtime_prepare_refresh_pending is False
+
+        window._species_table.icApplied.emit(
+            "ds1",
+            {"A": {"initial": 2.0, "min": 0.0, "max": 10.0, "log10": False}},
+            {"A": True},
+        )
+
+        assert window._fit_runtime_prepare_refresh_pending is True
+    finally:
+        window.close()
+
+
+def test_added_observable_scalar_parameter_schedules_fit_runtime_preparation_refresh(qt_app):
+    window = _build_window()
+    try:
+        window._fit_runtime_prepare_refresh_pending = False
+        window._params_ics_tab._shared_param_definitions["scale"] = {
+            "value": 1.0,
+            "min": 0.0,
+            "max": 10.0,
+            "source": "scalar parameter",
+        }
+        assert window._fit_runtime_prepare_refresh_pending is False
+
+        window._params_ics_tab.add_missing_scalars_as_parameters(
+            ["scale"],
+            ["ds1"],
+            "shared",
+        )
+
+        assert window._fit_runtime_prepare_refresh_pending is True
+    finally:
+        window.close()
+
+
+def test_close_waits_for_active_fit_runtime_preparation_before_deleting(qt_app, qtbot, monkeypatch):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+        release_warm = threading.Event()
+        warm_started = threading.Event()
+
+        class _RuntimeSession:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def warm(self, *, cancellation_check=None, lane_count=None):
+                warm_started.set()
+                while not release_warm.wait(0.01):
+                    if cancellation_check is not None and cancellation_check():
+                        return
+
+            def cancel_run(self):
+                self.cancelled = True
+
+            def is_ready(self, *, lane_count=None) -> bool:
+                return False
+
+            def close(self, *, kill: bool = False):
+                close_calls.append(bool(kill))
+
+        sessions: list[_RuntimeSession] = []
+        close_calls: list[bool] = []
+        monkeypatch.setattr(
+            "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+            lambda _evaluator, *, max_lanes, ledger=None: sessions.append(_RuntimeSession()) or sessions[-1],
+        )
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: warm_started.is_set(), timeout=2000)
+
+        window.close()
+        qt_app.processEvents()
+
+        assert shiboken6.isValid(window)
+        assert window._close_after_fit_runtime_prepare is True
+        assert sessions[-1].cancelled is True
+
+        release_warm.set()
+
+        qtbot.waitUntil(lambda: not shiboken6.isValid(window), timeout=2000)
+        assert close_calls == [True]
+    finally:
+        release_warm.set()
+        if shiboken6.isValid(window):
+            window.close()
+
+
+def test_close_waits_for_failed_fit_runtime_preparation_before_deleting(qt_app, qtbot, monkeypatch):
+    window = _build_window()
+    release_warm = threading.Event()
+    try:
+        window.show()
+        qt_app.processEvents()
+        warm_started = threading.Event()
+        close_calls: list[bool] = []
+
+        class _RuntimeSession:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def warm(self, *, cancellation_check=None, lane_count=None):
+                warm_started.set()
+                while not release_warm.wait(0.01):
+                    if cancellation_check is not None and cancellation_check():
+                        break
+                raise RuntimeError("warm failed after close")
+
+            def cancel_run(self):
+                self.cancelled = True
+
+            def is_ready(self, *, lane_count=None) -> bool:
+                return False
+
+            def close(self, *, kill: bool = False):
+                close_calls.append(bool(kill))
+
+        sessions: list[_RuntimeSession] = []
+        monkeypatch.setattr(
+            "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+            lambda _evaluator, *, max_lanes, ledger=None: sessions.append(_RuntimeSession()) or sessions[-1],
+        )
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: warm_started.is_set(), timeout=2000)
+
+        window.close()
+        qt_app.processEvents()
+
+        assert shiboken6.isValid(window)
+        assert window._close_after_fit_runtime_prepare is True
+        assert sessions[-1].cancelled is True
+
+        release_warm.set()
+
+        qtbot.waitUntil(lambda: not shiboken6.isValid(window), timeout=2000)
+        assert close_calls == [True]
+    finally:
+        release_warm.set()
+        if shiboken6.isValid(window):
+            window.close()
 
 
 def test_detached_fit_worker_registry_releases_without_custom_finished_payload(qt_app, qtbot):
@@ -634,7 +2701,8 @@ def test_detached_fit_worker_late_emissions_do_not_reenter_deleted_dialog(qt_app
     }
 
     window._set_running_state(True)
-    window._start_global_fit_worker(
+    _start_worker_from_accepted_launch(
+        window,
         datasets=[],
         config=config,
         dataset_overrides=[],
@@ -706,7 +2774,8 @@ def test_consecutive_fit_dispatch_cycles_leave_clean_state(qt_app, monkeypatch):
 
         for run_index in range(3):
             window._set_running_state(True)
-            window._start_global_fit_worker(
+            _start_worker_from_accepted_launch(
+                window,
                 datasets=[],
                 config=config,
                 dataset_overrides=[],
@@ -766,13 +2835,18 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
             self.deleted = True
 
     monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: fn())
 
     window = _build_window()
     try:
         runtime_close_calls: list[bool] = []
 
         class _BadCloseRuntimeSession:
+            def warm(self, *, cancellation_check=None, lane_count=None):
+                return None
+
+            def is_ready(self, *, lane_count=None) -> bool:
+                return True
+
             def close(self, *, kill: bool = False):
                 cancel_events.append(f"runtime:close:{kill}")
                 runtime_close_calls.append(bool(kill))
@@ -788,8 +2862,100 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
             "log10_params": {},
         }
 
+        from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
+        from kindred.gui.fitting.window import FittingRuntimeSession
+
+        identity = FittingRuntimeIdentity(
+            datasets=(),
+            config=config,
+            dataset_overrides=(),
+            weights=None,
+            requested_solver="BDF",
+            requested_rtol=1e-6,
+            requested_atol=1e-12,
+            fit_evaluator=_basic_serial_fitting_evaluator(),
+            stamp={},
+            stamp_hash="cancel-run",
+            stamp_short="cancel-run",
+            lane_count=1,
+            readiness_required=True,
+        )
+        original_session_factory = FittingRuntimeSession.from_serial_evaluator
+        FittingRuntimeSession.from_serial_evaluator = staticmethod(
+            lambda _fit_evaluator, *, max_lanes, ledger=None: _BadCloseRuntimeSession()
+        )
+        try:
+            window._fit_runtime_readiness.set_desired_identity(identity)
+            worker = window._fit_runtime_readiness.worker
+            if worker is not None:
+                while worker.isRunning():
+                    QtCore.QCoreApplication.processEvents()
+                window._fit_runtime_readiness.handle_worker_finished()
+        finally:
+            FittingRuntimeSession.from_serial_evaluator = original_session_factory
+        accepted_launch = window._fit_runtime_readiness.accepted_launch_for(identity)
+        assert accepted_launch is not None
+
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        window._start_accepted_fit_worker(accepted_launch)
+        worker = worker_ref["worker"]
+
+        window._cancel_fit()
+
+        assert runtime_close_calls == [True]
+        assert cancel_events == ["worker:cancel", "runtime:close:True"]
+        assert worker.cancel_called is True
+        assert worker.wait_calls == [2000]
+        assert worker.terminate_called is False
+        assert window._worker is None
+        assert window._run_button.isEnabled() is False
+        assert window._stop_button.isEnabled() is False
+        assert window._status_label.text() == "Fit cancelled"
+        worker.bestUpdated.emit({"cost": 99.0})
+        worker.error.emit({"kind": "cancelled", "message": "late cancelled"})
+        QtCore.QCoreApplication.processEvents()
+        assert "late cancelled" not in window._status_label.text()
+    finally:
+        window.close()
+
+
+def test_stop_fit_schedules_runtime_preparation_refresh(qt_app, monkeypatch):
+    worker_ref: dict[str, object] = {}
+    scheduled: list[str] = []
+
+    class _CancelableWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.wait_calls: list[int] = []
+            worker_ref["worker"] = self
+
+        def wait(self, msecs: int | None = None) -> bool:
+            self.wait_calls.append(int(msecs or 0))
+            self._running = False
+            return True
+
+        def terminate(self) -> None:
+            self._running = False
+
+        def deleteLater(self) -> None:
+            return None
+
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
+
+    window = _build_window()
+    try:
+        config = {
+            "parameters": {"k": 1.0},
+            "bounds": {"k": (0.0, 2.0)},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 2,
+            "seed": None,
+            "log10_params": {},
+        }
+        window._set_running_state(True)
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -802,35 +2968,403 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
             stamp_hash="cancel-run",
             stamp_short="cancel-run",
         )
-        worker = worker_ref["worker"]
-        window._fit_runtime_session = _BadCloseRuntimeSession()
+        monkeypatch.setattr(window, "_schedule_fit_runtime_preparation_refresh", lambda: scheduled.append("schedule"))
 
         window._cancel_fit()
 
-        assert runtime_close_calls == [True]
-        assert cancel_events == ["worker:cancel", "runtime:close:True"]
-        assert worker.cancel_called is True
-        assert worker.wait_calls == [2000]
-        assert worker.terminate_called is False
-        assert window._worker is None
-        assert window._run_button.isEnabled() is True
-        assert window._stop_button.isEnabled() is False
-        assert window._status_label.text() == "Fit cancelled"
-        worker.bestUpdated.emit({"cost": 99.0})
-        worker.error.emit({"kind": "cancelled", "message": "late cancelled"})
-        QtCore.QCoreApplication.processEvents()
+        assert worker_ref["worker"].cancel_called is True
+        assert scheduled == ["schedule"]
         assert window._status_label.text() == "Fit cancelled"
     finally:
         window.close()
 
 
-def test_fit_runtime_session_cache_invalidates_when_lane_budget_changes(qt_app, monkeypatch):
+def test_stop_fit_runtime_preparation_does_not_schedule_refresh(qt_app, monkeypatch):
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+    from kindred.gui.fitting.window import FittingRuntimeSession
+
+    scheduled: list[str] = []
+    release_warm = threading.Event()
+
+    class _BlockingRuntimeSession:
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            while not release_warm.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    return
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return False
+
+        def cancel_run(self) -> None:
+            release_warm.set()
+
+        def close(self, *, kill: bool = False) -> None:
+            release_warm.set()
+
+    original_session_factory = FittingRuntimeSession.from_serial_evaluator
+    FittingRuntimeSession.from_serial_evaluator = staticmethod(
+        lambda _fit_evaluator, *, max_lanes, ledger=None: _BlockingRuntimeSession()
+    )
+    window = _build_dataset_variable_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._prepare_fit_runtime_for_current_state()
+        assert window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING
+        window._schedule_fit_runtime_preparation_refresh()
+        assert window._fit_runtime_prepare_refresh_pending is True
+        monkeypatch.setattr(window, "_schedule_fit_runtime_preparation_refresh", lambda: scheduled.append("schedule"))
+
+        window._cancel_fit()
+
+        assert scheduled == []
+        assert window._fit_runtime_prepare_refresh_pending is False
+        assert window._status_label.text() == "Fitting runtime preparation cancelled"
+    finally:
+        release_warm.set()
+        FittingRuntimeSession.from_serial_evaluator = original_session_factory
+        window.close()
+
+
+def test_visible_stop_button_cancels_run_initiated_fit_runtime_preparation(qt_app, qtbot, monkeypatch):
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    release_warm = threading.Event()
+    sessions: list[object] = []
+
+    class _BlockingRuntimeSession:
+        def __init__(self) -> None:
+            self.cancelled = False
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            while not release_warm.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    self.cancelled = True
+                    return
+            self.ready = True
+
+        def cancel_run(self) -> None:
+            self.cancelled = True
+            release_warm.set()
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False) -> None:
+            release_warm.set()
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        session = _BlockingRuntimeSession()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+
+        window._start_fit()
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING,
+            timeout=2000,
+        )
+
+        assert window._stop_button.isEnabled() is True
+        window._stop_button.click()
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is not FittingRuntimeReadinessState.PREPARING,
+            timeout=2000,
+        )
+
+        assert sessions
+        assert sessions[-1].cancelled is True
+        assert window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.EMPTY
+        assert window._status_label.text() == "Fitting runtime preparation cancelled"
+        session_count = len(sessions)
+        qtbot.wait(100)
+        window._poll_fit_runtime_preparation()
+        qt_app.processEvents()
+        assert len(sessions) == session_count
+        assert window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.EMPTY
+    finally:
+        release_warm.set()
+        window.close()
+
+
+def test_run_fit_starts_accepted_launch_after_runtime_ready(qt_app, qtbot, monkeypatch):
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    release_warm = threading.Event()
+    started: list[dict[str, object]] = []
+
+    class _ReadyAfterReleaseRuntimeSession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        @property
+        def ledger(self):
+            return None
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            while not release_warm.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    return
+            self.ready = True
+
+        def cancel_run(self) -> None:
+            release_warm.set()
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False) -> None:
+            release_warm.set()
+
+    class _CaptureWorker(_SignalWorker):
+        def __init__(self, datasets, shared_params, *, fit_evaluator=None, fit_runtime_session=None, **kwargs):
+            super().__init__()
+            started.append(
+                {
+                    "datasets": list(datasets),
+                    "shared_params": dict(shared_params),
+                    "fit_evaluator": fit_evaluator,
+                    "fit_runtime_session": fit_runtime_session,
+                    "run_stamp_hash": str(kwargs.get("run_stamp_hash") or ""),
+                }
+            )
+            self._running = False
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        return _ReadyAfterReleaseRuntimeSession()
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CaptureWorker)
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+
+        window._start_fit()
+        assert started == []
+        release_warm.set()
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            timeout=2000,
+        )
+        assert started == []
+        window._start_fit()
+        qtbot.waitUntil(lambda: bool(started), timeout=2000)
+
+        assert isinstance(started[-1]["fit_evaluator"], SerialFittingEvaluator)
+        assert started[-1]["fit_runtime_session"] is not None
+        assert started[-1]["run_stamp_hash"]
+    finally:
+        release_warm.set()
+        window.close()
+
+
+def test_deferred_fit_launch_captures_failed_restore_baseline(qt_app, qtbot, monkeypatch):
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    release_warm = threading.Event()
+    workers: list[_SignalWorker] = []
+
+    class _ReadyAfterReleaseRuntimeSession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        @property
+        def ledger(self):
+            return None
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            while not release_warm.wait(0.01):
+                if cancellation_check is not None and cancellation_check():
+                    return
+            self.ready = True
+
+        def cancel_run(self) -> None:
+            release_warm.set()
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False) -> None:
+            release_warm.set()
+
+    class _CaptureWorker(_SignalWorker):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            workers.append(self)
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        lambda *_args, **_kwargs: _ReadyAfterReleaseRuntimeSession(),
+    )
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CaptureWorker)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "exec",
+        lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
+    )
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+
+        window._start_fit()
+        assert workers == []
+        release_warm.set()
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            timeout=2000,
+        )
+        assert workers == []
+        window._start_fit()
+        qtbot.waitUntil(lambda: bool(workers), timeout=2000)
+        worker = workers[-1]
+
+        window._params_ics_tab.push_best_update({"k": 0.9}, {})
+        assert window._params_ics_tab._param_table.item(0, 3).text() == "0.9"
+
+        result = _build_completion_result(
+            status="fail",
+            message="Optimization terminated successfully.",
+            value=0.5,
+        )
+        result.model_series = {}
+        result.dataset_info = []
+
+        worker.finished.emit({"result": result})
+
+        assert window._params_ics_tab.get_last_fit_params() == {}
+        assert window._params_ics_tab._param_table.item(0, 3).text() == "1"
+        assert window._params_ics_tab.get_parameter_state()[0]["last_fit"] is None
+    finally:
+        release_warm.set()
+        window.close()
+
+
+def test_deferred_generic_evaluator_prepares_without_runtime_session_requirement(qt_app, qtbot, monkeypatch):
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+
+    def _generic_builder(*_args, **_kwargs):
+        def _evaluate(_params):
+            return {"t": np.asarray([0.0, 1.0]), "species": {"A": np.asarray([1.0, 1.0])}}
+
+        return _evaluate
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("generic evaluator must not create runtime session")),
+    )
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 1.0], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0]), "y": np.asarray([1.0, 1.0]), "species": "A"}
+        ],
+        mechanism_species=["A"],
+        mechanism_text_getter=lambda: "reaction: A -> B; k=0\ninitial: A=1.0",
+        reactions_text_getter=lambda: "reaction: A -> B; k=0",
+        simulation_func=None,
+        simulation_builder=_generic_builder,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._prepare_fit_runtime_for_current_state()
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state is not FittingRuntimeReadinessState.PREPARING,
+            timeout=2000,
+        )
+
+        snapshot = window._fit_runtime_readiness.snapshot()
+        assert snapshot.state is FittingRuntimeReadinessState.READY
+        assert snapshot.identity is not None
+        assert snapshot.identity.readiness_required is False
+        assert snapshot.session is None
+        assert window._run_button.isEnabled() is True
+    finally:
+        window.close()
+
+
+def test_successful_fit_result_parameter_mutation_reprepares_next_run_identity(qt_app, qtbot, monkeypatch):
+    created: list[object] = []
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.closed: list[bool] = []
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False):
+            self.closed.append(bool(kill))
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        session = _ReadySession()
+        created.append(session)
+        return session
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: len(created) == 1 and window._run_button.isEnabled(), timeout=2000)
+        old_session = created[-1]
+
+        window._handle_global_fit_complete({"result": _build_success_result(param_name="k", value=1.5)})
+
+        qtbot.waitUntil(lambda: len(created) >= 2, timeout=2000)
+        assert old_session.closed == [False]
+        assert window._params_ics_tab.get_parameter_state()[0]["value"] == pytest.approx(1.5)
+        assert window._run_button.isEnabled() is True
+    finally:
+        window.close()
+
+
+def test_fit_runtime_session_cache_invalidates_when_lane_budget_changes(qt_app, qtbot, monkeypatch):
     created: list[tuple[str, int]] = []
 
     class _FakeSession:
         def __init__(self, *, budget: int):
             self.budget = int(budget)
             self.closed: list[bool] = []
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
 
         def close(self, *, kill: bool = False):
             self.closed.append(bool(kill))
@@ -843,33 +3377,32 @@ def test_fit_runtime_session_cache_invalidates_when_lane_budget_changes(qt_app, 
         "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
         _fake_from_serial,
     )
-    budget = {"value": 2}
     window = _build_window()
     try:
-        monkeypatch.setattr(window, "_fit_runtime_lane_budget", lambda _dataset_count: int(budget["value"]))
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._simulation_func = _basic_serial_fitting_evaluator()
+        identity = window._build_current_fit_runtime_identity()
+        assert identity is not None
+        first_identity = replace(identity, lane_count=2)
+        second_identity = replace(identity, lane_count=2)
+        third_identity = replace(identity, lane_count=4)
 
-        class _Serial:
-            pass
-
-        monkeypatch.setattr("kindred.gui.fitting.window.SerialFittingEvaluator", _Serial)
-        evaluator = _Serial()
-
-        first = window._fit_runtime_session_for_run(
-            fit_evaluator=evaluator,
-            stamp_hash="same",
-            dataset_count=3,
+        window._fit_runtime_readiness.set_desired_identity(first_identity)
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state.name == "READY",
+            timeout=2000,
         )
-        second = window._fit_runtime_session_for_run(
-            fit_evaluator=evaluator,
-            stamp_hash="same",
-            dataset_count=3,
+        first = window._fit_runtime_readiness.snapshot().session
+        window._fit_runtime_readiness.set_desired_identity(second_identity)
+        second = window._fit_runtime_readiness.snapshot().session
+        window._fit_runtime_readiness.set_desired_identity(third_identity)
+        qtbot.waitUntil(
+            lambda: window._fit_runtime_readiness.snapshot().state.name == "READY"
+            and window._fit_runtime_readiness.snapshot().session is not first,
+            timeout=2000,
         )
-        budget["value"] = 4
-        third = window._fit_runtime_session_for_run(
-            fit_evaluator=evaluator,
-            stamp_hash="same",
-            dataset_count=3,
-        )
+        third = window._fit_runtime_readiness.snapshot().session
 
         assert first is second
         assert third is not first
@@ -925,7 +3458,8 @@ def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeyp
         )
 
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -1696,15 +4230,17 @@ def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_pa
         )
         monkeypatch.setattr(
             window,
-            "_start_global_fit_worker",
-            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("launch boom")),
+            "_start_accepted_fit_worker",
+            lambda _accepted_launch: (_ for _ in ()).throw(RuntimeError("launch boom")),
         )
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        window._params_ics_tab._integration_solver_combo.setCurrentText("BDF")
+        window._params_ics_tab._integration_rtol_edit.setText("1e-6")
+        window._params_ics_tab._integration_atol_edit.setText("1e-12")
+        window._start_fit()
 
         parameter_names = [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()]
         assert parameter_names == ["k2"]
@@ -1803,7 +4339,7 @@ def test_failed_completion_clears_results_summary_state_after_prior_success(qt_a
         qt_app.processEvents()
 
 
-def test_failed_completion_with_pending_rebuild_uses_current_applied_targets(qt_app, monkeypatch):
+def test_target_change_during_active_fit_cancels_stale_run_and_uses_current_targets(qt_app, monkeypatch):
     dataset_entries = [
         {
             "id": "ds1",
@@ -1838,12 +4374,30 @@ def test_failed_completion_with_pending_rebuild_uses_current_applied_targets(qt_
         qt_app.processEvents()
         assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["A"]
 
-        worker = _SignalWorker()
+        class _CancelableWorker(_SignalWorker):
+            def wait(self, msecs: int | None = None) -> bool:
+                self._running = False
+                return True
+
+            def terminate(self) -> None:
+                self._running = False
+
+            def deleteLater(self) -> None:
+                return None
+
+        worker = _CancelableWorker()
         window._worker = worker
+        worker.progress.connect(window._dispatch_fit_worker_progress)
+        worker.bestUpdated.connect(window._dispatch_fit_worker_best_update)
+        worker.finished.connect(window._dispatch_fit_worker_finished)
+        worker.error.connect(window._dispatch_fit_worker_error)
         window._species_table._fit_targets_selection_applied["ds1"] = ["B"]
         window._on_targets_applied()
         qt_app.processEvents()
-        assert window._results_rebuild_pending is True
+        assert worker.cancel_called is True
+        assert window._worker is None
+        assert window._results_rebuild_pending is False
+        assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["B"]
 
         monkeypatch.setattr(
             QtWidgets.QMessageBox,
@@ -1852,7 +4406,6 @@ def test_failed_completion_with_pending_rebuild_uses_current_applied_targets(qt_
         )
 
         window.hide()
-        window._worker = None
         failed = _build_completion_result(
             status="fail",
             dataset_id="ds1",
@@ -1862,9 +4415,8 @@ def test_failed_completion_with_pending_rebuild_uses_current_applied_targets(qt_
         failed.model_series = {}
         failed.dataset_info = []
 
-        window._handle_global_fit_complete({"result": failed})
+        window._handle_global_fit_complete({"result": failed, "run_stamp_hash": "stale"}, worker=worker)
 
-        assert window._results_rebuild_pending is False
         assert window._run_results_tab._fit_targets_by_dataset["ds1"] == ["B"]
         payload = window._run_results_tab._dataset_plot_views["ds1"]._datasets[0]
         assert payload["current_species"] == "B"
@@ -1921,6 +4473,7 @@ def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, m
             },
         )
         monkeypatch.setattr(window._params_ics_tab, "collect_integration_settings", lambda: ("BDF", 1e-6, 1e-12))
+        monkeypatch.setattr(window, "_datasets_payloads_for_readiness", lambda _ids: None)
         monkeypatch.setattr(window, "_datasets_payloads_for_run", lambda _ids: None)
 
         window._start_fit()
@@ -1934,7 +4487,7 @@ def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, m
         qt_app.processEvents()
 
 
-def test_start_global_fit_unavailable_callback_clears_prior_dataset_manager_fit_state(qt_app, monkeypatch):
+def test_run_fit_unavailable_evaluator_clears_prior_dataset_manager_fit_state(qt_app, monkeypatch):
     window = _build_window()
     try:
         window.show()
@@ -1974,9 +4527,8 @@ def test_start_global_fit_unavailable_callback_clears_prior_dataset_manager_fit_
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection)
+        window._start_fit()
 
         ds_view = window._dataset_manager._dataset_views["ds1"]
         assert ds_view["model_series"] is None
@@ -1989,7 +4541,7 @@ def test_start_global_fit_unavailable_callback_clears_prior_dataset_manager_fit_
         qt_app.processEvents()
 
 
-def test_start_global_fit_unavailable_callback_clears_open_results_summary_state(qt_app, monkeypatch):
+def test_run_fit_unavailable_evaluator_clears_open_results_summary_state(qt_app, monkeypatch):
     window = _build_window()
     try:
         window.show()
@@ -2021,9 +4573,8 @@ def test_start_global_fit_unavailable_callback_clears_open_results_summary_state
 
         config = window._params_ics_tab._collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection)
+        window._start_fit()
 
         assert not window._results_summary_button.isEnabled()
         assert window._run_results_tab._last_run_stamp == {}
@@ -2211,6 +4762,26 @@ def test_failed_completion_routes_through_failed_run_closeout_helper(qt_app, mon
         window._handle_global_fit_complete({"result": result})
 
         assert calls == [result]
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_terminal_completion_without_result_exits_visible_running_state(qt_app):
+    window = _build_window()
+    try:
+        window.show()
+        qt_app.processEvents()
+
+        window._set_running_state(True)
+        assert window._stop_button.isEnabled()
+        assert not window._params_ics_tab._add_param_button.isEnabled()
+
+        window._handle_global_fit_complete({})
+
+        assert window._status_label.text() == "Global fit failed"
+        assert not window._stop_button.isEnabled()
+        assert window._params_ics_tab._add_param_button.isEnabled()
     finally:
         window.close()
         qt_app.processEvents()
@@ -2519,7 +5090,8 @@ def test_close_teardown_disconnects_worker_signals(qt_app, monkeypatch):
             "log10_params": {},
         }
         window._set_running_state(True)
-        window._start_global_fit_worker(
+        _start_worker_from_accepted_launch(
+            window,
             datasets=[],
             config=config,
             dataset_overrides=[],
@@ -2606,18 +5178,8 @@ def test_start_fit_clears_cached_state_before_launch(monkeypatch):
                 "ids": ["ds1"],
             },
         )
-        launch_state: list[tuple[dict, dict]] = []
-        monkeypatch.setattr(
-            window,
-            "_start_global_fit",
-            lambda config, dataset_selection, *, solver="Radau", rtol=1e-6, atol=1e-12: launch_state.append(
-                (dict(config), dict(dataset_selection))
-            ),
-        )
-
         window._start_fit()
 
-        assert launch_state
         assert window._latest_model_series == {}
         assert window._latest_dataset_stats == {}
         assert window._latest_plot_model_series == {}

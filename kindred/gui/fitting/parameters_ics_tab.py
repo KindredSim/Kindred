@@ -12,7 +12,6 @@ from PySide6.QtCore import Qt, Signal
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
-from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +303,7 @@ class _AddFittableParameterDialog(QtWidgets.QDialog):
 
 class ParametersIcsTab(QtWidgets.QWidget):
     addAlgebraicObservableRequested = Signal(dict)
+    runtimeInputsChanged = Signal()
     statusMessage = Signal(str)
 
     def __init__(
@@ -325,14 +325,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         reactions_text_getter: Callable[[], str],
         integration_defaults: Tuple[str, float, float],
         config_defaults: Dict[str, Any],
-        ic_panel: Optional[UnifiedSpeciesTable] = None,
+        initial_parameter_defaults_getter: Optional[Callable[[str, str], tuple[bool, dict[str, float]]]] = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        # transitional — ic_panel is passed for forwarder reach-through
-        # only. FittingWindow owns all IC signal wiring. This parameter
-        # and the associated forwarders are removed in Session 3.
-        self._ic_panel = ic_panel
         # Deep-copy transferred state
         self._parameter_state = [dict(row) for row in parameter_state]
         self._initial_parameter_snapshot = [dict(row) for row in initial_parameter_snapshot]
@@ -354,6 +350,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._worker_running_getter = worker_running_getter
         self._dataset_manager_getter = dataset_manager_getter
         self._reactions_text_getter = reactions_text_getter
+        self._initial_parameter_defaults_getter = initial_parameter_defaults_getter
         # Build UI
         self._build_ui(integration_defaults)
         self._apply_config_defaults(config_defaults)
@@ -498,20 +495,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return widget
 
     # ------------------------------------------------------------------
-    # Transitional forwarders for IC panel widgets
-    # ------------------------------------------------------------------
-
-    @property
-    def _ic_dataset_combo(self):
-        return None
-
-    # ------------------------------------------------------------------
     # IC applied handler
     # ------------------------------------------------------------------
 
     def _on_ic_applied(self, dataset_id: str, updates: dict, fit_flags_updates: dict) -> None:
         self._apply_ic_updates_to_window_state(dataset_id, updates, fit_flags_updates)
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     # ------------------------------------------------------------------
     # Config defaults
@@ -848,6 +838,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self.addAlgebraicObservableRequested.emit(request)
             return
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     def _add_rate_parameter(self, name: str) -> None:
         present = {
@@ -1142,6 +1133,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         self._remove_parameter_rows(rows)
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     def _remove_parameter_rows(self, rows: Sequence[int], *, update_fixed: bool = True) -> None:
         for row in sorted({int(r) for r in (rows or []) if isinstance(r, int)}, reverse=True):
@@ -1348,6 +1340,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._parameter_state = [dict(row) for row in self._initial_parameter_snapshot]
         self._fixed_shared_params = {}
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     def _reset_to_last_fit(self) -> None:
         if not self._last_fit_params:
@@ -1367,6 +1360,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     entry["value"] = float(ds_map[param_name])
                     entry["last_fit"] = float(ds_map[param_name])
         self._populate_parameter_table()
+        self.runtimeInputsChanged.emit()
 
     def _collect_parameter_config(self) -> Optional[Dict[str, Any]]:
         parameters: Dict[str, float] = {}
@@ -1541,7 +1535,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
             logger.debug("Skipped %d global-fit parameter definitions without a 'name' field.", missing_name_count)
         return state
 
-    def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
+    def _collect_integration_settings(
+        self,
+        *,
+        show_messages: bool,
+    ) -> Optional[Tuple[str, float, float]]:
         from kindred.core.simulator.solvers import normalize_solver_name
 
         allowed = ("Radau", "BDF")
@@ -1550,7 +1548,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if solver_label not in allowed:
             solver_label = FITTING_DEFAULT_SOLVER
         solver_method, solver_warning = normalize_solver_name(solver_label)
-        if solver_warning:
+        if solver_warning and show_messages:
             QtWidgets.QMessageBox.information(
                 self.window(),
                 "Solver Normalization",
@@ -1570,19 +1568,25 @@ class ParametersIcsTab(QtWidgets.QWidget):
             rtol = float(rtol_text)
             atol = float(atol_text)
         except Exception:
-            QtWidgets.QMessageBox.warning(
-                self.window(),
-                "Advanced Integration Settings",
-                "rtol and atol must be valid floating-point numbers (scientific notation is allowed).",
-            )
+            if show_messages:
+                QtWidgets.QMessageBox.warning(
+                    self.window(),
+                    "Advanced Integration Settings",
+                    "rtol and atol must be valid floating-point numbers (scientific notation is allowed).",
+                )
             return None
         if not (np.isfinite(rtol) and rtol > 0.0):
-            QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "rtol must be a finite value > 0.")
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "rtol must be a finite value > 0.")
             return None
         if not (np.isfinite(atol) and atol > 0.0):
-            QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "atol must be a finite value > 0.")
+            if show_messages:
+                QtWidgets.QMessageBox.warning(self.window(), "Advanced Integration Settings", "atol must be a finite value > 0.")
             return None
         return str(solver_method), float(rtol), float(atol)
+
+    def _collect_integration_settings_for_run(self) -> Optional[Tuple[str, float, float]]:
+        return self._collect_integration_settings(show_messages=True)
 
     # ------------------------------------------------------------------
     # Mechanism rebuild
@@ -1629,6 +1633,18 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "max": float(max_val),
             "log10": bool(spec.get("log10", False)),
         }
+
+    def _initial_parameter_defaults_for_species(self, dataset_id: str, species: str) -> tuple[bool, dict[str, float]]:
+        getter = self._initial_parameter_defaults_getter
+        if callable(getter):
+            try:
+                fit_flag, default_spec = getter(str(dataset_id), str(species))
+                coerced = self._coerce_variable_spec(default_spec)
+                if coerced is not None:
+                    return bool(fit_flag), coerced
+            except Exception as exc:
+                logger.debug("Failed to read IC defaults for %s/%s: %s", dataset_id, species, exc, exc_info=True)
+        return False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
 
     def rebuild_for_mechanism(self, mechanism_text: str, dataset_entries: List[Dict[str, Any]]) -> list[str]:
         param_defs = self._scan_parameter_definitions_for_mechanism(mechanism_text)
@@ -1711,10 +1727,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 param_name = f"{INITIAL_PREFIX}{species}"
                 if param_name in fixed_map or param_name in variable_map:
                     continue
-                if self._ic_panel is not None:
-                    fit_flag, default_spec = self._ic_panel.initial_parameter_defaults_for_species(ds_id, species)
-                else:
-                    fit_flag, default_spec = False, {"initial": 0.0, "min": 0.0, "max": 10.0, "log10": False}
+                fit_flag, default_spec = self._initial_parameter_defaults_for_species(ds_id, species)
                 if fit_flag:
                     variable_map[param_name] = dict(default_spec)
                 else:
@@ -1823,9 +1836,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._initial_parameter_snapshot = [dict(row) for row in self._parameter_state]
         self._dataset_entries = list(dataset_entries)
         self._populate_parameter_table()
-        if self._ic_panel is not None:
-            self._ic_panel.set_mechanism_species(list(self._mechanism_species))
-            self._ic_panel.refresh_dataset_combo(list(self._dataset_entries))
         return list(self._prepared_param_names)
 
     # ------------------------------------------------------------------
@@ -2004,17 +2014,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._remove_param_button.setEnabled(
                 (not running) and bool({item.row() for item in self._param_table.selectedItems()})
             )
-        if self._ic_panel is not None:
-            self._ic_panel.set_running_state(running)
 
     # ------------------------------------------------------------------
     # Public API — dataset lifecycle
     # ------------------------------------------------------------------
 
-    def refresh_ic_dataset_combo(self, dataset_entries: List[Dict[str, Any]]) -> None:
+    def refresh_dataset_entries(self, dataset_entries: List[Dict[str, Any]]) -> None:
         self._dataset_entries = list(dataset_entries)
-        if self._ic_panel is not None:
-            self._ic_panel.refresh_dataset_combo(dataset_entries)
 
     def remove_dataset_parameter_rows(self, dataset_ids: Sequence[str]) -> None:
         remove_set = {str(x) for x in dataset_ids}
@@ -2049,6 +2055,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
             scalar_scope=scalar_scope,
         )
         self._populate_parameter_table()
+        if missing_scalars:
+            self.runtimeInputsChanged.emit()
 
     def mirror_staged_ic_values(self) -> int:
         total_updates = 0
@@ -2069,3 +2077,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def collect_integration_settings(self) -> Optional[Tuple[str, float, float]]:
         return self._collect_integration_settings_for_run()
+
+    def collect_integration_settings_silent(self) -> Optional[Tuple[str, float, float]]:
+        return self._collect_integration_settings(show_messages=False)

@@ -1413,7 +1413,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._populate_table()
         self._update_combined_dirty_state()
 
-    def refresh_dataset_combo(self, dataset_entries: list) -> None:
+    def refresh_dataset_entries(self, dataset_entries: list) -> None:
         self._dataset_entries = list(dataset_entries)
 
     def initial_parameter_defaults_for_species(self, dataset_id: str, species: str) -> tuple[bool, dict[str, float]]:

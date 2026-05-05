@@ -237,6 +237,11 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
             "execution_request",
             "Batch task execution_request payloads must be carried by simulation_plan.",
         )
+    if not has_plan_execution_request:
+        raise SimulationPreparationError(
+            "simulation_plan",
+            "Batch task execution inputs must be carried by simulation_plan.",
+        )
     execution_request = None
     mechanism_text = str(task.get("mechanism_text") or "")
     solver_config = dict(task.get("solver_config") or {})
@@ -249,10 +254,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         solver_config = dict(plan_execution_request.get("solver_config") or solver_config)
         initials = dict(plan_execution_request.get("initials") or initials)
         simulation_identity = plan_execution_request.get("simulation_identity") or simulation_identity
-        if plan_execution_request.get("prepared_payload") is not None:
-            execution_request = plan_execution_request
-        else:
-            execution_request = None
+        execution_request = plan_execution_request
     structured_prepared_request = isinstance(execution_request, Mapping) and execution_request.get("prepared_payload") is not None
     temperature_K = float(solver_config.get("temperature_K") or 298.15)
     wegscheider_enabled = bool(
@@ -301,12 +303,9 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         t_start, t_end = 0.0, float(task.get("t_end") or 0.0)
     t_span = (float(t_start), float(t_end))
 
-    if isinstance(execution_request, Mapping):
+    if structured_prepared_request and isinstance(execution_request, Mapping):
         prepared = prepare_simulation_worker_run(execution_request=execution_request)
-        if structured_prepared_request:
-            mechanism_text = str(execution_request.get("mechanism_text") or "")
-        else:
-            mechanism_text = str(execution_request.get("mechanism_text") or mechanism_text or "")
+        mechanism_text = str(execution_request.get("mechanism_text") or "")
     else:
         try:
             entry = _prepared_entry(
@@ -335,6 +334,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         prepared_payload["y0"] = np.array(prepared_payload.get("y0", bound.y0), copy=True, dtype=float)
 
         prepared = prepare_simulation_worker_run(
+            execution_request=execution_request if isinstance(execution_request, Mapping) else None,
             mechanism_text=mechanism_text,
             initials=initials,
             t_span=t_span,
@@ -409,17 +409,19 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def run_batch_simulation_task(task: Mapping[str, Any]) -> Dict[str, Any]:
+    task_payload: Dict[str, Any] = {}
     try:
-        return _run_batch_simulation_task_impl(task)
+        task_payload = dict(task or {})
+        return _run_batch_simulation_task_impl(task_payload)
     except Exception as exc:
         from kindred.core.simulation_preparation import SimulationPreparationError
 
         if isinstance(exc, SimulationPreparationError):
             return {
                 "success": False,
-                "run_id": int(task.get("run_id") or 0),
-                "set_id": str(task.get("set_id") or ""),
-                "set_name": str(task.get("set_name") or ""),
+                "run_id": int(task_payload.get("run_id") or 0),
+                "set_id": str(task_payload.get("set_id") or ""),
+                "set_name": str(task_payload.get("set_name") or ""),
                 "error": _failure_payload_with_stack_trace(
                     build_simulation_failure(
                         "preparation_error",
@@ -432,9 +434,9 @@ def run_batch_simulation_task(task: Mapping[str, Any]) -> Dict[str, Any]:
             }
         return {
             "success": False,
-            "run_id": int(task.get("run_id") or 0),
-            "set_id": str(task.get("set_id") or ""),
-            "set_name": str(task.get("set_name") or ""),
+            "run_id": int(task_payload.get("run_id") or 0),
+            "set_id": str(task_payload.get("set_id") or ""),
+            "set_name": str(task_payload.get("set_name") or ""),
             "error": _failure_payload_with_stack_trace(
                 simulation_failure_from_exception(exc),
                 exc=exc,

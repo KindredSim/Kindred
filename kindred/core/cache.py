@@ -45,6 +45,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple, TypeVar, Param
 
 import numpy as np
 
+from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.lru_cache import LRUCache
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -854,6 +855,17 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
     schedule_fp: Optional[str] = None
     if schedule_val is not None:
         schedule_fp = _fingerprint_temperature_schedule_value(schedule_val)
+    intervention_schedule_fp: Optional[str] = None
+    intervention_species_names: Tuple[str, ...] = tuple()
+    intervention_schedule_val = getattr(req, "intervention_schedule", None)
+    if intervention_schedule_val is not None:
+        try:
+            intervention_schedule = coerce_intervention_schedule(intervention_schedule_val)
+        except Exception:
+            return None
+        if intervention_schedule is not None:
+            intervention_schedule_fp = str(intervention_schedule.fingerprint)
+            intervention_species_names = tuple(str(name) for name in (getattr(req, "species_names", None) or ()))
 
     payload = (
         tuple(map(float, req.t_span)),
@@ -866,6 +878,8 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
         bool(getattr(req, "jacobian_func", None)),
         jac_tag,
         schedule_fp,
+        intervention_schedule_fp,
+        intervention_species_names,
         bool(getattr(req, "progress_callback", None)),
         getattr(req, "positivity", None),
         tuple(getattr(req, "pos_indices", []) or []),

@@ -86,7 +86,7 @@ def _coerce_execution_request(value: SimulationExecutionRequest | Mapping[str, A
 
 @dataclass(frozen=True)
 class SimulationPlan:
-    """Typed no-behavior-change wrapper around a simulation execution request."""
+    """Typed execution boundary carrying a nested preparation request."""
 
     execution_request: SimulationExecutionRequest
     execution_mode: str

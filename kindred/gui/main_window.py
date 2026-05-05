@@ -557,6 +557,13 @@ class MainWindow(
             self._refresh_authoritative_mechanism_derived_ui()
         if outcome.readiness_schedule_required:
             self._schedule_simulation_runtime_availability_refresh(wait=False)
+        if (
+            bool(outcome.runtime_input_invalidation_required)
+            or bool(outcome.runtime_invalidation_required)
+        ):
+            notify_fit_windows = getattr(self, "_notify_active_fit_windows_runtime_inputs_changed", None)
+            if callable(notify_fit_windows):
+                notify_fit_windows()
         return outcome
 
     def _apply_canonical_batch_initials_transition(
@@ -737,6 +744,9 @@ class MainWindow(
 
     def _on_temperature_spinbox_value_changed_for_main_window(self) -> None:
         self._update_temperature_mode_indicator()
+        notify_fit_windows = getattr(self, "_notify_active_fit_windows_runtime_inputs_changed", None)
+        if callable(notify_fit_windows):
+            notify_fit_windows()
 
     @staticmethod
     def _state_network_dialog_info_text(*, locked: bool) -> str:
@@ -5384,12 +5394,15 @@ class MainWindow(
         rhs = build_ode_rhs_from_mechanism(mechanism)
 
         temperature_schedule = None
+        intervention_schedule = None
         try:
             meta = getattr(mechanism, "metadata", {}) or {}
             if isinstance(meta, dict):
                 temperature_schedule = meta.get("temperature_schedule")
+                intervention_schedule = meta.get("intervention_schedule")
         except Exception:
             temperature_schedule = None
+            intervention_schedule = None
 
         jacobian_func = None
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
@@ -5416,6 +5429,8 @@ class MainWindow(
             grid={"N": max(2, int(num_points))},
             jacobian_func=jacobian_func,
             temperature_schedule=temperature_schedule,
+            intervention_schedule=intervention_schedule,
+            species_names=tuple(species_names),
         )
         try:
             result = solve_ode(request)
@@ -6966,10 +6981,21 @@ class MainWindow(
     def _current_workspace_preview_identity(self, *, set_id: str):
         from kindred.core.simulation_identity import SimulationIdentity
 
+        mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
         expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
             set_id=str(set_id),
-            mechanism_text=self._mechanism_text_for_workspace_selection(set_id=str(set_id)),
+            mechanism_text=mechanism_text,
         )
+        try:
+            from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+
+            intervention_schedule_fingerprint = str(
+                intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or ""
+            )
+        except Exception:
+            intervention_schedule_fingerprint = hashlib.sha256(
+                str(mechanism_text or "").encode("utf-8", "surrogatepass")
+            ).hexdigest()
         initials_fingerprint = ""
         row = self._batch_row_for_set_id(str(set_id))
         if row is not None:
@@ -7006,6 +7032,7 @@ class MainWindow(
             canonical_initials_fingerprint=initials_fingerprint,
             solver_config=expected_solver_config,
             t_end=expected_t_end,
+            intervention_schedule_fingerprint=intervention_schedule_fingerprint,
             preview_batch_cache_token=expected_overlay_token,
             execution_flags=("fast_mode",),
         )
@@ -9456,6 +9483,11 @@ class MainWindow(
             current_atol = float(self._initial_atol or 1e-12)
             current_sparse = bool(self._use_sparse_jacobian)
             current_wegscheider = bool(self._wegscheider_cyclicity_enabled)
+            previous_fit_runtime_settings = {
+                "use_sparse_jacobian": bool(current_sparse),
+                "wegscheider_cyclicity_enabled": bool(current_wegscheider),
+                "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
+            }
             current_runtime_settings = {
                 "solver": str(current_solver),
                 "rtol": float(current_rtol),
@@ -9609,6 +9641,15 @@ class MainWindow(
                 "limit_blas_threads_per_worker",
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker,
             )
+            next_fit_runtime_settings = {
+                "use_sparse_jacobian": bool(self._use_sparse_jacobian),
+                "wegscheider_cyclicity_enabled": bool(self._wegscheider_cyclicity_enabled),
+                "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
+            }
+            if next_fit_runtime_settings != previous_fit_runtime_settings:
+                notify_fit_windows = getattr(self, "_notify_active_fit_windows_runtime_inputs_changed", None)
+                if callable(notify_fit_windows):
+                    notify_fit_windows()
             slider_schema_refresh_needed = bool(
                 current_runtime_settings["wegscheider_cyclicity_enabled"]
                 != next_runtime_settings["wegscheider_cyclicity_enabled"]

@@ -42,3 +42,60 @@ def test_coerce_simulation_builder_maps_all_required_kwarg_mismatches(legacy_bui
 
     with pytest.raises(SimulationBuilderContractError):
         builder("A -> B", ["k1"], solver="BDF", rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.unit
+def test_coerce_simulation_builder_forwards_supported_runtime_settings() -> None:
+    calls = []
+
+    def runtime_builder(
+        mechanism_text,
+        param_names,
+        *,
+        solver,
+        rtol,
+        atol,
+        temperature_K=None,
+        use_sparse_jacobian=None,
+        wegscheider_cyclicity_enabled=None,
+    ):
+        calls.append(
+            {
+                "mechanism_text": mechanism_text,
+                "param_names": list(param_names),
+                "solver": solver,
+                "rtol": rtol,
+                "atol": atol,
+                "temperature_K": temperature_K,
+                "use_sparse_jacobian": use_sparse_jacobian,
+                "wegscheider_cyclicity_enabled": wegscheider_cyclicity_enabled,
+            }
+        )
+        return object()
+
+    builder = coerce_simulation_builder(runtime_builder)
+
+    result = builder(
+        "A -> B",
+        ["k1"],
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-9,
+        temperature_K=310.0,
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    assert result is not None
+    assert calls == [
+        {
+            "mechanism_text": "A -> B",
+            "param_names": ["k1"],
+            "solver": "BDF",
+            "rtol": 1e-6,
+            "atol": 1e-9,
+            "temperature_K": 310.0,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        }
+    ]

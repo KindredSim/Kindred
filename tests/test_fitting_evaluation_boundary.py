@@ -535,6 +535,111 @@ def test_serial_fitting_evaluator_process_payload_round_trip_matches_original() 
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("temperature_K", 999.0, "temperature_K"),
+        ("initial_prefix", "stale:", "initial_prefix"),
+        ("requested_param_names", ["other"], "requested_param_names"),
+    ],
+)
+def test_serial_fitting_process_payload_rejects_plan_conflicting_duplicate_fields(field, value, match) -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        temperature_K=310.0,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=match):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
+def test_serial_fitting_process_payload_rejects_schedule_fingerprint_conflict() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        temperature_K=310.0,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    payload["prepared_metadata"] = dict(payload["prepared_metadata"])
+    payload["prepared_metadata"]["intervention_schedule_fingerprint"] = "stale-schedule"
+
+    with pytest.raises(ValueError, match="intervention_schedule_fingerprint"):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
+def test_serial_fitting_process_payload_preserves_and_executes_intervention_schedule() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.intervention_schedule import coerce_intervention_schedule
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=3.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=4,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    schedule = coerce_intervention_schedule(context.execution_request.intervention_schedule)
+    assert schedule is not None
+    assert context.prepared_metadata.intervention_schedule_fingerprint == schedule.fingerprint
+
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    plan_request = payload["simulation_plan"]["execution_request"]
+    assert plan_request["intervention_schedule"] == schedule.to_payload()
+    assert plan_request["prepared_payload"]["intervention_schedule"] == schedule.to_payload()
+    assert payload["prepared_metadata"]["intervention_schedule_fingerprint"] == schedule.fingerprint
+
+    restored = SerialFittingEvaluator.from_process_payload(payload)
+    result = restored({"init:A": 1.0, "k1": 0.0})
+
+    assert float(np.asarray(result.species["A"], dtype=float)[0]) == pytest.approx(3.0)
+
+
 def test_serial_fitting_evaluator_process_payload_is_picklable_without_prepared_rhs() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 

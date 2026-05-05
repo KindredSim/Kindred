@@ -7,6 +7,28 @@ import pytest
 
 pytestmark = [pytest.mark.gui]
 
+
+@pytest.fixture(autouse=True)
+def _ready_fit_runtime_session(monkeypatch):
+    class _ReadyRuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            return None
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        lambda _fit_evaluator, *, max_lanes, ledger=None: _ReadyRuntimeSession(),
+    )
+
 def _seed_two_datasets(main_window) -> None:
     data_panel = main_window._right_panel._data_manager
     data_panel._datasets.clear()
@@ -97,6 +119,68 @@ def _parameter_table_names(window) -> list[str]:
         if item is not None and item.text().strip():
             names.append(item.text().strip())
     return names
+
+def _start_fit_after_runtime_ready(window, qtbot, config, selection, **kwargs) -> None:
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
+    from kindred.gui.fitting.window import FittingRuntimeSession
+
+    class _ReadyRuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
+        def warm(self, *, cancellation_check=None, lane_count=None) -> None:
+            return None
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False) -> None:
+            return None
+
+    solver = str(kwargs.get("solver") or "BDF")
+    rtol = float(kwargs.get("rtol", 1e-6))
+    atol = float(kwargs.get("atol", 1e-12))
+    combo = getattr(window._params_ics_tab, "_integration_solver_combo", None)
+    if combo is not None:
+        combo.setCurrentText(solver)
+    rtol_edit = getattr(window._params_ics_tab, "_integration_rtol_edit", None)
+    if rtol_edit is not None:
+        rtol_edit.setText(f"{rtol:.12g}")
+    atol_edit = getattr(window._params_ics_tab, "_integration_atol_edit", None)
+    if atol_edit is not None:
+        atol_edit.setText(f"{atol:.12g}")
+
+    original_session_factory = FittingRuntimeSession.from_serial_evaluator
+    FittingRuntimeSession.from_serial_evaluator = staticmethod(lambda _fit_evaluator, *, max_lanes, ledger=None: _ReadyRuntimeSession())
+    try:
+        worker_before = getattr(window, "_worker", None)
+        window._start_fit()
+        try:
+            qtbot.waitUntil(
+                lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+                timeout=3000,
+            )
+        except Exception as exc:
+            snapshot = window._fit_runtime_readiness.snapshot()
+            raise AssertionError(
+                "Fitting runtime did not become ready: "
+                f"state={snapshot.state!r}, "
+                f"desired_hash={snapshot.desired_hash!r}, "
+                f"active_hash={snapshot.active_hash!r}, "
+                f"ready_hash={snapshot.ready_hash!r}, "
+                f"error={snapshot.error!r}"
+            ) from exc
+        if (
+            window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY
+            and getattr(window, "_worker", None) is worker_before
+        ):
+            window._start_fit()
+        elif getattr(window, "_worker", None) is worker_before:
+            assert window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY
+    finally:
+        FittingRuntimeSession.from_serial_evaluator = original_session_factory
+    qtbot.wait(0)
 
 def _parameter_table_rows(window) -> list[dict[str, object]]:
     from PySide6 import QtCore
@@ -1359,7 +1443,7 @@ def test_global_fit_apply_to_project_initial_condition_settings_sync_without_can
     finally:
         window.close()
 
-def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(main_window, monkeypatch, qt_app):
+def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(main_window, monkeypatch, qt_app, qtbot):
     from PySide6 import QtCore, QtWidgets
 
     _seed_two_datasets(main_window)
@@ -1425,7 +1509,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         assert "init:A" in config["parameters"]
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1437,8 +1521,9 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         )
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled() is False, timeout=1000)
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert "Global A_0" in _parameter_table_names(window)
 
@@ -1449,7 +1534,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
     finally:
         window.close()
 
-def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edit(main_window, monkeypatch, qt_app):
+def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edit(main_window, monkeypatch, qt_app, qtbot):
     from PySide6 import QtCore, QtWidgets
 
     _seed_two_datasets(main_window)
@@ -1520,7 +1605,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1533,7 +1618,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
 
         rows_after = _parameter_table_rows(window)
@@ -1544,7 +1629,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
     finally:
         window.close()
 
-def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_edit(main_window, monkeypatch, qt_app):
+def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_edit(main_window, monkeypatch, qt_app, qtbot):
     from PySide6 import QtCore, QtWidgets
 
     from kindred.gui.controllers.dataset_manager import DatasetManagerError
@@ -1612,13 +1697,16 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         main_window._mechanism_editor._reactions_text.setPlainText("")
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        window._params_ics_tab._integration_solver_combo.setCurrentText("BDF")
+        window._params_ics_tab._integration_rtol_edit.setText("1e-6")
+        window._params_ics_tab._integration_atol_edit.setText("1e-12")
+        window._start_fit()
         assert len(captured_runs) == 1
         assert warning_calls
         assert warning_calls[-1] == ("Global Fit", "Mechanism text is empty.")
@@ -1626,7 +1714,7 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         window.close()
 
 
-def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_window, monkeypatch, qt_app):
+def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_window, monkeypatch, qt_app, qtbot):
     from PySide6 import QtCore, QtWidgets
 
     _seed_two_datasets(main_window)
@@ -1688,7 +1776,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
         first_simulation = captured_runs[0]["kwargs"]["fit_evaluator"]
         first_result = first_simulation({"k1": 0.2, "init:A": 1.0})
@@ -1706,7 +1794,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
 
         second_simulation = captured_runs[1]["kwargs"]["fit_evaluator"]
@@ -1721,7 +1809,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         window.close()
 
 
-def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanism_edit(main_window, monkeypatch, qt_app):
+def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanism_edit(main_window, monkeypatch, qt_app, qtbot):
     from PySide6 import QtCore, QtWidgets
 
     _seed_two_datasets(main_window)
@@ -1782,7 +1870,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1795,7 +1883,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _parameter_table_names(window) == ["k2"]
         assert [str(entry.get("param_name") or "") for entry in window._params_ics_tab.get_parameter_state()] == ["k2"]
@@ -1803,7 +1891,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         window.close()
 
 
-def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism_edit(main_window, monkeypatch, qt_app):
+def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism_edit(main_window, monkeypatch, qt_app, qtbot):
     from PySide6 import QtCore, QtWidgets
     from kindred.gui.fitting.unified_species_table import _Col
 
@@ -1864,7 +1952,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
         assert config is not None
         selection = window._collect_dataset_selection()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
 
         mechanism_b = "\n".join(
@@ -1877,7 +1965,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
         qt_app.processEvents()
 
-        window._start_global_fit(config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
+        _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 2
         assert _ic_table_species(window) == ["A", "C"]
         table = window.findChild(QtWidgets.QTableWidget, "global_fit_unified_species_table")

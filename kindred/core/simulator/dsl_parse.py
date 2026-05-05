@@ -54,6 +54,7 @@ from .errors import (
 
 if TYPE_CHECKING:
     from ..mechanism import Mechanism
+    from ..intervention_schedule import InterventionSchedule
     from ..temperature import TemperatureScheduleProtocol
     from .dsl_parameter_scan import ParameterDefinition
     from .state_model import StateNetwork
@@ -138,12 +139,15 @@ class DSLResult:
     temperature_schedule : TemperatureScheduleProtocol | None
         Temperature schedule for time-dependent temperature.
         None if no temperature schedule specified.
+    intervention_schedule : InterventionSchedule | None
+        Fixed species intervention schedule parsed from intervention directives.
     ir : DSLIR | None
         Structured intermediate representation (single source of truth for parsing).
     """
     previews: List[StepPreview] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     temperature_schedule: Optional["TemperatureScheduleProtocol"] = None
+    intervention_schedule: Optional["InterventionSchedule"] = None
     ir: Optional["DSLIR"] = None
 
 
@@ -162,6 +166,7 @@ class DSLIR:
     standard_conc_M: float
     kappa_global: float
     temperature_schedule: Optional["TemperatureScheduleProtocol"]
+    intervention_schedule: Optional["InterventionSchedule"]
     state_network: "StateNetwork"
     steps: List["ParsedStep"]
     algebra_lines: List[str]
@@ -436,8 +441,10 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
     # Parse temperature schedule if present
     from ..temperature_dsl import parse_temperature_schedule
+    from ..intervention_schedule import parse_intervention_schedule_from_dsl
 
     temperature_schedule = parse_temperature_schedule(text)
+    intervention_schedule = parse_intervention_schedule_from_dsl(text)
 
     raw_lines = text.splitlines()
     if not any(line.strip() and not line.strip().startswith("#") for line in raw_lines):
@@ -459,6 +466,9 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         # Temperature schedule lines: parsed separately above
         if lower.startswith(("time:", "temp_const:", "temp_step:", "temp_response:")):
+            continue
+
+        if lower.startswith("intervention:"):
             continue
 
         # Header-like switches
@@ -620,6 +630,8 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
     if temperature_schedule is not None:
         notes.append(f"Temperature schedule detected: {temperature_schedule}")
+    if intervention_schedule is not None:
+        notes.append("Intervention schedule detected")
 
     return DSLIR(
         version=_DSL_IR_VERSION,
@@ -628,6 +640,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         standard_conc_M=float(standard_conc_M),
         kappa_global=float(kappa_global),
         temperature_schedule=temperature_schedule,
+        intervention_schedule=intervention_schedule,
         state_network=state_network,
         steps=steps,
         algebra_lines=algebra_lines,
@@ -663,6 +676,7 @@ def parse_dsl(text: str, *, units: UnitsModel | None = None) -> DSLResult:
         previews=previews,
         notes=list(ir.notes),
         temperature_schedule=ir.temperature_schedule,
+        intervention_schedule=ir.intervention_schedule,
         ir=ir,
     )
 

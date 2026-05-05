@@ -907,7 +907,7 @@ def test_public_api_surface(qt_app):
         assert callable(getattr(tbl, "refresh_validity_ui", None))
         assert callable(getattr(tbl, "load_for_dataset", None))
         assert callable(getattr(tbl, "set_mechanism_species", None))
-        assert callable(getattr(tbl, "refresh_dataset_combo", None))
+        assert callable(getattr(tbl, "refresh_dataset_entries", None))
         assert callable(getattr(tbl, "initial_parameter_defaults_for_species", None))
         assert callable(getattr(tbl, "set_running_state", None))
 

@@ -60,10 +60,7 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
     )
     try:
         window._params_ics_tab.set_staged_dataset_params({"ds1": {"init:A": 0.6}})
-        window._start_global_fit(
-            {"parameters": {"k1": 0.2}, "bounds": {"k1": (0.01, 1.0)}, "method": "trf", "max_nfev": 10, "seed": None},
-            {"ids": ["ds1"], "rows": [{"id": "ds1", "include": True, "weight": 1.0}]},
-        )
+        window._start_fit()
         assert captured["dataset_variable_params"] is None
         _, dataset_variable_params = split_fit_dataset_parameter_overrides(captured["dataset_overrides"])
         assert dataset_variable_params["ds1"]["init:A"]["initial"] == pytest.approx(0.6)
