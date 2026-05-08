@@ -81,6 +81,162 @@ class BatchContextSeed:
 
 
 @dataclass(frozen=True)
+class BatchRunStartRequest:
+    request_id: int
+    run_id: int | None
+    runtime_input_epoch: int
+    runtime_input_global_epoch: int
+    runtime_input_set_epoch_by_set_id: Mapping[str, Any]
+    fast_mode: bool
+    reuse_parallel_lane_pool: bool
+    parallel: bool
+    effective_workers: int
+    retain_prepared_payloads_in_context: bool
+    prepared_payload: Mapping[str, Any] | None
+    prepared_payload_by_set_id: Mapping[str, Mapping[str, Any]]
+    primary_simulation_plan: Mapping[str, Any] | None
+    simulation_plan_by_set_id: Mapping[str, Mapping[str, Any]]
+    cache_key: Any
+    scope_identity: Mapping[str, Any]
+    full_dsl: str
+    mechanism_text_by_set_id: Mapping[str, str]
+    mechanism_signature: str
+    mechanism_signature_by_set_id: Mapping[str, str]
+    simulation_identity_by_set_id: Mapping[str, Mapping[str, Any]]
+    solver_config: Mapping[str, Any]
+    t_end: float
+    rows: Sequence[int]
+    queue_ids: Sequence[str]
+    queue_names: Sequence[str]
+    pending_workspace_reset_set_ids: Sequence[str]
+    pending_dirty_reset_generation_by_set_id: Mapping[str, Any]
+    primary_set_id: str | None
+    pending_init_seed: Mapping[str, Mapping[str, Any]]
+    pending_init_rewrite: str | None
+    pending_init_applied: bool
+    explicit_cache_preview_token: str | None
+    explicit_cache_preview_scope_set_ids: Sequence[str] | None
+    explicit_cache_valid_set_ids: Sequence[str] | None
+    explicit_cache_invalidated_set_ids: Sequence[str] | None
+    preview_scope_set_ids: Sequence[str] | None
+    preview_owner_epoch: int | None
+    preview_batch_cache_token_by_set_id: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "runtime_input_set_epoch_by_set_id",
+            deepcopy(dict(self.runtime_input_set_epoch_by_set_id or {})),
+        )
+        object.__setattr__(
+            self,
+            "prepared_payload",
+            deepcopy(dict(self.prepared_payload)) if isinstance(self.prepared_payload, Mapping) else None,
+        )
+        object.__setattr__(
+            self,
+            "prepared_payload_by_set_id",
+            {
+                str(set_id): deepcopy(dict(payload))
+                for set_id, payload in dict(self.prepared_payload_by_set_id or {}).items()
+                if str(set_id) and isinstance(payload, Mapping)
+            },
+        )
+        object.__setattr__(
+            self,
+            "primary_simulation_plan",
+            deepcopy(dict(self.primary_simulation_plan))
+            if isinstance(self.primary_simulation_plan, Mapping)
+            else None,
+        )
+        object.__setattr__(
+            self,
+            "simulation_plan_by_set_id",
+            {
+                str(set_id): deepcopy(dict(payload))
+                for set_id, payload in dict(self.simulation_plan_by_set_id or {}).items()
+                if str(set_id) and isinstance(payload, Mapping)
+            },
+        )
+        object.__setattr__(self, "scope_identity", deepcopy(dict(self.scope_identity or {})))
+        object.__setattr__(
+            self,
+            "mechanism_text_by_set_id",
+            {
+                str(set_id): str(text)
+                for set_id, text in dict(self.mechanism_text_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+        object.__setattr__(
+            self,
+            "mechanism_signature_by_set_id",
+            {
+                str(set_id): str(signature)
+                for set_id, signature in dict(self.mechanism_signature_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+        object.__setattr__(
+            self,
+            "simulation_identity_by_set_id",
+            {
+                str(set_id): deepcopy(dict(payload))
+                for set_id, payload in dict(self.simulation_identity_by_set_id or {}).items()
+                if str(set_id) and isinstance(payload, Mapping)
+            },
+        )
+        object.__setattr__(self, "solver_config", deepcopy(dict(self.solver_config or {})))
+        object.__setattr__(self, "rows", tuple(int(row) for row in self.rows))
+        object.__setattr__(self, "queue_ids", tuple(str(set_id) for set_id in self.queue_ids))
+        object.__setattr__(self, "queue_names", tuple(str(name) for name in self.queue_names))
+        object.__setattr__(
+            self,
+            "pending_workspace_reset_set_ids",
+            tuple(str(set_id) for set_id in self.pending_workspace_reset_set_ids if str(set_id)),
+        )
+        object.__setattr__(
+            self,
+            "pending_dirty_reset_generation_by_set_id",
+            {
+                str(set_id): value
+                for set_id, value in dict(self.pending_dirty_reset_generation_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+        object.__setattr__(
+            self,
+            "pending_init_seed",
+            {
+                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
+                for set_name, seed in dict(self.pending_init_seed or {}).items()
+                if str(set_name) and isinstance(seed, Mapping)
+            },
+        )
+        for name in (
+            "explicit_cache_preview_scope_set_ids",
+            "explicit_cache_valid_set_ids",
+            "explicit_cache_invalidated_set_ids",
+            "preview_scope_set_ids",
+        ):
+            value = getattr(self, name)
+            object.__setattr__(
+                self,
+                name,
+                tuple(str(set_id) for set_id in value if str(set_id)) if value is not None else None,
+            )
+        object.__setattr__(
+            self,
+            "preview_batch_cache_token_by_set_id",
+            {
+                str(set_id): str(token)
+                for set_id, token in dict(self.preview_batch_cache_token_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+
+
+@dataclass(frozen=True)
 class BatchCompletionSummary:
     fast_mode: bool
     has_truthful_success: bool
@@ -634,139 +790,101 @@ class BatchRunContextOwner:
         ctx = context if isinstance(context, Mapping) else self._context
         return self._coerce_bool(ctx.get("fast_mode"))
 
-    def start_run(
-        self,
-        *,
-        request_id: int,
-        run_id: int | None,
-        runtime_input_epoch: int,
-        runtime_input_global_epoch: int,
-        runtime_input_set_epoch_by_set_id: Mapping[str, Any],
-        fast_mode: bool,
-        reuse_parallel_lane_pool: bool,
-        parallel: bool,
-        effective_workers: int,
-        retain_prepared_payloads_in_context: bool,
-        prepared_payload: Mapping[str, Any] | None,
-        prepared_payload_by_set_id: Mapping[str, Mapping[str, Any]],
-        primary_simulation_plan: Mapping[str, Any] | None,
-        simulation_plan_by_set_id: Mapping[str, Mapping[str, Any]],
-        cache_key: Any,
-        scope_identity: Mapping[str, Any],
-        full_dsl: str,
-        mechanism_text_by_set_id: Mapping[str, str],
-        mechanism_signature: str,
-        mechanism_signature_by_set_id: Mapping[str, str],
-        simulation_identity_by_set_id: Mapping[str, Mapping[str, Any]],
-        solver_config: Mapping[str, Any],
-        t_end: float,
-        rows: Sequence[int],
-        queue_ids: Sequence[str],
-        queue_names: Sequence[str],
-        pending_workspace_reset_set_ids: Sequence[str],
-        pending_dirty_reset_generation_by_set_id: Mapping[str, Any],
-        primary_set_id: str | None,
-        pending_init_seed: Mapping[str, Mapping[str, Any]],
-        pending_init_rewrite: str | None,
-        pending_init_applied: bool,
-        explicit_cache_preview_token: str | None,
-        explicit_cache_preview_scope_set_ids: Sequence[str] | None,
-        explicit_cache_valid_set_ids: Sequence[str] | None,
-        explicit_cache_invalidated_set_ids: Sequence[str] | None,
-        preview_scope_set_ids: Sequence[str] | None,
-        preview_owner_epoch: int | None,
-        preview_batch_cache_token_by_set_id: Mapping[str, str],
-    ) -> Dict[str, Any]:
-        retain_prepared = bool(retain_prepared_payloads_in_context)
-        serial_explicit = bool((not fast_mode) and retain_prepared)
+    def start_run(self, request: BatchRunStartRequest) -> Dict[str, Any]:
+        retain_prepared = bool(request.retain_prepared_payloads_in_context)
+        serial_explicit = bool((not request.fast_mode) and retain_prepared)
         context: Dict[str, Any] = {
             "active": True,
-            "request_id": int(request_id),
-            "run_id": run_id,
-            "runtime_input_epoch": int(runtime_input_epoch),
-            "runtime_input_global_epoch": int(runtime_input_global_epoch),
+            "request_id": int(request.request_id),
+            "run_id": request.run_id,
+            "runtime_input_epoch": int(request.runtime_input_epoch),
+            "runtime_input_global_epoch": int(request.runtime_input_global_epoch),
             "runtime_input_set_epoch_by_set_id": {
                 str(set_id): value
-                for set_id, value in dict(runtime_input_set_epoch_by_set_id or {}).items()
+                for set_id, value in dict(request.runtime_input_set_epoch_by_set_id or {}).items()
                 if str(set_id)
             },
-            "fast_mode": bool(fast_mode),
-            "reuse_parallel_lane_pool": bool(reuse_parallel_lane_pool),
-            "keep_lane_pool_alive": bool(reuse_parallel_lane_pool and parallel),
-            "parallel": bool(parallel),
-            "effective_workers": int(effective_workers),
-            "prepared": deepcopy(dict(prepared_payload)) if serial_explicit and isinstance(prepared_payload, Mapping) else None,
+            "fast_mode": bool(request.fast_mode),
+            "reuse_parallel_lane_pool": bool(request.reuse_parallel_lane_pool),
+            "keep_lane_pool_alive": bool(request.reuse_parallel_lane_pool and request.parallel),
+            "parallel": bool(request.parallel),
+            "effective_workers": int(request.effective_workers),
+            "prepared": (
+                deepcopy(dict(request.prepared_payload))
+                if serial_explicit and isinstance(request.prepared_payload, Mapping)
+                else None
+            ),
             "prepared_by_set_id": (
                 {
                     str(set_id): deepcopy(dict(payload))
-                    for set_id, payload in dict(prepared_payload_by_set_id or {}).items()
+                    for set_id, payload in dict(request.prepared_payload_by_set_id or {}).items()
                     if str(set_id) and isinstance(payload, Mapping)
                 }
                 if retain_prepared
                 else {}
             ),
             "simulation_plan": (
-                deepcopy(dict(primary_simulation_plan))
-                if ((not fast_mode) and isinstance(primary_simulation_plan, Mapping))
+                deepcopy(dict(request.primary_simulation_plan))
+                if ((not request.fast_mode) and isinstance(request.primary_simulation_plan, Mapping))
                 else None
             ),
             "simulation_plan_by_set_id": {
                 str(set_id): deepcopy(dict(payload))
-                for set_id, payload in dict(simulation_plan_by_set_id or {}).items()
+                for set_id, payload in dict(request.simulation_plan_by_set_id or {}).items()
                 if str(set_id) and isinstance(payload, Mapping)
             },
-            "cache_key": cache_key,
-            "scope_identity": deepcopy(dict(scope_identity or {})),
-            "full_dsl": str(full_dsl),
+            "cache_key": request.cache_key,
+            "scope_identity": deepcopy(dict(request.scope_identity or {})),
+            "full_dsl": str(request.full_dsl),
             "mechanism_text_by_set_id": {
                 str(set_id): str(text)
-                for set_id, text in dict(mechanism_text_by_set_id or {}).items()
+                for set_id, text in dict(request.mechanism_text_by_set_id or {}).items()
                 if str(set_id)
             },
-            "mechanism_signature": str(mechanism_signature),
+            "mechanism_signature": str(request.mechanism_signature),
             "mechanism_signature_by_set_id": {
                 str(set_id): str(signature)
-                for set_id, signature in dict(mechanism_signature_by_set_id or {}).items()
+                for set_id, signature in dict(request.mechanism_signature_by_set_id or {}).items()
                 if str(set_id)
             },
             "simulation_identity_by_set_id": {
                 str(set_id): deepcopy(dict(payload))
-                for set_id, payload in dict(simulation_identity_by_set_id or {}).items()
+                for set_id, payload in dict(request.simulation_identity_by_set_id or {}).items()
                 if str(set_id) and isinstance(payload, Mapping)
             },
-            "solver_config": deepcopy(dict(solver_config or {})),
-            "t_end": float(t_end),
-            "rows": [int(row) for row in rows],
-            "queue_ids": [str(set_id) for set_id in queue_ids],
-            "queue_names": [str(name) for name in queue_names],
+            "solver_config": deepcopy(dict(request.solver_config or {})),
+            "t_end": float(request.t_end),
+            "rows": [int(row) for row in request.rows],
+            "queue_ids": [str(set_id) for set_id in request.queue_ids],
+            "queue_names": [str(name) for name in request.queue_names],
             "pending_workspace_reset_set_ids": [
-                str(set_id) for set_id in pending_workspace_reset_set_ids if str(set_id)
+                str(set_id) for set_id in request.pending_workspace_reset_set_ids if str(set_id)
             ],
             "pending_dirty_reset_generation_by_set_id": {
                 str(set_id): value
-                for set_id, value in dict(pending_dirty_reset_generation_by_set_id or {}).items()
+                for set_id, value in dict(request.pending_dirty_reset_generation_by_set_id or {}).items()
                 if str(set_id)
             },
             "pos": 0,
-            "primary_set_id": primary_set_id,
-            "total": len(queue_ids),
+            "primary_set_id": request.primary_set_id,
+            "total": len(request.queue_ids),
             "completed_set_ids": [],
             "pending_init_seed": {
                 str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-                for set_name, seed in dict(pending_init_seed or {}).items()
+                for set_name, seed in dict(request.pending_init_seed or {}).items()
                 if str(set_name) and isinstance(seed, Mapping)
             },
-            "pending_init_rewrite": pending_init_rewrite,
-            "pending_init_applied": bool(pending_init_applied),
-            "explicit_cache_preview_token": explicit_cache_preview_token,
-            "explicit_cache_preview_scope_set_ids": explicit_cache_preview_scope_set_ids,
-            "explicit_cache_valid_set_ids": explicit_cache_valid_set_ids,
-            "explicit_cache_invalidated_set_ids": explicit_cache_invalidated_set_ids,
-            "preview_scope_set_ids": preview_scope_set_ids,
-            "preview_owner_epoch": preview_owner_epoch,
+            "pending_init_rewrite": request.pending_init_rewrite,
+            "pending_init_applied": bool(request.pending_init_applied),
+            "explicit_cache_preview_token": request.explicit_cache_preview_token,
+            "explicit_cache_preview_scope_set_ids": request.explicit_cache_preview_scope_set_ids,
+            "explicit_cache_valid_set_ids": request.explicit_cache_valid_set_ids,
+            "explicit_cache_invalidated_set_ids": request.explicit_cache_invalidated_set_ids,
+            "preview_scope_set_ids": request.preview_scope_set_ids,
+            "preview_owner_epoch": request.preview_owner_epoch,
             "preview_batch_cache_token_by_set_id": {
                 str(set_id): str(token)
-                for set_id, token in dict(preview_batch_cache_token_by_set_id or {}).items()
+                for set_id, token in dict(request.preview_batch_cache_token_by_set_id or {}).items()
                 if str(set_id)
             },
         }

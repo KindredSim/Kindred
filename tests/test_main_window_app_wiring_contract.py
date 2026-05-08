@@ -192,6 +192,11 @@ _SIMULATION_PORT_METHODS = {
     "runtime": (
         "prepare_slider_runtime",
         "apply_slider_overrides_to_bindings",
+        "is_energy_mode_mechanism",
+        "dsl_has_computational_mode_generated_block",
+        "sync_energy_mode_temperature_from_mechanism",
+        "populate_energy_mode_variables_from_mechanism",
+        "extract_and_populate_variables",
     ),
     "results": (
         "set_data",

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from PySide6 import QtCore
 
+from kindred.gui.fitting.launch import FittingLaunchPurpose
 from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
 
 if TYPE_CHECKING:
@@ -63,15 +64,22 @@ class FittingRuntimePreparationOwner:
         if bool(getattr(window, "_worker", None) and getattr(window._worker, "isRunning", lambda: False)()):
             return
         try:
-            identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+            launch_result = window.fit_launch_identity_owner.build_current_launch_result(
+                purpose=FittingLaunchPurpose.PASSIVE_READINESS,
+            )
         except RuntimeError as exc:
             window.fit_runtime_readiness.set_blocked(exc)
             if hasattr(window, "_status_label"):
                 window._status_label.setText(f"Fitting runtime not ready: {exc}")
             window._refresh_run_button_enabled_state()
             return
+        identity = launch_result.identity
         if identity is None:
             window.fit_runtime_readiness.set_blocked()
+            window.fit_launch_identity_owner.render_launch_rejection(
+                launch_result,
+                purpose=FittingLaunchPurpose.PASSIVE_READINESS,
+            )
             window._refresh_run_button_enabled_state()
             return
         window.fit_runtime_readiness.set_desired_identity(identity)

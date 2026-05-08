@@ -948,7 +948,7 @@ class SimulationBatchOwner:
         set_id: str,
         mechanism_text: str,
     ) -> tuple[Dict[str, Any], float, str]:
-        from kindred.gui.controllers.simulation_controller import build_fast_preview_solver_grid_context
+        from kindred.gui.controllers.simulation_run_preparation import build_fast_preview_solver_grid_context
 
         solver_grid_context = build_fast_preview_solver_grid_context(
             initial_solver_name=self._solver_owner.initial_solver_name(),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import replace
+from types import SimpleNamespace
 import threading
 from unittest import mock
 
@@ -451,6 +452,31 @@ def test_fit_runtime_readiness_still_blocks_de_infinite_bounds(qt_app):
         window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
 
         assert window.fit_launch_identity_owner.build_current_fit_runtime_identity() is None
+    finally:
+        window.close()
+        qt_app.processEvents()
+
+
+def test_explicit_fit_invalid_de_bounds_warns_once(qt_app, monkeypatch):
+    warnings: list[tuple[str, str]] = []
+
+    def _capture_warning(_parent, title, message, *_args, **_kwargs):
+        warnings.append((str(title), str(message)))
+        return int(QtWidgets.QMessageBox.StandardButton.Ok)
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_capture_warning))
+    window = _build_window()
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        table = window._params_ics_tab._param_table
+        table.item(0, 4).setText("-inf")
+        table.item(0, 5).setText("inf")
+        window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
+
+        window.run_fit()
+
+        assert len(warnings) == 1
+        assert warnings[0][0] == "Invalid Bounds"
     finally:
         window.close()
         qt_app.processEvents()
@@ -2186,7 +2212,7 @@ def test_dataset_scoped_readiness_rejects_live_unchecked_fit_flag(qt_app):
         window.close()
 
 
-def test_passive_readiness_and_run_fit_use_single_launch_config_collector(qt_app, monkeypatch):
+def test_passive_readiness_and_run_fit_share_collector_but_run_fit_revalidates(qt_app, monkeypatch):
     window = _build_window()
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
@@ -2234,7 +2260,7 @@ def test_passive_readiness_and_run_fit_use_single_launch_config_collector(qt_app
         window.fit_runtime_preparation_owner.prepare_current_state()
         window.run_fit()
 
-        assert collect_calls == [False, False, True]
+        assert collect_calls == [False, True]
         assert started
     finally:
         window.close()
@@ -2433,6 +2459,146 @@ def test_run_fit_button_rejects_stale_ready_identity_after_runtime_setting_chang
 
         assert window._run_button.isEnabled() is False
         assert created_temperatures == [298.15]
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("change", ["dataset_selection", "integration_rtol"])
+def test_run_fit_button_rejects_stale_ready_identity_after_launch_input_change(qt_app, qtbot, monkeypatch, change):
+    created: list[int] = []
+
+    class _ReadySession:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            self.ready = True
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return bool(self.ready)
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    def _fake_from_serial(_evaluator, *, max_lanes, ledger=None):
+        created.append(int(max_lanes))
+        return _ReadySession()
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
+
+    window = _build_window(
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+            {
+                "id": "ds2",
+                "label": "Dataset 2",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([0.9, 0.7, 0.5], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            },
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"},
+            {"id": "ds2", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([0.9, 0.7, 0.5]), "species": "A"},
+        ],
+        simulation_func=_basic_serial_fitting_evaluator(),
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._species_table._fit_targets_selection_applied["ds2"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._on_targets_applied()
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
+
+        assert created == [2]
+        assert window._run_button.isEnabled() is True
+
+        if change == "dataset_selection":
+            window._dataset_entries[1]["include"] = False
+        else:
+            rtol_edit = window._params_ics_tab._integration_rtol_edit
+            rtol_edit.blockSignals(True)
+            rtol_edit.setText("1e-5")
+            rtol_edit.blockSignals(False)
+        window._refresh_run_button_enabled_state()
+
+        assert window._run_button.isEnabled() is False
+        assert created == [2]
+    finally:
+        window.close()
+
+
+def test_runtime_request_identity_matches_false_runtime_settings(qt_app):
+    runtime_settings = {
+        "temperature_K": 298.15,
+        "use_sparse_jacobian": False,
+        "wegscheider_cyclicity_enabled": False,
+    }
+
+    def _runtime_settings_getter():
+        return dict(runtime_settings)
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": np.asarray([0.0, 1.0, 2.0], dtype=float),
+                "species_data": {"A": np.asarray([1.0, 0.8, 0.6], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": np.asarray([0.0, 1.0, 2.0]), "y": np.asarray([1.0, 0.8, 0.6]), "species": "A"}
+        ],
+        mechanism_species=["A", "B"],
+        mechanism_text_getter=_basic_mechanism_text,
+        reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
+        simulation_func=None,
+        simulation_builder=lambda *_args, **_kwargs: _basic_serial_fitting_evaluator(),
+        runtime_settings_getter=_runtime_settings_getter,
+    )
+    try:
+        identity = SimpleNamespace(
+            stamp={
+                "runtime_request": {
+                    "temperature_K": "298.15",
+                    "use_sparse_jacobian": False,
+                    "wegscheider_cyclicity_enabled": False,
+                }
+            }
+        )
+
+        assert window._fit_runtime_identity_matches_runtime_settings(identity) is True
+    finally:
+        window.close()
+
+
+def test_passive_readiness_preserves_invalid_applied_settings_status(qt_app):
+    window = _build_window(simulation_func=_basic_serial_fitting_evaluator())
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        window._mechanism_text_getter = _basic_mechanism_text
+        window._invalid_applied_used_dataset_ids_for_run = lambda: ["ds1"]
+
+        window.fit_runtime_preparation_owner.prepare_current_state()
+
+        assert "invalid applied settings" in window._status_label.text()
+        assert window._run_button.isEnabled() is False
     finally:
         window.close()
 
@@ -4043,6 +4209,12 @@ def test_completion_dialog_does_not_log_suppressed_top_level_detail_text_on_succ
             "exec",
             lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
         )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *_args, **_kwargs: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+        monkeypatch.setattr(window, "_refresh_fit_window_state_for_current_mechanism", lambda **_kwargs: True)
 
         with caplog.at_level("WARNING", logger="kindred.gui.fitting.window"):
             window._handle_global_fit_complete({"result": result})
@@ -4741,6 +4913,12 @@ def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, m
             "exec",
             lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
         )
+        monkeypatch.setattr(
+            QtWidgets.QMessageBox,
+            "warning",
+            lambda *_args, **_kwargs: int(QtWidgets.QMessageBox.StandardButton.Ok),
+        )
+        monkeypatch.setattr(window, "_refresh_fit_window_state_for_current_mechanism", lambda **_kwargs: True)
         window._handle_global_fit_complete({"result": _build_success_result()})
 
         monkeypatch.setattr(
@@ -4765,8 +4943,8 @@ def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, m
             ),
         )
         monkeypatch.setattr(window._params_ics_tab, "collect_integration_settings", lambda: ("BDF", 1e-6, 1e-12))
-        monkeypatch.setattr(window, "_datasets_payloads_for_readiness", lambda _ids: None)
-        monkeypatch.setattr(window, "_datasets_payloads_for_run", lambda _ids: None)
+        window._global_payload_lookup.pop("ds1", None)
+        window._on_fit_runtime_inputs_changed()
 
         window.run_fit()
 
@@ -4817,6 +4995,7 @@ def test_run_fit_unavailable_evaluator_clears_prior_dataset_manager_fit_state(qt
         window._fit_evaluator_state.set_base_evaluator(None)
         window._simulation_builder = None
         window._fit_evaluator_state.set_simulation_builder(None)
+        window._on_fit_runtime_inputs_changed()
 
         config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
@@ -4864,6 +5043,7 @@ def test_run_fit_unavailable_evaluator_clears_open_results_summary_state(qt_app,
         window._fit_evaluator_state.set_base_evaluator(None)
         window._simulation_builder = None
         window._fit_evaluator_state.set_simulation_builder(None)
+        window._on_fit_runtime_inputs_changed()
 
         config = window._params_ics_tab.collect_parameter_config()
         assert config is not None

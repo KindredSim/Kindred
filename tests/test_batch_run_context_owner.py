@@ -2,12 +2,58 @@ from __future__ import annotations
 
 import pytest
 
-from kindred.gui.controllers.batch_run_context_owner import BatchRunContextOwner
+from kindred.gui.controllers.batch_run_context_owner import BatchRunContextOwner, BatchRunStartRequest
 from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
 from tests.batch_context_test_helpers import seed_batch_context
 
 
 pytestmark = pytest.mark.unit
+
+
+def _batch_run_start_request(**overrides):
+    values = {
+        "request_id": 7,
+        "run_id": 9,
+        "runtime_input_epoch": 3,
+        "runtime_input_global_epoch": 4,
+        "runtime_input_set_epoch_by_set_id": {"id1": 5},
+        "fast_mode": False,
+        "reuse_parallel_lane_pool": True,
+        "parallel": True,
+        "effective_workers": 2,
+        "retain_prepared_payloads_in_context": False,
+        "prepared_payload": {"shared": {"value": 1}},
+        "prepared_payload_by_set_id": {"id1": {"prepared": True}},
+        "primary_simulation_plan": {"execution_mode": "explicit", "metadata": {"set_id": "id1"}},
+        "simulation_plan_by_set_id": {"id1": {"execution_mode": "explicit", "metadata": {"set_id": "id1"}}},
+        "cache_key": "cache-1",
+        "scope_identity": {"scope": "selected"},
+        "full_dsl": "reaction: A -> B; k=1",
+        "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=1"},
+        "mechanism_signature": "sig-primary",
+        "mechanism_signature_by_set_id": {"id1": "sig-id1"},
+        "simulation_identity_by_set_id": {"id1": {"fingerprint": "before"}},
+        "solver_config": {"solver": "BDF"},
+        "t_end": 10.0,
+        "rows": [0],
+        "queue_ids": ["id1"],
+        "queue_names": ["set1"],
+        "pending_workspace_reset_set_ids": ["id1"],
+        "pending_dirty_reset_generation_by_set_id": {"id1": 2},
+        "primary_set_id": "id1",
+        "pending_init_seed": {"set1": {"A": 1.25}},
+        "pending_init_rewrite": "rewrite",
+        "pending_init_applied": True,
+        "explicit_cache_preview_token": None,
+        "explicit_cache_preview_scope_set_ids": ("id1",),
+        "explicit_cache_valid_set_ids": ("id1",),
+        "explicit_cache_invalidated_set_ids": (),
+        "preview_scope_set_ids": None,
+        "preview_owner_epoch": 6,
+        "preview_batch_cache_token_by_set_id": {"id1": "preview-token"},
+    }
+    values.update(overrides)
+    return BatchRunStartRequest(**values)
 
 
 def test_current_queue_item_returns_name_and_id_at_owned_position():
@@ -452,45 +498,12 @@ def test_start_run_owns_batch_context_start_policy_and_defensive_copies_payloads
     simulation_identity_by_set_id = {"id1": {"fingerprint": "before"}}
 
     context = owner.start_run(
-        request_id=7,
-        run_id=9,
-        runtime_input_epoch=3,
-        runtime_input_global_epoch=4,
-        runtime_input_set_epoch_by_set_id={"id1": 5},
-        fast_mode=False,
-        reuse_parallel_lane_pool=True,
-        parallel=True,
-        effective_workers=2,
-        retain_prepared_payloads_in_context=False,
-        prepared_payload=prepared_payload,
-        prepared_payload_by_set_id={"id1": {"prepared": True}},
-        primary_simulation_plan={"execution_mode": "explicit", "metadata": {"set_id": "id1"}},
-        simulation_plan_by_set_id=plan_by_set_id,
-        cache_key="cache-1",
-        scope_identity={"scope": "selected"},
-        full_dsl="reaction: A -> B; k=1",
-        mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"},
-        mechanism_signature="sig-primary",
-        mechanism_signature_by_set_id={"id1": "sig-id1"},
-        simulation_identity_by_set_id=simulation_identity_by_set_id,
-        solver_config={"solver": "BDF"},
-        t_end=10.0,
-        rows=[0],
-        queue_ids=["id1"],
-        queue_names=["set1"],
-        pending_workspace_reset_set_ids=["id1"],
-        pending_dirty_reset_generation_by_set_id={"id1": 2},
-        primary_set_id="id1",
-        pending_init_seed={"set1": {"A": 1.25}},
-        pending_init_rewrite="rewrite",
-        pending_init_applied=True,
-        explicit_cache_preview_token=None,
-        explicit_cache_preview_scope_set_ids=("id1",),
-        explicit_cache_valid_set_ids=("id1",),
-        explicit_cache_invalidated_set_ids=(),
-        preview_scope_set_ids=None,
-        preview_owner_epoch=6,
-        preview_batch_cache_token_by_set_id={"id1": "preview-token"},
+        _batch_run_start_request(
+            prepared_payload=prepared_payload,
+            prepared_payload_by_set_id={"id1": {"prepared": True}},
+            simulation_plan_by_set_id=plan_by_set_id,
+            simulation_identity_by_set_id=simulation_identity_by_set_id,
+        )
     )
 
     prepared_payload["shared"]["value"] = 99
@@ -517,45 +530,47 @@ def test_start_run_keeps_serial_explicit_prepared_payloads_when_context_owns_ser
     owner = BatchRunContextOwner()
 
     context = owner.start_run(
-        request_id=11,
-        run_id=None,
-        runtime_input_epoch=1,
-        runtime_input_global_epoch=1,
-        runtime_input_set_epoch_by_set_id={"id1": 1},
-        fast_mode=False,
-        reuse_parallel_lane_pool=False,
-        parallel=False,
-        effective_workers=1,
-        retain_prepared_payloads_in_context=True,
-        prepared_payload={"prepared": "primary"},
-        prepared_payload_by_set_id={"id1": {"prepared": "id1"}},
-        primary_simulation_plan={"execution_mode": "explicit", "metadata": {"set_id": "id1"}},
-        simulation_plan_by_set_id={"id1": {"execution_mode": "explicit", "metadata": {"set_id": "id1"}}},
-        cache_key="cache-serial",
-        scope_identity={"scope": "selected"},
-        full_dsl="reaction: A -> B; k=1",
-        mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"},
-        mechanism_signature="sig-primary",
-        mechanism_signature_by_set_id={"id1": "sig-id1"},
-        simulation_identity_by_set_id={"id1": {"fingerprint": "id1"}},
-        solver_config={"solver": "BDF"},
-        t_end=10.0,
-        rows=[0],
-        queue_ids=["id1"],
-        queue_names=["set1"],
-        pending_workspace_reset_set_ids=[],
-        pending_dirty_reset_generation_by_set_id={},
-        primary_set_id="id1",
-        pending_init_seed={},
-        pending_init_rewrite=None,
-        pending_init_applied=False,
-        explicit_cache_preview_token=None,
-        explicit_cache_preview_scope_set_ids=None,
-        explicit_cache_valid_set_ids=("id1",),
-        explicit_cache_invalidated_set_ids=(),
-        preview_scope_set_ids=None,
-        preview_owner_epoch=None,
-        preview_batch_cache_token_by_set_id={},
+        _batch_run_start_request(
+            request_id=11,
+            run_id=None,
+            runtime_input_epoch=1,
+            runtime_input_global_epoch=1,
+            runtime_input_set_epoch_by_set_id={"id1": 1},
+            fast_mode=False,
+            reuse_parallel_lane_pool=False,
+            parallel=False,
+            effective_workers=1,
+            retain_prepared_payloads_in_context=True,
+            prepared_payload={"prepared": "primary"},
+            prepared_payload_by_set_id={"id1": {"prepared": "id1"}},
+            primary_simulation_plan={"execution_mode": "explicit", "metadata": {"set_id": "id1"}},
+            simulation_plan_by_set_id={"id1": {"execution_mode": "explicit", "metadata": {"set_id": "id1"}}},
+            cache_key="cache-serial",
+            scope_identity={"scope": "selected"},
+            full_dsl="reaction: A -> B; k=1",
+            mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"},
+            mechanism_signature="sig-primary",
+            mechanism_signature_by_set_id={"id1": "sig-id1"},
+            simulation_identity_by_set_id={"id1": {"fingerprint": "id1"}},
+            solver_config={"solver": "BDF"},
+            t_end=10.0,
+            rows=[0],
+            queue_ids=["id1"],
+            queue_names=["set1"],
+            pending_workspace_reset_set_ids=[],
+            pending_dirty_reset_generation_by_set_id={},
+            primary_set_id="id1",
+            pending_init_seed={},
+            pending_init_rewrite=None,
+            pending_init_applied=False,
+            explicit_cache_preview_token=None,
+            explicit_cache_preview_scope_set_ids=None,
+            explicit_cache_valid_set_ids=("id1",),
+            explicit_cache_invalidated_set_ids=(),
+            preview_scope_set_ids=None,
+            preview_owner_epoch=None,
+            preview_batch_cache_token_by_set_id={},
+        )
     )
 
     assert context["active"] is True

@@ -137,6 +137,7 @@ def test_fitting_sidecar_owners_use_public_owner_dependencies():
     assert "._collect_dataset_selection" not in run_command_source
     launch_source = (package_root / "launch.py").read_text(encoding="utf-8")
     assert "._collect_dataset_selection" not in launch_source
+    assert "show_dataset_messages" not in launch_source
 
 
 def test_fitting_workflow_tests_use_public_runtime_readiness_owner():
@@ -151,9 +152,89 @@ def test_fitting_workflow_tests_use_public_runtime_readiness_owner():
     assert offenders == []
 
 
+def test_run_fit_revalidates_explicit_launch_even_when_runtime_is_ready():
+    from kindred.gui.fitting.launch import FittingLaunchPurpose, FittingLaunchResult
+    from kindred.gui.fitting.run_command import FittingRunCommandOwner
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeLaunchDecisionState,
+        FittingRuntimeReadinessState,
+    )
+
+    stale_identity = SimpleNamespace(name="stale")
+    explicit_identity = SimpleNamespace(name="explicit")
+    accepted_launch = SimpleNamespace(identity=explicit_identity)
+    calls: list[object] = []
+
+    class _Worker:
+        def isRunning(self) -> bool:
+            return False
+
+    class _SpeciesTable:
+        def flush_visible_weight_edits(self) -> None:
+            calls.append("flush_visible")
+
+        def flush_dataset_weight_editor(self) -> None:
+            calls.append("flush_dataset")
+
+    class _Readiness:
+        def snapshot(self):
+            return SimpleNamespace(
+                state=FittingRuntimeReadinessState.READY,
+                identity=stale_identity,
+            )
+
+        def is_ready_for(self, identity):
+            calls.append(("ready_for", identity))
+            return identity is stale_identity or identity is explicit_identity
+
+        def set_blocked(self, *_args, **_kwargs) -> None:
+            calls.append("blocked")
+
+        def prepare_or_accept_launch(self, identity):
+            calls.append(("accept", identity))
+            return SimpleNamespace(
+                state=FittingRuntimeLaunchDecisionState.ACCEPTED,
+                accepted_launch=accepted_launch,
+                snapshot=self.snapshot(),
+            )
+
+    class _LaunchOwner:
+        def build_current_launch_result(self, *, purpose, **_kwargs):
+            calls.append(("build", purpose))
+            return FittingLaunchResult(identity=explicit_identity)
+
+        def render_launch_rejection(self, *_args, **_kwargs) -> None:
+            calls.append("reject")
+
+    class _WorkerLaunchOwner:
+        def start_runtime_launch(self, launch):
+            calls.append(("start", launch))
+
+    window = SimpleNamespace(
+        _worker=_Worker(),
+        _species_table=_SpeciesTable(),
+        fit_runtime_readiness=_Readiness(),
+        fit_launch_identity_owner=_LaunchOwner(),
+        fit_worker_launch_owner=_WorkerLaunchOwner(),
+        _reset_fit_run_cached_state=lambda: calls.append("reset"),
+        _fit_runtime_identity_matches_current_noncollecting_inputs=lambda identity: identity is stale_identity,
+        _capture_failed_fit_restore_baseline=lambda: calls.append("capture_baseline"),
+        _clear_failed_run_visual_state=lambda: calls.append("clear_failed"),
+        _refresh_run_button_enabled_state=lambda: calls.append("refresh_button"),
+    )
+
+    FittingRunCommandOwner(window).run_fit()
+
+    assert ("build", FittingLaunchPurpose.EXPLICIT_RUN) in calls
+    assert ("accept", explicit_identity) in calls
+    assert ("start", accepted_launch) in calls
+    assert ("accept", stale_identity) not in calls
+
+
 @pytest.mark.gui
 def test_fitting_window_routes_passive_and_explicit_launch_identity_through_owner(qt_app, monkeypatch):
     from kindred.gui.fitting.window import FittingWindow
+    from kindred.gui.fitting.launch import FittingLaunchPurpose, FittingLaunchResult
 
     t = np.asarray([0.0, 1.0], dtype=float)
     window = FittingWindow(
@@ -177,19 +258,86 @@ def test_fitting_window_routes_passive_and_explicit_launch_identity_through_owne
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.asarray([1.0, 0.8])}},
     )
     try:
-        calls: list[bool] = []
+        calls: list[FittingLaunchPurpose] = []
 
-        def _capture_identity(**kwargs):
-            calls.append(bool(kwargs.get("show_dataset_messages")))
-            return None
+        def _capture_result(*, purpose, **_kwargs):
+            calls.append(purpose)
+            return FittingLaunchResult(identity=None)
 
         owner = window.fit_launch_identity_owner
-        monkeypatch.setattr(owner, "build_current_fit_runtime_identity", _capture_identity)
+        monkeypatch.setattr(owner, "build_current_launch_result", _capture_result)
 
         window.fit_runtime_preparation_owner.prepare_current_state()
         window.run_fit()
 
-        assert calls == [False, True]
+        assert calls == [FittingLaunchPurpose.PASSIVE_READINESS, FittingLaunchPurpose.EXPLICIT_RUN]
+    finally:
+        window.close()
+
+
+@pytest.mark.gui
+def test_fitting_launch_validation_result_owns_payload_errors_without_window_split(qt_app, monkeypatch):
+    from PySide6 import QtWidgets
+
+    from kindred.core.analysis.fit_dataset_payload import FitDatasetPayloadResult
+    from kindred.gui.fitting.launch import FittingLaunchPurpose
+    from kindred.gui.fitting.window import FittingWindow
+
+    t = np.asarray([0.0, 1.0], dtype=float)
+    captured: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "warning",
+        lambda _parent, title, text, *args, **kwargs: captured.append((str(title), str(text)))
+        or QtWidgets.QMessageBox.StandardButton.Ok,
+    )
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": t.copy(),
+                "species_data": {"A": np.asarray([1.0, 0.8], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.asarray([1.0, 0.8], dtype=float), "species": "A"}
+        ],
+        mechanism_species=["A"],
+        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.asarray([1.0, 0.8])}},
+    )
+    try:
+        assert not hasattr(FittingWindow, "_datasets_payloads_for_run")
+        assert not hasattr(FittingWindow, "_datasets_payloads_for_readiness")
+        window._global_payload_results["ds1"] = FitDatasetPayloadResult.invalid("invalid payload")
+
+        passive = window.fit_launch_identity_owner.build_current_launch_result(
+            purpose=FittingLaunchPurpose.PASSIVE_READINESS,
+            refresh_current_mechanism=False,
+        )
+        explicit = window.fit_launch_identity_owner.build_current_launch_result(
+            purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+            refresh_current_mechanism=False,
+        )
+
+        assert passive.identity is None
+        assert explicit.identity is None
+        assert passive.rejection is not None
+        assert explicit.rejection == passive.rejection
+        assert captured == []
+
+        window.fit_launch_identity_owner.render_launch_rejection(
+            explicit,
+            purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+        )
+        assert captured
+        assert captured[-1][0] == "Global Fit"
+        assert "invalid payload" in captured[-1][1]
     finally:
         window.close()
 

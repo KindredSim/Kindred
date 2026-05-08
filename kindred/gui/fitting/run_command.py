@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from PySide6 import QtWidgets
 
+from kindred.gui.fitting.launch import FittingLaunchPurpose
 from kindred.gui.fitting.runtime_readiness import (
     FittingRuntimeLaunchDecisionState,
     FittingRuntimeReadinessState,
@@ -28,8 +29,8 @@ class FittingRunCommandOwner:
         window._species_table.flush_visible_weight_edits()
         window._species_table.flush_dataset_weight_editor()
         try:
-            identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity(
-                show_dataset_messages=True,
+            launch_result = window.fit_launch_identity_owner.build_current_launch_result(
+                purpose=FittingLaunchPurpose.EXPLICIT_RUN,
             )
         except RuntimeError as exc:
             window.fit_runtime_readiness.set_blocked(exc)
@@ -37,8 +38,13 @@ class FittingRunCommandOwner:
                 window._status_label.setText(f"Fitting runtime not ready: {exc}")
             window._refresh_run_button_enabled_state()
             return
+        identity = launch_result.identity
         if identity is None:
             window.fit_runtime_readiness.set_blocked()
+            window.fit_launch_identity_owner.render_launch_rejection(
+                launch_result,
+                purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+            )
             window._clear_failed_run_visual_state()
             window._refresh_run_button_enabled_state()
             return

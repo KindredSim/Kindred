@@ -299,6 +299,22 @@ class SimulationRuntimePort(Protocol):
 
     def set_slider_runtime_dirty(self, value: bool) -> None: ...
 
+    def is_energy_mode_mechanism(self, mechanism: object) -> bool: ...
+
+    def dsl_has_computational_mode_generated_block(self, mechanism_text: str) -> bool: ...
+
+    def sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None: ...
+
+    def populate_energy_mode_variables_from_mechanism(
+        self,
+        mechanism: object,
+        *,
+        refresh_sliders: bool,
+        preserve_visibility: bool = False,
+    ) -> None: ...
+
+    def extract_and_populate_variables(self, *, preserve_visibility: bool = False) -> None: ...
+
 
 class SimulationResultsPort(Protocol):
     def set_data(
@@ -390,27 +406,11 @@ class SimulationMechanismHelpersPort(Protocol):
 
     def remember_last_mechanism(self, mechanism: object, mechanism_text: str, solver_config: Dict[str, Any]) -> None: ...
 
-    def is_energy_mode_mechanism(self, mechanism: object) -> bool: ...
-
-    def dsl_has_computational_mode_generated_block(self, mechanism_text: str) -> bool: ...
-
-    def sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None: ...
-
     def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None: ...
 
     def set_temperature_mode_indicator_text(self, text: str) -> None: ...
 
     def update_temperature_mode_indicator(self) -> None: ...
-
-    def populate_energy_mode_variables_from_mechanism(
-        self,
-        mechanism: object,
-        *,
-        refresh_sliders: bool,
-        preserve_visibility: bool = False,
-    ) -> None: ...
-
-    def extract_and_populate_variables(self, *, preserve_visibility: bool = False) -> None: ...
 
     def authoritative_structure_snapshot(
         self,

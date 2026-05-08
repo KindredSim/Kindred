@@ -248,8 +248,18 @@ def test_fitting_window_preserves_invalid_payload_reason_during_rebuild(qt_app, 
 
         window._rebuild_selected_payload_lookup()
 
-        payloads = window._datasets_payloads_for_run(["ds1"])
-        assert payloads is None
+        from kindred.gui.fitting.launch import FittingLaunchPurpose
+
+        result = window.fit_launch_identity_owner.build_current_launch_result(
+            purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+            refresh_current_mechanism=False,
+        )
+        assert result.identity is None
+        assert result.rejection is not None
+        window.fit_launch_identity_owner.render_launch_rejection(
+            result,
+            purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+        )
         assert captured
         assert "invalid payload" in captured[-1].lower()
         assert "invalid x_obs" in captured[-1].lower()

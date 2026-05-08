@@ -77,16 +77,43 @@ RUN_UI_ENTRY_PROGRESS_TARGET_METHODS_BY_METHOD = {
         "set_stop_button_enabled",
     },
     "_start_parallel_batch_simulations": {
+        "set_status_text",
+        "set_sim_progress_value",
+    },
+    "_handle_parallel_batch_runtime_waiting": {
         "set_run_button_enabled",
         "set_stop_button_enabled",
         "set_status_text",
         "set_sim_progress_value",
     },
-    "_start_next_batch_simulation": {
+    "_handle_parallel_batch_runtime_check_failed": {
         "set_run_button_enabled",
         "set_stop_button_enabled",
         "set_status_text",
+        "set_sim_progress_value",
     },
+    "_submit_parallel_batch_tasks": {
+        "set_run_button_enabled",
+        "set_stop_button_enabled",
+    },
+    "_finish_parallel_batch_with_no_active_requests": {
+        "set_run_button_enabled",
+        "set_stop_button_enabled",
+    },
+    "_start_next_batch_simulation": {
+        "set_status_text",
+    },
+    "_abort_serial_batch_for_invalid_initials": {
+        "set_run_button_enabled",
+        "set_stop_button_enabled",
+    },
+    "_run_rows_or_abort": {
+        "set_run_button_enabled",
+        "set_stop_button_enabled",
+    },
+    "_run_mechanism_context_or_abort": set(),
+    "_run_solver_context_or_abort": set(),
+    "_build_run_dispatch_context_or_abort": set(),
     "_flush_progress_ui": {
         "set_sim_progress_value",
         "set_status_text",
@@ -97,11 +124,7 @@ RUN_UI_ENTRY_PROGRESS_TARGET_METHODS_BY_METHOD = {
 RUN_UI_ENTRY_PROGRESS_TARGET_METHODS = set().union(*RUN_UI_ENTRY_PROGRESS_TARGET_METHODS_BY_METHOD.values())
 
 RUN_UI_LIFECYCLE_TARGET_METHODS_BY_METHOD = {
-    "_run_simulation_internal": {
-        "set_run_button_enabled",
-        "set_stop_button_enabled",
-        "set_status_text",
-    },
+    "_run_simulation_internal": set(),
     "_on_simulation_complete": set(),
     "_on_simulation_error": set(),
     "_stop_simulation": {
@@ -133,17 +156,12 @@ MECHANISM_HELPERS_SNAPSHOT_TARGET_METHODS = {
 }
 
 COMPLETION_MECHANISM_HELPERS_TARGET_METHODS = {
-    "is_energy_mode_mechanism",
-    "dsl_has_computational_mode_generated_block",
-    "sync_energy_mode_temperature_from_mechanism",
     "set_temperature_override_state",
     "set_temperature_mode_indicator_text",
     "update_temperature_mode_indicator",
     "remember_last_mechanism",
     "apply_pending_init_migration",
     "arm_pending_init_result_invalidation_guard",
-    "populate_energy_mode_variables_from_mechanism",
-    "extract_and_populate_variables",
     "sync_mechanism_controls_to_focused_batch_set",
 }
 
@@ -264,12 +282,20 @@ def _attribute_chain(node: ast.AST) -> tuple[str, ...] | None:
 
 
 def _simulation_controller_method_node(tree: ast.AST, method_name: str) -> ast.FunctionDef:
+    return _class_method_node(tree, "SimulationController", method_name)
+
+
+def _completion_publication_method_node(tree: ast.AST, method_name: str) -> ast.FunctionDef:
+    return _class_method_node(tree, "SimulationCompletionPublicationOwner", method_name)
+
+
+def _class_method_node(tree: ast.AST, class_name: str, method_name: str) -> ast.FunctionDef:
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "SimulationController":
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
             for item in node.body:
                 if isinstance(item, ast.FunctionDef) and item.name == method_name:
                     return item
-    raise AssertionError(f"Expected SimulationController.{method_name} to exist")
+    raise AssertionError(f"Expected {class_name}.{method_name} to exist")
 
 
 def _collect_port_usage(
@@ -296,7 +322,20 @@ def _collect_port_usage(
                 )
             )
             continue
-        if len(chain) == 4 and chain[:3] == ("self", "ui", explicit_port) and chain[3] in methods:
+        if (
+            (
+                len(chain) == 4
+                and chain[:3] == ("self", "ui", explicit_port)
+            )
+            or (
+                len(chain) == 4
+                and chain[:3] == ("self", "_ui", explicit_port)
+            )
+            or (
+                len(chain) == 4
+                and chain[:3] == ("self", "_ports", explicit_port)
+            )
+        ) and chain[3] in methods:
             explicit_methods.add(chain[3])
     return flattened_hits, explicit_methods
 
@@ -355,12 +394,12 @@ def _simulation_complete_solver_provenance_cluster(fn: ast.FunctionDef) -> list[
 
 def test_simulation_complete_provenance_cluster_uses_explicit_provenance_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
     assert target.is_file(), f"Expected file at {target}"
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
-    fn = _simulation_controller_method_node(tree, "_publish_completion_annotations_and_provenance")
+    fn = _completion_publication_method_node(tree, "publish_annotations_and_provenance")
     lines = source.splitlines()
 
     flattened_hits: list[_CallHit] = []
@@ -372,7 +411,7 @@ def test_simulation_complete_provenance_cluster_uses_explicit_provenance_port() 
         chain = _attribute_chain(node.func)
         if not chain:
             continue
-        if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in TARGET_METHODS:
+        if len(chain) == 3 and chain[:2] in {("self", "ui"), ("self", "_ui")} and chain[2] in TARGET_METHODS:
             flattened_hits.append(
                 _CallHit(
                     method=chain[2],
@@ -381,7 +420,7 @@ def test_simulation_complete_provenance_cluster_uses_explicit_provenance_port() 
                 )
             )
             continue
-        if len(chain) == 4 and chain[:3] == ("self", "ui", "provenance") and chain[3] in TARGET_METHODS:
+        if len(chain) == 4 and chain[:3] in {("self", "ui", "provenance"), ("self", "_ui", "provenance")} and chain[3] in TARGET_METHODS:
             low_level_hits.append(
                 _CallHit(
                     method=chain[3],
@@ -392,7 +431,7 @@ def test_simulation_complete_provenance_cluster_uses_explicit_provenance_port() 
             continue
         if (
             len(chain) == 4
-            and chain[:3] == ("self", "ui", "provenance")
+            and chain[:3] in {("self", "ui", "provenance"), ("self", "_ui", "provenance")}
             and chain[3] == "publish_simulation_completion_provenance"
         ):
             explicit_methods.add(chain[3])
@@ -457,11 +496,16 @@ def test_simulation_controller_init_uses_explicit_settings_port() -> None:
     ("method_name", "expected_methods"),
     (
         ("_run_simulation", {"message_box_warning"}),
-        ("_start_parallel_batch_simulations", {"message_box_warning"}),
-        ("_start_next_batch_simulation", {"message_box_warning"}),
-        ("_run_simulation_internal", {"message_box_warning"}),
-        ("_on_simulation_complete", {"message_box_critical"}),
-        ("_publish_completion_primary_materialization", {"message_box_warning"}),
+        ("_start_parallel_batch_simulations", set()),
+        ("_submit_parallel_batch_tasks", {"message_box_warning"}),
+        ("_start_next_batch_simulation", set()),
+        ("_abort_serial_batch_for_invalid_initials", {"message_box_warning"}),
+        ("_run_simulation_internal", set()),
+        ("_run_rows_or_abort", {"message_box_warning"}),
+        ("_run_mechanism_context_or_abort", set()),
+        ("_run_solver_context_or_abort", set()),
+        ("_build_run_dispatch_context_or_abort", set()),
+        ("_on_simulation_complete", set()),
         ("_on_simulation_error", set()),
     ),
 )
@@ -504,9 +548,10 @@ def test_simulation_controller_dialog_clusters_use_explicit_dialogs_port(
     (
         ("_run_simulation", {"parse_sim_time_seconds"}),
         (
-            "_run_simulation_internal",
-            REMAINING_SOLVER_TARGET_METHODS,
+            "_run_solver_context_or_abort",
+            set(),
         ),
+        ("_run_simulation_internal", set()),
     ),
 )
 def test_simulation_controller_non_completion_solver_clusters_use_explicit_solver_port(
@@ -544,6 +589,100 @@ def test_simulation_controller_non_completion_solver_clusters_use_explicit_solve
 
 
 @pytest.mark.parametrize(
+    ("class_name", "method_name", "explicit_port", "target_methods", "expected_methods"),
+    (
+        (
+            "SimulationRunMechanismPreparationOwner",
+            "build_mechanism_context_or_abort",
+            "dialogs",
+            DIALOGS_TARGET_METHODS,
+            {"message_box_warning"},
+        ),
+        (
+            "SimulationRunSolverPreparationOwner",
+            "build_solver_context_or_abort",
+            "dialogs",
+            DIALOGS_TARGET_METHODS,
+            {"message_box_warning"},
+        ),
+        (
+            "SimulationRunDispatchPreparationOwner",
+            "build_dispatch_context_or_abort",
+            "dialogs",
+            DIALOGS_TARGET_METHODS,
+            {"message_box_warning"},
+        ),
+        (
+            "SimulationRunSolverPreparationOwner",
+            "build_solver_context_or_abort",
+            "solver",
+            REMAINING_SOLVER_TARGET_METHODS,
+            REMAINING_SOLVER_TARGET_METHODS,
+        ),
+        (
+            "SimulationRunMechanismPreparationOwner",
+            "build_mechanism_context_or_abort",
+            "mechanism",
+            MECHANISM_TARGET_METHODS,
+            {
+                "apply_overrides_to_state_network_dsl",
+                "apply_overrides_to_text",
+                "has_slider_overrides",
+                "mechanism_reactions_text_raw",
+                "mechanism_state_network_dsl_raw",
+            },
+        ),
+        (
+            "SimulationRunSolverPreparationOwner",
+            "build_solver_context_or_abort",
+            "mechanism",
+            MECHANISM_TARGET_METHODS,
+            {
+                "mechanism_slider_points_value",
+                "mechanism_slider_solver_value",
+            },
+        ),
+    ),
+)
+def test_simulation_run_preparation_owners_use_explicit_ports(
+    class_name: str,
+    method_name: str,
+    explicit_port: str,
+    target_methods: set[str],
+    expected_methods: set[str],
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_run_preparation.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    fn = _class_method_node(tree, class_name, method_name)
+    lines = source.splitlines()
+
+    flattened_hits, explicit_methods = _collect_port_usage(
+        fn,
+        lines,
+        explicit_port=explicit_port,
+        methods=target_methods,
+    )
+
+    assert explicit_methods == expected_methods, (
+        f"Guardrail expectation changed: `{class_name}.{method_name}` must route audited {explicit_port} calls "
+        f"through `self._ports.{explicit_port}`, but only found {sorted(explicit_methods)}."
+    )
+
+    assert flattened_hits == [], (
+        f"Guardrail violated: `{class_name}.{method_name}` must not use flattened `self.ui.<method>` access "
+        f"for audited {explicit_port} port methods.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(flattened_hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+@pytest.mark.parametrize(
     ("method_name", "expected_methods"),
     (
         (
@@ -561,24 +700,22 @@ def test_simulation_controller_non_completion_solver_clusters_use_explicit_solve
             },
         ),
         (
-            "_start_next_batch_simulation",
+            "_serial_batch_dispatch_state",
             {
                 "slider_overrides",
                 "apply_parameter_overrides_to_dsl",
             },
         ),
+        ("_start_next_batch_simulation", set()),
         (
-            "_run_simulation_internal",
-            {
-                "mechanism_reactions_text_raw",
-                "has_slider_overrides",
-                "apply_overrides_to_text",
-                "mechanism_state_network_dsl_raw",
-                "apply_overrides_to_state_network_dsl",
-                "mechanism_slider_points_value",
-                "mechanism_slider_solver_value",
-            },
+            "_run_mechanism_context_or_abort",
+            set(),
         ),
+        (
+            "_run_solver_context_or_abort",
+            set(),
+        ),
+        ("_run_simulation_internal", set()),
         (
             "_run_simulation",
             {
@@ -586,8 +723,7 @@ def test_simulation_controller_non_completion_solver_clusters_use_explicit_solve
                 "is_mechanism_ready_for_run",
             },
         ),
-            ("_build_completion_result_state", set()),
-            ("_on_simulation_complete", {"get_mechanism_text"}),
+            ("_on_simulation_complete", set()),
     ),
 )
 def test_simulation_controller_mechanism_clusters_use_explicit_mechanism_port(
@@ -651,6 +787,8 @@ def test_simulation_controller_cached_batch_selection_cluster_uses_explicit_batc
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    if method_name == "_on_simulation_complete":
+        target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
     assert target.is_file(), f"Expected file at {target}"
 
     source = target.read_text(encoding="utf-8")
@@ -660,19 +798,23 @@ def test_simulation_controller_cached_batch_selection_cluster_uses_explicit_batc
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
     method_names = (
-        (method_name, "_publish_completion_display")
+        ("publish_display",)
         if method_name == "_on_simulation_complete"
         else (method_name,)
     )
     for inspected_method in method_names:
-        fn = _simulation_controller_method_node(tree, inspected_method)
+        fn = (
+            _completion_publication_method_node(tree, inspected_method)
+            if method_name == "_on_simulation_complete"
+            else _simulation_controller_method_node(tree, inspected_method)
+        )
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
                 continue
             chain = _attribute_chain(node.func)
             if not chain:
                 continue
-            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in BATCH_TARGET_METHODS:
+            if len(chain) == 3 and chain[:2] in {("self", "ui"), ("self", "_ui")} and chain[2] in BATCH_TARGET_METHODS:
                 flattened_hits.append(
                     _CallHit(
                         method=chain[2],
@@ -681,7 +823,11 @@ def test_simulation_controller_cached_batch_selection_cluster_uses_explicit_batc
                     )
                 )
                 continue
-            if len(chain) == 4 and chain[:3] == ("self", "ui", "batch") and chain[3] in BATCH_TARGET_METHODS:
+            if (
+                len(chain) == 4
+                and chain[:3] in {("self", "ui", "batch"), ("self", "_ui", "batch")}
+                and chain[3] in BATCH_TARGET_METHODS
+            ):
                 explicit_methods.add(chain[3])
 
     assert explicit_methods == expected_methods, (
@@ -706,36 +852,73 @@ def test_run_simulation_internal_queue_context_cluster_uses_explicit_batch_port(
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
-    fn = _simulation_controller_method_node(tree, "_run_simulation_internal")
     lines = source.splitlines()
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
-    for node in ast.walk(fn):
-        if not isinstance(node, ast.Call):
-            continue
-        chain = _attribute_chain(node.func)
-        if not chain:
-            continue
-        if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in QUEUE_CONTEXT_BATCH_TARGET_METHODS:
-            flattened_hits.append(
-                _CallHit(
-                    method=chain[2],
-                    lineno=node.lineno,
-                    line=lines[node.lineno - 1].strip(),
+    prep_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_run_preparation.py"
+    prep_source = prep_target.read_text(encoding="utf-8")
+    prep_tree = ast.parse(prep_source, filename=str(prep_target))
+    prep_lines = prep_source.splitlines()
+
+    controller_methods = ("_run_simulation_internal",)
+    prep_methods = (
+        ("SimulationRunMechanismPreparationOwner", "build_mechanism_context_or_abort"),
+        ("SimulationRunDispatchPreparationOwner", "build_dispatch_context_or_abort"),
+    )
+    for method_name in controller_methods:
+        fn = _simulation_controller_method_node(tree, method_name)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _attribute_chain(node.func)
+            if not chain:
+                continue
+            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in QUEUE_CONTEXT_BATCH_TARGET_METHODS:
+                flattened_hits.append(
+                    _CallHit(
+                        method=chain[2],
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
                 )
-            )
-            continue
-        if (
-            len(chain) == 4
-            and chain[:3] == ("self", "ui", "batch")
-            and chain[3] in QUEUE_CONTEXT_BATCH_TARGET_METHODS
-        ):
-            explicit_methods.add(chain[3])
+                continue
+            if (
+                len(chain) == 4
+                and chain[:3] == ("self", "ui", "batch")
+                and chain[3] in QUEUE_CONTEXT_BATCH_TARGET_METHODS
+                ):
+                    explicit_methods.add(chain[3])
+    for class_name, method_name in prep_methods:
+        fn = _class_method_node(prep_tree, class_name, method_name)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _attribute_chain(node.func)
+            if not chain:
+                continue
+            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in QUEUE_CONTEXT_BATCH_TARGET_METHODS:
+                flattened_hits.append(
+                    _CallHit(
+                        method=chain[2],
+                        lineno=node.lineno,
+                        line=prep_lines[node.lineno - 1].strip(),
+                    )
+                )
+                continue
+            if (
+                len(chain) == 4
+                and chain[:3] in {
+                    ("self", "ui", "batch"),
+                    ("self", "_ports", "batch"),
+                }
+                and chain[3] in QUEUE_CONTEXT_BATCH_TARGET_METHODS
+            ):
+                explicit_methods.add(chain[3])
 
     assert explicit_methods == QUEUE_CONTEXT_BATCH_TARGET_METHODS, (
-        "Guardrail expectation changed: `SimulationController._run_simulation_internal` must route the queue/context "
-        f"batch subcluster through `self.ui.batch`, but only found {sorted(explicit_methods)}."
+        "Guardrail expectation changed: run preparation must route the queue/context batch subcluster through "
+        f"`self.ui.batch`, but only found {sorted(explicit_methods)}."
     )
 
     assert flattened_hits == [], (
@@ -751,15 +934,16 @@ def test_run_simulation_internal_queue_context_cluster_uses_explicit_batch_port(
 @pytest.mark.parametrize(
     ("method_name", "expected_methods"),
     (
-        ("_start_parallel_batch_simulations", {"batch_initials_for_row"}),
+        ("_start_parallel_batch_simulations", set()),
+        ("_submit_parallel_batch_tasks", {"batch_initials_for_row"}),
         (
             "_start_next_batch_simulation",
             {
                 "batch_set_name_for_id",
                 "batch_initials_for_row",
-                "batch_model_validate_rows",
             },
         ),
+        ("_abort_serial_batch_for_invalid_initials", {"batch_model_validate_rows"}),
     ),
 )
 def test_simulation_controller_launch_validation_cluster_uses_explicit_batch_port(
@@ -815,28 +999,39 @@ def test_simulation_controller_launch_validation_cluster_uses_explicit_batch_por
 
 def test_simulation_complete_completion_reconciliation_cluster_uses_explicit_batch_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
-    assert target.is_file(), f"Expected file at {target}"
+    controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
+    assert controller_target.is_file(), f"Expected file at {controller_target}"
+    assert owner_target.is_file(), f"Expected file at {owner_target}"
 
-    source = target.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(target))
-    lines = source.splitlines()
-    method_names = (
-        "_resolve_completion_batch_identity",
-        "_remember_primary_result_mechanism",
+    controller_source = controller_target.read_text(encoding="utf-8")
+    controller_tree = ast.parse(controller_source, filename=str(controller_target))
+    owner_source = owner_target.read_text(encoding="utf-8")
+    owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    method_specs = (
+        (owner_target, owner_tree, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "resolve_batch_identity")),
+        (
+            controller_target,
+            controller_tree,
+            controller_source.splitlines(),
+            _simulation_controller_method_node(controller_tree, "_remember_primary_result_mechanism"),
+        ),
     )
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
-    for method_name in method_names:
-        fn = _simulation_controller_method_node(tree, method_name)
+    for _target, _tree, lines, fn in method_specs:
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
                 continue
             chain = _attribute_chain(node.func)
             if not chain:
                 continue
-            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in COMPLETION_RECONCILIATION_BATCH_TARGET_METHODS:
+            if (
+                len(chain) == 3
+                and chain[:2] in {("self", "ui"), ("self", "_ui")}
+                and chain[2] in COMPLETION_RECONCILIATION_BATCH_TARGET_METHODS
+            ):
                 flattened_hits.append(
                     _CallHit(
                         method=chain[2],
@@ -847,7 +1042,7 @@ def test_simulation_complete_completion_reconciliation_cluster_uses_explicit_bat
                 continue
             if (
                 len(chain) == 4
-                and chain[:3] == ("self", "ui", "batch")
+                and chain[:3] in {("self", "ui", "batch"), ("self", "_ui", "batch")}
                 and chain[3] in COMPLETION_RECONCILIATION_BATCH_TARGET_METHODS
             ):
                 explicit_methods.add(chain[3])
@@ -861,7 +1056,7 @@ def test_simulation_complete_completion_reconciliation_cluster_uses_explicit_bat
         "Guardrail violated: the audited completion-reconciliation batch cluster must not use flattened "
         "`self.ui.<method>` access.\n"
         + "\n".join(
-            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            f"{controller_target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(flattened_hits, key=lambda hit: (hit.lineno, hit.method))
         )
     )
@@ -869,32 +1064,38 @@ def test_simulation_complete_completion_reconciliation_cluster_uses_explicit_bat
 
 def test_simulation_complete_mechanism_helpers_cluster_uses_explicit_mechanism_helpers_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
-    assert target.is_file(), f"Expected file at {target}"
+    controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
+    assert controller_target.is_file(), f"Expected file at {controller_target}"
+    assert owner_target.is_file(), f"Expected file at {owner_target}"
 
-    source = target.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(target))
-    lines = source.splitlines()
-    method_names = (
-        "_finalize_explicit_batch_dirty_reset",
-        "_apply_completion_pending_init",
-        "_apply_completion_pending_init_guard",
-        "_update_primary_result_materialization_contract",
-        "_remember_primary_result_mechanism",
-        "_refresh_primary_result_controls",
+    controller_source = controller_target.read_text(encoding="utf-8")
+    controller_tree = ast.parse(controller_source, filename=str(controller_target))
+    owner_source = owner_target.read_text(encoding="utf-8")
+    owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    method_specs = (
+        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_finalize_explicit_batch_dirty_reset")),
+        (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "apply_pending_init")),
+        (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "apply_pending_init_guard")),
+        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_update_primary_result_materialization_contract")),
+        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_remember_primary_result_mechanism")),
+        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_refresh_primary_result_controls")),
     )
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
-    for method_name in method_names:
-        fn = _simulation_controller_method_node(tree, method_name)
+    for _target, lines, fn in method_specs:
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
                 continue
             chain = _attribute_chain(node.func)
             if not chain:
                 continue
-            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in COMPLETION_MECHANISM_HELPERS_TARGET_METHODS:
+            if (
+                len(chain) == 3
+                and chain[:2] in {("self", "ui"), ("self", "_ui")}
+                and chain[2] in COMPLETION_MECHANISM_HELPERS_TARGET_METHODS
+            ):
                 flattened_hits.append(
                     _CallHit(
                         method=chain[2],
@@ -905,7 +1106,7 @@ def test_simulation_complete_mechanism_helpers_cluster_uses_explicit_mechanism_h
                 continue
             if (
                 len(chain) == 4
-                and chain[:3] == ("self", "ui", "mechanism_helpers")
+                and chain[:3] in {("self", "ui", "mechanism_helpers"), ("self", "_ui", "mechanism_helpers")}
                 and chain[3] in COMPLETION_MECHANISM_HELPERS_TARGET_METHODS
             ):
                 explicit_methods.add(chain[3])
@@ -920,7 +1121,7 @@ def test_simulation_complete_mechanism_helpers_cluster_uses_explicit_mechanism_h
         "Guardrail violated: the audited mechanism-helper completion cluster must not use flattened "
         "`self.ui.<method>` access.\n"
         + "\n".join(
-            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            f"{controller_target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(flattened_hits, key=lambda hit: (hit.lineno, hit.method))
         )
     )
@@ -987,7 +1188,7 @@ def test_run_simulation_internal_snapshot_reads_use_explicit_mechanism_helpers_p
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
-    fn = _simulation_controller_method_node(tree, "_run_simulation_internal")
+    fn = _simulation_controller_method_node(tree, "_sync_batch_species_columns_for_run")
     lines = source.splitlines()
 
     flattened_hits, explicit_methods = _collect_port_usage(
@@ -998,7 +1199,7 @@ def test_run_simulation_internal_snapshot_reads_use_explicit_mechanism_helpers_p
     )
 
     assert explicit_methods == MECHANISM_HELPERS_SNAPSHOT_TARGET_METHODS, (
-        "Guardrail expectation changed: `SimulationController._run_simulation_internal` must route mechanism "
+        "Guardrail expectation changed: `SimulationController._sync_batch_species_columns_for_run` must route mechanism "
         f"snapshot reads through `self.ui.mechanism_helpers`, but only found {sorted(explicit_methods)}."
     )
 
@@ -1079,6 +1280,153 @@ def test_simulation_controller_has_no_flattened_runtime_port_usage() -> None:
     )
 
 
+def test_run_simulation_internal_delegates_plan_payload_construction() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    fn = _simulation_controller_method_node(tree, "_run_simulation_internal")
+    lines = source.splitlines()
+
+    forbidden_calls: list[_CallHit] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        name = chain[-1] if chain else ""
+        if name in {"SimulationExecutionRequest", "_new_simulation_plan_payload"}:
+            forbidden_calls.append(
+                _CallHit(
+                    method=name,
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    assert forbidden_calls == [], (
+        "`SimulationController._run_simulation_internal` must delegate per-set execution request and "
+        "SimulationPlan payload construction to the batch dispatch plan boundary.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(forbidden_calls, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_runtime_readiness_builder_delegates_plan_payload_construction() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    fn = _simulation_controller_method_node(tree, "_build_runtime_readiness_plan_payloads")
+    lines = source.splitlines()
+
+    forbidden_calls: list[_CallHit] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        name = chain[-1] if chain else ""
+        if name in {"SimulationExecutionRequest", "_new_simulation_plan_payload"}:
+            forbidden_calls.append(
+                _CallHit(
+                    method=name,
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    assert forbidden_calls == [], (
+        "`SimulationController._build_runtime_readiness_plan_payloads` must share the batch dispatch plan "
+        "boundary instead of preserving a second local SimulationPlan construction policy.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(forbidden_calls, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_campaign_a_runtime_controller_entrypoints_are_bounded_orchestrators() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    lines = source.splitlines()
+    max_lines_by_method = {
+        "_run_simulation_internal": 240,
+        "_start_parallel_batch_simulations": 140,
+        "_start_next_batch_simulation": 140,
+    }
+
+    hits: list[_CallHit] = []
+    for method_name, max_lines in max_lines_by_method.items():
+        fn = _simulation_controller_method_node(tree, method_name)
+        line_count = int(fn.end_lineno or fn.lineno) - int(fn.lineno) + 1
+        if line_count > max_lines:
+            hits.append(
+                _CallHit(
+                    method=method_name,
+                    lineno=fn.lineno,
+                    line=f"{method_name} spans {line_count} lines (max {max_lines}): {lines[fn.lineno - 1].strip()}",
+                )
+            )
+
+    assert hits == [], (
+        "Campaign A runtime controller entrypoints must remain bounded orchestrators; large policy bodies need "
+        "real owner/helper boundaries plus the responsibility-specific guards in this file.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_start_run_context_and_dispatch_delegates_start_request_construction() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    lines = source.splitlines()
+    fn = _simulation_controller_method_node(tree, "_start_run_context_and_dispatch")
+
+    forbidden_calls: list[_CallHit] = []
+    forbidden_names = {
+        "BatchRunStartRequest",
+        "batch_mechanism_signature",
+        "coerce_simulation_identity",
+    }
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        name = chain[-1] if chain else ""
+        if name in forbidden_names:
+            forbidden_calls.append(
+                _CallHit(
+                    method=name,
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    assert forbidden_calls == [], (
+        "`SimulationController._start_run_context_and_dispatch` must compose around the run-preparation boundary; "
+        "batch-run start request construction and primary-signature policy belong outside the controller.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(forbidden_calls, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
 def test_simulation_controller_has_no_flattened_mechanism_helpers_port_usage() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
@@ -1116,11 +1464,21 @@ def test_simulation_controller_has_no_flattened_mechanism_helpers_port_usage() -
 def test_simulation_controller_slider_cluster_uses_explicit_slider_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    prep_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_run_preparation.py"
+    callback_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_callback.py"
     assert target.is_file(), f"Expected file at {target}"
+    assert prep_target.is_file(), f"Expected file at {prep_target}"
+    assert callback_target.is_file(), f"Expected file at {callback_target}"
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
     lines = source.splitlines()
+    prep_source = prep_target.read_text(encoding="utf-8")
+    prep_tree = ast.parse(prep_source, filename=str(prep_target))
+    prep_lines = prep_source.splitlines()
+    callback_source = callback_target.read_text(encoding="utf-8")
+    callback_tree = ast.parse(callback_source, filename=str(callback_target))
+    callback_lines = callback_source.splitlines()
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
@@ -1138,13 +1496,45 @@ def test_simulation_controller_slider_cluster_uses_explicit_slider_port() -> Non
             )
             flattened_hits.extend(method_hits)
             explicit_methods.update(method_explicit)
+    for node in ast.walk(callback_tree):
+        if not isinstance(node, ast.ClassDef) or node.name != "SimulationCompletionCallbackOwner":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            method_hits, method_explicit = _collect_port_usage(
+                item,
+                callback_lines,
+                explicit_port="slider",
+                methods=SLIDER_TARGET_METHODS,
+            )
+            flattened_hits.extend(method_hits)
+            explicit_methods.update(method_explicit)
+    for node in ast.walk(prep_tree):
+        if not isinstance(node, ast.ClassDef) or node.name not in {
+            "SimulationRunMechanismPreparationOwner",
+            "SimulationRunSolverPreparationOwner",
+            "SimulationRunDispatchPreparationOwner",
+        }:
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            method_hits, method_explicit = _collect_port_usage(
+                item,
+                prep_lines,
+                explicit_port="slider",
+                methods=SLIDER_TARGET_METHODS,
+            )
+            flattened_hits.extend(method_hits)
+            explicit_methods.update(method_explicit)
 
     assert explicit_methods == SLIDER_TARGET_METHODS, (
-        "Guardrail expectation changed: `SimulationController` must route the audited slider cluster through "
+        "Guardrail expectation changed: runtime GUI owners must route the audited slider cluster through "
         f"`self.ui.slider`, but only found {sorted(explicit_methods)}."
     )
     assert flattened_hits == [], (
-        "Guardrail violated: `SimulationController` must not use flattened `self.ui.<method>` access for "
+        "Guardrail violated: runtime GUI owners must not use flattened `self.ui.<method>` access for "
         "SimulationSliderPort methods.\n"
         + "\n".join(
             f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
@@ -1155,28 +1545,32 @@ def test_simulation_controller_slider_cluster_uses_explicit_slider_port() -> Non
 
 def test_simulation_complete_results_cluster_uses_explicit_results_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
     assert target.is_file(), f"Expected file at {target}"
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
     method_names = (
-        "_publish_completion_display",
-        "_publish_completion_annotations_and_provenance",
+        "publish_display",
+        "publish_annotations_and_provenance",
     )
     lines = source.splitlines()
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
     for method_name in method_names:
-        fn = _simulation_controller_method_node(tree, method_name)
+        fn = _completion_publication_method_node(tree, method_name)
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
                 continue
             chain = _attribute_chain(node.func)
             if not chain:
                 continue
-            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in COMPLETION_RESULTS_TARGET_METHODS:
+            if (
+                len(chain) == 3
+                and chain[:2] in {("self", "ui"), ("self", "_ui")}
+                and chain[2] in COMPLETION_RESULTS_TARGET_METHODS
+            ):
                 flattened_hits.append(
                     _CallHit(
                         method=chain[2],
@@ -1187,7 +1581,7 @@ def test_simulation_complete_results_cluster_uses_explicit_results_port() -> Non
                 continue
             if (
                 len(chain) == 4
-                and chain[:3] == ("self", "ui", "results")
+                and chain[:3] in {("self", "ui", "results"), ("self", "_ui", "results")}
                 and chain[3] in COMPLETION_RESULTS_TARGET_METHODS
             ):
                 explicit_methods.add(chain[3])
@@ -1210,27 +1604,33 @@ def test_simulation_complete_results_cluster_uses_explicit_results_port() -> Non
 
 def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
-    assert target.is_file(), f"Expected file at {target}"
+    controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
+    assert controller_target.is_file(), f"Expected file at {controller_target}"
+    assert owner_target.is_file(), f"Expected file at {owner_target}"
 
-    source = target.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(target))
-    method_names = (
-        "_resolve_completion_mechanism",
-        "_publish_completion_annotations_and_provenance",
+    controller_source = controller_target.read_text(encoding="utf-8")
+    controller_tree = ast.parse(controller_source, filename=str(controller_target))
+    owner_source = owner_target.read_text(encoding="utf-8")
+    owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    method_specs = (
+        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_resolve_completion_mechanism")),
+        (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "publish_annotations_and_provenance")),
     )
-    lines = source.splitlines()
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
-    for method_name in method_names:
-        fn = _simulation_controller_method_node(tree, method_name)
+    for _target, lines, fn in method_specs:
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
                 continue
             chain = _attribute_chain(node.func)
             if not chain:
                 continue
-            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in COMPLETION_SOLVER_TARGET_METHODS:
+            if (
+                len(chain) == 3
+                and chain[:2] in {("self", "ui"), ("self", "_ui")}
+                and chain[2] in COMPLETION_SOLVER_TARGET_METHODS
+            ):
                 flattened_hits.append(
                     _CallHit(
                         method=chain[2],
@@ -1241,7 +1641,7 @@ def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
                 continue
             if (
                 len(chain) == 4
-                and chain[:3] == ("self", "ui", "solver")
+                and chain[:3] in {("self", "ui", "solver"), ("self", "_ui", "solver")}
                 and chain[3] in COMPLETION_SOLVER_TARGET_METHODS
             ):
                 explicit_methods.add(chain[3])
@@ -1256,7 +1656,7 @@ def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
         "Guardrail violated: `SimulationController._on_simulation_complete` must not use flattened "
         "`self.ui.<method>` access for the audited solver completion cluster.\n"
         + "\n".join(
-            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            f"{controller_target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(flattened_hits, key=lambda hit: (hit.lineno, hit.method))
         )
     )
@@ -1325,7 +1725,7 @@ def test_simulation_complete_callback_remains_small_orchestration_boundary() -> 
 
 def test_simulation_completion_owner_methods_do_not_hide_a_relocated_monolith() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
 
@@ -1336,11 +1736,12 @@ def test_simulation_completion_owner_methods_do_not_hide_a_relocated_monolith() 
         if not isinstance(node, ast.FunctionDef):
             continue
         if not (
-            node.name.startswith("_build_completion")
-            or node.name.startswith("_publish_completion")
-            or node.name.startswith("_apply_completion")
-            or node.name.startswith("_advance_completion")
-            or node.name.startswith("_finalize_completion")
+            node.name.startswith("build_")
+            or node.name.startswith("publish_")
+            or node.name.startswith("apply_")
+            or node.name.startswith("advance_")
+            or node.name.startswith("finalize_")
+            or node.name.startswith("resolve_")
         ):
             continue
         line_count = int(node.end_lineno or node.lineno) - int(node.lineno) + 1
@@ -1364,19 +1765,19 @@ def test_simulation_completion_owner_methods_do_not_hide_a_relocated_monolith() 
 
 def test_simulation_completion_builders_do_not_publish_or_apply_effects() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
     lines = source.splitlines()
-    fn = _simulation_controller_method_node(tree, "_build_completion_result_state")
+    fn = _completion_publication_method_node(tree, "build_result_state")
 
     forbidden_self_calls = {
-        "_apply_simulation_lifecycle_effects",
-        "_publish_completion_cache_truth",
-        "_publish_completion_primary_materialization",
-        "_publish_completion_cache_entry",
-        "_publish_completion_display",
-        "_publish_completion_annotations_and_provenance",
+        "apply_algebra_status",
+        "publish_cache_truth",
+        "publish_primary_materialization",
+        "publish_cache_entry",
+        "publish_display",
+        "publish_annotations_and_provenance",
     }
     hits: list[_CallHit] = []
     for node in ast.walk(fn):
@@ -1402,23 +1803,80 @@ def test_simulation_completion_builders_do_not_publish_or_apply_effects() -> Non
     )
 
 
-def test_simulation_completion_resolver_returns_decisions_without_applying_lifecycle_effects() -> None:
+def test_simulation_completion_variable_runtime_policy_uses_runtime_port_not_mechanism_helpers() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
     lines = source.splitlines()
-    fn = _simulation_controller_method_node(tree, "_resolve_completion_callback_state")
+    runtime_methods = {
+        "is_energy_mode_mechanism",
+        "dsl_has_computational_mode_generated_block",
+        "sync_energy_mode_temperature_from_mechanism",
+        "populate_energy_mode_variables_from_mechanism",
+        "extract_and_populate_variables",
+    }
+    checked_methods = {
+        "_update_primary_result_materialization_contract",
+        "_refresh_primary_result_controls",
+    }
+    hits: list[_CallHit] = []
+    for method_name in checked_methods:
+        fn = _simulation_controller_method_node(tree, method_name)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _attribute_chain(node.func)
+            if len(chain or ()) == 4 and chain[:3] == ("self", "ui", "mechanism_helpers") and chain[3] in runtime_methods:
+                hits.append(
+                    _CallHit(
+                        method=f"{method_name}:{chain[3]}",
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
+                )
+
+    assert hits == [], (
+        "Completion materialization must route variable-runtime policy through `ui.runtime`; "
+        "`ui.mechanism_helpers` owns mechanism snapshots and pending-init helpers, not variable runtime forwarding.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_simulation_completion_callback_owner_applies_callback_policy_outside_controller() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_callback.py"
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    lines = source.splitlines()
+    fn = _class_method_node(tree, "SimulationCompletionCallbackOwner", "handle_completion")
 
     hits: list[_CallHit] = []
+    expected_owner_calls = {
+        "active_batch_context_runtime_input_stale_for_set",
+        "mark_stale_runtime_input_callback_consumed",
+        "effective_preview_owner_epoch_for_callback",
+        "missing_preview_owner_epoch_for_current_fast_owner",
+        "preview_request_matches_current_owner_epoch",
+        "apply_completion_policy_state_patch",
+        "apply_lifecycle_effects",
+        "publish_success",
+    }
+    observed_owner_calls: set[str] = set()
     for node in ast.walk(fn):
         if not isinstance(node, ast.Call):
             continue
         chain = _attribute_chain(node.func)
-        if chain in {
-            ("self", "_apply_simulation_lifecycle_effects"),
-            ("self", "_apply_completion_policy_state_patch"),
-            ("self", "_mark_stale_runtime_input_callback_consumed"),
+        if chain and chain[-1] in expected_owner_calls:
+            observed_owner_calls.add(chain[-1])
+        if chain and chain[0] == "self" and chain[-1] in {
+            "_apply_simulation_lifecycle_effects",
+            "_apply_completion_policy_state_patch",
+            "_mark_stale_runtime_input_callback_consumed",
+            "_active_batch_context_runtime_input_stale_for_set",
         }:
             hits.append(
                 _CallHit(
@@ -1428,9 +1886,57 @@ def test_simulation_completion_resolver_returns_decisions_without_applying_lifec
                 )
             )
 
+    missing = expected_owner_calls - observed_owner_calls
+    assert missing == set(), (
+        "Completion callback policy must live in `SimulationCompletionCallbackOwner`, not in "
+        f"`SimulationController._on_simulation_complete`. Missing expected owner calls: {sorted(missing)}"
+    )
     assert hits == [], (
-        "Completion callback resolution must return a typed decision; it must not apply lifecycle effects "
-        "or lifecycle consumption inline.\n"
+        "Completion callback owner must route state mutation through injected dependencies instead of "
+        "controller-private callback policy methods.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_simulation_completion_callback_does_not_resolve_policy_in_controller() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    lines = source.splitlines()
+    fn = _simulation_controller_method_node(tree, "_on_simulation_complete")
+
+    forbidden_calls = {
+        "resolve_superseded_fast_completion",
+        "_active_batch_context_runtime_input_stale_for_set",
+        "_mark_stale_runtime_input_callback_consumed",
+        "_effective_preview_owner_epoch_for_callback",
+        "_missing_preview_owner_epoch_for_current_fast_owner",
+        "_preview_request_matches_current_owner_epoch",
+        "_apply_completion_policy_state_patch",
+        "_apply_simulation_lifecycle_effects",
+        "publish_success",
+    }
+    hits: list[_CallHit] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain and chain[-1] in forbidden_calls:
+            hits.append(
+                _CallHit(
+                    method=chain[-1],
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    assert hits == [], (
+        "`SimulationController._on_simulation_complete` must delegate callback policy to "
+        "`SimulationCompletionCallbackOwner`; it must not resolve stale/publication policy inline.\n"
         + "\n".join(
             f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
@@ -1487,6 +1993,52 @@ def test_simulation_completion_and_error_callbacks_do_not_own_lifecycle_policy()
     assert hits == [], (
         "Simulation completion/error callbacks must ask typed lifecycle owners for effects and apply them "
         "through one effect applier, not inline lifecycle cleanup or run-control policy.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_simulation_error_callback_delegates_error_policy_to_owner() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    fn = _simulation_controller_method_node(tree, "_on_simulation_error")
+    lines = source.splitlines()
+
+    max_callback_lines = 35
+    line_count = int(fn.end_lineno or fn.lineno) - int(fn.lineno) + 1
+    forbidden_calls = {
+        "coerce_simulation_failure",
+        "simulation_failure_user_message",
+        "simulation_failure_detail_text",
+        "is_cancelled_failure",
+        "resolve_superseded_fast_error",
+        "terminal_error_effects",
+    }
+    hits: list[_CallHit] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain and chain[-1] in forbidden_calls:
+            hits.append(
+                _CallHit(
+                    method=chain[-1],
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    assert line_count <= max_callback_lines, (
+        "`SimulationController._on_simulation_error` must stay a small delegate to the error handling owner; "
+        f"observed {line_count} lines."
+    )
+    assert hits == [], (
+        "`SimulationController._on_simulation_error` must not own simulation-error classification or terminal "
+        "lifecycle policy.\n"
         + "\n".join(
             f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
@@ -1588,11 +2140,19 @@ def test_batch_run_context_tests_do_not_seed_or_inspect_raw_context_dicts() -> N
 def test_simulation_controller_run_entry_batch_cluster_uses_explicit_batch_port(method_name: str) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_slider_preview_launch.py"
     assert target.is_file(), f"Expected file at {target}"
 
-    source = target.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(target))
-    fn = _simulation_controller_method_node(tree, method_name)
+    if method_name == "_run_simulation_from_slider":
+        source = owner_target.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(owner_target))
+        fn = _class_method_node(tree, "SimulationSliderPreviewLaunchOwner", "run_from_slider")
+        inspected_target = owner_target
+    else:
+        source = target.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(target))
+        fn = _simulation_controller_method_node(tree, method_name)
+        inspected_target = target
     lines = source.splitlines()
 
     flattened_hits: list[_CallHit] = []
@@ -1603,7 +2163,7 @@ def test_simulation_controller_run_entry_batch_cluster_uses_explicit_batch_port(
         chain = _attribute_chain(node.func)
         if not chain:
             continue
-        if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in RUN_ENTRY_BATCH_TARGET_METHODS:
+        if len(chain) == 3 and chain[:2] in {("self", "ui"), ("self", "_ui")} and chain[2] in RUN_ENTRY_BATCH_TARGET_METHODS:
             flattened_hits.append(
                 _CallHit(
                     method=chain[2],
@@ -1612,7 +2172,11 @@ def test_simulation_controller_run_entry_batch_cluster_uses_explicit_batch_port(
                 )
             )
             continue
-        if len(chain) == 4 and chain[:3] == ("self", "ui", "batch") and chain[3] in RUN_ENTRY_BATCH_TARGET_METHODS:
+        if (
+            len(chain) == 4
+            and chain[:3] in {("self", "ui", "batch"), ("self", "_ui", "batch")}
+            and chain[3] in RUN_ENTRY_BATCH_TARGET_METHODS
+        ):
             explicit_methods.add(chain[3])
 
     assert explicit_methods == RUN_ENTRY_BATCH_TARGET_METHODS, (
@@ -1624,7 +2188,7 @@ def test_simulation_controller_run_entry_batch_cluster_uses_explicit_batch_port(
         f"Guardrail violated: `SimulationController.{method_name}` must not use flattened `self.ui.<method>` access "
         "for run-entry batch methods.\n"
         + "\n".join(
-            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            f"{inspected_target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(flattened_hits, key=lambda hit: (hit.lineno, hit.method))
         )
     )
@@ -1639,11 +2203,19 @@ def test_simulation_controller_run_ui_entry_progress_clusters_use_explicit_run_u
 ) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_slider_preview_launch.py"
     assert target.is_file(), f"Expected file at {target}"
 
-    source = target.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(target))
-    fn = _simulation_controller_method_node(tree, method_name)
+    if method_name == "_run_simulation_from_slider":
+        source = owner_target.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(owner_target))
+        fn = _class_method_node(tree, "SimulationSliderPreviewLaunchOwner", "run_from_slider")
+        inspected_target = owner_target
+    else:
+        source = target.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(target))
+        fn = _simulation_controller_method_node(tree, method_name)
+        inspected_target = target
     lines = source.splitlines()
 
     flattened_hits, explicit_methods = _collect_port_usage(
@@ -1662,7 +2234,7 @@ def test_simulation_controller_run_ui_entry_progress_clusters_use_explicit_run_u
         f"Guardrail violated: `SimulationController.{method_name}` must not use flattened `self.ui.<method>` access "
         "for the audited phase-1 SimulationRunUiPort methods.\n"
         + "\n".join(
-            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            f"{inspected_target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(flattened_hits, key=lambda hit: (hit.lineno, hit.method))
         )
     )
@@ -1773,44 +2345,85 @@ def test_simulation_controller_has_no_flattened_run_ui_port_usage() -> None:
 def test_run_simulation_internal_final_batch_residue_uses_explicit_batch_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    prep_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_run_preparation.py"
     assert target.is_file(), f"Expected file at {target}"
+    assert prep_target.is_file(), f"Expected file at {prep_target}"
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
-    fn = _simulation_controller_method_node(tree, "_run_simulation_internal")
     lines = source.splitlines()
+    prep_source = prep_target.read_text(encoding="utf-8")
+    prep_tree = ast.parse(prep_source, filename=str(prep_target))
+    prep_lines = prep_source.splitlines()
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
-    for node in ast.walk(fn):
-        if not isinstance(node, ast.Call):
-            continue
-        chain = _attribute_chain(node.func)
-        if not chain:
-            continue
-        if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS:
-            flattened_hits.append(
-                _CallHit(
-                    method=chain[2],
-                    lineno=node.lineno,
-                    line=lines[node.lineno - 1].strip(),
+    for method_name in (
+        "_run_simulation_internal",
+        "_run_rows_or_abort",
+        "_run_solver_context_or_abort",
+        "_run_mechanism_context_or_abort",
+        "_sync_batch_species_columns_for_run",
+    ):
+        fn = _simulation_controller_method_node(tree, method_name)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _attribute_chain(node.func)
+            if not chain:
+                continue
+            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS:
+                flattened_hits.append(
+                    _CallHit(
+                        method=chain[2],
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
                 )
-            )
-            continue
-        if (
-            len(chain) == 4
-            and chain[:3] == ("self", "ui", "batch")
-            and chain[3] in RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS
-        ):
-            explicit_methods.add(chain[3])
+                continue
+            if (
+                len(chain) == 4
+                and chain[:3] == ("self", "ui", "batch")
+                and chain[3] in RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS
+            ):
+                explicit_methods.add(chain[3])
+    for class_name, method_name in (
+        ("SimulationRunMechanismPreparationOwner", "build_mechanism_context_or_abort"),
+        ("SimulationRunSolverPreparationOwner", "build_solver_context_or_abort"),
+    ):
+        fn = _class_method_node(prep_tree, class_name, method_name)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _attribute_chain(node.func)
+            if not chain:
+                continue
+            if len(chain) == 3 and chain[:2] == ("self", "ui") and chain[2] in RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS:
+                flattened_hits.append(
+                    _CallHit(
+                        method=chain[2],
+                        lineno=node.lineno,
+                        line=prep_lines[node.lineno - 1].strip(),
+                    )
+                )
+                continue
+            if (
+                len(chain) == 4
+                and chain[:3] in {
+                    ("self", "ui", "batch"),
+                    ("self", "_ports", "batch"),
+                }
+                and chain[3] in RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS
+            ):
+                explicit_methods.add(chain[3])
 
     assert explicit_methods == RUN_SIMULATION_INTERNAL_FINAL_BATCH_TARGET_METHODS, (
-        "Guardrail expectation changed: `SimulationController._run_simulation_internal` must route the final "
+        "Guardrail expectation changed: run preparation must route the final "
         f"batch residue through `self.ui.batch`, but only found {sorted(explicit_methods)}."
     )
 
     assert flattened_hits == [], (
-        "Guardrail violated: `SimulationController._run_simulation_internal` must not use flattened "
+        "Guardrail violated: run preparation must not use flattened "
         "`self.ui.<method>` access for the final batch residue.\n"
         + "\n".join(
             f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
@@ -1827,11 +2440,42 @@ def test_start_next_batch_simulation_dispatches_only_contained_plan_workers() ->
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
     fn = _simulation_controller_method_node(tree, "_start_next_batch_simulation")
+    helper_fn = _simulation_controller_method_node(tree, "_start_contained_serial_batch_worker")
     lines = source.splitlines()
 
     legacy_hits: list[_CallHit] = []
     contained_hits: list[_CallHit] = []
+    helper_calls: list[_CallHit] = []
     for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain == ("self", "_start_contained_serial_batch_worker"):
+            helper_calls.append(
+                _CallHit(
+                    method="_start_contained_serial_batch_worker",
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+        elif chain == ("ContainedSimulationWorker",):
+            legacy_hits.append(
+                _CallHit(
+                    method="ContainedSimulationWorker",
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+        elif chain == ("SimulationWorker",):
+            legacy_hits.append(
+                _CallHit(
+                    method="SimulationWorker",
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    for node in ast.walk(helper_fn):
         if isinstance(node, ast.ImportFrom) and node.module == "kindred.gui.simulation_worker":
             imported_names = {alias.name for alias in node.names}
             if "SimulationWorker" in imported_names:
@@ -1870,16 +2514,67 @@ def test_start_next_batch_simulation_dispatches_only_contained_plan_workers() ->
                     )
                 )
 
+    assert helper_calls, (
+        "Guardrail expectation changed: `SimulationController._start_next_batch_simulation` must delegate contained "
+        "worker launch to `_start_contained_serial_batch_worker` instead of constructing the worker inline."
+    )
     assert contained_hits, (
-        "Guardrail expectation changed: `SimulationController._start_next_batch_simulation` must dispatch queued "
-        "serial batch runs through the contained typed plan worker."
+        "Guardrail expectation changed: serial batch launch must dispatch queued serial batch runs through the "
+        "contained typed plan worker."
     )
     assert legacy_hits == [], (
-        "Guardrail violated: `SimulationController._start_next_batch_simulation` must not retain a direct "
-        "`SimulationWorker` fallback after typed plan normalization.\n"
+        "Guardrail violated: serial batch launch must not retain direct worker construction in the orchestration "
+        "method or a `SimulationWorker` fallback after typed plan normalization.\n"
         + "\n".join(
             f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
             for hit in sorted(legacy_hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_parallel_batch_outcome_policy_is_not_controller_local() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "parallel_batch_outcome.py"
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    owner_source = owner_target.read_text(encoding="utf-8")
+    owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    lines = source.splitlines()
+
+    _class_method_node(owner_tree, "ParallelBatchOutcomeOwner", "handle_scoped_failure")
+    _class_method_node(owner_tree, "ParallelBatchOutcomeOwner", "consume_outcome")
+
+    forbidden_calls = {
+        "record_scoped_failure",
+        "record_explicit_scoped_failure_cache_state",
+        "completion_summary",
+        "resolve_parallel_batch_outcome",
+        "active_request_metadata",
+        "discard_request",
+    }
+    hits: list[_CallHit] = []
+    for method_name in {"_try_handle_scoped_batch_failure", "_consume_parallel_batch_outcome"}:
+        fn = _simulation_controller_method_node(tree, method_name)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _attribute_chain(node.func)
+            if chain and chain[-1] in forbidden_calls:
+                hits.append(
+                    _CallHit(
+                        method=f"{method_name}:{chain[-1]}",
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
+                )
+
+    assert hits == [], (
+        "Parallel batch lane outcome/scoped-failure policy must be owned by `ParallelBatchOutcomeOwner`; "
+        "controller methods may only delegate for compatibility.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
         )
     )
 

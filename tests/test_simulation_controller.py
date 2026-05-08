@@ -5554,7 +5554,7 @@ def test_run_simulation_from_slider_preflight_abort_clears_slider_triggered_flag
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda _text: "",
     )
 
@@ -5960,14 +5960,14 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": (
             {"randomname3": {"A": 1.0}},
             text.replace("initial: A=1", "# Initial concentrations moved to Batch Initial Conditions table (randomname3). Edit there."),
         ),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text.replace("initial:", "# stripped initial:"),
     )
     monkeypatch.setattr(
@@ -6115,11 +6115,11 @@ def test_serial_single_set_run_uses_contained_owner_lane(monkeypatch, mw: _FakeM
 
     monkeypatch.setattr(controller, "_acquire_ready_contained_simulation_owner_for_plan", _ready_owner)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6459,11 +6459,11 @@ def test_interactive_runtime_availability_warms_exact_ordinary_and_preview_plans
         return owner
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6541,11 +6541,11 @@ def test_interactive_runtime_ready_is_pure_and_ensure_warms_changed_payload(
         return owner
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6619,14 +6619,14 @@ def test_interactive_runtime_availability_does_not_apply_pending_init_migration(
         apply_pending_init_migration,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": (
             {"set1": {"A": 1.0}},
             "reaction: A -> B; k=1",
         ),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6680,11 +6680,11 @@ def test_interactive_runtime_availability_uses_readiness_boundary_without_user_l
         return owner
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6741,11 +6741,11 @@ def test_serial_runtime_readiness_warms_every_selected_set_owner(
         return owner
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6848,11 +6848,11 @@ def test_first_serial_actions_reuse_startup_ready_exact_contained_owners(
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _worker_factory)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -6957,11 +6957,11 @@ def test_first_ordinary_action_requires_ready_exact_contained_owner(
         lambda **kwargs: created_workers.append(kwargs) or object(),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -7037,11 +7037,11 @@ def test_contained_worker_construction_failure_releases_acquired_runtime_owner(
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _raising_worker_factory)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -7121,11 +7121,11 @@ def test_contained_worker_construction_failure_release_error_preserves_original_
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _raising_worker_factory)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -7186,11 +7186,11 @@ def test_first_preview_action_requires_ready_exact_contained_owner(
         lambda **kwargs: created_workers.append(kwargs) or object(),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -7828,11 +7828,11 @@ def test_runtime_readiness_only_ordinary_warm_preserves_preview_ownership(
     controller: SimulationController,
 ):
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -7880,11 +7880,11 @@ def test_runtime_readiness_only_ordinary_warm_does_not_mutate_status_for_solver_
     controller: SimulationController,
 ):
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -7953,11 +7953,11 @@ def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
     mw.preview_batch_cache_token = MagicMock(side_effect=_preview_token)
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -8250,11 +8250,11 @@ def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
     mw.preview_batch_cache_token = MagicMock(return_value="set:id1|A=2.5")
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -8321,11 +8321,11 @@ def test_run_simulation_internal_explicit_cache_key_ignores_non_primary_set_fing
     mw._simulation_param_fingerprints = {"id1": "params-id1", "id2": "params-id2a"}
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -8377,11 +8377,11 @@ def test_run_simulation_internal_baseline_explicit_run_leaves_overlay_cache_toke
     mw.preview_batch_cache_token = MagicMock(return_value="")
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -8436,11 +8436,11 @@ def test_run_simulation_internal_fast_mode_seeds_active_preview_scope_set_ids(
     mw.preview_initials_for_row = MagicMock(side_effect=[{"A": 1.0}, {"A": 2.0}])
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -9475,11 +9475,11 @@ def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkey
 
     monkeypatch.setattr("kindred.core.simulator.dsl.parse_dsl_to_mechanism", lambda *_a, **_k: _MechTmp())
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({"set1": {"A": 1.0}}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -9545,11 +9545,11 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
     mw._batch_store.visible_species.return_value = ["A"]
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.migrate_reaction_dsl_initial_concentration_sets",
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -9614,7 +9614,7 @@ def test_run_simulation_internal_invalid_t_end_does_not_schedule_pending_slider_
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -9673,7 +9673,7 @@ def test_run_simulation_internal_invalid_t_end_reinvalidates_preserved_pending_i
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -9740,7 +9740,7 @@ def test_run_simulation_internal_no_mechanism_after_pending_init_migration_reinv
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda _text: "",
     )
     monkeypatch.setattr(
@@ -9785,7 +9785,7 @@ def test_run_simulation_internal_fast_no_mechanism_clears_preview_ownership_and_
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda _text: "",
     )
     monkeypatch.setattr(
@@ -9835,7 +9835,7 @@ def test_explicit_run_worker_error_reinvalidates_preserved_pending_init_results(
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -11790,7 +11790,7 @@ def test_explicit_run_worker_error_preserves_targeted_dirty_workspaces(
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -11855,7 +11855,7 @@ def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_a
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -11918,7 +11918,7 @@ def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_n
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -11994,7 +11994,7 @@ def test_explicit_run_success_cancels_pending_species_preview_after_targeted_ove
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -12075,7 +12075,7 @@ def test_explicit_run_success_preserves_pending_slider_replay_for_non_targeted_d
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -12148,7 +12148,7 @@ def test_explicit_run_preflight_abort_does_not_schedule_pending_slider_replay(
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda _text: "",
     )
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -12463,7 +12463,7 @@ def test_explicit_run_success_requeues_surviving_pending_slider_replay_with_fres
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -12562,7 +12562,7 @@ def test_explicit_run_success_preserves_targeted_dirty_state_edited_after_run_st
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -12640,7 +12640,7 @@ def test_run_simulation_internal_invalid_t_end_preserves_targeted_dirty_workspac
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -12692,7 +12692,7 @@ def test_run_simulation_internal_invalid_initials_preserves_targeted_dirty_works
 
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(
@@ -12763,7 +12763,7 @@ def test_explicit_run_success_preserves_pending_species_preview_replay_when_no_t
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.strip_reaction_dsl_initial_concentrations",
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
         lambda text: text,
     )
     monkeypatch.setattr(

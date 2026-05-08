@@ -57,6 +57,7 @@ from kindred.gui.fitting.run_stamp import (
     hash_global_fit_run_stamp,
 )
 from kindred.gui.fitting.runtime_readiness import (
+    FittingRuntimeIdentity,
     FittingRuntimeReadinessController,
     FittingRuntimeReadinessState,
 )
@@ -1124,13 +1125,64 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_button.setEnabled((not running) and (not preparing) and not invalid and ready)
 
     def _fit_runtime_ready_for_run_button(self) -> bool:
-        if self._fit_runtime_readiness.snapshot().state is not FittingRuntimeReadinessState.READY:
+        snapshot = self._fit_runtime_readiness.snapshot()
+        if snapshot.state is not FittingRuntimeReadinessState.READY:
             return False
-        try:
-            identity = self._fit_launch_identity_owner.build_current_fit_runtime_identity()
-        except RuntimeError:
+        identity = snapshot.identity
+        if not self._fit_runtime_identity_matches_current_noncollecting_inputs(identity):
             return False
         return self._fit_runtime_readiness.is_ready_for(identity)
+
+    def _fit_runtime_identity_matches_current_noncollecting_inputs(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
+        if identity is None:
+            return False
+        if not self._fit_launch_identity_owner.payloads_available_for_identity(identity):
+            return False
+        current_selection = self._fit_launch_identity_owner.collect_dataset_selection()
+        current_dataset_ids = tuple(str(ds_id) for ds_id in current_selection.ids)
+        identity_dataset_ids = tuple(str(getattr(spec, "dataset_id", "") or "") for spec in identity.datasets)
+        if current_dataset_ids != identity_dataset_ids:
+            return False
+        integration = self._params_ics_tab.collect_integration_settings_silent()
+        if integration is None:
+            return False
+        solver, rtol, atol = integration
+        requested_solver, _solver_warning = normalize_solver_name(str(solver or FITTING_DEFAULT_SOLVER))
+        if str(requested_solver) != str(identity.requested_solver):
+            return False
+        if not math.isclose(float(rtol), float(identity.requested_rtol), rel_tol=1e-9, abs_tol=1e-12):
+            return False
+        if not math.isclose(float(atol), float(identity.requested_atol), rel_tol=1e-9, abs_tol=1e-12):
+            return False
+        try:
+            current_lane_count = self._fit_runtime_lane_budget(len(identity.datasets))
+        except Exception:
+            return False
+        if int(current_lane_count) != int(identity.lane_count):
+            return False
+        return self._fit_runtime_identity_matches_runtime_settings(identity)
+
+    def _fit_runtime_identity_matches_runtime_settings(self, identity: FittingRuntimeIdentity) -> bool:
+        if not callable(getattr(self, "_simulation_builder", None)):
+            return True
+        current = self._runtime_settings_for_identity()
+        stamp = dict(identity.stamp or {})
+        prepared = stamp.get("prepared_simulation")
+        if isinstance(prepared, Mapping):
+            return (
+                str(prepared.get("temperature_K") or "") == str(current.get("temperature_K") or "")
+                and bool(prepared.get("use_sparse_jacobian")) == bool(current.get("use_sparse_jacobian"))
+                and bool(prepared.get("wegscheider_cyclicity_enabled"))
+                == bool(current.get("wegscheider_cyclicity_enabled"))
+            )
+        runtime_request = stamp.get("runtime_request")
+        if isinstance(runtime_request, Mapping):
+            for key, value in current.items():
+                if key not in runtime_request:
+                    return False
+                if str(runtime_request.get(key)) != str(value):
+                    return False
+        return True
 
     def _fitting_evaluator_components_for_runtime_identity(
         self,
@@ -1834,35 +1886,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def run_fit(self) -> None:
         self._fit_run_command_owner.run_fit()
-
-    def _datasets_payloads_for_run(self, selected_ids: Sequence[str]) -> Optional[list[dict[str, Any]]]:
-        datasets: list[dict[str, Any]] = []
-        for dataset_id in selected_ids:
-            result = self._global_payload_results.get(str(dataset_id))
-            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
-                reason = str(result.error or "Dataset payload is invalid.")
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Global Fit",
-                    f"Dataset '{dataset_id}' has invalid payload:\n{reason}",
-                )
-                return None
-            if dataset_id not in self._global_payload_lookup:
-                QtWidgets.QMessageBox.warning(self, "Global Fit", f"Dataset '{dataset_id}' is missing payloads.")
-                return None
-            datasets.append(dict(self._global_payload_lookup[dataset_id]))
-        return datasets
-
-    def _datasets_payloads_for_readiness(self, selected_ids: Sequence[str]) -> Optional[list[dict[str, Any]]]:
-        datasets: list[dict[str, Any]] = []
-        for dataset_id in selected_ids:
-            result = self._global_payload_results.get(str(dataset_id))
-            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
-                return None
-            if dataset_id not in self._global_payload_lookup:
-                return None
-            datasets.append(dict(self._global_payload_lookup[dataset_id]))
-        return datasets
 
     @staticmethod
     def _shared_param_keys_for_run(config: Dict[str, Any]) -> set[str]:
