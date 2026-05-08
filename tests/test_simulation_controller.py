@@ -3972,6 +3972,57 @@ def test_primary_explicit_completion_preserves_fresh_cache_during_post_run_speci
     mw._sync_batch_species_columns.assert_called_once_with(["A", "C"], preserve_active_cache=True)
     assert controller.batch_cache.active_cache_valid_set_ids == ("id1",)
 
+
+@pytest.mark.unit
+def test_primary_materialization_uses_context_cache_key_when_callback_omits_key(
+    mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Mechanism:
+        def species_names(self) -> list[str]:
+            return ["A", "C"]
+
+    controller._active_run_id = 7
+    controller._latest_sim_request_id = 11
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        keep_lane_pool_alive=True,
+        run_id=7,
+        request_id=11,
+        fast_mode=False,
+        cache_key="fresh-current-cache",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        primary_set_id="id1",
+        total=2,
+    )
+    controller.batch_cache.active_cache_key = "fresh-current-cache"
+    controller.batch_cache.active_cache_preview_token = "narrow-preview-token"
+    controller.batch_cache.active_cache_preview_scope_set_ids = ("id1",)
+    controller.batch_cache.active_cache_valid_set_ids = ("id1",)
+
+    result = _successful_result_payload()
+    result["mechanism"] = _Mechanism()
+    result["mechanism_text"] = "reaction: A -> C ; k=0.1"
+    result["species_names"] = ["A", "C"]
+
+    controller._on_simulation_complete(
+        result,
+        run_id=7,
+        fast_mode=False,
+        request_id=11,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key=None,
+    )
+
+    policy_context = _batch_policy_context(controller)
+    assert policy_context.explicit_cache_preview_token == "narrow-preview-token"
+    assert policy_context.explicit_cache_preview_scope_set_ids == ("id1",)
+    assert policy_context.explicit_cache_valid_set_ids == ("id1",)
+
+
 @pytest.mark.unit
 def test_on_simulation_complete_later_completion_does_not_widen_narrowed_valid_subset(
     mw: _FakeMainWindow, controller: SimulationController
@@ -10217,6 +10268,148 @@ def test_scoped_runtime_input_supersede_rejects_affected_completion_but_accepts_
     )
     mw.set_data.assert_called_once()
     assert "ck::id2" in controller.batch_cache.result_cache
+
+
+@pytest.mark.unit
+def test_scoped_runtime_input_supersede_rejects_completion_before_any_publication_surface(
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1},
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    cache_truth = MagicMock()
+    cache_entry = MagicMock()
+    display = MagicMock()
+    annotations = MagicMock()
+    provenance = MagicMock()
+    controller._cache_admin.publish_completion_cache_truth = cache_truth
+    controller._cache_admin.publish_completion_cache = cache_entry
+    controller.ui.results.publish_simulation_completion_result = display
+    controller.ui.results.publish_completion_intervention_annotations = annotations
+    controller.ui.provenance.publish_simulation_completion_provenance = provenance
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    cache_truth.assert_not_called()
+    cache_entry.assert_not_called()
+    display.assert_not_called()
+    annotations.assert_not_called()
+    provenance.assert_not_called()
+
+
+@pytest.mark.unit
+def test_malformed_completion_payload_does_not_publish_cache_truth(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    cache_truth = MagicMock()
+    mw.message_box_critical = MagicMock()
+    controller._cache_admin.publish_completion_cache_truth = cache_truth
+
+    controller._on_simulation_complete(
+        {"t": np.array([0.0])},
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    cache_truth.assert_not_called()
+
+
+@pytest.mark.unit
+def test_materialization_failure_does_not_publish_cache_truth(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    class _Mechanism:
+        def species_names(self) -> list[str]:
+            return ["A", "B"]
+
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    cache_truth = MagicMock()
+    mw.message_box_critical = MagicMock()
+    mw._is_energy_mode_mechanism = MagicMock(side_effect=RuntimeError("materialization boom"))
+    controller._cache_admin.publish_completion_cache_truth = cache_truth
+    payload = _successful_result_payload()
+    payload["mechanism"] = _Mechanism()
+
+    controller._on_simulation_complete(
+        payload,
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+
+    cache_truth.assert_not_called()
+    mw.message_box_critical.assert_called_once()
 
 
 @pytest.mark.unit

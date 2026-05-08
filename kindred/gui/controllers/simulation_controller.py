@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from contextlib import suppress
 import hashlib
 import json
@@ -78,6 +78,53 @@ logger = logging.getLogger(__name__)
 __all__ = ["SimulationController"]
 
 _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR = "_kindred_controller_worker_signal_handlers"
+
+
+@dataclass
+class _CompletionCallbackState:
+    run_id: Optional[int]
+    request_id: Optional[int]
+    batch_set: Optional[str]
+    batch_set_id: Optional[str]
+    cache_key: Optional[str]
+    policy_context: CompletionPolicyContext | None
+    ctx: Mapping[str, Any] | None
+    shutdown_requested: bool
+    is_preview: bool
+    slider_triggered: bool
+    explicit_batch_coalescing: bool
+    stale_fast_handoff_after_display: bool = False
+    batch_queue_done: bool = True
+
+
+@dataclass
+class _CompletionCallbackDecision:
+    state: _CompletionCallbackState | None
+    lifecycle_effects: SimulationLifecycleEffects | None = None
+    state_patch: PolicyStatePatch | None = None
+    stale_runtime_input_batch_set_id: Optional[str] = None
+
+
+@dataclass
+class _CompletionResultState:
+    t: Any
+    Y: Any
+    species_names: Sequence[str]
+    algebra_scalars: Mapping[str, Any]
+    algebra_errors: Sequence[Any]
+    solver_provenance: Mapping[str, Any]
+    mechanism: object | None
+    base_species_count: int | None
+    mechanism_text: str
+    solver_config: Mapping[str, Any]
+    fallback_occurred: bool
+    fallback_message: object | None
+    cache_plan: SimulationPlan | None
+    series: Dict[str, Any]
+    is_primary: bool
+    energy_mode: bool
+    redraw_valid_set_ids: object | None
+    has_redraw_subset: bool
 
 
 def _try_float(value: object) -> Optional[float]:
@@ -5816,6 +5863,658 @@ class SimulationController(QtCore.QObject):
         self.ui.slider.set_slider_triggered_simulation(False)
         logger.debug("Skipped variable extraction (slider-triggered simulation)")
 
+    def _resolve_completion_callback_state(
+        self,
+        *,
+        run_id: Optional[int],
+        fast_mode: Optional[bool],
+        request_id: Optional[int],
+        owner_epoch: Optional[int],
+        batch_set: Optional[str],
+        batch_set_id: Optional[str],
+        cache_key: Optional[str],
+    ) -> _CompletionCallbackDecision:
+        active_run_id = int(getattr(self, "_active_run_id", 0))
+        shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
+        if run_id is not None and int(run_id) != active_run_id:
+            logger.debug(
+                "Ignoring stale simulation completion (run_id=%s, active=%s)",
+                run_id,
+                active_run_id,
+            )
+            return _CompletionCallbackDecision(state=None)
+
+        ctx: Mapping[str, Any] | None = None
+        if batch_set is None or batch_set_id is None:
+            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item()
+            if batch_set is None:
+                batch_set = hinted_set
+            if batch_set_id is None:
+                batch_set_id = hinted_set_id
+        if batch_set_id is None and isinstance(batch_set, str):
+            batch_set_id = self.ui.batch.batch_set_id_for_name(batch_set)
+        if self._active_batch_context_runtime_input_stale_for_set(batch_set_id=batch_set_id):
+            logger.debug(
+                "Ignoring stale simulation completion (batch_set_id=%s, current_global_epoch=%s)",
+                str(batch_set_id or ""),
+                int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0),
+            )
+            return _CompletionCallbackDecision(
+                state=None,
+                stale_runtime_input_batch_set_id=batch_set_id,
+            )
+
+        policy_context = self._batch_context_owner.completion_policy_context()
+        latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
+        callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
+            owner_epoch=owner_epoch,
+            context=policy_context,
+        )
+        missing_owner_epoch = self._missing_preview_owner_epoch_for_current_fast_owner(
+            fast_mode=fast_mode,
+            request_id=request_id,
+            owner_epoch=callback_owner_epoch,
+            latest_request_id=latest_request_id,
+        )
+        state = _CompletionCallbackState(
+            run_id=run_id,
+            request_id=request_id,
+            batch_set=batch_set,
+            batch_set_id=batch_set_id,
+            cache_key=cache_key,
+            policy_context=policy_context,
+            ctx=ctx,
+            shutdown_requested=shutdown_requested,
+            is_preview=bool(fast_mode),
+            slider_triggered=bool(self.ui.slider.slider_triggered_simulation()) or bool(fast_mode),
+            explicit_batch_coalescing=False,
+        )
+        is_superseded_fast_request = bool(
+            fast_mode
+            and request_id is not None
+            and (
+                bool(missing_owner_epoch)
+                or (not self._preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
+            )
+        )
+        if not is_superseded_fast_request:
+            state.explicit_batch_coalescing = self._batch_context_owner.explicit_batch_coalescing_for_completion(
+                slider_triggered=bool(state.slider_triggered),
+                context=state.ctx,
+            )
+            return _CompletionCallbackDecision(state=state)
+
+        stale_fast_decision = self._completion_policy.resolve_superseded_fast_completion(
+            preview_ownership=self._completion_policy_preview_ownership(),
+            context=policy_context,
+            request_id=int(request_id),
+            preview_owner_epoch=callback_owner_epoch,
+            pending_replay=self._completion_policy_pending_replay_state(),
+            shutdown_requested=shutdown_requested,
+        )
+        logger.debug(
+            "Active fast completion superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, display_current_preview=%s, handoff_after_display=%s)",
+            request_id,
+            latest_request_id,
+            run_id,
+            bool(stale_fast_decision.schedule_pending_preview_run),
+            bool(stale_fast_decision.display_current_preview),
+            bool(stale_fast_decision.defer_context_deactivation_until_after_display),
+        )
+
+        if stale_fast_decision.display_current_preview:
+            state.stale_fast_handoff_after_display = bool(
+                stale_fast_decision.defer_context_deactivation_until_after_display
+            )
+            state.explicit_batch_coalescing = self._batch_context_owner.explicit_batch_coalescing_for_completion(
+                slider_triggered=bool(state.slider_triggered),
+                context=state.ctx,
+            )
+            return _CompletionCallbackDecision(
+                state=state,
+                state_patch=stale_fast_decision.state_patch,
+            )
+
+        return _CompletionCallbackDecision(
+            state=None,
+            state_patch=stale_fast_decision.state_patch,
+            lifecycle_effects=self._lifecycle_effect_owner.superseded_fast_completion_effects(
+                deactivate_context_immediately=bool(stale_fast_decision.deactivate_context_immediately),
+                schedule_pending_preview_run=bool(stale_fast_decision.schedule_pending_preview_run),
+                reset_status_progress=bool(stale_fast_decision.reset_status_progress),
+                display_current_preview=bool(stale_fast_decision.display_current_preview),
+                cleanup_state=self._batch_context_owner.completion_cleanup_state(state.ctx),
+            ),
+        )
+
+    def _build_completion_result_state(
+        self,
+        result: Mapping[str, Any],
+    ) -> _CompletionResultState:
+        t = result["t"]
+        Y = result["Y"]
+        species_names = result["species_names"]
+        algebra_scalars = result.get("algebra_scalars") or {}
+        algebra_errors = result.get("algebra_errors") or []
+        solver_provenance = result.get("provenance") if isinstance(result.get("provenance"), Mapping) else {}
+        mechanism = result.get("mechanism")
+        base_species_count = self._completion_base_species_count(result, mechanism=mechanism)
+        mechanism_text = str(result.get("mechanism_text", ""))
+        solver_config = result.get("solver_config", {})
+        solver_config_map = solver_config if isinstance(solver_config, Mapping) else {}
+        return _CompletionResultState(
+            t=t,
+            Y=Y,
+            species_names=species_names,
+            algebra_scalars=algebra_scalars if isinstance(algebra_scalars, Mapping) else {},
+            algebra_errors=algebra_errors,
+            solver_provenance=solver_provenance if isinstance(solver_provenance, Mapping) else {},
+            mechanism=mechanism,
+            base_species_count=base_species_count,
+            mechanism_text=mechanism_text,
+            solver_config=solver_config_map,
+            fallback_occurred=bool(result.get("fallback_occurred")),
+            fallback_message=result.get("fallback_message"),
+            cache_plan=None,
+            series={str(species_name): Y[i, :] for i, species_name in enumerate(species_names)},
+            is_primary=True,
+            energy_mode=False,
+            redraw_valid_set_ids=None,
+            has_redraw_subset=False,
+        )
+
+    def _resolve_completion_result_ownership(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        completion.redraw_valid_set_ids, completion.has_redraw_subset = self._completion_redraw_scope(state)
+        completion.cache_plan = self._completion_cache_plan_for_set(state)
+        completion.is_primary = self._completion_is_primary(state)
+        completion.mechanism = self._resolve_completion_mechanism(
+            mechanism=completion.mechanism,
+            mechanism_text=completion.mechanism_text,
+            solver_config=completion.solver_config,
+            is_preview=bool(state.is_preview),
+            is_primary=bool(completion.is_primary),
+        )
+
+    def _apply_completion_materialization_contract(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        completion.energy_mode = self._update_primary_result_materialization_contract(
+            mechanism=completion.mechanism,
+            mechanism_text=completion.mechanism_text,
+            solver_config=completion.solver_config,
+            is_preview=bool(state.is_preview),
+            is_primary=bool(completion.is_primary),
+        )
+
+    def _apply_completion_algebra_status(self, completion: _CompletionResultState) -> None:
+        self._apply_simulation_lifecycle_effects(
+            self._lifecycle_effect_owner.algebra_status_effect(
+                species_names=completion.species_names,
+                base_species_count=completion.base_species_count,
+                algebra_errors=completion.algebra_errors,
+            )
+        )
+
+    def _completion_base_species_count(self, result: Mapping[str, Any], *, mechanism: object | None) -> int | None:
+        raw_base_species_count = result.get("base_species_count")
+        try:
+            if raw_base_species_count is not None:
+                return max(0, int(raw_base_species_count))
+        except Exception:
+            pass
+        if mechanism is not None:
+            try:
+                return len(list(mechanism.species_names()))
+            except Exception:
+                return None
+        return None
+
+    def _resolve_completion_cache_key(self, state: _CompletionCallbackState) -> None:
+        if state.cache_key is None:
+            state.cache_key = self._batch_context_owner.completion_cache_key(state.ctx)
+        if state.cache_key is None:
+            state.cache_key = (
+                self._batch_cache.active_preview_cache_key
+                if state.is_preview
+                else self._batch_cache.active_cache_key
+            )
+        state.cache_key = str(state.cache_key) if state.cache_key else None
+
+    def _publish_completion_cache_truth(self, state: _CompletionCallbackState) -> None:
+        self._resolve_completion_cache_key(state)
+        if not state.cache_key:
+            return
+        if state.is_preview:
+            preview_scope_ids = (
+                state.policy_context.preview_scope_set_ids
+                if state.policy_context is not None and state.policy_context.preview_scope_set_ids
+                else None
+            )
+            self._cache_admin.publish_completion_cache_truth(
+                is_preview=True,
+                cache_key=state.cache_key,
+                preview_scope_set_ids=preview_scope_ids,
+            )
+            return
+        cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
+            context=state.policy_context or self._batch_context_owner.completion_policy_context(state.ctx),
+            cache_state=self._completion_policy_cache_state(),
+            cache_key=state.cache_key,
+        )
+        self._cache_admin.publish_completion_cache_truth(
+            is_preview=False,
+            cache_key=state.cache_key,
+            clear_active_selection_state=cache_reconciliation.clear_active_selection_state,
+            active_cache_key=cache_reconciliation.active_cache_key,
+            active_cache_preview_token=cache_reconciliation.active_cache_preview_token,
+            active_cache_preview_scope_set_ids=cache_reconciliation.active_cache_preview_scope_set_ids,
+            active_cache_valid_set_ids=cache_reconciliation.active_cache_valid_set_ids,
+            active_cache_invalidated_set_ids=cache_reconciliation.active_cache_invalidated_set_ids,
+        )
+
+    def _completion_redraw_scope(self, state: _CompletionCallbackState) -> tuple[object | None, bool]:
+        if state.is_preview or state.policy_context is None:
+            return None, False
+        cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
+            context=state.policy_context,
+            cache_state=self._completion_policy_cache_state(),
+            cache_key=state.cache_key,
+        )
+        return cache_reconciliation.redraw_valid_set_ids, bool(cache_reconciliation.has_redraw_subset)
+
+    def _resolve_completion_batch_identity(self, state: _CompletionCallbackState) -> None:
+        if state.batch_set is None or state.batch_set_id is None:
+            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(state.ctx)
+            if state.batch_set is None:
+                state.batch_set = hinted_set
+            if state.batch_set_id is None:
+                state.batch_set_id = hinted_set_id
+        if state.batch_set_id is None and isinstance(state.batch_set, str):
+            state.batch_set_id = self.ui.batch.batch_set_id_for_name(state.batch_set)
+        if state.batch_set is None and isinstance(state.batch_set_id, str):
+            state.batch_set = self.ui.batch.batch_set_name_for_id(state.batch_set_id)
+
+    def _completion_cache_plan_for_set(self, state: _CompletionCallbackState) -> SimulationPlan | None:
+        try:
+            return _simulation_plan(
+                self._batch_context_owner.simulation_plan_payload_for_set(state.batch_set_id, state.ctx)
+            )
+        except (TypeError, ValueError) as exc:
+            logger.debug("Ignoring invalid simulation plan payload for cache identity: %s", exc, exc_info=True)
+            return None
+
+    def _completion_is_primary(self, state: _CompletionCallbackState) -> bool:
+        primary_set = self._batch_context_owner.primary_set_id(state.ctx)
+        if not primary_set:
+            return True
+        return bool(state.batch_set_id is not None and str(state.batch_set_id) == str(primary_set))
+
+    def _publish_completion_primary_materialization(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        if (not state.is_preview) and completion.is_primary and completion.fallback_occurred:
+            solver_name = completion.solver_config.get("solver", "selected solver")
+            warning_text = f"The requested stiff solver {solver_name} failed"
+            warning_text += f" ({completion.fallback_message})." if completion.fallback_message else "."
+            warning_text += " The simulation retried with an alternative stiff SciPy solver."
+            logger.warning("Displaying solver fallback warning: %s", warning_text)
+            self.ui.dialogs.message_box_warning("Solver fallback", warning_text)
+
+        if state.is_preview or (not completion.is_primary) or completion.mechanism is None:
+            return
+        self._remember_primary_result_mechanism(
+            mechanism=completion.mechanism,
+            mechanism_text=completion.mechanism_text,
+            solver_config=completion.solver_config,
+        )
+        if state.policy_context is not None and state.cache_key:
+            state.policy_context = self._completion_policy.build_context_update_from_cache_truth(
+                context=state.policy_context,
+                cache_state=self._completion_policy_cache_state(),
+                cache_key=state.cache_key,
+            )
+            state.ctx = self._batch_context_owner.serialize_completion_policy_context(
+                state.policy_context,
+                base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
+            )
+
+    def _publish_completion_cache_entry(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        cache_plan = completion.cache_plan
+        cache_token = (cache_plan.cache_key() if cache_plan is not None else "") or str(state.cache_key or "")
+        if not cache_token or not state.batch_set_id:
+            return
+        cached_mechanism = (
+            completion.mechanism
+            if self._include_mechanism_in_result_payload(
+                fast_mode=bool(state.is_preview),
+                batch_set_id=state.batch_set_id,
+                context=state.ctx,
+            )
+            else None
+        )
+        cache_simulation_identity = cache_plan.simulation_identity_payload() if cache_plan is not None else {}
+        if not cache_simulation_identity:
+            cache_simulation_identity = self._batch_context_owner.simulation_identity_for_set(
+                str(state.batch_set_id),
+                state.ctx,
+            )
+        cache_preview_token = None
+        if state.is_preview:
+            cache_preview_token = (
+                cache_plan.preview_batch_cache_token() if cache_plan is not None else ""
+            ) or self._batch_context_owner.preview_batch_cache_token_for_set(state.batch_set_id, state.ctx)
+        self._cache_admin.publish_completion_cache(
+            cache_key=cache_token,
+            cache_token=cache_token,
+            set_id=str(state.batch_set_id),
+            is_preview=bool(state.is_preview),
+            t=completion.t,
+            series=completion.series,
+            algebra_scalars=(dict(completion.algebra_scalars) if isinstance(completion.algebra_scalars, dict) else None),
+            mechanism=cached_mechanism,
+            mechanism_text=completion.mechanism_text,
+            simulation_identity=cache_simulation_identity,
+            solver_config=dict(completion.solver_config) if isinstance(completion.solver_config, dict) else None,
+            preview_batch_cache_token=cache_preview_token,
+            fallback_occurred=bool(completion.fallback_occurred),
+            fallback_message=completion.fallback_message,
+            solver_provenance=completion.solver_provenance,
+        )
+
+    def _apply_completion_pending_init(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        if state.policy_context is None:
+            return
+        pending_init_completion = self._completion_policy.resolve_pending_init_completion(
+            context=state.policy_context,
+            batch_set=state.batch_set,
+            is_preview=bool(state.is_preview),
+            is_primary=bool(completion.is_primary),
+        )
+        if not pending_init_completion.should_attempt_apply:
+            return
+        applied = False
+        try:
+            applied = bool(
+                self.ui.mechanism_helpers.apply_pending_init_migration(
+                    seed_sets={str(state.batch_set): dict(pending_init_completion.seed_for_ui)},
+                    rewrite=str(pending_init_completion.rewrite or ""),
+                )
+            )
+        except Exception:
+            applied = False
+        if not applied:
+            return
+        state.policy_context = self._completion_policy.note_pending_init_apply_result(
+            context=state.policy_context,
+            applied=True,
+        )
+        state.ctx = self._batch_context_owner.serialize_completion_policy_context(
+            state.policy_context,
+            base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
+        )
+
+    def _publish_completion_display(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        if state.cache_key and (state.slider_triggered or state.explicit_batch_coalescing):
+            self.queue_slider_plot_update(
+                set_id=state.batch_set_id,
+                cache_key=str(state.cache_key),
+                request_id=state.request_id,
+                run_id=state.run_id,
+                slider_triggered=bool(state.slider_triggered),
+                valid_set_ids=(
+                    completion.redraw_valid_set_ids
+                    if (state.explicit_batch_coalescing and completion.has_redraw_subset)
+                    else None
+                ),
+                allow_fallback=(not bool(state.explicit_batch_coalescing)),
+            )
+            return
+
+        owned_species = None
+        if completion.mechanism is not None:
+            try:
+                owned_species = list(completion.mechanism.species_names())
+            except Exception:
+                owned_species = None
+        selected_sets = self.ui.batch.batch_set_ids_for_scope("selected")
+        prefer = None
+        current_row = self.ui.batch.batch_current_row()
+        if current_row is not None:
+            prefer = self.ui.batch.batch_set_id_for_row(int(current_row))
+        self.ui.results.publish_simulation_completion_result(
+            t=completion.t,
+            series=completion.series,
+            cache_key=state.cache_key,
+            batch_set=state.batch_set,
+            batch_set_id=state.batch_set_id,
+            selected_sets=selected_sets,
+            prefer_set=prefer,
+            redraw_valid_set_ids=completion.redraw_valid_set_ids,
+            has_redraw_subset=completion.has_redraw_subset,
+            slider_triggered=bool(state.slider_triggered),
+            explicit_batch_coalescing=bool(state.explicit_batch_coalescing),
+            algebra_scalars=completion.algebra_scalars,
+            owned_species=owned_species,
+        )
+
+    def _publish_completion_annotations_and_provenance(
+        self,
+        completion: _CompletionResultState,
+    ) -> None:
+        try:
+            self.ui.results.publish_completion_intervention_annotations(completion.solver_provenance)
+        except Exception as exc:
+            self._record_nonfatal_exception("Failed to update intervention plot annotations", exc)
+
+        if not completion.is_primary:
+            return
+        temperature_used = float(self.ui.solver.temperature_spinbox_value())
+        energy_unit_used = None
+        if completion.mechanism is not None:
+            try:
+                mmeta = getattr(completion.mechanism, "metadata", {}) or {}
+                if isinstance(mmeta, dict) and mmeta.get("temperature_K") is not None:
+                    temperature_used = float(mmeta.get("temperature_K"))
+                if isinstance(mmeta, dict) and mmeta.get("energy_unit"):
+                    energy_unit_used = str(mmeta.get("energy_unit"))
+            except Exception as exc:
+                self._record_nonfatal_exception("Failed to read mechanism metadata for simulation provenance", exc)
+
+        sim_time_prov: float | str = str(self.ui.solver.sim_time_spinbox_text()).strip()
+        try:
+            sim_time_prov = float(self.ui.solver.parse_sim_time_seconds())
+        except Exception as exc:
+            self._record_nonfatal_exception("Failed to parse simulation time for provenance; keeping text value", exc)
+
+        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
+
+        solver_label = str(
+            completion.solver_config.get("solver_label") or self.ui.solver.initial_solver_name() or DEFAULT_SOLVER_NAME
+        ).strip() or DEFAULT_SOLVER_NAME
+        solver_method, solver_warning = normalize_solver_name(
+            str(completion.solver_config.get("solver") or solver_label)
+        )
+        overlay_snapshot = getattr(self.ui.results.main_plot(), "overlay_snapshot", None)
+        dataset_overlays = overlay_snapshot() if callable(overlay_snapshot) else None
+        self.ui.provenance.publish_simulation_completion_provenance(
+            mechanism_text=completion.mechanism_text,
+            solver_method=str(solver_method),
+            solver_label=str(solver_label),
+            solver_warning=(str(solver_warning) if solver_warning else None),
+            solver_config={
+                "rtol": completion.solver_config.get("rtol", self.ui.solver.initial_rtol() or 1e-6),
+                "atol": completion.solver_config.get("atol", self.ui.solver.initial_atol() or 1e-12),
+            },
+            temperature_K=float(temperature_used),
+            temperature_source=(
+                "dsl" if self.ui.solver.dsl_global_temperature_K(completion.mechanism_text) is not None else "ui"
+            ),
+            energy_unit=energy_unit_used,
+            energy_mode=bool(completion.energy_mode),
+            simulation_time=sim_time_prov,
+            num_points_requested=int(self.ui.solver.num_points_spinbox_value()),
+            species_names=list(completion.species_names),
+            t=completion.t,
+            series=completion.series,
+            algebra_scalars=completion.algebra_scalars,
+            dataset_overlays=dataset_overlays,
+        )
+
+    def _apply_completion_pending_init_guard(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        if state.policy_context is None:
+            return
+        pending_init_guard_rewrite = self._completion_policy.should_arm_pending_init_guard(
+            context=state.policy_context,
+            is_preview=bool(state.is_preview),
+            is_primary=bool(completion.is_primary),
+        )
+        if pending_init_guard_rewrite:
+            self.ui.mechanism_helpers.arm_pending_init_result_invalidation_guard(
+                rewrite=str(pending_init_guard_rewrite)
+            )
+
+    def _advance_completion_batch_success(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> bool:
+        completion_state = self._batch_context_owner.completion_state(
+            state.ctx if isinstance(state.ctx, Mapping) else None
+        )
+        if completion_state is None or not completion_state.active:
+            return True
+        total = max(1, int(completion_state.total or len(completion_state.queue_ids) or 1))
+        if state.stale_fast_handoff_after_display:
+            state.ctx = self._batch_context_owner.deactivate()
+            return True
+        if completion_state.parallel:
+            transition = self._batch_context_owner.record_parallel_success(
+                set_id=state.batch_set_id,
+                total=total,
+            )
+            state.ctx = transition.context
+            if transition.batch_done:
+                return True
+            self._publish_completion_batch_progress(
+                state.batch_set,
+                completed=int(transition.completed_count),
+                total=total,
+            )
+            return False
+
+        transition = self._batch_context_owner.record_serial_success(
+            set_id=state.batch_set_id,
+            shutdown_requested=state.shutdown_requested,
+        )
+        state.ctx = transition.context
+        if transition.batch_done:
+            self._apply_simulation_lifecycle_effects(
+                self._lifecycle_effect_owner.serial_batch_continue_effects()
+            )
+            return True
+        self._publish_completion_batch_progress(
+            state.batch_set,
+            completed=int(transition.completed_count),
+            total=total,
+        )
+        self._apply_simulation_lifecycle_effects(
+            self._lifecycle_effect_owner.serial_batch_continue_effects()
+        )
+        QtCore.QTimer.singleShot(0, self._start_next_batch_simulation)
+        return False
+
+    def _publish_completion_batch_progress(
+        self,
+        batch_set: object,
+        *,
+        completed: int,
+        total: int,
+    ) -> None:
+        progress_value = None
+        if total > 1:
+            progress_value = max(0, min(100, int((int(completed) / float(total)) * 100.0)))
+        self._apply_simulation_lifecycle_effects(
+            self._lifecycle_effect_owner.progress_update(
+                progress_value=progress_value,
+                status_text=f"Completed {batch_set} ({completed}/{total})" if batch_set else None,
+            )
+        )
+
+    def _finalize_completion_success(
+        self,
+        completion: _CompletionResultState,
+        state: _CompletionCallbackState,
+    ) -> None:
+        if (not state.is_preview) and isinstance(state.ctx, dict):
+            state.ctx = self._finalize_explicit_batch_dirty_reset(
+                state.ctx,
+                mechanism=completion.mechanism,
+                species_names=completion.species_names,
+            )
+        if state.slider_triggered or state.explicit_batch_coalescing:
+            self.flush_slider_plot_updates(
+                force=bool(state.explicit_batch_coalescing),
+                cache_key=state.cache_key,
+                request_id=state.request_id,
+                run_id=state.run_id,
+            )
+        summary = self._batch_context_owner.completion_summary(state.ctx) if isinstance(state.ctx, Mapping) else None
+        failed_set_ids = summary.failed_set_ids if summary is not None else ()
+        self._apply_simulation_lifecycle_effects(
+            self._lifecycle_effect_owner.completion_status_effect(
+                species_count=len(completion.species_names),
+                point_count=len(completion.t),
+                failed_set_ids=failed_set_ids,
+                is_preview=bool(state.is_preview),
+            )
+        )
+        if summary is not None and summary.failed_set_ids and not bool(state.is_preview):
+            self._show_scoped_batch_failure_summary(
+                failed_set_ids=summary.failed_set_ids,
+                failed_errors=summary.failed_errors,
+            )
+        logger.info(f"Displayed results: {len(completion.t)} time points")
+        logger.info("Captured simulation provenance and CTC metadata")
+
+    def _apply_completion_final_effects(self, state: _CompletionCallbackState) -> None:
+        has_deferred_preview_replay = self._has_deferred_preview_replay_intent()
+        if has_deferred_preview_replay:
+            logger.debug("Processing pending slider update after completion")
+        self._apply_simulation_lifecycle_effects(
+            self._lifecycle_effect_owner.successful_completion_final_effects(
+                cleanup_state=self._batch_context_owner.completion_cleanup_state(
+                    state.ctx if isinstance(state.ctx, Mapping) else None
+                ),
+                stale_fast_handoff_after_display=bool(state.stale_fast_handoff_after_display),
+                has_deferred_preview_replay=bool(has_deferred_preview_replay),
+                shutdown_requested=bool(state.shutdown_requested),
+            )
+        )
+
     def _on_simulation_complete(
         self,
         result: dict,
@@ -5828,99 +6527,27 @@ class SimulationController(QtCore.QObject):
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
     ):
-        active_run_id = int(getattr(self, "_active_run_id", 0))
-        shutdown_requested = bool(getattr(self, "_shutdown_requested_for_close", False))
-        stale_fast_handoff_after_display = False
-        if run_id is not None and int(run_id) != active_run_id:
-            logger.debug(
-                "Ignoring stale simulation completion (run_id=%s, active=%s)",
-                run_id,
-                active_run_id,
-            )
-            return
-        latest_request_id = int(getattr(self, "_latest_sim_request_id", 0))
-        ctx = None
-        if batch_set is None or batch_set_id is None:
-            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item()
-            if batch_set is None:
-                batch_set = hinted_set
-            if batch_set_id is None:
-                batch_set_id = hinted_set_id
-        if batch_set_id is None and isinstance(batch_set, str):
-            batch_set_id = self.ui.batch.batch_set_id_for_name(batch_set)
-        if self._active_batch_context_runtime_input_stale_for_set(
-            batch_set_id=batch_set_id,
-        ):
-            logger.debug(
-                "Ignoring stale simulation completion (batch_set_id=%s, current_global_epoch=%s)",
-                str(batch_set_id or ""),
-                int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0),
-            )
-            self._mark_stale_runtime_input_callback_consumed(batch_set_id=batch_set_id)
-            return
-        policy_context = self._batch_context_owner.completion_policy_context()
-        callback_owner_epoch = self._effective_preview_owner_epoch_for_callback(
-            owner_epoch=owner_epoch,
-            context=policy_context,
-        )
-        missing_owner_epoch = self._missing_preview_owner_epoch_for_current_fast_owner(
+        callback_decision = self._resolve_completion_callback_state(
+            run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
-            owner_epoch=callback_owner_epoch,
-            latest_request_id=latest_request_id,
+            owner_epoch=owner_epoch,
+            batch_set=batch_set,
+            batch_set_id=batch_set_id,
+            cache_key=cache_key,
         )
-        is_superseded_fast_request = bool(
-            fast_mode
-            and request_id is not None
-            and (
-                bool(missing_owner_epoch)
-                or (not self._preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
+        if callback_decision.stale_runtime_input_batch_set_id is not None:
+            self._mark_stale_runtime_input_callback_consumed(
+                batch_set_id=callback_decision.stale_runtime_input_batch_set_id
             )
-        )
-        if is_superseded_fast_request:
-            stale_fast_decision = self._completion_policy.resolve_superseded_fast_completion(
-                preview_ownership=self._completion_policy_preview_ownership(),
-                context=policy_context,
-                request_id=int(request_id),
-                preview_owner_epoch=callback_owner_epoch,
-                pending_replay=self._completion_policy_pending_replay_state(),
-                shutdown_requested=shutdown_requested,
-            )
-            logger.debug(
-                "Active fast completion superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, display_current_preview=%s, handoff_after_display=%s)",
-                request_id,
-                latest_request_id,
-                run_id,
-                bool(stale_fast_decision.schedule_pending_preview_run),
-                bool(stale_fast_decision.display_current_preview),
-                bool(stale_fast_decision.defer_context_deactivation_until_after_display),
-            )
-
-            if stale_fast_decision.display_current_preview:
-                self._apply_completion_policy_state_patch(stale_fast_decision.state_patch)
-                if stale_fast_decision.defer_context_deactivation_until_after_display:
-                    stale_fast_handoff_after_display = True
-            else:
-                updated_policy_context = self._apply_completion_policy_state_patch(
-                    stale_fast_decision.state_patch,
-                )
-                if stale_fast_decision.deactivate_context_immediately:
-                    policy_context = updated_policy_context
-
-                self._apply_simulation_lifecycle_effects(
-                    self._lifecycle_effect_owner.superseded_fast_completion_effects(
-                        deactivate_context_immediately=bool(stale_fast_decision.deactivate_context_immediately),
-                        schedule_pending_preview_run=bool(stale_fast_decision.schedule_pending_preview_run),
-                        reset_status_progress=bool(stale_fast_decision.reset_status_progress),
-                        display_current_preview=bool(stale_fast_decision.display_current_preview),
-                        cleanup_state=self._batch_context_owner.completion_cleanup_state(ctx),
-                    )
-                )
-                return
-
-        is_preview = bool(fast_mode)
-        slider_triggered = bool(self.ui.slider.slider_triggered_simulation()) or bool(fast_mode)
-        batch_queue_done = True
+        if callback_decision.state_patch is not None:
+            self._apply_completion_policy_state_patch(callback_decision.state_patch)
+        if callback_decision.lifecycle_effects is not None:
+            self._apply_simulation_lifecycle_effects(callback_decision.lifecycle_effects)
+            return
+        state = callback_decision.state
+        if state is None:
+            return
         try:
             logger.info("Simulation completed successfully")
             if bool(getattr(self, "_debug_batch_parallel", False)):
@@ -5929,466 +6556,33 @@ class SimulationController(QtCore.QObject):
                     int(run_id or 0),
                     int(request_id or 0),
                     str(batch_set_id or ""),
-                    bool(slider_triggered),
+                    bool(state.slider_triggered),
                     float(perf_counter()),
                 )
-
-            t = result["t"]
-            Y = result["Y"]
-            species_names = result["species_names"]
-            algebra_scalars = result.get("algebra_scalars") or {}
-            algebra_errors = result.get("algebra_errors") or []
-            solver_provenance = result.get("provenance") if isinstance(result.get("provenance"), Mapping) else {}
-            mechanism = result.get("mechanism")
-            base_species_count = None
-            raw_base_species_count = result.get("base_species_count")
-            try:
-                if raw_base_species_count is not None:
-                    base_species_count = max(0, int(raw_base_species_count))
-            except Exception:
-                base_species_count = None
-            if base_species_count is None and mechanism is not None:
-                try:
-                    base_species_count = len(list(mechanism.species_names()))
-                except Exception:
-                    base_species_count = None
-            mechanism_text = result.get("mechanism_text", self.ui.mechanism.get_mechanism_text())
-            solver_config = result.get("solver_config", {})
-
-            explicit_batch_coalescing = self._batch_context_owner.explicit_batch_coalescing_for_completion(
-                slider_triggered=bool(slider_triggered),
-                context=ctx,
-            )
-            if cache_key is None:
-                cache_key = self._batch_context_owner.completion_cache_key(ctx)
-            if cache_key is None:
-                if is_preview:
-                    cache_key = self._batch_cache.active_preview_cache_key
-                else:
-                    cache_key = self._batch_cache.active_cache_key
-            cache_key = str(cache_key) if cache_key else None
-            if cache_key:
-                if is_preview:
-                    preview_scope_ids = (
-                        policy_context.preview_scope_set_ids
-                        if policy_context is not None and policy_context.preview_scope_set_ids
-                        else None
-                    )
-                    self._cache_admin.publish_completion_cache_truth(
-                        is_preview=True,
-                        cache_key=cache_key,
-                        preview_scope_set_ids=preview_scope_ids,
-                    )
-                else:
-                    cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
-                        context=policy_context or self._batch_context_owner.completion_policy_context(ctx),
-                        cache_state=self._completion_policy_cache_state(),
-                        cache_key=cache_key,
-                    )
-                    self._cache_admin.publish_completion_cache_truth(
-                        is_preview=False,
-                        cache_key=cache_key,
-                        clear_active_selection_state=cache_reconciliation.clear_active_selection_state,
-                        active_cache_key=cache_reconciliation.active_cache_key,
-                        active_cache_preview_token=cache_reconciliation.active_cache_preview_token,
-                        active_cache_preview_scope_set_ids=cache_reconciliation.active_cache_preview_scope_set_ids,
-                        active_cache_valid_set_ids=cache_reconciliation.active_cache_valid_set_ids,
-                        active_cache_invalidated_set_ids=cache_reconciliation.active_cache_invalidated_set_ids,
-                    )
-
-            cache_reconciliation = None
-            redraw_valid_set_ids = None
-            has_redraw_subset = False
-            if not is_preview and policy_context is not None:
-                cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
-                    context=policy_context,
-                    cache_state=self._completion_policy_cache_state(),
-                    cache_key=cache_key,
-                )
-                redraw_valid_set_ids = cache_reconciliation.redraw_valid_set_ids
-                has_redraw_subset = bool(cache_reconciliation.has_redraw_subset)
-
-            if batch_set is None or batch_set_id is None:
-                hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(ctx)
-                if batch_set is None:
-                    batch_set = hinted_set
-                if batch_set_id is None:
-                    batch_set_id = hinted_set_id
-            if batch_set_id is None and isinstance(batch_set, str):
-                batch_set_id = self.ui.batch.batch_set_id_for_name(batch_set)
-            if batch_set is None and isinstance(batch_set_id, str):
-                batch_set = self.ui.batch.batch_set_name_for_id(batch_set_id)
-            try:
-                cache_plan_for_completion = _simulation_plan(
-                    self._batch_context_owner.simulation_plan_payload_for_set(batch_set_id, ctx)
-                )
-            except (TypeError, ValueError) as exc:
-                logger.debug("Ignoring invalid simulation plan payload for cache identity: %s", exc, exc_info=True)
-                cache_plan_for_completion = None
-
-            primary_set = self._batch_context_owner.primary_set_id(ctx)
-            is_primary = True
-            if primary_set:
-                is_primary = bool(batch_set_id is not None and str(batch_set_id) == str(primary_set))
-
-            mechanism = self._resolve_completion_mechanism(
-                mechanism=mechanism,
-                mechanism_text=str(mechanism_text),
-                solver_config=solver_config,
-                is_preview=bool(is_preview),
-                is_primary=bool(is_primary),
-            )
-            energy_mode = self._update_primary_result_materialization_contract(
-                mechanism=mechanism,
-                mechanism_text=str(mechanism_text),
-                solver_config=solver_config,
-                is_preview=bool(is_preview),
-                is_primary=bool(is_primary),
-            )
-
-            fallback_occurred = bool(result.get("fallback_occurred"))
-            fallback_message = result.get("fallback_message")
-            if (not is_preview) and is_primary and fallback_occurred:
-                solver_name = solver_config.get("solver", "selected solver")
-                warning_text = f"The requested stiff solver {solver_name} failed"
-                if fallback_message:
-                    warning_text += f" ({fallback_message})."
-                else:
-                    warning_text += "."
-                warning_text += " The simulation retried with an alternative stiff SciPy solver."
-                logger.warning("Displaying solver fallback warning: %s", warning_text)
-                self.ui.dialogs.message_box_warning("Solver fallback", warning_text)
-
-            if (not is_preview) and is_primary and mechanism is not None:
-                self._remember_primary_result_mechanism(
-                    mechanism=mechanism,
-                    mechanism_text=str(mechanism_text),
-                    solver_config=solver_config,
-                )
-                if policy_context is not None and cache_key:
-                    policy_context = self._completion_policy.build_context_update_from_cache_truth(
-                        context=policy_context,
-                        cache_state=self._completion_policy_cache_state(),
-                        cache_key=cache_key,
-                    )
-                    ctx = self._batch_context_owner.serialize_completion_policy_context(
-                        policy_context,
-                        base_context=ctx if isinstance(ctx, Mapping) else None,
-                    )
-
-            series: Dict[str, Any] = {}
-            for i, species_name in enumerate(species_names):
-                series[species_name] = Y[i, :]
-
-            self._apply_simulation_lifecycle_effects(
-                self._lifecycle_effect_owner.algebra_status_effect(
-                    species_names=species_names,
-                    base_species_count=base_species_count,
-                    algebra_errors=algebra_errors,
-                )
-            )
-
-            cache_plan = cache_plan_for_completion
-            cache_token = (cache_plan.cache_key() if cache_plan is not None else "") or str(cache_key or "")
-            if cache_token and batch_set_id:
-                cached_mechanism = (
-                    mechanism
-                    if self._include_mechanism_in_result_payload(
-                        fast_mode=bool(is_preview),
-                        batch_set_id=batch_set_id,
-                        context=ctx,
-                    )
-                    else None
-                )
-                cache_simulation_identity = (
-                    cache_plan.simulation_identity_payload() if cache_plan is not None else {}
-                )
-                if not cache_simulation_identity:
-                    cache_simulation_identity = self._batch_context_owner.simulation_identity_for_set(
-                        str(batch_set_id),
-                        ctx,
-                    )
-                cache_preview_token = None
-                if bool(is_preview):
-                    cache_preview_token = (
-                        cache_plan.preview_batch_cache_token() if cache_plan is not None else ""
-                    ) or self._batch_context_owner.preview_batch_cache_token_for_set(batch_set_id, ctx)
-                self._cache_admin.publish_completion_cache(
-                    cache_key=cache_token,
-                    cache_token=cache_token,
-                    set_id=str(batch_set_id),
-                    is_preview=bool(is_preview),
-                    t=t,
-                    series=series,
-                    algebra_scalars=(algebra_scalars if isinstance(algebra_scalars, dict) else None),
-                    mechanism=cached_mechanism,
-                    mechanism_text=str(mechanism_text),
-                    simulation_identity=cache_simulation_identity,
-                    solver_config=(solver_config if isinstance(solver_config, dict) else None),
-                    preview_batch_cache_token=cache_preview_token,
-                    fallback_occurred=bool(fallback_occurred),
-                    fallback_message=fallback_message,
-                    solver_provenance=(solver_provenance if isinstance(solver_provenance, Mapping) else None),
-                )
-
-            if policy_context is not None:
-                pending_init_completion = self._completion_policy.resolve_pending_init_completion(
-                    context=policy_context,
-                    batch_set=batch_set,
-                    is_preview=bool(is_preview),
-                    is_primary=bool(is_primary),
-                )
-                if pending_init_completion.should_attempt_apply:
-                    applied = False
-                    try:
-                        applied = bool(
-                            self.ui.mechanism_helpers.apply_pending_init_migration(
-                                seed_sets={str(batch_set): dict(pending_init_completion.seed_for_ui)},
-                                rewrite=str(pending_init_completion.rewrite or ""),
-                            )
-                        )
-                    except Exception:
-                        applied = False
-                    if applied:
-                        policy_context = self._completion_policy.note_pending_init_apply_result(
-                            context=policy_context,
-                            applied=True,
-                        )
-                        ctx = self._batch_context_owner.serialize_completion_policy_context(
-                            policy_context,
-                            base_context=ctx if isinstance(ctx, Mapping) else None,
-                        )
-
-            displayed = False
-            if cache_key and (slider_triggered or explicit_batch_coalescing):
-                self.queue_slider_plot_update(
-                    set_id=batch_set_id,
-                    cache_key=str(cache_key),
-                    request_id=request_id,
-                    run_id=run_id,
-                    slider_triggered=bool(slider_triggered),
-                    valid_set_ids=(
-                        redraw_valid_set_ids
-                        if (explicit_batch_coalescing and has_redraw_subset)
-                        else None
-                    ),
-                    allow_fallback=(not bool(explicit_batch_coalescing)),
-                )
-                displayed = True
-            if not displayed:
-                owned_species = None
-                if mechanism is not None:
-                    try:
-                        owned_species = list(mechanism.species_names())
-                    except Exception:
-                        owned_species = None
-                selected_sets = self.ui.batch.batch_set_ids_for_scope("selected")
-                prefer = None
-                current_row = self.ui.batch.batch_current_row()
-                if current_row is not None:
-                    prefer = self.ui.batch.batch_set_id_for_row(int(current_row))
-                displayed = self.ui.results.publish_simulation_completion_result(
-                    t=t,
-                    series=series,
-                    cache_key=cache_key,
-                    batch_set=batch_set,
-                    batch_set_id=batch_set_id,
-                    selected_sets=selected_sets,
-                    prefer_set=prefer,
-                    redraw_valid_set_ids=redraw_valid_set_ids,
-                    has_redraw_subset=has_redraw_subset,
-                    slider_triggered=bool(slider_triggered),
-                    explicit_batch_coalescing=bool(explicit_batch_coalescing),
-                    algebra_scalars=(algebra_scalars if isinstance(algebra_scalars, Mapping) else None),
-                    owned_species=owned_species,
-                )
-
-            try:
-                self.ui.results.publish_completion_intervention_annotations(solver_provenance)
-            except Exception as exc:
-                self._record_nonfatal_exception("Failed to update intervention plot annotations", exc)
-
-            if policy_context is not None:
-                pending_init_guard_rewrite = self._completion_policy.should_arm_pending_init_guard(
-                    context=policy_context,
-                    is_preview=bool(is_preview),
-                    is_primary=bool(is_primary),
-                )
-                if pending_init_guard_rewrite:
-                    self.ui.mechanism_helpers.arm_pending_init_result_invalidation_guard(
-                        rewrite=str(pending_init_guard_rewrite)
-                    )
-
+            self._resolve_completion_batch_identity(state)
+            result_for_completion = dict(result)
+            result_for_completion.setdefault("mechanism_text", self.ui.mechanism.get_mechanism_text())
+            completion = self._build_completion_result_state(result_for_completion)
+            self._resolve_completion_cache_key(state)
+            self._resolve_completion_result_ownership(completion, state)
+            self._apply_completion_materialization_contract(completion, state)
+            self._publish_completion_primary_materialization(completion, state)
+            self._apply_completion_algebra_status(completion)
+            self._publish_completion_cache_truth(state)
+            self._publish_completion_cache_entry(completion, state)
+            self._apply_completion_pending_init(completion, state)
+            self._publish_completion_display(completion, state)
+            self._publish_completion_annotations_and_provenance(completion)
+            self._apply_completion_pending_init_guard(completion, state)
             self._refresh_primary_result_controls(
-                mechanism=mechanism,
-                energy_mode=bool(energy_mode),
-                slider_triggered=bool(slider_triggered),
-                is_primary=bool(is_primary),
+                mechanism=completion.mechanism,
+                energy_mode=bool(completion.energy_mode),
+                slider_triggered=bool(state.slider_triggered),
+                is_primary=bool(completion.is_primary),
             )
-
-            if is_primary:
-                temperature_used = float(self.ui.solver.temperature_spinbox_value())
-                energy_unit_used = None
-                if mechanism is not None:
-                    try:
-                        mmeta = getattr(mechanism, "metadata", {}) or {}
-                        if isinstance(mmeta, dict) and mmeta.get("temperature_K") is not None:
-                            temperature_used = float(mmeta.get("temperature_K"))
-                        if isinstance(mmeta, dict) and mmeta.get("energy_unit"):
-                            energy_unit_used = str(mmeta.get("energy_unit"))
-                    except Exception as exc:
-                        self._record_nonfatal_exception(
-                            "Failed to read mechanism metadata for simulation provenance",
-                            exc,
-                        )
-
-                sim_time_prov: float | str
-                sim_time_prov = str(self.ui.solver.sim_time_spinbox_text()).strip()
-                try:
-                    sim_time_prov = float(self.ui.solver.parse_sim_time_seconds())
-                except Exception as exc:
-                    self._record_nonfatal_exception(
-                        "Failed to parse simulation time for provenance; keeping text value",
-                        exc,
-                    )
-
-                from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
-
-                solver_label = str(
-                    solver_config.get("solver_label") or self.ui.solver.initial_solver_name() or DEFAULT_SOLVER_NAME
-                ).strip() or DEFAULT_SOLVER_NAME
-                solver_method, solver_warning = normalize_solver_name(str(solver_config.get("solver") or solver_label))
-
-                overlay_snapshot = getattr(self.ui.results.main_plot(), "overlay_snapshot", None)
-                dataset_overlays = None
-                if callable(overlay_snapshot):
-                    dataset_overlays = overlay_snapshot()
-                self.ui.provenance.publish_simulation_completion_provenance(
-                    mechanism_text=str(mechanism_text),
-                    solver_method=str(solver_method),
-                    solver_label=str(solver_label),
-                    solver_warning=(str(solver_warning) if solver_warning else None),
-                    solver_config={
-                        "rtol": solver_config.get("rtol", self.ui.solver.initial_rtol() or 1e-6),
-                        "atol": solver_config.get("atol", self.ui.solver.initial_atol() or 1e-12),
-                    },
-                    temperature_K=float(temperature_used),
-                    temperature_source=(
-                        "dsl"
-                        if self.ui.solver.dsl_global_temperature_K(mechanism_text) is not None
-                        else "ui"
-                    ),
-                    energy_unit=energy_unit_used,
-                    energy_mode=bool(energy_mode),
-                    simulation_time=sim_time_prov,
-                    num_points_requested=int(self.ui.solver.num_points_spinbox_value()),
-                    species_names=list(species_names),
-                    t=t,
-                    series=series,
-                    algebra_scalars=(algebra_scalars if isinstance(algebra_scalars, Mapping) else None),
-                    dataset_overlays=dataset_overlays,
-                )
-
-            completion_state = self._batch_context_owner.completion_state(
-                ctx if isinstance(ctx, Mapping) else None
-            )
-            if completion_state is not None and completion_state.active:
-                total = max(1, int(completion_state.total or len(completion_state.queue_ids) or 1))
-
-                if stale_fast_handoff_after_display:
-                    ctx = self._batch_context_owner.deactivate()
-                    batch_queue_done = True
-                elif completion_state.parallel:
-                    transition = self._batch_context_owner.record_parallel_success(
-                        set_id=batch_set_id,
-                        total=total,
-                    )
-                    ctx = transition.context
-                    completed = int(transition.completed_count)
-                    if not transition.batch_done:
-                        batch_queue_done = False
-                        progress_value = None
-                        if total > 1:
-                            overall = int((completed / float(total)) * 100.0)
-                            progress_value = max(0, min(100, overall))
-                        self._apply_simulation_lifecycle_effects(
-                            self._lifecycle_effect_owner.progress_update(
-                                progress_value=progress_value,
-                                status_text=(
-                                    f"Completed {batch_set} ({completed}/{total})"
-                                    if batch_set
-                                    else None
-                                ),
-                            )
-                        )
-                    else:
-                        batch_queue_done = True
-                else:
-                    transition = self._batch_context_owner.record_serial_success(
-                        set_id=batch_set_id,
-                        shutdown_requested=shutdown_requested,
-                    )
-                    ctx = transition.context
-                    next_pos = int(transition.completed_count)
-                    if not transition.batch_done:
-                        batch_queue_done = False
-                        progress_value = None
-                        if total > 1:
-                            overall = int((next_pos / float(total)) * 100.0)
-                            progress_value = max(0, min(100, overall))
-                        self._apply_simulation_lifecycle_effects(
-                            self._lifecycle_effect_owner.progress_update(
-                                progress_value=progress_value,
-                                status_text=(
-                                    f"Completed {batch_set} ({next_pos}/{total})"
-                                    if batch_set
-                                    else None
-                                ),
-                            )
-                        )
-                        self._apply_simulation_lifecycle_effects(
-                            self._lifecycle_effect_owner.serial_batch_continue_effects()
-                        )
-                        QtCore.QTimer.singleShot(0, self._start_next_batch_simulation)
-                    else:
-                        self._apply_simulation_lifecycle_effects(
-                            self._lifecycle_effect_owner.serial_batch_continue_effects()
-                        )
-                        batch_queue_done = True
-
-            if batch_queue_done:
-                if (not is_preview) and isinstance(ctx, dict):
-                    ctx = self._finalize_explicit_batch_dirty_reset(
-                        ctx,
-                        mechanism=mechanism,
-                        species_names=species_names,
-                    )
-                if slider_triggered or explicit_batch_coalescing:
-                    self.flush_slider_plot_updates(
-                        force=bool(explicit_batch_coalescing),
-                        cache_key=cache_key,
-                        request_id=request_id,
-                        run_id=run_id,
-                    )
-                summary = self._batch_context_owner.completion_summary(ctx) if isinstance(ctx, Mapping) else None
-
-                failed_set_ids = summary.failed_set_ids if summary is not None else ()
-                self._apply_simulation_lifecycle_effects(
-                    self._lifecycle_effect_owner.completion_status_effect(
-                        species_count=len(species_names),
-                        point_count=len(t),
-                        failed_set_ids=failed_set_ids,
-                        is_preview=bool(is_preview),
-                    )
-                )
-                if summary is not None and summary.failed_set_ids and not bool(is_preview):
-                    self._show_scoped_batch_failure_summary(
-                        failed_set_ids=summary.failed_set_ids,
-                        failed_errors=summary.failed_errors,
-                    )
-
-                logger.info(f"Displayed results: {len(t)} time points")
-                logger.info("Captured simulation provenance and CTC metadata")
+            state.batch_queue_done = self._advance_completion_batch_success(completion, state)
+            if state.batch_queue_done:
+                self._finalize_completion_success(completion, state)
 
         except Exception as e:
             logger.error(f"Error displaying results: {e}", exc_info=True)
@@ -6400,21 +6594,8 @@ class SimulationController(QtCore.QObject):
                 self._lifecycle_effect_owner.progress_update(status_text="Display failed")
             )
         finally:
-            if batch_queue_done:
-                ctx_for_cleanup = locals().get("ctx", {}) or {}
-                has_deferred_preview_replay = self._has_deferred_preview_replay_intent()
-                if has_deferred_preview_replay:
-                    logger.debug("Processing pending slider update after completion")
-                self._apply_simulation_lifecycle_effects(
-                    self._lifecycle_effect_owner.successful_completion_final_effects(
-                        cleanup_state=self._batch_context_owner.completion_cleanup_state(
-                            ctx_for_cleanup if isinstance(ctx_for_cleanup, Mapping) else None
-                        ),
-                        stale_fast_handoff_after_display=bool(stale_fast_handoff_after_display),
-                        has_deferred_preview_replay=bool(has_deferred_preview_replay),
-                        shutdown_requested=bool(shutdown_requested),
-                    )
-                )
+            if state.batch_queue_done:
+                self._apply_completion_final_effects(state)
 
     def _on_simulation_error(
         self,

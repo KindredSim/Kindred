@@ -118,6 +118,48 @@ class SimulationOutput:
     fallback_message: Optional[str] = None
 
 
+def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
+    states: list[list[np.ndarray]] = [[] for _ in range(max(0, int(count)))]
+    if raw_states is None or count <= 0:
+        return states
+    if not isinstance(raw_states, Sequence):
+        return states
+    for idx in range(min(int(count), len(raw_states))):
+        raw = raw_states[idx]
+        arr = np.asarray(raw, dtype=float)
+        if arr.size == 0:
+            continue
+        if arr.ndim == 1:
+            if int(species_count) == 1:
+                arr = arr.reshape(-1, 1)
+            elif arr.size == int(species_count):
+                arr = arr.reshape(1, int(species_count))
+            else:
+                continue
+        elif arr.ndim != 2:
+            try:
+                arr = arr.reshape(-1, int(species_count))
+            except Exception:
+                continue
+        states[idx] = [np.asarray(row, dtype=float).reshape(-1) for row in arr]
+    return states
+
+
+def _attach_event_states(
+    output: SimulationOutput,
+    *,
+    raw_states: object,
+    count: int,
+    species_count: int,
+) -> SimulationOutput:
+    object.__setattr__(
+        output,
+        "_kindred_event_states",
+        _normal_event_states(raw_states, count=count, species_count=species_count),
+    )
+    return output
+
+
 def _scipy_method_for(name: object) -> Tuple[str, Optional[str]]:
     """Map solver name to SciPy method name with correct capitalization."""
     n = str(name or "").strip().upper()
@@ -467,13 +509,28 @@ def _execute_scipy(
     )
     if hasattr(sol, "t_events") and sol.t_events:
         prov["events"] = [list(te) for te in sol.t_events]
-    return SimulationOutput(
+    output = SimulationOutput(
         t=t_out,
         Y=Y_out,
         provenance=prov,
         fallback_occurred=fallback_occurred,
         fallback_message=fallback_message,
     )
+    return _attach_event_states(
+        output,
+        raw_states=getattr(sol, "y_events", None),
+        count=len(events_list or ()),
+        species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
+    )
+
+
+def _request_for_internal_segment(req: SimulationRequest, *, t0: float, t1: float) -> SimulationRequest:
+    if req.first_step is None:
+        return req
+    segment_span = abs(float(t1) - float(t0))
+    if float(req.first_step) <= segment_span:
+        return req
+    return replace(req, first_step=None)
 
 
 def _event_terminal_flags(
@@ -587,6 +644,22 @@ def _apply_instant_events(
     return out
 
 
+def _apply_fixed_interval_values(
+    y: np.ndarray,
+    intervals: Iterable[InterventionInterval],
+    *,
+    species_index: Mapping[str, int],
+) -> np.ndarray:
+    out = np.asarray(y, dtype=float).copy()
+    for interval in intervals:
+        if interval.kind not in {"reservoir", "clamp"}:
+            continue
+        fixed_idx = species_index.get(interval.species)
+        if fixed_idx is not None:
+            out[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
+    return out
+
+
 def _trigger_direction_value(direction: str) -> float:
     if direction == "rising":
         return 1.0
@@ -605,12 +678,59 @@ def _trigger_available(
 ) -> bool:
     if int(trigger_counts[trigger_index]) >= int(trigger.max_count):
         return False
+    ready_time = _trigger_next_eligible_time(
+        trigger,
+        trigger_index=trigger_index,
+        trigger_counts=trigger_counts,
+        trigger_last_times=trigger_last_times,
+    )
+    if ready_time is None:
+        return True
+    return float(segment_start) >= float(ready_time)
+
+
+def _trigger_next_eligible_time(
+    trigger: InterventionTriggerEvent,
+    *,
+    trigger_index: int,
+    trigger_counts: Sequence[int],
+    trigger_last_times: Sequence[float | None],
+) -> float | None:
+    if int(trigger_counts[trigger_index]) >= int(trigger.max_count):
+        return None
     last_time = trigger_last_times[trigger_index]
     if last_time is None:
-        return True
-    if float(segment_start) <= float(np.nextafter(float(last_time), np.inf)):
-        return False
-    return float(segment_start) - float(last_time) >= float(trigger.min_interval)
+        return None
+    min_ready = float(last_time) + max(0.0, float(trigger.min_interval))
+    just_after_last = float(np.nextafter(float(last_time), np.inf))
+    return max(min_ready, just_after_last)
+
+
+def _next_trigger_rearm_boundary(
+    triggers: Sequence[InterventionTriggerEvent],
+    *,
+    segment_start: float,
+    segment_end: float,
+    trigger_counts: Sequence[int],
+    trigger_last_times: Sequence[float | None],
+) -> float | None:
+    candidates: list[float] = []
+    start_value = float(segment_start)
+    end_value = float(segment_end)
+    for trigger_index, trigger in enumerate(triggers):
+        ready_time = _trigger_next_eligible_time(
+            trigger,
+            trigger_index=trigger_index,
+            trigger_counts=trigger_counts,
+            trigger_last_times=trigger_last_times,
+        )
+        if ready_time is None:
+            continue
+        if start_value < float(ready_time) < end_value:
+            candidates.append(float(ready_time))
+    if not candidates:
+        return None
+    return min(candidates)
 
 
 def _trigger_callables_for_segment(
@@ -672,6 +792,34 @@ def _trigger_hits_from_event_provenance(
     return float(trigger_time), trigger_indices
 
 
+def _trigger_state_from_event_states(
+    event_provenance: Sequence[Sequence[float]],
+    event_states: Sequence[Sequence[np.ndarray]],
+    *,
+    trigger_mapping: Sequence[int],
+    user_event_count: int,
+    trigger_time: float,
+    trigger_indices: Sequence[int],
+) -> np.ndarray | None:
+    trigger_set = {int(trigger_index) for trigger_index in trigger_indices}
+    lower = float(np.nextafter(float(trigger_time), -np.inf))
+    upper = float(np.nextafter(float(trigger_time), np.inf))
+    for offset, trigger_index in enumerate(trigger_mapping):
+        if int(trigger_index) not in trigger_set:
+            continue
+        event_idx = int(user_event_count) + int(offset)
+        if event_idx >= len(event_provenance) or event_idx >= len(event_states):
+            continue
+        states = event_states[event_idx]
+        for state_idx, raw_time in enumerate(event_provenance[event_idx]):
+            if not (lower <= float(raw_time) <= upper):
+                continue
+            if state_idx >= len(states):
+                continue
+            return np.asarray(states[state_idx], dtype=float).reshape(-1)
+    return None
+
+
 def _segment_eval_mask(t_eval: np.ndarray, *, seg_start: float, seg_end: float, is_final: bool) -> np.ndarray:
     start_floor = float(np.nextafter(float(seg_start), -np.inf))
     end_floor = float(np.nextafter(float(seg_end), -np.inf))
@@ -715,6 +863,30 @@ def _eval_times_include_boundary(t_eval: np.ndarray, boundary: float) -> bool:
     lower = float(np.nextafter(boundary_value, -np.inf))
     upper = float(np.nextafter(boundary_value, np.inf))
     return bool(np.any((values >= lower) & (values <= upper)))
+
+
+def _append_segment_output_samples(
+    outputs_t: list[np.ndarray],
+    outputs_y: list[np.ndarray],
+    *,
+    seg_t: np.ndarray,
+    seg_Y: np.ndarray,
+    count: int,
+) -> None:
+    actual_count = min(int(count), int(seg_t.size))
+    if actual_count <= 0:
+        return
+    emit_t = np.asarray(seg_t[:actual_count], dtype=float).reshape(-1)
+    emit_Y = np.asarray(seg_Y[:, :actual_count], dtype=float)
+    if outputs_t and outputs_t[-1].size and emit_t.size:
+        previous_t = float(outputs_t[-1][-1])
+        first_t = float(emit_t[0])
+        if float(np.nextafter(previous_t, -np.inf)) <= first_t <= float(np.nextafter(previous_t, np.inf)):
+            emit_t = emit_t[1:]
+            emit_Y = emit_Y[:, 1:]
+    if emit_t.size:
+        outputs_t.append(emit_t)
+        outputs_y.append(emit_Y)
 
 
 def _execute_with_intervention_schedule(
@@ -783,36 +955,45 @@ def _execute_with_intervention_schedule(
         is_final = idx == len(boundaries) - 2
         sub_start = seg_start
         while sub_start < seg_end:
+            sub_end = seg_end
+            rearm_boundary = _next_trigger_rearm_boundary(
+                trigger_events,
+                segment_start=sub_start,
+                segment_end=seg_end,
+                trigger_counts=trigger_counts,
+                trigger_last_times=trigger_last_times,
+            )
+            if rearm_boundary is not None:
+                sub_end = float(rearm_boundary)
+            is_sub_final = bool(is_final and float(sub_end) == float(seg_end))
             requested_mask = _segment_eval_mask(
                 t_eval,
                 seg_start=sub_start,
-                seg_end=seg_end,
-                is_final=is_final,
+                seg_end=sub_end,
+                is_final=is_sub_final,
             )
             requested_eval = _snap_eval_times_to_segment_boundaries(
                 t_eval[requested_mask],
                 seg_start=sub_start,
-                seg_end=seg_end,
+                seg_end=sub_end,
             )
             requested_eval = _deduplicate_snapped_eval_times(requested_eval)
-            if requested_eval.size and float(requested_eval[-1]) == float(seg_end):
+            if requested_eval.size and float(requested_eval[-1]) == float(sub_end):
                 internal_eval = requested_eval
                 requested_count = int(requested_eval.size)
             elif requested_eval.size:
-                internal_eval = np.concatenate([requested_eval, np.array([seg_end], dtype=float)])
+                internal_eval = np.concatenate([requested_eval, np.array([sub_end], dtype=float)])
                 requested_count = int(requested_eval.size)
             else:
-                internal_eval = np.array([seg_end], dtype=float)
+                internal_eval = np.array([sub_end], dtype=float)
                 requested_count = 0
             active_intervals = intervals_active_at(schedule, sub_start)
             if active_intervals:
-                current_y = np.asarray(current_y, dtype=float).copy()
-                for interval in active_intervals:
-                    if interval.kind not in {"reservoir", "clamp"}:
-                        continue
-                    fixed_idx = species_index.get(interval.species)
-                    if fixed_idx is not None:
-                        current_y[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
+                current_y = _apply_fixed_interval_values(
+                    current_y,
+                    active_intervals,
+                    species_index=species_index,
+                )
             seg_rhs = rhs
             seg_rhs_for_jac = rhs_for_jac
             if active_intervals:
@@ -831,7 +1012,15 @@ def _execute_with_intervention_schedule(
                 custom_jacobian_disabled = True
                 seg_req = replace(seg_req, jacobian_func=None)
             if trigger_callables:
-                seg_req = replace(seg_req, events=segment_events)
+                segment_terminal_flags = tuple(
+                    _event_terminal_flags(segment_req_base, events_tuple)
+                ) + tuple(True for _trigger in trigger_callables)
+                seg_req = replace(
+                    seg_req,
+                    events=segment_events,
+                    event_terminal=segment_terminal_flags,
+                )
+            seg_req = _request_for_internal_segment(seg_req, t0=sub_start, t1=sub_end)
             seg_prov: Dict[str, object] = dict(prov)
             seg_prov["intervention_segment_index"] = int(segment_count)
             seg_out = _execute_scipy(
@@ -839,7 +1028,7 @@ def _execute_with_intervention_schedule(
                 rhs=seg_rhs,
                 rhs_for_jac=seg_rhs_for_jac,
                 t0=sub_start,
-                t1=seg_end,
+                t1=sub_end,
                 y0=current_y,
                 t_eval=internal_eval,
                 prov=seg_prov,
@@ -855,6 +1044,13 @@ def _execute_with_intervention_schedule(
             if alternative:
                 segment_alternatives.append(str(alternative))
             seg_events_all = _normal_event_provenance(seg_out.provenance.get("events"), count=len(segment_events))
+            seg_event_states_all = getattr(seg_out, "_kindred_event_states", None)
+            if seg_event_states_all is None:
+                seg_event_states_all = _normal_event_states(
+                    None,
+                    count=len(segment_events),
+                    species_count=int(np.asarray(current_y, dtype=float).reshape(-1).size),
+                )
             seg_events = seg_events_all[: len(events_tuple)]
             if event_provenance:
                 for event_idx, values in enumerate(seg_events):
@@ -875,26 +1071,25 @@ def _execute_with_intervention_schedule(
                 seg_Y = _solver_trajectory_array(seg_Y, y0=current_y, t_out=seg_t)
             if seg_Y.shape[1]:
                 current_y = np.asarray(seg_Y[:, -1], dtype=float).reshape(-1)
-                for interval in active_intervals:
-                    if interval.kind not in {"reservoir", "clamp"}:
-                        continue
-                    fixed_idx = species_index.get(interval.species)
-                    if fixed_idx is not None:
-                        current_y[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
-            elif not terminal_stop:
+                current_y = _apply_fixed_interval_values(
+                    current_y,
+                    active_intervals,
+                    species_index=species_index,
+                )
+            elif not terminal_stop and trigger_hit is None:
                 raise create_solver_error(
                     req.solver,
                     sub_start,
                     "Scheduled simulation segment produced no state samples without a terminal event.",
                 )
             if requested_count:
-                actual_count = min(
-                    int(requested_count),
-                    int(seg_t.size),
+                _append_segment_output_samples(
+                    outputs_t,
+                    outputs_y,
+                    seg_t=seg_t,
+                    seg_Y=seg_Y,
+                    count=int(requested_count),
                 )
-                if actual_count:
-                    outputs_t.append(seg_t[:actual_count])
-                    outputs_y.append(seg_Y[:, :actual_count])
             if terminal_stop and seg_t.size:
                 terminal_time = float(seg_t[-1])
                 if _eval_times_include_boundary(t_eval, terminal_time):
@@ -905,10 +1100,34 @@ def _execute_with_intervention_schedule(
             if terminal_stop:
                 break
             if trigger_hit is None:
+                if rearm_boundary is not None and float(sub_end) < float(seg_end):
+                    sub_start = float(sub_end)
+                    continue
                 break
             trigger_time, trigger_indices = trigger_hit
+            trigger_state = _trigger_state_from_event_states(
+                seg_events_all,
+                seg_event_states_all,
+                trigger_mapping=trigger_mapping,
+                user_event_count=len(events_tuple),
+                trigger_time=trigger_time,
+                trigger_indices=trigger_indices,
+            )
+            if trigger_state is not None:
+                current_y = trigger_state
+            else:
+                raise create_solver_error(
+                    req.solver,
+                    trigger_time,
+                    "State-trigger event did not provide an event-time state for scheduled intervention resume.",
+                )
             trigger_instants = [trigger_events[trigger_index].to_instant_event(time=trigger_time) for trigger_index in trigger_indices]
             current_y = _apply_instant_events(current_y, trigger_instants, species_index=species_index)
+            current_y = _apply_fixed_interval_values(
+                current_y,
+                intervals_active_at(schedule, float(trigger_time)),
+                species_index=species_index,
+            )
             if outputs_t and outputs_t[-1].size and _eval_times_include_boundary(outputs_t[-1], trigger_time):
                 outputs_y[-1][:, -1] = current_y
             for trigger_index in trigger_indices:

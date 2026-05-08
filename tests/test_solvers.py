@@ -452,6 +452,313 @@ def test_solve_ode_scheduled_terminal_before_first_requested_sample_returns_empt
     assert out.provenance["intervention_segments"] == 1
 
 
+def test_solve_ode_state_trigger_resumes_from_event_state_between_requested_samples():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 1.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 1.0]))
+    assert out.provenance["intervention_trigger_events"] == [
+        {
+            "time": pytest.approx(0.5, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "add",
+        }
+    ]
+    assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_rearms_after_min_interval_inside_same_segment():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 2.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 2.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "set",
+                    "value": 0.0,
+                    "max_count": 2,
+                    "min_interval": 0.25,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    assert out.provenance["intervention_trigger_events"] == [
+        {
+            "time": pytest.approx(0.5, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "set",
+        },
+        {
+            "time": pytest.approx(1.0, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "set",
+        },
+    ]
+    np.testing.assert_allclose(out.t, np.array([0.0, 2.0]))
+    assert float(out.Y[0, -1]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_rearm_slice_drops_out_of_bounds_first_step():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 2.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        first_step=0.1,
+        t_eval=np.array([0.0, 2.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "set",
+                    "value": 0.0,
+                    "max_count": 2,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    assert out.provenance["intervention_trigger_events"] == [
+        {
+            "time": pytest.approx(0.5, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "set",
+        },
+        {
+            "time": pytest.approx(1.0, abs=1e-6),
+            "trigger_species": "A",
+            "species": "A",
+            "action": "set",
+        },
+    ]
+    np.testing.assert_allclose(out.t, np.array([0.0, 2.0]))
+    assert float(out.Y[0, -1]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_at_requested_sample_keeps_t_eval_grid_stable():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
+    assert float(out.Y[0, 1]) == pytest.approx(1.5, abs=1e-6)
+    assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_ignores_surplus_user_event_terminal_flags():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.75, 1.0]),
+        event_terminal=[False],
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.75, 1.0]))
+    assert float(out.Y[0, 1]) == pytest.approx(1.75, abs=1e-6)
+    assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_solve_ode_state_trigger_respects_active_clamp_interval_at_event_sample():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([0.0, 1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0, 0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0]),
+        species_names=("A", "B"),
+        intervention_schedule={
+            "intervals": [
+                {"kind": "clamp", "species": "A", "start": 0.0, "end": 1.0, "value": 0.0}
+            ],
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "B",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ],
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
+    np.testing.assert_allclose(out.Y[0], np.array([0.0, 0.0, 0.0]), atol=1e-7)
+    assert out.provenance["intervention_trigger_events"][0]["species"] == "A"
+
+
+def test_solve_ode_state_trigger_at_clamp_interval_end_is_not_reclamped():
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([0.0, 1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0, 0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 0.5, 1.0]),
+        species_names=("A", "B"),
+        intervention_schedule={
+            "intervals": [
+                {"kind": "clamp", "species": "A", "start": 0.0, "end": 0.5, "value": 0.0}
+            ],
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "B",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ],
+        },
+    )
+
+    out = solvers.solve_ode(request)
+
+    np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
+    assert float(out.Y[0, 1]) == pytest.approx(1.0, abs=1e-7)
+    assert float(out.Y[0, -1]) == pytest.approx(1.0, abs=1e-7)
+
+
+def test_solve_ode_state_trigger_requires_event_state_when_event_between_samples(monkeypatch):
+    def fake_solve_ivp(*, t_span, y0, **kwargs):
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        return types.SimpleNamespace(
+            success=True,
+            message="ok",
+            status=1,
+            t=t_eval[:1],
+            y=np.asarray(y0, float).reshape(-1, 1),
+            t_events=[np.array([0.5])],
+        )
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    request = solvers.SimulationRequest(
+        rhs=lambda _t, _y: np.array([1.0]),
+        t_span=(0.0, 1.0),
+        y0=np.array([0.0]),
+        solver="BDF",
+        t_eval=np.array([0.0, 1.0]),
+        species_names=("A",),
+        intervention_schedule={
+            "trigger_events": [
+                {
+                    "op": "trigger",
+                    "trigger_species": "A",
+                    "threshold": 0.5,
+                    "direction": "rising",
+                    "species": "A",
+                    "action": "add",
+                    "amount": 1.0,
+                    "max_count": 1,
+                    "min_interval": 0.0,
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(Exception, match="did not provide an event-time state"):
+        solvers.solve_ode(request)
+
+
 def test_solve_ode_exercises_implicit_alternatives_and_raises_after_exhaustion(monkeypatch):
     class DummySolution:
         def __init__(self):
