@@ -168,6 +168,69 @@ def test_serial_fitting_evaluator_runs_from_structured_context() -> None:
     assert np.asarray(result.species["A"], dtype=float).shape == (6,)
 
 
+def test_serial_fitting_evaluator_applies_parameterized_schedule_amount_per_candidate() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["dose"],
+        t_end=2.0,
+        num_points=3,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    low = evaluator({"dose": 1.0})
+    high = evaluator({"dose": 3.0})
+
+    assert float(np.asarray(low.species["A"], dtype=float)[-1]) == pytest.approx(2.0, abs=1e-6)
+    assert float(np.asarray(high.species["A"], dtype=float)[-1]) == pytest.approx(4.0, abs=1e-6)
+
+
+def test_serial_fitting_evaluator_applies_parameterized_state_trigger_per_candidate() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "reaction: C -> D; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "initial: C=0.0",
+            "initial: D=0.0",
+            "intervention: op=trigger; trigger_species=A; threshold=0.5; direction=falling; action=add; species=C; amount_param=trigger_dose; max_count=1; min_interval=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["trigger_dose"],
+        t_end=2.0,
+        num_points=9,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    low = evaluator({"trigger_dose": 1.0})
+    high = evaluator({"trigger_dose": 3.0})
+
+    assert float(np.asarray(low.species["C"], dtype=float)[-1]) == pytest.approx(1.0, abs=1e-6)
+    assert float(np.asarray(high.species["C"], dtype=float)[-1]) == pytest.approx(3.0, abs=1e-6)
+
+
 def test_serial_fitting_evaluator_preserves_runtime_param_precedence_over_fixed_params() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 

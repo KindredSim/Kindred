@@ -4,6 +4,7 @@ from typing import Any, Dict
 
 import numpy as np
 import pytest
+from tests.batch_context_test_helpers import seed_batch_context
 
 
 pytestmark = [pytest.mark.gui]
@@ -27,23 +28,12 @@ def test_explicit_parallel_completions_do_not_redraw_per_completion(main_window,
     main_window.simulation_controller.run_state.latest_sim_request_id = 501
     main_window.simulation_controller.run_state.active_run_id = 88
     main_window.simulation_controller.batch_cache.active_cache_key = "explicit-coalesce-key"
-    main_window.simulation_controller.batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 88,
-        "request_id": 501,
-        "fast_mode": False,
-        "cache_key": "explicit-coalesce-key",
-        "primary_set_id": "set1",
-        "total": 5,
-        "completed_set_ids": [],
-        "queue_ids": ["set1", "set2", "set3", "set4", "set5"],
-        "queue_names": ["set1", "set2", "set3", "set4", "set5"],
-    }
+    seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=True, run_id=88, request_id=501, fast_mode=False, cache_key="explicit-coalesce-key", primary_set_id="set1", total=5, completed_set_ids=[], queue_ids=["set1", "set2", "set3", "set4", "set5"], queue_names=["set1", "set2", "set3", "set4", "set5"])
 
-    monkeypatch.setattr(main_window, "_batch_set_ids_for_scope", lambda _scope: ["set1", "set2", "set3"], raising=False)
-    monkeypatch.setattr(main_window, "_batch_current_row", lambda: 0, raising=False)
-    monkeypatch.setattr(main_window, "_batch_set_id_for_row", lambda _row: "set1", raising=False)
+    batch_port = main_window.simulation_controller.ui.batch
+    monkeypatch.setattr(batch_port, "batch_set_ids_for_scope", lambda _scope: ["set1", "set2", "set3"], raising=True)
+    monkeypatch.setattr(batch_port, "batch_current_row", lambda: 0, raising=True)
+    monkeypatch.setattr(batch_port, "batch_set_id_for_row", lambda _row: "set1", raising=True)
 
     display_calls: list[Dict[str, Any]] = []
 
@@ -51,7 +41,7 @@ def test_explicit_parallel_completions_do_not_redraw_per_completion(main_window,
         display_calls.append(dict(kwargs))
         return True
 
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", _display, raising=False)
+    monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=2.0),
@@ -85,24 +75,13 @@ def test_explicit_coalesced_flush_batches_multiple_set_ids(main_window, monkeypa
     main_window.simulation_controller.run_state.latest_sim_request_id = 777
     main_window.simulation_controller.run_state.active_run_id = 303
     main_window.simulation_controller.batch_cache.active_cache_key = "explicit-batch-key"
-    main_window.simulation_controller.batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 303,
-        "request_id": 777,
-        "fast_mode": False,
-        "cache_key": "explicit-batch-key",
-        "primary_set_id": "set1",
-        "total": 6,
-        "completed_set_ids": [],
-        "queue_ids": ["set1", "set2", "set3", "set4", "set5", "set6"],
-        "queue_names": ["set1", "set2", "set3", "set4", "set5", "set6"],
-    }
+    seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=True, run_id=303, request_id=777, fast_mode=False, cache_key="explicit-batch-key", primary_set_id="set1", total=6, completed_set_ids=[], queue_ids=["set1", "set2", "set3", "set4", "set5", "set6"], queue_names=["set1", "set2", "set3", "set4", "set5", "set6"])
 
-    monkeypatch.setattr(main_window, "_batch_set_ids_for_scope", lambda _scope: ["set1", "set2", "set3", "set4"], raising=False)
-    monkeypatch.setattr(main_window, "_shown_batch_set_ids", lambda: ["set1", "set2", "set3", "set4"], raising=False)
-    monkeypatch.setattr(main_window, "_batch_current_row", lambda: 0, raising=False)
-    monkeypatch.setattr(main_window, "_batch_set_id_for_row", lambda _row: "set1", raising=False)
+    batch_port = main_window.simulation_controller.ui.batch
+    monkeypatch.setattr(batch_port, "batch_set_ids_for_scope", lambda _scope: ["set1", "set2", "set3", "set4"], raising=True)
+    monkeypatch.setattr(batch_port, "shown_batch_set_ids", lambda: ["set1", "set2", "set3", "set4"], raising=True)
+    monkeypatch.setattr(batch_port, "batch_current_row", lambda: 0, raising=True)
+    monkeypatch.setattr(batch_port, "batch_set_id_for_row", lambda _row: "set1", raising=True)
 
     display_calls: list[Dict[str, Any]] = []
 
@@ -110,7 +89,7 @@ def test_explicit_coalesced_flush_batches_multiple_set_ids(main_window, monkeypa
         display_calls.append(dict(kwargs))
         return True
 
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", _display, raising=False)
+    monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
 
     for sid in ("set2", "set3", "set4"):
         main_window.simulation_controller.on_simulation_complete(
@@ -137,23 +116,16 @@ def test_explicit_parallel_run_triggers_final_refresh_once(main_window, monkeypa
     main_window.simulation_controller.run_state.latest_sim_request_id = 909
     main_window.simulation_controller.run_state.active_run_id = 404
     main_window.simulation_controller.batch_cache.active_cache_key = "explicit-final-refresh-key"
-    main_window.simulation_controller.batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 404,
-        "request_id": 909,
-        "fast_mode": False,
-        "cache_key": "explicit-final-refresh-key",
-        "primary_set_id": "set9",
-        "total": 2,
-        "completed_set_ids": [],
-        "queue_ids": ["set1", "set2"],
-        "queue_names": ["set1", "set2"],
-    }
+    seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=True, run_id=404, request_id=909, fast_mode=False, cache_key="explicit-final-refresh-key", primary_set_id="set9", total=2, completed_set_ids=[], queue_ids=["set1", "set2"], queue_names=["set1", "set2"])
 
     # Force no pending coalesced keys so we can assert final forced refresh behavior.
     monkeypatch.setattr(main_window.simulation_controller, "queue_slider_plot_update", lambda **_kwargs: None, raising=True)
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", lambda **_kwargs: True, raising=False)
+    monkeypatch.setattr(
+        main_window.simulation_controller.ui.batch,
+        "display_cached_batch_selection",
+        lambda **_kwargs: True,
+        raising=True,
+    )
 
     flush_calls: list[Dict[str, Any]] = []
 
@@ -190,24 +162,12 @@ def test_explicit_parallel_final_flush_preserves_valid_subset_after_earlier_time
     main_window.simulation_controller.run_state.active_run_id = 405
     main_window.simulation_controller.batch_cache.active_cache_key = "explicit-final-subset-key"
     main_window.simulation_controller.batch_cache.active_cache_valid_set_ids = ("set2",)
-    main_window.simulation_controller.batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 405,
-        "request_id": 910,
-        "fast_mode": False,
-        "cache_key": "explicit-final-subset-key",
-        "primary_set_id": "set1",
-        "total": 2,
-        "completed_set_ids": [],
-        "queue_ids": ["set1", "set2"],
-        "queue_names": ["set1", "set2"],
-        "explicit_cache_valid_set_ids": ("set2",),
-    }
+    seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=True, run_id=405, request_id=910, fast_mode=False, cache_key="explicit-final-subset-key", primary_set_id="set1", total=2, completed_set_ids=[], queue_ids=["set1", "set2"], queue_names=["set1", "set2"], explicit_cache_valid_set_ids=("set2",))
 
-    monkeypatch.setattr(main_window, "_batch_set_ids_for_scope", lambda _scope: ["set1"], raising=False)
-    monkeypatch.setattr(main_window, "_batch_current_row", lambda: 0, raising=False)
-    monkeypatch.setattr(main_window, "_batch_set_id_for_row", lambda _row: "set1", raising=False)
+    batch_port = main_window.simulation_controller.ui.batch
+    monkeypatch.setattr(batch_port, "batch_set_ids_for_scope", lambda _scope: ["set1"], raising=True)
+    monkeypatch.setattr(batch_port, "batch_current_row", lambda: 0, raising=True)
+    monkeypatch.setattr(batch_port, "batch_set_id_for_row", lambda _row: "set1", raising=True)
 
     display_calls: list[Dict[str, Any]] = []
 
@@ -215,7 +175,7 @@ def test_explicit_parallel_final_flush_preserves_valid_subset_after_earlier_time
         display_calls.append(dict(kwargs))
         return False
 
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", _display, raising=False)
+    monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=2.0),

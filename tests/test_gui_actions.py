@@ -70,7 +70,7 @@ def test_run_simulation_uses_worker_stub(main_window: MainWindow, monkeypatch):
         "reaction: A -> B; k=0.5\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window.simulation_controller.run_simulation()
-    assert "species_names" in main_window._last_simulation_provenance
+    assert "species_names" in main_window._simulation_provenance_owner.last_simulation_provenance
     assert "Simulation complete" in main_window._status_label.text()
 
 

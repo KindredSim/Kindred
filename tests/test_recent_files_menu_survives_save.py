@@ -43,8 +43,8 @@ def test_save_project_recovers_if_recent_menu_was_deleted(tmp_path, monkeypatch,
 
     window = MainWindow()
     try:
-        window._settings.clear()
-        window._settings.sync()
+        window._settings_owner.qsettings.clear()
+        window._settings_owner.qsettings.sync()
 
         recent_menus = _recent_projects_menus(window)
         assert recent_menus, "Expected Recent Projects submenu to exist"
@@ -72,7 +72,7 @@ def test_save_project_recovers_if_recent_menu_was_deleted(tmp_path, monkeypatch,
         ]
         assert project_path.name in recent_action_titles
     finally:
-        window._settings.clear()
-        window._settings.sync()
+        window._settings_owner.qsettings.clear()
+        window._settings_owner.qsettings.sync()
         window.close()
         QtWidgets.QApplication.processEvents()

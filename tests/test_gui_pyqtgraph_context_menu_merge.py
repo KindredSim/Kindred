@@ -151,6 +151,101 @@ def test_clear_resets_simulation_metadata_to_init_values(qtbot):
     assert panel._simulation_set_popup_label is None
     assert panel._simulation_overlays == []
 
+
+@pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
+def test_intervention_interval_annotations_are_exportable_but_hidden_until_user_toggles(qtbot, monkeypatch):
+    panel = PyQtGraphPlotPanel()
+    qtbot.addWidget(panel)
+    panel.show()
+    QtWidgets.QApplication.processEvents()
+    menu_callbacks = []
+    annotation_menus = []
+
+    def _fake_exec(menu, *_args, **_kwargs):
+        menu_callbacks.pop(0)(menu)
+        return None
+
+    original_add_menu = QtWidgets.QMenu.addMenu
+
+    def _record_add_menu(menu, title, *args, **kwargs):
+        submenu = original_add_menu(menu, title, *args, **kwargs)
+        if title == "Annotations":
+            annotation_menus.append(submenu)
+        return submenu
+
+    monkeypatch.setattr(QtWidgets.QMenu, "addMenu", _record_add_menu)
+    monkeypatch.setattr(QtWidgets.QMenu, "exec_", _fake_exec)
+
+    panel.set_data(
+        np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float),
+        {"A": np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float)},
+        label="scheduled",
+    )
+    panel.set_intervention_annotations_from_provenance(
+        {
+            "intervention_schedule": {
+                "intervals": [
+                    {
+                        "kind": "source",
+                        "species": "A",
+                        "start": 1.0,
+                        "end": 3.0,
+                        "rate": 0.5,
+                    }
+                ]
+            }
+        }
+    )
+
+    payload = panel.export_payload()
+
+    assert payload["intervention_annotations"] == [
+        {
+            "start": 1.0,
+            "end": 3.0,
+            "kind": "source",
+            "label": "source A",
+        }
+    ]
+    assert panel._intervention_annotation_items == []
+
+    def _turn_annotations_on(_menu):
+        annotation_menu = annotation_menus.pop()
+        toggle_action = _find_action(annotation_menu.actions(), "Show Intervention Schedule Annotations")
+        assert toggle_action.isCheckable()
+        assert toggle_action.isChecked() is False
+        toggle_action.trigger()
+
+    menu_callbacks.append(_turn_annotations_on)
+    panel._show_context_menu(QtCore.QPoint(0, 0))
+    QtWidgets.QApplication.processEvents()
+
+    assert panel._intervention_annotation_items
+
+    def _turn_annotations_off(_menu):
+        annotation_menu = annotation_menus.pop()
+        toggle_action = _find_action(annotation_menu.actions(), "Show Intervention Schedule Annotations")
+        assert toggle_action.isChecked() is True
+        toggle_action.trigger()
+
+    menu_callbacks.append(_turn_annotations_off)
+    panel._show_context_menu(QtCore.QPoint(0, 0))
+    QtWidgets.QApplication.processEvents()
+
+    assert panel._intervention_annotation_items == []
+    assert panel.export_payload()["intervention_annotations"] == payload["intervention_annotations"]
+
+
+def test_fitting_grid_plot_does_not_expose_intervention_annotation_controls(qtbot):
+    from kindred.gui.widgets.grid_plot_view import GridPlotView
+
+    view = GridPlotView()
+    qtbot.addWidget(view)
+
+    assert not hasattr(view, "set_intervention_annotations_from_provenance")
+    assert not hasattr(view, "set_intervention_annotations_visible")
+
+
 @pytest.mark.skipif(not PYQTGRAPH_AVAILABLE, reason="PyQtGraph not available")
 def test_main_plot_context_menu_toggle_hides_and_restores_canonical_reference_lines(qtbot, monkeypatch):
     panel = PyQtGraphPlotPanel(enable_canonical_ghost_toggle_action=True)

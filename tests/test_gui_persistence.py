@@ -129,10 +129,10 @@ def test_profile_activation_updates_widgets(tmp_path, monkeypatch, qt_app):
         assert window._initial_solver == profile.solver_method
         assert f"Solver: {profile.solver_method}" in window._solver_summary_label.text()
 
-        stored = window._settings.value("profiles/active", "", type=str)
+        stored = window._settings_owner.qsettings.value("profiles/active", "", type=str)
         assert stored == "Fast"
     finally:
-        window._settings.clear()
+        window._settings_owner.qsettings.clear()
         window.close()
 
 

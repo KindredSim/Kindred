@@ -20,6 +20,7 @@ class BatchCacheEntryV1(TypedDict):
     preview_batch_cache_token: str
     fallback_occurred: bool
     fallback_message: Any
+    solver_provenance: Dict[str, Any]
 
 
 class PlotOverlayEntryV1(TypedDict):
@@ -70,6 +71,7 @@ def build_batch_cache_entry(
     preview_batch_cache_token: Optional[str] = None,
     fallback_occurred: bool = False,
     fallback_message: Any = None,
+    solver_provenance: Optional[Mapping[str, Any]] = None,
 ) -> BatchCacheEntryV1:
     scalars: Dict[str, float] = {}
     if isinstance(algebra_scalars, Mapping):
@@ -93,6 +95,7 @@ def build_batch_cache_entry(
         "preview_batch_cache_token": str(preview_batch_cache_token or ""),
         "fallback_occurred": bool(fallback_occurred),
         "fallback_message": fallback_message,
+        "solver_provenance": dict(solver_provenance or {}),
     }
 
 
@@ -117,6 +120,7 @@ def read_batch_cache_entry(payload: object) -> BatchCacheEntryReadResult:
             preview_batch_cache_token=cast(Optional[str], payload.get("preview_batch_cache_token")),
             fallback_occurred=bool(payload.get("fallback_occurred")),
             fallback_message=payload.get("fallback_message"),
+            solver_provenance=cast(Optional[Mapping[str, Any]], payload.get("solver_provenance")),
         )
     except Exception:
         return BatchCacheEntryReadResult("invalid")

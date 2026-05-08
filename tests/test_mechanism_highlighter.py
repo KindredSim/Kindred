@@ -65,7 +65,7 @@ def doc_and_hl(qt_app):
 
 @pytest.mark.parametrize("word", [
     "reaction", "equilibrium", "init", "initial",
-    "state", "edge", "temp_const", "temp_step", "temp_response",
+    "state", "edge", "temp_const", "temp_step", "temp_response", "intervention",
 ])
 def test_valid_keyword_highlighted(doc_and_hl, word):
     doc, hl = doc_and_hl

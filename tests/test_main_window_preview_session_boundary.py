@@ -1028,7 +1028,7 @@ def test_main_window_preview_session_species_scope_clear_rejects_queued_preview_
     monkeypatch.setattr(main_window, "_batch_current_row", lambda: 0)
     monkeypatch.setattr(main_window, "_batch_set_id_for_row", lambda row: set0_id)
     monkeypatch.setattr(
-        main_window,
+        main_window._simulation_batch_owner,
         "display_cached_batch_selection",
         lambda *args, **kwargs: display_calls.__setitem__("count", display_calls["count"] + 1) or True,
     )

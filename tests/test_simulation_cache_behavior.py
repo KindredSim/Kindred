@@ -8,9 +8,12 @@ import numpy as np
 import pytest
 from PySide6 import QtCore
 
+from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
+from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
+from tests.batch_context_test_helpers import seed_batch_context
 
 def _fake_sim_result(*, marker: float = 1.0) -> dict:
     t = np.asarray([0.0, 1.0], dtype=float)
@@ -26,6 +29,44 @@ def _fake_sim_result(*, marker: float = 1.0) -> dict:
         "fallback_occurred": False,
         "fallback_message": None,
     }
+
+
+def test_simulation_cache_admin_publishes_completion_cache_entry_and_preview_identity() -> None:
+    cache = BatchSimulationCache()
+    admin = SimulationCacheAdmin(
+        cache=cache,
+        settings_set_value=lambda *_args, **_kwargs: None,
+        settings_sync=lambda: None,
+        record_nonfatal_exception=lambda *_args, **_kwargs: None,
+    )
+    t = np.asarray([0.0, 1.0], dtype=float)
+    series = {"A": np.asarray([1.0, 0.5], dtype=float)}
+
+    result = admin.publish_completion_cache(
+        cache_key="preview-key",
+        cache_token="preview-token",
+        set_id="id1",
+        is_preview=True,
+        t=t,
+        series=series,
+        algebra_scalars={"S": 1.0},
+        mechanism=None,
+        mechanism_text="reaction: A -> B; k=1",
+        simulation_identity={"schema_id": "schema"},
+        solver_config={"solver": "BDF"},
+        preview_batch_cache_token="preview-token",
+        fallback_occurred=False,
+        fallback_message=None,
+        solver_provenance={"interventions": []},
+        preview_scope_set_ids=("id1",),
+    )
+
+    assert result.cache_token == "preview-token"
+    assert cache.active_preview_cache_key == "preview-key"
+    assert cache.active_preview_scope_set_ids == ("id1",)
+    payload = cache.entry_for_set(cache_key="preview-token", set_id="id1", is_preview=True).entry
+    assert isinstance(payload, dict)
+    np.testing.assert_allclose(np.asarray(payload["t"]), t)
 
 def _select_rows(main_window, rows: list[int]) -> None:
     from PySide6 import QtCore
@@ -89,16 +130,16 @@ def _assert_main_plot_matches(main_window, t, series: dict[str, np.ndarray]) -> 
 def _current_preview_solver_config(main_window) -> dict:
     from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 
-    solver_label = str(main_window._initial_solver or DEFAULT_SOLVER_NAME).strip()
+    solver_label = str(main_window._simulation_solver_owner.initial_solver_name() or DEFAULT_SOLVER_NAME).strip()
     solver_label = solver_label or DEFAULT_SOLVER_NAME
     solver_method, solver_warning = normalize_solver_name(solver_label)
-    n_points = int(main_window.num_points_spinbox_value())
-    points_override = main_window.mechanism_slider_points_value()
+    n_points = int(main_window._simulation_solver_owner.num_points_spinbox_value())
+    points_override = main_window._simulation_mechanism_owner.mechanism_slider_points_value()
     if points_override is not None:
         n_points = max(50, int(points_override))
     else:
         n_points = max(50, n_points)
-    solver_override = main_window.mechanism_slider_solver_value()
+    solver_override = main_window._simulation_mechanism_owner.mechanism_slider_solver_value()
     if solver_override is not None:
         solver_label = str(solver_override).strip() or solver_label
         solver_method, solver_warning = normalize_solver_name(solver_label)
@@ -115,12 +156,12 @@ def _current_preview_solver_config(main_window) -> dict:
         "solver": str(solver_method),
         "solver_label": str(solver_label),
         "solver_warning": str(solver_warning) if solver_warning else None,
-        "rtol": main_window._initial_rtol or 1e-6,
-        "atol": main_window._initial_atol or 1e-12,
+        "rtol": main_window._simulation_solver_owner.initial_rtol() or 1e-6,
+        "atol": main_window._simulation_solver_owner.initial_atol() or 1e-12,
         "grid": {"N": int(n_points)},
-        "temperature_K": float(main_window.temperature_spinbox_value()),
-        "use_sparse_jacobian": bool(main_window.use_sparse_jacobian()),
-        "wegscheider_cyclicity_enabled": bool(main_window.wegscheider_cyclicity_enabled()),
+        "temperature_K": float(main_window._simulation_solver_owner.temperature_spinbox_value()),
+        "use_sparse_jacobian": bool(main_window._simulation_solver_owner.use_sparse_jacobian()),
+        "wegscheider_cyclicity_enabled": bool(main_window._simulation_solver_owner.wegscheider_cyclicity_enabled()),
     }
 
 def _current_preview_time_axis(main_window) -> np.ndarray:
@@ -215,7 +256,7 @@ def _current_preview_identity_payload(
     set_id: str,
     preview_batch_cache_token: str | None = None,
 ) -> dict:
-    identity = main_window._current_workspace_preview_identity(set_id=str(set_id))
+    identity = main_window._simulation_batch_owner.current_workspace_preview_identity(set_id=str(set_id))
     payload = identity.to_payload()
     if preview_batch_cache_token is not None:
         assert str(payload.get("preview_batch_cache_token") or "") == str(preview_batch_cache_token or "")
@@ -239,7 +280,7 @@ def _workspace_preview_payload(
         "mechanism_text": (
             str(mechanism_text)
             if mechanism_text is not None
-            else main_window._mechanism_text_for_workspace_selection(set_id=str(set_id))
+            else main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=str(set_id))
         ),
         "solver_config": dict(solver_config or _current_preview_solver_config(main_window)),
         "preview_batch_cache_token": str(preview_batch_cache_token or ""),
@@ -543,7 +584,7 @@ def test_selection_change_stale_workspace_preview_surfaces_preview_pending_witho
     cache.active_cache_key = explicit_key
     main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
     main_window._preview_session.stage_slider_value("k1", 2.0)
-    stale_preview_mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=primary_id)
+    stale_preview_mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=primary_id)
     cache.active_preview_cache_key = preview_key
     main_window._preview_session.stage_slider_value("k1", 3.0)
     cache.preview_cache[f"{preview_key}::{primary_id}"]["mechanism_text"] = stale_preview_mechanism_text
@@ -764,7 +805,7 @@ def test_selection_change_reuses_current_workspace_preview_from_inactive_preview
 
     reusable_preview_key = "preview-current-context-selection-cache-key"
     active_preview_key = "preview-active-context-selection-cache-key"
-    preview_mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=primary_id)
+    preview_mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=primary_id)
     preview_t = _current_preview_time_axis(main_window)
     preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
     cache.preview_cache[f"{reusable_preview_key}::{primary_id}"] = {
@@ -837,7 +878,7 @@ def test_selection_change_reuses_current_workspace_preview_from_same_key_outside
         "t": preview_t,
         "series": preview_series,
         "algebra_scalars": {},
-        "mechanism_text": main_window._mechanism_text_for_workspace_selection(set_id=primary_id),
+        "mechanism_text": main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=primary_id),
         "solver_config": _current_preview_solver_config(main_window),
     }
     cache.active_preview_cache_key = preview_key
@@ -1026,8 +1067,8 @@ def test_selection_change_reuses_workspace_preview_with_slider_override_solver_a
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("selection change triggered run")),
         raising=True,
     )
-    monkeypatch.setattr(main_window, "mechanism_slider_points_value", lambda: 35, raising=True)
-    monkeypatch.setattr(main_window, "mechanism_slider_solver_value", lambda: "Radau", raising=True)
+    monkeypatch.setattr(main_window._simulation_mechanism_owner, "mechanism_slider_points_value", lambda: 35, raising=True)
+    monkeypatch.setattr(main_window._simulation_mechanism_owner, "mechanism_slider_solver_value", lambda: "Radau", raising=True)
 
     _select_rows(main_window, [0])
     qt_app.processEvents()
@@ -1097,7 +1138,7 @@ def test_selection_change_rejects_workspace_preview_with_wrong_solver_context(
         "t": _current_preview_time_axis(main_window),
         "series": {"A": np.linspace(9.0, 18.0, _current_preview_time_axis(main_window).size, dtype=float)},
         "algebra_scalars": {},
-        "mechanism_text": main_window._mechanism_text_for_workspace_selection(set_id=primary_id),
+        "mechanism_text": main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=primary_id),
         "solver_config": wrong_solver_config,
     }
     cache.active_preview_cache_key = "preview-other-active-context-selection-cache-key"
@@ -1908,7 +1949,7 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
     assert str(main_window.mechanism_reactions_text_raw() or "") == baseline_text
     assert str(main_window.simulation_schema_id() or "") == baseline_schema_id
 
-    preview_entry = main_window._matching_preview_entry_for_workspace_set(set_id=primary_id)
+    preview_entry = main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=primary_id)
     assert preview_entry.entry is not None
 
     main_window._refresh_batch_display_from_focus_and_shown()
@@ -2172,21 +2213,9 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
 
     main_window.simulation_controller.run_state.latest_sim_request_id = 21
     main_window.simulation_controller.run_state.active_run_id = 8
-    main_window.simulation_controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "run_id": 8,
-        "request_id": 21,
-        "fast_mode": False,
-        "cache_key": cache_key,
-        "queue_ids": [newer_id],
-        "queue_names": [
-            str(main_window.batch_set_name_for_id(newer_id) or newer_id),
-        ],
-        "primary_set_id": newer_id,
-        "total": 1,
-        "explicit_cache_valid_set_ids": (newer_id,),
-    }
+    seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=False, run_id=8, request_id=21, fast_mode=False, cache_key=cache_key, queue_ids=[newer_id], queue_names=[
+                str(main_window.batch_set_name_for_id(newer_id) or newer_id),
+            ], primary_set_id=newer_id, total=1, explicit_cache_valid_set_ids=(newer_id,))
 
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=2.0),

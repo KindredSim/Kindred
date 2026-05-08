@@ -20,7 +20,7 @@ def test_message_box_critical_without_details_uses_static_dialog(main_window, mo
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", _critical)
     monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _unexpected_exec)
 
-    main_window.message_box_critical("Simulation Error", "Simulation failed")
+    main_window._simulation_dialogs.message_box_critical("Simulation Error", "Simulation failed")
 
     assert calls == [(main_window, "Simulation Error", "Simulation failed")]
 
@@ -45,7 +45,7 @@ def test_message_box_critical_with_details_uses_detail_pane(main_window, monkeyp
     monkeypatch.setattr(QtWidgets.QMessageBox, "critical", _unexpected_critical)
     monkeypatch.setattr(QtWidgets.QMessageBox, "exec", _capture_exec)
 
-    main_window.message_box_critical(
+    main_window._simulation_dialogs.message_box_critical(
         "Simulation Error",
         "Simulation failed:\n\nsolver blew up",
         details="Traceback line 1\nTraceback line 2",

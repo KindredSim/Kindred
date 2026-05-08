@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -9,7 +9,7 @@ import numpy as np
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_simulation_cache import BatchSimulationCache
-from kindred.gui.controllers.cache_contracts import (
+from kindred.core.batch_cache_contracts import (
     BatchCacheEntryReadResult,
     BatchCacheEntryV1,
     build_overlay_entry,
@@ -105,6 +105,20 @@ class ResultsController(QtCore.QObject):
         except Exception as exc:
             logger.debug("Main plot unavailable through MainWindow seam: %s", exc, exc_info=True)
             return None
+
+    def main_plot(self) -> object:
+        return self._ui.main_plot()
+
+    def update_main_plot_parameter_summary(self, parameters: Dict[str, tuple[float, str]]) -> None:
+        plot = self._ui.main_plot()
+        if hasattr(plot, "update_parameters"):
+            plot.update_parameters(dict(parameters))
+
+    def set_results_table(self, table: object) -> None:
+        self._ui.set_results_table(table)
+
+    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None:
+        self._ui.sync_main_plot_copy_labels(primary_set_id, selected_set_ids)
 
     def _main_plot_snapshot(self, plot: object) -> MainPlotSnapshot:
         had_existing_data = False
@@ -555,6 +569,7 @@ class ResultsController(QtCore.QObject):
 
         plot = self._main_plot()
         if plot is not None:
+            self._apply_intervention_annotations(plot=plot, entry=entry)
             self._apply_cached_batch_plot_metadata(
                 plot=plot,
                 store=store,
@@ -632,6 +647,7 @@ class ResultsController(QtCore.QObject):
 
         plot = self._main_plot()
         if plot is not None:
+            self._apply_intervention_annotations(plot=plot, entry=primary.entry)
             self._apply_resolved_batch_plot_metadata(
                 plot=plot,
                 resolved_entries=list(resolved_entries),
@@ -648,6 +664,101 @@ class ResultsController(QtCore.QObject):
             [str(resolved.set_id) for resolved in resolved_entries],
         )
         return CachedBatchSelectionDisplayOutcome(True)
+
+    def publish_simulation_completion_result(
+        self,
+        *,
+        t: np.ndarray,
+        series: Dict[str, np.ndarray],
+        cache_key: str | None,
+        batch_set: str | None,
+        batch_set_id: str | None,
+        selected_sets: Sequence[str],
+        prefer_set: str | None,
+        redraw_valid_set_ids: Sequence[str] | None,
+        has_redraw_subset: bool,
+        slider_triggered: bool,
+        explicit_batch_coalescing: bool,
+        algebra_scalars: Mapping[str, object] | None,
+        owned_species: Sequence[str] | None = None,
+    ) -> bool:
+        displayed = False
+        normalized_cache_key = str(cache_key or "").strip()
+        if normalized_cache_key:
+            displayed = bool(
+                self.display_cached_batch_selection(
+                    cache_key=normalized_cache_key,
+                    selected_sets=selected_sets,
+                    prefer_set=prefer_set,
+                    cache_store=None,
+                    valid_set_ids=(redraw_valid_set_ids if bool(has_redraw_subset) else None),
+                    allow_fallback=False,
+                )
+            )
+        if displayed:
+            return True
+
+        set_id = str(batch_set_id or "").strip()
+        set_name = str(batch_set or "").strip()
+        if set_id:
+            self._ui.set_active_batch_selection(set_id, set_name, [set_id])
+        else:
+            setter = getattr(self._ui, "clear_display_selection_state", None)
+            if callable(setter):
+                setter()
+
+        self.set_data(
+            t,
+            series,
+            label=(set_name or None),
+            overlays=[],
+            owned_species=owned_species,
+        )
+        if set_id:
+            self._ui.sync_main_plot_copy_labels(set_id, [set_id])
+        else:
+            self._ui.sync_main_plot_copy_labels("", [])
+
+        plot = self._main_plot()
+        if plot is None:
+            return True
+        try:
+            self._ui.set_main_plot_scalar_values(dict(algebra_scalars or {}))
+        except Exception as exc:
+            logger.exception("Failed to set plot scalar values after simulation completion: %s", exc)
+
+        display_label = set_name or set_id or "Results"
+        try:
+            self._ui.update_main_plot_statistics(
+                stats_results_map={str(display_label): {"t": t, "series": series}},
+                prefer=str(display_label),
+                t=np.asarray(t, dtype=float),
+                series={str(k): np.asarray(v, dtype=float) for k, v in series.items()},
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to update plot statistics after simulation completion (label=%s): %s",
+                display_label,
+                exc,
+            )
+        try:
+            table_getter = getattr(plot, "stats_table", None)
+            table = table_getter() if callable(table_getter) else self._ui.main_plot_stats_table()
+            self._ui.set_results_table(table)
+        except Exception as exc:
+            logger.exception("Failed to update results table after simulation completion: %s", exc)
+        return True
+
+    def publish_completion_intervention_annotations(
+        self,
+        solver_provenance: Mapping[str, Any] | None,
+    ) -> None:
+        plot = self._main_plot()
+        if plot is None:
+            return
+        setter = getattr(plot, "set_intervention_annotations_from_provenance", None)
+        if callable(setter):
+            setter(solver_provenance if isinstance(solver_provenance, Mapping) else None)
 
     def set_data(
         self,
@@ -675,3 +786,10 @@ class ResultsController(QtCore.QObject):
         except Exception as exc:
             logger.warning("Failed to set data: %s", exc, exc_info=True)
             QtWidgets.QMessageBox.warning(self._ui.parent, "Error", f"Failed to set data: {exc}")
+
+    def _apply_intervention_annotations(self, *, plot: object, entry: Mapping[str, Any]) -> None:
+        setter = getattr(plot, "set_intervention_annotations_from_provenance", None)
+        if not callable(setter):
+            return
+        solver_provenance = entry.get("solver_provenance") if isinstance(entry, Mapping) else None
+        setter(solver_provenance if isinstance(solver_provenance, Mapping) else None)

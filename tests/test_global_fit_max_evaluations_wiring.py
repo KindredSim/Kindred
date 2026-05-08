@@ -31,7 +31,7 @@ def test_global_fit_window_default_max_evaluations_is_1000(qt_app):
     )
     try:
         assert window._params_ics_tab._max_eval_spin.value() == 1000
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
         assert config["max_nfev"] == 1000
     finally:
@@ -109,7 +109,7 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -121,9 +121,9 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
     )
     try:
         window._params_ics_tab._max_eval_spin.setValue(123)
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
         assert captured["max_nfev"] == 123
     finally:
         window.close()

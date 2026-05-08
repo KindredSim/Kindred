@@ -184,10 +184,10 @@ class ProjectController(QtCore.QObject):
                 "File Not Found",
                 f"File no longer exists:\n{filepath}",
             )
-            recent_files = self.mw._settings.value("recent_files", [])
+            recent_files = self.mw._settings_owner.qsettings.value("recent_files", [])
             if filepath in recent_files:
                 recent_files.remove(filepath)
-                self.mw._settings.setValue("recent_files", recent_files)
+                self.mw._settings_owner.qsettings.setValue("recent_files", recent_files)
                 self.mw.config_controller.update_recent_files_menu()
             return
 

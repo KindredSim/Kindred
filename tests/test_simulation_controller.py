@@ -25,6 +25,7 @@ from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.ports import SliderReplayIntent, SimulationUiPorts
 from kindred.gui.simulation_worker import SimulationWorker
 from tests.worker_stubs import make_stubborn_worker
+from tests.batch_context_test_helpers import seed_batch_context
 
 
 class _RecordingLanePool:
@@ -50,6 +51,12 @@ class _RecordingLanePool:
 
 def _join_active_batch_requests(controller: SimulationController) -> None:
     controller.parallel_batch.join_active_requests(timeout_s=2.0)
+
+
+def _batch_policy_context(controller: SimulationController):
+    policy_context = controller.batch_context_owner.completion_policy_context()
+    assert policy_context is not None
+    return policy_context
 
 
 def _install_ready_batch_lane_pool(
@@ -335,7 +342,7 @@ def test_unready_runtime_abort_does_not_persist_requested_run_disable(
     mw.set_run_button_enabled(False)
     mw._stop_btn.setEnabled(True)
     mw._sim_progress.setValue(47)
-    controller._batch_run_context = {"active": True}
+    seed_batch_context(controller.batch_context_owner, active=True)
 
     controller._abort_for_unready_interactive_runtime(
         fast_mode=False,
@@ -698,6 +705,70 @@ class _FakeMainWindow(QtCore.QObject):
             )
         )
 
+    def publish_simulation_completion_result(
+        self,
+        *,
+        t: object,
+        series: dict[str, object],
+        cache_key: Optional[str],
+        batch_set: Optional[str],
+        batch_set_id: Optional[str],
+        selected_sets: list[str],
+        prefer_set: Optional[str],
+        redraw_valid_set_ids: Optional[list[str] | tuple[str, ...]],
+        has_redraw_subset: bool,
+        slider_triggered: bool,
+        explicit_batch_coalescing: bool,
+        algebra_scalars: Optional[dict[str, object]],
+        owned_species: Optional[list[str]] = None,
+    ) -> bool:
+        displayed = False
+        if cache_key:
+            displayed = self.display_cached_batch_selection(
+                cache_key=str(cache_key),
+                selected_sets=list(selected_sets),
+                prefer_set=prefer_set,
+                cache_store=None,
+                valid_set_ids=(redraw_valid_set_ids if has_redraw_subset else None),
+                allow_fallback=False,
+            )
+        if displayed:
+            return True
+        if str(batch_set_id or "").strip():
+            self.set_active_batch_selection(str(batch_set_id), str(batch_set or ""), [str(batch_set_id)])
+        else:
+            self.clear_display_selection_state()
+        self.set_data(
+            t,
+            series,
+            label=(str(batch_set) if batch_set else None),
+            overlays=[],
+            owned_species=owned_species,
+        )
+        self.sync_main_plot_copy_labels(
+            str(batch_set_id or ""),
+            [str(batch_set_id)] if str(batch_set_id or "").strip() else [],
+        )
+        plot = self.main_plot()
+        if hasattr(plot, "set_scalar_values"):
+            plot.set_scalar_values(dict(algebra_scalars or {}))
+        display_label = str(batch_set) if batch_set else (str(batch_set_id) if batch_set_id else "Results")
+        if hasattr(plot, "set_statistics_results"):
+            plot.set_statistics_results({display_label: {"t": t, "series": series}}, prefer=display_label)
+        elif hasattr(plot, "update_statistics"):
+            plot.update_statistics(t, series)
+        self.set_results_table(plot.stats_table())
+        return True
+
+    def publish_completion_intervention_annotations(
+        self,
+        solver_provenance: Optional[dict[str, Any]],
+    ) -> None:
+        plot = self.main_plot()
+        setter = getattr(plot, "set_intervention_annotations_from_provenance", None)
+        if callable(setter):
+            setter(solver_provenance if isinstance(solver_provenance, dict) else None)
+
     def update_batch_row_controls_state(self) -> None:
         self._update_batch_row_controls_state()
 
@@ -803,6 +874,62 @@ class _FakeMainWindow(QtCore.QObject):
     ) -> tuple[float, str, bool, float, str]:
         _ = (t, y, uniformity_eps, tail_strategy)
         return (1.0, "trapz", True, float(uniformity_eps), str(tail_strategy))
+
+    def publish_simulation_completion_provenance(
+        self,
+        *,
+        mechanism_text: str,
+        solver_method: str,
+        solver_label: str,
+        solver_warning: Optional[str],
+        solver_config: dict[str, Any],
+        temperature_K: float,
+        temperature_source: str,
+        energy_unit: Optional[str],
+        energy_mode: bool,
+        simulation_time: float | str,
+        num_points_requested: int,
+        species_names: list[str],
+        t: object,
+        series: dict[str, object],
+        algebra_scalars: Optional[dict[str, object]] = None,
+        dataset_overlays: object = None,
+    ) -> dict[str, Any]:
+        ctc_values = {str(name): 1.0 for name in series}
+        self.set_last_simulation_ctc(ctc_values)
+        provenance = {
+            "mechanism_dsl": str(mechanism_text),
+            "solver": str(solver_method),
+            "solver_label": str(solver_label),
+            "solver_warning": str(solver_warning) if solver_warning else None,
+            "rtol": solver_config.get("rtol", 1e-6),
+            "atol": solver_config.get("atol", 1e-12),
+            "temperature_K": float(temperature_K),
+            "temperature_source": str(temperature_source),
+            "energy_unit": energy_unit,
+            "energy_mode": bool(energy_mode),
+            "simulation_time": simulation_time,
+            "num_points_requested": int(num_points_requested),
+            "num_species": len(species_names),
+            "num_points": len(t),
+            "species_names": list(species_names),
+            "datasets": self.snapshot_datasets(),
+            "ctc": {
+                "integration_method": "trapz",
+                "uniform_grid_detected": True,
+                "uniformity_eps": 1e-6,
+                "tail_strategy": "38",
+            },
+        }
+        if algebra_scalars:
+            provenance["algebra_scalars"] = dict(algebra_scalars)
+        if dataset_overlays is not None:
+            provenance["dataset_overlays"] = dataset_overlays
+        fit_meta = self.last_fit_metadata()
+        if fit_meta:
+            provenance["fit"] = fit_meta
+        self.set_last_simulation_provenance(provenance)
+        return provenance
 
     def remember_last_mechanism(self, mechanism: object, mechanism_text: str, solver_config: dict[str, Any]) -> None:
         self._remember_last_mechanism(mechanism, str(mechanism_text), dict(solver_config))
@@ -1036,22 +1163,77 @@ def test_default_batch_lane_pool_factory_creates_warm_lane_pool():
     finally:
         pool.close(kill=True)
 
+
+@pytest.mark.unit
+def test_batch_run_context_storage_is_owned_outside_controller_dict(controller: SimulationController):
+    assert "batch_run_context" not in controller.__dict__
+    assert not hasattr(type(controller), "_batch_run_context")
+    assert not hasattr(type(controller), "batch_run_context")
+    assert controller.batch_context_owner.active_batch_state() is None
+
+    seed_batch_context(controller.batch_context_owner, active=True, request_id=12)
+
+    assert "batch_run_context" not in controller.__dict__
+    active_state = controller.batch_context_owner.active_batch_state()
+    assert active_state is not None
+    assert active_state.active is True
+    assert active_state.request_id == 12
+
+    seed_batch_context(controller.batch_context_owner, active=False, request_id=13)
+
+    assert "batch_run_context" not in controller.__dict__
+    policy_context = controller.batch_context_owner.completion_policy_context()
+    assert policy_context is not None
+    assert policy_context.active is False
+    assert policy_context.request_id == 13
+
+
+@pytest.mark.unit
+def test_parallel_batch_runtime_readiness_state_is_owned_outside_controller(controller: SimulationController):
+    from kindred.gui.controllers.parallel_batch_runtime_readiness_owner import (
+        ParallelBatchRuntimeReadinessOwner,
+    )
+
+    assert "pool_eagerly_created" not in controller.__dict__
+    assert "_pool_eagerly_created" not in controller.__dict__
+    assert "_pool_eager_creation_thread" not in controller.__dict__
+    assert "_pool_eager_creation_lock" not in controller.__dict__
+    assert not hasattr(type(controller), "_pool_eagerly_created")
+    assert not hasattr(type(controller), "_pool_eager_creation_thread")
+    assert isinstance(
+        controller.parallel_batch_runtime_readiness_owner,
+        ParallelBatchRuntimeReadinessOwner,
+    )
+
+
+@pytest.mark.unit
+def test_simulation_controller_tests_do_not_lock_batch_runtime_readiness_compat_fields():
+    from pathlib import Path
+
+    lines = [
+        line
+        for line in Path("tests/test_simulation_controller.py").read_text(encoding="utf-8").splitlines()
+        if "not in source" not in line
+    ]
+    source = "\n".join(lines)
+
+    assert "._pool_eagerly_created" not in source
+    assert "._pool_eager_creation_thread" not in source
+
+
 @pytest.mark.unit
 def test_set_simulation_cache_caps_clamps_and_persists(mw: _FakeMainWindow, controller: SimulationController):
     result = controller.set_simulation_cache_caps(result_cap=-5, preview_cap="7", persist=True)
     assert result.ok is True
     assert result.operation == "set_caps"
-    assert controller.batch_cache.result_cache.max_entries() == 0
-    assert controller.batch_cache.preview_cache.max_entries() == 7
+    assert controller.batch_cache.result_cache_max_entries() == 0
+    assert controller.batch_cache.preview_cache_max_entries() == 7
     mw._settings.setValue.assert_any_call("simulation/result_cache_cap", 0)
     mw._settings.setValue.assert_any_call("simulation/preview_cache_cap", 7)
 
 @pytest.mark.unit
 def test_simulation_cache_stats_surfaces_failures(controller: SimulationController):
-    controller.batch_cache.result_cache = MagicMock()
-    controller.batch_cache.result_cache.used_entries.side_effect = RuntimeError("boom")
-    controller.batch_cache.preview_cache = MagicMock()
-    controller.batch_cache.preview_cache.used_entries.side_effect = RuntimeError("boom")
+    controller.batch_cache.stats_best_effort = MagicMock(side_effect=RuntimeError("boom"))
     result = controller.simulation_cache_stats()
     assert result.ok is False
     assert result.operation == "stats"
@@ -1386,14 +1568,7 @@ def test_deferred_close_successful_completion_does_not_schedule_next_serial_batc
     controller._simulation_running = True
     mw._run_btn.setEnabled(False)
     mw._stop_btn.setEnabled(True)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "total": 2,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, queue_ids=["id1", "id2"], queue_names=["set1", "set2"], total=2)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -1418,7 +1593,7 @@ def test_deferred_close_successful_completion_does_not_schedule_next_serial_batc
     worker.result_ready.emit(_successful_result_payload())
 
     assert scheduled == []
-    assert controller._batch_run_context.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert controller._simulation_running is False
     assert controller._simulation_worker is None
     assert worker not in controller._retained_simulation_workers
@@ -1520,14 +1695,7 @@ def test_deferred_close_error_recovery_restores_later_serial_batch_continuation(
     controller._active_run_id = 13
     controller._latest_sim_request_id = 12
     controller._simulation_running = True
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "total": 2,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, queue_ids=["id1", "id2"], queue_names=["set1", "set2"], total=2)
 
     controller._on_simulation_complete(
         _successful_result_payload(),
@@ -1540,8 +1708,8 @@ def test_deferred_close_error_recovery_restores_later_serial_batch_continuation(
     )
 
     assert scheduled == [controller._start_next_batch_simulation]
-    assert controller._batch_run_context["active"] is True
-    assert controller._batch_run_context["pos"] == 1
+    assert _batch_policy_context(controller).active is True
+    assert _batch_policy_context(controller).pos == 1
 
 @pytest.mark.unit
 def test_deferred_close_error_recovery_restores_later_pending_slider_rerun(
@@ -1590,14 +1758,7 @@ def test_deferred_close_error_recovery_restores_later_pending_slider_rerun(
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._pending_slider_simulation = True
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, queue_ids=["id1"], queue_names=["set1"], total=1)
 
     controller._on_simulation_complete(
         _successful_result_payload(),
@@ -1650,7 +1811,7 @@ def test_slider_request_during_parallel_full_run_defers_without_force_terminate(
     worker.terminate = _boom_thread_terminate  # type: ignore[assignment]
     controller._simulation_worker = worker
 
-    controller._batch_run_context = {"active": True, "parallel": True}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True)
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = rid
 
@@ -1686,12 +1847,7 @@ def test_stale_fast_completion_schedules_pending_slider_run(monkeypatch, mw: _Fa
     controller._pending_slider_simulation = True
 
     controller._active_run_id = 5
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=1)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -1726,14 +1882,7 @@ def test_second_stale_fast_completion_does_not_queue_duplicate_handoff_before_fi
         request_id=7,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": False,
-        "parallel": True,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 1,
-        "keep_lane_pool_alive": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=False, parallel=True, fast_mode=True, request_id=7, preview_owner_epoch=1, keep_lane_pool_alive=True)
 
     controller._on_simulation_complete(
         _successful_result_payload(),
@@ -1770,13 +1919,7 @@ def test_stale_fast_completion_treats_same_request_as_superseded_after_owner_epo
         epoch=4,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=7, preview_owner_epoch=3)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -1789,8 +1932,7 @@ def test_stale_fast_completion_treats_same_request_as_superseded_after_owner_epo
         owner_epoch=3,
     )
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
 
 
@@ -1810,13 +1952,7 @@ def test_worker_signal_completion_preserves_owner_epoch_for_stale_fast_replay(
         epoch=4,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=7, preview_owner_epoch=3)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -1834,8 +1970,7 @@ def test_worker_signal_completion_preserves_owner_epoch_for_stale_fast_replay(
 
     worker.result_ready.emit(_successful_result_payload())
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
 
 
@@ -1855,13 +1990,7 @@ def test_worker_signal_completion_uses_captured_owner_epoch_after_context_turnov
         epoch=4,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=7, preview_owner_epoch=3)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -1876,12 +2005,12 @@ def test_worker_signal_completion_uses_captured_owner_epoch_after_context_turnov
         set_id="id2",
         cache_key="preview-cache",
     )
-    controller._batch_run_context["preview_owner_epoch"] = 4
+    policy_context = _batch_policy_context(controller).evolve(preview_owner_epoch=4)
+    controller.batch_context_owner.serialize_completion_policy_context(policy_context)
 
     worker.result_ready.emit(_successful_result_payload())
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
 
 
@@ -1902,22 +2031,7 @@ def test_superseded_multiset_preview_completion_still_displays_current_result_be
         epoch=1,
         target_set_ids=("id1", "id2"),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 7,
-        "request_id": int(rid_old),
-        "fast_mode": True,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "total": 2,
-        "completed_set_ids": ["id1"],
-        "preview_scope_set_ids": ("id1", "id2"),
-        "preview_batch_cache_token_by_set_id": {"id1": "", "id2": ""},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=7, request_id=int(rid_old), fast_mode=True, cache_key="preview-cache", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", total=2, completed_set_ids=["id1"], preview_scope_set_ids=("id1", "id2"), preview_batch_cache_token_by_set_id={"id1": "", "id2": ""})
     mw._batch_set_ids_for_scope.return_value = ["id1", "id2"]
     mw._batch_current_row.return_value = 0
     mw._batch_set_id_for_row.side_effect = lambda row: ("id1", "id2")[int(row)]
@@ -1956,22 +2070,7 @@ def test_superseded_multiset_preview_partial_completion_keeps_parallel_batch_act
         epoch=1,
         target_set_ids=("id1", "id2"),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 8,
-        "request_id": int(rid_old),
-        "fast_mode": True,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "total": 2,
-        "completed_set_ids": [],
-        "preview_scope_set_ids": ("id1", "id2"),
-        "preview_batch_cache_token_by_set_id": {"id1": "", "id2": ""},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=8, request_id=int(rid_old), fast_mode=True, cache_key="preview-cache", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", total=2, completed_set_ids=[], preview_scope_set_ids=("id1", "id2"), preview_batch_cache_token_by_set_id={"id1": "", "id2": ""})
     mw._batch_set_ids_for_scope.return_value = ["id1", "id2"]
     mw._batch_current_row.return_value = 0
     mw._batch_set_id_for_row.side_effect = lambda row: ("id1", "id2")[int(row)]
@@ -1990,9 +2089,10 @@ def test_superseded_multiset_preview_partial_completion_keeps_parallel_batch_act
         cache_key="preview-cache",
     )
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is True
-    assert ctx.get("completed_set_ids") == ["id1"]
+    assert _batch_policy_context(controller).active is True
+    completion_state = controller.batch_context_owner.completion_state()
+    assert completion_state is not None
+    assert completion_state.completed_set_ids == ("id1",)
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is True
     assert scheduled == []
@@ -2012,21 +2112,7 @@ def test_fast_completion_displays_current_owner_even_when_latest_request_id_has_
         epoch=8,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "keep_lane_pool_alive": False,
-        "run_id": 8,
-        "request_id": 5,
-        "fast_mode": True,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-        "preview_scope_set_ids": ("id1",),
-        "preview_owner_epoch": 8,
-        "preview_batch_cache_token_by_set_id": {"id1": ""},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, keep_lane_pool_alive=False, run_id=8, request_id=5, fast_mode=True, cache_key="preview-cache", queue_ids=["id1"], queue_names=["set1"], total=1, preview_scope_set_ids=("id1",), preview_owner_epoch=8, preview_batch_cache_token_by_set_id={"id1": ""})
     mw._batch_set_ids_for_scope.return_value = ["id1"]
     mw._batch_current_row.return_value = 0
     mw._batch_set_id_for_row.return_value = "id1"
@@ -2057,12 +2143,7 @@ def test_stale_fast_completion_without_pending_still_cleans_up_active_run(monkey
     )
 
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=1)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -2080,8 +2161,7 @@ def test_stale_fast_completion_without_pending_still_cleans_up_active_run(monkey
         request_id=1,
     )
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is None
@@ -2098,20 +2178,7 @@ def test_on_simulation_complete_uses_base_species_count_for_algebra_status_witho
         epoch=1,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "keep_lane_pool_alive": False,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": True,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-        "preview_scope_set_ids": ("id1",),
-        "preview_batch_cache_token_by_set_id": {"id1": ""},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, keep_lane_pool_alive=False, run_id=7, request_id=11, fast_mode=True, cache_key="preview-cache", queue_ids=["id1"], queue_names=["set1"], total=1, preview_scope_set_ids=("id1",), preview_batch_cache_token_by_set_id={"id1": ""})
     mw._batch_set_ids_for_scope.return_value = ["id1"]
     mw._batch_current_row.return_value = 0
     mw._batch_set_id_for_row.return_value = "id1"
@@ -2145,20 +2212,7 @@ def test_on_simulation_complete_prefers_payload_base_species_count_over_mechanis
         epoch=1,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "keep_lane_pool_alive": False,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": True,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-        "preview_scope_set_ids": ("id1",),
-        "preview_batch_cache_token_by_set_id": {"id1": ""},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, keep_lane_pool_alive=False, run_id=7, request_id=11, fast_mode=True, cache_key="preview-cache", queue_ids=["id1"], queue_names=["set1"], total=1, preview_scope_set_ids=("id1",), preview_batch_cache_token_by_set_id={"id1": ""})
     mw._batch_set_ids_for_scope.return_value = ["id1"]
     mw._batch_current_row.return_value = 0
     mw._batch_set_id_for_row.return_value = "id1"
@@ -2195,7 +2249,7 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_ui_active_when_full_r
     controller._pending_slider_simulation = True
     controller._simulation_running = True
     controller._slider_simulation_active = False
-    controller._batch_run_context = {"active": True, "parallel": True, "fast_mode": False}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False)
 
     mw._slider_triggered_simulation = True
     mw._run_btn.setEnabled(False)
@@ -2206,7 +2260,7 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_ui_active_when_full_r
     controller.invalidate_slider_preview_work()
 
     assert controller._pending_slider_simulation is False
-    assert controller._batch_run_context.get("active") is True
+    assert _batch_policy_context(controller).active is True
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is False
     assert mw._slider_triggered_simulation is False
@@ -2225,17 +2279,10 @@ def test_invalidate_slider_preview_work_supersedes_active_fast_parallel_batch(
     controller._pending_slider_sim_request_id = int(rid)
     controller._simulation_running = True
     controller._slider_simulation_active = True
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "fast_mode": True,
-        "request_id": int(rid),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=True, request_id=int(rid))
 
     def _fake_supersede() -> None:
-        ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-        ctx["active"] = False
-        controller._batch_run_context = ctx
+        controller.batch_context_owner.deactivate()
 
     controller._supersede_parallel_batch_run_soft = MagicMock(side_effect=_fake_supersede)
 
@@ -2248,7 +2295,7 @@ def test_invalidate_slider_preview_work_supersedes_active_fast_parallel_batch(
     controller.invalidate_slider_preview_work()
 
     controller._supersede_parallel_batch_run_soft.assert_called_once_with()
-    assert controller._batch_run_context.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
     assert mw._slider_triggered_simulation is False
@@ -2266,12 +2313,7 @@ def test_invalidate_slider_preview_work_suppresses_stale_completion_ui_after_dis
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = int(rid)
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=1)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -2313,12 +2355,7 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_co
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = int(rid)
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 99,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=99)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     explicit_worker = _FakeWorker(running=True, wait_returns=False)
@@ -2343,9 +2380,9 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_co
         request_id=int(rid),
     )
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is True
-    assert ctx.get("fast_mode") is False
+    policy_context = _batch_policy_context(controller)
+    assert policy_context.active is True
+    assert policy_context.fast_mode is False
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is explicit_worker
@@ -2368,12 +2405,7 @@ def test_nonowning_stale_fast_completion_does_not_reset_explicit_run_status_prog
     controller._pending_slider_simulation = False
     controller._discarded_slider_preview_generation_id = None
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=3)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     explicit_worker = _FakeWorker(running=True, wait_returns=False)
@@ -2397,9 +2429,9 @@ def test_nonowning_stale_fast_completion_does_not_reset_explicit_run_status_prog
         request_id=1,
     )
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is True
-    assert ctx.get("fast_mode") is False
+    policy_context = _batch_policy_context(controller)
+    assert policy_context.active is True
+    assert policy_context.fast_mode is False
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is explicit_worker
@@ -2450,7 +2482,7 @@ def test_stale_fast_completion_with_pending_newer_preview_replays_without_displa
     controller._pending_slider_simulation = True
     controller._discarded_slider_preview_generation_id = None
     controller._active_run_id = 11
-    controller._batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller.run_state.preview_ownership = PreviewOwnershipState(
@@ -2499,7 +2531,7 @@ def test_stale_fast_completion_preserves_current_owner_request_for_pending_repla
     controller._pending_slider_sim_request_id = int(rid_owner)
     controller._pending_slider_simulation = True
     controller._active_run_id = 11
-    controller._batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller.run_state.preview_ownership = PreviewOwnershipState(
@@ -2540,12 +2572,7 @@ def test_invalidate_slider_preview_work_suppresses_stale_error_ui_after_discard(
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = int(rid)
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=1)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -2585,12 +2612,7 @@ def test_stale_contained_timeout_error_from_old_run_does_not_clobber_newer_run(
     controller._latest_sim_request_id = 8
     controller._simulation_running = True
     controller._slider_simulation_active = False
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 8,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=8)
     mw._run_btn.setEnabled(False)
     mw._stop_btn.setEnabled(True)
     mw._status_label.setText("Running simulation...")
@@ -2610,7 +2632,7 @@ def test_stale_contained_timeout_error_from_old_run_does_not_clobber_newer_run(
     )
 
     assert controller._simulation_running is True
-    assert controller._batch_run_context["active"] is True
+    assert _batch_policy_context(controller).active is True
     assert mw._run_btn.isEnabled() is False
     assert mw._stop_btn.isEnabled() is True
     assert mw._status_label.text == "Running simulation..."
@@ -2632,16 +2654,7 @@ def test_current_preview_timeout_marks_dirty_preview_unavailable_without_modal(
         epoch=4,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "run_id": 31,
-        "request_id": 9,
-        "preview_owner_epoch": 4,
-        "queue_ids": ["id1"],
-        "queue_names": ["Set 1"],
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, run_id=31, request_id=9, preview_owner_epoch=4, queue_ids=["id1"], queue_names=["Set 1"])
     mw._dirty_state_generations = {"id1": 7}
     mw._run_btn.setEnabled(False)
     mw._stop_btn.setEnabled(True)
@@ -2668,7 +2681,7 @@ def test_current_preview_timeout_marks_dirty_preview_unavailable_without_modal(
     mw.show_preview_unavailable_for_dirty_state.assert_called_once()
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
     assert mw._sim_progress.value == 0
@@ -2696,16 +2709,7 @@ def test_stale_preview_timeout_does_not_mark_current_dirty_preview_unavailable(
         epoch=6,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "run_id": 41,
-        "request_id": 12,
-        "preview_owner_epoch": 6,
-        "queue_ids": ["id1"],
-        "queue_names": ["Set 1"],
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, run_id=41, request_id=12, preview_owner_epoch=6, queue_ids=["id1"], queue_names=["Set 1"])
     mw._run_btn.setEnabled(False)
     mw._stop_btn.setEnabled(True)
     mw._status_label.setText("Updating current preview...")
@@ -2731,7 +2735,7 @@ def test_stale_preview_timeout_does_not_mark_current_dirty_preview_unavailable(
     mw.show_preview_unavailable_for_dirty_state.assert_not_called()
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is True
-    assert controller._batch_run_context["active"] is True
+    assert _batch_policy_context(controller).active is True
     assert mw._run_btn.isEnabled() is False
     assert mw._stop_btn.isEnabled() is True
     assert mw._status_label.text == "Updating current preview..."
@@ -2753,16 +2757,7 @@ def test_current_preview_non_timeout_error_closes_preview_owner_not_ordinary_own
         epoch=8,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "run_id": 51,
-        "request_id": 14,
-        "preview_owner_epoch": 8,
-        "queue_ids": ["id1"],
-        "queue_names": ["Set 1"],
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, run_id=51, request_id=14, preview_owner_epoch=8, queue_ids=["id1"], queue_names=["Set 1"])
     ordinary_owner = _FakeContainedOwner()
     preview_owner = _FakeContainedOwner()
     controller._ordinary_simulation_owner = ordinary_owner
@@ -2799,16 +2794,7 @@ def test_current_contained_preview_child_failure_is_status_only_dirty_no_preview
         epoch=9,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "run_id": 52,
-        "request_id": 15,
-        "preview_owner_epoch": 9,
-        "queue_ids": ["id1"],
-        "queue_names": ["Set 1"],
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, run_id=52, request_id=15, preview_owner_epoch=9, queue_ids=["id1"], queue_names=["Set 1"])
     preview_owner = _FakeContainedOwner()
     controller._preview_simulation_owner = preview_owner
     mw.message_box_critical = MagicMock()
@@ -2842,12 +2828,7 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_er
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = int(rid)
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 101,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=101)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     explicit_worker = _FakeWorker(running=True, wait_returns=False)
@@ -2869,9 +2850,9 @@ def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_er
     controller.invalidate_slider_preview_work()
     controller._on_simulation_error("boom", run_id=11, fast_mode=True, request_id=int(rid))
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is True
-    assert ctx.get("fast_mode") is False
+    policy_context = _batch_policy_context(controller)
+    assert policy_context.active is True
+    assert policy_context.fast_mode is False
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is explicit_worker
@@ -2891,12 +2872,7 @@ def test_invalidate_active_explicit_simulation_for_authoritative_change_cancels_
 ):
     controller._run_sequence_id = 11
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 101,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=101)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     explicit_worker = _FakeWorker(running=True, wait_returns=False)
@@ -2935,12 +2911,7 @@ def test_supersede_active_work_for_authoritative_mechanism_transition_rejects_ol
 ):
     controller._run_sequence_id = 11
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 101,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=101)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     explicit_worker = _FakeWorker(running=True, wait_returns=False)
@@ -3015,21 +2986,7 @@ def test_scoped_runtime_input_supersede_accepts_unaffected_preview_completion(
         epoch=2,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 4,
-        "run_id": 10,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id2"],
-        "queue_names": ["set2"],
-        "total": 1,
-        "pos": 0,
-        "preview_scope_set_ids": ("id2",),
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id2": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=4, run_id=10, cache_key="preview-cache", queue_ids=["id2"], queue_names=["set2"], total=1, pos=0, preview_scope_set_ids=("id2",), runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id2": 0})
     mw._batch_set_ids_for_scope.return_value = ["id2"]
     mw._shown_batch_set_ids.return_value = ["id2"]
     mw._batch_current_row.return_value = 0
@@ -3057,7 +3014,7 @@ def test_scoped_runtime_input_supersede_accepts_unaffected_preview_completion(
     )
 
     assert mw._display_cached_batch_selection.call_count == 1
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
 
 
 @pytest.mark.unit
@@ -3074,21 +3031,7 @@ def test_scoped_runtime_input_supersede_rejects_affected_preview_completion(
         epoch=2,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 4,
-        "run_id": 10,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-        "pos": 0,
-        "preview_scope_set_ids": ("id1",),
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=4, run_id=10, cache_key="preview-cache", queue_ids=["id1"], queue_names=["set1"], total=1, pos=0, preview_scope_set_ids=("id1",), runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0})
     mw._display_cached_batch_selection.return_value = True
 
     controller.supersede_active_work_for_authoritative_mechanism_transition(
@@ -3128,21 +3071,7 @@ def test_scoped_runtime_input_supersede_rejects_affected_preview_error(
         epoch=2,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 4,
-        "run_id": 10,
-        "cache_key": "preview-cache",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-        "pos": 0,
-        "preview_scope_set_ids": ("id1",),
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=4, run_id=10, cache_key="preview-cache", queue_ids=["id1"], queue_names=["set1"], total=1, pos=0, preview_scope_set_ids=("id1",), runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0})
     mw.message_box_critical = MagicMock()
     mw._status_label.setText("Running preview")
 
@@ -3178,12 +3107,7 @@ def test_nonowning_stale_fast_error_does_not_reset_explicit_run_status_progress(
     controller._pending_slider_simulation = False
     controller._discarded_slider_preview_generation_id = None
     controller._active_run_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=3)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     explicit_worker = _FakeWorker(running=True, wait_returns=False)
@@ -3204,9 +3128,9 @@ def test_nonowning_stale_fast_error_does_not_reset_explicit_run_status_progress(
 
     controller._on_simulation_error("boom", run_id=11, fast_mode=True, request_id=1)
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is True
-    assert ctx.get("fast_mode") is False
+    policy_context = _batch_policy_context(controller)
+    assert policy_context.active is True
+    assert policy_context.fast_mode is False
     assert controller._simulation_running is True
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is explicit_worker
@@ -3232,7 +3156,7 @@ def test_stale_fast_error_with_pending_newer_preview_replays_without_showing_err
     controller._pending_slider_simulation = True
     controller._discarded_slider_preview_generation_id = None
     controller._active_run_id = 11
-    controller._batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller.run_state.preview_ownership = PreviewOwnershipState(
@@ -3279,12 +3203,7 @@ def test_stale_fast_error_without_pending_still_cleans_up_active_run(
     )
 
     controller._active_run_id = 7
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=1)
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -3300,8 +3219,7 @@ def test_stale_fast_error_without_pending_still_cleans_up_active_run(
 
     controller._on_simulation_error("boom", run_id=7, fast_mode=True, request_id=1)
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
     assert controller._simulation_worker is None
@@ -3324,13 +3242,7 @@ def test_stale_fast_error_treats_same_request_as_superseded_after_owner_epoch_ch
         epoch=4,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=7, preview_owner_epoch=3)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -3345,8 +3257,7 @@ def test_stale_fast_error_treats_same_request_as_superseded_after_owner_epoch_ch
         owner_epoch=3,
     )
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
     message_box.assert_not_called()
 
@@ -3369,13 +3280,7 @@ def test_fast_error_surfaces_current_owner_even_when_latest_request_id_has_advan
         epoch=8,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 5,
-        "preview_owner_epoch": 8,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=5, preview_owner_epoch=8)
 
     controller._on_simulation_error(
         "boom",
@@ -3408,12 +3313,7 @@ def test_fast_error_treats_missing_owner_epoch_for_current_owner_as_superseded(
         epoch=8,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 5,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=5)
 
     controller._on_simulation_error(
         "boom",
@@ -3444,13 +3344,7 @@ def test_worker_signal_error_preserves_owner_epoch_for_stale_fast_replay(
         epoch=4,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=7, preview_owner_epoch=3)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -3470,8 +3364,7 @@ def test_worker_signal_error_preserves_owner_epoch_for_stale_fast_replay(
 
     worker.error.emit("boom")
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
     message_box.assert_not_called()
 
@@ -3492,13 +3385,7 @@ def test_worker_signal_error_uses_captured_owner_epoch_after_context_turnover(
         epoch=4,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 3,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=7, preview_owner_epoch=3)
 
     scheduled: list[object] = []
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
@@ -3515,12 +3402,12 @@ def test_worker_signal_error_uses_captured_owner_epoch_after_context_turnover(
         set_id="id2",
         cache_key="preview-cache",
     )
-    controller._batch_run_context["preview_owner_epoch"] = 4
+    policy_context = _batch_policy_context(controller).evolve(preview_owner_epoch=4)
+    controller.batch_context_owner.serialize_completion_policy_context(policy_context)
 
     worker.error.emit("boom")
 
-    ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-    assert ctx.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
     message_box.assert_not_called()
 
@@ -3548,14 +3435,7 @@ def test_second_stale_fast_error_preserves_queued_replay_snapshot_before_timer_f
         request_id=7,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": False,
-        "parallel": True,
-        "fast_mode": True,
-        "request_id": 7,
-        "preview_owner_epoch": 1,
-        "keep_lane_pool_alive": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=False, parallel=True, fast_mode=True, request_id=7, preview_owner_epoch=1, keep_lane_pool_alive=True)
 
     controller._on_simulation_error(
         "boom",
@@ -3584,7 +3464,7 @@ def test_slider_run_deferral_does_not_set_updating_status_when_no_new_run_starts
     rid = controller._next_sim_request_id()
     controller._pending_slider_sim_request_id = rid
 
-    controller._batch_run_context = {"active": True, "fast_mode": True}
+    seed_batch_context(controller.batch_context_owner, active=True, fast_mode=True)
     controller._simulation_worker = None
     controller._simulation_running = False
 
@@ -3611,17 +3491,10 @@ def test_slider_run_supersedes_active_fast_parallel_preview_for_newer_request(
     mw._batch_store.row_count.return_value = 1
     mw._batch_rows_for_scope.return_value = [0]
     mw._batch_set_id_for_row.return_value = "id1"
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "fast_mode": True,
-        "request_id": int(rid_old),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=True, request_id=int(rid_old))
 
     def _fake_supersede() -> None:
-        ctx = dict(getattr(controller, "_batch_run_context", {}) or {})
-        ctx["active"] = False
-        controller._batch_run_context = ctx
+        controller.batch_context_owner.deactivate()
 
     controller._supersede_parallel_batch_run_soft = MagicMock(side_effect=_fake_supersede)
 
@@ -3888,7 +3761,7 @@ def test_supersede_parallel_batch_run_soft_invalidates_lane_requests_and_stops_t
             set_id=sid,
             set_name=sid.upper(),
         )
-    controller._batch_run_context = {"active": True, "parallel": True}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True)
 
     controller._supersede_parallel_batch_run_soft()
     release.set()
@@ -3929,7 +3802,7 @@ def test_superseded_parallel_batch_lane_outcome_error_is_drained_deterministical
         set_id="sid",
         set_name="set1",
     )
-    controller._batch_run_context = {"active": False, "parallel": False}
+    seed_batch_context(controller.batch_context_owner, active=False, parallel=False)
     controller._record_nonfatal_exception = MagicMock()
 
     controller._supersede_parallel_batch_run_soft()
@@ -3971,7 +3844,7 @@ def test_stale_lane_request_bookkeeping_does_not_abort_active_run(controller: Si
     first = _FakeLanePool("initial")
     controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: first
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller._pool_eagerly_created = True
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = True
     controller.parallel_batch.begin_run(
         run_id=11,
         request_id=22,
@@ -3987,14 +3860,7 @@ def test_stale_lane_request_bookkeeping_does_not_abort_active_run(controller: Si
         set_id="current",
         set_name="current-set",
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 11,
-        "request_id": 22,
-        "fast_mode": False,
-        "cache_key": "current-cache",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=11, request_id=22, fast_mode=False, cache_key="current-cache")
     controller._on_simulation_error = MagicMock()
     controller._on_simulation_complete = MagicMock()
     controller._record_nonfatal_exception = MagicMock()
@@ -4003,34 +3869,18 @@ def test_stale_lane_request_bookkeeping_does_not_abort_active_run(controller: Si
 
     controller._on_simulation_error.assert_not_called()
     controller._record_nonfatal_exception.assert_not_called()
-    assert controller._batch_run_context["active"] is True
+    assert _batch_policy_context(controller).active is True
     assert first.close_calls == []
     assert controller.parallel_batch.has_lane_pool()
     assert controller.parallel_batch.has_active_requests()
-    assert controller._pool_eagerly_created is True
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is True
 
     release.set()
     controller.parallel_batch.join_active_requests(timeout_s=2.0)
     controller._poll_parallel_batch_completions()
     controller._on_simulation_complete.assert_called_once()
 
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["fresh"],
-        "queue_names": ["fresh-set"],
-        "run_id": 12,
-        "request_id": 23,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=12, request_id=23, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
     controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
 
     controller._start_parallel_batch_simulations()
@@ -4050,18 +3900,7 @@ def test_parallel_keep_lane_pool_alive_completion_stops_polling_without_retained
     controller._record_nonfatal_exception = MagicMock()
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["sid"],
-        "queue_names": ["set1"],
-        "total": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=7, request_id=11, fast_mode=False, cache_key="ck", queue_ids=["sid"], queue_names=["set1"], total=1)
 
     controller._on_simulation_complete(
         _successful_result_payload(),
@@ -4073,7 +3912,7 @@ def test_parallel_keep_lane_pool_alive_completion_stops_polling_without_retained
         cache_key="ck",
     )
 
-    assert controller._batch_run_context.get("active") is False
+    assert _batch_policy_context(controller).active is False
     assert not controller._batch_parallel.has_active_requests()
     controller._record_nonfatal_exception.assert_not_called()
     timer.stop.assert_called_once()
@@ -4090,15 +3929,15 @@ def test_superseded_parallel_batch_lane_outcome_error_payload_keeps_healthy_pool
     pool = _FakeLanePool()
     controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: pool
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller._pool_eagerly_created = True
-    controller._batch_run_context = {"active": False, "parallel": False}
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = True
+    seed_batch_context(controller.batch_context_owner, active=False, parallel=False)
     controller._record_nonfatal_exception = MagicMock()
 
     controller._poll_parallel_batch_completions()
 
     assert controller.parallel_batch.has_lane_pool()
     assert pool.close_calls == []
-    assert controller._pool_eagerly_created is True
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is True
     controller._record_nonfatal_exception.assert_not_called()
 
 @pytest.mark.unit
@@ -4111,18 +3950,7 @@ def test_primary_explicit_completion_preserves_fresh_cache_during_post_run_speci
 
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "keep_lane_pool_alive": False,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "fresh-current-cache",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, keep_lane_pool_alive=False, run_id=7, request_id=11, fast_mode=False, cache_key="fresh-current-cache", queue_ids=["id1"], queue_names=["set1"], total=1)
     controller.batch_cache.active_cache_key = "fresh-current-cache"
     mw._sync_batch_species_columns = MagicMock()
 
@@ -4150,22 +3978,7 @@ def test_on_simulation_complete_later_completion_does_not_widen_narrowed_valid_s
 ):
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "fresh-current-cache",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "total": 2,
-        "explicit_cache_preview_token": "narrow-preview-token",
-        "explicit_cache_preview_scope_set_ids": ("id1",),
-        "explicit_cache_valid_set_ids": ("id1",),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=7, request_id=11, fast_mode=False, cache_key="fresh-current-cache", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", total=2, explicit_cache_preview_token="narrow-preview-token", explicit_cache_preview_scope_set_ids=("id1",), explicit_cache_valid_set_ids=("id1",))
     controller.batch_cache.active_cache_key = "fresh-current-cache"
     controller.batch_cache.active_cache_preview_token = "narrow-preview-token"
     controller.batch_cache.active_cache_preview_scope_set_ids = ("id1",)
@@ -4191,20 +4004,7 @@ def test_on_simulation_complete_redraw_falls_back_to_current_result_when_constra
 ):
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "keep_lane_pool_alive": False,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "fresh-current-cache",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "total": 2,
-        "explicit_cache_valid_set_ids": ("id2",),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, keep_lane_pool_alive=False, run_id=7, request_id=11, fast_mode=False, cache_key="fresh-current-cache", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", total=2, explicit_cache_valid_set_ids=("id2",))
     controller.batch_cache.active_cache_key = "fresh-current-cache"
     controller.batch_cache.active_cache_valid_set_ids = ("id2",)
     mw._batch_set_ids_for_scope.return_value = ["id1"]
@@ -4235,20 +4035,7 @@ def test_on_simulation_complete_coalesced_flush_uses_valid_subset_without_fallba
 ):
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "fresh-current-cache",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "total": 2,
-        "explicit_cache_valid_set_ids": ("id2",),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=7, request_id=11, fast_mode=False, cache_key="fresh-current-cache", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", total=2, explicit_cache_valid_set_ids=("id2",))
     controller.batch_cache.active_cache_key = "fresh-current-cache"
     controller.batch_cache.active_cache_valid_set_ids = ("id2",)
     mw._batch_set_ids_for_scope.return_value = ["id1"]
@@ -4280,23 +4067,7 @@ def test_on_simulation_complete_coalesced_flush_keeps_valid_subset_after_dirty_r
 ):
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "fresh-current-cache",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "total": 2,
-        "completed_set_ids": ["id1"],
-        "explicit_cache_valid_set_ids": ("id1", "id2"),
-        "pending_workspace_reset_set_ids": ["id2"],
-        "pending_dirty_reset_generation_by_set_id": {"id2": 1},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=7, request_id=11, fast_mode=False, cache_key="fresh-current-cache", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", total=2, completed_set_ids=["id1"], explicit_cache_valid_set_ids=("id1", "id2"), pending_workspace_reset_set_ids=["id2"], pending_dirty_reset_generation_by_set_id={"id2": 1})
     controller.batch_cache.active_cache_key = "fresh-current-cache"
     controller.batch_cache.active_cache_valid_set_ids = ("id1", "id2")
     mw._dirty_state_generations = {"id2": 1}
@@ -4330,23 +4101,7 @@ def test_on_simulation_complete_normalizes_scalar_context_ids_before_dirty_reset
 ):
     controller._active_run_id = 7
     controller._latest_sim_request_id = 11
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "run_id": 7,
-        "request_id": 11,
-        "fast_mode": False,
-        "cache_key": "fresh-current-cache",
-        "queue_ids": "id1",
-        "queue_names": "set1",
-        "primary_set_id": "id1",
-        "total": 2,
-        "completed_set_ids": "id1",
-        "explicit_cache_valid_set_ids": ("id1", "id2"),
-        "pending_workspace_reset_set_ids": "id2",
-        "pending_dirty_reset_generation_by_set_id": {"id2": 1},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, run_id=7, request_id=11, fast_mode=False, cache_key="fresh-current-cache", queue_ids="id1", queue_names="set1", primary_set_id="id1", total=2, completed_set_ids="id1", explicit_cache_valid_set_ids=("id1", "id2"), pending_workspace_reset_set_ids="id2", pending_dirty_reset_generation_by_set_id={"id2": 1})
     controller.batch_cache.active_cache_key = "fresh-current-cache"
     controller.batch_cache.active_cache_valid_set_ids = ("id1", "id2")
     mw._dirty_state_generations = {"id2": 1}
@@ -4457,8 +4212,20 @@ def test_flush_slider_plot_updates_force_uses_cache_keys_when_no_selection(mw: _
     mw._shown_batch_set_ids.return_value = []
     mw._display_cached_batch_selection.return_value = True
 
-    controller.batch_cache.preview_cache.put("cache-key::x", {"t": [], "series": {}})
-    controller.batch_cache.preview_cache.put("cache-key::y", {"t": [], "series": {}})
+    controller.batch_cache.put_completion_entry(
+        cache_key="cache-key",
+        set_id="x",
+        is_preview=True,
+        t=[],
+        series={},
+    )
+    controller.batch_cache.put_completion_entry(
+        cache_key="cache-key",
+        set_id="y",
+        is_preview=True,
+        t=[],
+        series={},
+    )
 
     ok = controller._flush_slider_plot_updates(force=True)
     assert ok is True
@@ -4683,17 +4450,7 @@ def test_consume_parallel_batch_outcome_error_is_set_scoped_when_batch_sets_rema
         {"bad": failed_lane_outcome, "ok": _lane_outcome("ok")},
         set_names={"bad": "Bad Set", "ok": "OK Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["bad", "ok"],
-        "queue_names": ["Bad Set", "OK Set"],
-        "total": 2,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2)
 
     controller._on_simulation_error = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
@@ -4708,9 +4465,12 @@ def test_consume_parallel_batch_outcome_error_is_set_scoped_when_batch_sets_rema
     assert ok is True
     controller._on_simulation_error.assert_not_called()
     controller._shutdown_batch_lane_pool.assert_not_called()
-    assert controller._batch_run_context["active"] is True
-    assert controller._batch_run_context["failed_set_ids"] == ["bad"]
-    assert "bad" in controller._batch_run_context["completed_set_ids"]
+    assert _batch_policy_context(controller).active is True
+    summary = controller.batch_context_owner.completion_summary()
+    completion_state = controller.batch_context_owner.completion_state()
+    assert summary.failed_set_ids == ("bad",)
+    assert completion_state is not None
+    assert "bad" in completion_state.completed_set_ids
 
 
 @pytest.mark.unit
@@ -4720,14 +4480,7 @@ def test_stale_batch_outcome_by_request_id_clears_last_active_request(
 ):
     outcome = _lane_outcome("sid", {"payload": 123}, request_id=99)
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"})
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck")
     controller._simulation_running = True
     controller._slider_simulation_active = True
     mw._run_btn.setEnabled(False)
@@ -4742,7 +4495,7 @@ def test_stale_batch_outcome_by_request_id_clears_last_active_request(
     )
 
     assert ok is False
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     assert not controller._batch_parallel.has_active_requests()
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
@@ -4754,14 +4507,7 @@ def test_stale_batch_outcome_by_request_id_clears_last_active_request(
 def test_stale_batch_outcome_by_owner_epoch_is_rejected(controller: SimulationController):
     outcome = _lane_outcome("sid", {"payload": 123}, owner_epoch=3)
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"}, owner_epoch=4)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck")
 
     ok = _consume_parallel_batch_outcome_for_test(
         controller,
@@ -4772,7 +4518,7 @@ def test_stale_batch_outcome_by_owner_epoch_is_rejected(controller: SimulationCo
     )
 
     assert ok is False
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     assert not controller._batch_parallel.has_active_requests()
 
 
@@ -4790,20 +4536,7 @@ def test_stale_batch_outcome_marks_set_failed_without_stranding_multiset_paralle
         {"bad": stale, "ok": healthy},
         set_names={"bad": "Bad Set", "ok": "OK Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["bad", "ok"],
-        "queue_names": ["Bad Set", "OK Set"],
-        "total": 2,
-        "pending_workspace_reset_set_ids": ["bad", "ok"],
-        "pending_dirty_reset_generation_by_set_id": {"bad": 1, "ok": 1},
-        "explicit_cache_valid_set_ids": ("bad", "ok"),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2, pending_workspace_reset_set_ids=["bad", "ok"], pending_dirty_reset_generation_by_set_id={"bad": 1, "ok": 1}, explicit_cache_valid_set_ids=("bad", "ok"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -4823,9 +4556,12 @@ def test_stale_batch_outcome_marks_set_failed_without_stranding_multiset_paralle
         cache_key="ck",
         source="callback",
     ) is True
-    assert controller._batch_run_context["active"] is True
-    assert controller._batch_run_context["failed_set_ids"] == ["bad"]
-    assert "bad" in controller._batch_run_context["completed_set_ids"]
+    assert _batch_policy_context(controller).active is True
+    summary = controller.batch_context_owner.completion_summary()
+    completion_state = controller.batch_context_owner.completion_state()
+    assert summary.failed_set_ids == ("bad",)
+    assert completion_state is not None
+    assert "bad" in completion_state.completed_set_ids
 
     assert _consume_parallel_batch_outcome_for_test(
         controller,
@@ -4838,7 +4574,7 @@ def test_stale_batch_outcome_marks_set_failed_without_stranding_multiset_paralle
         source="scan",
     ) is True
 
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     assert mw._status_label.text == "Batch completed with 1 failed set(s)"
     mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
     mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["ok"])
@@ -4852,14 +4588,7 @@ def test_poll_parallel_batch_outcome_rejects_owner_epoch_mismatch_after_pop(
 ):
     outcome = _lane_outcome("sid", {"payload": 123}, run_id=1, request_id=2, owner_epoch=3)
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"}, owner_epoch=4)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck")
     controller._simulation_running = True
     controller._slider_simulation_active = True
     controller._on_simulation_complete = MagicMock()
@@ -4892,20 +4621,7 @@ def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
         {"bad": failed_lane_outcome, "ok": success_lane_outcome},
         set_names={"bad": "Bad Set", "ok": "OK Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["bad", "ok"],
-        "queue_names": ["Bad Set", "OK Set"],
-        "total": 2,
-        "pending_workspace_reset_set_ids": ["bad", "ok"],
-        "pending_dirty_reset_generation_by_set_id": {"bad": 1, "ok": 1},
-        "explicit_cache_valid_set_ids": ("bad", "ok"),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2, pending_workspace_reset_set_ids=["bad", "ok"], pending_dirty_reset_generation_by_set_id={"bad": 1, "ok": 1}, explicit_cache_valid_set_ids=("bad", "ok"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -4926,8 +4642,9 @@ def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
         source="callback",
         completed_ts=1.0,
     ) is True
-    assert controller._batch_run_context["explicit_cache_valid_set_ids"] == ("ok",)
-    assert controller._batch_run_context["explicit_cache_invalidated_set_ids"] == ("bad",)
+    failure_cache_state = controller.batch_context_owner.scoped_failure_cache_state()
+    assert failure_cache_state.explicit_cache_valid_set_ids == ("ok",)
+    assert failure_cache_state.explicit_cache_invalidated_set_ids == ("bad",)
     assert controller.batch_cache.active_cache_valid_set_ids == ("ok",)
     assert controller.batch_cache.active_cache_invalidated_set_ids == ("bad",)
 
@@ -4962,21 +4679,7 @@ def test_parallel_batch_final_scoped_failure_finalizes_prior_success(
         {"bad": failed_lane_outcome},
         set_names={"bad": "Bad Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["ok", "bad"],
-        "queue_names": ["OK Set", "Bad Set"],
-        "total": 2,
-        "completed_set_ids": ["ok"],
-        "pending_workspace_reset_set_ids": ["ok", "bad"],
-        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
-        "explicit_cache_valid_set_ids": ("ok", "bad"),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["ok", "bad"], queue_names=["OK Set", "Bad Set"], total=2, completed_set_ids=["ok"], pending_workspace_reset_set_ids=["ok", "bad"], pending_dirty_reset_generation_by_set_id={"ok": 1, "bad": 1}, explicit_cache_valid_set_ids=("ok", "bad"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -5036,21 +4739,7 @@ def test_parallel_batch_final_scoped_failure_prunes_reset_sets_from_pending_repl
         {"bad": failed_lane_outcome},
         set_names={"bad": "Bad Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["ok", "bad"],
-        "queue_names": ["OK Set", "Bad Set"],
-        "total": 2,
-        "completed_set_ids": ["ok"],
-        "pending_workspace_reset_set_ids": ["ok", "bad"],
-        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
-        "explicit_cache_valid_set_ids": ("ok", "bad"),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["ok", "bad"], queue_names=["OK Set", "Bad Set"], total=2, completed_set_ids=["ok"], pending_workspace_reset_set_ids=["ok", "bad"], pending_dirty_reset_generation_by_set_id={"ok": 1, "bad": 1}, explicit_cache_valid_set_ids=("ok", "bad"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -5097,21 +4786,7 @@ def test_parallel_batch_final_scoped_failure_keeps_replay_when_reset_clear_fails
         {"bad": failed_lane_outcome},
         set_names={"bad": "Bad Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["ok", "bad"],
-        "queue_names": ["OK Set", "Bad Set"],
-        "total": 2,
-        "completed_set_ids": ["ok"],
-        "pending_workspace_reset_set_ids": ["ok", "bad"],
-        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
-        "explicit_cache_valid_set_ids": ("ok", "bad"),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["ok", "bad"], queue_names=["OK Set", "Bad Set"], total=2, completed_set_ids=["ok"], pending_workspace_reset_set_ids=["ok", "bad"], pending_dirty_reset_generation_by_set_id={"ok": 1, "bad": 1}, explicit_cache_valid_set_ids=("ok", "bad"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -5159,21 +4834,7 @@ def test_parallel_batch_final_scoped_failure_refreshes_batch_columns_after_overl
         {"bad": failed_lane_outcome},
         set_names={"bad": "Bad Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["ok", "bad"],
-        "queue_names": ["OK Set", "Bad Set"],
-        "total": 2,
-        "completed_set_ids": ["ok"],
-        "pending_workspace_reset_set_ids": ["ok", "bad"],
-        "pending_dirty_reset_generation_by_set_id": {"ok": 1, "bad": 1},
-        "explicit_cache_valid_set_ids": ("ok", "bad"),
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["ok", "bad"], queue_names=["OK Set", "Bad Set"], total=2, completed_set_ids=["ok"], pending_workspace_reset_set_ids=["ok", "bad"], pending_dirty_reset_generation_by_set_id={"ok": 1, "bad": 1}, explicit_cache_valid_set_ids=("ok", "bad"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -5211,20 +4872,7 @@ def test_parallel_batch_scoped_failure_reinvalidates_pending_init_results(
         {"bad": failed_lane_outcome},
         set_names={"bad": "Bad Set"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["bad", "ok"],
-        "queue_names": ["Bad Set", "OK Set"],
-        "total": 2,
-        "pending_init_seed": {},
-        "pending_init_rewrite": "reaction: A -> B; k=1",
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2, pending_init_seed={}, pending_init_rewrite="reaction: A -> B; k=1", pending_init_applied=True)
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
 
@@ -5241,7 +4889,7 @@ def test_parallel_batch_scoped_failure_reinvalidates_pending_init_results(
     ) is True
 
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
-    assert controller._batch_run_context["pending_init_applied"] is False
+    assert _batch_policy_context(controller).pending_init_applied is False
 
 
 @pytest.mark.unit
@@ -5260,19 +4908,7 @@ def test_parallel_batch_all_scoped_failures_replays_deferred_preview(
         {"bad-a": failed_a, "bad-b": failed_b},
         set_names={"bad-a": "Bad A", "bad-b": "Bad B"},
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-        "queue_ids": ["bad-a", "bad-b"],
-        "queue_names": ["Bad A", "Bad B"],
-        "total": 2,
-        "pending_workspace_reset_set_ids": ["bad-a", "bad-b"],
-        "pending_dirty_reset_generation_by_set_id": {"bad-a": 1, "bad-b": 1},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad-a", "bad-b"], queue_names=["Bad A", "Bad B"], total=2, pending_workspace_reset_set_ids=["bad-a", "bad-b"], pending_dirty_reset_generation_by_set_id={"bad-a": 1, "bad-b": 1})
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller._pending_slider_simulation = True
@@ -5348,21 +4984,14 @@ def test_consume_parallel_batch_outcome_exception_tears_down_pool_and_next_paral
         created.append(pool)
         return pool
 
-    controller._pool_eagerly_created = True
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = True
     failed_outcome = _lane_outcome(
         "sid",
         success=False,
         failure={"kind": "internal_error", "phase": "lane_pool", "message": "boom"},
     )
     _install_active_lane_outcomes(controller, {"sid": failed_outcome}, set_names={"sid": "set1"})
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 1,
-        "request_id": 2,
-        "fast_mode": False,
-        "cache_key": "ck",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck")
     controller._on_simulation_error = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
@@ -5378,30 +5007,14 @@ def test_consume_parallel_batch_outcome_exception_tears_down_pool_and_next_paral
 
     assert ok is False
     controller._on_simulation_error.assert_called_once()
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     assert not controller.parallel_batch.has_lane_pool()
     assert not controller.parallel_batch.has_active_requests()
-    assert controller._pool_eagerly_created is False
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is False
 
     controller.parallel_batch.lane_pool_factory = _factory
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["fresh"],
-        "queue_names": ["fresh-set"],
-        "run_id": 3,
-        "request_id": 11,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
     controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
 
     controller._start_parallel_batch_simulations()
@@ -5419,14 +5032,7 @@ def test_poll_parallel_batch_outcomes_consumes_callback_then_scan(controller: Si
     _install_active_lane_outcomes(controller, {"a": outcome_a, "b": outcome_b}, set_names={"a": "A", "b": "B"})
     controller._batch_parallel.drain_completion_queue()
     controller._batch_parallel.enqueue_completion("a")
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 9,
-        "request_id": 8,
-        "fast_mode": False,
-        "cache_key": "ck",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=9, request_id=8, fast_mode=False, cache_key="ck")
 
     controller._consume_parallel_batch_outcome = MagicMock(return_value=True)
     controller._poll_parallel_batch_completions()
@@ -5465,17 +5071,9 @@ def test_poll_parallel_batch_outcomes_callback_then_scan_only_queue_one_replay_h
         request_id=7,
         target_set_ids=("id2",),
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 11,
-        "request_id": 7,
-        "fast_mode": True,
-        "cache_key": "ck",
-        "preview_owner_epoch": 1,
-        "keep_lane_pool_alive": True,
-    }
-    stale_context = dict(controller._batch_run_context)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=11, request_id=7, fast_mode=True, cache_key="ck", preview_owner_epoch=1, keep_lane_pool_alive=True)
+    stale_policy_context = _batch_policy_context(controller)
+    stale_cache_key = controller.batch_context_owner.completion_flush_context().cache_key
 
     def _consume_stale_completion(**kwargs):
         controller._on_simulation_complete(
@@ -5489,7 +5087,8 @@ def test_poll_parallel_batch_outcomes_callback_then_scan_only_queue_one_replay_h
             cache_key="ck",
         )
         if kwargs["source"] == "callback":
-            controller._batch_run_context = dict(stale_context)
+            controller.batch_context_owner.serialize_completion_policy_context(stale_policy_context)
+            controller.batch_context_owner.record_cache_key(stale_cache_key)
             controller._simulation_running = True
             controller._slider_simulation_active = True
         return True
@@ -5510,14 +5109,7 @@ def test_poll_parallel_batch_outcomes_catches_unhandled_exceptions_and_shuts_dow
     outcome_a = _lane_outcome("a", {"ok": 1}, run_id=9, request_id=8)
 
     _install_active_lane_outcomes(controller, {"a": outcome_a}, set_names={"a": "A"})
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 9,
-        "request_id": 8,
-        "fast_mode": False,
-        "cache_key": "ck",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=9, request_id=8, fast_mode=False, cache_key="ck")
 
     controller._on_simulation_error = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
@@ -5651,7 +5243,7 @@ def test_run_simulation_from_slider_noops_for_stray_callback_after_consumed_repl
     assert controller.run_simulation_internal.call_count == 1
     controller._simulation_running = False
     controller._slider_simulation_active = False
-    controller._batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
 
     controller._run_simulation_from_slider()
 
@@ -5933,7 +5525,7 @@ def test_run_simulation_from_slider_defers_when_full_run_in_progress(mw: _FakeMa
     mw._run_btn = _FakeButton(False)
     controller._simulation_worker = None
     controller._simulation_running = True
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": False}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False)
     controller.queue_pending_slider_preview_replay(
         target_set_ids=("id1",),
         request_id=7,
@@ -5966,13 +5558,13 @@ def test_retained_worker_finish_preserves_valid_deferred_replay_without_current_
 
 @pytest.mark.unit
 def test_cancel_active_run_for_restart_resets_ui_and_shuts_down(mw: _FakeMainWindow, controller: SimulationController):
-    controller._batch_run_context = {"active": True}
+    seed_batch_context(controller.batch_context_owner, active=True)
     controller._shutdown_batch_lane_pool = MagicMock()
     worker = _FakeWorker(running=True, wait_returns=True)
     controller._simulation_worker = worker
 
     controller._cancel_active_run_for_restart()
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     controller._shutdown_batch_lane_pool.assert_called_once_with(force_terminate=True)
     assert controller._simulation_worker is None
     assert controller._simulation_running is False
@@ -5986,7 +5578,7 @@ def test_stop_simulation_does_not_close_active_contained_owner_outside_worker_th
     controller: SimulationController,
 ):
     controller._simulation_running = True
-    controller._batch_run_context = {"active": True, "fast_mode": False}
+    seed_batch_context(controller.batch_context_owner, active=True, fast_mode=False)
     controller._shutdown_batch_lane_pool = MagicMock()
     owner = _FakeContainedOwner()
     controller._ordinary_simulation_owner = owner
@@ -6006,7 +5598,7 @@ def test_run_simulation_blocks_restart_while_retained_worker_is_still_running(
 ):
     mw._batch_rows_for_scope.return_value = [0]
     controller.run_simulation_internal = MagicMock()
-    controller._batch_run_context = {"active": True}
+    seed_batch_context(controller.batch_context_owner, active=True)
     controller._shutdown_batch_lane_pool = MagicMock()
     worker = make_stubborn_worker(_FakeWorker)
     controller._simulation_worker = worker
@@ -6156,20 +5748,14 @@ def test_start_parallel_batch_simulations_reports_unready_when_lane_pool_is_miss
     controller._queue_run_after_runtime_ready = MagicMock()
     controller._simulation_running = True
     mw._stop_btn.setEnabled(True)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "run_id": 1,
-        "effective_workers": 2,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], run_id=1, effective_workers=2)
 
     controller._start_parallel_batch_simulations()
-    assert controller._batch_run_context["parallel"] is True
-    assert controller._batch_run_context["active"] is False
-    assert controller._batch_run_context["runtime_waiting"] is True
+    state = controller.batch_context_owner.active_batch_state()
+    assert state is not None
+    assert state.parallel is True
+    assert state.active is False
+    assert state.runtime_waiting is True
     assert controller._simulation_running is False
     controller._start_next_batch_simulation.assert_not_called()
     controller._queue_run_after_runtime_ready.assert_not_called()
@@ -6187,17 +5773,7 @@ def test_start_parallel_batch_simulations_requeues_unready_slider_preview_as_pre
     controller._ensure_parallel_batch_pool_eagerly_created = MagicMock()
     controller._simulation_running = True
     controller._slider_simulation_active = True
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "run_id": 1,
-        "request_id": 4,
-        "effective_workers": 2,
-        "fast_mode": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], run_id=1, request_id=4, effective_workers=2, fast_mode=True)
 
     controller._start_parallel_batch_simulations()
 
@@ -6254,28 +5830,16 @@ def test_start_parallel_batch_simulations_maps_submit_failure_to_affected_set(
         )
 
     monkeypatch.setattr(type(controller._batch_parallel), "submit_task", _submit_task)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1],
-        "queue_ids": ["bad", "ok"],
-        "queue_names": ["Bad Set", "OK Set"],
-        "run_id": 1,
-        "request_id": 2,
-        "effective_workers": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], run_id=1, request_id=2, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
 
-    assert controller._batch_run_context["active"] is True
-    assert controller._batch_run_context["failed_set_ids"] == ["bad"]
-    assert "bad" in controller._batch_run_context["completed_set_ids"]
+    assert _batch_policy_context(controller).active is True
+    summary = controller.batch_context_owner.completion_summary()
+    completion_state = controller.batch_context_owner.completion_state()
+    assert summary.failed_set_ids == ("bad",)
+    assert completion_state is not None
+    assert "bad" in completion_state.completed_set_ids
     assert controller._batch_parallel.active_request_count() == 1
     assert submitted == []
 
@@ -6295,22 +5859,7 @@ def test_start_parallel_batch_simulations_resizes_retained_pool_before_submit(
     controller._batch_parallel.ensure_lane_pool(max_lanes=2)
     controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: new_pool
     controller._batch_parallel.ensure_lane_pool(max_lanes=4)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1, 2, 3],
-        "queue_ids": ["id1", "id2", "id3", "id4"],
-        "queue_names": ["set1", "set2", "set3", "set4"],
-        "run_id": 1,
-        "request_id": 2,
-        "effective_workers": 4,
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1, 2, 3], queue_ids=["id1", "id2", "id3", "id4"], queue_names=["set1", "set2", "set3", "set4"], run_id=1, request_id=2, effective_workers=4, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -6386,16 +5935,18 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
     mw.discard_concentration_overlays_for_rows.return_value = True
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
-    ctx = controller._batch_run_context
-    assert ctx["active"] is True
-    assert ctx["parallel"] is False
-    assert isinstance(ctx["cache_key"], str)
-    assert ctx["cache_key"] != "ck"
-    assert "# State Network" in ctx["full_dsl"]
-    assert ctx["queue_names"] == ["randomname3"]
-    assert ctx["pending_init_seed"] == {"randomname3": {"A": 1.0}}
-    assert isinstance(ctx["pending_init_rewrite"], str) and ctx["pending_init_rewrite"]
-    assert ctx["pending_init_applied"] is True
+    policy_context = _batch_policy_context(controller)
+    execution_state = controller.batch_context_owner.execution_payload_state()
+    cache_key = controller.batch_context_owner.completion_flush_context().cache_key
+    assert policy_context.active is True
+    assert policy_context.parallel is False
+    assert isinstance(cache_key, str)
+    assert cache_key != "ck"
+    assert any("# State Network" in text for text in execution_state.mechanism_text_by_set_id.values())
+    assert policy_context.queue_names == ("randomname3",)
+    assert policy_context.pending_init_seed == {"randomname3": {"A": 1.0}}
+    assert isinstance(policy_context.pending_init_rewrite, str) and policy_context.pending_init_rewrite
+    assert policy_context.pending_init_applied is True
     controller._start_next_batch_simulation.assert_called_once()
 
 
@@ -6584,7 +6135,7 @@ def test_close_teardown_detaches_active_contained_owner_for_running_worker(
     owner = _FakeContainedOwner()
     controller._simulation_worker = worker
     controller._ordinary_simulation_owner = owner
-    controller._batch_run_context = {"active": True, "fast_mode": False}
+    seed_batch_context(controller.batch_context_owner, active=True, fast_mode=False)
     controller._shutdown_batch_lane_pool = MagicMock()
 
     assert controller._prepare_simulation_shutdown_for_close() is False
@@ -6604,7 +6155,7 @@ def test_close_teardown_closes_detached_owner_when_worker_stops_during_cleanup(
     owner = _FakeContainedOwner()
     controller._simulation_worker = worker
     controller._ordinary_simulation_owner = owner
-    controller._batch_run_context = {"active": True, "fast_mode": False}
+    seed_batch_context(controller.batch_context_owner, active=True, fast_mode=False)
     controller._shutdown_batch_lane_pool = MagicMock()
 
     assert controller._prepare_simulation_shutdown_for_close() is True
@@ -6626,17 +6177,7 @@ def test_successful_ordinary_completion_retains_contained_owner(
     controller._simulation_running = True
     controller._active_run_id = 1
     controller.run_state.latest_sim_request_id = 2
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "completed_set_ids": [],
-        "total": 1,
-        "pos": 0,
-        "pending_workspace_reset_set_ids": [],
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, queue_ids=["id1"], queue_names=["set1"], completed_set_ids=[], total=1, pos=0, pending_workspace_reset_set_ids=[])
     controller._cleanup_parallel_batch_lane_pool_after_run = MagicMock()
 
     payload = _successful_result_payload()
@@ -6686,16 +6227,7 @@ def test_ordinary_containment_timeout_error_resets_ui_and_discards_owner(
     controller._simulation_running = True
     controller._active_run_id = 7
     controller.run_state.latest_sim_request_id = 8
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "completed_set_ids": [],
-        "total": 1,
-        "pos": 0,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, queue_ids=["id1"], queue_names=["set1"], completed_set_ids=[], total=1, pos=0)
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
     controller._shutdown_batch_lane_pool = MagicMock()
     critical_messages: list[tuple[str, str, Optional[str]]] = []
@@ -7865,12 +7397,12 @@ def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_in
     controller._shutdown_batch_lane_pool = MagicMock()
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
-    ctx = controller._batch_run_context
+    policy_context = _batch_policy_context(controller)
 
-    assert ctx["pending_init_seed"] == {"set1": {"A": 1.0}}
-    assert isinstance(ctx["pending_init_rewrite"], str) and ctx["pending_init_rewrite"]
-    assert ctx["pending_init_applied"] is True
-    assert ctx["pending_init_rewrite"].count(
+    assert policy_context.pending_init_seed == {"set1": {"A": 1.0}}
+    assert isinstance(policy_context.pending_init_rewrite, str) and policy_context.pending_init_rewrite
+    assert policy_context.pending_init_applied is True
+    assert policy_context.pending_init_rewrite.count(
         "Initial concentrations moved to Batch Initial Conditions table (set1). Edit there."
     ) == 2
     mw._batch_store.set_value.assert_any_call(0, "A", "1")
@@ -7971,11 +7503,10 @@ def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
 
     controller._run_simulation_internal(fast_mode=True, request_id=7, batch_rows=[0, 1], reuse_parallel_lane_pool=False)
 
-    prepared_by_set_id = controller._batch_run_context["prepared_by_set_id"]
-    simulation_plan_by_set_id = controller._batch_run_context["simulation_plan_by_set_id"]
-    assert controller._batch_run_context["prepared"] is None
-    assert "execution_request" not in controller._batch_run_context
-    assert "execution_request_by_set_id" not in controller._batch_run_context
+    execution_state = controller.batch_context_owner.execution_payload_state()
+    prepared_by_set_id = execution_state.prepared_by_set_id
+    simulation_plan_by_set_id = execution_state.simulation_plan_by_set_id
+    assert execution_state.prepared is None
     assert prepared_by_set_id == {}
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
@@ -8081,7 +7612,7 @@ def test_run_simulation_internal_fast_mode_refreshes_runtime_after_multi_set_pre
 
     assert created_runtimes == []
 
-    controller._batch_run_context = {"active": False}
+    seed_batch_context(controller.batch_context_owner, active=False)
     controller._run_simulation_internal(fast_mode=True, request_id=8, batch_rows=[1], reuse_parallel_lane_pool=False)
 
     assert created_runtimes == []
@@ -8394,16 +7925,14 @@ def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
 
     controller._run_simulation_internal(fast_mode=True, request_id=7, batch_rows=[0, 1], reuse_parallel_lane_pool=False)
 
-    assert controller._batch_run_context["preview_batch_cache_token_by_set_id"] == {
-        "id1": "token:id1",
-        "id2": "token:id2",
-    }
+    assert controller.batch_context_owner.preview_batch_cache_token_for_set("id1") == "token:id1"
+    assert controller.batch_context_owner.preview_batch_cache_token_for_set("id2") == "token:id2"
 
     row_to_set_id.clear()
     row_to_set_id.update({0: "id9", 1: "id1", 2: "id2"})
 
     result = _successful_result_payload()
-    cache_key = str(controller._batch_run_context["cache_key"])
+    cache_key = str(controller.batch_context_owner.completion_cache_key())
     controller._on_simulation_complete(
         result,
         run_id=None,
@@ -8414,7 +7943,7 @@ def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
         cache_key=cache_key,
     )
 
-    payload = controller.batch_cache.preview_cache.get(f"{cache_key}::id1")
+    payload = controller.batch_cache.entry_for_set(cache_key=cache_key, set_id="id1", is_preview=True).entry
     assert isinstance(payload, dict)
     assert payload.get("preview_batch_cache_token") == "token:id1"
 
@@ -8474,22 +8003,22 @@ def test_run_simulation_internal_fast_mode_parallel_signatures_follow_preview_me
         batch_rows=[0, 1],
         reuse_parallel_lane_pool=False,
     )
-    first_ctx = dict(controller._batch_run_context)
+    first_state = controller.batch_context_owner.execution_payload_state()
 
     mw._slider_overrides = {"k1": 5.0}
-    controller._batch_run_context = {"active": False}
+    seed_batch_context(controller.batch_context_owner, active=False)
     controller._run_simulation_internal(
         fast_mode=True,
         request_id=8,
         batch_rows=[0, 1],
         reuse_parallel_lane_pool=False,
     )
-    second_ctx = dict(controller._batch_run_context)
+    second_state = controller.batch_context_owner.execution_payload_state()
 
-    first_text = dict(first_ctx["mechanism_text_by_set_id"])
-    second_text = dict(second_ctx["mechanism_text_by_set_id"])
-    first_sig = dict(first_ctx["mechanism_signature_by_set_id"])
-    second_sig = dict(second_ctx["mechanism_signature_by_set_id"])
+    first_text = dict(first_state.mechanism_text_by_set_id)
+    second_text = dict(second_state.mechanism_text_by_set_id)
+    first_sig = dict(first_state.mechanism_signature_by_set_id)
+    second_sig = dict(second_state.mechanism_signature_by_set_id)
 
     assert first_sig == {
         set_id: f"text:{text}"
@@ -8556,7 +8085,7 @@ def test_fast_mode_preview_owner_identity_uses_set_specific_staged_request_dsl(
         reuse_parallel_lane_pool=False,
     )
 
-    plan_payload = controller._batch_run_context["simulation_plan_by_set_id"]["id1"]
+    plan_payload = controller.batch_context_owner.simulation_plan_payload_for_set("id1")
     plan = SimulationPlan.from_payload(plan_payload)
     request_text = plan.to_execution_request().mechanism_text
     owner_identity = dict(plan.metadata["contained_owner_identity"])
@@ -8637,7 +8166,7 @@ def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_w
 
     controller._run_simulation_internal(fast_mode=True, request_id=8, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    assert "param a = 2" in controller._batch_run_context["mechanism_text_by_set_id"]["id1"]
+    assert "param a = 2" in controller.batch_context_owner.execution_payload_state().mechanism_text_by_set_id["id1"]
     mw._apply_parameter_overrides_to_dsl.assert_called()
 
 @pytest.mark.unit
@@ -8690,7 +8219,7 @@ def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    solver_cfg = controller._batch_run_context["solver_config"]
+    solver_cfg = controller.batch_context_owner.execution_payload_state().solver_config
     expected = SimulationScopeIdentity.build(
         queue_ids=["id1"],
         identity_by_set_id={
@@ -8704,7 +8233,7 @@ def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
             )
         },
     ).cache_key()
-    assert controller._batch_run_context["cache_key"] == expected
+    assert controller.batch_context_owner.completion_cache_key() == expected
     assert controller.batch_cache.active_cache_key == expected
     assert controller.batch_cache.active_cache_preview_token is None
     assert controller.batch_cache.active_cache_preview_scope_set_ids is None
@@ -8760,12 +8289,12 @@ def test_run_simulation_internal_explicit_cache_key_ignores_non_primary_set_fing
     controller._shutdown_batch_lane_pool = MagicMock()
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0, 1], reuse_parallel_lane_pool=False)
-    first_key = str(controller._batch_run_context["cache_key"])
+    first_key = str(controller.batch_context_owner.completion_cache_key())
 
     mw._batch_set_id_for_row.side_effect = ["id1", "id2", "id1", "id2"]
     mw._simulation_param_fingerprints = {"id1": "params-id1", "id2": "params-id2b"}
     controller._run_simulation_internal(fast_mode=False, request_id=2, batch_rows=[0, 1], reuse_parallel_lane_pool=False)
-    second_key = str(controller._batch_run_context["cache_key"])
+    second_key = str(controller.batch_context_owner.completion_cache_key())
 
     assert first_key == second_key
 
@@ -8817,9 +8346,9 @@ def test_run_simulation_internal_baseline_explicit_run_leaves_overlay_cache_toke
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    assert isinstance(controller._batch_run_context["cache_key"], str)
-    assert controller._batch_run_context["cache_key"] != "baseline-cache"
-    assert controller.batch_cache.active_cache_key == controller._batch_run_context["cache_key"]
+    assert isinstance(controller.batch_context_owner.completion_cache_key(), str)
+    assert controller.batch_context_owner.completion_cache_key() != "baseline-cache"
+    assert controller.batch_cache.active_cache_key == controller.batch_context_owner.completion_cache_key()
     assert controller.batch_cache.active_cache_preview_token is None
     assert controller.batch_cache.active_cache_preview_scope_set_ids is None
     assert controller.batch_cache.active_cache_valid_set_ids == ("id1",)
@@ -8898,25 +8427,7 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
     )
     controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "run_id": 3,
-        "request_id": 11,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {"id1": "sig-1", "id2": "sig-2"},
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1", "id2": "sig-2"}, solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -8967,29 +8478,16 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
         "mechanism_text": "reaction: A -> B; k=3",
         "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
     }
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 1,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_text_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=1, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={
             "id1": "reaction: A -> B; k=2",
             "id2": "reaction: A -> B; k=3",
-        },
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {
+        }, mechanism_signature="sig", mechanism_signature_by_set_id={
             "id1": "sig-2",
             "id2": "sig-3",
-        },
-        "prepared": None,
-        "prepared_by_set_id": {
+        }, prepared=None, prepared_by_set_id={
             "id1": {"prepared_for": "id1"},
             "id2": {"prepared_for": "id2"},
-        },
-        "simulation_plan_by_set_id": {
+        }, simulation_plan_by_set_id={
             "id2": SimulationPlan.from_execution_request(
                 request_payload,
                 execution_mode="preview",
@@ -8997,15 +8495,7 @@ def test_start_next_batch_simulation_fast_mode_uses_set_specific_prepared_payloa
                 cache_identity_payload={"cache_key": "slider-cache"},
                 metadata={"set_id": "id2", "set_name": "set2", "fast_mode": True},
             ).to_payload(),
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 7,
-        "cache_key": "slider-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=7, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -9054,35 +8544,15 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 4.0})
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 1,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_text_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=1, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={
             "id1": "reaction: A -> B; k=2",
             "id2": "reaction: A -> B; k=3",
-        },
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {
+        }, mechanism_signature="sig", mechanism_signature_by_set_id={
             "id1": "sig-2",
             "id2": "sig-3",
-        },
-        "prepared": {"prepared_for": "id1"},
-        "prepared_by_set_id": {
+        }, prepared={"prepared_for": "id1"}, prepared_by_set_id={
             "id1": {"prepared_for": "id1"},
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 11,
-        "cache_key": "slider-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=11, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -9095,7 +8565,7 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
     assert getattr(controller._simulation_worker, "_execution_request", None) is None
 
 @pytest.mark.unit
-def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_execution_request(
+def test_start_next_batch_simulation_fast_mode_uses_target_queue_preview_inputs(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
     created: dict[str, object] = {}
@@ -9127,51 +8597,13 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_exec
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 4.0})
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 1,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_text_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=1, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={
             "id1": "reaction: A -> B; k=2",
             "id2": "reaction: A -> B; k=3",
-        },
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {
+        }, mechanism_signature="sig", mechanism_signature_by_set_id={
             "id1": "sig-2",
             "id2": "sig-3",
-        },
-        "prepared": None,
-        "prepared_by_set_id": {},
-        "execution_request": {
-            "prepared_payload": {"version": 2, "prepared_for": "id1"},
-            "initials": {"A": 9.0},
-            "t_span": (0.0, 10.0),
-            "solver_config": {"solver": "BDF"},
-            "mechanism_text": "reaction: A -> B; k=2",
-            "simulation_identity": {"schema_id": "schema-a", "param_fingerprint": "fingerprint-a"},
-        },
-        "execution_request_by_set_id": {
-            "id1": {
-                "prepared_payload": {"version": 2, "prepared_for": "id1"},
-                "initials": {"A": 9.0},
-                "t_span": (0.0, 10.0),
-                "solver_config": {"solver": "BDF"},
-                "mechanism_text": "reaction: A -> B; k=2",
-                "simulation_identity": {"schema_id": "schema-a", "param_fingerprint": "fingerprint-a"},
-            },
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 12,
-        "cache_key": "slider-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=12, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -9222,29 +8654,9 @@ def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fall
         )
     )
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "full_dsl": "reaction: A -> B; k=1\n# Algebra\nparam a = 5\n",
-        "mechanism_text_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1\n# Algebra\nparam a = 5\n", mechanism_text_by_set_id={
             "id1": "reaction: A -> B; k=1\n# Algebra\nparam a = 5\n",
-        },
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {"id1": "sig-1"},
-        "prepared": None,
-        "prepared_by_set_id": {},
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 9,
-        "cache_key": "slider-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=9, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -9287,29 +8699,9 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
     mw._simulation_schema_id = "schema-preview"
     mw._simulation_param_fingerprints = {"id1": "params-id1"}
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "full_dsl": "reaction: A -> B; k=1\n# Algebra\nparam a = 5\n",
-        "mechanism_text_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1\n# Algebra\nparam a = 5\n", mechanism_text_by_set_id={
             "id1": "reaction: A -> B; k=1\n# Algebra\nparam a = 5\n",
-        },
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {"id1": "sig-1"},
-        "prepared": None,
-        "prepared_by_set_id": {},
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 9,
-        "cache_key": "slider-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-        "simulation_identity_by_set_id": {
+        }, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=9, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True, simulation_identity_by_set_id={
             "id1": {
                 "version": 1,
                 "schema_id": "schema-preview",
@@ -9327,8 +8719,7 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
                 "preview_batch_cache_token": "",
                 "execution_flags": ("fast_mode",),
             }
-        },
-    }
+        })
 
     rewritten_texts = [
         "reaction: A -> B; k=1\n# Algebra\nparam a = 2\n# witness one\n",
@@ -9339,12 +8730,14 @@ def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewrit
     _install_recording_contained_worker(monkeypatch, created, controller)
 
     controller._start_next_batch_simulation()
-    first_key = str(controller._batch_run_context["cache_key"])
+    first_key = str(controller.batch_context_owner.completion_cache_key())
 
-    controller._batch_run_context["pos"] = 0
-    controller._batch_run_context["cache_key"] = "slider-cache"
+    controller.batch_context_owner.serialize_completion_policy_context(
+        _batch_policy_context(controller).evolve(pos=0)
+    )
+    controller.batch_context_owner.record_cache_key("slider-cache")
     controller._start_next_batch_simulation()
-    second_key = str(controller._batch_run_context["cache_key"])
+    second_key = str(controller.batch_context_owner.completion_cache_key())
 
     assert first_key == second_key
 
@@ -9378,22 +8771,7 @@ def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_se
     mw._batch_initials_for_row.return_value = {"A": 0.25}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["randomname3"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 7,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {"randomname3": {"A": 1.0}},
-        "pending_init_applied": False,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["randomname3"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={"randomname3": {"A": 1.0}}, pending_init_applied=False)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -9419,23 +8797,7 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
     )
     controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["randomname3"],
-        "run_id": 3,
-        "request_id": 11,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {"randomname3": {"A": 1.0}},
-        "pending_init_applied": False,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["randomname3"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={"randomname3": {"A": 1.0}}, pending_init_applied=False)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -9462,13 +8824,13 @@ def test_parallel_batch_pool_settings_changed_shuts_down_idle_pool_immediately(
     fake = _FakeLanePool()
     controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: fake
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller.batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
 
     controller.parallel_batch_pool_settings_changed()
 
     assert fake.close_calls == [False]
     assert not controller.parallel_batch.has_lane_pool()
-    assert controller._pool_eagerly_created is False
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is False
 
 @pytest.mark.unit
 def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_completion(
@@ -9505,17 +8867,7 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_com
         active_timeout_s=60.0,
         cache_key="cache-key",
     )
-    controller.batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "keep_lane_pool_alive": True,
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "completed_set_ids": [],
-        "total": 1,
-        "fast_mode": False,
-        "primary_set_id": "other-id",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, keep_lane_pool_alive=True, queue_ids=["id1"], queue_names=["set1"], completed_set_ids=[], total=1, fast_mode=False, primary_set_id="other-id")
     controller._active_run_id = 3
     controller.run_state.latest_sim_request_id = 11
     mw._batch_current_row.return_value = None
@@ -9645,18 +8997,18 @@ def test_ensure_parallel_batch_pool_eagerly_created_only_once(
 
     controller.parallel_batch.max_parallel_workers = 5
     controller.parallel_batch.lane_pool_factory = _factory
-    controller._pool_eagerly_created = False
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = False
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 4)
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
     first_token = controller.parallel_batch.lane_pool_token()
     controller.ensure_parallel_batch_pool_eagerly_created()
     controller.parallel_batch_pool_settings_changed()
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
     assert created == [(3, True), (3, True)]
     assert controller.parallel_batch.has_lane_pool()
@@ -9691,12 +9043,12 @@ def test_ensure_parallel_batch_pool_eagerly_created_defaults_to_nonblocking_warm
 
     controller.parallel_batch.max_parallel_workers = 5
     controller.parallel_batch.lane_pool_factory = _factory
-    controller._pool_eagerly_created = False
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = False
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 4)
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
     assert created == [(3, True)]
     assert controller.parallel_batch.has_lane_pool()
@@ -9731,25 +9083,25 @@ def test_ensure_parallel_batch_pool_eagerly_created_retries_after_failure(
     controller.parallel_batch.lane_pool_factory = _factory
     controller.parallel_batch.record_nonfatal_exception = _record
     controller._record_nonfatal_exception = _record
-    controller._pool_eagerly_created = False
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = False
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 4)
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
     assert attempts == [(3, True)]
     assert not controller.parallel_batch.has_lane_pool()
-    assert controller._pool_eagerly_created is False
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is False
     assert recorded == [("Failed to create batch lane pool", "factory boom")]
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
     assert attempts == [(3, True), (3, True)]
     assert controller.parallel_batch.has_lane_pool()
-    assert controller._pool_eagerly_created is True
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is True
 
 
 @pytest.mark.unit
@@ -9788,26 +9140,26 @@ def test_ensure_parallel_batch_pool_eagerly_created_retries_after_warm_failure(
     controller.parallel_batch.lane_pool_factory = _factory
     controller.parallel_batch.record_nonfatal_exception = _record
     controller._record_nonfatal_exception = _record
-    controller._pool_eagerly_created = False
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = False
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 4)
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
     assert attempts == [(3, True)]
     assert not controller.parallel_batch.has_lane_pool()
-    assert controller._pool_eagerly_created is False
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is False
     assert recorded == [("Failed to warm batch lane pool", "warm boom")]
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
     assert attempts == [(3, True), (3, True)]
     assert controller.parallel_batch.has_lane_pool()
     assert created_pools[-1].warm_calls[:1] == [(3, True)]
-    assert controller._pool_eagerly_created is False
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is False
 
 
 @pytest.mark.unit
@@ -9827,13 +9179,13 @@ def test_ensure_parallel_batch_pool_eagerly_created_factory_failure_records_once
     controller.parallel_batch.lane_pool_factory = _factory
     controller.parallel_batch.record_nonfatal_exception = _record
     controller._record_nonfatal_exception = _record
-    controller._pool_eagerly_created = False
+    controller.parallel_batch_runtime_readiness_owner.eagerly_created = False
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 4)
 
     controller.ensure_parallel_batch_pool_eagerly_created()
 
     assert not controller.parallel_batch.has_lane_pool()
-    assert controller._pool_eagerly_created is False
+    assert controller.parallel_batch_runtime_readiness_owner.eagerly_created is False
     assert recorded == [("Failed to create batch lane pool", "factory boom")]
 
 
@@ -9874,28 +9226,10 @@ def test_start_parallel_batch_uses_prewarmed_lane_pool_without_blocking_warm(
     controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: pool
 
     controller.ensure_parallel_batch_pool_eagerly_created()
-    assert controller._pool_eager_creation_thread is not None
-    controller._pool_eager_creation_thread.join(timeout=1.0)
+    assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
+    controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1],
-        "queue_ids": ["a", "b"],
-        "queue_names": ["A", "B"],
-        "run_id": 10,
-        "request_id": 20,
-        "effective_workers": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 1.0,
-        "fast_mode": False,
-        "keep_lane_pool_alive": True,
-        "cache_key": "cache-a",
-        "simulation_plan_by_set_id": {},
-        "mechanism_text_by_set_id": {},
-        "simulation_identity_by_set_id": {},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["a", "b"], queue_names=["A", "B"], run_id=10, request_id=20, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=1.0, fast_mode=False, keep_lane_pool_alive=True, cache_key="cache-a", simulation_plan_by_set_id={}, mechanism_text_by_set_id={}, simulation_identity_by_set_id={})
 
     controller._start_parallel_batch_simulations()
     controller.parallel_batch.join_active_requests(timeout_s=1.0)
@@ -9947,25 +9281,7 @@ def test_start_parallel_batch_does_not_submit_until_lane_pool_is_ready(
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     assert controller.parallel_batch.has_ready_lane_pool(max_lanes=2) is False
 
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0, 1],
-        "queue_ids": ["a", "b"],
-        "queue_names": ["A", "B"],
-        "run_id": 10,
-        "request_id": 20,
-        "effective_workers": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 1.0,
-        "fast_mode": False,
-        "keep_lane_pool_alive": True,
-        "cache_key": "cache-a",
-        "simulation_plan_by_set_id": {},
-        "mechanism_text_by_set_id": {},
-        "simulation_identity_by_set_id": {},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["a", "b"], queue_names=["A", "B"], run_id=10, request_id=20, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=1.0, fast_mode=False, keep_lane_pool_alive=True, cache_key="cache-a", simulation_plan_by_set_id={}, mechanism_text_by_set_id={}, simulation_identity_by_set_id={})
 
     controller._start_parallel_batch_simulations()
     controller.parallel_batch.join_active_requests(timeout_s=1.0)
@@ -10002,7 +9318,7 @@ def test_poll_parallel_batch_outcomes_shuts_down_stale_pool_after_active_request
     controller.parallel_batch.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: pool
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     controller.parallel_batch.mark_pool_stale()
-    controller._batch_run_context = {"active": False, "parallel": False}
+    seed_batch_context(controller.batch_context_owner, active=False, parallel=False)
 
     controller._poll_parallel_batch_completions()
 
@@ -10023,29 +9339,14 @@ def test_start_next_batch_simulation_invalid_initials_after_pending_init_migrati
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
 
     mw._batch_initials_for_row.side_effect = ValueError("bad initials")
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 7,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
 
     controller._start_next_batch_simulation()
 
     assert warned == [("Invalid Initial Conditions", "Set 'set1' has invalid initial conditions:\n\nbad initials")]
     mw._batch_model.validate_rows.assert_called_once_with([0])
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
-    assert controller._batch_run_context["pending_init_applied"] is False
+    assert _batch_policy_context(controller).pending_init_applied is False
 
 @pytest.mark.unit
 def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_migration_reinvalidates_preserved_results(
@@ -10070,30 +9371,14 @@ def test_start_parallel_batch_simulations_invalid_initials_after_pending_init_mi
     mw._batch_initials_for_row.side_effect = ValueError("bad initials")
     _install_ready_batch_lane_pool(controller, _NoSubmitLanePool(), max_lanes=2)
     controller._shutdown_batch_lane_pool = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "run_id": 3,
-        "request_id": 11,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["set1"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
 
     assert warned == [("Invalid Initial Conditions", "Set 'set1' has invalid initial conditions:\n\nbad initials")]
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._shutdown_batch_lane_pool.assert_called_once_with(force_terminate=True)
-    assert controller._batch_run_context["pending_init_applied"] is False
+    assert _batch_policy_context(controller).pending_init_applied is False
 
 @pytest.mark.unit
 def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkeypatch, mw: _FakeMainWindow, controller: SimulationController):
@@ -10158,11 +9443,7 @@ def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkey
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
     controller._simulation_running = True
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pending_init_applied=True)
     mw._run_btn.setEnabled(False)
     mw._stop_btn.setEnabled(True)
 
@@ -10173,7 +9454,7 @@ def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkey
     assert mw._run_btn.isEnabled() is True
     assert mw._stop_btn.isEnabled() is False
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
-    assert controller._batch_run_context["pending_init_applied"] is False
+    assert _batch_policy_context(controller).pending_init_applied is False
     controller._start_next_batch_simulation.assert_not_called()
 
 @pytest.mark.unit
@@ -10232,7 +9513,7 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
     controller._shutdown_batch_lane_pool = MagicMock()
 
     controller._run_simulation_internal(fast_mode=True, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
-    solver_cfg = controller._batch_run_context["solver_config"]
+    solver_cfg = controller.batch_context_owner.execution_payload_state().solver_config
     assert solver_cfg["solver"] == "Radau"
     assert int(solver_cfg["grid"]["N"]) <= 120
     assert int(solver_cfg["grid"]["N"]) >= 50
@@ -10373,7 +9654,7 @@ def test_invalidate_preserved_pending_init_results_after_failed_run_honors_expli
     mw: _FakeMainWindow,
     controller: SimulationController,
 ):
-    controller._batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
 
     controller._invalidate_preserved_pending_init_results_after_failed_run(
         pending_init_applied=True,
@@ -10382,41 +9663,6 @@ def test_invalidate_preserved_pending_init_results_after_failed_run_honors_expli
 
     mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
 
-
-@pytest.mark.unit
-def test_completion_policy_context_from_raw_tolerates_non_integer_context_fields(
-    controller: SimulationController,
-):
-    controller._batch_run_context = {
-        "active": "false",
-        "fast_mode": "false",
-        "parallel": "false",
-        "keep_lane_pool_alive": "false",
-        "request_id": float("inf"),
-        "run_id": float("-inf"),
-        "total": "bad-total",
-        "pos": "bad-pos",
-        "queue_ids": "id1",
-        "queue_names": "set1",
-        "pending_init_applied": "false",
-        "pending_dirty_reset_generation_by_set_id": {"id1": "bad-generation"},
-    }
-
-    ctx = controller._completion_policy_context_from_raw()
-
-    assert ctx is not None
-    assert ctx.active is False
-    assert ctx.fast_mode is False
-    assert ctx.parallel is False
-    assert ctx.keep_lane_pool_alive is False
-    assert ctx.request_id is None
-    assert ctx.run_id is None
-    assert ctx.total == 0
-    assert ctx.pos == 0
-    assert ctx.queue_ids == ("id1",)
-    assert ctx.queue_names == ("set1",)
-    assert ctx.pending_init_applied is False
-    assert ctx.pending_dirty_reset_generation_by_set_id == {}
 
 @pytest.mark.unit
 def test_run_simulation_internal_no_mechanism_after_pending_init_migration_reinvalidates_preserved_results(
@@ -10611,18 +9857,7 @@ def test_on_simulation_complete_updates_cache_and_marks_pending_init_applied(mon
     mw._batch_store.ensure_set = MagicMock(return_value=0)
     mw._batch_store.set_value = MagicMock()
 
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "queue_names": ["set1"],
-        "queue_ids": ["id1"],
-        "cache_key": "ck",
-        "pending_init_seed": {"set1": {"A": 1.0}},
-        "pending_init_rewrite": "reaction: A -> B; k=1",
-        "pending_init_applied": False,
-        "primary_set_id": "id1",
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, queue_names=["set1"], queue_ids=["id1"], cache_key="ck", pending_init_seed={"set1": {"A": 1.0}}, pending_init_rewrite="reaction: A -> B; k=1", pending_init_applied=False, primary_set_id="id1")
 
     result = {
         "t": np.linspace(0.0, 1.0, 3),
@@ -10645,10 +9880,10 @@ def test_on_simulation_complete_updates_cache_and_marks_pending_init_applied(mon
         cache_key="ck",
     )
 
-    payload = controller.batch_cache.result_cache.get("ck::id1")
+    payload = controller.batch_cache.entry_for_set(cache_key="ck", set_id="id1", is_preview=False).entry
     assert isinstance(payload, dict)
     assert np.allclose(np.asarray(payload.get("t")), result["t"])
-    assert controller._batch_run_context["pending_init_applied"] is True
+    assert _batch_policy_context(controller).pending_init_applied is True
     mw._arm_pending_init_result_invalidation_guard.assert_called_once_with(rewrite="reaction: A -> B; k=1")
     controller._queue_slider_plot_update.assert_called_once()
 
@@ -10693,19 +9928,7 @@ def test_on_simulation_complete_writes_cache_identity_from_simulation_plan(
     controller._latest_sim_request_id = 1
     controller._active_run_id = 2
     controller._queue_slider_plot_update = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "queue_names": ["set1"],
-        "queue_ids": ["id1"],
-        "cache_key": "ck",
-        "primary_set_id": "id1",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-        "simulation_plan_by_set_id": {"id1": plan_payload},
-        "simulation_identity_by_set_id": {"id1": stale_context_identity},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, queue_names=["set1"], queue_ids=["id1"], cache_key="ck", primary_set_id="id1", pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={"id1": plan_payload}, simulation_identity_by_set_id={"id1": stale_context_identity})
 
     controller._on_simulation_complete(
         _successful_result_payload(),
@@ -10717,7 +9940,7 @@ def test_on_simulation_complete_writes_cache_identity_from_simulation_plan(
         cache_key="ck",
     )
 
-    payload = controller.batch_cache.result_cache.get("ck::id1")
+    payload = controller.batch_cache.entry_for_set(cache_key="ck", set_id="id1", is_preview=False).entry
     assert isinstance(payload, dict)
     assert payload["simulation_identity"] == plan_identity
 
@@ -10762,19 +9985,7 @@ def test_on_simulation_complete_uses_plan_identity_after_batch_set_id_fallback(
     controller._latest_sim_request_id = 1
     controller._active_run_id = 2
     controller._queue_slider_plot_update = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "queue_names": ["set1"],
-        "queue_ids": ["id1"],
-        "cache_key": "ck",
-        "primary_set_id": "id1",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-        "simulation_plan_by_set_id": {"id1": plan_payload},
-        "simulation_identity_by_set_id": {"id1": stale_context_identity},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, queue_names=["set1"], queue_ids=["id1"], cache_key="ck", primary_set_id="id1", pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={"id1": plan_payload}, simulation_identity_by_set_id={"id1": stale_context_identity})
 
     controller._on_simulation_complete(
         _successful_result_payload(),
@@ -10786,7 +9997,7 @@ def test_on_simulation_complete_uses_plan_identity_after_batch_set_id_fallback(
         cache_key="ck",
     )
 
-    payload = controller.batch_cache.result_cache.get("ck::id1")
+    payload = controller.batch_cache.entry_for_set(cache_key="ck", set_id="id1", is_preview=False).entry
     assert isinstance(payload, dict)
     assert payload["simulation_identity"] == plan_identity
 
@@ -10868,7 +10079,7 @@ def test_on_simulation_error_non_cancelled_explicit_requeues_preserved_pending_s
 
     controller._latest_sim_request_id = 5
     controller._active_run_id = 3
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": False, "request_id": 5}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=5)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -10914,13 +10125,7 @@ def test_on_simulation_error_ignores_stale_runtime_input_epoch_before_ui_publica
     controller._latest_sim_request_id = 5
     controller._active_run_id = 3
     controller._authoritative_runtime_input_epoch = 2
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 5,
-        "runtime_input_epoch": 1,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=5, runtime_input_epoch=1)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -10937,7 +10142,7 @@ def test_on_simulation_error_ignores_stale_runtime_input_epoch_before_ui_publica
 
     critical.assert_not_called()
     assert mw._status_label.text != "Simulation failed"
-    assert controller._batch_run_context["active"] is True
+    assert _batch_policy_context(controller).active is True
     assert controller._simulation_running is True
 
 
@@ -10954,23 +10159,22 @@ def test_scoped_runtime_input_supersede_rejects_affected_completion_but_accepts_
     controller._authoritative_runtime_input_epoch = 2
     controller._authoritative_runtime_input_global_epoch = 0
     controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
-    base_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 5,
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 1, "id2": 0},
-        "cache_key": "ck",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "rows": [0, 1],
-        "pos": 0,
-        "total": 2,
-        "primary_set_id": "id1",
-    }
-
-    controller._batch_run_context = dict(base_context)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        primary_set_id="id1",
+    )
     controller._on_simulation_complete(
         _successful_result_payload(),
         run_id=3,
@@ -10982,8 +10186,26 @@ def test_scoped_runtime_input_supersede_rejects_affected_completion_but_accepts_
     )
     mw.set_data.assert_not_called()
     assert "ck::id1" not in controller.batch_cache.result_cache
+    state = controller.batch_context_owner.completion_state()
+    assert state is not None
+    assert state.active is True
 
-    controller._batch_run_context = dict(base_context, pos=1, primary_set_id="id2")
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=1,
+        total=2,
+        primary_set_id="id2",
+    )
     controller._on_simulation_complete(
         _successful_result_payload(),
         run_id=3,
@@ -11010,17 +10232,17 @@ def test_scoped_runtime_input_supersede_rejects_affected_error_but_surfaces_unaf
     controller._authoritative_runtime_input_epoch = 2
     controller._authoritative_runtime_input_global_epoch = 0
     controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
-    base_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 5,
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 1, "id2": 0},
-    }
     mw.message_box_critical = MagicMock()
 
-    controller._batch_run_context = dict(base_context)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0},
+    )
     controller._on_simulation_error(
         "affected boom",
         run_id=3,
@@ -11031,10 +10253,18 @@ def test_scoped_runtime_input_supersede_rejects_affected_error_but_surfaces_unaf
         cache_key="ck",
     )
     mw.message_box_critical.assert_not_called()
-    assert controller._batch_run_context["active"] is True
+    assert _batch_policy_context(controller).active is True
     assert controller._simulation_running is True
 
-    controller._batch_run_context = dict(base_context)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0},
+    )
     controller._on_simulation_error(
         "unaffected boom",
         run_id=3,
@@ -11060,17 +10290,17 @@ def test_global_authoritative_supersede_rejects_unaffected_completion_and_error(
     controller._authoritative_runtime_input_epoch = 2
     controller._authoritative_runtime_input_global_epoch = 2
     controller._authoritative_runtime_input_set_epoch_by_set_id = {}
-    context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": 5,
-        "runtime_input_global_epoch": 1,
-        "runtime_input_set_epoch_by_set_id": {"id2": 0},
-    }
     mw.message_box_critical = MagicMock()
 
-    controller._batch_run_context = dict(context)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=1,
+        runtime_input_set_epoch_by_set_id={"id2": 0},
+    )
     controller._on_simulation_complete(
         _successful_result_payload(),
         run_id=3,
@@ -11083,7 +10313,15 @@ def test_global_authoritative_supersede_rejects_unaffected_completion_and_error(
     mw.set_data.assert_not_called()
     assert "ck::id2" not in controller.batch_cache.result_cache
 
-    controller._batch_run_context = dict(context)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=5,
+        runtime_input_global_epoch=1,
+        runtime_input_set_epoch_by_set_id={"id2": 0},
+    )
     controller._on_simulation_error(
         "global stale boom",
         run_id=3,
@@ -11107,7 +10345,7 @@ def test_on_simulation_error_non_cancelled_explicit_replays_existing_owned_pendi
 
     controller._latest_sim_request_id = 5
     controller._active_run_id = 3
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": False, "request_id": 5}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=5)
     controller._simulation_running = True
     controller._slider_simulation_active = False
     controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
@@ -11154,7 +10392,7 @@ def test_on_simulation_error_surfaces_stack_trace_as_dialog_details_and_log(
         epoch=1,
         target_set_ids=("id1",),
     )
-    controller._batch_run_context = {"active": True, "parallel": False, "fast_mode": True, "request_id": 5}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=True, request_id=5)
     controller._simulation_running = True
     controller._slider_simulation_active = True
 
@@ -11228,24 +10466,7 @@ def test_parallel_batch_stale_runtime_input_error_is_consumed_without_failure_pu
     controller._batch_cache.active_cache_key = "ck"
     controller._batch_cache.active_cache_valid_set_ids = ("id1", "id2")
     controller._batch_cache.active_cache_invalidated_set_ids = None
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "fast_mode": False,
-        "run_id": 1,
-        "request_id": 2,
-        "cache_key": "ck",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "total": 2,
-        "completed_set_ids": [],
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 0, "id2": 0},
-        "explicit_cache_valid_set_ids": ("id1", "id2"),
-        "explicit_cache_invalidated_set_ids": None,
-        "pending_workspace_reset_set_ids": ["id1", "id2"],
-        "pending_dirty_reset_generation_by_set_id": {"id1": 1, "id2": 2},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False, run_id=1, request_id=2, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], total=2, completed_set_ids=[], runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 0}, explicit_cache_valid_set_ids=("id1", "id2"), explicit_cache_invalidated_set_ids=None, pending_workspace_reset_set_ids=["id1", "id2"], pending_dirty_reset_generation_by_set_id={"id1": 1, "id2": 2})
     mw._dirty_state_generations = {"id1": 1, "id2": 2}
     controller._on_simulation_error = MagicMock()
     mw.message_box_critical = MagicMock()
@@ -11263,12 +10484,16 @@ def test_parallel_batch_stale_runtime_input_error_is_consumed_without_failure_pu
     )
 
     assert ok is True
-    ctx = dict(controller._batch_run_context)
-    assert ctx["completed_set_ids"] == ["id1"]
-    assert "failed_set_ids" not in ctx
-    assert "failed_set_errors" not in ctx
-    assert ctx["pending_workspace_reset_set_ids"] == ["id2"]
-    assert ctx["pending_dirty_reset_generation_by_set_id"] == {"id2": 2}
+    state = controller.batch_context_owner.completion_state()
+    assert state is not None
+    assert state.completed_set_ids == ("id1",)
+    summary = controller.batch_context_owner.completion_summary()
+    assert summary.failed_set_ids == ()
+    assert summary.failed_errors == {}
+    policy_context = controller.batch_context_owner.completion_policy_context()
+    assert policy_context is not None
+    assert policy_context.pending_workspace_reset_set_ids == ("id2",)
+    assert policy_context.pending_dirty_reset_generation_by_set_id == {"id2": 2}
     assert controller._batch_cache.active_cache_valid_set_ids == ("id1", "id2")
     assert controller._batch_cache.active_cache_invalidated_set_ids is None
     controller._on_simulation_error.assert_not_called()
@@ -11292,8 +10517,9 @@ def test_parallel_batch_stale_runtime_input_error_is_consumed_without_failure_pu
 
     mw.reset_mechanism_workspaces.assert_called_once_with(["id2"])
     mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id2"])
-    assert controller._batch_run_context["pending_workspace_reset_set_ids"] == []
-    assert controller._batch_run_context["pending_dirty_reset_generation_by_set_id"] == {}
+    pending_reset_state = controller.batch_context_owner.pending_dirty_reset_state()
+    assert pending_reset_state.set_ids == ()
+    assert pending_reset_state.generation_by_set_id == {}
 
 
 @pytest.mark.unit
@@ -11315,20 +10541,7 @@ def test_parallel_batch_all_stale_runtime_input_callbacks_finish_run_cleanly(
     mw._stop_btn.setEnabled(True)
     mw._sim_progress.setValue(42)
     mw._status_label.setText("Running 1 set in parallel")
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "fast_mode": False,
-        "run_id": 1,
-        "request_id": 2,
-        "cache_key": "ck",
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "total": 1,
-        "completed_set_ids": [],
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False, run_id=1, request_id=2, cache_key="ck", queue_ids=["id1"], queue_names=["set1"], total=1, completed_set_ids=[], runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0})
     controller.queue_pending_slider_preview_replay(target_set_ids=("id2",), request_id=9)
     controller._on_simulation_error = MagicMock()
     mw.message_box_critical = MagicMock()
@@ -11345,7 +10558,7 @@ def test_parallel_batch_all_stale_runtime_input_callbacks_finish_run_cleanly(
     )
 
     assert ok is True
-    assert controller._batch_run_context["active"] is False
+    assert _batch_policy_context(controller).active is False
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
     assert mw._run_btn.isEnabled() is True
@@ -11380,20 +10593,7 @@ def test_parallel_batch_multiset_all_stale_runtime_input_callbacks_finish_run_cl
     mw._stop_btn.setEnabled(True)
     mw._sim_progress.setValue(42)
     mw._status_label.setText("Running 2 sets in parallel")
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "fast_mode": False,
-        "run_id": 1,
-        "request_id": 2,
-        "cache_key": "ck",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "total": 2,
-        "completed_set_ids": [],
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 0, "id2": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False, run_id=1, request_id=2, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], total=2, completed_set_ids=[], runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 0})
     controller._on_simulation_error = MagicMock()
     mw.message_box_critical = MagicMock()
 
@@ -11408,7 +10608,7 @@ def test_parallel_batch_multiset_all_stale_runtime_input_callbacks_finish_run_cl
         source="test",
     ) is True
 
-    assert controller._batch_run_context["active"] is True
+    assert _batch_policy_context(controller).active is True
     assert controller._simulation_running is True
     assert mw._status_label.text == "Running 2 sets in parallel"
 
@@ -11423,9 +10623,12 @@ def test_parallel_batch_multiset_all_stale_runtime_input_callbacks_finish_run_cl
         source="test",
     ) is True
 
-    assert controller._batch_run_context["active"] is False
-    assert sorted(controller._batch_run_context["completed_set_ids"]) == ["id1", "id2"]
-    assert "failed_set_ids" not in controller._batch_run_context
+    assert _batch_policy_context(controller).active is False
+    policy_context = controller.batch_context_owner.completion_policy_context()
+    summary = controller.batch_context_owner.completion_summary()
+    assert policy_context is not None
+    assert policy_context.completed_set_ids == ("id1", "id2")
+    assert summary.failed_set_ids == ()
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
     assert mw._run_btn.isEnabled() is True
@@ -11454,27 +10657,7 @@ def test_scoped_runtime_input_supersede_preserves_unaffected_serial_queue_tail(
     controller._simulation_running = True
     controller._slider_simulation_active = False
     mw._batch_initials_for_row.side_effect = lambda row: {0: {"A": 1.0}, 1: {"A": 2.0}}[int(row)]
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "run_id": 3,
-        "request_id": 5,
-        "cache_key": "ck",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "rows": [0, 1],
-        "pos": 0,
-        "total": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "completed_set_ids": [],
-        "pending_workspace_reset_set_ids": ["id1", "id2"],
-        "pending_dirty_reset_generation_by_set_id": {"id1": 1, "id2": 2},
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 1, "id2": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, run_id=3, request_id=5, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], rows=[0, 1], pos=0, total=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, completed_set_ids=[], pending_workspace_reset_set_ids=["id1", "id2"], pending_dirty_reset_generation_by_set_id={"id1": 1, "id2": 2}, runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0})
 
     controller._supersede_active_work_for_authoritative_mechanism_transition(
         epoch=2,
@@ -11482,11 +10665,14 @@ def test_scoped_runtime_input_supersede_preserves_unaffected_serial_queue_tail(
     )
 
     assert active_worker._cancelled is True
-    assert controller._batch_run_context["active"] is True
-    assert controller._batch_run_context["pos"] == 1
-    assert controller._batch_run_context["completed_set_ids"] == ["id1"]
-    assert controller._batch_run_context["pending_workspace_reset_set_ids"] == ["id2"]
-    assert controller._batch_run_context["pending_dirty_reset_generation_by_set_id"] == {"id2": 2}
+    assert _batch_policy_context(controller).active is True
+    assert _batch_policy_context(controller).pos == 1
+    completion_state = controller.batch_context_owner.completion_state()
+    assert completion_state is not None
+    assert completion_state.completed_set_ids == ("id1",)
+    pending_reset_state = controller.batch_context_owner.pending_dirty_reset_state()
+    assert pending_reset_state.set_ids == ("id2",)
+    assert pending_reset_state.generation_by_set_id == {"id2": 2}
     assert scheduled == [controller._start_next_batch_simulation]
 
     scheduled[0]()
@@ -11514,31 +10700,17 @@ def test_start_next_batch_simulation_stale_serial_tail_uses_completion_cleanup(
     mw._dirty_state_generations = {"id1": 1, "id2": 2}
     mw.reset_mechanism_workspaces.return_value = True
     mw.discard_concentration_overlays_for_set_ids.return_value = True
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "run_id": 3,
-        "request_id": 5,
-        "cache_key": "ck",
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "rows": [0, 1],
-        "pos": 1,
-        "total": 2,
-        "completed_set_ids": ["id1"],
-        "pending_workspace_reset_set_ids": ["id1", "id2"],
-        "pending_dirty_reset_generation_by_set_id": {"id1": 1, "id2": 2},
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {"id1": 0, "id2": 0},
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, run_id=3, request_id=5, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], rows=[0, 1], pos=1, total=2, completed_set_ids=["id1"], pending_workspace_reset_set_ids=["id1", "id2"], pending_dirty_reset_generation_by_set_id={"id1": 1, "id2": 2}, runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 0})
 
     controller._start_next_batch_simulation()
 
-    assert controller._batch_run_context["active"] is False
-    assert controller._batch_run_context["completed_set_ids"] == ["id1", "id2"]
-    assert controller._batch_run_context["pending_workspace_reset_set_ids"] == []
-    assert controller._batch_run_context["pending_dirty_reset_generation_by_set_id"] == {}
+    assert _batch_policy_context(controller).active is False
+    policy_context = controller.batch_context_owner.completion_policy_context()
+    assert policy_context is not None
+    assert policy_context.completed_set_ids == ("id1", "id2")
+    pending_reset_state = controller.batch_context_owner.pending_dirty_reset_state()
+    assert pending_reset_state.set_ids == ()
+    assert pending_reset_state.generation_by_set_id == {}
     mw.reset_mechanism_workspaces.assert_called_once_with(["id1"])
     mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["id1"])
     assert controller._simulation_running is False
@@ -11646,9 +10818,10 @@ def test_run_simulation_internal_non_fast_mode_does_not_build_prepared_payloads(
     # Explicit run: fast_mode=False
     controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    prepared_by_set_id = controller._batch_run_context.get("prepared_by_set_id", {})
+    execution_state = controller.batch_context_owner.execution_payload_state()
+    prepared_by_set_id = execution_state.prepared_by_set_id
     assert prepared_by_set_id == {}
-    assert controller._batch_run_context.get("prepared") is None
+    assert execution_state.prepared is None
     assert created_runtimes == []
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
@@ -11730,9 +10903,7 @@ def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
 
     controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    simulation_plan_by_set_id = controller._batch_run_context.get("simulation_plan_by_set_id", {})
-    assert "execution_request" not in controller._batch_run_context
-    assert "execution_request_by_set_id" not in controller._batch_run_context
+    simulation_plan_by_set_id = controller.batch_context_owner.execution_payload_state().simulation_plan_by_set_id
     assert "id1" in simulation_plan_by_set_id
     plan = SimulationPlan.from_payload(simulation_plan_by_set_id["id1"])
     request = plan.to_execution_request().to_payload()
@@ -11840,9 +11011,7 @@ def test_run_simulation_internal_non_fast_mode_multiset_plans_do_not_inherit_pri
 
     controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0, 1], reuse_parallel_lane_pool=False)
 
-    assert "execution_request" not in controller._batch_run_context
-    assert "execution_request_by_set_id" not in controller._batch_run_context
-    plan_by_set_id = controller._batch_run_context.get("simulation_plan_by_set_id", {})
+    plan_by_set_id = controller.batch_context_owner.execution_payload_state().simulation_plan_by_set_id
     request_id1 = SimulationPlan.from_payload(plan_by_set_id["id1"]).to_execution_request().to_payload()
     request_id2 = SimulationPlan.from_payload(plan_by_set_id["id2"]).to_execution_request().to_payload()
     assert request_id1["prepared_payload"] is None
@@ -11888,29 +11057,9 @@ def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=1"},
-        "mechanism_signature": "sig",
-        "mechanism_signature_by_set_id": {"id1": "sig-1"},
-        "prepared": None,
-        "prepared_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"}, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, prepared=None, prepared_by_set_id={
             "id1": {"prepared_for": "id1", "version": 1},
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,  # explicit run
-        "request_id": 42,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=42, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -11968,23 +11117,7 @@ def test_start_next_batch_simulation_non_fast_mode_sets_plan_only_execution_boun
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "simulation_plan_by_set_id": {"id1": plan_payload},
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 42,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={"id1": plan_payload}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=42, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -12031,28 +11164,9 @@ def test_start_parallel_batch_simulations_submits_simulation_plan_payload(
         _RecordingLanePool(submitted_tasks),
         max_lanes=2,
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "run_id": 101,
-        "effective_workers": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "simulation_plan_by_set_id": {"id1": plan_payload},
-        "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=1"},
-        "mechanism_signature_by_set_id": {"id1": "sig"},
-        "simulation_identity_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["set1"], run_id=101, effective_workers=2, full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={"id1": plan_payload}, mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"}, mechanism_signature_by_set_id={"id1": "sig"}, simulation_identity_by_set_id={
             "id1": {"schema_id": "schema", "param_fingerprint": "fingerprint"}
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 42,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=42, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -12083,28 +11197,9 @@ def test_start_parallel_batch_simulations_fast_fallback_submits_preview_plan_wit
         _RecordingLanePool(submitted_tasks),
         max_lanes=2,
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "run_id": 101,
-        "effective_workers": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "simulation_plan_by_set_id": {},
-        "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=4"},
-        "mechanism_signature_by_set_id": {"id1": "sig"},
-        "simulation_identity_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["set1"], run_id=101, effective_workers=2, full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={}, mechanism_text_by_set_id={"id1": "reaction: A -> B; k=4"}, mechanism_signature_by_set_id={"id1": "sig"}, simulation_identity_by_set_id={
             "id1": {"schema_id": "schema", "param_fingerprint": "fingerprint"}
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 42,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=42, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -12163,28 +11258,9 @@ def test_start_parallel_batch_simulations_fast_existing_gui_plan_submits_batch_p
         _RecordingLanePool(submitted_tasks),
         max_lanes=2,
     )
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id1"],
-        "queue_names": ["set1"],
-        "run_id": 101,
-        "effective_workers": 2,
-        "full_dsl": "reaction: A -> B; k=1",
-        "simulation_plan_by_set_id": {"id1": plan_payload},
-        "mechanism_text_by_set_id": {"id1": "reaction: A -> B; k=4"},
-        "mechanism_signature_by_set_id": {"id1": "sig"},
-        "simulation_identity_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["set1"], run_id=101, effective_workers=2, full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={"id1": plan_payload}, mechanism_text_by_set_id={"id1": "reaction: A -> B; k=4"}, mechanism_signature_by_set_id={"id1": "sig"}, simulation_identity_by_set_id={
             "id1": {"schema_id": "schema", "param_fingerprint": "fingerprint"}
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 42,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=42, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -12242,16 +11318,7 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
         "mechanism_text": "reaction: A -> B; k=2",
         "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
     }
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 1,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "primary_set_id": "id1",
-        "full_dsl": "reaction: A -> B; k=1",
-        "simulation_plan_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=1, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={
             "id2": SimulationPlan.from_execution_request(
                 request_payload,
                 execution_mode="explicit",
@@ -12259,15 +11326,7 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
                 cache_identity_payload={"cache_key": "explicit-cache"},
                 metadata={"set_id": "id2", "set_name": "set2", "fast_mode": False},
             ).to_payload(),
-        },
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 42,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=42, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "ordinary-owner"
@@ -12323,29 +11382,9 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
     mw.preview_initials_for_row = MagicMock(return_value={"A": 4.0})
     mw._slider_overrides = {}
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 1,
-        "rows": [0, 1],
-        "queue_ids": ["id1", "id2"],
-        "queue_names": ["set1", "set2"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_text_by_set_id": {"id2": "reaction: A -> B; k=3"},
-        "mechanism_signature_by_set_id": {"id2": "sig-3"},
-        "simulation_identity_by_set_id": {
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=1, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={"id2": "reaction: A -> B; k=3"}, mechanism_signature_by_set_id={"id2": "sig-3"}, simulation_identity_by_set_id={
             "id2": {"schema_id": "schema-b", "param_fingerprint": "fingerprint-b"}
-        },
-        "simulation_plan_by_set_id": {},
-        "prepared_by_set_id": {},
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": True,
-        "request_id": 12,
-        "cache_key": "slider-cache",
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+        }, simulation_plan_by_set_id={}, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=12, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "preview-owner"
@@ -12456,12 +11495,11 @@ def test_run_simulation_internal_energy_mode_builds_simulation_plans(
 
     controller._run_simulation_internal(fast_mode=False, request_id=99, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    prepared_by_set_id = controller._batch_run_context.get("prepared_by_set_id", {})
-    simulation_plan_by_set_id = controller._batch_run_context.get("simulation_plan_by_set_id", {})
+    execution_state = controller.batch_context_owner.execution_payload_state()
+    prepared_by_set_id = execution_state.prepared_by_set_id
+    simulation_plan_by_set_id = execution_state.simulation_plan_by_set_id
 
     assert prepared_by_set_id == {}
-    assert "execution_request" not in controller._batch_run_context
-    assert "execution_request_by_set_id" not in controller._batch_run_context
     request = SimulationPlan.from_payload(simulation_plan_by_set_id["id1"]).to_execution_request().to_payload()
     assert request["prepared_payload"] is None
     mw._prepare_slider_runtime.assert_not_called()
@@ -12501,22 +11539,7 @@ def test_start_next_batch_simulation_explicit_run_ignores_staged_concentration_o
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
     controller._release_current_simulation_worker = MagicMock()
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "pos": 0,
-        "rows": [0],
-        "queue_ids": ["id2"],
-        "queue_names": ["set2"],
-        "full_dsl": "reaction: A -> B; k=1",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "fast_mode": False,
-        "request_id": 7,
-        "cache_key": "explicit-cache",
-        "pending_init_seed": {},
-            "pending_init_applied": True,
-        }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id2"], queue_names=["set2"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -12542,23 +11565,7 @@ def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentrat
     )
     controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "rows": [0],
-        "queue_ids": ["id2"],
-        "queue_names": ["set2"],
-        "run_id": 3,
-        "request_id": 11,
-        "full_dsl": "reaction: A -> B; k=1",
-        "mechanism_signature": "sig",
-        "solver_config": {"solver": "BDF"},
-        "t_end": 10.0,
-        "effective_workers": 2,
-        "fast_mode": False,
-        "pending_init_seed": {},
-        "pending_init_applied": True,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id2"], queue_names=["set2"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -12616,7 +11623,7 @@ def test_explicit_run_worker_error_preserves_targeted_dirty_workspaces(
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
+    assert controller.batch_context_owner.pending_dirty_reset_state().set_ids == ("id1",)
     mw.reset_mechanism_workspaces.assert_not_called()
     mw.discard_concentration_overlays_for_set_ids.assert_not_called()
     mw.discard_concentration_overlays_for_rows.assert_not_called()
@@ -12681,7 +11688,7 @@ def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_a
 
     controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    assert controller._batch_run_context.get("pending_workspace_reset_set_ids") == ["id1"]
+    assert controller.batch_context_owner.pending_dirty_reset_state().set_ids == ("id1",)
     mw._batch_set_id_for_row.side_effect = lambda row: {0: "id2", 1: "id1"}.get(int(row))
 
     controller._on_simulation_complete(

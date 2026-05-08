@@ -10,6 +10,9 @@ These tests ensure that:
 
 from __future__ import annotations
 
+from pathlib import Path
+import re
+
 import numpy as np
 import pytest
 
@@ -19,6 +22,50 @@ from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 from kindred.io.resources import get_all_example_specs, get_resource_text
 
 pytestmark = pytest.mark.integration
+
+
+_DOC_INTERVENTION_EXAMPLE_RE = re.compile(
+    r"<!--\s*kindred-test:\s*intervention-example\s*-->\s*```text\n(?P<body>.*?)\n```",
+    re.DOTALL,
+)
+
+
+def _run_scheduled_doc_example(text: str):
+    mechanism = parse_dsl_to_mechanism(text)
+    rhs = build_ode_rhs_from_mechanism(mechanism)
+    species_names = mechanism.species_names()
+    y0 = np.asarray([mechanism.species[name].initial_conc for name in species_names], dtype=float)
+    request = SimulationRequest(
+        rhs=rhs,
+        t_span=(0.0, 4.0),
+        y0=y0,
+        solver="BDF",
+        grid={"N": 9},
+        species_names=tuple(species_names),
+        intervention_schedule=mechanism.metadata.get("intervention_schedule"),
+    )
+    return solve_ode(request)
+
+
+def test_dsl_reference_intervention_examples_are_executable() -> None:
+    reference = Path("DSL_REFERENCE.md").read_text(encoding="utf-8")
+    examples = [match.group("body").strip() for match in _DOC_INTERVENTION_EXAMPLE_RE.finditer(reference)]
+
+    assert examples, "DSL_REFERENCE.md must include executable intervention examples."
+
+    for example in examples:
+        result = _run_scheduled_doc_example(example)
+        assert result.provenance["has_intervention_schedule"] is True
+        assert result.t.size > 0
+        assert result.Y.shape[1] == result.t.size
+
+
+def test_dsl_reference_describes_schedule_annotations_as_optional_display_aids() -> None:
+    reference = Path("DSL_REFERENCE.md").read_text(encoding="utf-8")
+
+    assert "off by default" in reference
+    assert "Show Intervention Schedule Annotations" in reference
+    assert "display truth" in reference
 
 
 

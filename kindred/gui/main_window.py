@@ -15,15 +15,13 @@ import warnings
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Sequence, TYPE_CHECKING, Mapping
 from collections import OrderedDict
-from collections.abc import MutableMapping
 import math
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 
 from kindred import __version__ as KINDRED_VERSION
-from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 from kindred.core.mechanism_runtime_transition import (
     AuthoritativeMechanismSnapshot,
@@ -39,8 +37,6 @@ from kindred.core.simulator.dsl_text_update import (
     step_rewrite_block_reason,
 )
 from kindred.core.validation import try_parse_finite_float
-from kindred.gui.controllers.cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
-from kindred.gui.controllers.simulation_completion_policy import pending_initial_seed_for_set
 from kindred.gui.project_schema import (
     FITTING_DEFAULTS_KEYS,
     PROJECT_DEFAULTS,
@@ -50,7 +46,6 @@ from kindred.gui.project_schema import (
 if TYPE_CHECKING:
     from kindred.core.mechanism import Mechanism
     from kindred.core.simulation_preparation import BoundMechanism
-    from kindred.gui.controllers.results_controller import ResolvedBatchSelectionEntry
     from kindred.gui.controllers.simulation_controller import SimulationController
     from kindred.gui.ports import SimulationUiPorts
     from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableView
@@ -74,6 +69,13 @@ from kindred.gui.diagnostics import record_best_effort_failure as record_gui_bes
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.mechanism_session_owner import MechanismSessionOwner
 from kindred.gui.main_window_preview_session import MainWindowPreviewSession
+from kindred.gui.simulation_batch_owner import SimulationBatchOwner
+from kindred.gui.simulation_dialogs import SimulationDialogs
+from kindred.gui.simulation_mechanism_owner import SimulationMechanismOwner
+from kindred.gui.simulation_provenance_owner import SimulationProvenanceOwner
+from kindred.gui.simulation_run_ui_owner import SimulationRunUiOwner
+from kindred.gui.simulation_settings_owner import SimulationSettingsOwner
+from kindred.gui.simulation_solver_owner import SimulationSolverOwner
 from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.mixins.ports import FittingMixinPorts, ProfileMixinPorts
 from kindred.gui.mixins.fitting_mixin import FittingMixin
@@ -158,11 +160,13 @@ class MainWindow(
     ):
         super().__init__()
         self._init_cli_args(profile=profile, solver=solver, rtol=rtol, atol=atol)
+        self._settings_owner = SimulationSettingsOwner()
         self._init_simulation_plumbing_and_state()
         self._init_batch_initial_conditions()
         self._init_settings_and_controllers()
         self._init_profile_and_template_managers()
         self._init_window_shell()
+        self._init_simulation_controller()
         self._init_mechanism_dock_and_panel()
         self._init_sliders_dock()
         self._init_batch_dock_and_panel()
@@ -216,25 +220,48 @@ class MainWindow(
 
     def _init_simulation_plumbing_and_state(self) -> None:
         self._preview_session = MainWindowPreviewSession(self)
+        self._simulation_dialogs = SimulationDialogs(self)
+        self._simulation_run_ui_owner = SimulationRunUiOwner(
+            schedule_runtime_availability_refresh=self._schedule_simulation_runtime_availability_refresh,
+            results_table_getter=lambda: getattr(self, "_results_table", None),
+        )
         self._variable_runtime = MainWindowVariableRuntime(self)
         self._mechanism_helpers = MainWindowMechanismHelpers(self)
+        self._simulation_mechanism_owner = SimulationMechanismOwner(
+            mechanism_session_owner_getter=lambda: getattr(self, "_mechanism_session_owner", None),
+            mechanism_editor_getter=lambda: getattr(self, "_mechanism_editor", None),
+            preview_session=self._preview_session,
+            variable_runtime=self._variable_runtime,
+            mechanism_locked_getter=self.mechanism_editing_locked,
+            try_lock_mechanism_editor=self._try_lock_mechanism_editor,
+            apply_overrides_to_text=self._apply_overrides_to_text,
+            apply_overrides_to_state_network_dsl=self._apply_overrides_to_state_network_dsl,
+            apply_parameter_overrides_to_dsl=self._apply_parameter_overrides_to_dsl,
+        )
+        self._simulation_solver_owner = SimulationSolverOwner(
+            initial_solver_getter=lambda: self._initial_solver,
+            initial_rtol_getter=lambda: self._initial_rtol,
+            initial_atol_getter=lambda: self._initial_atol,
+            temperature_getter=lambda: float(self._temperature_spinbox.value()),
+            num_points_getter=lambda: int(self._num_points_spinbox.value()),
+            sim_time_text_getter=lambda: str(self._sim_time_spinbox.text()),
+            parse_sim_time_seconds=self._parse_sim_time_seconds,
+            dsl_global_temperature_getter=self._dsl_global_temperature_K,
+            sparse_jacobian_getter=lambda: self._use_sparse_jacobian,
+            wegscheider_cyclicity_getter=lambda: self._wegscheider_cyclicity_enabled,
+        )
+        self._last_fit_metadata: Optional[Dict[str, Any]] = None
+        self._simulation_provenance_owner = SimulationProvenanceOwner(
+            dataset_snapshot_getter=self._snapshot_datasets,
+            fit_metadata_getter=lambda: self._last_fit_metadata,
+        )
         self._mechanism_runtime_transition = MechanismRuntimeTransitionService()
         self._authoritative_mechanism_runtime_refresh_defer_depth = 0
         self._suppress_canonical_batch_initials_transition = False
         self._pending_canonical_batch_initials_changed_set_ids: list[str] | None = None
 
-        # Simulation execution, batch orchestration, caching, and worker lifecycle.
-        plumbing = build_simulation_plumbing(self)
-        self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
-        self._sim_controller = plumbing.controller
-
         # Fitting state.
         self._last_fit_result = None
-
-        # Provenance tracking for the last simulation.
-        self._last_simulation_provenance = {}
-        self._last_simulation_ctc = {}
-        self._last_fit_metadata: Optional[Dict[str, Any]] = None
 
         # Best-effort failure recording (GUI hardening).
         self._best_effort_failures: set[str] = set()
@@ -249,18 +276,46 @@ class MainWindow(
         self._fitting_defaults: Dict[str, object] = {}
         self._last_batch_results: List[Dict[str, Any]] = []
         self._advanced_dsl_enabled = True  # Physics-aware DSL is always active.
-        self._simulation_runtime_run_ready = True
         self._simulation_runtime_preview_ready = True
-        self._run_button_requested_enabled = True
 
         # Registry of actions that support customizable shortcuts.
         self._shortcut_actions: Dict[str, Dict[str, Any]] = {}
+
+    def _init_simulation_controller(self) -> None:
+        # Simulation execution, batch orchestration, caching, and worker lifecycle.
+        plumbing = build_simulation_plumbing(self)
+        self._sim_ui_port: SimulationUiPorts = plumbing.ui_port
+        self._sim_controller = plumbing.controller
 
     def _init_batch_initial_conditions(self) -> None:
         # Batch initial conditions (source-of-truth for initials after first migration).
         batch_components = build_batch_initial_conditions(self)
         self._batch_store = batch_components.store
         self._batch_model = batch_components.model
+        self._simulation_batch_owner = SimulationBatchOwner(
+            batch_rows_for_scope=self._batch_rows_for_scope,
+            batch_set_ids_for_scope=self._batch_set_ids_for_scope,
+            shown_batch_set_ids=self._shown_batch_set_ids,
+            slider_edit_target_set_ids=self._slider_edit_target_set_ids,
+            focused_batch_set_id=self._focused_batch_set_id_value,
+            batch_current_row=self._batch_current_row,
+            batch_set_id_for_row=self._batch_set_id_for_row,
+            batch_set_name_for_id=self._batch_set_name_for_id,
+            batch_set_id_for_name=self._batch_set_id_for_name,
+            batch_preferred_primary_set_id=self._batch_preferred_primary_set_id,
+            batch_cache_key=self._batch_cache_key,
+            batch_cache_getter=lambda: self._sim_controller.batch_cache,
+            batch_store=self._batch_store,
+            batch_model=self._batch_model,
+            batch_initials_for_row=self._batch_initials_for_row,
+            preview_session=self._preview_session,
+            mechanism_owner=self._simulation_mechanism_owner,
+            solver_owner=self._simulation_solver_owner,
+            results_controller_getter=lambda: self.results_controller,
+            set_status_text=self.set_status_text,
+            update_batch_row_controls_state=self._update_batch_row_controls_state,
+            sync_batch_species_columns=self._sync_batch_species_columns,
+        )
         self._batch_table: Optional[BatchInitialConditionsTableView] = None
         self._focused_batch_set_id = ""
         self._connected_batch_semantics_model = None
@@ -271,9 +326,6 @@ class MainWindow(
     def _init_settings_and_controllers(self) -> None:
         # Theme state.
         self._dark_mode = False  # Will be loaded from settings.
-
-        # Settings manager (QSettings instance).
-        self._settings = QSettings("Kindred", "KindredGUI")
 
         # Configuration persistence + settings-driven UI application.
         controllers = build_settings_and_controllers(self)
@@ -287,15 +339,6 @@ class MainWindow(
 
         # Undo/Redo stack for high-level operations.
         self._undo_stack = controllers.undo_stack
-
-    def settings_set_value(self, key: str, value: object) -> None:
-        self._settings.setValue(str(key), value)
-
-    def settings_remove(self, key: str) -> None:
-        self._settings.remove(str(key))
-
-    def settings_sync(self) -> None:
-        self._settings.sync()
 
     def _init_profile_and_template_managers(self) -> None:
         managers = build_profile_and_template_managers()
@@ -595,7 +638,7 @@ class MainWindow(
             displayed_dirty_preview_set_ids = []
             for set_id in dirty_preview_reset_set_ids:
                 try:
-                    if self._displayed_workspace_preview_provenance_matches_current_workspace(set_id=str(set_id)):
+                    if self._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(set_id=str(set_id)):
                         displayed_dirty_preview_set_ids.append(str(set_id))
                 except Exception:
                     continue
@@ -819,7 +862,7 @@ class MainWindow(
             self._sync_mechanism_session_owner_from_widgets(authoritative=False)
             if not owner.commit_edit_session():
                 return False
-        elif not self.is_mechanism_ready_for_run():
+        elif not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
             return False
         self._apply_authoritative_mechanism_transition()
         self._refresh_mechanism_edit_lock_ui()
@@ -838,17 +881,6 @@ class MainWindow(
             self._refresh_mechanism_edit_lock_ui()
             return True
         return self._force_lock_editor()
-
-    def auto_lock_for_run(self) -> bool:
-        if not self.mechanism_editing_locked():
-            return self._try_lock_mechanism_editor()
-        return True
-
-    def is_mechanism_ready_for_run(self) -> bool:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            return False
-        return bool(owner.is_ready_for_explicit_run())
 
     def is_mechanism_valid_for_preview(self) -> bool:
         owner = getattr(self, "_mechanism_session_owner", None)
@@ -993,7 +1025,7 @@ class MainWindow(
         if decision == "commit":
             self._on_commit_slider_overrides_clicked()
             if bool(preview.has_dirty_transaction()):
-                self.message_box_warning(
+                self._simulation_dialogs.message_box_warning(
                     "Pending Slider Changes",
                     f"{str(action_text)} was canceled because pending slider changes could not be applied.",
                 )
@@ -1002,7 +1034,7 @@ class MainWindow(
 
         self._discard_slider_transaction_for_invalidation()
         if bool(preview.has_dirty_transaction()):
-            self.message_box_warning(
+            self._simulation_dialogs.message_box_warning(
                 "Pending Slider Changes",
                 f"{str(action_text)} was canceled because pending slider changes could not be discarded.",
             )
@@ -1192,6 +1224,14 @@ class MainWindow(
         self._algebra_status_label = QtWidgets.QLabel("")
         self._algebra_status_label.setStyleSheet("QLabel { font-size: 10px; }")
         self._status_bar.addPermanentWidget(self._algebra_status_label)
+        self._simulation_run_ui_owner.bind_widgets(
+            run_button=self._run_btn,
+            stop_button=self._stop_btn,
+            progress=self._sim_progress,
+            status_label=self._status_label,
+            algebra_status_label=self._algebra_status_label,
+            mechanism_editor=self._mechanism_editor,
+        )
 
         # Temperature mode indicator in status bar.
         self._temperature_mode_indicator = QtWidgets.QLabel("Temperature: 298.15 K (isothermal)")
@@ -1287,9 +1327,7 @@ class MainWindow(
         self._set_runtime_backed_preview_controls_ready(bool(ready))
 
     def _set_runtime_backed_run_controls_ready(self, ready: bool) -> None:
-        ready_value = bool(ready)
-        self._simulation_runtime_run_ready = ready_value
-        self.set_run_button_enabled(bool(getattr(self, "_run_button_requested_enabled", True)))
+        self._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(bool(ready))
 
     def _set_runtime_backed_preview_controls_ready(self, ready: bool) -> None:
         ready_value = bool(ready)
@@ -1368,8 +1406,8 @@ class MainWindow(
             profiles_menu_getter=lambda: None,  # Hidden: Profiles menu removed from menu bar
             profile_indicator_setter=lambda text: self._profile_indicator.setText(str(text)),
             status_setter=lambda text: self._status_label.setText(str(text)),
-            settings_set_value=self.settings_set_value,
-            settings_remove=self.settings_remove,
+            settings_set_value=self._settings_owner.settings_set_value,
+            settings_remove=self._settings_owner.settings_remove,
             num_points_spinbox=self._num_points_spinbox,
             dark_mode_action=getattr(self, "_dark_mode_action", None),
             toggle_theme=self._toggle_theme,
@@ -1483,7 +1521,7 @@ class MainWindow(
 
             temperature_k = float(self._temperature_spinbox.value())
             units = UnitsModel(temperature_K=temperature_k)
-            wegscheider_enabled = bool(self.wegscheider_cyclicity_enabled())
+            wegscheider_enabled = bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled())
 
             def _build_structure_snapshot(full_dsl: str) -> object:
                 mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)
@@ -3398,226 +3436,6 @@ class MainWindow(
         self.show_simulation_tab()
         self.refresh_simulation_plot_views()
 
-    def _batch_cache_entry_matches_plot_payload(
-        self,
-        *,
-        entry: Optional[Mapping[str, Any]],
-        t: np.ndarray,
-        series: Mapping[str, Any],
-    ) -> bool:
-        if not isinstance(entry, Mapping):
-            return False
-        entry_t_payload = entry.get("t")
-        entry_t = np.asarray(entry_t_payload if entry_t_payload is not None else [], dtype=float).reshape(-1)
-        plot_t = np.asarray(t, dtype=float).reshape(-1)
-        if entry_t.size <= 0 or entry_t.shape != plot_t.shape:
-            return False
-        if not np.allclose(entry_t, plot_t, rtol=1e-9, atol=1e-12):
-            return False
-        entry_series_raw = entry.get("series") or {}
-        if not isinstance(entry_series_raw, Mapping):
-            return False
-        plot_series = {
-            str(species_name): np.asarray(values, dtype=float).reshape(-1)
-            for species_name, values in dict(series or {}).items()
-        }
-        entry_series = {
-            str(species_name): np.asarray(values, dtype=float).reshape(-1)
-            for species_name, values in dict(entry_series_raw).items()
-        }
-        if set(entry_series.keys()) != set(plot_series.keys()):
-            return False
-        for species_name, plot_values in plot_series.items():
-            entry_values = entry_series.get(str(species_name))
-            if entry_values is None or entry_values.shape != plot_values.shape:
-                return False
-            if not np.allclose(entry_values, plot_values, rtol=1e-9, atol=1e-12):
-                return False
-        return True
-
-    def _active_explicit_cache_entry_for_set(self, *, set_id: str) -> BatchCacheEntryReadResult:
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        if batch_cache is None or not active_cache_key:
-            return BatchCacheEntryReadResult("missing")
-        sid = str(set_id or "").strip()
-        if not sid:
-            return BatchCacheEntryReadResult("missing")
-        store_data = getattr(batch_cache.result_cache, "_data", batch_cache.result_cache)
-        direct = read_batch_cache_entry(
-            (store_data or {}).get(BatchSimulationCache.entry_key(active_cache_key, sid))
-        )
-        if direct.entry is not None:
-            return direct
-        set_name = self.batch_set_name_for_id(sid)
-        by_name = BatchCacheEntryReadResult("missing")
-        if set_name:
-            by_name = read_batch_cache_entry(
-                (store_data or {}).get(BatchSimulationCache.entry_key(active_cache_key, str(set_name)))
-            )
-            if by_name.entry is not None:
-                return by_name
-        if direct.state == "invalid" or by_name.state == "invalid":
-            return BatchCacheEntryReadResult("invalid")
-        return BatchCacheEntryReadResult("missing")
-
-    def _current_workspace_preview_identity_payload(self, *, set_id: str) -> Optional[Dict[str, Any]]:
-        sid = str(set_id or "").strip()
-        if not sid:
-            return None
-        try:
-            identity = self._current_workspace_preview_identity(set_id=sid)
-        except Exception:
-            return None
-        try:
-            return dict(identity.to_payload())
-        except Exception:
-            return None
-
-    def _main_plot_workspace_preview_provenance(self) -> Dict[str, Dict[str, Any]]:
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        raw = getattr(plot, "_workspace_preview_display_provenance_by_set_id", None) if plot is not None else None
-        if not isinstance(raw, Mapping):
-            return {}
-        cleaned: Dict[str, Dict[str, Any]] = {}
-        for raw_set_id, raw_payload in dict(raw).items():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or not isinstance(raw_payload, Mapping):
-                continue
-            cleaned[set_id] = dict(raw_payload)
-        return cleaned
-
-    def _set_main_plot_workspace_preview_provenance(
-        self,
-        provenance_by_set_id: Mapping[str, Mapping[str, Any]],
-    ) -> None:
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return
-        cleaned: Dict[str, Dict[str, Any]] = {}
-        for raw_set_id, raw_payload in dict(provenance_by_set_id or {}).items():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or not isinstance(raw_payload, Mapping):
-                continue
-            cleaned[set_id] = dict(raw_payload)
-        setattr(plot, "_workspace_preview_display_provenance_by_set_id", cleaned)
-
-    def _displayed_workspace_preview_provenance_matches_current_workspace(self, *, set_id: str) -> bool:
-        sid = str(set_id or "").strip()
-        if not sid:
-            return False
-        current_payload = self._current_workspace_preview_identity_payload(set_id=sid)
-        if not isinstance(current_payload, dict):
-            return False
-        stored_payload = self._main_plot_workspace_preview_provenance().get(sid)
-        return isinstance(stored_payload, dict) and stored_payload == current_payload
-
-    def _record_current_main_plot_workspace_preview_provenance(
-        self,
-        *,
-        selected_set_ids: Sequence[str],
-    ) -> None:
-        selected_ids = [str(set_id) for set_id in (selected_set_ids or ()) if str(set_id)]
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None or not selected_ids:
-            self._set_main_plot_workspace_preview_provenance({})
-            return
-
-        active_set_id = str(self.active_batch_selection()[0] or "").strip()
-        if (not active_set_id) and selected_ids:
-            active_set_id = selected_ids[0]
-        if not active_set_id:
-            self._set_main_plot_workspace_preview_provenance({})
-            return
-
-        current_t_raw = getattr(plot, "_t", None)
-        current_t = np.asarray(current_t_raw if current_t_raw is not None else [], dtype=float).reshape(-1)
-        current_series = dict(getattr(plot, "_series", {}) or {})
-        if current_t.size <= 0 or not current_series:
-            self._set_main_plot_workspace_preview_provenance({})
-            return
-
-        selected_local_workspace_ids = {
-            set_id for set_id in selected_ids if self._preview_session.has_local_mechanism_workspace(set_id)
-        }
-        selected_overlay_dirty_ids: set[str] = set()
-        for set_id in selected_ids:
-            try:
-                row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-            except Exception:
-                row = None
-            if row is not None:
-                try:
-                    if bool(self._preview_session.preview_batch_cache_token([int(row)])):
-                        selected_overlay_dirty_ids.add(str(set_id))
-                except Exception:
-                    continue
-
-        selected_dirty_overlay_ids = {
-            str(set_id)
-            for set_id in selected_ids
-            if str(set_id)
-            and (
-                str(set_id) in selected_local_workspace_ids
-                or str(set_id) in selected_overlay_dirty_ids
-            )
-        }
-        provenance_by_set_id: Dict[str, Dict[str, Any]] = {}
-        active_requires_truthful_dirty_preview = bool(
-            active_set_id in selected_local_workspace_ids or active_set_id in selected_overlay_dirty_ids
-        )
-        if active_requires_truthful_dirty_preview:
-            active_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=active_set_id)
-            if self._batch_cache_entry_matches_plot_payload(
-                entry=active_preview_entry.entry,
-                t=current_t,
-                series=current_series,
-            ):
-                active_payload = self._current_workspace_preview_identity_payload(set_id=active_set_id)
-                if isinstance(active_payload, dict):
-                    provenance_by_set_id[active_set_id] = active_payload
-
-        overlay_label_to_set_id: Dict[str, str] = {}
-        for set_id in selected_ids:
-            set_id_s = str(set_id or "").strip()
-            if not set_id_s:
-                continue
-            overlay_label_to_set_id[set_id_s] = set_id_s
-            set_name = str(self.batch_set_name_for_id(set_id_s) or "").strip()
-            if set_name:
-                overlay_label_to_set_id[set_name] = set_id_s
-        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-            if not isinstance(entry, dict):
-                continue
-            overlay_label = str(entry.get("label") or "").strip()
-            overlay_set_id = str(entry.get("set_id") or "").strip() or overlay_label_to_set_id.get(overlay_label, "")
-            if not overlay_set_id or overlay_set_id not in selected_dirty_overlay_ids:
-                continue
-            overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-            overlay_series_raw = entry.get("series") or {}
-            if overlay_t.size <= 0 or not isinstance(overlay_series_raw, dict):
-                continue
-            overlay_series: Dict[str, np.ndarray] = {}
-            for species_name, values in overlay_series_raw.items():
-                overlay_arr = np.asarray(values, dtype=float).reshape(-1)
-                if overlay_arr.size <= 0:
-                    continue
-                overlay_series[str(species_name)] = overlay_arr
-            if not overlay_series:
-                continue
-            overlay_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=overlay_set_id)
-            if not self._batch_cache_entry_matches_plot_payload(
-                entry=overlay_preview_entry.entry,
-                t=overlay_t,
-                series=overlay_series,
-            ):
-                continue
-            overlay_payload = self._current_workspace_preview_identity_payload(set_id=overlay_set_id)
-            if isinstance(overlay_payload, dict):
-                provenance_by_set_id[overlay_set_id] = overlay_payload
-
-        self._set_main_plot_workspace_preview_provenance(provenance_by_set_id)
-
     def _active_workspace_preview_display_snapshot(self) -> Optional[Dict[str, Any]]:
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
         if batch_cache is None or not self.main_plot_has_data():
@@ -3680,14 +3498,16 @@ class MainWindow(
             active_has_local_mechanism_workspace or active_has_dirty_overlay
         )
         if active_requires_truthful_dirty_preview:
-            active_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=active_set_id)
-            active_plot_is_truthful_dirty_preview = self._batch_cache_entry_matches_plot_payload(
+            active_preview_entry = self._simulation_batch_owner.matching_preview_entry_for_workspace_set(
+                set_id=active_set_id
+            )
+            active_plot_is_truthful_dirty_preview = self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
                 entry=active_preview_entry.entry,
                 t=current_t,
                 series=current_series,
             )
             if not active_plot_is_truthful_dirty_preview:
-                active_plot_is_truthful_dirty_preview = self._displayed_workspace_preview_provenance_matches_current_workspace(
+                active_plot_is_truthful_dirty_preview = self._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(
                     set_id=active_set_id,
                 )
 
@@ -3733,8 +3553,10 @@ class MainWindow(
                     overlay_series[str(species_name)] = overlay_arr
                 if not overlay_series:
                     continue
-                explicit_overlay_entry = self._active_explicit_cache_entry_for_set(set_id=overlay_set_id)
-                overlay_matches_explicit = self._batch_cache_entry_matches_plot_payload(
+                explicit_overlay_entry = self._simulation_batch_owner.active_explicit_cache_entry_for_set(
+                    set_id=overlay_set_id
+                )
+                overlay_matches_explicit = self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
                     entry=explicit_overlay_entry.entry,
                     t=overlay_t,
                     series=overlay_series,
@@ -3747,14 +3569,16 @@ class MainWindow(
                     ):
                         continue
                 else:
-                    overlay_preview_entry = self._matching_preview_entry_for_workspace_set(set_id=overlay_set_id)
-                    overlay_is_truthful_dirty_preview = self._batch_cache_entry_matches_plot_payload(
+                    overlay_preview_entry = self._simulation_batch_owner.matching_preview_entry_for_workspace_set(
+                        set_id=overlay_set_id
+                    )
+                    overlay_is_truthful_dirty_preview = self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
                         entry=overlay_preview_entry.entry,
                         t=overlay_t,
                         series=overlay_series,
                     )
                     if not overlay_is_truthful_dirty_preview:
-                        overlay_is_truthful_dirty_preview = self._displayed_workspace_preview_provenance_matches_current_workspace(
+                        overlay_is_truthful_dirty_preview = self._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(
                             set_id=overlay_set_id,
                         )
                     if not overlay_is_truthful_dirty_preview or overlay_matches_explicit:
@@ -3772,7 +3596,9 @@ class MainWindow(
 
         active_canonical_ghost: Dict[str, object] | None = None
         if active_plot_is_truthful_dirty_preview:
-            explicit_active_entry = self._active_explicit_cache_entry_for_set(set_id=active_set_id)
+            explicit_active_entry = self._simulation_batch_owner.active_explicit_cache_entry_for_set(
+                set_id=active_set_id
+            )
             for entry in list(getattr(plot, "_simulation_overlays", []) or []):
                 if not isinstance(entry, dict):
                     continue
@@ -3792,7 +3618,7 @@ class MainWindow(
                     overlay_series[str(species_name)] = overlay_arr
                 if not overlay_series:
                     continue
-                if not self._batch_cache_entry_matches_plot_payload(
+                if not self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
                     entry=explicit_active_entry.entry,
                     t=overlay_t,
                     series=overlay_series,
@@ -3973,7 +3799,7 @@ class MainWindow(
                     prefer=plot_label,
                 )
                 replay_selected_ids = preserved_selected_ids or ([preserved_set_id] if preserved_set_id else [])
-                self._record_current_main_plot_workspace_preview_provenance(
+                self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(
                     selected_set_ids=replay_selected_ids
                 )
                 self.show_simulation_tab()
@@ -4427,7 +4253,7 @@ class MainWindow(
 
     def set_status_text(self, text: str) -> None:
         """Public API used by controllers (avoid reaching into `_` widget fields)."""
-        self._status_label.setText(str(text))
+        self._simulation_run_ui_owner.set_status_text(str(text))
 
     def main_plot_has_data(self) -> bool:
         plot = self.main_plot()
@@ -4438,65 +4264,6 @@ class MainWindow(
 
     def set_main_plot_selected_series(self, series_names: Sequence[str]) -> None:
         self.main_plot().set_selected_series(list(series_names))
-
-    def run_button_is_enabled(self) -> bool:
-        return bool(self._run_btn.isEnabled())
-
-    def set_runtime_backed_run_controls_ready(self, ready: bool) -> None:
-        self._set_runtime_backed_run_controls_ready(bool(ready))
-
-    def schedule_runtime_availability_refresh(self) -> None:
-        self._schedule_simulation_runtime_availability_refresh(wait=False)
-
-    def set_run_button_enabled(self, enabled: bool) -> None:
-        requested_enabled = bool(enabled)
-        self._run_button_requested_enabled = requested_enabled
-        runtime_ready = bool(getattr(self, "_simulation_runtime_run_ready", True))
-        effective_enabled = bool(requested_enabled and runtime_ready)
-        self._run_btn.setEnabled(effective_enabled)
-        editor = getattr(self, "_mechanism_editor", None)
-        if editor is not None:
-            if hasattr(editor, "set_run_gated"):
-                editor.set_run_gated(not effective_enabled)
-            elif effective_enabled:
-                editor.run_btn.setEnabled(editor.is_mechanism_valid())
-            else:
-                editor.run_btn.setEnabled(False)
-
-    def set_stop_button_enabled(self, enabled: bool) -> None:
-        self._stop_btn.setEnabled(bool(enabled))
-
-    def set_sim_progress_value(self, value: int) -> None:
-        self._sim_progress.setValue(int(value))
-
-    def repaint_simulation_widgets(self) -> None:
-        with suppress(RuntimeError):
-            self._sim_progress.update()
-        with suppress(RuntimeError):
-            self._status_label.update()
-        table = getattr(self, "_results_table", None)
-        if table is not None:
-            with suppress(RuntimeError):
-                viewport = table.viewport()
-                viewport.update()
-
-    def set_algebra_status_text(self, text: str) -> None:
-        self._algebra_status_label.setText(str(text))
-
-    def message_box_warning(self, title: str, message: str) -> None:
-        QtWidgets.QMessageBox.warning(self, str(title), str(message))
-
-    def message_box_critical(self, title: str, message: str, *, details: Optional[str] = None) -> None:
-        if not details:
-            QtWidgets.QMessageBox.critical(self, str(title), str(message))
-            return
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Icon.Critical)
-        dialog.setWindowTitle(str(title))
-        dialog.setText(str(message))
-        dialog.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Ok)
-        dialog.setDetailedText(str(details))
-        dialog.exec()
 
     def main_plot(self) -> object:
         return self._plot_tabs._main_plot
@@ -4613,29 +4380,10 @@ class MainWindow(
         self._results_table = table
 
     def mechanism_reactions_text_raw(self) -> str:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        return str(owner.canonical_reactions_text)
+        return self._simulation_mechanism_owner.mechanism_reactions_text_raw()
 
     def mechanism_state_network_dsl_raw(self) -> str:
-        owner = getattr(self, "_mechanism_session_owner", None)
-        if owner is None:
-            raise RuntimeError("Mechanism session owner is unavailable.")
-        return str(owner.canonical_state_network_dsl or "")
-
-    def mechanism_slider_points_value(self) -> Optional[int]:
-        try:
-            return int(self._mechanism_editor.slider_points_value())
-        except Exception:
-            return None
-
-    def mechanism_slider_solver_value(self) -> Optional[str]:
-        try:
-            value = self._mechanism_editor.slider_solver_value()
-        except Exception:
-            return None
-        return str(value) if value is not None else None
+        return self._simulation_mechanism_owner.mechanism_state_network_dsl_raw()
 
     def set_variable_sliders(
         self,
@@ -4645,42 +4393,24 @@ class MainWindow(
         preserve_visibility: bool = False,
         visibility_scope_signature: object | None = None,
     ) -> None:
-        self._mechanism_editor._variable_sliders.set_variables(
-            dict(variables),
-            metadata=dict(metadata or {}),
-            preserve_visibility=bool(preserve_visibility),
+        self._simulation_mechanism_owner.set_variable_sliders(
+            variables,
+            metadata=metadata,
+            preserve_visibility=preserve_visibility,
             visibility_scope_signature=visibility_scope_signature,
         )
 
     def variable_slider_values(self) -> Dict[str, float]:
-        sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-        if sliders is None or not hasattr(sliders, "get_variables"):
-            return {}
-        values = sliders.get_variables() or {}
-        return {str(name): float(value) for name, value in values.items()}
+        return self._simulation_mechanism_owner.variable_slider_values()
 
     def clear_variable_sliders(self) -> None:
-        sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
-        if sliders is not None and hasattr(sliders, "clear"):
-            sliders.clear()
+        self._simulation_mechanism_owner.clear_variable_sliders()
 
     def temperature_spinbox_value(self) -> float:
-        return float(self._temperature_spinbox.value())
-
-    def num_points_spinbox_value(self) -> int:
-        return int(self._num_points_spinbox.value())
-
-    def sim_time_spinbox_text(self) -> str:
-        return str(self._sim_time_spinbox.text())
+        return self._simulation_solver_owner.temperature_spinbox_value()
 
     def parse_sim_time_seconds(self) -> float:
-        return float(self._parse_sim_time_seconds())
-
-    def use_sparse_jacobian(self) -> bool:
-        return bool(self._use_sparse_jacobian)
-
-    def wegscheider_cyclicity_enabled(self) -> bool:
-        return bool(self._wegscheider_cyclicity_enabled)
+        return self._simulation_solver_owner.parse_sim_time_seconds()
 
     def set_mechanism_reactions_text_with_optional_undo(
         self,
@@ -4784,9 +4514,6 @@ class MainWindow(
         if callable(clear_display):
             clear_display()
 
-    def batch_result_cache_store(self) -> MutableMapping[str, Dict[str, Any]]:
-        return self._sim_controller.batch_cache.result_cache
-
     def batch_store_row_count(self) -> int:
         return int(self._batch_store.row_count())
 
@@ -4810,199 +4537,6 @@ class MainWindow(
             return {str(key): float(value) for key, value in initials.items()}
         return dict(initials)
 
-    def display_cached_batch_selection(
-        self,
-        *,
-        cache_key: str,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        cache_store: Optional[object] = None,
-        valid_set_ids: Optional[Sequence[str]] = None,
-        invalidated_set_ids: Optional[Sequence[str]] = None,
-        allow_fallback: bool = True,
-    ) -> bool:
-        batch_cache = self._sim_controller.batch_cache
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if cache_store is batch_cache.preview_cache and normalized_selected_sets:
-            workspace_displayed = self._display_workspace_aware_preview_batch_selection(
-                selected_sets=normalized_selected_sets,
-                prefer_set=prefer_set,
-                preview_cache_key=str(cache_key or ""),
-            )
-            if workspace_displayed:
-                return True
-            if len(normalized_selected_sets) > 1:
-                return False
-            if not bool(allow_fallback):
-                single_set_id = str(normalized_selected_sets[0] or "")
-                if single_set_id and self._preview_session.has_dirty_state_for_set(single_set_id):
-                    preview_entry = self._matching_preview_entry_for_workspace_set(
-                        set_id=single_set_id,
-                        preview_cache_key=str(cache_key or ""),
-                    )
-                    if preview_entry.entry is None:
-                        return False
-        resolved_invalidated_set_ids = invalidated_set_ids
-        if (
-            resolved_invalidated_set_ids is None
-            and str(batch_cache.active_cache_key or "") == str(cache_key)
-        ):
-            resolved_invalidated_set_ids = batch_cache.active_cache_invalidated_set_ids
-        displayed = self.results_controller.display_cached_batch_selection(
-            cache_key=str(cache_key),
-            selected_sets=normalized_selected_sets,
-            prefer_set=str(prefer_set) if prefer_set is not None else None,
-            cache_store=cache_store,
-            valid_set_ids=(
-                tuple(str(set_id) for set_id in valid_set_ids)
-                if valid_set_ids is not None
-                else None
-            ),
-            invalidated_set_ids=(
-                tuple(str(set_id) for set_id in resolved_invalidated_set_ids)
-                if resolved_invalidated_set_ids is not None
-                else None
-            ),
-            allow_fallback=bool(allow_fallback),
-        )
-        if displayed:
-            self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=normalized_selected_sets)
-        return displayed
-
-    def _focused_batch_selection_is_dirty(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-    ) -> bool:
-        focused_set_id = str(prefer_set or (selected_sets[0] if selected_sets else "") or "").strip()
-        if not focused_set_id:
-            return False
-        try:
-            return bool(self._preview_session.has_dirty_state_for_set(focused_set_id))
-        except Exception:
-            return False
-
-    def _selection_uses_fresh_explicit_cache_after_post_run_sync(
-        self,
-        *,
-        selected_sets: Sequence[str],
-    ) -> bool:
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if not normalized_selected_sets:
-            return False
-        batch_cache = self._sim_controller.batch_cache
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
-        if not active_cache_key or not active_preview_token:
-            return False
-        active_valid_set_ids = {
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_valid_set_ids", None) or ()) if str(set_id)
-        }
-        if active_valid_set_ids and any(set_id not in active_valid_set_ids for set_id in normalized_selected_sets):
-            return False
-        active_preview_scope_ids = {
-            str(set_id)
-            for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
-            if str(set_id)
-        }
-        if active_preview_scope_ids and any(set_id not in active_preview_scope_ids for set_id in normalized_selected_sets):
-            return False
-        scope_rows: list[int] = []
-        row_for_set_id = getattr(getattr(self, "_batch_store", None), "row_for_set_id", None)
-        if not callable(row_for_set_id):
-            return False
-        for set_id in normalized_selected_sets:
-            try:
-                row = row_for_set_id(str(set_id))
-            except Exception:
-                row = None
-            if row is None:
-                return False
-            scope_rows.append(int(row))
-        try:
-            current_preview_token = str(self._preview_session.preview_batch_cache_token(scope_rows) or "").strip()
-        except Exception:
-            return False
-        return bool(current_preview_token) and current_preview_token == active_preview_token
-
-    def _display_workspace_aware_preview_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        preview_cache_key: Optional[str] = None,
-    ) -> bool:
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if not normalized_selected_sets:
-            return False
-        focused_selection_is_dirty = self._focused_batch_selection_is_dirty(
-            selected_sets=normalized_selected_sets,
-            prefer_set=prefer_set,
-        )
-        (
-            resolved_entries,
-            outcome_reason,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
-        ) = self._resolve_workspace_aware_batch_selection(
-            selected_sets=normalized_selected_sets,
-            preview_cache_key=preview_cache_key,
-        )
-        if not has_workspace_selection:
-            return False
-        if all_selected_sets_resolved and resolved_entries:
-            outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                resolved_entries=resolved_entries,
-                prefer_set=prefer_set,
-            )
-            if outcome.displayed:
-                self._record_current_main_plot_workspace_preview_provenance(
-                    selected_set_ids=normalized_selected_sets
-                )
-            return bool(outcome.displayed)
-        if (
-            resolved_entries
-            and outcome_reason in {"preview_pending", "no_cached_results"}
-            and has_resolved_workspace_preview
-            and (
-                bool(focused_selection_uses_workspace_controls)
-                or ((not bool(focused_selection_is_dirty)) and bool(focused_selection_has_resolved_entry))
-            )
-        ):
-            outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                resolved_entries=resolved_entries,
-                prefer_set=prefer_set,
-            )
-            if outcome.displayed:
-                self._record_current_main_plot_workspace_preview_provenance(
-                    selected_set_ids=normalized_selected_sets
-                )
-                if outcome_reason == "preview_pending":
-                    self.set_status_text("Preview pending for current selection.")
-                else:
-                    self.set_status_text("Result not cached (evicted). Press Run to compute.")
-            return bool(outcome.displayed)
-        return False
-
-    def display_workspace_aware_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        preview_cache_key: Optional[str] = None,
-    ) -> bool:
-        return bool(
-            self._display_workspace_aware_preview_batch_selection(
-                selected_sets=selected_sets,
-                prefer_set=prefer_set,
-                preview_cache_key=preview_cache_key,
-            )
-        )
-
     def update_batch_row_controls_state(self) -> None:
         self._update_batch_row_controls_state()
 
@@ -5015,29 +4549,16 @@ class MainWindow(
         self._sync_batch_species_columns(list(species_names), preserve_active_cache=bool(preserve_active_cache))
 
     def has_slider_overrides(self) -> bool:
-        return bool(self._preview_session.has_local_mechanism_workspaces())
+        return self._simulation_mechanism_owner.has_slider_overrides()
 
     def _simulation_schema_text(self) -> str:
-        reactions_text = self.mechanism_reactions_text_raw()
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-        return str(full_dsl)
+        return self._simulation_mechanism_owner.get_mechanism_text()
 
     def simulation_schema_id(self) -> str:
-        param_store = self._preview_session.param_store
-        schema_text = self._simulation_schema_text()
-        if str(param_store.schema_text or "") != schema_text:
-            param_store.set_schema(schema_text)
-        return str(param_store.schema_id or "")
+        return self._simulation_mechanism_owner.simulation_schema_id()
 
     def simulation_param_fingerprint(self, set_id: Optional[str] = None) -> str:
-        self.simulation_schema_id()
-        target_set_id = str(set_id or "").strip()
-        if not self._preview_session.param_store.has_local_overrides_for_set(target_set_id):
-            return ""
-        return str(self._preview_session.param_store.param_fingerprint(target_set_id) or "")
+        return self._simulation_mechanism_owner.simulation_param_fingerprint(set_id=set_id)
 
     def _batch_store_is_pristine_default_placeholder(self) -> bool:
         if int(self._batch_store.row_count()) != 1:
@@ -5110,30 +4631,25 @@ class MainWindow(
         return rows
 
     def slider_overrides(self, set_id: Optional[str] = None) -> Dict[str, float]:
-        raw = self._preview_session.slider_overrides(set_id=set_id)
-        overrides: Dict[str, float] = {}
-        for key, value in raw.items():
-            parsed, ok = try_parse_finite_float(value)
-            if not ok:
-                continue
-            overrides[str(key)] = float(parsed)
-        return overrides
+        return self._simulation_mechanism_owner.slider_overrides(set_id=set_id)
 
     def apply_overrides_to_text(self, base_text: str, *, set_id: Optional[str] = None) -> str:
-        return str(self._apply_overrides_to_text(str(base_text), set_id=set_id))
+        return self._simulation_mechanism_owner.apply_overrides_to_text(str(base_text), set_id=set_id)
 
     def apply_overrides_to_state_network_dsl(self, base_text: str, *, set_id: Optional[str] = None) -> str:
-        return str(self._apply_overrides_to_state_network_dsl(str(base_text), set_id=set_id))
+        return self._simulation_mechanism_owner.apply_overrides_to_state_network_dsl(
+            str(base_text),
+            set_id=set_id,
+        )
 
     def apply_parameter_overrides_to_dsl(self, mechanism_text: str, parameters: Dict[str, float]) -> str:
-        return str(self._apply_parameter_overrides_to_dsl(str(mechanism_text), dict(parameters)))
+        return self._simulation_mechanism_owner.apply_parameter_overrides_to_dsl(
+            str(mechanism_text),
+            dict(parameters),
+        )
 
     def get_mechanism_text(self) -> str:
-        return str(self._get_mechanism_text())
-
-    def initial_solver_name(self) -> Optional[str]:
-        solver = self._initial_solver
-        return str(solver) if solver is not None else None
+        return self._simulation_mechanism_owner.get_mechanism_text()
 
     def explicit_startup_solver_name(self) -> Optional[str]:
         solver = getattr(self, "_explicit_startup_solver_value", None)
@@ -5148,47 +4664,22 @@ class MainWindow(
     def has_explicit_startup_atol_override(self) -> bool:
         return bool(getattr(self, "_explicit_startup_atol_override", False))
 
-    def initial_rtol(self) -> Optional[float]:
-        value = self._initial_rtol
-        return float(value) if value is not None else None
-
     def explicit_startup_rtol(self) -> Optional[float]:
         value = getattr(self, "_explicit_startup_rtol_value", None)
-        return float(value) if value is not None else None
-
-    def initial_atol(self) -> Optional[float]:
-        value = self._initial_atol
         return float(value) if value is not None else None
 
     def explicit_startup_atol(self) -> Optional[float]:
         value = getattr(self, "_explicit_startup_atol_value", None)
         return float(value) if value is not None else None
 
-    def dsl_global_temperature_K(self, dsl_text: str) -> Optional[float]:
-        value = self._dsl_global_temperature_K(str(dsl_text))
-        return float(value) if value is not None else None
-
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
-        return self._variable_runtime.variable_metadata()
+        return self._simulation_mechanism_owner.variable_metadata()
 
     def set_variable_metadata(self, metadata: Dict[str, Dict[str, object]] | None) -> None:
         self._variable_runtime.set_variable_metadata(metadata)
 
     def _mutable_variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return self._variable_runtime.mutable_variable_metadata()
-
-    def snapshot_datasets(self) -> Dict[str, Any]:
-        return dict(self._snapshot_datasets() or {})
-
-    def last_fit_metadata(self) -> Optional[Dict[str, Any]]:
-        value = self._last_fit_metadata
-        return dict(value) if isinstance(value, dict) else None
-
-    def set_last_simulation_provenance(self, provenance: Dict[str, Any]) -> None:
-        self._last_simulation_provenance = dict(provenance)
-
-    def set_last_simulation_ctc(self, ctc: Dict[str, float]) -> None:
-        self._last_simulation_ctc = {str(key): float(value) for key, value in (ctc or {}).items()}
 
     def update_temperature_mode_indicator(self) -> None:
         self._update_temperature_mode_indicator()
@@ -5325,7 +4816,7 @@ class MainWindow(
         step_analysis_context = None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         for name, value in parameters.items():
             name_str = str(name)
@@ -5670,15 +5161,13 @@ class MainWindow(
         coverage = self.results_controller.cached_batch_selection_coverage(
             cache_key=str(cache_key),
             selected_sets=[str(set_id)],
-            cache_store=self._sim_controller.batch_cache.result_cache,
             valid_set_ids=valid_set_ids,
             invalidated_set_ids=invalidated_set_ids,
             allow_fallback=False,
         )
         if not coverage.available_ids:
             return None, str(coverage.reason or "no_cached_results")
-        entry_result = self._cache_entry_for_set_id_from_store(
-            store=self._sim_controller.batch_cache.result_cache,
+        entry_result = self._simulation_batch_owner.active_explicit_cache_entry_for_set(
             cache_key=str(cache_key),
             set_id=str(set_id),
         )
@@ -5773,7 +5262,7 @@ class MainWindow(
         return None
 
     def _copy_all_dirty_shown_block(self, *, set_id: str, label: str):
-        resolved_entries, reason, _, _, _, _, _ = self._resolve_workspace_aware_batch_selection(
+        resolved_entries, reason, _, _, _, _, _ = self._simulation_batch_owner.resolve_workspace_aware_batch_selection(
             selected_sets=[str(set_id)]
         )
         resolved = next((entry for entry in resolved_entries if str(entry.set_id) == str(set_id)), None)
@@ -6032,26 +5521,6 @@ class MainWindow(
             return [0]
         return []
 
-    def _batch_cache_contains_set(self, *, set_id: str, set_name: str) -> bool:
-        sid = str(set_id or "")
-        sname = str(set_name or "")
-        for store in (
-            self._sim_controller.batch_cache.result_cache,
-            self._sim_controller.batch_cache.preview_cache,
-        ):
-            suffixes = []
-            if sid:
-                suffixes.append(f"::{sid}")
-            if sname:
-                suffixes.append(f"::{sname}")
-            if not suffixes:
-                continue
-            for k in (store or {}).keys():
-                token = str(k or "")
-                if any(token.endswith(suf) for suf in suffixes):
-                    return True
-        return False
-
     def _datasets_mapped_to_batch_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> List[str]:
         manager = getattr(self, "_dataset_manager", None)
         if manager is None:
@@ -6115,34 +5584,6 @@ class MainWindow(
             return list(manager.unmap_batch_sets(set_ids=set_ids, set_names=set_names))
         return []
 
-    def _purge_batch_cache_for_deleted_sets(self, *, set_ids: Sequence[str], set_names: Sequence[str]) -> None:
-        id_targets = {str(v) for v in (set_ids or []) if str(v)}
-        name_targets = {str(v) for v in (set_names or []) if str(v)}
-        for store in (
-            self._sim_controller.batch_cache.result_cache,
-            self._sim_controller.batch_cache.preview_cache,
-        ):
-            for composite_key in list((store or {}).keys()):
-                token = str(composite_key or "")
-                if "::" not in token:
-                    continue
-                _prefix, sid = token.rsplit("::", 1)
-                if sid in id_targets or sid in name_targets:
-                    try:
-                        store.pop(composite_key, None)  # type: ignore[union-attr]
-                    except Exception as exc:
-                        try:
-                            del store[composite_key]  # type: ignore[union-attr]
-                        except Exception as exc2:
-                            logger.debug(
-                                "Failed to purge cache key %s: %s / %s",
-                                composite_key,
-                                exc,
-                                exc2,
-                                exc_info=True,
-                            )
-                            continue
-
     def _select_single_batch_row(self, row: int) -> None:
         table = getattr(self, "_batch_table", None)
         if table is None:
@@ -6196,7 +5637,7 @@ class MainWindow(
 
         mapped_datasets = self._datasets_mapped_to_batch_sets(set_ids=delete_ids, set_names=delete_names)
         has_cached_results = any(
-            self._batch_cache_contains_set(set_id=sid, set_name=name)
+            self._simulation_batch_owner.batch_cache_contains_set(set_id=sid, set_name=name)
             for sid, name in zip(delete_ids, delete_names)
         )
         deleting_last_remaining = len(delete_ids) >= int(self._batch_store.row_count())
@@ -6221,7 +5662,7 @@ class MainWindow(
         self._batch_model.reset_invalid()
 
         self._unmap_datasets_for_deleted_batch_sets(set_ids=delete_ids, set_names=delete_names)
-        self._purge_batch_cache_for_deleted_sets(set_ids=delete_ids, set_names=delete_names)
+        self._simulation_batch_owner.purge_batch_cache_for_deleted_sets(set_ids=delete_ids, set_names=delete_names)
 
         if str(self._sim_controller.batch_cache.active_batch_set_id or "") in set(delete_ids):
             self._sim_controller.batch_cache.active_batch_set_id = None
@@ -6669,7 +6110,7 @@ class MainWindow(
         focused_set_id = self._focused_batch_set_id_value()
         if focused_set_id:
             prefer = focused_set_id
-        focused_selection_is_dirty = self._focused_batch_selection_is_dirty(
+        focused_selection_is_dirty = self._simulation_batch_owner.focused_batch_selection_is_dirty(
             selected_sets=shown_sets,
             prefer_set=prefer,
         )
@@ -6716,10 +6157,10 @@ class MainWindow(
             return any(str(set_id) in invalidated_set_ids for set_id in shown_sets)
 
         def _finalize_displayed_selection_change() -> None:
-            self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
+            self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
             _reset_stale_cache_warning_status()
 
-        if focused_selection_is_dirty and self._selection_uses_fresh_explicit_cache_after_post_run_sync(
+        if focused_selection_is_dirty and self._simulation_batch_owner.selection_uses_fresh_explicit_cache_after_post_run_sync(
             selected_sets=shown_sets
         ):
             valid_set_ids = None
@@ -6757,7 +6198,7 @@ class MainWindow(
             focused_selection_uses_workspace_controls,
             focused_selection_has_resolved_entry,
         ) = (
-            self._resolve_workspace_aware_batch_selection(selected_sets=shown_sets)
+            self._simulation_batch_owner.resolve_workspace_aware_batch_selection(selected_sets=shown_sets)
         )
         if all_selected_sets_resolved and resolved_entries:
             outcome = self.results_controller.display_resolved_batch_selection_outcome(
@@ -6786,7 +6227,7 @@ class MainWindow(
                     prefer_set=prefer,
                 )
                 if outcome.displayed:
-                    self._record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
+                    self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
                     self._sync_mechanism_controls_to_focused_batch_set(
                         use_workspace=bool(focused_selection_uses_workspace_controls)
                     )
@@ -6886,373 +6327,6 @@ class MainWindow(
         )
         _set_selection_status(miss_msg)
 
-    def _cache_entry_for_set_id_from_store(
-        self,
-        *,
-        store: MutableMapping[str, Dict[str, Any]],
-        cache_key: str,
-        set_id: str,
-    ) -> BatchCacheEntryReadResult:
-        sid = str(set_id or "").strip()
-        if not sid or not cache_key:
-            return BatchCacheEntryReadResult("missing")
-        direct = read_batch_cache_entry((store or {}).get(BatchSimulationCache.entry_key(cache_key, sid)))
-        if direct.entry is not None:
-            return direct
-        name = self.batch_set_name_for_id(sid)
-        by_name = BatchCacheEntryReadResult("missing")
-        if name:
-            by_name = read_batch_cache_entry((store or {}).get(BatchSimulationCache.entry_key(cache_key, str(name))))
-            if by_name.entry is not None:
-                return by_name
-        if direct.state == "invalid" or by_name.state == "invalid":
-            return BatchCacheEntryReadResult("invalid")
-        return BatchCacheEntryReadResult("missing")
-
-    def _mechanism_text_for_workspace_selection(self, *, set_id: str) -> str:
-        from kindred.core.batch_initial_conditions import (
-            strip_reaction_dsl_initial_concentrations,
-        )
-
-        reactions_text = self.mechanism_reactions_text_raw()
-        if self.has_slider_overrides():
-            reactions_text = self._apply_overrides_to_text(reactions_text, set_id=str(set_id))
-        reactions_text = strip_reaction_dsl_initial_concentrations(reactions_text)
-
-        state_network_dsl = self.mechanism_state_network_dsl_raw()
-        if self.has_slider_overrides():
-            state_network_dsl = self._apply_overrides_to_state_network_dsl(state_network_dsl, set_id=str(set_id))
-
-        full_dsl = reactions_text
-        if state_network_dsl.strip():
-            full_dsl += "\n\n# State Network\n" + state_network_dsl
-        if self.has_slider_overrides():
-            full_dsl = self._apply_parameter_overrides_to_dsl(
-                full_dsl,
-                self._normalized_slider_overrides(set_id=str(set_id)),
-            )
-        return str(full_dsl)
-
-    def _current_workspace_preview_context(
-        self,
-        *,
-        set_id: str,
-        mechanism_text: str,
-    ) -> tuple[Dict[str, Any], float, str]:
-        from kindred.gui.controllers.simulation_controller import build_fast_preview_solver_grid_context
-
-        solver_grid_context = build_fast_preview_solver_grid_context(
-            initial_solver_name=self._initial_solver,
-            num_points=int(self.num_points_spinbox_value()),
-            fast_mode=True,
-            slider_points_override=self.mechanism_slider_points_value(),
-            slider_solver_override=self.mechanism_slider_solver_value(),
-            slider_drag_active=bool(self._preview_session.slider_drag_active()),
-            last_slider_change_name=str(self._preview_session.last_slider_change_name() or ""),
-        )
-        temperature_k = float(self.temperature_spinbox_value())
-        t_override = self.dsl_global_temperature_K(str(mechanism_text))
-        if t_override is not None:
-            temperature_k = float(t_override)
-        solver_config = {
-            "solver": str(solver_grid_context.get("solver") or ""),
-            "solver_label": str(solver_grid_context.get("solver_label") or ""),
-            "solver_warning": (
-                str(solver_grid_context.get("solver_warning"))
-                if solver_grid_context.get("solver_warning")
-                else None
-            ),
-            "rtol": self._initial_rtol or 1e-6,
-            "atol": self._initial_atol or 1e-12,
-            "grid": dict(solver_grid_context.get("grid") or {"N": int(self.num_points_spinbox_value())}),
-            "temperature_K": float(temperature_k),
-            "use_sparse_jacobian": bool(self.use_sparse_jacobian()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
-        }
-        overlay_token = ""
-        try:
-            row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-        except Exception:
-            row = None
-        if row is not None:
-            overlay_token = str(self._preview_session.preview_batch_cache_token([int(row)]) or "")
-        return solver_config, float(self.parse_sim_time_seconds()), overlay_token
-
-    def _current_workspace_preview_identity(self, *, set_id: str):
-        from kindred.core.simulation_identity import SimulationIdentity
-
-        mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
-        expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
-            set_id=str(set_id),
-            mechanism_text=mechanism_text,
-        )
-        try:
-            from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
-
-            intervention_schedule_fingerprint = str(
-                intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or ""
-            )
-        except Exception:
-            intervention_schedule_fingerprint = hashlib.sha256(
-                str(mechanism_text or "").encode("utf-8", "surrogatepass")
-            ).hexdigest()
-        initials_fingerprint = ""
-        row = self._batch_row_for_set_id(str(set_id))
-        if row is not None:
-            try:
-                baseline_initials = self.batch_initials_for_row(int(row))
-                reactions_text_raw = self.mechanism_reactions_text_raw()
-                if self.has_slider_overrides():
-                    reactions_text_raw = self._apply_overrides_to_text(
-                        reactions_text_raw,
-                        set_id=str(set_id),
-                    )
-                try:
-                    pending_init_seed, _migrated = migrate_reaction_dsl_initial_concentration_sets(
-                        reactions_text_raw,
-                        default_set_name="set1",
-                    )
-                except Exception:
-                    pending_init_seed = {}
-                set_name = str(self.batch_set_name_for_id(str(set_id)) or "")
-                for species, value in pending_initial_seed_for_set(
-                    pending_init_seed,
-                    set_name=set_name,
-                ).items():
-                    parsed, ok = try_parse_finite_float(value)
-                    if ok:
-                        baseline_initials[str(species)] = float(parsed)
-                preview_initials = self._preview_session.preview_initials_for_row(int(row), baseline_initials)
-                initials_fingerprint = canonical_initials_fingerprint(preview_initials)
-            except Exception:
-                initials_fingerprint = ""
-        return SimulationIdentity.build(
-            schema_id=self.simulation_schema_id(),
-            param_fingerprint=self.simulation_param_fingerprint(set_id=str(set_id)),
-            canonical_initials_fingerprint=initials_fingerprint,
-            solver_config=expected_solver_config,
-            t_end=expected_t_end,
-            intervention_schedule_fingerprint=intervention_schedule_fingerprint,
-            preview_batch_cache_token=expected_overlay_token,
-            execution_flags=("fast_mode",),
-        )
-
-    def _matching_preview_entry_for_workspace_set(
-        self,
-        *,
-        set_id: str,
-        preview_cache_key: Optional[str] = None,
-    ) -> BatchCacheEntryReadResult:
-        from kindred.core.simulation_identity import coerce_simulation_identity
-
-        preview_store = self._sim_controller.batch_cache.preview_cache
-        expected_mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
-        resolved_preview_cache_key = str(
-            preview_cache_key
-            if preview_cache_key is not None
-            else (self._sim_controller.batch_cache.active_preview_cache_key or "")
-        ).strip()
-
-        try:
-            expected_identity = self._current_workspace_preview_identity(set_id=str(set_id))
-            expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
-                set_id=str(set_id),
-                mechanism_text=str(expected_mechanism_text),
-            )
-        except Exception:
-            return BatchCacheEntryReadResult("missing")
-
-        def _entry_matches_expected(result: BatchCacheEntryReadResult) -> bool:
-            if result.entry is None:
-                return False
-            entry_identity = coerce_simulation_identity(result.entry.get("simulation_identity"))
-            if entry_identity is not None:
-                if entry_identity != expected_identity:
-                    return False
-            else:
-                if str(result.entry.get("mechanism_text") or "") != str(expected_mechanism_text):
-                    return False
-                if dict(result.entry.get("solver_config") or {}) != dict(expected_solver_config):
-                    return False
-                if str(result.entry.get("preview_batch_cache_token") or "") != str(expected_overlay_token):
-                    return False
-            entry_t_payload = result.entry.get("t")
-            entry_t = np.asarray(entry_t_payload if entry_t_payload is not None else [], dtype=float).reshape(-1)
-            expected_grid_n = int((expected_solver_config.get("grid") or {}).get("N") or 0)
-            if expected_grid_n > 0 and int(entry_t.size) != expected_grid_n:
-                return False
-            if entry_t.size <= 0:
-                return False
-            return math.isclose(float(entry_t[-1]), float(expected_t_end), rel_tol=1e-9, abs_tol=1e-12)
-
-        invalid_found = False
-        direct = self._cache_entry_for_set_id_from_store(
-            store=preview_store,
-            cache_key=resolved_preview_cache_key,
-            set_id=str(set_id),
-        )
-        if _entry_matches_expected(direct):
-            return direct
-        if direct.state == "invalid":
-            invalid_found = True
-
-        candidate_suffixes = {f"::{str(set_id)}"}
-        set_name = self.batch_set_name_for_id(str(set_id))
-        if set_name:
-            candidate_suffixes.add(f"::{str(set_name)}")
-
-        preview_data = getattr(preview_store, "_data", None)
-        if hasattr(preview_data, "items"):
-            preview_items = list(preview_data.items())
-        else:
-            preview_items = list((preview_store or {}).items())
-
-        for key, payload in reversed(preview_items):
-            key_s = str(key)
-            if not any(key_s.endswith(suffix) for suffix in candidate_suffixes):
-                continue
-            if resolved_preview_cache_key and key_s.startswith(f"{resolved_preview_cache_key}::"):
-                continue
-            result = read_batch_cache_entry(payload)
-            if _entry_matches_expected(result):
-                return result
-            invalid_found = invalid_found or result.state == "invalid"
-
-        return BatchCacheEntryReadResult("invalid" if invalid_found else "missing")
-
-    def _resolve_workspace_aware_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        preview_cache_key: Optional[str] = None,
-    ) -> Tuple[List[ResolvedBatchSelectionEntry], Optional[str], bool, bool, bool, bool, bool]:
-        from kindred.gui.controllers.results_controller import ResolvedBatchSelectionEntry
-
-        batch_cache = self._sim_controller.batch_cache
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
-        invalidated_set_ids = {
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_invalidated_set_ids", None) or ()) if str(set_id)
-        }
-        focused_set_id = str(self._focused_batch_set_id_value() or "").strip()
-        if (not focused_set_id) and selected_sets:
-            focused_set_id = str(selected_sets[0] or "").strip()
-
-        resolved_entries: List[ResolvedBatchSelectionEntry] = []
-        has_workspace_selection = False
-        has_resolved_workspace_preview = False
-        focused_selection_uses_workspace_controls = False
-        focused_selection_has_resolved_entry = False
-        missing_workspace_entry = False
-        missing_explicit_entry = False
-        invalid_entry = False
-
-        for raw_set_id in selected_sets or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id:
-                continue
-            label = self.batch_set_name_for_id(set_id) or set_id
-            if self._preview_session.has_dirty_state_for_set(set_id):
-                has_workspace_selection = True
-                preview_entry = self._matching_preview_entry_for_workspace_set(
-                    set_id=set_id,
-                    preview_cache_key=preview_cache_key,
-                )
-                if preview_entry.entry is not None:
-                    has_resolved_workspace_preview = True
-                    canonical_entry = None
-                    if active_cache_key and set_id not in invalidated_set_ids:
-                        explicit_entry = self._cache_entry_for_set_id_from_store(
-                            store=batch_cache.result_cache,
-                            cache_key=active_cache_key,
-                            set_id=set_id,
-                        )
-                        canonical_entry = explicit_entry.entry
-                    resolved_entries.append(
-                        ResolvedBatchSelectionEntry(
-                            set_id=str(set_id),
-                            label=str(label),
-                            entry=preview_entry.entry,
-                            canonical_entry=canonical_entry,
-                        )
-                    )
-                    if set_id == focused_set_id:
-                        focused_selection_uses_workspace_controls = True
-                        focused_selection_has_resolved_entry = True
-                elif preview_entry.state == "invalid":
-                    invalid_entry = True
-                else:
-                    missing_workspace_entry = True
-                continue
-
-            if not active_cache_key:
-                missing_explicit_entry = True
-                continue
-            explicit_entry = self._cache_entry_for_set_id_from_store(
-                store=batch_cache.result_cache,
-                cache_key=active_cache_key,
-                set_id=set_id,
-            )
-            if set_id in invalidated_set_ids:
-                if explicit_entry.state == "invalid":
-                    invalid_entry = True
-                else:
-                    missing_explicit_entry = True
-                continue
-            if explicit_entry.entry is not None:
-                resolved_entries.append(
-                    ResolvedBatchSelectionEntry(set_id=str(set_id), label=str(label), entry=explicit_entry.entry)
-                )
-                if set_id == focused_set_id:
-                    focused_selection_uses_workspace_controls = False
-                    focused_selection_has_resolved_entry = True
-            elif explicit_entry.state == "invalid":
-                invalid_entry = True
-            else:
-                missing_explicit_entry = True
-
-        all_selected_sets_resolved = len(resolved_entries) == len(
-            [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        )
-        if invalid_entry:
-            return (
-                resolved_entries,
-                "invalid_cache_entry",
-                all_selected_sets_resolved,
-                has_workspace_selection,
-                has_resolved_workspace_preview,
-                focused_selection_uses_workspace_controls,
-                focused_selection_has_resolved_entry,
-            )
-        if missing_workspace_entry:
-            return (
-                resolved_entries,
-                "preview_pending",
-                all_selected_sets_resolved,
-                has_workspace_selection,
-                has_resolved_workspace_preview,
-                focused_selection_uses_workspace_controls,
-                focused_selection_has_resolved_entry,
-            )
-        if missing_explicit_entry:
-            return (
-                resolved_entries,
-                "no_cached_results",
-                all_selected_sets_resolved,
-                has_workspace_selection,
-                has_resolved_workspace_preview,
-                focused_selection_uses_workspace_controls,
-                focused_selection_has_resolved_entry,
-            )
-        return (
-            resolved_entries,
-            None,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
-        )
-
     def _normalized_slider_overrides(
         self,
         *,
@@ -7287,7 +6361,7 @@ class MainWindow(
         step_analysis_context = None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         for var_name, var_value in override_map.items():
             meta = metadata.get(var_name, {})
@@ -7681,7 +6755,7 @@ class MainWindow(
         from kindred.core.units import UnitsModel
         step_constraint_context = {
             "temperature_K": float(T),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         step_analysis_context = build_current_text_step_analysis_context(
             str(base_text or ""),
@@ -8999,7 +8073,7 @@ class MainWindow(
         sliders = getattr(self._mechanism_editor, "_variable_sliders", None) if commit else None
         step_constraint_context = {
             "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self.wegscheider_cyclicity_enabled()),
+            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
         }
         try:
             outcome = analyze_step_parameter_update(
@@ -9471,8 +8545,8 @@ class MainWindow(
             'slider_preview_points': int(current_slider_preview_points),
             'parameter_preview_debounce_ms': int(current_parameter_preview_debounce_ms),
             'equilibrium_preview_debounce_ms': int(current_equilibrium_preview_debounce_ms),
-            'result_cache_cap': int(self._sim_controller.batch_cache.result_cache.max_entries()),
-            'preview_cache_cap': int(self._sim_controller.batch_cache.preview_cache.max_entries()),
+            'result_cache_cap': int(self._sim_controller.batch_cache.result_cache_max_entries()),
+            'preview_cache_cap': int(self._sim_controller.batch_cache.preview_cache_max_entries()),
         }
         dialog.set_settings(current_settings)
 
@@ -9586,30 +8660,30 @@ class MainWindow(
                     result_cap=int(
                         settings.get(
                             'result_cache_cap',
-                            self._sim_controller.batch_cache.result_cache.max_entries(),
+                            self._sim_controller.batch_cache.result_cache_max_entries(),
                         )
                     ),
                     preview_cap=int(
                         settings.get(
                             'preview_cache_cap',
-                            self._sim_controller.batch_cache.preview_cache.max_entries(),
+                            self._sim_controller.batch_cache.preview_cache_max_entries(),
                         )
                     ),
                     persist=True,
                 )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/slider_preview_solver",
                 str(next_runtime_settings["slider_preview_solver"]),
             )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/slider_preview_points",
                 int(next_runtime_settings["slider_preview_points"]),
             )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/parameter_preview_debounce_ms",
                 int(next_runtime_settings["parameter_preview_debounce_ms"]),
             )
-            self.settings_set_value(
+            self._settings_owner.settings_set_value(
                 "simulation/equilibrium_preview_debounce_ms",
                 int(next_runtime_settings["equilibrium_preview_debounce_ms"]),
             )

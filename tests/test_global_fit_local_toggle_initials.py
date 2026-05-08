@@ -47,7 +47,7 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -70,9 +70,9 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
         # Uncheck "Fit" for the local initial condition row.
         window._params_ics_tab._param_table.item(row, 0).setCheckState(QtCore.Qt.Unchecked)
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         assert captured["dataset_params"] is None
         assert captured["dataset_variable_params"] is None

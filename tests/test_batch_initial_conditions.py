@@ -740,7 +740,7 @@ def test_display_cached_batch_selection_first_run_is_not_blank(main_window):
         "algebra_scalars": {},
     }
 
-    ok = main_window.display_cached_batch_selection(
+    ok = main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=cache_key,
         selected_sets=["set1"],
         prefer_set="set1",

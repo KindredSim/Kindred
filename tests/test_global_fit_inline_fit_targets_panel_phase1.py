@@ -177,7 +177,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:
@@ -198,9 +198,9 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         qt_app.processEvents()
         assert window._global_payload_lookup["ds1"]["species"] == ["A"]
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
         assert captured["starts"] == 1
         assert captured["datasets"][-1][0]["species"] == ["A"]
 
@@ -210,7 +210,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         assert captured["starts"] == 1
         assert set(window._global_payload_lookup["ds1"]["species"]) == {"A", "B"}
 
-        window._start_fit()
+        window.run_fit()
         assert captured["starts"] == 2
         assert set(captured["datasets"][-1][0]["species"]) == {"A", "B"}
     finally:
@@ -238,7 +238,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:
@@ -257,9 +257,9 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
 
         assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 1.0}
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
         assert captured["starts"] == 1
         assert captured["datasets"][-1][0]["target_weights"] == {"A": 1.0}
 
@@ -268,7 +268,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
         assert captured["starts"] == 1
         assert window._global_payload_lookup["ds1"]["target_weights"] == {"A": 2.5}
 
-        window._start_fit()
+        window.run_fit()
         assert captured["starts"] == 2
         assert captured["datasets"][-1][0]["target_weights"] == {"A": 2.5}
     finally:

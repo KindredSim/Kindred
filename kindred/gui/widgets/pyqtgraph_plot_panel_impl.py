@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 import logging
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, NamedTuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, NamedTuple
 
 import numpy as np
 from PySide6 import QtCore, QtWidgets
@@ -69,6 +69,81 @@ def _try_1d_float_array(value: object) -> np.ndarray:
         return np.asarray(value, dtype=float).reshape(-1)
     except Exception:
         return np.asarray([], dtype=float)
+
+
+def _intervention_annotations_from_provenance(provenance: Mapping[str, object] | None) -> List[Dict[str, object]]:
+    if not isinstance(provenance, Mapping):
+        return []
+    annotations: List[Dict[str, object]] = []
+    schedule = provenance.get("intervention_schedule")
+    if isinstance(schedule, Mapping):
+        for event in list(schedule.get("instant_events") or ()):
+            if not isinstance(event, Mapping):
+                continue
+            time_value = _try_float(event.get("time"))
+            if time_value is None:
+                continue
+            annotations.append(
+                {
+                    "time": float(time_value),
+                    "kind": "instant",
+                    "label": f"{event.get('op', 'event')} {event.get('species', '')}".strip(),
+                }
+            )
+        for event in list(schedule.get("repeated_events") or ()):
+            if not isinstance(event, Mapping):
+                continue
+            start = _try_float(event.get("start"))
+            every = _try_float(event.get("every"))
+            try:
+                count = int(event.get("count") or 0)
+            except Exception:
+                count = 0
+            if start is None or every is None or count <= 0:
+                continue
+            for idx in range(count):
+                annotations.append(
+                    {
+                        "time": float(start + every * float(idx)),
+                        "kind": "pulse",
+                        "label": f"pulse {event.get('species', '')}".strip(),
+                    }
+                )
+        for interval in list(schedule.get("intervals") or ()):
+            if not isinstance(interval, Mapping):
+                continue
+            start = _try_float(interval.get("start"))
+            end = _try_float(interval.get("end"))
+            if start is None or end is None or end <= start:
+                continue
+            annotations.append(
+                {
+                    "start": float(start),
+                    "end": float(end),
+                    "kind": str(interval.get("kind") or "interval"),
+                    "label": f"{interval.get('kind', 'interval')} {interval.get('species', '')}".strip(),
+                }
+            )
+    for event in list(provenance.get("intervention_trigger_events") or ()):
+        if not isinstance(event, Mapping):
+            continue
+        time_value = _try_float(event.get("time"))
+        if time_value is None:
+            continue
+        annotations.append(
+            {
+                "time": float(time_value),
+                "kind": "trigger",
+                "label": f"trigger {event.get('trigger_species', '')}".strip(),
+            }
+        )
+    return sorted(
+        annotations,
+        key=lambda item: (
+            float(item.get("time", item.get("start", 0.0))),
+            str(item.get("label") or ""),
+        ),
+    )
 
 
 # Try to import pyqtgraph
@@ -250,6 +325,9 @@ if PYQTGRAPH_AVAILABLE:
             self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
             self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
             self._annotations: List[pg.TextItem] = []
+            self._intervention_annotations: List[Dict[str, object]] = []
+            self._intervention_annotation_items: List[object] = []
+            self._show_intervention_annotations: bool = False
             self._sampling_mode: str = "dense"
             self._sampling_target: int = 1000
             self._export_scope_preference: str = "axis"
@@ -493,6 +571,7 @@ if PYQTGRAPH_AVAILABLE:
             self._simulation_set_label = str(label) if label else None
             self._simulation_set_popup_label = None
             self._workspace_preview_display_provenance_by_set_id = {}
+            self._intervention_annotations = []
             normalized_overlays: List[Dict[str, object]] = []
             for entry in (overlays or []):
                 if not isinstance(entry, dict):
@@ -686,7 +765,16 @@ if PYQTGRAPH_AVAILABLE:
             return {
                 "t": np.asarray(self._t, dtype=float).reshape(-1),
                 "series": dict(self._series),
+                "intervention_annotations": [dict(item) for item in self._intervention_annotations],
             }
+
+        def set_intervention_annotations_from_provenance(self, provenance: Mapping[str, object] | None) -> None:
+            self._intervention_annotations = _intervention_annotations_from_provenance(provenance)
+            self._refresh_intervention_annotations()
+
+        def set_intervention_annotations_visible(self, visible: bool) -> None:
+            self._show_intervention_annotations = bool(visible)
+            self._refresh_intervention_annotations()
 
         def set_selected_series(self, names: Sequence[str]) -> None:
             """Apply a specific selection of Y-series."""
@@ -1869,7 +1957,67 @@ if PYQTGRAPH_AVAILABLE:
             self._rebuild_overlay_series_caches(axis_scope_series)
             self._draw_overlay_series(list(self._active_overlay_series))
             self._overlay_panel.set_status_messages(self._visible_overlay_warnings)
+            self._refresh_intervention_annotations()
             self._refresh_view_after_plot_update()
+
+        def _refresh_intervention_annotations(self) -> None:
+            for item in list(self._intervention_annotation_items):
+                try:
+                    self._plot_item.removeItem(item)
+                except Exception:
+                    pass
+            self._intervention_annotation_items = []
+            if (
+                not self._show_intervention_annotations
+                or self._t is None
+                or self._parametric_mode
+                or self._x_axis_name != "t"
+            ):
+                return
+            for annotation in list(self._intervention_annotations or []):
+                start_value = _try_float(annotation.get("start"))
+                end_value = _try_float(annotation.get("end"))
+                label = str(annotation.get("label") or annotation.get("kind") or "intervention")
+                if start_value is not None and end_value is not None and end_value > start_value:
+                    try:
+                        region = pg.LinearRegionItem(
+                            values=(float(start_value), float(end_value)),
+                            movable=False,
+                            brush=pg.mkBrush(210, 110, 0, 32),
+                            pen=pg.mkPen(color=(210, 110, 0), width=1, style=Qt.DashLine),
+                        )
+                        region.setZValue(8)
+                        self._plot_item.addItem(region, ignoreBounds=True)
+                        self._intervention_annotation_items.append(region)
+                    except Exception:
+                        logger.debug("Failed to draw intervention interval annotation.", exc_info=True)
+                    for boundary_label, boundary_time in (("start", start_value), ("end", end_value)):
+                        line = pg.InfiniteLine(
+                            angle=90,
+                            pos=float(boundary_time),
+                            movable=False,
+                            pen=pg.mkPen(color=(210, 110, 0), width=1, style=Qt.DashLine),
+                            label=f"{label} {boundary_label}",
+                            labelOpts={"position": 0.95, "color": (110, 70, 0)},
+                        )
+                        line.setZValue(9)
+                        self._plot_item.addItem(line, ignoreBounds=True)
+                        self._intervention_annotation_items.append(line)
+                    continue
+                time_value = _try_float(annotation.get("time"))
+                if time_value is None:
+                    continue
+                line = pg.InfiniteLine(
+                    angle=90,
+                    pos=float(time_value),
+                    movable=False,
+                    pen=pg.mkPen(color=(210, 110, 0), width=1, style=Qt.DashLine),
+                    label=label,
+                    labelOpts={"position": 0.95, "color": (110, 70, 0)},
+                )
+                line.setZValue(9)
+                self._plot_item.addItem(line, ignoreBounds=True)
+                self._intervention_annotation_items.append(line)
 
         def _refresh_view_after_plot_update(self) -> None:
             """Keep auto-range truthful across live result updates without overriding manual ranges."""
@@ -2359,6 +2507,8 @@ if PYQTGRAPH_AVAILABLE:
             self._export_all_overlay_warnings = []
             self._export_all_overlay_cache_dirty = True
             self._annotations = []
+            self._intervention_annotations = []
+            self._intervention_annotation_items = []
             self._guide_items = []
             self._scalar_values = {}
             self._simulation_set_label = None
@@ -2415,6 +2565,11 @@ if PYQTGRAPH_AVAILABLE:
 
             # Annotation actions
             annotation_menu = menu.addMenu("Annotations")
+            show_intervention_action = annotation_menu.addAction("Show Intervention Schedule Annotations")
+            show_intervention_action.setCheckable(True)
+            show_intervention_action.setChecked(bool(self._show_intervention_annotations))
+            show_intervention_action.triggered.connect(self.set_intervention_annotations_visible)
+
             add_annotation_action = annotation_menu.addAction("Add Text Annotation...")
             add_annotation_action.triggered.connect(self._add_annotation)
 
@@ -2676,6 +2831,14 @@ else:
             self._analysis_tabs_detached = not bool(embed_analysis_tabs)
 
         def set_data(self, t, series):
+            """Stub method."""
+            pass
+
+        def set_intervention_annotations_from_provenance(self, provenance):
+            """Stub method."""
+            pass
+
+        def set_intervention_annotations_visible(self, visible):
             """Stub method."""
             pass
 

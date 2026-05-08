@@ -41,8 +41,16 @@ def test_intervention_schedule_normalizes_payload_and_fingerprint() -> None:
     assert payload["instant_events"] == [
         {"time": 1.0, "species": "A", "op": "set", "value": 3.0},
         {"time": 2.0, "species": "A", "op": "add", "amount": 0.25},
-        {"time": 4.0, "species": "B", "op": "add", "amount": 0.5},
-        {"time": 6.0, "species": "B", "op": "add", "amount": 0.5},
+    ]
+    assert payload["repeated_events"] == [
+        {
+            "species": "B",
+            "op": "add",
+            "count": 2,
+            "start": 4.0,
+            "every": 2.0,
+            "amount": 0.5,
+        },
     ]
     assert payload["intervals"] == [
         {"start": 1.0, "end": 3.0, "species": "B", "kind": "source", "rate": 0.1}
@@ -76,6 +84,20 @@ def test_intervention_schedule_rejects_conflicting_absolute_events() -> None:
         )
 
 
+def test_intervention_schedule_rejects_absolute_and_delta_events_without_ordering_policy() -> None:
+    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
+
+    with pytest.raises(InterventionScheduleError, match="Cannot combine absolute and add/remove"):
+        InterventionSchedule.from_payload(
+            {
+                "instant_events": [
+                    {"time": 1.0, "species": "A", "op": "set", "value": 2.0},
+                    {"time": 1.0, "species": "A", "op": "add", "amount": 0.5},
+                ]
+            }
+        )
+
+
 def test_dsl_intervention_directives_build_core_schedule_metadata() -> None:
     from kindred.core.mechanism_metadata import MechanismMetadataKeys
     from kindred.core.simulator.dsl import parse_dsl_to_mechanism
@@ -88,6 +110,7 @@ def test_dsl_intervention_directives_build_core_schedule_metadata() -> None:
                 "initial: B=0.0",
                 "intervention: op=set; species=A; time=1.0; value=3.0",
                 "intervention: op=pulse; species=B; start=2.0; every=1.0; count=2; amount=0.25",
+                "intervention: op=trigger; trigger_species=A; threshold=0.5; direction=falling; action=add; species=B; amount=0.1; max_count=1; min_interval=0.0",
                 "intervention: op=source; species=B; start=1.0; end=4.0; rate=0.5",
             ]
         )
@@ -96,10 +119,102 @@ def test_dsl_intervention_directives_build_core_schedule_metadata() -> None:
     schedule = mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
     payload = schedule.to_payload()
 
-    assert [event["time"] for event in payload["instant_events"]] == [1.0, 2.0, 3.0]
+    assert [event["time"] for event in payload["instant_events"]] == [1.0]
+    assert payload["repeated_events"] == [
+        {
+            "species": "B",
+            "op": "pulse",
+            "count": 2,
+            "start": 2.0,
+            "every": 1.0,
+            "amount": 0.25,
+        }
+    ]
+    assert payload["trigger_events"] == [
+        {
+            "trigger_species": "A",
+            "direction": "falling",
+            "species": "B",
+            "action": "add",
+            "max_count": 1,
+            "min_interval": 0.0,
+            "threshold": 0.5,
+            "amount": 0.1,
+        }
+    ]
     assert payload["intervals"] == [
         {"start": 1.0, "end": 4.0, "species": "B", "kind": "source", "rate": 0.5}
     ]
+
+
+def test_dsl_intervention_directives_preserve_parameterized_schedule_fields() -> None:
+    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=0.1",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=add; species=A; time_param=pulse_time; amount_param=dose",
+                "intervention: op=pulse; species=A; start_param=pulse_start; every_param=pulse_gap; count=2; amount_param=pulse_amount",
+                "intervention: op=source; species=B; start=1.0; end_param=stop_time; rate_param=feed",
+            ]
+        )
+    )
+
+    schedule = mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
+    payload = schedule.to_payload()
+
+    assert payload["instant_events"] == [
+        {"time_param": "pulse_time", "species": "A", "op": "add", "amount_param": "dose"}
+    ]
+    assert payload["repeated_events"] == [
+        {
+            "species": "A",
+            "op": "pulse",
+            "count": 2,
+            "start_param": "pulse_start",
+            "every_param": "pulse_gap",
+            "amount_param": "pulse_amount",
+        }
+    ]
+    assert payload["intervals"] == [
+        {
+            "start": 1.0,
+            "end_param": "stop_time",
+            "species": "B",
+            "kind": "source",
+            "rate_param": "feed",
+        }
+    ]
+
+
+def test_parameterized_intervention_schedule_requires_request_parameter_values_before_solve() -> None:
+    from kindred.core.simulation_preparation import (
+        SimulationExecutionRequest,
+        SimulationPreparationError,
+        prepare_simulation_worker_run,
+    )
+
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config={"solver": "BDF", "grid": {"N": 3}},
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=add; species=A; time=1.0; amount_param=dose",
+            ]
+        ),
+    )
+
+    with pytest.raises(SimulationPreparationError, match="Missing intervention schedule parameter: dose"):
+        prepare_simulation_worker_run(execution_request=request)
 
 
 def test_simulation_execution_request_round_trips_intervention_schedule_payload() -> None:

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui import main_window as main_window_module
+from kindred.gui.simulation_batch_owner import SimulationBatchOwner
 
 
 pytestmark = pytest.mark.gui
@@ -152,23 +156,172 @@ def _assert_default_shell_contract(main_window) -> None:
     _assert_right_column_contract(main_window)
 
 
-def test_main_window_simulation_controller_uses_window_owned_ui_ports(main_window) -> None:
+_SIMULATION_PORT_METHODS = {
+    "dialogs": ("message_box_warning", "message_box_critical"),
+    "settings": ("settings_set_value", "settings_sync"),
+    "run_ui": (
+        "run_button_is_enabled",
+        "set_run_button_enabled",
+        "set_runtime_backed_run_controls_ready",
+        "set_status_text",
+    ),
+    "slider": (
+        "is_mechanism_valid_for_preview",
+        "preview_initials_for_row",
+        "preview_batch_cache_token",
+        "reset_mechanism_workspaces",
+    ),
+    "batch": (
+        "batch_rows_for_scope",
+        "batch_set_id_for_row",
+        "batch_cache_key",
+        "display_cached_batch_selection",
+    ),
+    "mechanism": (
+        "auto_lock_for_run",
+        "is_mechanism_ready_for_run",
+        "mechanism_reactions_text_raw",
+        "get_mechanism_text",
+        "apply_parameter_overrides_to_dsl",
+    ),
+    "solver": (
+        "parse_sim_time_seconds",
+        "initial_solver_name",
+        "use_sparse_jacobian",
+    ),
+    "runtime": (
+        "prepare_slider_runtime",
+        "apply_slider_overrides_to_bindings",
+    ),
+    "results": (
+        "set_data",
+        "main_plot",
+        "set_results_table",
+    ),
+    "provenance": (
+        "set_last_simulation_provenance",
+        "set_last_simulation_ctc",
+    ),
+    "mechanism_helpers": (
+        "authoritative_structure_snapshot",
+        "last_mechanism",
+        "remember_last_mechanism",
+    ),
+}
+
+
+def _assert_port_capabilities(port: object, *, port_name: str, methods: tuple[str, ...]) -> None:
+    missing = [method for method in methods if not callable(getattr(port, method, None))]
+    assert missing == [], f"{port_name} port missing callable methods: {missing}"
+
+
+def test_main_window_simulation_controller_wires_explicit_simulation_port_capabilities(main_window) -> None:
     ui = main_window.simulation_controller.ui
 
     assert getattr(main_window, "_preview_session", None) is not None
     assert getattr(main_window, "_variable_runtime", None) is not None
     assert getattr(main_window, "_mechanism_helpers", None) is not None
-    assert ui.dialogs is main_window
-    assert ui.settings is main_window
-    assert ui.run_ui is main_window
+    for port_name, methods in _SIMULATION_PORT_METHODS.items():
+        _assert_port_capabilities(
+            getattr(ui, port_name),
+            port_name=port_name,
+            methods=methods,
+        )
+
+    assert ui.run_ui is not main_window
+    assert ui.dialogs is main_window._simulation_dialogs
+    assert ui.settings is main_window._settings_owner
+    assert ui.settings is not main_window
+    assert ui.run_ui is main_window._simulation_run_ui_owner
+    assert ui.results is main_window.results_controller
+    assert ui.results is not main_window
+    assert ui.provenance is main_window._simulation_provenance_owner
+    assert ui.solver is main_window._simulation_solver_owner
+    assert ui.solver is not main_window
+    assert ui.mechanism is main_window._simulation_mechanism_owner
+    assert ui.mechanism is not main_window
+    assert ui.batch is main_window._simulation_batch_owner
+    assert ui.batch is not main_window
+    assert not hasattr(main_window, "_settings")
+    assert not hasattr(main_window, "settings_set_value")
+    assert not hasattr(main_window, "settings_remove")
+    assert not hasattr(main_window, "settings_sync")
+    assert not hasattr(main_window, "_run_button_requested_enabled")
+    assert not hasattr(main_window, "_simulation_runtime_run_ready")
+    assert not hasattr(main_window, "_last_simulation_provenance")
+    assert not hasattr(main_window, "_last_simulation_ctc")
+    assert not hasattr(main_window, "display_cached_batch_selection")
+    assert not hasattr(main_window, "display_workspace_aware_batch_selection")
+    assert not hasattr(main_window, "_display_workspace_aware_preview_batch_selection")
+    assert not hasattr(main_window, "_resolve_workspace_aware_batch_selection")
+    assert not hasattr(main_window, "_matching_preview_entry_for_workspace_set")
+    assert not hasattr(main_window, "_record_current_main_plot_workspace_preview_provenance")
+    assert not hasattr(main_window, "_displayed_workspace_preview_provenance_matches_current_workspace")
+    assert not hasattr(main_window, "_batch_cache_entry_matches_plot_payload")
+    assert not hasattr(main_window, "_current_workspace_preview_identity_payload")
+    assert not hasattr(main_window, "_active_explicit_cache_entry_for_set")
+    assert not hasattr(main_window, "_batch_cache_contains_set")
+    assert not hasattr(main_window, "_purge_batch_cache_for_deleted_sets")
+    assert not hasattr(main_window, "batch_result_cache_store")
+    assert not hasattr(main_window, "auto_lock_for_run")
+    assert not hasattr(main_window, "is_mechanism_ready_for_run")
+    assert not hasattr(main_window, "mechanism_slider_points_value")
+    assert not hasattr(main_window, "mechanism_slider_solver_value")
+    assert not hasattr(main_window, "num_points_spinbox_value")
+    assert not hasattr(main_window, "sim_time_spinbox_text")
+    assert not hasattr(main_window, "use_sparse_jacobian")
+    assert not hasattr(main_window, "initial_solver_name")
+    assert not hasattr(main_window, "initial_rtol")
+    assert not hasattr(main_window, "initial_atol")
+    assert not hasattr(main_window, "dsl_global_temperature_K")
     assert ui.slider is main_window._preview_session
-    assert ui.batch is main_window
-    assert ui.mechanism is main_window
-    assert ui.solver is main_window
     assert ui.runtime is main_window._variable_runtime
-    assert ui.results is main_window
-    assert ui.provenance is main_window
     assert ui.mechanism_helpers is main_window._mechanism_helpers
+
+    batch_owner_init = inspect.signature(SimulationBatchOwner.__init__).parameters
+    assert "display_cached_batch_selection" not in batch_owner_init
+    assert "display_workspace_aware_batch_selection" not in batch_owner_init
+
+    settings_key = "tests/simulation_settings_owner_contract"
+    try:
+        ui.settings.settings_set_value(settings_key, "owner-value")
+        ui.settings.settings_sync()
+        assert main_window._settings_owner.qsettings.value(settings_key) == "owner-value"
+    finally:
+        main_window._settings_owner.settings_remove(settings_key)
+        main_window._settings_owner.settings_sync()
+
+    provenance = {"solver": "BDF"}
+    ui.provenance.set_last_simulation_provenance(provenance)
+    provenance["solver"] = "LSODA"
+    assert ui.provenance.last_simulation_provenance == {"solver": "BDF"}
+    returned_provenance = ui.provenance.last_simulation_provenance
+    returned_provenance["solver"] = "mutated"
+    assert ui.provenance.last_simulation_provenance == {"solver": "BDF"}
+
+    ui.results.set_data(
+        np.asarray([0.0, 1.0]),
+        {"A": np.asarray([1.0, 0.5])},
+        label="owner-contract",
+        overlays=[],
+    )
+    assert main_window.main_plot_has_data() is True
+
+    ui.run_ui.set_runtime_backed_run_controls_ready(False)
+    ui.run_ui.set_run_button_enabled(True)
+    assert ui.run_ui.requested_run_enabled is True
+    assert ui.run_ui.runtime_ready is False
+    assert main_window._run_btn.isEnabled() is False
+
+    ui.run_ui.set_runtime_backed_run_controls_ready(True)
+    assert main_window._run_btn.isEnabled() is True
+
+
+def test_main_window_source_does_not_read_batch_cache_stores_directly() -> None:
+    source = inspect.getsource(main_window_module.MainWindow)
+
+    assert ".batch_cache.result_cache." not in source
+    assert ".batch_cache.preview_cache." not in source
 
 
 def test_main_window_preview_session_uses_bound_lifecycle_port_instead_of_main_window_controller_attr(

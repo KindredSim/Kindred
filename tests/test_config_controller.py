@@ -155,8 +155,8 @@ def test_wait_for_dock_area_pumps_events_before_final_match_check(monkeypatch) -
 
 
 def test_recent_files_menu_populates_placeholder_when_empty(main_window):
-    main_window._settings.setValue("recent_files", [])
-    main_window._settings.sync()
+    main_window._settings_owner.qsettings.setValue("recent_files", [])
+    main_window._settings_owner.qsettings.sync()
 
     main_window.config_controller.update_recent_files_menu()
     menu = _get_recent_menu(main_window)
@@ -168,22 +168,22 @@ def test_recent_files_menu_populates_placeholder_when_empty(main_window):
 
 
 def test_add_to_recent_files_dedupes_and_caps(main_window, tmp_path):
-    main_window._settings.setValue("recent_files", [])
-    main_window._settings.sync()
+    main_window._settings_owner.qsettings.setValue("recent_files", [])
+    main_window._settings_owner.qsettings.sync()
 
     paths = [tmp_path / f"proj_{idx:02d}.kin" for idx in range(12)]
     for path in paths:
         path.write_text("{}", encoding="utf-8")
         main_window.config_controller.add_to_recent_files(str(path))
 
-    recent_files = main_window._settings.value("recent_files", [])
+    recent_files = main_window._settings_owner.qsettings.value("recent_files", [])
     assert isinstance(recent_files, list)
     assert len(recent_files) == 10
     assert recent_files[0].endswith("proj_11.kin")
     assert recent_files[-1].endswith("proj_02.kin")
 
     main_window.config_controller.add_to_recent_files(str(paths[5]))
-    recent_files = main_window._settings.value("recent_files", [])
+    recent_files = main_window._settings_owner.qsettings.value("recent_files", [])
     assert isinstance(recent_files, list)
     assert len(recent_files) == 10
     assert recent_files[0].endswith("proj_05.kin")
@@ -196,7 +196,7 @@ def test_toggle_theme_persists_setting(main_window):
     main_window.config_controller.toggle_theme()
 
     assert main_window._dark_mode == (not original_checked)
-    assert main_window._settings.value("ui/dark_mode", True, type=bool) == (not original_checked)
+    assert main_window._settings_owner.qsettings.value("ui/dark_mode", True, type=bool) == (not original_checked)
 
 
 def test_config_controller_port_exposes_bounded_surface_without_raw_main_window(main_window):
@@ -204,12 +204,12 @@ def test_config_controller_port_exposes_bounded_surface_without_raw_main_window(
 
     assert not hasattr(port, "main_window")
     assert port.parent is main_window
-    assert port.settings() is main_window._settings
+    assert port.settings() is main_window._settings_owner.qsettings
     assert port.dark_mode_action() is main_window._dark_mode_action
 
 
 def test_save_then_load_settings_round_trip(main_window):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -267,7 +267,7 @@ def test_save_then_load_settings_round_trip(main_window):
 def test_load_settings_clamps_parallel_batch_workers_to_shared_ceiling(main_window):
     from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/max_parallel_batch_workers", 200)
     settings.setValue("simulation/batch_runtime_lane_budget", 200)
@@ -335,7 +335,7 @@ def test_insert_preference_surface_removed(main_window):
 
 
 def test_legacy_insert_preference_setting_is_ignored(main_window):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.setValue("ui/insert_preference", "append")
     settings.sync()
 
@@ -348,7 +348,7 @@ def test_legacy_insert_preference_setting_is_ignored(main_window):
 
 
 def test_solver_settings_persist_across_restart_and_restore_visible_combo(main_window, qt_app):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -375,7 +375,7 @@ def test_solver_settings_persist_across_restart_and_restore_visible_combo(main_w
 
 
 def test_slider_preview_preferences_persist_across_restart(main_window, qt_app):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -397,7 +397,7 @@ def test_slider_preview_preferences_persist_across_restart(main_window, qt_app):
 
 @pytest.mark.skip(reason="Ribbon hidden from users — feature intact, entry point commented out in main_window.py")
 def test_ribbon_collapsed_state_persists_across_restart(main_window, qt_app):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -449,7 +449,7 @@ def test_saved_maximized_state_stays_hidden_until_explicit_show(qt_app):
 
 
 def test_maximized_state_round_trips_via_window_settings(main_window, qt_app):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -475,7 +475,7 @@ def test_maximized_state_round_trips_via_window_settings(main_window, qt_app):
 
 @pytest.mark.parametrize("dock_attr", ["_mechanism_dock", "_sliders_dock", "_batch_dock", "_right_dock", "_analysis_dock"])
 def test_dock_visibility_round_trips_via_window_state(main_window, qt_app, dock_attr):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -497,7 +497,7 @@ def test_dock_visibility_round_trips_via_window_state(main_window, qt_app, dock_
 
 @pytest.mark.parametrize("dock_attr", ["_mechanism_dock", "_sliders_dock", "_batch_dock", "_right_dock", "_analysis_dock"])
 def test_dock_floating_state_round_trips_via_window_state(main_window, qt_app, dock_attr):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -521,7 +521,7 @@ def test_dock_floating_state_round_trips_via_window_state(main_window, qt_app, d
 
 
 def test_unsafe_restored_floating_dock_state_redocks_to_last_area(main_window, qt_app, monkeypatch):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -559,7 +559,7 @@ def test_unsafe_restored_floating_dock_state_redocks_to_last_area(main_window, q
 
 
 def test_unsafe_restored_floating_dock_recovery_preserves_maximized_main_window(main_window, qt_app, monkeypatch):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -612,7 +612,7 @@ def test_unsafe_restored_floating_dock_recovery_preserves_maximized_main_window(
     ],
 )
 def test_dock_area_round_trips_via_window_state(main_window, qt_app, dock_attr, target_area):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -639,7 +639,7 @@ def test_dock_area_round_trips_via_window_state(main_window, qt_app, dock_attr, 
 
 
 def test_default_side_first_arrangement_round_trips_via_window_state(main_window, qt_app):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -668,7 +668,7 @@ def test_splitter_state_round_trips_via_main_plot_workspace_splitter_even_with_d
 
     window = MainWindow()
     try:
-        settings = window._settings
+        settings = window._settings_owner.qsettings
         settings.clear()
         settings.sync()
 
@@ -718,7 +718,7 @@ def test_splitter_state_round_trips_via_main_plot_workspace_splitter_even_with_d
 
 
 def test_load_settings_corrupt_splitter_state_falls_back_without_crashing(main_window, monkeypatch, caplog):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("window/splitter_state", QtCore.QByteArray(b"corrupt-state"))
     settings.sync()
@@ -746,7 +746,7 @@ def test_load_settings_corrupt_splitter_state_falls_back_without_crashing(main_w
 
 
 def test_compact_on_screen_sliders_dock_floating_state_round_trips_via_window_state(main_window, qt_app, monkeypatch):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -823,7 +823,7 @@ def test_invalid_explicit_startup_tolerances_do_not_override_saved_settings(qt_a
 
 
 def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, caplog):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/max_parallel_batch_workers", "not-an-int")
     settings.setValue("simulation/batch_runtime_lane_budget", "bad-lanes")
@@ -845,8 +845,8 @@ def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, cap
         main_window.simulation_controller.batch_runtime_lane_budget
         == PROJECT_DEFAULTS["batch_runtime_lane_budget"]
     )
-    assert int(main_window.simulation_controller.batch_cache.result_cache.max_entries()) == default_result_cap
-    assert int(main_window.simulation_controller.batch_cache.preview_cache.max_entries()) == default_preview_cap
+    assert int(main_window.simulation_controller.batch_cache.result_cache_max_entries()) == default_result_cap
+    assert int(main_window.simulation_controller.batch_cache.preview_cache_max_entries()) == default_preview_cap
     assert "simulation/max_parallel_batch_workers='not-an-int'" in caplog.text
     assert "simulation/batch_runtime_lane_budget='bad-lanes'" in caplog.text
     assert "simulation/result_cache_cap='bad-cap'" in caplog.text
@@ -854,7 +854,7 @@ def test_load_settings_invalid_integer_values_fall_back_and_log(main_window, cap
 
 
 def test_load_settings_empty_settings_uses_factory_cache_caps(main_window):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -862,16 +862,16 @@ def test_load_settings_empty_settings_uses_factory_cache_caps(main_window):
 
     main_window.config_controller.load_settings()
 
-    assert int(main_window.simulation_controller.batch_cache.result_cache.max_entries()) == int(
+    assert int(main_window.simulation_controller.batch_cache.result_cache_max_entries()) == int(
         BatchSimulationCache.result_cache_cap
     )
-    assert int(main_window.simulation_controller.batch_cache.preview_cache.max_entries()) == int(
+    assert int(main_window.simulation_controller.batch_cache.preview_cache_max_entries()) == int(
         BatchSimulationCache.preview_cache_cap
     )
 
 
 def test_load_settings_invalid_tolerances_preserve_active_values(main_window, caplog):
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/rtol", "bad-rtol")
     settings.setValue("simulation/atol", "bad-atol")

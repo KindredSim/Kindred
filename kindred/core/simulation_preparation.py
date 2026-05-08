@@ -454,6 +454,42 @@ def _execution_request_intervention_schedule(
         raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
 
 
+def _resolve_intervention_schedule_for_request(
+    schedule: InterventionSchedule | None,
+    request_payload: SimulationExecutionRequest | None,
+    *,
+    allow_deferred_parameters: bool = False,
+) -> InterventionSchedule | None:
+    if schedule is None:
+        return None
+    parameter_values = dict(request_payload.parameter_overrides or {}) if request_payload is not None else {}
+    if schedule.is_parameterized and not parameter_values:
+        if bool(allow_deferred_parameters):
+            return schedule
+        try:
+            schedule.resolve_parameters({})
+        except InterventionScheduleError as exc:
+            raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
+        return schedule
+    try:
+        return schedule.resolve_parameters(parameter_values)
+    except InterventionScheduleError as exc:
+        raise SimulationPreparationError("intervention_schedule", str(exc)) from exc
+
+
+def _prepared_request_allows_deferred_schedule_parameters(
+    request_payload: SimulationExecutionRequest | None,
+    *,
+    structured_prepared_request: bool,
+) -> bool:
+    if request_payload is None or not bool(structured_prepared_request):
+        return False
+    prepared_payload = request_payload.prepared_payload
+    if not isinstance(prepared_payload, Mapping):
+        return False
+    return isinstance(prepared_payload.get("bindings"), Mapping)
+
+
 def coerce_prepared_simulation_metadata(
     prepared: object,
 ) -> Optional[PreparedSimulationMetadata]:
@@ -886,6 +922,11 @@ def prepared_simulation_run_for_execution_request(
         intervention_schedule = prepared.request.intervention_schedule
         if intervention_schedule is None:
             intervention_schedule = _execution_request_intervention_schedule(request_payload)
+    intervention_schedule = _resolve_intervention_schedule_for_request(
+        intervention_schedule,
+        request_payload,
+        allow_deferred_parameters=True,
+    )
     warnings = list(getattr(prepared, "warnings", None) or [])
     if intervention_schedule is not None:
         try:
@@ -1181,6 +1222,14 @@ def prepare_simulation_worker_run(
                 MechanismMetadataKeys.INTERVENTION_SCHEDULE
             )
             intervention_schedule = coerce_intervention_schedule(meta_schedule)
+        intervention_schedule = _resolve_intervention_schedule_for_request(
+            intervention_schedule,
+            request_payload,
+            allow_deferred_parameters=_prepared_request_allows_deferred_schedule_parameters(
+                request_payload,
+                structured_prepared_request=structured_prepared_request,
+            ),
+        )
         if intervention_schedule is not None:
             intervention_schedule.validate_species(species_names)
     except InterventionScheduleError as exc:

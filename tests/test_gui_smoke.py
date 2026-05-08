@@ -32,7 +32,7 @@ def _run_fake_simulation(window: MainWindow, monkeypatch):
         label="Results",
         overlays=[],
     )
-    window.set_last_simulation_ctc({"A": 0.5, "B": 0.5})
+    window._simulation_provenance_owner.set_last_simulation_ctc({"A": 0.5, "B": 0.5})
     return payload
 
 
@@ -97,9 +97,10 @@ def test_simulation_completion_updates_state(main_window, monkeypatch):
     _run_fake_simulation(main_window, monkeypatch)
     visible = set(main_window._plot_tabs._main_plot.visible_series())
     assert {"A", "B"}.issubset(visible)
-    assert set(main_window._last_simulation_ctc) == {"A", "B"}
-    assert main_window._last_simulation_ctc["A"] == pytest.approx(0.5)
-    assert main_window._last_simulation_ctc["B"] == pytest.approx(0.5)
+    ctc = main_window._simulation_provenance_owner.last_simulation_ctc
+    assert set(ctc) == {"A", "B"}
+    assert ctc["A"] == pytest.approx(0.5)
+    assert ctc["B"] == pytest.approx(0.5)
 
 
 def test_species_registry_detection(main_window):
@@ -278,11 +279,11 @@ def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window
     editor = main_window._mechanism_editor
     editor._reactions_text.setPlainText("reaction: A -> B; k=1.0")
     editor._validate_dsl()
-    main_window.set_runtime_backed_run_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
 
     assert editor.run_btn.isEnabled() is True
 
-    main_window.set_run_button_enabled(False)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(False)
 
     assert main_window._run_btn.isEnabled() is False
     assert editor.run_btn.isEnabled() is False
@@ -291,7 +292,7 @@ def test_mechanism_editor_run_stays_disabled_while_main_run_is_gated(main_window
 
     assert editor.run_btn.isEnabled() is False
 
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
 
     assert main_window._run_btn.isEnabled() is True
     assert editor.run_btn.isEnabled() is True

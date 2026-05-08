@@ -176,8 +176,10 @@ def test_slider_parallel_path_submits_all_selected_sets(main_window, monkeypatch
 
     _wait_for_submission_count(fake, len(names))
     assert len(_simulation_submissions(fake)) == len(names)
-    assert bool(main_window.simulation_controller.batch_run_context.get("parallel")) is True
-    assert int(main_window.simulation_controller.batch_run_context.get("effective_workers") or 0) > 1
+    state = main_window.simulation_controller.batch_context_owner.active_batch_state()
+    assert state is not None
+    assert state.parallel is True
+    assert state.effective_workers > 1
     main_window.simulation_controller.shutdown_batch_lane_pool(force_terminate=True)
 
 

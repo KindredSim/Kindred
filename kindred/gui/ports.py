@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
 
 
 def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
@@ -319,6 +319,29 @@ class SimulationResultsPort(Protocol):
 
     def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None: ...
 
+    def publish_simulation_completion_result(
+        self,
+        *,
+        t: Any,
+        series: Dict[str, Any],
+        cache_key: Optional[str],
+        batch_set: Optional[str],
+        batch_set_id: Optional[str],
+        selected_sets: Sequence[str],
+        prefer_set: Optional[str],
+        redraw_valid_set_ids: Optional[Sequence[str]],
+        has_redraw_subset: bool,
+        slider_triggered: bool,
+        explicit_batch_coalescing: bool,
+        algebra_scalars: Optional[Mapping[str, object]],
+        owned_species: Optional[Sequence[str]] = None,
+    ) -> bool: ...
+
+    def publish_completion_intervention_annotations(
+        self,
+        solver_provenance: Optional[Mapping[str, Any]],
+    ) -> None: ...
+
 
 class SimulationProvenancePort(Protocol):
     def snapshot_datasets(self) -> Dict[str, Any]: ...
@@ -337,6 +360,27 @@ class SimulationProvenancePort(Protocol):
         uniformity_eps: float,
         tail_strategy: str,
     ) -> Tuple[float, str, bool, float, str]: ...
+
+    def publish_simulation_completion_provenance(
+        self,
+        *,
+        mechanism_text: str,
+        solver_method: str,
+        solver_label: str,
+        solver_warning: Optional[str],
+        solver_config: Mapping[str, Any],
+        temperature_K: float,
+        temperature_source: str,
+        energy_unit: Optional[str],
+        energy_mode: bool,
+        simulation_time: float | str,
+        num_points_requested: int,
+        species_names: Sequence[str],
+        t: Any,
+        series: Mapping[str, Any],
+        algebra_scalars: Optional[Mapping[str, Any]] = None,
+        dataset_overlays: Any = None,
+    ) -> Dict[str, Any]: ...
 
 
 class SimulationMechanismHelpersPort(Protocol):

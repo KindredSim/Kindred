@@ -83,8 +83,8 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
         (first_set_id, first_preview_key, first_preview_series),
         (second_set_id, second_preview_key, second_preview_series),
     ):
-        mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-        solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+        solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
             set_id=set_id,
             mechanism_text=mechanism_text,
         )

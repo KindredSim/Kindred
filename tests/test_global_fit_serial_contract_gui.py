@@ -52,7 +52,7 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
         def cancel(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     dataset_payloads = [
         {"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]},
@@ -102,7 +102,7 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
             lane_count=1,
             readiness_required=False,
         )
-        window._start_accepted_fit_worker(FittingRuntimeAcceptedLaunch(identity=identity, session=None))
+        window.fit_worker_launch_owner.start_worker(FittingRuntimeAcceptedLaunch(identity=identity, session=None))
     finally:
         window.close()
 

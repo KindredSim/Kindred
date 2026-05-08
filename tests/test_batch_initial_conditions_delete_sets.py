@@ -88,7 +88,7 @@ def test_delete_selected_batch_sets_updates_store_mapping_cache_and_selection(ma
         s2.batch_set_id = str(main_window._batch_store.set_id_for_row(1))
 
     # Prime plot overlays from cached selection.
-    ok = main_window.display_cached_batch_selection(
+    ok = main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=cache_key,
         selected_sets=names_before[:3],
         prefer_set=names_before[0],
@@ -380,7 +380,7 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
     main_window.simulation_controller.parallel_batch.ensure_lane_pool(
         max_lanes=int(main_window._batch_store.row_count())
     )
-    main_window.set_runtime_backed_run_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
     _run_all_and_wait(main_window, qt_app)
     key1 = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     prefix1 = f"{key1}::"
@@ -396,7 +396,7 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
     main_window.simulation_controller.parallel_batch.ensure_lane_pool(
         max_lanes=int(main_window._batch_store.row_count())
     )
-    main_window.set_runtime_backed_run_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
     _run_all_and_wait(main_window, qt_app)
     key2 = str(main_window.simulation_controller.batch_cache.active_cache_key or "")
     prefix2 = f"{key2}::"

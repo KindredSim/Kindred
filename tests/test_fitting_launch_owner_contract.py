@@ -53,8 +53,152 @@ def _seed_simple_mechanism(main_window) -> None:
 
 
 @pytest.mark.gui
-def test_fitting_mixin_run_global_fit_delegates_to_launch_owner(main_window, monkeypatch):
-    from kindred.gui.fitting import GlobalFitLaunchContext
+def test_fitting_window_base_evaluator_state_is_owned_outside_simulation_func_field(qt_app):
+    from kindred.gui.fitting.window import FittingWindow
+    from kindred.gui.fitting.launch import FittingLaunchIdentityOwner
+    from kindred.gui.fitting.run_command import FittingRunCommandOwner
+    from kindred.gui.fitting.run_state import FittingRunStateOwner
+    from kindred.gui.fitting.runtime_preparation import FittingRuntimePreparationOwner
+    from kindred.gui.fitting.worker_launch import FittingAcceptedLaunchWorkerOwner
+
+    t = np.asarray([0.0, 1.0], dtype=float)
+
+    def _base_evaluator(_params):
+        return {"t": t.copy(), "species": {"A": np.asarray([1.0, 0.8], dtype=float)}}
+
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": t.copy(),
+                "species_data": {"A": np.asarray([1.0, 0.8], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.asarray([1.0, 0.8], dtype=float), "species": "A"}
+        ],
+        mechanism_species=["A"],
+        simulation_func=_base_evaluator,
+    )
+    try:
+        window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
+        assert not hasattr(type(window), "_build_current_fit_runtime_identity")
+        assert not hasattr(type(window), "build_current_fit_runtime_identity")
+        assert not hasattr(type(window), "_start_fit")
+        assert not hasattr(type(window), "_start_accepted_fit_worker")
+        assert not hasattr(type(window), "_start_accepted_fit_runtime_launch")
+        assert not hasattr(type(window), "start_accepted_fit_worker")
+        assert callable(getattr(window, "run_fit", None))
+        assert getattr(window, "fit_launch_identity_owner", None) is not None
+        assert isinstance(window.fit_launch_identity_owner, FittingLaunchIdentityOwner)
+        assert getattr(window, "fit_run_command_owner", None) is not None
+        assert isinstance(window.fit_run_command_owner, FittingRunCommandOwner)
+        assert getattr(window, "fit_worker_launch_owner", None) is not None
+        assert isinstance(window.fit_worker_launch_owner, FittingAcceptedLaunchWorkerOwner)
+        assert getattr(window, "fit_runtime_readiness", None) is not None
+        assert not hasattr(type(window), "_prepare_fit_runtime_for_current_state")
+        assert not hasattr(type(window), "_poll_fit_runtime_preparation")
+        assert not hasattr(window, "_fit_runtime_prepare_refresh_pending")
+        assert not hasattr(window, "_close_after_fit_runtime_prepare")
+        assert getattr(window, "fit_runtime_preparation_owner", None) is not None
+        assert isinstance(window.fit_runtime_preparation_owner, FittingRuntimePreparationOwner)
+        assert isinstance(window.fit_runtime_preparation_owner.refresh_pending, bool)
+        assert window.fit_runtime_preparation_owner.close_after_prepare is False
+        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+
+        assert "_simulation_func" not in window.__dict__
+        assert "_last_fit_config" not in window.__dict__
+        assert "_active_fit_dataset_ids" not in window.__dict__
+        assert "_active_fit_run_stamp_hash" not in window.__dict__
+        assert "_active_fit_run_superseded" not in window.__dict__
+        assert isinstance(window.fit_run_state_owner, FittingRunStateOwner)
+        assert identity is not None
+        assert identity.base_evaluator is _base_evaluator
+    finally:
+        window.close()
+
+
+def test_fitting_sidecar_owners_use_public_owner_dependencies():
+    from pathlib import Path
+
+    package_root = Path("kindred/gui/fitting")
+    for relative in ("run_command.py", "runtime_preparation.py"):
+        source = (package_root / relative).read_text(encoding="utf-8")
+        assert "._fit_runtime_readiness" not in source
+        assert "._fit_launch_identity_owner" not in source
+        assert "._fit_worker_launch_owner" not in source
+    run_command_source = (package_root / "run_command.py").read_text(encoding="utf-8")
+    assert "._collect_dataset_selection" not in run_command_source
+    launch_source = (package_root / "launch.py").read_text(encoding="utf-8")
+    assert "._collect_dataset_selection" not in launch_source
+
+
+def test_fitting_workflow_tests_use_public_runtime_readiness_owner():
+    from pathlib import Path
+
+    offenders: list[str] = []
+    for path in Path("tests").glob("test_global_fit*.py"):
+        source = path.read_text(encoding="utf-8")
+        if "._fit_runtime_readiness" in source:
+            offenders.append(str(path))
+
+    assert offenders == []
+
+
+@pytest.mark.gui
+def test_fitting_window_routes_passive_and_explicit_launch_identity_through_owner(qt_app, monkeypatch):
+    from kindred.gui.fitting.window import FittingWindow
+
+    t = np.asarray([0.0, 1.0], dtype=float)
+    window = FittingWindow(
+        mode="global",
+        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        dataset_entries=[
+            {
+                "id": "ds1",
+                "label": "Dataset 1",
+                "t": t.copy(),
+                "species_data": {"A": np.asarray([1.0, 0.8], dtype=float)},
+                "selected_species": ["A"],
+                "weight": 1.0,
+                "include": True,
+            }
+        ],
+        dataset_payloads=[
+            {"id": "ds1", "t": t.copy(), "y": np.asarray([1.0, 0.8], dtype=float), "species": "A"}
+        ],
+        mechanism_species=["A"],
+        simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.asarray([1.0, 0.8])}},
+    )
+    try:
+        calls: list[bool] = []
+
+        def _capture_identity(**kwargs):
+            calls.append(bool(kwargs.get("show_dataset_messages")))
+            return None
+
+        owner = window.fit_launch_identity_owner
+        monkeypatch.setattr(owner, "build_current_fit_runtime_identity", _capture_identity)
+
+        window.fit_runtime_preparation_owner.prepare_current_state()
+        window.run_fit()
+
+        assert calls == [False, True]
+    finally:
+        window.close()
+
+
+@pytest.mark.gui
+def test_fitting_mixin_run_global_fit_launches_window_through_fitting_owner(main_window, monkeypatch):
+    from PySide6 import QtWidgets
+
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator
 
     _seed_one_dataset(main_window)
     _seed_simple_mechanism(main_window)
@@ -66,24 +210,43 @@ def test_fitting_mixin_run_global_fit_delegates_to_launch_owner(main_window, mon
 
     captured: dict[str, object] = {}
 
-    def fake_launch(context):
-        captured["context"] = context
-        return None
+    class _FakeWindow(QtWidgets.QDialog):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            captured["kwargs"] = dict(kwargs)
 
-    monkeypatch.setattr("kindred.gui.mixins.fitting_mixin.launch_global_fit_session", fake_launch, raising=False)
+        def setWindowTitle(self, title):
+            captured["title"] = str(title)
+
+    monkeypatch.setattr("kindred.gui.fitting.window.FittingWindow", _FakeWindow)
 
     try:
-        main_window._run_global_fit()
+        window = main_window._run_global_fit()
+        assert isinstance(window, _FakeWindow)
+        kwargs = captured.get("kwargs")
+        assert isinstance(kwargs, dict)
+        assert kwargs.get("parent") is main_window
+        assert kwargs.get("simulation_func") is None
+        assert kwargs.get("dataset_manager") is main_window._dataset_manager
+        assert kwargs.get("dataset_payloads")
+        assert kwargs["dataset_payloads"][0]["id"] == "ds1"
+        assert callable(kwargs.get("mechanism_text_getter"))
+        assert callable(kwargs.get("reactions_text_getter"))
+        assert callable(kwargs.get("reactions_text_setter"))
+        simulation_builder = kwargs.get("simulation_builder")
+        assert callable(simulation_builder)
+        evaluator = simulation_builder(
+            "reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
+            ["k1"],
+            solver="BDF",
+            rtol=1e-6,
+            atol=1e-12,
+        )
+        assert isinstance(evaluator, SerialFittingEvaluator)
+        assert str(captured.get("title") or "").startswith("Global Fit")
     finally:
         for window in list(getattr(main_window, "_active_fit_windows", []) or []):
             window.close()
-
-    context = captured.get("context")
-    assert isinstance(context, GlobalFitLaunchContext)
-    assert context.parent is main_window
-    assert context.dataset_manager is main_window._dataset_manager
-    assert callable(context.reactions_text_getter)
-    assert callable(context.reactions_text_setter)
 
 
 @pytest.mark.gui
@@ -307,7 +470,16 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
     from kindred.gui.fitting.window import FittingWindow
 
     _seed_one_dataset(main_window)
-    _seed_simple_mechanism(main_window)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=set; species=A; time=0.0; value=2.0",
+            ]
+        )
+    )
     monkeypatch.setattr(
         main_window._dataset_manager,
         "scan_mechanism_parameters",
@@ -328,6 +500,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
             captured["datasets"] = list(datasets)
             captured["shared_params"] = dict(shared_params)
             captured["fit_evaluator"] = fit_evaluator
+            captured["worker_kwargs"] = dict(kwargs)
 
         def start(self):
             return
@@ -368,7 +541,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
         def activateWindow(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
     monkeypatch.setattr(
         "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
         lambda _evaluator, *, max_lanes, ledger=None: _RuntimeSession(),
@@ -378,16 +551,25 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
     assert isinstance(window, QtWidgets.QDialog)
     eager_window = FittingWindow(**launch_kwargs)
     try:
-        config = eager_window._params_ics_tab._collect_parameter_config()
+        config = eager_window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = eager_window._collect_dataset_selection()
-        assert selection["ids"] == ["ds1"]
-        assert eager_window._simulation_func is None
+        selection = eager_window.fit_launch_identity_owner.collect_dataset_selection()
+        assert list(selection.ids) == ["ds1"]
+        assert "_simulation_func" not in eager_window.__dict__
+        assert eager_window._fit_evaluator_state.current_base_evaluator() is None
 
         eager_window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         eager_window._on_targets_applied()
         qtbot.waitUntil(lambda: eager_window._run_button.isEnabled(), timeout=3000)
-        eager_window._start_fit()
+        collect_calls = []
+        original_collect = eager_window._params_ics_tab.collect_parameter_config_bundle
+
+        def _collect_once_for_launch(*, show_errors: bool):
+            collect_calls.append(bool(show_errors))
+            return original_collect(show_errors=show_errors)
+
+        monkeypatch.setattr(eager_window._params_ics_tab, "collect_parameter_config_bundle", _collect_once_for_launch)
+        eager_window.run_fit()
 
         captured_fit_evaluator = captured.get("fit_evaluator")
         assert isinstance(captured_fit_evaluator, SerialFittingEvaluator)
@@ -400,6 +582,14 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
             captured_fit_evaluator.context.simulation_plan.algebra_policy
             is SimulationAlgebraPolicy.FITTING_STRICT
         )
+        schedule = captured_fit_evaluator.context.execution_request.intervention_schedule
+        assert schedule is not None
+        assert schedule.to_payload()["instant_events"][0]["value"] == pytest.approx(2.0)
+        worker_kwargs = captured.get("worker_kwargs")
+        assert isinstance(worker_kwargs, dict)
+        run_stamp = worker_kwargs["run_stamp"]
+        assert run_stamp["prepared_simulation"]["intervention_schedule_fingerprint"] == schedule.fingerprint
+        assert collect_calls == [True]
     finally:
         eager_window.close()
         eager_window.deleteLater()

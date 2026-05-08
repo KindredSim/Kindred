@@ -67,7 +67,12 @@ def test_initial_condition_add_select_reselect_is_passive_runtime_work(
         "run_simulation_internal",
         lambda **kwargs: recomputes.append(dict(kwargs)),
     )
-    monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
+    def _record_runtime_timer(delay_ms, fn):
+        qualname = str(getattr(fn, "__qualname__", ""))
+        if "_FitDialogWorkerRegistry.schedule_cleanup" not in qualname:
+            scheduled.append((int(delay_ms), fn))
+
+    monkeypatch.setattr(QtCore.QTimer, "singleShot", _record_runtime_timer)
 
     main_window._set_runtime_backed_controls_ready(True)
     runtime_ensures.clear()
@@ -121,6 +126,99 @@ class _RecordingOwner:
     def close(self, *, kill: bool = False) -> None:
         self.close_calls.append(bool(kill))
         self.ready = False
+
+
+def test_schedule_bearing_runtime_readiness_reuses_and_invalidates_by_schedule_identity(
+    main_window,
+    qtbot,
+    qt_app,
+    monkeypatch,
+):
+    from kindred.core.simulation_containment import contained_owner_identity_payload
+
+    owners: list[_RecordingOwner] = []
+
+    def _owner_factory(*, fast_mode: bool, simulation_plan_payload: dict[str, object]) -> _RecordingOwner:
+        owner = _RecordingOwner(dict(simulation_plan_payload), fast_mode=bool(fast_mode))
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: None,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: None,
+    )
+    main_window.simulation_controller._contained_simulation_owner_factory = _owner_factory
+    main_window.show()
+    qtbot.waitUntil(lambda: main_window.isVisible(), timeout=1000)
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=set; species=A; time=0.0; value=2.0",
+            ]
+        )
+    )
+    main_window._extract_and_populate_variables()
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [0])
+    qt_app.processEvents()
+
+    main_window.simulation_controller._ensure_interactive_simulation_runtime_available_for_mode(
+        fast_mode=False,
+        wait=True,
+    )
+
+    assert len(owners) == 1
+    first_owner = owners[0]
+    first_identity = contained_owner_identity_payload(first_owner.simulation_plan_payload)
+    first_identity_key = str(first_identity.get("simulation_identity_key") or "")
+    assert first_identity_key
+    assert first_owner.is_ready is True
+
+    main_window.simulation_controller._ensure_interactive_simulation_runtime_available_for_mode(
+        fast_mode=False,
+        wait=True,
+    )
+    assert owners == [first_owner]
+    assert first_owner.is_ready is True
+
+    main_window._mechanism_editor._reactions_text.setPlainText(
+        "\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=set; species=A; time=0.0; value=3.0",
+            ]
+        )
+    )
+    main_window._extract_and_populate_variables()
+    qt_app.processEvents()
+
+    main_window.simulation_controller._ensure_interactive_simulation_runtime_available_for_mode(
+        fast_mode=False,
+        wait=True,
+    )
+
+    assert len(owners) == 2
+    second_owner = owners[1]
+    second_identity = contained_owner_identity_payload(second_owner.simulation_plan_payload)
+    assert str(second_identity.get("simulation_identity_key") or "") != first_identity_key
+    assert first_owner.close_calls
+    assert second_owner.is_ready is True
 
 
 @pytest.mark.parametrize("preset_name", ["M1", "M9"])
@@ -599,8 +697,8 @@ def test_run_clicked_while_selected_runtime_is_warming_replays_without_second_cl
         timeout=2000,
     )
 
-    main_window.set_runtime_backed_run_controls_ready(True)
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     qtbot.waitUntil(lambda: main_window._run_btn.isEnabled(), timeout=1000)
     qtbot.mouseClick(main_window._run_btn, QtCore.Qt.LeftButton)
     qt_app.processEvents()

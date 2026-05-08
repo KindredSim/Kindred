@@ -263,7 +263,7 @@ def test_apply_empty_targets_disables_run_fit(qt_app, qtbot):
         st = window._species_table
 
         # Initially ds1 has applied target ["A"], Run Fit should be enabled
-        window._prepare_fit_runtime_for_current_state()
+        window.fit_runtime_preparation_owner.prepare_current_state()
         qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
         assert window._run_button.isEnabled(), "Run Fit should start enabled with applied targets"
 

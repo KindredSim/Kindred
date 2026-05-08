@@ -128,13 +128,13 @@ def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = _make_window()
     try:
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
         qt_app.processEvents()
 
         assert window._run_results_tab._last_run_stamp_short

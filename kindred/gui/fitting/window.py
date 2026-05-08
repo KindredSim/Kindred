@@ -29,13 +29,10 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetPayloadResult,
     FitDatasetSpec,
     coerce_fit_dataset_payload_result,
-    coerce_fit_dataset_specs,
     read_fit_dataset_payload,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
     FitDatasetParameterOverrides,
-    coerce_fit_dataset_parameter_overrides,
-    split_fit_dataset_parameter_overrides,
 )
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
@@ -47,11 +44,9 @@ from kindred.core.batch_parallel import compute_effective_batch_workers
 from kindred.core.fitting_runtime_session import FittingRuntimeLedger, FittingRuntimeSession
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.simulator.solvers import normalize_solver_name
-from kindred.core.simulation_preparation import (
-    PreparedSimulationMetadata,
-    coerce_prepared_simulation_metadata,
-)
+from kindred.core.simulation_preparation import PreparedSimulationMetadata
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
+from kindred.gui.fitting.launch import FittingLaunchIdentityOwner, validate_de_bounds
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     simulation_failure_detail_text,
@@ -62,20 +57,21 @@ from kindred.gui.fitting.run_stamp import (
     hash_global_fit_run_stamp,
 )
 from kindred.gui.fitting.runtime_readiness import (
-    FittingRuntimeAcceptedLaunch,
-    FittingRuntimeIdentity,
     FittingRuntimeReadinessController,
     FittingRuntimeReadinessState,
-    PreparedFitEvaluator,
 )
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
+from kindred.gui.fitting.evaluator_state import FittingEvaluatorStateOwner
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
+from kindred.gui.fitting.run_command import FittingRunCommandOwner
+from kindred.gui.fitting.run_state import FittingRunStateOwner
+from kindred.gui.fitting.runtime_preparation import FittingRuntimePreparationOwner
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
+from kindred.gui.fitting.worker_launch import FittingAcceptedLaunchWorkerOwner
 from kindred.gui.fitting.worker import GlobalFitWorker
-from kindred.gui.ui_helpers import safe_float_parse
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
 from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
 
@@ -195,90 +191,6 @@ class _FitRuntimePreparationNotifier(QtCore.QObject):
 # VALIDATION FUNCTIONS
 # ============================================================================
 
-def validate_de_bounds(
-    config: Dict[str, Any],
-    *,
-    dataset_variable_params: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None,
-) -> Tuple[bool, List[str]]:
-    """
-    Validate that differential_evolution has proper bounds for all parameters.
-
-    Parameters
-    ----------
-    config : dict
-        Fit configuration with keys: method, parameters, bounds
-
-    Returns
-    -------
-    is_valid : bool
-        True if validation passes, False otherwise
-    errors : list of str
-        List of error messages (empty if valid)
-    """
-    errors = []
-
-    # Only validate if method is differential_evolution
-    method = str(config.get("method", "")).lower()
-    if method not in {"differential_evolution", "de"}:
-        return True, []
-
-    parameters = config.get("parameters", {})
-    bounds = config.get("bounds", {})
-
-    # Check each selected parameter has valid bounds
-    for param_name in parameters.keys():
-        if param_name not in bounds:
-            errors.append(f"Parameter '{param_name}' has no bounds defined")
-            continue
-
-        bound_tuple = bounds[param_name]
-        if not isinstance(bound_tuple, tuple) or len(bound_tuple) != 2:
-            errors.append(f"Parameter '{param_name}' has invalid bound format")
-            continue
-
-        min_val, max_val = bound_tuple
-
-        # Check for finite values
-        if not np.isfinite(min_val):
-            errors.append(f"Parameter '{param_name}' has non-finite minimum bound: {min_val}")
-
-        if not np.isfinite(max_val):
-            errors.append(f"Parameter '{param_name}' has non-finite maximum bound: {max_val}")
-
-        # Check min < max
-        if np.isfinite(min_val) and np.isfinite(max_val) and min_val >= max_val:
-            errors.append(
-                f"Parameter '{param_name}' has invalid bounds: "
-                f"min ({min_val:.6g}) >= max ({max_val:.6g})"
-            )
-
-    for dataset_id, spec_map in (dataset_variable_params or {}).items():
-        if not isinstance(spec_map, Mapping):
-            continue
-        for param_name, spec in spec_map.items():
-            if not isinstance(spec, Mapping):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has invalid bound format")
-                continue
-            try:
-                min_val = float(spec.get("min"))
-                max_val = float(spec.get("max"))
-            except (TypeError, ValueError):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-numeric bounds")
-                continue
-            if not np.isfinite(min_val):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-finite minimum bound: {min_val}")
-            if not np.isfinite(max_val):
-                errors.append(f"Dataset '{dataset_id}' parameter '{param_name}' has non-finite maximum bound: {max_val}")
-            if np.isfinite(min_val) and np.isfinite(max_val) and min_val >= max_val:
-                errors.append(
-                    f"Dataset '{dataset_id}' parameter '{param_name}' has invalid bounds: "
-                    f"min ({min_val:.6g}) >= max ({max_val:.6g})"
-                )
-
-    is_valid = len(errors) == 0
-    return is_valid, errors
-
-
 class _SimulationWithFixedParams:
     def __init__(self, base_evaluator: object, fixed_params: Dict[str, float]):
         self.base_evaluator = coerce_fitting_series_evaluator(base_evaluator)
@@ -380,7 +292,6 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._mode = normalized_mode
         self._dataset_manager = dataset_manager
-        self._simulation_func = simulation_func
         self._fit_func = fit_func
         self._mechanism_species = [str(x) for x in (mechanism_species or []) if str(x).strip()]
         self._mechanism_text_getter = mechanism_text_getter
@@ -391,6 +302,13 @@ class FittingWindow(QtWidgets.QDialog):
             if callable(simulation_builder)
             else None
         )
+        self._fit_evaluator_state = FittingEvaluatorStateOwner(
+            base_evaluator=simulation_func,
+            simulation_builder=self._simulation_builder,
+        )
+        self._fit_launch_identity_owner = FittingLaunchIdentityOwner(self)
+        self._fit_run_command_owner = FittingRunCommandOwner(self)
+        self._fit_worker_launch_owner = FittingAcceptedLaunchWorkerOwner(self)
         self._runtime_settings_getter = runtime_settings_getter
         self._apply_callback = apply_callback
         self._project_apply_callback = project_apply_callback
@@ -457,7 +375,7 @@ class FittingWindow(QtWidgets.QDialog):
         if ds_id:
             self._data_tab.select_dataset(ds_id)
         self._refresh_plot_baselines()
-        self._schedule_fit_runtime_preparation_refresh()
+        self._fit_runtime_preparation_owner.schedule_refresh()
 
 
     def _load_dataset_pool_from_entries(self) -> None:
@@ -522,7 +440,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._paused = False
         self._best_cost = None
-        self._last_fit_config = {}
         self._pre_run_parameter_state: Optional[List[Dict[str, Any]]] = None
         self._pre_run_staged_dataset_params: Optional[Dict[str, Dict[str, float]]] = None
         self._latest_model_series = {}
@@ -530,19 +447,16 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_plot_model_series = {}
         self._latest_plot_model_x = {}
         self._last_result = None
-        self._active_fit_dataset_ids: List[str] = []
-        self._active_fit_run_stamp_hash = ""
-        self._active_fit_run_superseded = False
+        self._fit_run_state_owner = FittingRunStateOwner()
         self._fit_runtime_prepare_notifier = _FitRuntimePreparationNotifier(self)
         self._fit_runtime_readiness = FittingRuntimeReadinessController(
             session_factory=self._create_fit_runtime_session,
             finished_callback=self._fit_runtime_prepare_notifier.completed.emit,
         )
-        self._fit_runtime_prepare_refresh_pending = False
-        self._close_after_fit_runtime_prepare = False
+        self._fit_runtime_preparation_owner = FittingRuntimePreparationOwner(self)
         self._fit_window_state_refreshing = False
         self._fit_runtime_prepare_notifier.completed.connect(
-            self._poll_fit_runtime_preparation,
+            self._fit_runtime_preparation_owner.poll_preparation,
             QtCore.Qt.ConnectionType.QueuedConnection,
         )
         self._closing = False
@@ -556,6 +470,30 @@ class FittingWindow(QtWidgets.QDialog):
     @property
     def _is_fit_running(self) -> bool:
         return bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
+
+    @property
+    def fit_launch_identity_owner(self) -> FittingLaunchIdentityOwner:
+        return self._fit_launch_identity_owner
+
+    @property
+    def fit_run_command_owner(self) -> FittingRunCommandOwner:
+        return self._fit_run_command_owner
+
+    @property
+    def fit_run_state_owner(self) -> FittingRunStateOwner:
+        return self._fit_run_state_owner
+
+    @property
+    def fit_runtime_preparation_owner(self) -> FittingRuntimePreparationOwner:
+        return self._fit_runtime_preparation_owner
+
+    @property
+    def fit_runtime_readiness(self) -> FittingRuntimeReadinessController:
+        return self._fit_runtime_readiness
+
+    @property
+    def fit_worker_launch_owner(self) -> FittingAcceptedLaunchWorkerOwner:
+        return self._fit_worker_launch_owner
 
     def _request_rebuild_subtabs(self) -> None:
         if self._is_fit_running:
@@ -929,8 +867,7 @@ class FittingWindow(QtWidgets.QDialog):
             self._supersede_active_fit_worker_for_runtime_input_change()
         else:
             if worker is not None:
-                self._active_fit_run_superseded = True
-                self._active_fit_run_stamp_hash = ""
+                self._fit_run_state_owner.mark_superseded()
                 self._clear_pending_best_update_state()
                 self._clear_worker_ref_if_stopped(worker)
                 self._discard_fit_runtime_session(kill=True)
@@ -938,11 +875,11 @@ class FittingWindow(QtWidgets.QDialog):
                 if hasattr(self, "_status_label"):
                     self._status_label.setText("Fitting runtime inputs changed; fit cancelled")
             else:
-                self._active_fit_run_superseded = False
+                self._fit_run_state_owner.clear_superseded()
             self._fit_runtime_readiness.set_desired_identity(None)
-        self._active_fit_run_stamp_hash = ""
+        self._fit_run_state_owner.clear_active_run_stamp_hash()
         self._refresh_run_button_enabled_state()
-        self._schedule_fit_runtime_preparation_refresh()
+        self._fit_runtime_preparation_owner.schedule_refresh()
 
     def handle_external_runtime_inputs_changed(self) -> None:
         self._on_fit_runtime_inputs_changed()
@@ -987,7 +924,7 @@ class FittingWindow(QtWidgets.QDialog):
         control_row.addWidget(self._progress_bar, stretch=2)
 
         self._run_button = QtWidgets.QPushButton("Run Fit")
-        self._run_button.clicked.connect(self._start_fit)
+        self._run_button.clicked.connect(self.run_fit)
         self._stop_button = QtWidgets.QPushButton("Stop")
         self._stop_button.setEnabled(False)
         self._stop_button.clicked.connect(self._cancel_fit)
@@ -1190,206 +1127,10 @@ class FittingWindow(QtWidgets.QDialog):
         if self._fit_runtime_readiness.snapshot().state is not FittingRuntimeReadinessState.READY:
             return False
         try:
-            identity = self._build_current_fit_runtime_identity()
+            identity = self._fit_launch_identity_owner.build_current_fit_runtime_identity()
         except RuntimeError:
             return False
         return self._fit_runtime_readiness.is_ready_for(identity)
-
-    def _schedule_fit_runtime_preparation_refresh(self) -> None:
-        if getattr(self, "_closing", False):
-            return
-        if bool(getattr(self, "_worker", None) and getattr(self._worker, "isRunning", lambda: False)()):
-            return
-        if self._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING:
-            self._fit_runtime_prepare_refresh_pending = True
-            return
-        if getattr(self, "_fit_runtime_prepare_refresh_pending", False):
-            return
-        self._fit_runtime_prepare_refresh_pending = True
-        QtCore.QTimer.singleShot(0, self._run_fit_runtime_preparation_refresh)
-
-    def _run_fit_runtime_preparation_refresh(self) -> None:
-        if not getattr(self, "_fit_runtime_prepare_refresh_pending", False):
-            return
-        self._fit_runtime_prepare_refresh_pending = False
-        self._prepare_fit_runtime_for_current_state()
-
-    def _prepare_fit_runtime_for_current_state(self) -> None:
-        if getattr(self, "_closing", False):
-            return
-        if self._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING:
-            return
-        if bool(getattr(self, "_worker", None) and getattr(self._worker, "isRunning", lambda: False)()):
-            return
-        if self._invalid_applied_used_dataset_ids_for_run():
-            self._fit_runtime_readiness.set_blocked()
-            return
-        try:
-            identity = self._build_current_fit_runtime_identity()
-        except RuntimeError as exc:
-            self._fit_runtime_readiness.set_blocked(exc)
-            if hasattr(self, "_status_label"):
-                self._status_label.setText(f"Fitting runtime not ready: {exc}")
-            self._refresh_run_button_enabled_state()
-            return
-        if identity is None:
-            self._fit_runtime_readiness.set_blocked()
-            self._refresh_run_button_enabled_state()
-            return
-        self._fit_runtime_readiness.set_desired_identity(identity)
-        if hasattr(self, "_status_label"):
-            snapshot = self._fit_runtime_readiness.snapshot()
-            if snapshot.state is FittingRuntimeReadinessState.PREPARING:
-                self._status_label.setText("Preparing fitting runtime...")
-                if hasattr(self, "_stop_button"):
-                    self._stop_button.setEnabled(True)
-            elif snapshot.state is FittingRuntimeReadinessState.READY:
-                self._status_label.setText("Fitting runtime ready")
-                if hasattr(self, "_stop_button"):
-                    self._stop_button.setEnabled(False)
-        self._refresh_run_button_enabled_state()
-
-    def _build_current_fit_runtime_identity(
-        self,
-        *,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        show_dataset_messages: bool = False,
-    ) -> Optional[FittingRuntimeIdentity]:
-        if getattr(self, "_fit_window_state_refreshing", False):
-            return None
-        if not self._refresh_fit_window_state_for_current_mechanism(show_errors=show_dataset_messages):
-            return None
-        config_bundle = self._collect_parameter_config_snapshot_for_readiness()
-        if config_bundle is None:
-            return
-        config, global_dataset_params, global_dataset_variable_params = config_bundle
-        dataset_selection = self._collect_dataset_selection()
-        if not dataset_selection.get("ids"):
-            return
-        collect_integration_settings = getattr(
-            self._params_ics_tab,
-            "collect_integration_settings_silent",
-            self._params_ics_tab.collect_integration_settings,
-        )
-        integration = integration_settings or collect_integration_settings()
-        if integration is None:
-            return
-        solver, rtol, atol = integration
-        from kindred.core.simulator.solvers import normalize_solver_name
-
-        requested_solver, _solver_warning = normalize_solver_name(str(solver or FITTING_DEFAULT_SOLVER))
-        mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
-        evaluator_components = self._fitting_evaluator_components_for_runtime_identity(
-            mechanism_text=mechanism_text,
-            config=config,
-            requested_solver=str(requested_solver),
-            requested_rtol=float(rtol),
-            requested_atol=float(atol),
-        )
-        if evaluator_components is None:
-            return
-        simulation_func, simulation_factory, prepared_simulation, readiness_required = evaluator_components
-
-        payload_collector = self._datasets_payloads_for_run if show_dataset_messages else self._datasets_payloads_for_readiness
-        datasets = payload_collector(list(dataset_selection.get("ids") or []))
-        if datasets is None:
-            return
-        try:
-            dataset_specs = coerce_fit_dataset_specs(datasets)
-        except Exception:
-            return
-
-        weights = self._weights_for_run(dataset_selection)
-        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
-        shared_param_keys = self._shared_param_keys_for_run(config)
-        dataset_params_for_run = self._dataset_params_for_run(
-            list(dataset_selection.get("ids") or []),
-            shared_param_keys,
-            staged_params,
-            global_dataset_params=global_dataset_params,
-        )
-        variable_params = self._variable_params_for_run(
-            list(dataset_selection.get("ids") or []),
-            shared_param_keys,
-            staged_params,
-            global_dataset_variable_params=global_dataset_variable_params,
-        )
-        ok, _errors = validate_de_bounds(
-            config,
-            dataset_variable_params=variable_params,
-        )
-        if not ok:
-            return
-        dataset_overrides = coerce_fit_dataset_parameter_overrides(
-            dataset_ids=list(dataset_selection.get("ids") or []),
-            dataset_params=dataset_params_for_run,
-            dataset_variable_params=variable_params,
-        )
-        reactions_text = self._safe_text_from_getter(getattr(self, "_reactions_text_getter", None))
-        applied_targets = dict(self._species_table.fit_targets_selection_applied or {})
-        applied_target_weights = {
-            str(ds_id): self._species_table.applied_target_weights_for_dataset(str(ds_id))
-            for ds_id in applied_targets.keys()
-        }
-        stamp = build_global_fit_run_stamp(
-            dataset_rows=list(dataset_selection.get("rows") or []),
-            included_ids=list(dataset_selection.get("ids") or []),
-            applied_fit_targets=applied_targets,
-            applied_target_weights=applied_target_weights,
-            weights_used=(dict(weights) if isinstance(weights, dict) else None),
-            weight_mode=("equal" if weights is None else "custom"),
-            fit_config=dict(config or {}),
-            mechanism_text=mechanism_text,
-            reactions_text=reactions_text,
-            prepared_simulation=prepared_simulation,
-            dataset_specs=list(dataset_specs),
-            dataset_overrides=list(dataset_overrides),
-        )
-        if prepared_simulation is None:
-            stamp["runtime_request"] = {
-                "solver": str(requested_solver),
-                "rtol": f"{float(rtol):.12g}",
-                "atol": f"{float(atol):.12g}",
-                "param_names": self._param_names_for_readiness_identity(
-                    config=config,
-                    prepared_simulation=None,
-                    mechanism_text=mechanism_text,
-                ),
-            }
-            stamp["runtime_request"].update(self._runtime_settings_for_identity())
-        stamp_hash = hash_global_fit_run_stamp(stamp)
-        stamp_short = str(stamp_hash)[:12]
-        fixed_params = self._fixed_params_for_run(config)
-        fit_evaluator = self._simulation_with_fixed_params(simulation_func, fixed_params) if simulation_func is not None else None
-        fit_evaluator_factory = None
-        if callable(simulation_factory):
-            fixed_snapshot = dict(fixed_params)
-
-            def fit_evaluator_factory():
-                base_evaluator = simulation_factory()
-                return PreparedFitEvaluator(
-                    base_evaluator=base_evaluator,
-                    fit_evaluator=self._simulation_with_fixed_params(base_evaluator, fixed_snapshot),
-                )
-
-        lane_budget = self._fit_runtime_lane_budget(len(dataset_specs))
-        return FittingRuntimeIdentity(
-            datasets=tuple(dataset_specs),
-            config=config,
-            dataset_overrides=tuple(dataset_overrides),
-            weights=dict(weights) if weights is not None else None,
-            requested_solver=str(requested_solver),
-            requested_rtol=float(rtol),
-            requested_atol=float(atol),
-            fit_evaluator=fit_evaluator,
-            stamp=stamp,
-            stamp_hash=str(stamp_hash),
-            stamp_short=str(stamp_short),
-            lane_count=int(lane_budget),
-            readiness_required=bool(readiness_required),
-            fit_evaluator_factory=fit_evaluator_factory,
-            base_evaluator=simulation_func,
-        )
 
     def _fitting_evaluator_components_for_runtime_identity(
         self,
@@ -1400,60 +1141,15 @@ class FittingWindow(QtWidgets.QDialog):
         requested_rtol: float,
         requested_atol: float,
     ):
-        simulation_func = getattr(self, "_simulation_func", None)
-        prepared_simulation = self._prepared_simulation_meta(simulation_func)
-        needs_builder = simulation_func is None
-        prepared_matches_request = False
-        if prepared_simulation is not None:
-            try:
-                prepared_rtol = float(prepared_simulation.rtol)
-                prepared_atol = float(prepared_simulation.atol)
-            except Exception:
-                prepared_rtol = float("nan")
-                prepared_atol = float("nan")
-            prepared_matches_request = (
-                self._prepared_simulation_matches_mechanism(prepared_simulation, mechanism_text)
-                and self._prepared_solver_normalized(prepared_simulation) == str(requested_solver)
-                and self._prepared_simulation_matches_runtime_settings(prepared_simulation)
-                and np.isfinite(prepared_rtol)
-                and np.isfinite(prepared_atol)
-                and math.isclose(float(prepared_rtol), float(requested_rtol), rel_tol=1e-9, abs_tol=1e-12)
-                and math.isclose(float(prepared_atol), float(requested_atol), rel_tol=1e-9, abs_tol=1e-12)
-            )
-            needs_builder = needs_builder or not prepared_matches_request
-        elif simulation_func is not None:
-            needs_builder = True
-        if not needs_builder:
-            readiness_required = type(coerce_fitting_series_evaluator(simulation_func)) is SerialFittingEvaluator
-            return simulation_func, None, prepared_simulation, readiness_required
-        if not callable(getattr(self, "_simulation_builder", None)):
-            if simulation_func is not None:
-                try:
-                    if type(coerce_fitting_series_evaluator(simulation_func)) is not SerialFittingEvaluator:
-                        return simulation_func, None, prepared_simulation, False
-                except Exception:
-                    return None
-            return None
-        param_names = self._param_names_for_readiness_identity(
-            config=config,
-            prepared_simulation=prepared_simulation if prepared_matches_request else None,
+        return self._fit_evaluator_state.components_for_runtime_identity(
             mechanism_text=mechanism_text,
+            config=config,
+            requested_solver=requested_solver,
+            requested_rtol=requested_rtol,
+            requested_atol=requested_atol,
+            runtime_settings=self._runtime_settings_for_identity(),
+            param_names_for_readiness=self._param_names_for_readiness_identity,
         )
-        runtime_settings = self._runtime_settings_for_identity()
-
-        def _build_deferred_fit_evaluator():
-            return self._simulation_builder(
-                str(mechanism_text or ""),
-                list(param_names),
-                solver=str(requested_solver),
-                rtol=float(requested_rtol),
-                atol=float(requested_atol),
-                temperature_K=float(runtime_settings["temperature_K"]),
-                use_sparse_jacobian=bool(runtime_settings["use_sparse_jacobian"]),
-                wegscheider_cyclicity_enabled=bool(runtime_settings["wegscheider_cyclicity_enabled"]),
-            )
-
-        return simulation_func, _build_deferred_fit_evaluator, None, True
 
     def _runtime_settings_for_identity(self) -> dict[str, object]:
         settings: Mapping[str, Any] = {}
@@ -1538,95 +1234,6 @@ class FittingWindow(QtWidgets.QDialog):
         names |= {str(k) for k in (config.get("parameters") or {}).keys() if str(k).strip()}
         names |= {str(k) for k in (config.get("fixed_params") or {}).keys() if str(k).strip()}
         return sorted(names)
-
-    def _collect_parameter_config_snapshot_for_readiness(
-        self,
-    ) -> Optional[tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict]]]]:
-        table = getattr(self._params_ics_tab, "_param_table", None)
-        if table is None:
-            return None
-        parameter_state = self._params_ics_tab.get_parameter_state()
-        has_live_fit_parameter = False
-        parameters: Dict[str, float] = {}
-        bounds: Dict[str, Tuple[float, float]] = {}
-        log10_params: Dict[str, bool] = {}
-        fixed_params: Dict[str, float] = dict(self._params_ics_tab.get_fixed_shared_params() or {})
-        global_dataset_params = self._params_ics_tab.get_global_dataset_params()
-        global_dataset_variable_params = self._params_ics_tab.get_global_dataset_variable_params()
-        for row, entry in enumerate(parameter_state):
-            if row >= table.rowCount():
-                return None
-            try:
-                fit_item = table.item(row, 0)
-                log10_item = table.item(row, 1)
-                name_item = table.item(row, 2)
-                value_item = table.item(row, 3)
-                min_item = table.item(row, 4)
-                max_item = table.item(row, 5)
-                fit_flag = fit_item.checkState() == Qt.Checked
-                log10_flag = log10_item.checkState() == Qt.Checked
-                value = float(value_item.text())
-                min_val = float(min_item.text())
-                max_val = float(max_item.text())
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                return None
-            if not np.isfinite(value):
-                return None
-            if not (min_val < max_val):
-                return None
-            if log10_flag and not (value > 0.0 and min_val > 0.0 and max_val > 0.0):
-                return None
-            param_name = str(entry.get("param_name") or (name_item.text() if name_item is not None else "") or "")
-            if not param_name.strip():
-                return None
-            scope = str(entry.get("scope") or "shared")
-            if scope == "shared":
-                if fit_flag:
-                    has_live_fit_parameter = True
-                    parameters[param_name] = value
-                    bounds[param_name] = (min_val, max_val)
-                    log10_params[param_name] = bool(log10_flag)
-                else:
-                    fixed_params[param_name] = value
-            elif scope == "dataset":
-                ds_id = str(entry.get("dataset_id") or "")
-                if not ds_id:
-                    return None
-                if fit_flag:
-                    has_live_fit_parameter = True
-                    spec_map = global_dataset_variable_params.setdefault(ds_id, {})
-                    spec_map[param_name] = {
-                        "initial": value,
-                        "min": min_val,
-                        "max": max_val,
-                        "log10": bool(log10_flag),
-                    }
-                    fixed_map = global_dataset_params.get(ds_id)
-                    if isinstance(fixed_map, dict):
-                        fixed_map.pop(param_name, None)
-                else:
-                    global_dataset_params.setdefault(ds_id, {})[param_name] = float(value)
-                    spec_map = global_dataset_variable_params.get(ds_id)
-                    if isinstance(spec_map, dict):
-                        spec_map.pop(param_name, None)
-                        if not spec_map:
-                            global_dataset_variable_params.pop(ds_id, None)
-        if not has_live_fit_parameter:
-            return None
-        method = self._params_ics_tab._method_combo.currentText().strip().lower()
-        config = {
-            "parameters": parameters,
-            "bounds": bounds,
-            "log10_params": log10_params,
-            "fixed_params": fixed_params,
-            "method": method,
-            "max_nfev": self._params_ics_tab._max_eval_spin.value(),
-            "ftol": max(safe_float_parse(self._params_ics_tab._ftol_edit.text(), 1e-10), 1e-15),
-            "xtol": max(safe_float_parse(self._params_ics_tab._xtol_edit.text(), 1e-10), 1e-15),
-            "seed": self._params_ics_tab._seed_spin.value() if self._params_ics_tab._seed_check.isChecked() else None,
-            "parallel_starts": DEFAULT_PARALLEL_STARTS,
-        }
-        return config, global_dataset_params, global_dataset_variable_params
 
     def _on_targets_validity_changed(self) -> None:
         if not hasattr(self, "_run_button"):
@@ -1853,8 +1460,8 @@ class FittingWindow(QtWidgets.QDialog):
     # Actions
     # ------------------------------------------------------------------
     def _selected_dataset_ids(self) -> List[str]:
-        selection = self._collect_dataset_selection()
-        return list(selection.get("ids") or [])
+        selection = self._fit_launch_identity_owner.collect_dataset_selection()
+        return list(selection.ids)
 
     def _add_algebraic_observable(
         self,
@@ -2135,40 +1742,24 @@ class FittingWindow(QtWidgets.QDialog):
                 solver, rtol, atol = (FITTING_DEFAULT_SOLVER, 1e-6, 1e-12)
             else:
                 solver, rtol, atol = integration
-            self._simulation_func = self._simulation_builder(
-                mechanism_text,
-                param_names,
-                solver=str(solver),
-                rtol=float(rtol),
-                atol=float(atol),
-                **self._runtime_settings_for_builder_kwargs(),
+            self._fit_evaluator_state.build_and_set(
+                mechanism_text=mechanism_text,
+                param_names=list(param_names),
+                requested_solver=str(solver),
+                requested_rtol=float(rtol),
+                requested_atol=float(atol),
+                runtime_settings=self._runtime_settings_for_identity(),
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Add Observable", f"Failed to refresh simulation:\n\n{exc}")
             return False
         return True
 
-    def _collect_dataset_selection(self) -> Dict[str, Any]:
-        rows = []
-        included_ids: List[str] = []
-        for entry in self._dataset_entries:
-            dataset_id = str(entry.get("id") or "").strip()
-            include = entry.get("include", True)
-            label = str(entry.get("label") or dataset_id)
-            species = ", ".join(entry.get("selected_species", []))
-            weight = self._dataset_weight_for_id(dataset_id)
-            entry["weight"] = weight
-            entry["include"] = include
-            rows.append({"id": dataset_id, "label": label, "species": species, "include": include, "weight": weight})
-            if include:
-                included_ids.append(dataset_id)
-        return {"rows": rows, "ids": included_ids}
-
     # ------------------------------------------------------------------
     # Fit lifecycle
     # ------------------------------------------------------------------
     def _reset_fit_run_cached_state(self) -> None:
-        self._active_fit_dataset_ids = []
+        self._fit_run_state_owner.reset_for_new_run()
         self._pre_run_parameter_state = None
         self._pre_run_staged_dataset_params = None
         self._latest_model_series = {}
@@ -2176,8 +1767,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_plot_model_series = {}
         self._latest_plot_model_x = {}
         self._best_cost = None
-        self._active_fit_run_stamp_hash = ""
-        self._active_fit_run_superseded = False
         self._best_effort_failures.clear()
         self._teardown_disable_failures.clear()
 
@@ -2199,7 +1788,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _refresh_fit_window_state_for_current_mechanism(self, *, show_errors: bool = True) -> bool:
         mechanism_text = self._safe_text_from_getter(getattr(self, "_mechanism_text_getter", None))
-        simulation_func = getattr(self, "_simulation_func", None)
+        simulation_func = self._fit_evaluator_state.current_base_evaluator()
         prepared_simulation = self._prepared_simulation_meta(simulation_func)
         mechanism_matches = self._prepared_simulation_matches_mechanism(prepared_simulation, mechanism_text)
         table_matches = self._fit_window_state_matches_mechanism(mechanism_text)
@@ -2243,97 +1832,8 @@ class FittingWindow(QtWidgets.QDialog):
             self._fit_window_state_refreshing = False
         return True
 
-    def _start_fit(self) -> None:
-        if self._worker and self._worker.isRunning():
-            QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
-            return
-        self._reset_fit_run_cached_state()
-        self._species_table.flush_visible_weight_edits()
-        self._species_table.flush_dataset_weight_editor()
-        config = self._params_ics_tab._collect_parameter_config()
-        if not config:
-            return
-        dataset_selection = self._collect_dataset_selection()
-        if not dataset_selection["ids"]:
-            QtWidgets.QMessageBox.warning(self, "No Datasets", "Select at least one dataset to include.")
-            return
-        invalid = self._invalid_applied_used_dataset_ids_for_run()
-        if invalid:
-            labels = [self._dataset_label_for_id(ds_id) for ds_id in invalid]
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Global Fit",
-                "Run Fit is disabled due to invalid applied settings for: "
-                + ", ".join(labels)
-                + ".",
-            )
-            return
-        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
-        shared_param_keys = self._shared_param_keys_for_run(config)
-        variable_params = self._variable_params_for_run(
-            list(dataset_selection.get("ids") or []),
-            shared_param_keys,
-            staged_params,
-            global_dataset_variable_params=self._params_ics_tab.get_global_dataset_variable_params(),
-        )
-        ok, errors = validate_de_bounds(config, dataset_variable_params=variable_params)
-        if not ok:
-            QtWidgets.QMessageBox.warning(self, "Invalid Bounds", "\n".join(errors))
-            return
-
-        integration = self._params_ics_tab.collect_integration_settings()
-        if integration is None:
-            return
-        if not self._refresh_fit_window_state_for_current_mechanism():
-            return
-        config = self._params_ics_tab._collect_parameter_config()
-        if not config:
-            return
-        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
-        shared_param_keys = self._shared_param_keys_for_run(config)
-        variable_params = self._variable_params_for_run(
-            list(dataset_selection.get("ids") or []),
-            shared_param_keys,
-            staged_params,
-            global_dataset_variable_params=self._params_ics_tab.get_global_dataset_variable_params(),
-        )
-        ok, errors = validate_de_bounds(config, dataset_variable_params=variable_params)
-        if not ok:
-            QtWidgets.QMessageBox.warning(self, "Invalid Bounds", "\n".join(errors))
-            return
-        try:
-            identity = self._build_current_fit_runtime_identity(
-                integration_settings=integration,
-                show_dataset_messages=True,
-            )
-        except RuntimeError as exc:
-            self._fit_runtime_readiness.set_blocked(exc)
-            if hasattr(self, "_status_label"):
-                self._status_label.setText(f"Fitting runtime not ready: {exc}")
-            self._refresh_run_button_enabled_state()
-            return
-        if identity is None:
-            self._fit_runtime_readiness.set_blocked()
-            if not self._active_fit_dataset_ids:
-                self._active_fit_dataset_ids = list(dataset_selection.get("ids") or [])
-            self._clear_failed_run_visual_state()
-            self._refresh_run_button_enabled_state()
-            return
-        self._capture_failed_fit_restore_baseline()
-        self._last_fit_config = dict(identity.config)
-        self._fit_runtime_readiness.set_desired_identity(identity)
-        if not self._fit_runtime_readiness.is_ready_for(identity):
-            if hasattr(self, "_status_label"):
-                snapshot = self._fit_runtime_readiness.snapshot()
-                if snapshot.state is FittingRuntimeReadinessState.PREPARING:
-                    self._status_label.setText("Preparing fitting runtime...")
-                    if hasattr(self, "_stop_button"):
-                        self._stop_button.setEnabled(True)
-                else:
-                    self._status_label.setText("Fitting runtime is not ready")
-            self._refresh_run_button_enabled_state()
-            return
-        self._start_accepted_fit_runtime_launch(identity)
+    def run_fit(self) -> None:
+        self._fit_run_command_owner.run_fit()
 
     def _datasets_payloads_for_run(self, selected_ids: Sequence[str]) -> Optional[list[dict[str, Any]]]:
         datasets: list[dict[str, Any]] = []
@@ -2416,15 +1916,16 @@ class FittingWindow(QtWidgets.QDialog):
                 return species_names
         return set()
 
-    def _consumable_dataset_param_names_for_run(self) -> tuple[set[str], Optional[set[str]]]:
-        species_names = self._prepared_species_names_from_evaluator(self._simulation_func)
+    def _consumable_dataset_param_names_for_run(self, evaluator: object | None = None) -> tuple[set[str], Optional[set[str]]]:
+        evaluator = self._fit_evaluator_state.current_base_evaluator() if evaluator is None else evaluator
+        species_names = self._prepared_species_names_from_evaluator(evaluator)
         if not species_names:
             species_names = {
                 str(name)
                 for name in (self._params_ics_tab.get_mechanism_species() or [])
                 if str(name).strip()
             }
-        prepared_simulation = self._prepared_simulation_meta(self._simulation_func)
+        prepared_simulation = self._prepared_simulation_meta(evaluator)
         if prepared_simulation is not None:
             prepared_param_names = {
                 str(name)
@@ -2453,6 +1954,7 @@ class FittingWindow(QtWidgets.QDialog):
         staged_params: Dict[str, Dict[str, float]],
         *,
         global_dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
+        evaluator: object | None = None,
     ) -> dict[str, dict[str, float]]:
         global_ds_params = (
             {str(k): dict(v) for k, v in global_dataset_params.items()}
@@ -2460,7 +1962,7 @@ class FittingWindow(QtWidgets.QDialog):
             else self._params_ics_tab.get_global_dataset_params()
         )
         dataset_params_for_run: dict[str, dict[str, float]] = {}
-        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run()
+        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run(evaluator)
         for ds_id in selected_ids:
             merged = dict(global_ds_params.get(ds_id, {}))
             stage_map = staged_params.get(ds_id)
@@ -2487,6 +1989,7 @@ class FittingWindow(QtWidgets.QDialog):
         staged_params: Dict[str, Dict[str, float]],
         *,
         global_dataset_variable_params: Optional[Dict[str, Dict[str, Dict]]] = None,
+        evaluator: object | None = None,
     ) -> dict[str, dict[str, dict[str, float]]]:
         global_ds_var_params = (
             {
@@ -2497,7 +2000,7 @@ class FittingWindow(QtWidgets.QDialog):
             else self._params_ics_tab.get_global_dataset_variable_params()
         )
         variable_params: dict[str, dict[str, dict[str, float]]] = {}
-        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run()
+        mechanism_species, prepared_param_names = self._consumable_dataset_param_names_for_run(evaluator)
         for ds_id in selected_ids:
             specs = global_ds_var_params.get(ds_id)
             if not isinstance(specs, dict) or not specs:
@@ -2550,20 +2053,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     @staticmethod
     def _prepared_simulation_meta(simulation_func) -> Optional[PreparedSimulationMetadata]:
-        if simulation_func is None:
-            return None
-        try:
-            prepared = getattr(simulation_func, "prepared_metadata", None)
-        except Exception:
-            prepared = None
-        meta = coerce_prepared_simulation_metadata(prepared)
-        if meta is not None:
-            return meta
-        try:
-            prepared = getattr(simulation_func, "_kindred_prepared_simulation_meta", None)
-        except Exception:
-            return None
-        return coerce_prepared_simulation_metadata(prepared)
+        return FittingEvaluatorStateOwner.prepared_simulation_meta_for(simulation_func)
 
     @staticmethod
     def _simulation_with_fixed_params(simulation_func, fixed_params: Dict[str, float]):
@@ -2669,18 +2159,14 @@ class FittingWindow(QtWidgets.QDialog):
             if not current_param_names:
                 current_param_names = list(param_names)
             runtime_settings = self._runtime_settings_for_identity()
-            base_simulation = self._simulation_builder(
-                mechanism_text,
-                list(current_param_names),
-                solver=str(requested_solver),
-                rtol=float(requested_rtol),
-                atol=float(requested_atol),
-                temperature_K=float(runtime_settings["temperature_K"]),
-                use_sparse_jacobian=bool(runtime_settings["use_sparse_jacobian"]),
-                wegscheider_cyclicity_enabled=bool(runtime_settings["wegscheider_cyclicity_enabled"]),
+            _base_simulation, prepared_simulation = self._fit_evaluator_state.build_and_set(
+                mechanism_text=mechanism_text,
+                param_names=list(current_param_names),
+                requested_solver=str(requested_solver),
+                requested_rtol=float(requested_rtol),
+                requested_atol=float(requested_atol),
+                runtime_settings=runtime_settings,
             )
-            self._simulation_func = base_simulation
-            prepared_simulation = self._prepared_simulation_meta(base_simulation)
         except SimulationBuilderContractError as exc:
             logger.error("Simulation builder contract mismatch: %s", exc)
             QtWidgets.QMessageBox.critical(
@@ -2784,9 +2270,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._fit_runtime_readiness.cancel(kill=bool(kill))
         self._fit_runtime_readiness.close_ready_session(kill=bool(kill))
 
-    def _cancel_fit_runtime_preparation(self, *, kill: bool) -> bool:
-        return self._fit_runtime_readiness.cancel(kill=bool(kill))
-
     def _set_fit_controls_locked(self, locked: bool) -> None:
         running = bool(locked)
         try:
@@ -2818,133 +2301,6 @@ class FittingWindow(QtWidgets.QDialog):
             max_lanes=int(lane_count),
             ledger=ledger,
         )
-
-    def _queue_pending_fit_runtime_preparation_refresh(self) -> None:
-        if getattr(self, "_closing", False):
-            return
-        if not getattr(self, "_fit_runtime_prepare_refresh_pending", False):
-            return
-        if self._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING:
-            return
-        self._run_fit_runtime_preparation_refresh()
-
-    def _close_after_fit_runtime_preparation_if_requested(self) -> bool:
-        if not getattr(self, "_close_after_fit_runtime_prepare", False):
-            return False
-        self._close_after_fit_runtime_prepare = False
-        QtCore.QTimer.singleShot(0, self.close)
-        return True
-
-    @QtCore.Slot()
-    def _poll_fit_runtime_preparation(self) -> None:
-        if not self._fit_runtime_readiness.handle_worker_finished():
-            QtCore.QTimer.singleShot(0, self._poll_fit_runtime_preparation)
-            return
-        snapshot = self._fit_runtime_readiness.snapshot()
-        if hasattr(self, "_status_label"):
-            if snapshot.state is FittingRuntimeReadinessState.READY:
-                self._status_label.setText("Fitting runtime ready")
-            elif snapshot.state is FittingRuntimeReadinessState.FAILED:
-                message = str(snapshot.error or "Unknown fitting runtime preparation failure.")
-                self._status_label.setText(f"Fitting runtime preparation failed: {message}")
-            elif snapshot.state is FittingRuntimeReadinessState.BLOCKED:
-                self._status_label.setText("Fitting runtime not ready")
-        if hasattr(self, "_stop_button"):
-            self._stop_button.setEnabled(False)
-        self._set_fit_controls_locked(False)
-        self._refresh_run_button_enabled_state()
-        if snapshot.state is FittingRuntimeReadinessState.FAILED:
-            self._fit_runtime_prepare_refresh_pending = False
-            return
-        if not self._close_after_fit_runtime_preparation_if_requested():
-            self._queue_pending_fit_runtime_preparation_refresh()
-
-    def _start_accepted_fit_runtime_launch(self, identity: FittingRuntimeIdentity) -> None:
-        accepted_launch = self._fit_runtime_readiness.accepted_launch_for(identity)
-        if accepted_launch is None:
-            if hasattr(self, "_status_label"):
-                self._status_label.setText("Fitting runtime is not ready")
-            self._refresh_run_button_enabled_state()
-            return
-        ready_identity = accepted_launch.identity
-        base_evaluator = ready_identity.base_evaluator
-        if base_evaluator is not None:
-            self._simulation_func = base_evaluator
-        self._active_fit_dataset_ids = [spec.dataset_id for spec in ready_identity.datasets]
-        _dataset_params_map, variable_params_map = split_fit_dataset_parameter_overrides(ready_identity.dataset_overrides)
-        self._active_variable_specs = variable_params_map
-        run_stamp = accepted_launch.stamp
-        run_stamp_hash = accepted_launch.stamp_hash
-        run_stamp_short = accepted_launch.stamp_short
-        self._run_results_tab.set_run_stamp(
-            run_stamp,
-            run_stamp_hash,
-            run_stamp_short,
-        )
-        self._results_summary_button.setEnabled(True)
-        self._start_accepted_fit_worker(accepted_launch)
-
-    def _start_accepted_fit_worker(
-        self,
-        accepted_launch: FittingRuntimeAcceptedLaunch,
-    ) -> None:
-        datasets = list(accepted_launch.datasets)
-        config = accepted_launch.config
-        dataset_overrides = list(accepted_launch.dataset_overrides)
-        weights = accepted_launch.weights
-        fit_evaluator = accepted_launch.fit_evaluator
-        runtime_session = accepted_launch.session
-        stamp = accepted_launch.stamp
-        stamp_hash = accepted_launch.stamp_hash
-        stamp_short = accepted_launch.stamp_short
-        self._active_fit_run_stamp_hash = str(stamp_hash or "")
-        self._active_fit_run_superseded = False
-        fit_runtime_ledger = getattr(runtime_session, "ledger", None)
-        worker = GlobalFitWorker(
-            datasets,
-            dict(config["parameters"]),
-            dataset_overrides=list(dataset_overrides),
-            bounds=config.get("bounds"),
-            weights=weights,
-            method=config.get("method", "trf"),
-            max_nfev=config.get("max_nfev", 1000),
-            ftol=config.get("ftol", 1e-10),
-            xtol=config.get("xtol", 1e-10),
-            seed=config.get("seed"),
-            log10_params=config.get("log10_params"),
-            fit_evaluator=fit_evaluator,
-            fit_runtime_session=runtime_session,
-            fit_runtime_max_lanes=int(accepted_launch.lane_count),
-            fit_runtime_ledger=fit_runtime_ledger,
-            fit_func=self._fit_func,
-            solver=str(accepted_launch.identity.requested_solver),
-            rtol=float(accepted_launch.identity.requested_rtol),
-            atol=float(accepted_launch.identity.requested_atol),
-            best_update_interval_s=0.25,
-            plot_update_interval_s=2.0,
-            run_stamp=dict(stamp),
-            run_stamp_hash=str(stamp_hash),
-            run_stamp_short=str(stamp_short),
-            parent=self,
-        )
-        self._worker = worker
-        worker.progress.connect(self._dispatch_fit_worker_progress)
-        if hasattr(worker, "bestUpdated"):
-            try:
-                worker.bestUpdated.connect(
-                    self._dispatch_fit_worker_best_update,
-                    QtCore.Qt.ConnectionType.QueuedConnection,
-                )
-            except Exception:
-                worker.bestUpdated.connect(self._dispatch_fit_worker_best_update)
-        worker.finished.connect(self._dispatch_fit_worker_finished)
-        worker.error.connect(self._dispatch_fit_worker_error)
-        worker.start()
-        if self._worker_is_running(worker):
-            self._set_running_state(True)
-        self._paused = False
-        self._pause_button.setEnabled(True)
-        self._resume_button.setEnabled(False)
 
     def _schedule_worker_cleanup(self, worker: QtCore.QThread) -> None:
         if worker is None:
@@ -2983,8 +2339,7 @@ class FittingWindow(QtWidgets.QDialog):
         return bool(worker is not None and self._worker_is_running(worker))
 
     def _supersede_active_fit_worker_for_runtime_input_change(self) -> None:
-        self._active_fit_run_superseded = True
-        self._active_fit_run_stamp_hash = ""
+        self._fit_run_state_owner.mark_superseded()
         self._clear_pending_best_update_state()
         self._hard_teardown_worker(
             reason="Fitting runtime inputs changed; fit cancelled",
@@ -3058,12 +2413,12 @@ class FittingWindow(QtWidgets.QDialog):
     def _cancel_fit(self) -> None:
         readiness = self._fit_runtime_readiness.snapshot()
         if readiness.state is FittingRuntimeReadinessState.PREPARING:
-            self._cancel_fit_runtime_preparation(kill=True)
+            self._fit_runtime_preparation_owner.cancel_preparation(kill=True)
             try:
                 self._stop_button.setEnabled(False)
                 self._status_label.setText("Fitting runtime preparation cancelled")
                 self._set_fit_controls_locked(False)
-                self._fit_runtime_prepare_refresh_pending = False
+                self._fit_runtime_preparation_owner.refresh_pending = False
                 self._refresh_run_button_enabled_state()
             except Exception as exc:
                 self._best_effort_failures.add("cancel_fit_runtime_preparation.status_label")
@@ -3084,7 +2439,7 @@ class FittingWindow(QtWidgets.QDialog):
         try:
             self._set_running_state(False)
             self._status_label.setText("Fit cancelled")
-            self._schedule_fit_runtime_preparation_refresh()
+            self._fit_runtime_preparation_owner.schedule_refresh()
         except Exception as exc:
             self._best_effort_failures.add("cancel_fit.status_label")
             logger.debug("Failed to set cancellation status label: %s", exc, exc_info=True)
@@ -3271,14 +2626,14 @@ class FittingWindow(QtWidgets.QDialog):
             self._schedule_worker_cleanup(old_worker)
 
     def _is_active_worker_callback(self, worker: Optional[QtCore.QThread]) -> bool:
-        if bool(getattr(self, "_active_fit_run_superseded", False)):
+        if self._fit_run_state_owner.active_run_superseded:
             return False
         if worker is None:
             return True
         return getattr(self, "_worker", None) is worker
 
     def _terminal_payload_matches_active_run(self, payload: object, *, worker: Optional[QtCore.QThread]) -> bool:
-        if bool(getattr(self, "_active_fit_run_superseded", False)):
+        if self._fit_run_state_owner.active_run_superseded:
             return False
         current_worker = getattr(self, "_worker", None)
         if worker is not None and current_worker is not None and current_worker is not worker:
@@ -3286,7 +2641,7 @@ class FittingWindow(QtWidgets.QDialog):
         payload_hash = ""
         if isinstance(payload, Mapping):
             payload_hash = str(payload.get("run_stamp_hash") or "")
-        active_hash = str(getattr(self, "_active_fit_run_stamp_hash", "") or "")
+        active_hash = self._fit_run_state_owner.active_run_stamp_hash
         if payload_hash and active_hash and payload_hash != active_hash:
             return False
         return True
@@ -3351,7 +2706,7 @@ class FittingWindow(QtWidgets.QDialog):
                 info.dataset_id: {"chi_squared": float(info.chi_squared), "r_squared": float(info.r_squared)}
                 for info in (result.dataset_info or [])
             }
-            self._active_fit_dataset_ids = []
+            self._fit_run_state_owner.clear_active_dataset_ids()
             self._pre_run_parameter_state = None
             self._pre_run_staged_dataset_params = None
         completion = getattr(result, "completion", None)
@@ -3393,7 +2748,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._status_label.setText(status)
         if severity != "fail":
             self._set_running_state(False)
-            self._schedule_fit_runtime_preparation_refresh()
+            self._fit_runtime_preparation_owner.schedule_refresh()
         if self.isVisible() and not self._closing:
             if severity == "ok":
                 icon = QtWidgets.QMessageBox.Icon.Information
@@ -3457,8 +2812,9 @@ class FittingWindow(QtWidgets.QDialog):
         return ordered
 
     def _active_or_result_dataset_ids(self, result: Optional[GlobalFitResult] = None) -> List[str]:
-        if self._active_fit_dataset_ids:
-            return list(self._active_fit_dataset_ids)
+        active_dataset_ids = self._fit_run_state_owner.active_dataset_ids
+        if active_dataset_ids:
+            return list(active_dataset_ids)
         return self._result_dataset_ids(result)
 
     def _clear_failed_dataset_manager_fit_state(self, dataset_ids: Sequence[str]) -> None:
@@ -3485,7 +2841,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._latest_dataset_stats = {}
         self._latest_plot_model_series = {}
         self._latest_plot_model_x = {}
-        self._active_fit_dataset_ids = []
+        self._fit_run_state_owner.clear_active_dataset_ids()
         self._pre_run_parameter_state = None
         self._pre_run_staged_dataset_params = None
         self._set_running_state(False)
@@ -3955,7 +3311,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._pending_best_payload = None
         self._hard_teardown_worker(reason="Cancelling...", disable_ui=True)
         if not self._fit_runtime_readiness.close(kill=True):
-            self._close_after_fit_runtime_prepare = True
+            self._fit_runtime_preparation_owner.request_close_after_prepare()
             try:
                 self.setEnabled(False)
             except Exception:

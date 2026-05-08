@@ -47,7 +47,7 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -60,7 +60,7 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
     )
     try:
         window._params_ics_tab.set_staged_dataset_params({"ds1": {"init:A": 0.6}})
-        window._start_fit()
+        window.run_fit()
         assert captured["dataset_variable_params"] is None
         _, dataset_variable_params = split_fit_dataset_parameter_overrides(captured["dataset_overrides"])
         assert dataset_variable_params["ds1"]["init:A"]["initial"] == pytest.approx(0.6)

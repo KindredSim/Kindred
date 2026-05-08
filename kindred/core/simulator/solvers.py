@@ -36,6 +36,7 @@ from kindred.core.intervention_schedule import (
     InterventionInterval,
     InterventionSchedule,
     InterventionScheduleError,
+    InterventionTriggerEvent,
     active_interval_boundaries,
     coerce_intervention_schedule,
     events_at_time,
@@ -586,6 +587,91 @@ def _apply_instant_events(
     return out
 
 
+def _trigger_direction_value(direction: str) -> float:
+    if direction == "rising":
+        return 1.0
+    if direction == "falling":
+        return -1.0
+    return 0.0
+
+
+def _trigger_available(
+    trigger: InterventionTriggerEvent,
+    *,
+    trigger_index: int,
+    segment_start: float,
+    trigger_counts: Sequence[int],
+    trigger_last_times: Sequence[float | None],
+) -> bool:
+    if int(trigger_counts[trigger_index]) >= int(trigger.max_count):
+        return False
+    last_time = trigger_last_times[trigger_index]
+    if last_time is None:
+        return True
+    if float(segment_start) <= float(np.nextafter(float(last_time), np.inf)):
+        return False
+    return float(segment_start) - float(last_time) >= float(trigger.min_interval)
+
+
+def _trigger_callables_for_segment(
+    triggers: Sequence[InterventionTriggerEvent],
+    *,
+    species_index: Mapping[str, int],
+    segment_start: float,
+    trigger_counts: Sequence[int],
+    trigger_last_times: Sequence[float | None],
+) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
+    callables: list[Callable[[float, np.ndarray], float]] = []
+    mapping: list[int] = []
+    for trigger_index, trigger in enumerate(triggers):
+        if not _trigger_available(
+            trigger,
+            trigger_index=trigger_index,
+            segment_start=segment_start,
+            trigger_counts=trigger_counts,
+            trigger_last_times=trigger_last_times,
+        ):
+            continue
+        species_idx = species_index.get(trigger.trigger_species)
+        if species_idx is None:
+            raise InterventionScheduleError(f"Unknown intervention trigger species: {trigger.trigger_species}")
+        threshold = float(trigger.threshold if trigger.threshold is not None else 0.0)
+
+        def _trigger_event(_t: float, y: np.ndarray, *, _idx=species_idx, _threshold=threshold) -> float:
+            return float(np.asarray(y, dtype=float).reshape(-1)[_idx] - _threshold)
+
+        _trigger_event.terminal = True  # type: ignore[attr-defined]
+        _trigger_event.direction = _trigger_direction_value(trigger.direction)  # type: ignore[attr-defined]
+        _trigger_event._kindred_intervention_trigger_index = int(trigger_index)  # type: ignore[attr-defined]
+        callables.append(_trigger_event)
+        mapping.append(int(trigger_index))
+    return tuple(callables), tuple(mapping)
+
+
+def _trigger_hits_from_event_provenance(
+    event_provenance: Sequence[Sequence[float]],
+    *,
+    trigger_mapping: Sequence[int],
+    user_event_count: int,
+) -> tuple[float, tuple[int, ...]] | None:
+    hits: list[tuple[float, int]] = []
+    for offset, trigger_index in enumerate(trigger_mapping):
+        event_idx = int(user_event_count) + int(offset)
+        if event_idx >= len(event_provenance):
+            continue
+        for raw_time in event_provenance[event_idx]:
+            hits.append((float(raw_time), int(trigger_index)))
+    if not hits:
+        return None
+    trigger_time = min(time for time, _trigger_index in hits)
+    lower = float(np.nextafter(trigger_time, -np.inf))
+    upper = float(np.nextafter(trigger_time, np.inf))
+    trigger_indices = tuple(
+        dict.fromkeys(trigger_index for time, trigger_index in hits if lower <= float(time) <= upper)
+    )
+    return float(trigger_time), trigger_indices
+
+
 def _segment_eval_mask(t_eval: np.ndarray, *, seg_start: float, seg_end: float, is_final: bool) -> np.ndarray:
     start_floor = float(np.nextafter(float(seg_start), -np.inf))
     end_floor = float(np.nextafter(float(seg_end), -np.inf))
@@ -678,6 +764,10 @@ def _execute_with_intervention_schedule(
     segment_alternatives: list[str] = []
     custom_jacobian_disabled = False
     terminal_stop = False
+    trigger_events = tuple(schedule.trigger_events)
+    trigger_counts = [0 for _ in trigger_events]
+    trigger_last_times: list[float | None] = [None for _ in trigger_events]
+    trigger_provenance: list[dict[str, object]] = []
 
     for idx in range(len(boundaries) - 1):
         seg_start = float(boundaries[idx])
@@ -691,109 +781,149 @@ def _execute_with_intervention_schedule(
         if seg_end <= seg_start:
             continue
         is_final = idx == len(boundaries) - 2
-        requested_mask = _segment_eval_mask(
-            t_eval,
-            seg_start=seg_start,
-            seg_end=seg_end,
-            is_final=is_final,
-        )
-        requested_eval = _snap_eval_times_to_segment_boundaries(
-            t_eval[requested_mask],
-            seg_start=seg_start,
-            seg_end=seg_end,
-        )
-        requested_eval = _deduplicate_snapped_eval_times(requested_eval)
-        if requested_eval.size and float(requested_eval[-1]) == float(seg_end):
-            internal_eval = requested_eval
-            requested_count = int(requested_eval.size)
-        elif requested_eval.size:
-            internal_eval = np.concatenate([requested_eval, np.array([seg_end], dtype=float)])
-            requested_count = int(requested_eval.size)
-        else:
-            internal_eval = np.array([seg_end], dtype=float)
-            requested_count = 0
-        active_intervals = intervals_active_at(schedule, seg_start)
-        if active_intervals:
-            current_y = np.asarray(current_y, dtype=float).copy()
-            for interval in active_intervals:
-                if interval.kind not in {"reservoir", "clamp"}:
-                    continue
-                fixed_idx = species_index.get(interval.species)
-                if fixed_idx is not None:
-                    current_y[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
-        seg_rhs = rhs
-        seg_rhs_for_jac = rhs_for_jac
-        if active_intervals:
-            seg_rhs = _InterventionRhs(rhs, intervals=active_intervals, species_index=species_index)
-            seg_rhs_for_jac = _InterventionRhs(rhs_for_jac, intervals=active_intervals, species_index=species_index)
-        seg_req = segment_req_base
-        if active_intervals and segment_req_base.jacobian_func is not None:
-            custom_jacobian_disabled = True
-            seg_req = replace(segment_req_base, jacobian_func=None)
-        seg_prov: Dict[str, object] = dict(prov)
-        seg_prov["intervention_segment_index"] = int(idx)
-        seg_out = _execute_scipy(
-            seg_req,
-            rhs=seg_rhs,
-            rhs_for_jac=seg_rhs_for_jac,
-            t0=seg_start,
-            t1=seg_end,
-            y0=current_y,
-            t_eval=internal_eval,
-            prov=seg_prov,
-            method=method,
-            note=note if idx == 0 else None,
-        )
-        segment_count += 1
-        fallback_occurred = fallback_occurred or bool(seg_out.fallback_occurred)
-        fallback_message = fallback_message or seg_out.fallback_message
-        segment_solver = str(seg_out.provenance.get("solver_used") or method)
-        segment_solvers.append(segment_solver)
-        alternative = seg_out.provenance.get("solver_alternative_used")
-        if alternative:
-            segment_alternatives.append(str(alternative))
-        seg_events = _normal_event_provenance(seg_out.provenance.get("events"), count=len(events_tuple))
-        if event_provenance:
-            for event_idx, values in enumerate(seg_events):
-                event_provenance[event_idx].extend(values)
-        terminal_stop = _non_cancel_terminal_event_hit(
-            events=events_tuple,
-            terminal_flags=terminal_flags,
-            event_provenance=seg_events,
-        )
-        seg_t = np.asarray(seg_out.t, dtype=float).reshape(-1)
-        seg_Y = np.asarray(seg_out.Y, dtype=float)
-        if seg_Y.ndim == 1:
-            seg_Y = _solver_trajectory_array(seg_Y, y0=current_y, t_out=seg_t)
-        if seg_Y.shape[1]:
-            current_y = np.asarray(seg_Y[:, -1], dtype=float).reshape(-1)
-            for interval in active_intervals:
-                if interval.kind not in {"reservoir", "clamp"}:
-                    continue
-                fixed_idx = species_index.get(interval.species)
-                if fixed_idx is not None:
-                    current_y[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
-        elif not terminal_stop:
-            raise create_solver_error(
-                req.solver,
-                seg_start,
-                "Scheduled simulation segment produced no state samples without a terminal event.",
+        sub_start = seg_start
+        while sub_start < seg_end:
+            requested_mask = _segment_eval_mask(
+                t_eval,
+                seg_start=sub_start,
+                seg_end=seg_end,
+                is_final=is_final,
             )
-        if requested_count:
-            actual_count = min(
-                int(requested_count),
-                int(seg_t.size),
+            requested_eval = _snap_eval_times_to_segment_boundaries(
+                t_eval[requested_mask],
+                seg_start=sub_start,
+                seg_end=seg_end,
             )
-            if actual_count:
-                outputs_t.append(seg_t[:actual_count])
-                outputs_y.append(seg_Y[:, :actual_count])
-        if terminal_stop and seg_t.size:
-            terminal_time = float(seg_t[-1])
-            if _eval_times_include_boundary(t_eval, terminal_time):
-                already_emitted = bool(outputs_t and outputs_t[-1].size and float(outputs_t[-1][-1]) == terminal_time)
-                if not already_emitted:
-                    outputs_t.append(seg_t[-1:])
-                    outputs_y.append(seg_Y[:, -1:])
+            requested_eval = _deduplicate_snapped_eval_times(requested_eval)
+            if requested_eval.size and float(requested_eval[-1]) == float(seg_end):
+                internal_eval = requested_eval
+                requested_count = int(requested_eval.size)
+            elif requested_eval.size:
+                internal_eval = np.concatenate([requested_eval, np.array([seg_end], dtype=float)])
+                requested_count = int(requested_eval.size)
+            else:
+                internal_eval = np.array([seg_end], dtype=float)
+                requested_count = 0
+            active_intervals = intervals_active_at(schedule, sub_start)
+            if active_intervals:
+                current_y = np.asarray(current_y, dtype=float).copy()
+                for interval in active_intervals:
+                    if interval.kind not in {"reservoir", "clamp"}:
+                        continue
+                    fixed_idx = species_index.get(interval.species)
+                    if fixed_idx is not None:
+                        current_y[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
+            seg_rhs = rhs
+            seg_rhs_for_jac = rhs_for_jac
+            if active_intervals:
+                seg_rhs = _InterventionRhs(rhs, intervals=active_intervals, species_index=species_index)
+                seg_rhs_for_jac = _InterventionRhs(rhs_for_jac, intervals=active_intervals, species_index=species_index)
+            trigger_callables, trigger_mapping = _trigger_callables_for_segment(
+                trigger_events,
+                species_index=species_index,
+                segment_start=sub_start,
+                trigger_counts=trigger_counts,
+                trigger_last_times=trigger_last_times,
+            )
+            segment_events = events_tuple + trigger_callables
+            seg_req = segment_req_base
+            if active_intervals and segment_req_base.jacobian_func is not None:
+                custom_jacobian_disabled = True
+                seg_req = replace(seg_req, jacobian_func=None)
+            if trigger_callables:
+                seg_req = replace(seg_req, events=segment_events)
+            seg_prov: Dict[str, object] = dict(prov)
+            seg_prov["intervention_segment_index"] = int(segment_count)
+            seg_out = _execute_scipy(
+                seg_req,
+                rhs=seg_rhs,
+                rhs_for_jac=seg_rhs_for_jac,
+                t0=sub_start,
+                t1=seg_end,
+                y0=current_y,
+                t_eval=internal_eval,
+                prov=seg_prov,
+                method=method,
+                note=note if segment_count == 0 else None,
+            )
+            segment_count += 1
+            fallback_occurred = fallback_occurred or bool(seg_out.fallback_occurred)
+            fallback_message = fallback_message or seg_out.fallback_message
+            segment_solver = str(seg_out.provenance.get("solver_used") or method)
+            segment_solvers.append(segment_solver)
+            alternative = seg_out.provenance.get("solver_alternative_used")
+            if alternative:
+                segment_alternatives.append(str(alternative))
+            seg_events_all = _normal_event_provenance(seg_out.provenance.get("events"), count=len(segment_events))
+            seg_events = seg_events_all[: len(events_tuple)]
+            if event_provenance:
+                for event_idx, values in enumerate(seg_events):
+                    event_provenance[event_idx].extend(values)
+            terminal_stop = _non_cancel_terminal_event_hit(
+                events=events_tuple,
+                terminal_flags=terminal_flags,
+                event_provenance=seg_events,
+            )
+            trigger_hit = None if terminal_stop else _trigger_hits_from_event_provenance(
+                seg_events_all,
+                trigger_mapping=trigger_mapping,
+                user_event_count=len(events_tuple),
+            )
+            seg_t = np.asarray(seg_out.t, dtype=float).reshape(-1)
+            seg_Y = np.asarray(seg_out.Y, dtype=float)
+            if seg_Y.ndim == 1:
+                seg_Y = _solver_trajectory_array(seg_Y, y0=current_y, t_out=seg_t)
+            if seg_Y.shape[1]:
+                current_y = np.asarray(seg_Y[:, -1], dtype=float).reshape(-1)
+                for interval in active_intervals:
+                    if interval.kind not in {"reservoir", "clamp"}:
+                        continue
+                    fixed_idx = species_index.get(interval.species)
+                    if fixed_idx is not None:
+                        current_y[fixed_idx] = float(interval.value if interval.value is not None else 0.0)
+            elif not terminal_stop:
+                raise create_solver_error(
+                    req.solver,
+                    sub_start,
+                    "Scheduled simulation segment produced no state samples without a terminal event.",
+                )
+            if requested_count:
+                actual_count = min(
+                    int(requested_count),
+                    int(seg_t.size),
+                )
+                if actual_count:
+                    outputs_t.append(seg_t[:actual_count])
+                    outputs_y.append(seg_Y[:, :actual_count])
+            if terminal_stop and seg_t.size:
+                terminal_time = float(seg_t[-1])
+                if _eval_times_include_boundary(t_eval, terminal_time):
+                    already_emitted = bool(outputs_t and outputs_t[-1].size and float(outputs_t[-1][-1]) == terminal_time)
+                    if not already_emitted:
+                        outputs_t.append(seg_t[-1:])
+                        outputs_y.append(seg_Y[:, -1:])
+            if terminal_stop:
+                break
+            if trigger_hit is None:
+                break
+            trigger_time, trigger_indices = trigger_hit
+            trigger_instants = [trigger_events[trigger_index].to_instant_event(time=trigger_time) for trigger_index in trigger_indices]
+            current_y = _apply_instant_events(current_y, trigger_instants, species_index=species_index)
+            if outputs_t and outputs_t[-1].size and _eval_times_include_boundary(outputs_t[-1], trigger_time):
+                outputs_y[-1][:, -1] = current_y
+            for trigger_index in trigger_indices:
+                trigger_counts[trigger_index] += 1
+                trigger_last_times[trigger_index] = float(trigger_time)
+                trigger = trigger_events[trigger_index]
+                trigger_provenance.append(
+                    {
+                        "time": float(trigger_time),
+                        "trigger_species": str(trigger.trigger_species),
+                        "species": str(trigger.species),
+                        "action": str(trigger.op),
+                    }
+                )
+            sub_start = float(trigger_time)
         if terminal_stop:
             break
 
@@ -837,6 +967,8 @@ def _execute_with_intervention_schedule(
     if custom_jacobian_disabled:
         prov["intervention_custom_jacobian_disabled"] = True
     prov["intervention_segments"] = int(segment_count)
+    if trigger_provenance:
+        prov["intervention_trigger_events"] = list(trigger_provenance)
     if event_provenance:
         prov["events"] = [list(values) for values in event_provenance]
     return SimulationOutput(

@@ -114,6 +114,9 @@ def test_ensure_worker_cache_bound_does_not_call_gc_collect_on_eviction(monkeypa
 
 
 def test_run_batch_simulation_task_sanitizes_unpicklable_solve_ode_exceptions(monkeypatch):
+    import kindred.core.simulation_preparation as simulation_preparation
+    import kindred.core.simulator.solvers as solver_api
+
     class _UnpicklableError(Exception):
         pass
 
@@ -153,17 +156,23 @@ def test_run_batch_simulation_task_sanitizes_unpicklable_solve_ode_exceptions(mo
     def _boom(_req):
         raise _UnpicklableError(lambda x: x)
 
+    original_solve_ode = solver_api.solve_ode
+    original_preparation_solve_ode = simulation_preparation.solve_ode
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _boom)
 
-    payload = batch_parallel.run_batch_simulation_task(
-        _batch_task_with_plan({
-            "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "BDF"},
-            "t_end": 1.0,
-            "set_id": "id1",
-            "set_name": "set1",
-        })
-    )
+    try:
+        payload = batch_parallel.run_batch_simulation_task(
+            _batch_task_with_plan({
+                "mechanism_text": "reaction: A -> A; k=1",
+                "solver_config": {"solver": "BDF"},
+                "t_end": 1.0,
+                "set_id": "id1",
+                "set_name": "set1",
+            })
+        )
+    finally:
+        solver_api.solve_ode = original_solve_ode
+        simulation_preparation.solve_ode = original_preparation_solve_ode
 
     assert payload["success"] is False
     ForkingPickler.dumps(payload["error"])
@@ -608,6 +617,50 @@ def test_run_batch_simulation_task_executes_intervention_schedule_from_plan_with
     assert payload["mechanism_text"] == mechanism_text
     assert payload["provenance"]["has_intervention_schedule"] is True
     assert float(np.asarray(payload["Y"])[a_index, -1]) == pytest.approx(3.0)
+
+
+def test_run_batch_simulation_task_executes_state_trigger_schedule_from_plan():
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "reaction: C -> D; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "initial: C=0.0",
+            "initial: D=0.0",
+            "intervention: op=trigger; trigger_species=A; threshold=0.5; direction=falling; action=add; species=C; amount=2.0; max_count=1; min_interval=0.0",
+        ]
+    )
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": {"A": 1.0, "B": 0.0, "C": 0.0, "D": 0.0},
+            "t_span": (0.0, 2.0),
+            "solver_config": {"solver": "BDF", "grid": {"N": 5}},
+            "mechanism_text": mechanism_text,
+            "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+    ).to_payload()
+
+    payload = batch_parallel.run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "mechanism_text": "reaction: A -> B; k=STALE",
+            "simulation_plan": plan_payload,
+        }
+    )
+
+    species_names = list(payload["species_names"])
+    c_index = species_names.index("C")
+    assert payload["success"] is True
+    assert payload["provenance"]["intervention_trigger_events"][0]["species"] == "C"
+    assert float(np.asarray(payload["Y"])[c_index, -1]) == pytest.approx(2.0, abs=1e-6)
 
 
 def test_run_batch_simulation_task_plan_schedule_removal_overrides_prepared_payload_schedule():

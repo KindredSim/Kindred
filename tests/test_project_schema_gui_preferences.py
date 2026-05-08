@@ -36,7 +36,7 @@ class TestGetUserPreferencePayload:
     def test_returns_complete_14_key_payload(self, main_window):
         from kindred.gui.project_schema import get_user_preference_payload
 
-        settings = main_window._settings
+        settings = main_window._settings_owner.qsettings
         settings.clear()
         settings.sync()
 
@@ -46,7 +46,7 @@ class TestGetUserPreferencePayload:
     def test_reads_qsettings_values_for_dual_persisted_keys(self, main_window):
         from kindred.gui.project_schema import get_user_preference_payload
 
-        settings = main_window._settings
+        settings = main_window._settings_owner.qsettings
         settings.clear()
         settings.setValue("simulation/solver", "BDF")
         settings.setValue("simulation/rtol", 1e-5)
@@ -63,7 +63,7 @@ class TestGetUserPreferencePayload:
     def test_type_coercion_for_rtol_stored_as_string(self, main_window):
         from kindred.gui.project_schema import get_user_preference_payload
 
-        settings = main_window._settings
+        settings = main_window._settings_owner.qsettings
         settings.clear()
         settings.setValue("simulation/rtol", "1e-8")
         settings.sync()
@@ -75,7 +75,7 @@ class TestGetUserPreferencePayload:
     def test_workers_clamped_to_minimum_one(self, main_window):
         from kindred.gui.project_schema import get_user_preference_payload
 
-        settings = main_window._settings
+        settings = main_window._settings_owner.qsettings
         settings.clear()
         settings.setValue("simulation/max_parallel_batch_workers", 0)
         settings.setValue("simulation/batch_runtime_lane_budget", 0)
@@ -89,7 +89,7 @@ class TestGetUserPreferencePayload:
         from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
         from kindred.gui.project_schema import get_user_preference_payload
 
-        settings = main_window._settings
+        settings = main_window._settings_owner.qsettings
         settings.clear()
         settings.setValue("simulation/max_parallel_batch_workers", 200)
         settings.setValue("simulation/batch_runtime_lane_budget", 200)
@@ -102,7 +102,7 @@ class TestGetUserPreferencePayload:
     def test_project_only_keys_use_factory_defaults(self, main_window):
         from kindred.gui.project_schema import PROJECT_DEFAULTS, get_user_preference_payload
 
-        settings = main_window._settings
+        settings = main_window._settings_owner.qsettings
         settings.clear()
         settings.sync()
 

@@ -127,7 +127,7 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:
@@ -139,9 +139,9 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         assert window._species_table.fit_targets_selection_applied["ds1"] == ["A"]
         assert window._species_table._fit_targets_selection_pending["ds1"] == {"B"}
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         rrt = window._run_results_tab
         assert hasattr(rrt, "_last_run_stamp")
@@ -184,7 +184,7 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:
@@ -197,9 +197,9 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
         edit_b.setText("9.0")
         qt_app.processEvents()
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         rrt = window._run_results_tab
         assert rrt._last_run_stamp["version"] == 3
@@ -298,27 +298,28 @@ def test_run_stamp_hash_stable_across_dataset_orderings():
 
 
 def test_run_stamp_hash_changes_with_prepared_intervention_schedule_fingerprint():
-    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+    from kindred.core.intervention_schedule import coerce_intervention_schedule
     from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
 
-    def _prepared_meta(schedule_fingerprint: str) -> PreparedSimulationMetadata:
-        return PreparedSimulationMetadata(
-            version=1,
-            mechanism_text_sha256="abc",
-            mechanism_text_len=1,
+    def _prepared_context(*, scheduled_value: float):
+        mechanism_text = "\n".join(
+            [
+                "reaction: A -> B; k=0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                f"intervention: op=set; species=A; time=0.0; value={float(scheduled_value):g}",
+            ]
+        )
+        return prepare_fitting_execution_context(
+            mechanism_text=mechanism_text,
             param_names=["k1"],
             t_end=1.0,
             num_points=6,
-            temperature_K=298.15,
-            solver_requested="BDF",
-            solver_normalized="BDF",
-            solver_warning=None,
+            solver="BDF",
             rtol=1e-6,
             atol=1e-12,
-            use_sparse_jacobian=False,
-            wegscheider_cyclicity_enabled=False,
             initial_prefix="init:",
-            intervention_schedule_fingerprint=str(schedule_fingerprint),
         )
 
     kwargs = {
@@ -337,15 +338,31 @@ def test_run_stamp_hash_changes_with_prepared_intervention_schedule_fingerprint(
             "seed": 42,
             "parallel_starts": 4,
         },
-        "mechanism_text": "rxn: A -> B; k=0.2",
-        "reactions_text": "rxn: A -> B; k=0.2",
     }
 
-    first = build_global_fit_run_stamp(prepared_simulation=_prepared_meta("schedule-a"), **kwargs)
-    second = build_global_fit_run_stamp(prepared_simulation=_prepared_meta("schedule-b"), **kwargs)
+    first_context = _prepared_context(scheduled_value=2.0)
+    second_context = _prepared_context(scheduled_value=3.0)
+    first_schedule = coerce_intervention_schedule(first_context.execution_request.intervention_schedule)
+    second_schedule = coerce_intervention_schedule(second_context.execution_request.intervention_schedule)
+    assert first_schedule is not None
+    assert second_schedule is not None
+    assert first_schedule.fingerprint != second_schedule.fingerprint
 
-    assert first["prepared_simulation"]["intervention_schedule_fingerprint"] == "schedule-a"
-    assert second["prepared_simulation"]["intervention_schedule_fingerprint"] == "schedule-b"
+    first = build_global_fit_run_stamp(
+        prepared_simulation=first_context.prepared_metadata,
+        mechanism_text=str(first_context.execution_request.mechanism_text),
+        reactions_text=str(first_context.execution_request.mechanism_text),
+        **kwargs,
+    )
+    second = build_global_fit_run_stamp(
+        prepared_simulation=second_context.prepared_metadata,
+        mechanism_text=str(second_context.execution_request.mechanism_text),
+        reactions_text=str(second_context.execution_request.mechanism_text),
+        **kwargs,
+    )
+
+    assert first["prepared_simulation"]["intervention_schedule_fingerprint"] == first_schedule.fingerprint
+    assert second["prepared_simulation"]["intervention_schedule_fingerprint"] == second_schedule.fingerprint
     assert hash_global_fit_run_stamp(first) != hash_global_fit_run_stamp(second)
 
 

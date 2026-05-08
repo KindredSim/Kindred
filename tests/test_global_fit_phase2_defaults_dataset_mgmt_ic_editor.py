@@ -155,14 +155,14 @@ def _start_fit_after_runtime_ready(window, qtbot, config, selection, **kwargs) -
     FittingRuntimeSession.from_serial_evaluator = staticmethod(lambda _fit_evaluator, *, max_lanes, ledger=None: _ReadyRuntimeSession())
     try:
         worker_before = getattr(window, "_worker", None)
-        window._start_fit()
+        window.run_fit()
         try:
             qtbot.waitUntil(
-                lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+                lambda: window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
                 timeout=3000,
             )
         except Exception as exc:
-            snapshot = window._fit_runtime_readiness.snapshot()
+            snapshot = window.fit_runtime_readiness.snapshot()
             raise AssertionError(
                 "Fitting runtime did not become ready: "
                 f"state={snapshot.state!r}, "
@@ -172,12 +172,12 @@ def _start_fit_after_runtime_ready(window, qtbot, config, selection, **kwargs) -
                 f"error={snapshot.error!r}"
             ) from exc
         if (
-            window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY
+            window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY
             and getattr(window, "_worker", None) is worker_before
         ):
-            window._start_fit()
+            window.run_fit()
         elif getattr(window, "_worker", None) is worker_before:
-            assert window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY
+            assert window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY
     finally:
         FittingRuntimeSession.from_serial_evaluator = original_session_factory
     qtbot.wait(0)
@@ -1483,7 +1483,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
             return
 
     captured_runs: list[dict[str, object]] = []
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1504,10 +1504,10 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
 
         assert "Global A_0" in _parameter_table_names(window)
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
         assert "init:A" in config["parameters"]
-        selection = window._collect_dataset_selection()
+        selection = window.fit_launch_identity_owner.collect_dataset_selection().as_mapping()
 
         _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
@@ -1527,7 +1527,7 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         assert len(captured_runs) == 2
         assert "Global A_0" in _parameter_table_names(window)
 
-        config_after = window._params_ics_tab._collect_parameter_config()
+        config_after = window._params_ics_tab.collect_parameter_config()
         assert config_after is not None
         assert "init:A" in config_after["parameters"]
         assert "k2" in config_after["parameters"]
@@ -1571,7 +1571,7 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
             return
 
     captured_runs: list[dict[str, object]] = []
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1601,9 +1601,9 @@ def test_global_fit_rebuild_keeps_fixed_dataset_rows_visible_after_mechanism_edi
         rows_before = _parameter_table_rows(window)
         assert any(row["name"] == "A_0 (ds1)" and row["fit"] is False for row in rows_before)
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
+        selection = window.fit_launch_identity_owner.collect_dataset_selection().as_mapping()
 
         _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
@@ -1677,7 +1677,7 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         return QtWidgets.QMessageBox.StandardButton.Ok
 
     captured_runs: list[dict[str, object]] = []
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", staticmethod(_fake_warning))
 
     main_window._run_global_fit()
@@ -1693,9 +1693,9 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         apply_btn.click()
         qt_app.processEvents()
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
+        selection = window.fit_launch_identity_owner.collect_dataset_selection().as_mapping()
 
         _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
@@ -1706,7 +1706,7 @@ def test_global_fit_rebuild_handles_scan_failures_with_warning_after_mechanism_e
         window._params_ics_tab._integration_solver_combo.setCurrentText("BDF")
         window._params_ics_tab._integration_rtol_edit.setText("1e-6")
         window._params_ics_tab._integration_atol_edit.setText("1e-12")
-        window._start_fit()
+        window.run_fit()
         assert len(captured_runs) == 1
         assert warning_calls
         assert warning_calls[-1] == ("Global Fit", "Mechanism text is empty.")
@@ -1757,7 +1757,7 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
             return
 
     captured_runs: list[dict[str, object]] = []
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1772,9 +1772,9 @@ def test_global_fit_rebuilds_live_window_simulation_after_mechanism_edit(main_wi
         apply_btn.click()
         qt_app.processEvents()
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
+        selection = window.fit_launch_identity_owner.collect_dataset_selection().as_mapping()
 
         _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
@@ -1849,7 +1849,7 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
             return
 
     captured_runs: list[dict[str, object]] = []
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -1866,9 +1866,9 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
 
         assert _parameter_table_names(window) == ["k1"]
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
+        selection = window.fit_launch_identity_owner.collect_dataset_selection().as_mapping()
 
         _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1
@@ -1925,11 +1925,12 @@ def test_global_fit_refreshes_no_prepared_window_before_readiness_after_mechanis
         qt_app.processEvents()
 
         qtbot.waitUntil(
-            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            lambda: window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
             timeout=3000,
         )
         assert _parameter_table_names(window) == ["k1"]
-        assert getattr(window, "_simulation_func", None) is None
+        assert "_simulation_func" not in window.__dict__
+        assert window._fit_evaluator_state.current_base_evaluator() is None
 
         mechanism_b = "\n".join(
             [
@@ -1942,12 +1943,12 @@ def test_global_fit_refreshes_no_prepared_window_before_readiness_after_mechanis
         qt_app.processEvents()
 
         qtbot.waitUntil(
-            lambda: window._fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
+            lambda: window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.READY,
             timeout=3000,
         )
 
         assert _parameter_table_names(window) == ["k2"]
-        ready_identity = window._fit_runtime_readiness.snapshot().identity
+        ready_identity = window.fit_runtime_readiness.snapshot().identity
         assert ready_identity is not None
         assert set(ready_identity.config["parameters"]) == {"k2"}
         assert ready_identity.stamp["parameters"]["fit"] == ["k2"]
@@ -1993,7 +1994,7 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
             return
 
     captured_runs: list[dict[str, object]] = []
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     main_window._run_global_fit()
     window = _latest_fit_window(main_window)
@@ -2012,9 +2013,9 @@ def test_global_fit_rebuild_refreshes_live_window_species_editor_after_mechanism
 
         assert _ic_table_species(window) == ["A", "B"]
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = window._collect_dataset_selection()
+        selection = window.fit_launch_identity_owner.collect_dataset_selection().as_mapping()
 
         _start_fit_after_runtime_ready(window, qtbot, config, selection, solver="BDF", rtol=1e-6, atol=1e-12)
         assert len(captured_runs) == 1

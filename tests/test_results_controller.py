@@ -77,6 +77,49 @@ def test_refresh_batch_plot_after_set_mutation_prefers_cached_selection_when_ava
     plot.set_data.assert_not_called()
 
 
+def test_publish_simulation_completion_result_owns_direct_display_sequence() -> None:
+    plot = MagicMock()
+    plot.stats_table.return_value = object()
+    ui = _make_results_ui(plot)
+    ui.batch_name_for_id = lambda set_id: {"id1": "set1"}.get(str(set_id))
+    ui.batch_id_for_name = lambda name: {"set1": "id1"}.get(str(name))
+    ui.selected_batch_set_ids = lambda: ["id1"]
+    ui.current_batch_row = lambda: 0
+    ui.batch_set_id_for_row = lambda row: "id1" if int(row) == 0 else None
+    ui.result_cache_store = lambda: {}
+    ui.set_active_batch_selection = MagicMock()
+    ui.set_main_plot_data = MagicMock()
+    ui.sync_main_plot_copy_labels = MagicMock()
+    ui.set_main_plot_scalar_values = MagicMock()
+    ui.update_main_plot_statistics = MagicMock()
+    ui.set_results_table = MagicMock()
+    controller = ResultsController(ui)
+
+    displayed = controller.publish_simulation_completion_result(
+        t=np.asarray([0.0, 1.0], dtype=float),
+        series={"A": np.asarray([1.0, 0.5], dtype=float)},
+        cache_key="cache-key",
+        batch_set="set1",
+        batch_set_id="id1",
+        selected_sets=["id1"],
+        prefer_set="id1",
+        redraw_valid_set_ids=None,
+        has_redraw_subset=False,
+        slider_triggered=False,
+        explicit_batch_coalescing=False,
+        algebra_scalars={"S": 1.0},
+        owned_species=["A"],
+    )
+
+    assert displayed is True
+    ui.set_active_batch_selection.assert_called_once_with("id1", "set1", ["id1"])
+    ui.set_main_plot_data.assert_called_once()
+    ui.sync_main_plot_copy_labels.assert_called_once_with("id1", ["id1"])
+    ui.set_main_plot_scalar_values.assert_called_once_with({"S": 1.0})
+    ui.update_main_plot_statistics.assert_called_once()
+    ui.set_results_table.assert_called_once_with(plot.stats_table.return_value)
+
+
 def test_refresh_batch_plot_after_set_mutation_forwards_narrowed_valid_subset_without_fallback() -> None:
     plot = MagicMock()
     ui = _make_results_ui(plot)

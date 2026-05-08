@@ -34,7 +34,7 @@ def test_species_statistics_selector_populates_and_switches(main_window, qtbot):
     cache[f"{cache_key}::{set_id_b}"] = {"t": t, "series": series_b, "algebra_scalars": {}}
     main_window.simulation_controller.batch_cache.active_cache_key = cache_key
 
-    ok = main_window.display_cached_batch_selection(
+    ok = main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=cache_key,
         selected_sets=[set_id_a, set_id_b],
         prefer_set=set_id_a,

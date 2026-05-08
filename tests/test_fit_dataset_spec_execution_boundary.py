@@ -184,7 +184,7 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
         def cancel(self):
             return
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -195,9 +195,9 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
         dataset_weights={"ds1": 1.0},
     )
     try:
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         datasets = captured.get("datasets")
         assert isinstance(datasets, list)
@@ -312,7 +312,7 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, qtbo
         )
         return SerialFittingEvaluator(context)
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
     monkeypatch.setattr(
         "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
         lambda _evaluator, *, max_lanes, ledger=None: _ReadyRuntimeSession(),
@@ -349,7 +349,7 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, qtbo
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window._on_targets_applied()
         qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=3000)
-        window._start_fit()
+        window.run_fit()
 
         assert build_calls
         assert warnings == []

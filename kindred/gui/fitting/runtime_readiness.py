@@ -38,6 +38,12 @@ class FittingRuntimeReadinessState(str, Enum):
     CLOSED = "closed"
 
 
+class FittingRuntimeLaunchDecisionState(str, Enum):
+    ACCEPTED = "accepted"
+    PREPARING = "preparing"
+    NOT_READY = "not_ready"
+
+
 @dataclass(frozen=True)
 class FittingRuntimeIdentity:
     datasets: tuple[FitDatasetSpec, ...]
@@ -157,6 +163,13 @@ class FittingRuntimeAcceptedLaunch:
     @property
     def lane_count(self) -> int:
         return int(self.identity.lane_count)
+
+
+@dataclass(frozen=True)
+class FittingRuntimeLaunchDecision:
+    state: FittingRuntimeLaunchDecisionState
+    accepted_launch: Optional[FittingRuntimeAcceptedLaunch] = None
+    snapshot: Optional[FittingRuntimeReadinessSnapshot] = None
 
 
 class FittingRuntimePreparationWorker:
@@ -426,6 +439,31 @@ class FittingRuntimeReadinessController:
         if self._ready_identity.readiness_required and session is None:
             return None
         return FittingRuntimeAcceptedLaunch(identity=self._ready_identity, session=session)
+
+    def prepare_or_accept_launch(
+        self,
+        identity: Optional[FittingRuntimeIdentity],
+    ) -> FittingRuntimeLaunchDecision:
+        self.set_desired_identity(identity)
+        if identity is None:
+            return FittingRuntimeLaunchDecision(
+                FittingRuntimeLaunchDecisionState.NOT_READY,
+                snapshot=self.snapshot(),
+            )
+        accepted = self.accepted_launch_for(identity)
+        if accepted is not None:
+            return FittingRuntimeLaunchDecision(
+                FittingRuntimeLaunchDecisionState.ACCEPTED,
+                accepted_launch=accepted,
+                snapshot=self.snapshot(),
+            )
+        snapshot = self.snapshot()
+        decision_state = (
+            FittingRuntimeLaunchDecisionState.PREPARING
+            if snapshot.state is FittingRuntimeReadinessState.PREPARING
+            else FittingRuntimeLaunchDecisionState.NOT_READY
+        )
+        return FittingRuntimeLaunchDecision(decision_state, snapshot=snapshot)
 
     def cancel(self, *, kill: bool = True) -> bool:
         self._desired_identity = None

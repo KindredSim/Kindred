@@ -827,7 +827,8 @@ class MainWindowPreviewSession:
 
     def _read_preview_delay_setting(self, key: str, *, default: int) -> int:
         mw = self._mw
-        settings = getattr(mw, "_settings", None)
+        settings_owner = getattr(mw, "_settings_owner", None)
+        settings = getattr(settings_owner, "qsettings", None)
         raw_value = default
         if settings is not None and hasattr(settings, "value"):
             try:

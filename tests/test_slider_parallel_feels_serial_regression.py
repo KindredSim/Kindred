@@ -12,6 +12,7 @@ from PySide6 import QtCore
 from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
+from tests.batch_context_test_helpers import seed_batch_context
 
 pytestmark = [pytest.mark.gui]
 
@@ -207,23 +208,12 @@ def test_slider_parallel_plot_updates_are_coalesced_per_ui_tick(main_window, mon
         target_set_ids=("set1", "set2", "set3", "set4", "set5"),
     )
     main_window.simulation_controller.batch_cache.active_cache_key = "coalesce-key"
-    main_window.simulation_controller.batch_run_context = {
-        "active": True,
-        "parallel": True,
-        "run_id": 77,
-        "request_id": 101,
-        "fast_mode": True,
-        "cache_key": "coalesce-key",
-        "primary_set_id": "set1",
-        "total": 5,
-        "completed_set_ids": [],
-        "queue_ids": ["set1", "set2", "set3", "set4", "set5"],
-        "queue_names": ["set1", "set2", "set3", "set4", "set5"],
-    }
+    seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=True, run_id=77, request_id=101, fast_mode=True, cache_key="coalesce-key", primary_set_id="set1", total=5, completed_set_ids=[], queue_ids=["set1", "set2", "set3", "set4", "set5"], queue_names=["set1", "set2", "set3", "set4", "set5"])
 
-    monkeypatch.setattr(main_window, "_batch_set_ids_for_scope", lambda _scope: ["set1", "set2", "set3"], raising=False)
-    monkeypatch.setattr(main_window, "_batch_current_row", lambda: 0, raising=False)
-    monkeypatch.setattr(main_window, "_batch_set_id_for_row", lambda _row: "set1", raising=False)
+    batch_port = main_window.simulation_controller.ui.batch
+    monkeypatch.setattr(batch_port, "batch_set_ids_for_scope", lambda _scope: ["set1", "set2", "set3"], raising=True)
+    monkeypatch.setattr(batch_port, "batch_current_row", lambda: 0, raising=True)
+    monkeypatch.setattr(batch_port, "batch_set_id_for_row", lambda _row: "set1", raising=True)
 
     display_calls: list[Dict[str, Any]] = []
 
@@ -231,7 +221,7 @@ def test_slider_parallel_plot_updates_are_coalesced_per_ui_tick(main_window, mon
         display_calls.append(dict(kwargs))
         return True
 
-    monkeypatch.setattr(main_window, "display_cached_batch_selection", _display, raising=False)
+    monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
 
     result = {
         "t": np.array([0.0, 1.0], dtype=float),

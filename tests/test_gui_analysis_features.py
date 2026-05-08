@@ -145,7 +145,7 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -184,7 +184,7 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
     weight_edit.setText("0.75")
     qapp.processEvents()
 
-    window._start_fit()
+    window.run_fit()
     assert captured["dataset_params"] is None
     assert captured["dataset_variable_params"] is None
     dataset_params_forwarded, _variable_params_forwarded = split_fit_dataset_parameter_overrides(captured["dataset_overrides"])
@@ -348,7 +348,7 @@ def test_global_fit_parameter_toggles_persist_across_best_updates_and_affect_con
         assert window._params_ics_tab._param_table.item(0, 1).checkState() == QtCore.Qt.Checked
         assert window._params_ics_tab._param_table.item(1, 0).checkState() == QtCore.Qt.Unchecked
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
         assert set(config["parameters"].keys()) == {"k1"}
         assert config["log10_params"] == {"k1": True}
@@ -393,7 +393,7 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         def cancel(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -422,9 +422,9 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
         window._params_ics_tab._param_table.item(1, 3).setText("9.87")
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         assert captured["shared_params"] == {"k1": pytest.approx(0.2)}
 
@@ -476,7 +476,7 @@ def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, m
         def cancel(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -504,9 +504,9 @@ def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, m
         window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
         window._params_ics_tab._param_table.item(1, 3).setText("9.87")
 
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         sim = captured["fit_evaluator"]
         assert callable(sim)

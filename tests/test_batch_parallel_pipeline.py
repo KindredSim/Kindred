@@ -168,7 +168,7 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
         raising=True,
     )
     main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
-    main_window.set_runtime_backed_run_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
 
     # "Run All" was intentionally removed; emulate it via Select All + Run Selected.
     _select_rows(main_window, [0, 1, 2])
@@ -252,7 +252,14 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
         cache_key=cache_key,
     )
 
-    assert main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{stale_sid}") is None
+    assert (
+        main_window.simulation_controller.batch_cache.entry_for_set(
+            cache_key=cache_key,
+            set_id=stale_sid,
+            is_preview=False,
+        ).entry
+        is None
+    )
 
     for sub in _simulation_submissions(new_pool):
         task = dict(sub.args[0] if sub.args else {})
@@ -284,7 +291,11 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
     for sub in _simulation_submissions(new_pool):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
-        payload = main_window.simulation_controller.batch_cache.result_cache.get(f"{cache_key}::{sid}")
+        payload = main_window.simulation_controller.batch_cache.entry_for_set(
+            cache_key=cache_key,
+            set_id=sid,
+            is_preview=False,
+        ).entry
         assert isinstance(payload, dict)
         cached_payloads.append(payload)
     assert cached_payloads
@@ -575,12 +586,13 @@ def test_open_solver_settings_persists_preview_debounce_controls(main_window, mo
 
     main_window._open_solver_settings()
 
+    settings = main_window._settings_owner.qsettings
     assert main_window._mechanism_editor.slider_solver_value() == "BDF"
     assert main_window._mechanism_editor.slider_points_value() == 350
-    assert main_window._settings.value("simulation/slider_preview_solver", type=str) == "BDF"
-    assert main_window._settings.value("simulation/slider_preview_points", type=int) == 350
-    assert main_window._settings.value("simulation/parameter_preview_debounce_ms", type=int) == 35
-    assert main_window._settings.value("simulation/equilibrium_preview_debounce_ms", type=int) == 90
+    assert settings.value("simulation/slider_preview_solver", type=str) == "BDF"
+    assert settings.value("simulation/slider_preview_points", type=int) == 350
+    assert settings.value("simulation/parameter_preview_debounce_ms", type=int) == 35
+    assert settings.value("simulation/equilibrium_preview_debounce_ms", type=int) == 90
     assert main_window._preview_session.variable_preview_debounce_ms("k1") == 35
     assert main_window._preview_session.variable_preview_debounce_ms("Keq1") == 90
 

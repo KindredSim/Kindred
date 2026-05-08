@@ -82,6 +82,41 @@ def test_state_getters_return_initial_values(qt_app):
         qt_app.processEvents()
 
 
+def testcollect_parameter_config_snapshot_for_readiness_reads_table_without_mutating_state(qt_app):
+    tab = _make_tab()
+    try:
+        tab.set_parameter_state([
+            {
+                "scope": "shared",
+                "name": "k",
+                "param_name": "k",
+                "value": 1.0,
+                "min": 0.1,
+                "max": 10.0,
+                "fit": True,
+                "log10": False,
+                "last_fit": None,
+            }
+        ])
+        tab._populate_parameter_table()
+        tab._param_table.item(0, 3).setText("2.5")
+        before_state = tab.get_parameter_state()
+
+        snapshot = tab.collect_parameter_config_snapshot_for_readiness()
+
+        assert snapshot is not None
+        config, dataset_params, dataset_variable_params = snapshot
+        assert config["parameters"] == {"k": 2.5}
+        assert config["bounds"] == {"k": (0.1, 10.0)}
+        assert config["fixed_params"] == {}
+        assert dataset_params == {}
+        assert dataset_variable_params == {}
+        assert tab.get_parameter_state() == before_state
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
 def test_rebuild_uses_initial_parameter_defaults_provider(qt_app):
     """Parameter rows use the bounded IC default provider instead of a widget reach-through."""
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab

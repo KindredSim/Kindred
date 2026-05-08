@@ -832,7 +832,7 @@ def test_apply_project_payload_clamps_parallel_workers_to_shared_ceiling(main_wi
 
 def test_new_project_inherits_user_preferences_not_factory_defaults(main_window, monkeypatch):
     """New Project uses the user's QSettings-based preferences for dual-persisted keys."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/solver", "BDF")
     settings.setValue("simulation/rtol", 1e-5)
@@ -863,7 +863,7 @@ def test_new_project_inherits_user_preferences_not_factory_defaults(main_window,
 
 def test_legacy_load_missing_simulation_keys_uses_tier2_preferences(main_window):
     """A .kin file missing simulation keys restores the user's tier-2 preferences."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/solver", "BDF")
     settings.setValue("simulation/temperature", 350.0)
@@ -880,7 +880,7 @@ def test_legacy_load_missing_simulation_keys_uses_tier2_preferences(main_window)
 
 def test_document_load_does_not_contaminate_user_preferences(main_window):
     """Loading a .kin file changes live state but must not modify _user_preferences."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/solver", "Radau")
     settings.sync()
@@ -902,7 +902,7 @@ def test_document_load_does_not_contaminate_user_preferences(main_window):
 
 def test_save_settings_writes_user_preferences_not_live_document_state(main_window):
     """save_settings persists user preferences, so loading a .kin cannot leak into QSettings."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/solver", "Radau")
     settings.sync()
@@ -920,7 +920,7 @@ def test_save_settings_writes_user_preferences_not_live_document_state(main_wind
 
 def test_dialog_update_user_preference_roundtrips(main_window):
     """update_user_preference stores values that save_settings persists."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -936,7 +936,7 @@ def test_dialog_update_user_preference_roundtrips(main_window):
 
 def test_spinbox_edit_updates_user_preference_when_not_applying_document(main_window):
     """Direct spinbox edits update user preferences when _suppress_preference_updates is False."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -952,7 +952,7 @@ def test_spinbox_edit_updates_user_preference_when_not_applying_document(main_wi
 
 def test_spinbox_during_project_apply_does_not_update_user_preferences(main_window):
     """_apply_project_payload sets _suppress_preference_updates=True so spinbox signals skip preferences."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/temperature", 298.15)
     settings.setValue("simulation/points", 100)
@@ -1000,7 +1000,7 @@ def test_reset_project_apply_dirty_session_state_clears_pending_preview_state_wi
 
 def test_solver_combo_change_persists_to_qsettings(main_window):
     """Changing the solver combo updates user preferences so save_settings persists the value."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.sync()
 
@@ -1022,7 +1022,7 @@ def test_solver_combo_change_persists_to_qsettings(main_window):
 
 def test_solver_unchanged_during_document_apply(main_window):
     """Applying a project payload with a different solver must not modify user preferences."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/solver", "Radau")
     settings.sync()
@@ -1039,7 +1039,7 @@ def test_solver_unchanged_during_document_apply(main_window):
 
 def test_load_settings_suppresses_preference_updates(main_window):
     """load_settings must not trigger update_user_preference via spinbox signals."""
-    settings = main_window._settings
+    settings = main_window._settings_owner.qsettings
     settings.clear()
     settings.setValue("simulation/temperature", 350.0)
     settings.setValue("simulation/points", 200)
@@ -1231,7 +1231,7 @@ def test_runtime_readiness_does_not_override_non_runtime_run_disabled_state(main
         lambda: True,
     )
 
-    main_window.set_run_button_enabled(False)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(False)
     main_window._set_runtime_backed_run_controls_ready(True)
 
     assert not main_window._run_btn.isEnabled()
@@ -1243,7 +1243,7 @@ def test_draft_reactions_typing_does_not_schedule_runtime_warm(main_window, monk
 
     main_window.show()
     main_window._set_runtime_backed_controls_ready(True)
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     assert main_window._run_btn.isEnabled()
     assert main_window._mechanism_editor._variable_sliders.isEnabled()
 
@@ -1331,7 +1331,7 @@ def test_authoritative_mechanism_commit_schedules_runtime_rewarm_after_invalidat
 
     main_window.show()
     main_window._set_runtime_backed_controls_ready(True)
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     assert main_window._run_btn.isEnabled()
     assert main_window._mechanism_editor._variable_sliders.isEnabled()
 
@@ -1398,7 +1398,7 @@ def test_authoritative_mechanism_commit_invalidates_display_before_scheduling_re
 
     main_window.show()
     main_window._set_runtime_backed_controls_ready(True)
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     main_window.simulation_controller.batch_cache.active_cache_key = "active-result"
 
     monkeypatch.setattr(
@@ -1462,7 +1462,7 @@ def test_programmatic_mechanism_load_invalidates_display_before_scheduling_rewar
 
     main_window.show()
     main_window._set_runtime_backed_controls_ready(True)
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     main_window.simulation_controller.batch_cache.active_cache_key = "active-result"
 
     monkeypatch.setattr(
@@ -2089,7 +2089,7 @@ def test_multiset_selection_gates_run_and_schedules_runtime_readiness(main_windo
 
     main_window._on_batch_selection_changed()
 
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     assert not main_window._run_btn.isEnabled()
     assert not main_window._mechanism_editor._variable_sliders.isEnabled()
     assert interactive_waits
@@ -2112,7 +2112,7 @@ def test_batch_selection_applies_failed_runtime_status_without_polling(main_wind
 
     main_window.show()
     main_window._set_runtime_backed_controls_ready(True)
-    main_window.set_run_button_enabled(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
     monkeypatch.setattr(
         main_window.simulation_controller,

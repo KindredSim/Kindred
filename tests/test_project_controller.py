@@ -27,7 +27,8 @@ def controller_and_mw(qt_app):
     mw = MagicMock(name="MainWindowMock")
     mw.set_status_text = MagicMock(name="SetStatusTextMock")
     mw._plot_tabs = MagicMock(name="PlotTabsMock")
-    mw._settings = MagicMock(name="SettingsMock")
+    settings = MagicMock(name="SettingsMock")
+    mw._settings_owner = SimpleNamespace(qsettings=settings)
     mw.config_controller = MagicMock(name="ConfigControllerMock")
     mw.serialize_project_state = MagicMock(name="SerializeProjectStateMock")
     mw.apply_project_payload = MagicMock(name="ApplyProjectPayloadMock")
@@ -185,7 +186,7 @@ def test_load_recent_project_missing_file_warns_and_prunes_recent(controller_and
     controller, mw = controller_and_mw
     missing = str(tmp_path / "missing.kin")
     other = str(tmp_path / "other.kin")
-    mw._settings.value.return_value = [missing, other]
+    mw._settings_owner.qsettings.value.return_value = [missing, other]
 
     with (
         patch("kindred.gui.controllers.project_controller.os.path.exists", return_value=False),
@@ -194,7 +195,7 @@ def test_load_recent_project_missing_file_warns_and_prunes_recent(controller_and
         controller.load_recent_project(missing)
 
     warning.assert_called_once()
-    mw._settings.setValue.assert_called_once_with("recent_files", [other])
+    mw._settings_owner.qsettings.setValue.assert_called_once_with("recent_files", [other])
     mw.config_controller.update_recent_files_menu.assert_called_once()
 
 
@@ -777,7 +778,7 @@ def test_new_project_uses_live_user_preferences_not_raw_qsettings(controller_and
         "batch_runtime_lane_budget": 6,
         "limit_blas_threads_per_worker": False,
     }.get(key)
-    mw._settings.value.side_effect = lambda key, default=None, type=None: {
+    mw._settings_owner.qsettings.value.side_effect = lambda key, default=None, type=None: {
         "simulation/solver": "BDF",
         "simulation/use_sparse_jacobian": True,
         "simulation/max_parallel_batch_workers": 3,

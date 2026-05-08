@@ -1362,50 +1362,82 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._populate_parameter_table()
         self.runtimeInputsChanged.emit()
 
-    def _collect_parameter_config(self) -> Optional[Dict[str, Any]]:
+    def collect_parameter_config(self) -> Optional[Dict[str, Any]]:
+        bundle = self.collect_parameter_config_bundle(show_errors=True)
+        if bundle is None:
+            return None
+        config, _global_dataset_params, _global_dataset_variable_params = bundle
+        return config
+
+    def collect_parameter_config_bundle(
+        self,
+        *,
+        show_errors: bool,
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict]]]]:
+        table = getattr(self, "_param_table", None)
+        if table is None:
+            return None
         parameters: Dict[str, float] = {}
         bounds: Dict[str, Tuple[float, float]] = {}
         log10_params: Dict[str, bool] = {}
-        fixed_params: Dict[str, float] = dict(self._fixed_shared_params or {})
+        fixed_params: Dict[str, float] = dict(self.get_fixed_shared_params() or {})
+        global_dataset_params = self.get_global_dataset_params()
+        global_dataset_variable_params = self.get_global_dataset_variable_params()
+        parameter_state = self.get_parameter_state()
         updated_state: List[Dict[str, Any]] = []
-        for row in range(self._param_table.rowCount()):
-            fit_flag = self._param_table.item(row, 0).checkState() == Qt.Checked
-            entry = self._parameter_state[row]
-            log10_flag = self._param_table.item(row, 1).checkState() == Qt.Checked
-            param_name = str(entry.get("param_name") or "")
+        has_live_fit_parameter = False
+
+        def _reject(title: str, message: str) -> None:
+            if show_errors:
+                QtWidgets.QMessageBox.warning(self.window(), title, message)
+
+        for row, entry in enumerate(parameter_state):
+            if row >= table.rowCount():
+                return None
             try:
-                value = float(self._param_table.item(row, 3).text())
-                min_val = float(self._param_table.item(row, 4).text())
-                max_val = float(self._param_table.item(row, 5).text())
-            except (ValueError, AttributeError):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
+                fit_item = table.item(row, 0)
+                log10_item = table.item(row, 1)
+                name_item = table.item(row, 2)
+                value_item = table.item(row, 3)
+                min_item = table.item(row, 4)
+                max_item = table.item(row, 5)
+                fit_flag = fit_item.checkState() == Qt.Checked
+                log10_flag = log10_item.checkState() == Qt.Checked
+                value = float(value_item.text())
+                min_val = float(min_item.text())
+                max_val = float(max_item.text())
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                param_label = ""
+                try:
+                    param_label = str(table.item(row, 2).text())
+                except (AttributeError, TypeError):
+                    param_label = str(entry.get("param_name") or "")
+                _reject(
                     "Invalid Parameter",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' contains non-numeric values.",
+                    f"Parameter '{param_label}' contains non-numeric values.",
                 )
                 return None
+            param_name = str(entry.get("param_name") or (name_item.text() if name_item is not None else "") or "")
+            if not param_name.strip():
+                return None
             if not np.isfinite(value):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
+                _reject(
                     "Invalid Parameter",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' initial value must be finite.",
+                    f"Parameter '{param_name}' initial value must be finite.",
                 )
                 return None
             if not (min_val < max_val):
-                QtWidgets.QMessageBox.warning(
-                    self.window(),
+                _reject(
                     "Invalid Bounds",
-                    f"Parameter '{self._param_table.item(row, 2).text()}' bounds must satisfy min < max.",
+                    f"Parameter '{param_name}' bounds must satisfy min < max.",
                 )
                 return None
-            if log10_flag:
-                if not (value > 0.0 and min_val > 0.0 and max_val > 0.0):
-                    QtWidgets.QMessageBox.warning(
-                        self.window(),
-                        "Invalid Log10 Bounds",
-                        f"Parameter '{self._param_table.item(row, 2).text()}' requires value/min/max > 0 when Log10 is enabled.",
-                    )
-                    return None
+            if log10_flag and not (value > 0.0 and min_val > 0.0 and max_val > 0.0):
+                _reject(
+                    "Invalid Log10 Bounds",
+                    f"Parameter '{param_name}' requires value/min/max > 0 when Log10 is enabled.",
+                )
+                return None
             scope = str(entry.get("scope") or "shared")
             updated = dict(entry)
             updated["value"] = value
@@ -1416,6 +1448,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             updated_state.append(updated)
             if scope == "shared":
                 if fit_flag:
+                    has_live_fit_parameter = True
                     parameters[param_name] = value
                     bounds[param_name] = (min_val, max_val)
                     log10_params[param_name] = bool(log10_flag)
@@ -1423,28 +1456,34 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     fixed_params[param_name] = value
             elif scope == "dataset":
                 ds_id = str(entry.get("dataset_id") or "")
+                if not ds_id:
+                    return None
                 if ds_id and param_name:
                     if fit_flag:
-                        spec_map = self._global_dataset_variable_params.setdefault(ds_id, {})
+                        has_live_fit_parameter = True
+                        spec_map = global_dataset_variable_params.setdefault(ds_id, {})
                         spec_map[param_name] = {
                             "initial": value,
                             "min": min_val,
                             "max": max_val,
                             "log10": bool(log10_flag),
                         }
-                        fixed_map = self._global_dataset_params.get(ds_id)
+                        fixed_map = global_dataset_params.get(ds_id)
                         if isinstance(fixed_map, dict):
                             fixed_map.pop(param_name, None)
                     else:
-                        self._global_dataset_params.setdefault(ds_id, {})[param_name] = float(value)
-                        spec_map = self._global_dataset_variable_params.get(ds_id)
+                        global_dataset_params.setdefault(ds_id, {})[param_name] = float(value)
+                        spec_map = global_dataset_variable_params.get(ds_id)
                         if isinstance(spec_map, dict):
                             spec_map.pop(param_name, None)
                             if not spec_map:
-                                self._global_dataset_variable_params.pop(ds_id, None)
-        self._parameter_state = updated_state
-        if not parameters and not any((entry.get("scope") == "dataset" and entry.get("fit", True)) for entry in self._parameter_state):
-            QtWidgets.QMessageBox.warning(self.window(), "No Parameters", "Select at least one parameter to fit.")
+                                global_dataset_variable_params.pop(ds_id, None)
+        if show_errors:
+            self._parameter_state = updated_state
+            self._global_dataset_params = global_dataset_params
+            self._global_dataset_variable_params = global_dataset_variable_params
+        if not has_live_fit_parameter:
+            _reject("No Parameters", "Select at least one parameter to fit.")
             return None
 
         method = self._method_combo.currentText().strip().lower()
@@ -1460,7 +1499,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "seed": self._seed_spin.value() if self._seed_check.isChecked() else None,
             "parallel_starts": DEFAULT_PARALLEL_STARTS,
         }
-        return config
+        return config, global_dataset_params, global_dataset_variable_params
+
+    def collect_parameter_config_snapshot_for_readiness(
+        self,
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict]]]]:
+        return self.collect_parameter_config_bundle(show_errors=False)
 
     def _build_parameter_state(self, definitions: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         state: List[Dict[str, Any]] = []

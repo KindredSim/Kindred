@@ -230,3 +230,107 @@ def test_run_submits_intervention_schedule_plan_and_surfaces_scheduled_result(ma
     assert payload["provenance"]["has_intervention_schedule"] is True  # type: ignore[index]
     assert plot_payload is not None
     assert float(np.asarray(plot_payload["series"]["A"])[0]) == pytest.approx(3.0)
+    assert plot_payload["intervention_annotations"] == [
+        {"time": 0.0, "kind": "instant", "label": "set A"}
+    ]
+
+
+def test_preview_submits_intervention_schedule_plan_and_surfaces_scheduled_result(main_window, qtbot, monkeypatch):
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=source; species=A; start=0.0; end=2.0; rate=1.0",
+        ]
+    )
+    main_window._mechanism_editor._reactions_text.setPlainText(mechanism_text)
+    main_window._extract_and_populate_variables()
+
+    captured: dict[str, object] = {}
+
+    class _ImmediateWorker(QtCore.QObject):
+        progress = QtCore.Signal(int, str)
+        result_ready = QtCore.Signal(dict)
+        error = QtCore.Signal(str)
+
+        def __init__(
+            self,
+            *,
+            owner,
+            simulation_plan_payload,
+            include_mechanism_in_result_payload=True,
+            parent=None,
+        ):
+            super().__init__(parent)
+            from kindred.core.simulation_plan import SimulationPlan
+
+            _ = owner
+            _ = include_mechanism_in_result_payload
+            self._running = False
+            self._request_payload = (
+                SimulationPlan.from_payload(dict(simulation_plan_payload or {}))
+                .to_execution_request()
+                .to_payload()
+            )
+            captured["request_payload"] = dict(self._request_payload)
+
+        def start(self):
+            from kindred.core.simulation_preparation import prepare_simulation_worker_run
+            from kindred.core.simulation_result_payload import build_simulation_success_payload
+            from kindred.core.simulator.solvers import solve_ode
+
+            self._running = True
+            prepared = prepare_simulation_worker_run(execution_request=self._request_payload)
+            result = solve_ode(prepared.request)
+            payload = build_simulation_success_payload(
+                result=result,
+                y=result.Y,
+                species_names=prepared.species_names,
+                base_species_count=len(prepared.species_names),
+                algebra_scalars={},
+                algebra_errors=[],
+                warnings=[],
+                solver=str(prepared.request.solver),
+                mechanism=prepared.mechanism,
+                mechanism_text=str(self._request_payload.get("mechanism_text") or ""),
+                solver_config=dict(self._request_payload.get("solver_config") or {}),
+                extra_fields={},
+            )
+            captured["payload"] = payload
+            self.result_ready.emit(payload)
+            self._running = False
+
+        def cancel(self):
+            self._running = False
+
+        def isRunning(self):
+            return self._running
+
+        def wait(self, *_args, **_kwargs):
+            return True
+
+        def terminate(self):
+            self._running = False
+
+    monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _ImmediateWorker)
+
+    main_window.simulation_controller.run_simulation_internal(fast_mode=True)
+    qtbot.waitUntil(lambda: "payload" in captured, timeout=2000)
+    QtWidgets.QApplication.processEvents()
+
+    request_payload = captured["request_payload"]
+    schedule_payload = request_payload["intervention_schedule"]  # type: ignore[index]
+    payload = captured["payload"]
+    species_names = list(payload["species_names"])  # type: ignore[index]
+    a_index = species_names.index("A")
+    plot_payload = main_window.main_plot().export_payload()
+
+    assert request_payload["solver_config"]["grid"]["N"] == main_window._mechanism_editor.slider_points_value()  # type: ignore[index]
+    assert schedule_payload["intervals"][0]["kind"] == "source"
+    assert float(np.asarray(payload["Y"])[a_index, -1]) == pytest.approx(3.0, abs=1e-6)  # type: ignore[index]
+    assert payload["provenance"]["has_intervention_schedule"] is True  # type: ignore[index]
+    assert plot_payload is not None
+    assert plot_payload["intervention_annotations"] == [
+        {"start": 0.0, "end": 2.0, "kind": "source", "label": "source A"}
+    ]

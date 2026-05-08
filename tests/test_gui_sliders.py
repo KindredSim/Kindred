@@ -15,6 +15,7 @@ from kindred.gui.controllers.simulation_controller import build_fallback_cache_k
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
 from tests.worker_stubs import make_contained_simulation_worker_stub
+from tests.batch_context_test_helpers import seed_batch_context
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
 
@@ -232,8 +233,8 @@ def _current_preview_time_axis(main_window) -> np.ndarray:
     selected_ids = [str(set_id) for set_id in (main_window._batch_set_ids_for_scope("selected") or ()) if str(set_id)]
     target_set_id = selected_ids[0] if selected_ids else str(main_window._preview_session.focused_mechanism_workspace_set_id() or "")
     assert target_set_id
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=target_set_id)
-    solver_config, t_end, _ = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=target_set_id)
+    solver_config, t_end, _ = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=target_set_id,
         mechanism_text=mechanism_text,
     )
@@ -1935,7 +1936,7 @@ def test_parameter_slider_drag_during_active_fast_preview_reserves_one_future_re
     controller.run_state.latest_sim_request_id = 5
     controller.run_state.simulation_running = True
     controller.run_state.slider_simulation_active = True
-    controller.batch_run_context = {"active": True, "parallel": True, "fast_mode": True, "request_id": 5}
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=True, request_id=5)
     monkeypatch.setattr(controller, "_run_simulation_from_slider", lambda: None)
 
     main_window._on_slider_drag_started("k1")
@@ -1972,7 +1973,7 @@ def test_parameter_slider_change_after_invalidated_serial_fast_preview_reserves_
 
     worker = _RunningFastWorker()
     controller._simulation_worker = worker
-    controller.batch_run_context = {}
+    seed_batch_context(controller.batch_context_owner)
     controller.run_state.sim_request_id = 5
     controller.run_state.latest_sim_request_id = 5
     controller._pending_slider_sim_request_id = 5
@@ -2203,8 +2204,8 @@ def test_K_slider_uses_longer_debounce_than_other_params(main_window, qtbot, mon
     assert long_ms > short_ms
 
 def test_slider_preview_debounce_settings_drive_parameter_and_K_timers(main_window, qtbot, monkeypatch):
-    main_window.settings_set_value("simulation/parameter_preview_debounce_ms", 25)
-    main_window.settings_set_value("simulation/equilibrium_preview_debounce_ms", 60)
+    main_window._settings_owner.settings_set_value("simulation/parameter_preview_debounce_ms", 25)
+    main_window._settings_owner.settings_set_value("simulation/equilibrium_preview_debounce_ms", 60)
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
             [
@@ -2695,8 +2696,8 @@ def test_replayed_precommit_dirty_overlay_is_not_reaccepted_as_truthful_after_au
         (primary_set_id, primary_preview_series),
         (secondary_set_id, secondary_preview_series),
     ):
-        mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-        solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+        solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
             set_id=set_id,
             mechanism_text=mechanism_text,
         )
@@ -2711,7 +2712,7 @@ def test_replayed_precommit_dirty_overlay_is_not_reaccepted_as_truthful_after_au
     cache.active_preview_cache_key = preview_key
     cache.active_preview_scope_set_ids = tuple(selected_ids)
 
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=preview_key,
         selected_sets=selected_ids,
         cache_store=cache.preview_cache,
@@ -2762,8 +2763,8 @@ def test_replayed_precommit_dirty_overlay_is_not_reaccepted_as_truthful_after_au
         np.asarray((replayed_secondary_preview_overlay.get("series") or {})["A"], dtype=float),
         secondary_preview_series,
     )
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=secondary_set_id).entry is None
-    assert main_window._displayed_workspace_preview_provenance_matches_current_workspace(
+    assert main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=secondary_set_id).entry is None
+    assert main_window._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(
         set_id=secondary_set_id
     ) is False
     assert main_window._active_workspace_preview_display_snapshot() is None
@@ -2819,8 +2820,8 @@ def test_commit_primary_dirty_preview_drops_stale_secondary_explicit_overlay(mai
     preview_t = _current_preview_time_axis(main_window)
     primary_preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "gui-slider-commit-drops-stale-secondary-explicit-overlay-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=primary_set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=primary_set_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=primary_set_id,
         mechanism_text=mechanism_text,
     )
@@ -2984,8 +2985,8 @@ def test_commit_does_not_preserve_older_active_preview_when_dirty_state_has_adva
     preview_t = _current_preview_time_axis(main_window)
     preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "gui-slider-commit-drops-older-active-preview-after-dirty-advance-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=set_id,
         mechanism_text=mechanism_text,
     )
@@ -2999,7 +3000,7 @@ def test_commit_does_not_preserve_older_active_preview_when_dirty_state_has_adva
     }
     cache.active_preview_cache_key = preview_key
     cache.active_preview_scope_set_ids = (set_id,)
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=preview_key,
         selected_sets=[set_id],
         cache_store=cache.preview_cache,
@@ -3008,7 +3009,7 @@ def test_commit_does_not_preserve_older_active_preview_when_dirty_state_has_adva
 
     main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[set_id])
     main_window._sim_controller._pending_slider_simulation = False
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
+    assert main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
 
     main_window._on_commit_slider_overrides_clicked()
     qt_app.processEvents()
@@ -3061,8 +3062,8 @@ def test_single_set_stale_preview_cache_display_returns_false_and_defers_to_prev
     preview_t = _current_preview_time_axis(main_window)
     stale_preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "single-set-stale-preview-cache-display-fallback-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=set_id,
         mechanism_text=mechanism_text,
     )
@@ -3079,10 +3080,10 @@ def test_single_set_stale_preview_cache_display_returns_false_and_defers_to_prev
 
     main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[set_id])
     main_window._sim_controller._pending_slider_simulation = False
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
+    assert main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=set_id).entry is None
 
     assert (
-        main_window.display_cached_batch_selection(
+        main_window._simulation_batch_owner.display_cached_batch_selection(
             cache_key=preview_key,
             selected_sets=[set_id],
             cache_store=cache.preview_cache,
@@ -3164,8 +3165,8 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
         (primary_set_id, primary_preview_series),
         (secondary_set_id, secondary_preview_series),
     ):
-        mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-        solver_config, _, preview_token = main_window._current_workspace_preview_context(
+        mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+        solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
             set_id=set_id,
             mechanism_text=mechanism_text,
         )
@@ -3179,7 +3180,7 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
         }
     cache.active_preview_cache_key = preview_key
     cache.active_preview_scope_set_ids = tuple(selected_ids)
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=preview_key,
         selected_sets=selected_ids,
         cache_store=cache.preview_cache,
@@ -3188,8 +3189,8 @@ def test_commit_drops_stale_secondary_preview_overlay_when_dirty_overlay_has_adv
 
     assert main_window._preview_session.stage_concentration_value_for_rows([1], species="A", value=3.5) is True
     main_window._sim_controller._pending_slider_simulation = False
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=secondary_set_id).entry is None
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=primary_set_id).entry is not None
+    assert main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=secondary_set_id).entry is None
+    assert main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=primary_set_id).entry is not None
 
     main_window._on_commit_slider_overrides_clicked()
     qt_app.processEvents()
@@ -3268,8 +3269,8 @@ def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_ex
     preview_t = _current_preview_time_axis(main_window)
     preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "species-only-commit-preserves-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=set_id,
         mechanism_text=mechanism_text,
     )
@@ -3283,7 +3284,7 @@ def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_ex
     }
     cache.active_preview_cache_key = preview_key
     cache.active_preview_scope_set_ids = (set_id,)
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=preview_key,
         selected_sets=[set_id],
         cache_store=cache.preview_cache,
@@ -3358,7 +3359,7 @@ def test_direct_species_cell_edit_clears_visible_multiset_without_invalidating_u
             unaffected_set_id: [7.0, 14.0],
         },
     )
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=explicit_key,
         selected_sets=set_ids,
         cache_store=cache.result_cache,
@@ -3373,24 +3374,10 @@ def test_direct_species_cell_edit_clears_visible_multiset_without_invalidating_u
     controller._simulation_running = True
     controller._slider_simulation_active = False
     controller._simulation_worker = _SliderCommitTransitionWorker(running=True)
-    controller._batch_run_context = {
-        "active": True,
-        "parallel": False,
-        "fast_mode": False,
-        "request_id": old_request_id,
-        "runtime_input_epoch": before_epoch,
-        "runtime_input_global_epoch": 0,
-        "runtime_input_set_epoch_by_set_id": {
-            edited_set_id: 0,
-            unaffected_set_id: 0,
-        },
-        "cache_key": explicit_key,
-        "queue_ids": [edited_set_id, unaffected_set_id],
-        "queue_names": ["edited", "unaffected"],
-        "rows": [0, 1],
-        "pos": 0,
-        "total": 2,
-    }
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, request_id=old_request_id, runtime_input_epoch=before_epoch, runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={
+                edited_set_id: 0,
+                unaffected_set_id: 0,
+            }, cache_key=explicit_key, queue_ids=[edited_set_id, unaffected_set_id], queue_names=["edited", "unaffected"], rows=[0, 1], pos=0, total=2)
 
     assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
     qt_app.processEvents()
@@ -3461,7 +3448,7 @@ def test_sequential_species_cell_edits_accumulate_stale_cache_scope_without_reco
             clean_set_id: [3.0, 30.0],
         },
     )
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=explicit_key,
         selected_sets=set_ids,
         cache_store=cache.result_cache,
@@ -3665,7 +3652,7 @@ def test_species_cell_paste_clears_visible_multiset_without_invalidating_unaffec
             changed_set_id: [4.0, 5.0],
         },
     )
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=explicit_key,
         selected_sets=[first_set_id, changed_set_id],
         cache_store=cache.result_cache,
@@ -3892,8 +3879,8 @@ def test_species_initial_edit_clears_stale_preview_only_plot_after_dirty_discard
     preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "species-initial-edit-clears-preview-only-plot"
     cache = main_window.simulation_controller.batch_cache
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=set_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=set_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=set_id,
         mechanism_text=mechanism_text,
     )
@@ -3907,7 +3894,7 @@ def test_species_initial_edit_clears_stale_preview_only_plot_after_dirty_discard
     }
     cache.active_preview_cache_key = preview_key
     cache.active_preview_scope_set_ids = (set_id,)
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=preview_key,
         selected_sets=[set_id],
         cache_store=cache.preview_cache,
@@ -3915,7 +3902,7 @@ def test_species_initial_edit_clears_stale_preview_only_plot_after_dirty_discard
     )
     cache.active_cache_key = None
     assert main_window.main_plot_has_data()
-    assert main_window._displayed_workspace_preview_provenance_matches_current_workspace(set_id=set_id) is True
+    assert main_window._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(set_id=set_id) is True
 
     main_window._mechanism_runtime_transition.reset_current_snapshot(
         main_window._authoritative_mechanism_transition_snapshot(),
@@ -4007,7 +3994,7 @@ def test_species_only_commit_invalidates_stale_explicit_but_preserves_unaffected
         }
     cache.active_cache_key = explicit_key
     cache.active_cache_valid_set_ids = (set_a, set_b)
-    assert main_window.display_cached_batch_selection(
+    assert main_window._simulation_batch_owner.display_cached_batch_selection(
         cache_key=explicit_key,
         selected_sets=[set_a],
         prefer_set=set_a,
@@ -4020,7 +4007,7 @@ def test_species_only_commit_invalidates_stale_explicit_but_preserves_unaffected
         main_window._authoritative_mechanism_transition_snapshot()
     )
     assert main_window._preview_session.stage_concentration_value_for_rows([0], species="A", value=2.5) is True
-    assert main_window._matching_preview_entry_for_workspace_set(set_id=set_a).entry is None
+    assert main_window._simulation_batch_owner.matching_preview_entry_for_workspace_set(set_id=set_a).entry is None
 
     main_window._on_commit_slider_overrides_clicked()
     qt_app.processEvents()
@@ -4084,8 +4071,8 @@ def test_workspace_aware_preview_display_clears_stale_pending_status_after_succe
     preview_t = _current_preview_time_axis(main_window)
     dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "workspace-aware-preview-status-success-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=dirty_primary_id,
         mechanism_text=mechanism_text,
     )
@@ -4102,7 +4089,7 @@ def test_workspace_aware_preview_display_clears_stale_pending_status_after_succe
 
     main_window._status_label.setText("Preview pending for current selection.")
     assert (
-        main_window.display_cached_batch_selection(
+        main_window._simulation_batch_owner.display_cached_batch_selection(
             cache_key=preview_key,
             selected_sets=selected_ids,
             prefer_set=dirty_primary_id,
@@ -4196,8 +4183,8 @@ def test_workspace_aware_preview_partial_success_uses_current_selection_warning(
     preview_t = _current_preview_time_axis(main_window)
     dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "workspace-aware-preview-partial-status-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=dirty_primary_id,
         mechanism_text=mechanism_text,
     )
@@ -4215,7 +4202,7 @@ def test_workspace_aware_preview_partial_success_uses_current_selection_warning(
     assert initial_status != expected_status
     main_window._status_label.setText(initial_status)
     assert (
-        main_window.display_cached_batch_selection(
+        main_window._simulation_batch_owner.display_cached_batch_selection(
             cache_key=preview_key,
             selected_sets=selected_ids,
             prefer_set=dirty_primary_id,
@@ -4279,8 +4266,8 @@ def test_slider_preview_flush_uses_shown_rows_for_plot_membership_not_only_highl
     preview_t = _current_preview_time_axis(main_window)
     dirty_preview = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "slider-preview-flush-shown-membership-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=dirty_primary_id,
         mechanism_text=mechanism_text,
     )
@@ -4379,8 +4366,8 @@ def test_slider_preview_single_shown_dirty_set_flush_displays_canonical_ref(
     preview_t = _current_preview_time_axis(main_window)
     preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     preview_key = "slider-preview-single-shown-flush-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=shown_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=shown_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=shown_id,
         mechanism_text=mechanism_text,
     )
@@ -4475,8 +4462,8 @@ def test_slider_preview_multiselect_flush_uses_requested_preview_cache_key_for_g
     newer_preview = np.asarray(np.linspace(11.0, 22.0, preview_t.size, dtype=float))
     requested_preview_key = "slider-preview-multiselect-requested-preview-key"
     active_preview_key = "slider-preview-multiselect-newer-active-preview-key"
-    mechanism_text = main_window._mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
-    solver_config, _, preview_token = main_window._current_workspace_preview_context(
+    mechanism_text = main_window._simulation_batch_owner.mechanism_text_for_workspace_selection(set_id=dirty_primary_id)
+    solver_config, _, preview_token = main_window._simulation_batch_owner.current_workspace_preview_context(
         set_id=dirty_primary_id,
         mechanism_text=mechanism_text,
     )
@@ -5177,8 +5164,10 @@ def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_s
     )
 
     main_window.simulation_controller.run_simulation_internal(fast_mode=False)
-    ctx = dict(main_window.simulation_controller._batch_run_context or {})
-    mechanism_text_by_set_id = dict(ctx.get("mechanism_text_by_set_id") or {})
+    batch_owner = main_window.simulation_controller.batch_context_owner
+    execution_state = batch_owner.execution_payload_state()
+    flush_context = batch_owner.completion_flush_context()
+    mechanism_text_by_set_id = dict(execution_state.mechanism_text_by_set_id or {})
 
     result = {
         "t": np.linspace(0.0, 1.0, 3),
@@ -5196,10 +5185,10 @@ def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_s
         result,
         run_id=int(main_window.simulation_controller._active_run_id),
         fast_mode=False,
-        request_id=int(ctx.get("request_id") or 0),
+        request_id=int(flush_context.request_id or 0),
         batch_set=str(main_window.batch_set_name_for_id(set_id) or ""),
         batch_set_id=set_id,
-        cache_key=str(ctx.get("cache_key") or ""),
+        cache_key=str(flush_context.cache_key or ""),
     )
     qt_app.processEvents()
 
@@ -5237,8 +5226,9 @@ def test_run_selected_completion_preserves_surviving_pending_slider_replay_after
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: scheduled.append(fn))
 
     controller.run_simulation_internal(fast_mode=False)
-    ctx = dict(controller._batch_run_context or {})
-    assert ctx.get("pending_workspace_reset_set_ids") == [set0_id]
+    batch_owner = controller.batch_context_owner
+    pending_reset_state = batch_owner.pending_dirty_reset_state()
+    assert pending_reset_state.set_ids == (set0_id,)
 
     intent = owner.build_slider_replay_intent(set_ids=[set1_id], source="variable_slider")
     assert intent is not None
@@ -5247,7 +5237,9 @@ def test_run_selected_completion_preserves_surviving_pending_slider_replay_after
     assert pending_before.active is True
     assert pending_before.target_set_ids == (set1_id,)
 
-    mechanism_text_by_set_id = dict(ctx.get("mechanism_text_by_set_id") or {})
+    execution_state = batch_owner.execution_payload_state()
+    flush_context = batch_owner.completion_flush_context()
+    mechanism_text_by_set_id = dict(execution_state.mechanism_text_by_set_id or {})
     result = {
         "t": np.linspace(0.0, 1.0, 3),
         "Y": np.asarray([[1.0, 0.5, 0.1], [0.0, 0.5, 0.9]], dtype=float),
@@ -5265,10 +5257,10 @@ def test_run_selected_completion_preserves_surviving_pending_slider_replay_after
         result,
         run_id=int(controller._active_run_id),
         fast_mode=False,
-        request_id=int(ctx.get("request_id") or 0),
+        request_id=int(flush_context.request_id or 0),
         batch_set=str(main_window.batch_set_name_for_id(set0_id) or ""),
         batch_set_id=set0_id,
-        cache_key=str(ctx.get("cache_key") or ""),
+        cache_key=str(flush_context.cache_key or ""),
     )
 
     pending_after = controller.run_state.pending_slider_preview_launch

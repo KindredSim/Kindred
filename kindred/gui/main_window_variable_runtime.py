@@ -241,7 +241,11 @@ class MainWindowVariableRuntime:
             state_network_dsl = mw.mechanism_state_network_dsl_raw()
             parse_mechanism_text = strip_named_reaction_dsl_initial_concentration_sets(mechanism_text)
             try:
-                wegscheider_enabled = bool(mw.wegscheider_cyclicity_enabled())
+                solver_owner = getattr(mw, "_simulation_solver_owner", None)
+                if solver_owner is not None and callable(getattr(solver_owner, "wegscheider_cyclicity_enabled", None)):
+                    wegscheider_enabled = bool(solver_owner.wegscheider_cyclicity_enabled())
+                else:
+                    wegscheider_enabled = bool(mw.wegscheider_cyclicity_enabled())
 
                 def _build_structure_snapshot(full_dsl: str) -> object:
                     mechanism_obj = parse_dsl_to_mechanism(full_dsl, initials={}, units=units)

@@ -639,7 +639,7 @@ def test_auto_lock_for_run_refuses_unchanged_invalid_mechanism(main_window, monk
     qt_app.processEvents()
 
     assert main_window.mechanism_editing_locked() is False
-    assert main_window.auto_lock_for_run() is False
+    assert main_window._simulation_mechanism_owner.auto_lock_for_run() is False
     assert main_window.mechanism_editing_locked() is False
     assert main_window._mechanism_editor.is_mechanism_valid() is False
 
@@ -649,21 +649,21 @@ def test_is_mechanism_ready_for_run_uses_canonical_state_while_unlocked(main_win
     main_window._mechanism_editor._state_network_editor.clear()
     qt_app.processEvents()
     assert main_window.mechanism_editing_locked() is True
-    assert main_window.is_mechanism_ready_for_run() is True
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is True
 
     main_window._force_lock_editor()
     _set_invalid_reactions_text(main_window, qt_app)
     assert main_window.mechanism_editing_locked() is True
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
 
     _unlock_reactions_editing(main_window, monkeypatch)
     _set_valid_reactions_text(main_window, qt_app, text="reaction: A -> B; k=1.0")
     assert main_window.mechanism_editing_locked() is False
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
 
     _set_invalid_reactions_text(main_window, qt_app)
     assert main_window.mechanism_editing_locked() is False
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
 
 
 def test_is_mechanism_ready_for_run_does_not_apply_authoritative_updates(main_window, monkeypatch, qt_app):
@@ -678,7 +678,7 @@ def test_is_mechanism_ready_for_run_does_not_apply_authoritative_updates(main_wi
 
     monkeypatch.setattr(owner, "apply_authoritative_update", _record_apply)
 
-    assert main_window.is_mechanism_ready_for_run() is True
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is True
     assert calls == []
 
 
@@ -688,7 +688,7 @@ def test_empty_reactions_valid_state_network_is_ready_for_run(main_window, qt_ap
     qt_app.processEvents()
 
     assert main_window._mechanism_editor._state_network_editor.is_valid() is True
-    assert main_window.is_mechanism_ready_for_run() is True
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is True
 
 
 def test_empty_reactions_no_state_network_not_ready_for_run(main_window, qt_app):
@@ -696,7 +696,7 @@ def test_empty_reactions_no_state_network_not_ready_for_run(main_window, qt_app)
     main_window._mechanism_editor._state_network_editor.clear()
     qt_app.processEvents()
 
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
 
 
 def test_invalid_reactions_valid_state_network_not_ready_for_run(main_window, qt_app):
@@ -705,7 +705,7 @@ def test_invalid_reactions_valid_state_network_not_ready_for_run(main_window, qt
     qt_app.processEvents()
 
     assert main_window._mechanism_editor._state_network_editor.is_valid() is True
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
 
 
 def test_valid_reactions_invalid_state_network_not_ready_for_run(main_window, qt_app):
@@ -714,7 +714,7 @@ def test_valid_reactions_invalid_state_network_not_ready_for_run(main_window, qt
     qt_app.processEvents()
 
     assert main_window._mechanism_editor._state_network_editor.is_valid() is False
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
 
 
 def test_named_inline_initial_set_blocks_are_ready_for_run(main_window, qt_app):
@@ -729,7 +729,7 @@ def test_named_inline_initial_set_blocks_are_ready_for_run(main_window, qt_app):
     qt_app.processEvents()
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
 
-    assert main_window.is_mechanism_ready_for_run() is True
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is True
 
 
 def test_state_network_validation_blocks_lock(main_window, monkeypatch, qt_app):
@@ -804,7 +804,7 @@ def test_locked_invalid_dsl_blocks_explicit_run(main_window, qt_app):
 
     main_window.simulation_controller.run_simulation_internal.assert_not_called()
     assert main_window.mechanism_editing_locked() is True
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
     assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
 
@@ -874,7 +874,7 @@ def test_state_network_invalid_blocks_run_even_when_locked(main_window, qt_app):
     qt_app.processEvents()
 
     main_window.simulation_controller.run_simulation_internal.assert_not_called()
-    assert main_window.is_mechanism_ready_for_run() is False
+    assert main_window._simulation_mechanism_owner.is_mechanism_ready_for_run() is False
     assert main_window._status_label.text() == "Cannot run: mechanism has errors. Fix and try again."
 
 

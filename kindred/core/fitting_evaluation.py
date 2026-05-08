@@ -25,7 +25,7 @@ from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
-from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule import InterventionScheduleError, coerce_intervention_schedule
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
@@ -784,6 +784,16 @@ class SerialFittingEvaluator:
         if cancellation_event is not None:
             events.append(cancellation_event)
 
+        intervention_schedule = prepared_run.request.intervention_schedule
+        if intervention_schedule is not None:
+            try:
+                intervention_schedule = intervention_schedule.resolve_parameters(param_map)
+            except InterventionScheduleError as exc:
+                raise FitSimulationError(
+                    f"Fitting intervention schedule failed: {exc}",
+                    details={"fatal": False, "stage": "intervention_schedule"},
+                ) from exc
+
         request = SimulationRequest(
             rhs=prepared_run.request.rhs,
             t_span=tuple(map(float, prepared_run.request.t_span)),
@@ -794,7 +804,7 @@ class SerialFittingEvaluator:
             grid=dict(prepared_run.request.grid or {}),
             jacobian_func=prepared_run.request.jacobian_func,
             temperature_schedule=prepared_run.request.temperature_schedule,
-            intervention_schedule=prepared_run.request.intervention_schedule,
+            intervention_schedule=intervention_schedule,
             species_names=tuple(prepared_run.species_names),
             events=tuple(events) if events else None,
         )

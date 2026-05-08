@@ -71,7 +71,7 @@ def test_slider_drag_does_not_recenter_other_ranges_or_break_ctc(main_window, qt
 
     kr_range_before = sliders._slider_ranges["kr1"]
     kr_pos_before = kr_slider.value()
-    ctc_before = dict(getattr(main_window, "_last_simulation_ctc", {}) or {})
+    ctc_before = main_window._simulation_provenance_owner.last_simulation_ctc
     preview = main_window._preview_session
 
     qtbot.addWidget(main_window)
@@ -100,6 +100,6 @@ def test_slider_drag_does_not_recenter_other_ranges_or_break_ctc(main_window, qt
     assert kr_slider.value() == kr_pos_before
 
     # Ensure the slider-triggered simulation completion path still runs and updates CTC.
-    qtbot.waitUntil(lambda: bool(getattr(main_window, "_last_simulation_ctc", {}) or {}), timeout=2500)
-    ctc_after = dict(getattr(main_window, "_last_simulation_ctc", {}) or {})
+    qtbot.waitUntil(lambda: bool(main_window._simulation_provenance_owner.last_simulation_ctc), timeout=2500)
+    ctc_after = main_window._simulation_provenance_owner.last_simulation_ctc
     assert ctc_after != ctc_before

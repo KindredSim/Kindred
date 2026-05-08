@@ -156,7 +156,7 @@ def test_fitting_window_passes_typed_dataset_overrides_to_worker(qt_app, monkeyp
         def cancel(self):
             return
 
-    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -173,9 +173,9 @@ def test_fitting_window_passes_typed_dataset_overrides_to_worker(qt_app, monkeyp
         dataset_weights={"ds1": 1.0},
     )
     try:
-        config = window._params_ics_tab._collect_parameter_config()
+        config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        window._start_fit()
+        window.run_fit()
 
         overrides = captured.get("dataset_overrides")
         assert isinstance(overrides, list)
