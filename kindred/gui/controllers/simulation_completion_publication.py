@@ -647,13 +647,10 @@ class SimulationCompletionPublicationOwner:
         )
 
     def _explicit_cache_policy_context(self, state: CompletionCallbackState) -> CompletionPolicyContext:
-        if isinstance(state.ctx, Mapping) and self._batch_context_owner.context_matches_current_run_identity(
-            state.ctx
-        ):
-            current_context = self._batch_context_owner.completion_policy_context()
-            if current_context is not None:
-                return current_context
-        context = state.policy_context or self._batch_context_owner.completion_policy_context(state.ctx)
+        context = self._batch_context_owner.completion_publication_policy_context(
+            callback_context=state.ctx if isinstance(state.ctx, Mapping) else None,
+            policy_context=state.policy_context,
+        )
         if context is None:
             return CompletionPolicyContext(
                 active=False,

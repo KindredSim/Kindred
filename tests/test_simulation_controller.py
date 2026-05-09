@@ -5206,13 +5206,15 @@ def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
     assert publish_truth_spy.call_args.kwargs["active_cache_invalidated_set_ids"] == ("bad",)
     assert controller.batch_cache.active_cache_valid_set_ids == ("ok",)
     assert controller.batch_cache.active_cache_invalidated_set_ids == ("bad",)
+    assert mw._display_cached_batch_selection.call_args.kwargs["valid_set_ids"] == ("ok",)
+    assert mw._display_cached_batch_selection.call_args.kwargs["allow_fallback"] is False
     mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
     mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["ok"])
     mw.message_box_critical.assert_called_once()
 
 
 @pytest.mark.unit
-def test_completion_publication_cache_truth_uses_current_mutable_cache_context_for_captured_identity(
+def test_completion_publication_cache_truth_uses_owner_publication_context_for_matching_callback_identity(
     controller: SimulationController,
 ):
     seed_batch_context(

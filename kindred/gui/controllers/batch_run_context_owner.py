@@ -1195,6 +1195,18 @@ class BatchRunContextOwner:
             preview_owner_epoch=ctx.get("preview_owner_epoch"),
         )
 
+    def completion_publication_policy_context(
+        self,
+        *,
+        callback_context: Mapping[str, Any] | None,
+        policy_context: CompletionPolicyContext | None,
+    ) -> CompletionPolicyContext | None:
+        if isinstance(callback_context, Mapping) and self.context_matches_current_run_identity(callback_context):
+            current_context = self.completion_policy_context()
+            if current_context is not None:
+                return current_context
+        return policy_context or self.completion_policy_context(callback_context)
+
     def serialize_completion_policy_context(
         self,
         context: CompletionPolicyContext,

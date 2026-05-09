@@ -73,6 +73,81 @@ def test_inactive_context_has_no_active_batch_state():
     assert owner.active_batch_state() is None
 
 
+def test_completion_publication_policy_context_refreshes_current_truth_for_matching_callback_context():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        cache_key="ck",
+        queue_ids=["bad", "ok"],
+        explicit_cache_valid_set_ids=("bad", "ok"),
+    )
+    callback_context = owner.callback_context_snapshot()
+    captured_policy_context = owner.completion_policy_context(callback_context)
+    assert captured_policy_context is not None
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        cache_key="ck",
+        queue_ids=["bad", "ok"],
+        completed_set_ids=["bad"],
+        explicit_cache_valid_set_ids=("ok",),
+        explicit_cache_invalidated_set_ids=("bad",),
+    )
+
+    context = owner.completion_publication_policy_context(
+        callback_context=callback_context,
+        policy_context=captured_policy_context,
+    )
+
+    assert context is not None
+    assert context.explicit_cache_valid_set_ids == ("ok",)
+    assert context.explicit_cache_invalidated_set_ids == ("bad",)
+
+
+def test_completion_publication_policy_context_keeps_stale_callback_context_out_of_current_truth():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        cache_key="ck",
+        queue_ids=["old"],
+        explicit_cache_valid_set_ids=("old",),
+    )
+    callback_context = owner.callback_context_snapshot()
+    captured_policy_context = owner.completion_policy_context(callback_context)
+    assert captured_policy_context is not None
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=True,
+        run_id=99,
+        request_id=100,
+        cache_key="other",
+        queue_ids=["new"],
+        explicit_cache_valid_set_ids=("new",),
+        explicit_cache_invalidated_set_ids=("old",),
+    )
+
+    context = owner.completion_publication_policy_context(
+        callback_context=callback_context,
+        policy_context=captured_policy_context,
+    )
+
+    assert context is captured_policy_context
+    assert context.explicit_cache_valid_set_ids == ("old",)
+    assert context.explicit_cache_invalidated_set_ids is None
+
+
 def test_seeded_context_copies_mutable_input_without_raw_context_reads():
     owner = BatchRunContextOwner()
     queue_ids = ["id1"]
