@@ -556,6 +556,39 @@ def test_context_matches_current_run_identity_ignores_progress_but_rejects_cache
     })
 
 
+def test_completion_publication_cache_key_uses_callback_key_before_context_fallback():
+    owner = BatchRunContextOwner()
+    seed_batch_context(owner, active=True, run_id=1, request_id=2, cache_key="context-cache")
+    callback_context = owner.callback_context_snapshot()
+
+    assert owner.completion_publication_cache_key(
+        callback_cache_key="callback-cache",
+        callback_context=callback_context,
+    ) == "callback-cache"
+
+
+def test_completion_publication_cache_key_uses_callback_context_as_named_fallback():
+    owner = BatchRunContextOwner()
+    seed_batch_context(owner, active=True, run_id=1, request_id=2, cache_key="context-cache")
+    callback_context = owner.callback_context_snapshot()
+    seed_batch_context(owner, active=True, run_id=99, request_id=100, cache_key="current-cache")
+
+    assert owner.completion_publication_cache_key(
+        callback_cache_key=None,
+        callback_context=callback_context,
+    ) == "context-cache"
+
+
+def test_completion_publication_cache_key_does_not_fall_back_to_current_context_without_callback_context():
+    owner = BatchRunContextOwner()
+    seed_batch_context(owner, active=True, run_id=1, request_id=2, cache_key="current-cache")
+
+    assert owner.completion_publication_cache_key(
+        callback_cache_key=None,
+        callback_context=None,
+    ) == ""
+
+
 def test_simulation_controller_tests_do_not_read_pending_reset_raw_context_fields():
     from pathlib import Path
 

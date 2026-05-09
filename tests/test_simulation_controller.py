@@ -5271,6 +5271,43 @@ def test_completion_publication_cache_truth_uses_owner_publication_context_for_m
 
 
 @pytest.mark.unit
+def test_completion_publication_missing_cache_key_without_callback_context_does_not_use_current_context(
+    controller: SimulationController,
+):
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        cache_key="current-cache",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        explicit_cache_valid_set_ids=("id1",),
+    )
+    publish_truth_spy = MagicMock(wraps=controller._cache_admin.publish_completion_cache_truth)
+    controller._cache_admin.publish_completion_cache_truth = publish_truth_spy
+    state = CompletionCallbackState(
+        run_id=1,
+        request_id=2,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key=None,
+        policy_context=None,
+        ctx=None,
+        shutdown_requested=False,
+        is_preview=False,
+        slider_triggered=False,
+        explicit_batch_coalescing=False,
+    )
+
+    controller._completion_publication_owner.publish_cache_truth(state)
+
+    assert state.cache_key is None
+    publish_truth_spy.assert_not_called()
+
+
+@pytest.mark.unit
 def test_parallel_batch_final_scoped_failure_finalizes_prior_success(
     mw: _FakeMainWindow,
     controller: SimulationController,

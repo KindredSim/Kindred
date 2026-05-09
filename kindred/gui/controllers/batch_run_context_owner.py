@@ -967,6 +967,18 @@ class BatchRunContextOwner:
         ctx = context if isinstance(context, Mapping) else self._context
         return str(ctx.get("cache_key") or "")
 
+    def completion_publication_cache_key(
+        self,
+        *,
+        callback_cache_key: str | None,
+        callback_context: Mapping[str, Any] | None,
+    ) -> str:
+        if callback_cache_key:
+            return str(callback_cache_key)
+        if isinstance(callback_context, Mapping):
+            return self.completion_cache_key(callback_context)
+        return ""
+
     def primary_set_id(
         self,
         context: Mapping[str, Any] | None = None,

@@ -216,8 +216,10 @@ class SimulationCompletionPublicationOwner:
         )
 
     def resolve_cache_key(self, state: CompletionCallbackState) -> None:
-        if state.cache_key is None:
-            state.cache_key = self._batch_context_owner.completion_cache_key(state.ctx)
+        state.cache_key = self._batch_context_owner.completion_publication_cache_key(
+            callback_cache_key=state.cache_key,
+            callback_context=state.ctx if isinstance(state.ctx, Mapping) else None,
+        )
         state.cache_key = str(state.cache_key) if state.cache_key else None
 
     def publish_cache_truth(self, state: CompletionCallbackState) -> None:
