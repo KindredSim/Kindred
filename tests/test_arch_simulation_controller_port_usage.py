@@ -41,8 +41,6 @@ LAUNCH_VALIDATION_BATCH_TARGET_METHODS = {
 }
 
 COMPLETION_RECONCILIATION_BATCH_TARGET_METHODS = {
-    "batch_set_id_for_name",
-    "batch_set_name_for_id",
     "sync_batch_species_columns",
 }
 
@@ -298,6 +296,13 @@ def _class_method_node(tree: ast.AST, class_name: str, method_name: str) -> ast.
     raise AssertionError(f"Expected {class_name}.{method_name} to exist")
 
 
+def _class_node(tree: ast.AST, class_name: str) -> ast.ClassDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node
+    raise AssertionError(f"Expected {class_name} to exist")
+
+
 def _collect_port_usage(
     fn: ast.FunctionDef,
     lines: list[str],
@@ -390,6 +395,199 @@ def _simulation_complete_solver_provenance_cluster(fn: ast.FunctionDef) -> list[
         return node.body[start_idx : provenance_idx + 1]
 
     raise AssertionError("Expected to find the structurally anchored solver provenance block in `_on_simulation_complete`.")
+
+
+def _repo_source_tree(relative_path: str) -> tuple[Path, str, ast.AST]:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / relative_path
+    assert target.is_file(), f"Expected file at {target}"
+    source = target.read_text(encoding="utf-8")
+    return target, source, ast.parse(source, filename=str(target))
+
+
+def _call_chains(fn: ast.FunctionDef) -> set[tuple[str, ...]]:
+    chains: set[tuple[str, ...]] = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain:
+            chains.add(chain)
+    return chains
+
+
+def _all_attribute_chains(fn: ast.FunctionDef) -> set[tuple[str, ...]]:
+    chains: set[tuple[str, ...]] = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Attribute):
+            continue
+        chain = _attribute_chain(node)
+        if chain:
+            chains.add(chain)
+    return chains
+
+
+def test_parallel_batch_runtime_snapshot_status_is_owned_by_readiness_owner() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    fn = _simulation_controller_method_node(tree, "_parallel_batch_runtime_snapshot")
+
+    chains = _call_chains(fn)
+
+    forbidden = {
+        ("self", "_batch_parallel", "has_ready_lane_pool"),
+        ("self", "_batch_parallel", "runtime_snapshot"),
+        ("self", "_parallel_batch_runtime_readiness_owner", "mark_ready"),
+        ("self", "_parallel_batch_runtime_readiness_owner", "mark_not_ready"),
+    }
+    assert chains.isdisjoint(forbidden), (
+        "`SimulationController._parallel_batch_runtime_snapshot` must not reconstruct batch readiness from "
+        "`ParallelBatchExecutor` state or mutate readiness markers directly; status/snapshot authority belongs "
+        "to `ParallelBatchRuntimeReadinessOwner`."
+    )
+
+
+def test_controller_no_longer_owns_duplicate_batch_lane_pool_factory() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+
+    assert all(
+        not (isinstance(node, ast.FunctionDef) and node.name == "_default_batch_lane_pool_factory")
+        for node in ast.walk(tree)
+    ), "`SimulationController` must not define a duplicate batch lane-pool factory; use the runtime adapter authority."
+
+
+def test_callback_identity_has_no_full_batch_context_snapshot_escape_hatch() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_callback_identity.py")
+    class_node = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "SimulationCallbackIdentity"
+    )
+
+    annotated_fields = {
+        stmt.target.id
+        for stmt in class_node.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+    assert "context_snapshot" not in annotated_fields
+    assert "callback_context" in annotated_fields
+
+
+def test_batch_context_owner_has_no_raw_current_snapshot_compatibility_api() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/batch_run_context_owner.py")
+    class_node = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == "BatchRunContextOwner"
+    )
+    methods = {node.name for node in class_node.body if isinstance(node, ast.FunctionDef)}
+
+    assert "current_context_snapshot" not in methods
+    assert "callback_context_snapshot" in methods
+
+
+def test_production_code_does_not_call_raw_batch_context_snapshot_for_callbacks() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    production_paths = [
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py",
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_callback.py",
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_error_handling.py",
+        repo_root / "kindred" / "gui" / "controllers" / "parallel_batch_outcome.py",
+    ]
+    hits: list[str] = []
+    for path in production_paths:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        lines = source.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            chain = _attribute_chain(node)
+            if chain and chain[-1] == "current_context_snapshot":
+                hits.append(f"{path.relative_to(repo_root)}:{node.lineno}: {lines[node.lineno - 1].strip()}")
+
+    assert hits == [], "Production callback flow must not call raw full batch context snapshots.\n" + "\n".join(hits)
+
+
+def test_completion_publication_does_not_fallback_to_active_cache_key_for_callback_paths() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_completion_publication.py")
+    fn = _completion_publication_method_node(tree, "resolve_cache_key")
+    chains = _all_attribute_chains(fn)
+
+    forbidden = {
+        ("self", "_batch_cache", "active_cache_key"),
+        ("self", "_batch_cache", "active_preview_cache_key"),
+    }
+    assert chains.isdisjoint(forbidden), (
+        "Callback-driven completion must not silently mask a missing callback cache key with active cache state; "
+        "any fallback must be explicit, named, and tested."
+    )
+
+
+def test_completion_publication_does_not_rediscover_batch_identity_after_callback_resolution() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_completion_publication.py")
+    class_node = _class_node(tree, "SimulationCompletionPublicationOwner")
+    method_names = {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert "resolve_batch_identity" not in method_names
+
+
+def test_completion_publication_dependencies_exclude_false_owner_pass_throughs() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_completion_publication.py")
+    class_node = _class_node(tree, "SimulationCompletionPublicationDependencies")
+    dependency_fields = {
+        stmt.target.id
+        for stmt in class_node.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+
+    forbidden = {
+        "completion_policy_cache_state",
+        "resolve_completion_mechanism",
+        "update_primary_result_materialization_contract",
+        "remember_primary_result_mechanism",
+        "include_mechanism_in_result_payload",
+        "refresh_primary_result_controls",
+    }
+    assert dependency_fields.isdisjoint(forbidden), (
+        "Completion publication must own cache-state reads directly, use the result-materialization owner "
+        "directly, and ask the batch-context owner for mechanism-payload policy instead of routing those "
+        "responsibilities through controller pass-through callables."
+    )
+
+
+def test_controller_no_longer_owns_completion_publication_policy_helpers() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    class_node = _class_node(tree, "SimulationController")
+    method_names = {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert "_completion_policy_cache_state" not in method_names
+    assert "_include_mechanism_in_result_payload" not in method_names
+
+
+def test_completion_publication_wiring_does_not_wrap_dependencies_in_lambdas() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    publication_dependency_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SimulationCompletionPublicationDependencies"
+    ]
+    assert len(publication_dependency_calls) == 1
+
+    lambda_fields = [
+        keyword.arg
+        for keyword in publication_dependency_calls[0].keywords
+        if isinstance(keyword.value, ast.Lambda)
+    ]
+    assert lambda_fields == [], (
+        "Completion publication wiring must pass bounded owner/controller callables directly; lambda wrappers "
+        "hide pass-through scaffolding and make ownership harder to audit."
+    )
 
 
 def test_simulation_complete_provenance_cluster_uses_explicit_provenance_port() -> None:
@@ -1023,12 +1221,9 @@ def test_simulation_complete_completion_reconciliation_cluster_uses_explicit_bat
     assert owner_target.is_file(), f"Expected file at {owner_target}"
     assert materialization_target.is_file(), f"Expected file at {materialization_target}"
 
-    owner_source = owner_target.read_text(encoding="utf-8")
-    owner_tree = ast.parse(owner_source, filename=str(owner_target))
     materialization_source = materialization_target.read_text(encoding="utf-8")
     materialization_tree = ast.parse(materialization_source, filename=str(materialization_target))
     method_specs = (
-        (owner_target, owner_tree, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "resolve_batch_identity")),
         (
             materialization_target,
             materialization_tree,

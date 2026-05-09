@@ -86,8 +86,8 @@ class SimulationErrorHandlingOwner:
             return
         latest_request_id = int(self._deps.latest_request_id())
         ctx = (
-            callback_identity.context_snapshot
-            if callback_identity is not None and isinstance(callback_identity.context_snapshot, Mapping)
+            callback_identity.callback_context
+            if callback_identity is not None and isinstance(callback_identity.callback_context, Mapping)
             else None
         )
         if batch_set is None or batch_set_id is None:
@@ -113,11 +113,9 @@ class SimulationErrorHandlingOwner:
                 context=ctx if isinstance(ctx, Mapping) else None,
             )
             return
-        policy_context = (
-            callback_identity.policy_context
-            if callback_identity is not None and callback_identity.policy_context is not None
-            else self._batch_context_owner.completion_policy_context()
-        )
+        policy_context = self._batch_context_owner.completion_policy_context(ctx)
+        if policy_context is None:
+            policy_context = self._batch_context_owner.completion_policy_context()
         callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
             context=policy_context,

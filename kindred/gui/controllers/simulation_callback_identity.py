@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from copy import deepcopy
 from typing import Any, Mapping, Optional
-
-from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
 
 
 @dataclass(frozen=True)
@@ -16,8 +13,9 @@ class SimulationCallbackIdentity:
     batch_set: Optional[str]
     batch_set_id: Optional[str]
     cache_key: Optional[str]
-    policy_context: CompletionPolicyContext | None = None
-    context_snapshot: Mapping[str, Any] | None = None
+    callback_context: Mapping[str, Any] | None = None
+    simulation_identity: Mapping[str, Any] | None = None
+    preview_batch_cache_token: Optional[str] = None
 
     @classmethod
     def capture(
@@ -30,8 +28,9 @@ class SimulationCallbackIdentity:
         batch_set: Optional[str],
         batch_set_id: Optional[str],
         cache_key: Optional[str],
-        policy_context: CompletionPolicyContext | None = None,
-        context_snapshot: Mapping[str, Any] | None = None,
+        callback_context: Mapping[str, Any] | None = None,
+        simulation_identity: Mapping[str, Any] | None = None,
+        preview_batch_cache_token: Optional[str] = None,
     ) -> "SimulationCallbackIdentity":
         return cls(
             run_id=int(run_id) if run_id is not None else None,
@@ -41,6 +40,9 @@ class SimulationCallbackIdentity:
             batch_set=str(batch_set) if batch_set is not None else None,
             batch_set_id=str(batch_set_id) if batch_set_id is not None else None,
             cache_key=str(cache_key) if cache_key is not None else None,
-            policy_context=policy_context,
-            context_snapshot=deepcopy(dict(context_snapshot)) if isinstance(context_snapshot, Mapping) else None,
+            callback_context=callback_context if isinstance(callback_context, Mapping) else None,
+            simulation_identity=dict(simulation_identity) if isinstance(simulation_identity, Mapping) else None,
+            preview_batch_cache_token=(
+                str(preview_batch_cache_token) if preview_batch_cache_token is not None else None
+            ),
         )

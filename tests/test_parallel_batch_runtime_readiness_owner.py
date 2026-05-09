@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -75,3 +76,10 @@ def test_run_start_availability_reports_waiting_without_creating_lane_pool() -> 
     assert availability.snapshot.message == "Preparing batch runtime..."
     assert batch_parallel.ensure_calls == []
     assert owner.eagerly_created is False
+
+
+def test_batch_waiting_runtime_status_mapping_has_one_owner() -> None:
+    source = inspect.getsource(ParallelBatchRuntimeReadinessOwner)
+
+    assert source.count('getattr(snapshot, "pool_stale", False)') == 1
+    assert source.count('getattr(snapshot, "has_lane_pool", False)') == 1

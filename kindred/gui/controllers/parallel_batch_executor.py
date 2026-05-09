@@ -22,7 +22,7 @@ def _noop_record_nonfatal_exception(_message: str, _exc: BaseException) -> None:
     return None
 
 
-def _default_lane_pool_factory(max_lanes: int, limit_blas_threads: bool) -> BatchLanePool:
+def default_batch_lane_pool_factory(max_lanes: int, limit_blas_threads: bool) -> BatchLanePool:
     return BatchLanePool(
         max_lanes=max(1, int(max_lanes)),
         limit_blas_threads_per_worker=bool(limit_blas_threads),
@@ -44,7 +44,7 @@ class ParallelBatchExecutor:
         lane_pool: Any = None,
     ) -> None:
         runtime_owner = BatchRuntimeLaneOwner(
-            lane_pool_factory=lane_pool_factory or _default_lane_pool_factory,
+            lane_pool_factory=lane_pool_factory or default_batch_lane_pool_factory,
             max_parallel_workers=int(max_parallel_workers),
             limit_blas_threads_per_worker=bool(limit_blas_threads_per_worker),
             record_nonfatal_exception=record_nonfatal_exception,

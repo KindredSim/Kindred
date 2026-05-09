@@ -241,7 +241,7 @@ class ParallelBatchOutcomeOwner:
         set_name = resolution.set_name
         owner_epoch = resolution.owner_epoch
         callback_identity = meta.get("callback_identity")
-        callback_context = getattr(callback_identity, "context_snapshot", None)
+        callback_context = getattr(callback_identity, "callback_context", None)
         callback_context = callback_context if isinstance(callback_context, Mapping) else None
         self._batch_parallel.discard_request(sid)
 

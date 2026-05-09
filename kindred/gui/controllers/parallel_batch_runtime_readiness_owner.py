@@ -91,6 +91,59 @@ class ParallelBatchRuntimeReadinessOwner:
         self._eagerly_created = bool(ready)
         return bool(ready)
 
+    def runtime_snapshot_for_selection(
+        self,
+        *,
+        row_count: int,
+        required_lanes: int,
+    ) -> RuntimeReadinessSnapshot:
+        if int(row_count) <= 1 or int(required_lanes) <= 1:
+            return RuntimeReadinessSnapshot(
+                mode="batch",
+                status="not_applicable",
+                ready=False,
+                generation=0,
+                failure=None,
+                message="Parallel batch runtime is not required for the current selection.",
+                required=False,
+                controls_ready=True,
+                polling=False,
+            )
+        required = max(1, int(required_lanes))
+        try:
+            ready = bool(self._batch_parallel.has_ready_lane_pool(max_lanes=required))
+            snapshot = self._batch_parallel.runtime_snapshot()
+        except Exception as exc:
+            self._eagerly_created = False
+            return _runtime_snapshot(
+                status="failed",
+                ready=False,
+                failure=f"{type(exc).__name__}: {exc}",
+                message=f"Batch runtime readiness check failed: {exc}",
+                polling=False,
+            )
+        generation = int(getattr(snapshot, "current_generation", 0) or 0)
+        if ready:
+            self._eagerly_created = True
+            return _runtime_snapshot(
+                status="ready",
+                ready=True,
+                generation=generation,
+                polling=False,
+            )
+        self._eagerly_created = False
+        failure = getattr(snapshot, "warm_failure", None)
+        if failure:
+            return _runtime_snapshot(
+                status="failed",
+                ready=False,
+                generation=generation,
+                failure=str(failure),
+                message=f"Batch runtime failed to prepare. {failure}",
+                polling=False,
+            )
+        return self._waiting_runtime_snapshot(snapshot)
+
     def ensure(self, *, wait: bool = False) -> None:
         effective_workers = self._effective_workers()
         try:
@@ -168,6 +221,13 @@ class ParallelBatchRuntimeReadinessOwner:
             )
 
         self._eagerly_created = False
+        return ParallelBatchRunStartAvailability(
+            ready=False,
+            lane_pool=None,
+            snapshot=self._waiting_runtime_snapshot(snapshot),
+        )
+
+    def _waiting_runtime_snapshot(self, snapshot: object) -> RuntimeReadinessSnapshot:
         if bool(getattr(snapshot, "pool_stale", False)):
             status = "stale"
             message = "Rebuilding batch runtime..."
@@ -177,16 +237,12 @@ class ParallelBatchRuntimeReadinessOwner:
         else:
             status = "missing"
             message = "Preparing batch runtime..."
-        return ParallelBatchRunStartAvailability(
+        return _runtime_snapshot(
+            status=status,
             ready=False,
-            lane_pool=None,
-            snapshot=_runtime_snapshot(
-                status=status,
-                ready=False,
-                generation=int(getattr(snapshot, "current_generation", 0) or 0),
-                message=message,
-                polling=True,
-            ),
+            generation=int(getattr(snapshot, "current_generation", 0) or 0),
+            message=message,
+            polling=True,
         )
 
     def _effective_workers(self) -> int:

@@ -18,8 +18,8 @@ from kindred.core.simulation_failure import build_simulation_failure
 from kindred.core.simulation_identity import SimulationIdentity, SimulationScopeIdentity
 from kindred.gui.controllers.simulation_controller import (
     SimulationController,
-    _default_batch_lane_pool_factory,
 )
+from kindred.gui.controllers.parallel_batch_executor import default_batch_lane_pool_factory
 from kindred.gui.controllers.simulation_completion_publication import CompletionCallbackState
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
@@ -1159,7 +1159,7 @@ def controller(mw: _FakeMainWindow) -> SimulationController:
 def test_default_batch_lane_pool_factory_creates_warm_lane_pool():
     from kindred.core.batch_containment import BatchLanePool
 
-    pool = _default_batch_lane_pool_factory(3, True)
+    pool = default_batch_lane_pool_factory(3, True)
     try:
         assert isinstance(pool, BatchLanePool)
         assert pool.retained_lane_count == 0
@@ -2207,6 +2207,101 @@ def test_completion_missing_set_fallback_uses_captured_context_after_context_tur
     assert published[0]["set_id"] == "captured-id"
     assert published[0]["simulation_identity"] == {"schema_id": "captured-schema"}
     assert published[0]["preview_batch_cache_token"] == "captured-token"
+
+
+@pytest.mark.unit
+def test_callback_identity_plan_identity_wins_after_same_run_context_turnover(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", lambda *_a, **_k: QtWidgets.QMessageBox.StandardButton.Ok)
+
+    solver_config = {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15}
+    captured_identity = SimulationIdentity.build(
+        schema_id="captured-schema",
+        param_fingerprint="captured-fingerprint",
+        solver_config=solver_config,
+        t_end=1.0,
+    ).to_payload()
+    current_identity = SimulationIdentity.build(
+        schema_id="current-schema",
+        param_fingerprint="current-fingerprint",
+        solver_config=solver_config,
+        t_end=1.0,
+    ).to_payload()
+
+    def _plan_payload(identity: dict[str, object]) -> dict[str, object]:
+        return SimulationPlan.from_execution_request(
+            {
+                "prepared_payload": None,
+                "initials": {"A": 1.0},
+                "t_span": (0.0, 1.0),
+                "solver_config": solver_config,
+                "mechanism_text": "reaction: A -> B; k=1",
+                "simulation_identity": identity,
+            },
+            execution_mode="explicit",
+            algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+            cache_identity_payload={"cache_key": "same-cache", "simulation_identity": identity},
+            cache_scope_payload={"scope_identity": {"schema_id": "scope"}, "queue_ids": ["id1"]},
+        ).to_payload()
+
+    controller._latest_sim_request_id = 7
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=7,
+        run_id=5,
+        cache_key="same-cache",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+        simulation_plan_by_set_id={"id1": _plan_payload(captured_identity)},
+        simulation_identity_by_set_id={"id1": {"schema_id": "stale-captured-context"}},
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=5,
+        fast_mode=False,
+        request_id=7,
+        owner_epoch=None,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="same-cache",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        request_id=7,
+        run_id=5,
+        cache_key="same-cache",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+        simulation_plan_by_set_id={"id1": _plan_payload(current_identity)},
+        simulation_identity_by_set_id={"id1": {"schema_id": "current-context"}},
+    )
+    published: list[dict[str, object]] = []
+    controller._cache_admin.publish_completion_cache = lambda **kwargs: published.append(dict(kwargs))
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        callback_identity=identity,
+    )
+
+    assert published
+    assert published[0]["simulation_identity"] == captured_identity
 
 
 @pytest.mark.unit
@@ -4710,10 +4805,11 @@ def test_consume_parallel_batch_outcome_uses_captured_context_for_runtime_stale_
     )
 
     assert ok is True
-    current = controller.batch_context_owner.current_context_snapshot()
-    assert current["active"] is False
-    assert current["completed_set_ids"] == ["id1", "id2"]
-    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    policy_context = _batch_policy_context(controller)
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    assert policy_context.active is False
+    assert policy_context.completed_set_ids == ("id1", "id2")
+    assert callback_context.stale_runtime_input_set_ids == ("id2",)
     controller._cache_admin.publish_completion_cache_truth.assert_not_called()
     controller._cache_admin.publish_completion_cache.assert_not_called()
     controller.ui.results.publish_simulation_completion_result.assert_not_called()
@@ -4802,10 +4898,11 @@ def test_consume_parallel_batch_outcome_error_uses_captured_context_for_runtime_
     )
 
     assert ok is True
-    current = controller.batch_context_owner.current_context_snapshot()
-    assert current["active"] is False
-    assert current["completed_set_ids"] == ["id1", "id2"]
-    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    policy_context = _batch_policy_context(controller)
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    assert policy_context.active is False
+    assert policy_context.completed_set_ids == ("id1", "id2")
+    assert callback_context.stale_runtime_input_set_ids == ("id2",)
     critical.assert_not_called()
     assert mw._status_label.text != "Simulation failed"
 
@@ -5152,7 +5249,7 @@ def test_completion_publication_cache_truth_uses_current_mutable_cache_context_f
         explicit_cache_valid_set_ids=("ok",),
         explicit_cache_invalidated_set_ids=("bad",),
     )
-    current_snapshot = controller.batch_context_owner.current_context_snapshot()
+    current_snapshot = controller.batch_context_owner.callback_context_snapshot()
     publish_truth_spy = MagicMock(wraps=controller._cache_admin.publish_completion_cache_truth)
     controller._cache_admin.publish_completion_cache_truth = publish_truth_spy
     state = CompletionCallbackState(
@@ -6385,6 +6482,274 @@ def test_start_parallel_batch_simulations_records_preview_owner_epoch_in_submitt
     metadata = controller._batch_parallel.active_request_metadata("id1")
     assert metadata["preview_owner_epoch"] == 7
     assert metadata["callback_identity"].owner_epoch == 7
+
+
+@pytest.mark.unit
+def test_start_parallel_batch_simulations_reuses_one_callback_context_for_submitted_sets(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+    monkeypatch,
+):
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    submitted: list[dict[str, object]] = []
+    lane_pool = _RecordingLanePool(submitted)
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=2)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        rows=[0, 1],
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        run_id=1,
+        request_id=2,
+        effective_workers=2,
+        preview_owner_epoch=7,
+        cache_key="batch-cache",
+        full_dsl="reaction: A -> B; k=1",
+        solver_config={"solver": "BDF"},
+        t_end=10.0,
+        fast_mode=False,
+        pending_init_seed={},
+        pending_init_applied=True,
+        prepared_by_set_id={
+            "id1": {"prepared": True},
+            "id2": {"prepared": True},
+        },
+        mechanism_text_by_set_id={
+            "id1": "reaction: A -> B; k=1",
+            "id2": "reaction: A -> C; k=2",
+        },
+        mechanism_signature_by_set_id={"id1": "sig-id1", "id2": "sig-id2"},
+        simulation_identity_by_set_id={
+            "id1": {"fingerprint": "fp-1"},
+            "id2": {"fingerprint": "fp-2"},
+        },
+        preview_batch_cache_token_by_set_id={"id1": "preview-1", "id2": "preview-2"},
+    )
+    original_snapshot = controller.batch_context_owner.callback_context_snapshot
+    callback_context_calls = 0
+
+    def _record_callback_context_snapshot(context=None):
+        nonlocal callback_context_calls
+        callback_context_calls += 1
+        return original_snapshot(context)
+
+    monkeypatch.setattr(controller.batch_context_owner, "callback_context_snapshot", _record_callback_context_snapshot)
+    monkeypatch.setattr(
+        controller.batch_context_owner,
+        "current_context_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("full context snapshot must not be captured for callbacks")),
+        raising=False,
+    )
+
+    controller._start_parallel_batch_simulations()
+
+    metadata_id1 = controller._batch_parallel.active_request_metadata("id1")
+    metadata_id2 = controller._batch_parallel.active_request_metadata("id2")
+    identities = [metadata_id1["callback_identity"], metadata_id2["callback_identity"]]
+    assert callback_context_calls == 1
+    assert identities[0].callback_context is identities[1].callback_context
+    assert not hasattr(identities[0], "context_snapshot")
+    assert not hasattr(identities[1], "context_snapshot")
+    assert identities[0].batch_set_id == "id1"
+    assert identities[1].batch_set_id == "id2"
+
+
+@pytest.mark.unit
+def test_parallel_batch_callback_identity_uses_submitted_task_plan_identity(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    submitted: list[dict[str, object]] = []
+    lane_pool = _RecordingLanePool(submitted)
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=1)
+    solver_config = {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "grid": {"N": 10}, "temperature_K": 298.15}
+    plan_identity = SimulationIdentity.build(
+        schema_id="parallel-plan-schema",
+        param_fingerprint="parallel-plan-fingerprint",
+        solver_config=solver_config,
+        t_end=10.0,
+    ).to_payload()
+    stale_map_identity = SimulationIdentity.build(
+        schema_id="parallel-stale-map-schema",
+        param_fingerprint="parallel-stale-map-fingerprint",
+        solver_config=solver_config,
+        t_end=10.0,
+    ).to_payload()
+    plan_payload = SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": {"prepared": True},
+            "initials": {"A": 1.0},
+            "t_span": (0.0, 10.0),
+            "solver_config": solver_config,
+            "mechanism_text": "reaction: A -> B; k=1",
+            "simulation_identity": plan_identity,
+        },
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+        cache_identity_payload={"cache_key": "batch-cache", "simulation_identity": plan_identity},
+        cache_scope_payload={"scope_identity": {"schema_id": "scope"}, "queue_ids": ["id1"]},
+    ).to_payload()
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        rows=[0],
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        run_id=1,
+        request_id=2,
+        effective_workers=1,
+        cache_key="batch-cache",
+        full_dsl="reaction: A -> B; k=1",
+        solver_config=solver_config,
+        t_end=10.0,
+        fast_mode=False,
+        pending_init_seed={},
+        pending_init_applied=True,
+        simulation_plan_by_set_id={"id1": plan_payload},
+        prepared_by_set_id={"id1": {"prepared": True}},
+        mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"},
+        mechanism_signature_by_set_id={"id1": "sig-id1"},
+        simulation_identity_by_set_id={"id1": stale_map_identity},
+    )
+
+    controller._start_parallel_batch_simulations()
+
+    metadata = controller._batch_parallel.active_request_metadata("id1")
+    identity = metadata["callback_identity"]
+    assert identity.simulation_identity == plan_identity
+
+
+@pytest.mark.gui
+def test_main_window_parallel_dispatch_identity_publishes_per_set_callback_cache(main_window, monkeypatch):
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    controller = main_window.simulation_controller
+    run_id = 13
+    request_id = 17
+    cache_key = "main-window-dispatch-cache"
+    solver_config = {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12, "temperature_K": 298.15}
+    preview_ownership = controller._set_preview_ownership(
+        request_id=request_id,
+        target_set_ids=("id1", "id2"),
+    )
+    controller.run_state.latest_sim_request_id = request_id
+    controller.run_state.active_run_id = run_id
+    submitted: list[dict[str, object]] = []
+    lane_pool = _RecordingLanePool(submitted)
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=2)
+    monkeypatch.setattr(
+        controller._batch_dispatch_materialization_owner,
+        "materialize_initials",
+        lambda **_kwargs: {"A": 1.0},
+    )
+    identity_by_set_id = {
+        set_id: SimulationIdentity.build(
+            schema_id="main-window-dispatch-schema",
+            param_fingerprint=set_id,
+            solver_config=solver_config,
+            t_end=10.0,
+            preview_batch_cache_token=f"preview-token-{set_id}",
+            execution_flags=("fast_mode",),
+        ).to_payload()
+        for set_id in ("id1", "id2")
+    }
+    plan_by_set_id = {
+        set_id: SimulationPlan.from_execution_request(
+            {
+                "prepared_payload": {"prepared": True, "set_id": set_id},
+                "initials": {"A": 1.0},
+                "t_span": (0.0, 10.0),
+                "solver_config": solver_config,
+                "mechanism_text": f"reaction: A -> B ; k={idx}",
+                "simulation_identity": identity_by_set_id[set_id],
+            },
+            execution_mode="preview",
+            algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+            cache_identity_payload={"cache_key": cache_key, "simulation_identity": identity_by_set_id[set_id]},
+            cache_scope_payload={"scope_identity": {"schema_id": "scope"}, "queue_ids": ["id1", "id2"]},
+        ).to_payload()
+        for idx, set_id in enumerate(("id1", "id2"), start=1)
+    }
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=True,
+        keep_lane_pool_alive=True,
+        run_id=run_id,
+        request_id=request_id,
+        cache_key=cache_key,
+        rows=[0, 1],
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        primary_set_id="id1",
+        total=2,
+        completed_set_ids=[],
+        effective_workers=2,
+        preview_owner_epoch=preview_ownership.epoch,
+        preview_scope_set_ids=("id1", "id2"),
+        full_dsl="reaction: A -> B ; k=1",
+        solver_config=solver_config,
+        t_end=10.0,
+        simulation_plan_by_set_id=plan_by_set_id,
+        prepared_by_set_id={
+            "id1": {"prepared": True, "set_id": "id1"},
+            "id2": {"prepared": True, "set_id": "id2"},
+        },
+        mechanism_text_by_set_id={
+            "id1": "reaction: A -> B ; k=1",
+            "id2": "reaction: A -> B ; k=2",
+        },
+        mechanism_signature_by_set_id={"id1": "sig-id1", "id2": "sig-id2"},
+        simulation_identity_by_set_id={
+            "id1": {"schema_id": "stale-context-id1"},
+            "id2": {"schema_id": "stale-context-id2"},
+        },
+        preview_batch_cache_token_by_set_id={
+            "id1": "preview-token-id1",
+            "id2": "preview-token-id2",
+        },
+        pending_init_seed={},
+        pending_init_applied=True,
+    )
+
+    controller.start_parallel_batch_simulations()
+
+    metadata_by_set_id = {
+        set_id: controller.parallel_batch.active_request_metadata(set_id)
+        for set_id in ("id1", "id2")
+    }
+    callback_identities = {
+        set_id: metadata["callback_identity"]
+        for set_id, metadata in metadata_by_set_id.items()
+    }
+    assert callback_identities["id1"].callback_context is callback_identities["id2"].callback_context
+    for set_id, identity in callback_identities.items():
+        assert identity.simulation_identity == identity_by_set_id[set_id]
+        assert identity.preview_batch_cache_token == f"preview-token-{set_id}"
+
+    for set_id, identity in callback_identities.items():
+        controller.on_simulation_complete(
+            _successful_result_payload(),
+            callback_identity=identity,
+        )
+
+    for set_id in ("id1", "id2"):
+        entry_result = controller.batch_cache.entry_for_set(
+            cache_key=cache_key,
+            set_id=set_id,
+            is_preview=True,
+        )
+        assert entry_result.state == "valid"
+        assert entry_result.entry is not None
+        assert entry_result.entry["simulation_identity"] == identity_by_set_id[set_id]
+        assert entry_result.entry["preview_batch_cache_token"] == f"preview-token-{set_id}"
 
 
 @pytest.mark.unit
@@ -10769,9 +11134,9 @@ def test_completion_uses_captured_context_for_runtime_stale_after_context_turnov
     display.assert_not_called()
     annotations.assert_not_called()
     provenance.assert_not_called()
-    current = controller.batch_context_owner.current_context_snapshot()
-    assert current["runtime_input_set_epoch_by_set_id"] == {"id1": 2}
-    assert "stale_runtime_input_set_ids" not in current
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    assert callback_context.runtime_input_set_epoch_by_set_id == {"id1": 2}
+    assert callback_context.stale_runtime_input_set_ids == ()
 
 
 @pytest.mark.unit
@@ -10839,10 +11204,12 @@ def test_error_uses_captured_context_for_runtime_stale_after_context_turnover(
 
     critical.assert_not_called()
     assert mw._status_label.text != "Simulation failed"
-    current = controller.batch_context_owner.current_context_snapshot()
-    assert current["active"] is True
-    assert current["runtime_input_set_epoch_by_set_id"] == {"id1": 2}
-    assert "stale_runtime_input_set_ids" not in current
+    completion_state = controller.batch_context_owner.completion_state()
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    assert completion_state is not None
+    assert completion_state.active is True
+    assert callback_context.runtime_input_set_epoch_by_set_id == {"id1": 2}
+    assert callback_context.stale_runtime_input_set_ids == ()
 
 
 @pytest.mark.unit
@@ -10911,10 +11278,11 @@ def test_parallel_stale_runtime_completion_consumes_current_batch_after_progress
         callback_identity=identity,
     )
 
-    current = controller.batch_context_owner.current_context_snapshot()
-    assert current["active"] is False
-    assert current["completed_set_ids"] == ["id1", "id2"]
-    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    policy_context = _batch_policy_context(controller)
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    assert policy_context.active is False
+    assert policy_context.completed_set_ids == ("id1", "id2")
+    assert callback_context.stale_runtime_input_set_ids == ("id2",)
     controller._cache_admin.publish_completion_cache_truth.assert_not_called()
     controller._cache_admin.publish_completion_cache.assert_not_called()
     controller.ui.results.publish_simulation_completion_result.assert_not_called()
@@ -10985,10 +11353,11 @@ def test_parallel_stale_runtime_error_consumes_current_batch_after_progress_turn
         callback_identity=identity,
     )
 
-    current = controller.batch_context_owner.current_context_snapshot()
-    assert current["active"] is False
-    assert current["completed_set_ids"] == ["id1", "id2"]
-    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    policy_context = _batch_policy_context(controller)
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    assert policy_context.active is False
+    assert policy_context.completed_set_ids == ("id1", "id2")
+    assert callback_context.stale_runtime_input_set_ids == ("id2",)
     critical.assert_not_called()
     assert mw._status_label.text != "Simulation failed"
 

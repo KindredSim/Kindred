@@ -7,9 +7,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from PySide6 import QtCore
 
-from kindred.core.simulation_plan import SimulationPlan
-from kindred.gui.controllers.batch_dispatch_plan import simulation_plan_from_payloadish
-from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
+from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +25,8 @@ class CompletionCallbackState:
     is_preview: bool
     slider_triggered: bool
     explicit_batch_coalescing: bool
+    simulation_identity: Mapping[str, Any] | None = None
+    preview_batch_cache_token: str | None = None
     stale_fast_handoff_after_display: bool = False
     batch_queue_done: bool = True
 
@@ -45,7 +45,6 @@ class CompletionResultState:
     solver_config: Mapping[str, Any]
     fallback_occurred: bool
     fallback_message: object | None
-    cache_plan: SimulationPlan | None
     series: Dict[str, Any]
     is_primary: bool
     energy_mode: bool
@@ -55,18 +54,12 @@ class CompletionResultState:
 
 @dataclass(frozen=True)
 class SimulationCompletionPublicationDependencies:
-    completion_policy_cache_state: Callable[[], Any]
-    resolve_completion_mechanism: Callable[..., Any]
-    update_primary_result_materialization_contract: Callable[..., bool]
-    remember_primary_result_mechanism: Callable[..., None]
-    include_mechanism_in_result_payload: Callable[..., bool]
     apply_lifecycle_effects: Callable[..., None]
     record_nonfatal_exception: Callable[[str, BaseException], None]
     queue_slider_plot_update: Callable[..., None]
     finalize_explicit_batch_dirty_reset: Callable[..., Mapping[str, Any]]
     flush_slider_plot_updates: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
-    refresh_primary_result_controls: Callable[..., None]
     has_deferred_preview_replay_intent: Callable[[], bool]
     start_next_batch_simulation: Callable[[], None]
 
@@ -81,6 +74,7 @@ class SimulationCompletionPublicationOwner:
         cache_admin: Any,
         completion_policy: Any,
         lifecycle_effect_owner: Any,
+        result_materialization_owner: Any,
         dependencies: SimulationCompletionPublicationDependencies,
     ) -> None:
         self._ui = ui
@@ -89,6 +83,7 @@ class SimulationCompletionPublicationOwner:
         self._cache_admin = cache_admin
         self._completion_policy = completion_policy
         self._lifecycle_effect_owner = lifecycle_effect_owner
+        self._result_materialization_owner = result_materialization_owner
         self._deps = dependencies
 
     def publish_success(
@@ -112,7 +107,6 @@ class SimulationCompletionPublicationOwner:
                     bool(state.slider_triggered),
                     float(perf_counter()),
                 )
-            self.resolve_batch_identity(state)
             result_for_completion = dict(result)
             result_for_completion.setdefault("mechanism_text", self._ui.mechanism.get_mechanism_text())
             completion = self.build_result_state(result_for_completion)
@@ -127,7 +121,7 @@ class SimulationCompletionPublicationOwner:
             self.publish_display(completion, state)
             self.publish_annotations_and_provenance(completion)
             self.apply_pending_init_guard(completion, state)
-            self._deps.refresh_primary_result_controls(
+            self._result_materialization_owner.refresh_primary_result_controls(
                 mechanism=completion.mechanism,
                 energy_mode=bool(completion.energy_mode),
                 slider_triggered=bool(state.slider_triggered),
@@ -177,7 +171,6 @@ class SimulationCompletionPublicationOwner:
             solver_config=solver_config_map,
             fallback_occurred=bool(result.get("fallback_occurred")),
             fallback_message=result.get("fallback_message"),
-            cache_plan=None,
             series={str(species_name): Y[i, :] for i, species_name in enumerate(species_names)},
             is_primary=True,
             energy_mode=False,
@@ -191,9 +184,8 @@ class SimulationCompletionPublicationOwner:
         state: CompletionCallbackState,
     ) -> None:
         completion.redraw_valid_set_ids, completion.has_redraw_subset = self._redraw_scope(state)
-        completion.cache_plan = self._cache_plan_for_set(state)
         completion.is_primary = self._is_primary(state)
-        completion.mechanism = self._deps.resolve_completion_mechanism(
+        completion.mechanism = self._result_materialization_owner.resolve_completion_mechanism(
             mechanism=completion.mechanism,
             mechanism_text=completion.mechanism_text,
             solver_config=completion.solver_config,
@@ -206,7 +198,7 @@ class SimulationCompletionPublicationOwner:
         completion: CompletionResultState,
         state: CompletionCallbackState,
     ) -> None:
-        completion.energy_mode = self._deps.update_primary_result_materialization_contract(
+        completion.energy_mode = self._result_materialization_owner.update_primary_result_materialization_contract(
             mechanism=completion.mechanism,
             mechanism_text=completion.mechanism_text,
             solver_config=completion.solver_config,
@@ -226,12 +218,6 @@ class SimulationCompletionPublicationOwner:
     def resolve_cache_key(self, state: CompletionCallbackState) -> None:
         if state.cache_key is None:
             state.cache_key = self._batch_context_owner.completion_cache_key(state.ctx)
-        if state.cache_key is None:
-            state.cache_key = (
-                self._batch_cache.active_preview_cache_key
-                if state.is_preview
-                else self._batch_cache.active_cache_key
-            )
         state.cache_key = str(state.cache_key) if state.cache_key else None
 
     def publish_cache_truth(self, state: CompletionCallbackState) -> None:
@@ -252,7 +238,7 @@ class SimulationCompletionPublicationOwner:
             return
         cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
             context=self._explicit_cache_policy_context(state),
-            cache_state=self._deps.completion_policy_cache_state(),
+            cache_state=self._completion_policy_cache_state(),
             cache_key=state.cache_key,
         )
         self._cache_admin.publish_completion_cache_truth(
@@ -265,18 +251,6 @@ class SimulationCompletionPublicationOwner:
             active_cache_valid_set_ids=cache_reconciliation.active_cache_valid_set_ids,
             active_cache_invalidated_set_ids=cache_reconciliation.active_cache_invalidated_set_ids,
         )
-
-    def resolve_batch_identity(self, state: CompletionCallbackState) -> None:
-        if state.batch_set is None or state.batch_set_id is None:
-            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(state.ctx)
-            if state.batch_set is None:
-                state.batch_set = hinted_set
-            if state.batch_set_id is None:
-                state.batch_set_id = hinted_set_id
-        if state.batch_set_id is None and isinstance(state.batch_set, str):
-            state.batch_set_id = self._ui.batch.batch_set_id_for_name(state.batch_set)
-        if state.batch_set is None and isinstance(state.batch_set_id, str):
-            state.batch_set = self._ui.batch.batch_set_name_for_id(state.batch_set_id)
 
     def publish_primary_materialization(
         self,
@@ -293,7 +267,7 @@ class SimulationCompletionPublicationOwner:
 
         if state.is_preview or (not completion.is_primary) or completion.mechanism is None:
             return
-        self._deps.remember_primary_result_mechanism(
+        self._result_materialization_owner.remember_primary_result_mechanism(
             mechanism=completion.mechanism,
             mechanism_text=completion.mechanism_text,
             solver_config=completion.solver_config,
@@ -301,7 +275,7 @@ class SimulationCompletionPublicationOwner:
         if state.policy_context is not None and state.cache_key:
             state.policy_context = self._completion_policy.build_context_update_from_cache_truth(
                 context=state.policy_context,
-                cache_state=self._deps.completion_policy_cache_state(),
+                cache_state=self._completion_policy_cache_state(),
                 cache_key=state.cache_key,
             )
             state.ctx = self._batch_context_owner.serialize_completion_policy_context(
@@ -314,30 +288,22 @@ class SimulationCompletionPublicationOwner:
         completion: CompletionResultState,
         state: CompletionCallbackState,
     ) -> None:
-        cache_plan = completion.cache_plan
-        cache_token = (cache_plan.cache_key() if cache_plan is not None else "") or str(state.cache_key or "")
+        cache_token = str(state.cache_key or "")
         if not cache_token or not state.batch_set_id:
             return
         cached_mechanism = (
             completion.mechanism
-            if self._deps.include_mechanism_in_result_payload(
+            if self._batch_context_owner.include_mechanism_in_result_payload(
                 fast_mode=bool(state.is_preview),
                 batch_set_id=state.batch_set_id,
                 context=state.ctx,
             )
             else None
         )
-        cache_simulation_identity = cache_plan.simulation_identity_payload() if cache_plan is not None else {}
-        if not cache_simulation_identity:
-            cache_simulation_identity = self._batch_context_owner.simulation_identity_for_set(
-                str(state.batch_set_id),
-                state.ctx,
-            )
+        cache_simulation_identity = dict(state.simulation_identity or {})
         cache_preview_token = None
         if state.is_preview:
-            cache_preview_token = (
-                cache_plan.preview_batch_cache_token() if cache_plan is not None else ""
-            ) or self._batch_context_owner.preview_batch_cache_token_for_set(state.batch_set_id, state.ctx)
+            cache_preview_token = state.preview_batch_cache_token
         self._cache_admin.publish_completion_cache(
             cache_key=cache_token,
             cache_token=cache_token,
@@ -666,10 +632,19 @@ class SimulationCompletionPublicationOwner:
             return None, False
         cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
             context=self._explicit_cache_policy_context(state),
-            cache_state=self._deps.completion_policy_cache_state(),
+            cache_state=self._completion_policy_cache_state(),
             cache_key=state.cache_key,
         )
         return cache_reconciliation.redraw_valid_set_ids, bool(cache_reconciliation.has_redraw_subset)
+
+    def _completion_policy_cache_state(self) -> CacheAuthorityState:
+        return CacheAuthorityState(
+            active_cache_key=self._batch_cache.active_cache_key,
+            active_cache_preview_token=self._batch_cache.active_cache_preview_token,
+            active_cache_preview_scope_set_ids=self._batch_cache.active_cache_preview_scope_set_ids,
+            active_cache_valid_set_ids=self._batch_cache.active_cache_valid_set_ids,
+            active_cache_invalidated_set_ids=self._batch_cache.active_cache_invalidated_set_ids,
+        )
 
     def _explicit_cache_policy_context(self, state: CompletionCallbackState) -> CompletionPolicyContext:
         if isinstance(state.ctx, Mapping) and self._batch_context_owner.context_matches_current_run_identity(
@@ -689,15 +664,6 @@ class SimulationCompletionPublicationOwner:
                 keep_lane_pool_alive=False,
             )
         return context
-
-    def _cache_plan_for_set(self, state: CompletionCallbackState) -> SimulationPlan | None:
-        try:
-            return simulation_plan_from_payloadish(
-                self._batch_context_owner.simulation_plan_payload_for_set(state.batch_set_id, state.ctx)
-            )
-        except (TypeError, ValueError) as exc:
-            logger.debug("Ignoring invalid simulation plan payload for cache identity: %s", exc, exc_info=True)
-            return None
 
     def _is_primary(self, state: CompletionCallbackState) -> bool:
         primary_set = self._batch_context_owner.primary_set_id(state.ctx)

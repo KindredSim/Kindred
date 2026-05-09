@@ -78,8 +78,8 @@ class SimulationCompletionCallbackOwner:
             return
 
         ctx: Mapping[str, Any] | None = (
-            callback_identity.context_snapshot
-            if callback_identity is not None and isinstance(callback_identity.context_snapshot, Mapping)
+            callback_identity.callback_context
+            if callback_identity is not None and isinstance(callback_identity.callback_context, Mapping)
             else None
         )
         if batch_set is None or batch_set_id is None:
@@ -105,11 +105,9 @@ class SimulationCompletionCallbackOwner:
             )
             return
 
-        policy_context = (
-            callback_identity.policy_context
-            if callback_identity is not None and callback_identity.policy_context is not None
-            else self._batch_context_owner.completion_policy_context()
-        )
+        policy_context = self._batch_context_owner.completion_policy_context(ctx)
+        if policy_context is None:
+            policy_context = self._batch_context_owner.completion_policy_context()
         latest_request_id = int(self._deps.latest_request_id())
         callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
@@ -133,6 +131,14 @@ class SimulationCompletionCallbackOwner:
             is_preview=bool(fast_mode),
             slider_triggered=bool(self._ui.slider.slider_triggered_simulation()) or bool(fast_mode),
             explicit_batch_coalescing=False,
+            simulation_identity=(
+                callback_identity.simulation_identity
+                if callback_identity is not None and isinstance(callback_identity.simulation_identity, Mapping)
+                else None
+            ),
+            preview_batch_cache_token=(
+                callback_identity.preview_batch_cache_token if callback_identity is not None else None
+            ),
         )
         is_superseded_fast_request = bool(
             fast_mode

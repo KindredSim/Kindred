@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Dict, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterator, Mapping, Sequence
 
 from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
 
@@ -78,6 +79,89 @@ class BatchContextSeed:
             else:
                 context[field.name] = value
         return context
+
+
+@dataclass(frozen=True)
+class BatchCallbackContext(MappingABC[str, Any]):
+    active: bool
+    request_id: int | None
+    run_id: int | None
+    cache_key: str
+    fast_mode: bool
+    parallel: bool
+    keep_lane_pool_alive: bool
+    queue_ids: tuple[str, ...] = ()
+    queue_names: tuple[str, ...] = ()
+    total: int = 0
+    pos: int = 0
+    primary_set_id: str | None = None
+    completed_set_ids: tuple[str, ...] = ()
+    failed_set_ids: tuple[str, ...] = ()
+    stale_runtime_input_set_ids: tuple[str, ...] = ()
+    runtime_input_epoch: int | None = None
+    runtime_input_global_epoch: int | None = None
+    runtime_input_set_epoch_by_set_id: Mapping[str, int] | None = None
+    pending_workspace_reset_set_ids: tuple[str, ...] = ()
+    pending_dirty_reset_generation_by_set_id: Mapping[str, int] | None = None
+    pending_init_seed: Mapping[str, Mapping[str, float]] | None = None
+    pending_init_rewrite: str | None = None
+    pending_init_applied: bool = False
+    explicit_cache_preview_token: str | None = None
+    explicit_cache_preview_scope_set_ids: tuple[str, ...] | None = None
+    explicit_cache_valid_set_ids: tuple[str, ...] | None = None
+    explicit_cache_invalidated_set_ids: tuple[str, ...] | None = None
+    preview_scope_set_ids: tuple[str, ...] | None = None
+    preview_owner_epoch: int | None = None
+
+    def to_context(self) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "active": bool(self.active),
+            "request_id": self.request_id,
+            "run_id": self.run_id,
+            "cache_key": str(self.cache_key or ""),
+            "fast_mode": bool(self.fast_mode),
+            "parallel": bool(self.parallel),
+            "keep_lane_pool_alive": bool(self.keep_lane_pool_alive),
+            "queue_ids": list(self.queue_ids),
+            "queue_names": list(self.queue_names),
+            "total": int(self.total),
+            "pos": int(self.pos),
+            "primary_set_id": self.primary_set_id,
+            "completed_set_ids": list(self.completed_set_ids),
+            "failed_set_ids": list(self.failed_set_ids),
+            "stale_runtime_input_set_ids": list(self.stale_runtime_input_set_ids),
+            "pending_workspace_reset_set_ids": list(self.pending_workspace_reset_set_ids),
+            "pending_dirty_reset_generation_by_set_id": dict(self.pending_dirty_reset_generation_by_set_id or {}),
+            "pending_init_seed": {
+                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
+                for set_name, seed in dict(self.pending_init_seed or {}).items()
+                if str(set_name) and isinstance(seed, Mapping)
+            },
+            "pending_init_rewrite": self.pending_init_rewrite,
+            "pending_init_applied": bool(self.pending_init_applied),
+            "explicit_cache_preview_token": self.explicit_cache_preview_token,
+            "explicit_cache_preview_scope_set_ids": self.explicit_cache_preview_scope_set_ids,
+            "explicit_cache_valid_set_ids": self.explicit_cache_valid_set_ids,
+            "explicit_cache_invalidated_set_ids": self.explicit_cache_invalidated_set_ids,
+            "preview_scope_set_ids": self.preview_scope_set_ids,
+            "preview_owner_epoch": self.preview_owner_epoch,
+        }
+        if self.runtime_input_epoch is not None:
+            context["runtime_input_epoch"] = self.runtime_input_epoch
+        if self.runtime_input_global_epoch is not None:
+            context["runtime_input_global_epoch"] = self.runtime_input_global_epoch
+        if self.runtime_input_set_epoch_by_set_id:
+            context["runtime_input_set_epoch_by_set_id"] = dict(self.runtime_input_set_epoch_by_set_id)
+        return context
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_context()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_context())
+
+    def __len__(self) -> int:
+        return len(self.to_context())
 
 
 @dataclass(frozen=True)
@@ -374,6 +458,7 @@ class BatchCompletionState:
     queue_ids: tuple[str, ...]
     queue_names: tuple[str, ...]
     completed_set_ids: tuple[str, ...]
+    stale_runtime_input_set_ids: tuple[str, ...]
 
     @property
     def completed_count(self) -> int:
@@ -389,8 +474,74 @@ class BatchRunContextOwner:
     def _current_context(self) -> Dict[str, Any]:
         return deepcopy(self._context)
 
-    def current_context_snapshot(self) -> Dict[str, Any]:
-        return self._current_context()
+    def callback_context_snapshot(
+        self,
+        context: Mapping[str, Any] | None = None,
+    ) -> BatchCallbackContext:
+        ctx = context if isinstance(context, Mapping) else self._context
+        return BatchCallbackContext(
+            active=self._coerce_bool(ctx.get("active")),
+            request_id=self._optional_int(ctx.get("request_id")),
+            run_id=self._optional_int(ctx.get("run_id")),
+            cache_key=str(ctx.get("cache_key") or ""),
+            fast_mode=self._coerce_bool(ctx.get("fast_mode")),
+            parallel=self._coerce_bool(ctx.get("parallel")),
+            keep_lane_pool_alive=self._coerce_bool(ctx.get("keep_lane_pool_alive")),
+            queue_ids=self._str_tuple(ctx.get("queue_ids"), dedupe=False),
+            queue_names=self._str_tuple(ctx.get("queue_names"), dedupe=False),
+            total=max(0, self._int_value(ctx.get("total"), default=0)),
+            pos=max(0, self._int_value(ctx.get("pos"), default=0)),
+            primary_set_id=(str(ctx.get("primary_set_id")).strip() if ctx.get("primary_set_id") is not None else None),
+            completed_set_ids=self._str_tuple(ctx.get("completed_set_ids"), dedupe=True),
+            failed_set_ids=self._str_tuple(ctx.get("failed_set_ids"), dedupe=True),
+            stale_runtime_input_set_ids=self._str_tuple(ctx.get("stale_runtime_input_set_ids"), dedupe=True),
+            runtime_input_epoch=self._optional_int(ctx.get("runtime_input_epoch")),
+            runtime_input_global_epoch=self._optional_int(ctx.get("runtime_input_global_epoch")),
+            runtime_input_set_epoch_by_set_id={
+                str(set_id): self._int_value(value, default=0)
+                for set_id, value in dict(ctx.get("runtime_input_set_epoch_by_set_id") or {}).items()
+                if str(set_id)
+            },
+            pending_workspace_reset_set_ids=self._str_tuple(ctx.get("pending_workspace_reset_set_ids"), dedupe=True),
+            pending_dirty_reset_generation_by_set_id={
+                str(set_id): self._int_value(value, default=0)
+                for set_id, value in dict(ctx.get("pending_dirty_reset_generation_by_set_id") or {}).items()
+                if str(set_id)
+            },
+            pending_init_seed={
+                str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
+                for set_name, seed in dict(ctx.get("pending_init_seed") or {}).items()
+                if str(set_name) and isinstance(seed, Mapping)
+            },
+            pending_init_rewrite=(
+                str(ctx.get("pending_init_rewrite")) if ctx.get("pending_init_rewrite") is not None else None
+            ),
+            pending_init_applied=self._coerce_bool(ctx.get("pending_init_applied")),
+            explicit_cache_preview_token=(
+                str(ctx.get("explicit_cache_preview_token")) if ctx.get("explicit_cache_preview_token") is not None else None
+            ),
+            explicit_cache_preview_scope_set_ids=(
+                self._str_tuple(ctx.get("explicit_cache_preview_scope_set_ids"), dedupe=True)
+                if ctx.get("explicit_cache_preview_scope_set_ids") is not None
+                else None
+            ),
+            explicit_cache_valid_set_ids=(
+                self._str_tuple(ctx.get("explicit_cache_valid_set_ids"), dedupe=True)
+                if ctx.get("explicit_cache_valid_set_ids") is not None
+                else None
+            ),
+            explicit_cache_invalidated_set_ids=(
+                self._str_tuple(ctx.get("explicit_cache_invalidated_set_ids"), dedupe=True)
+                if ctx.get("explicit_cache_invalidated_set_ids") is not None
+                else None
+            ),
+            preview_scope_set_ids=(
+                self._str_tuple(ctx.get("preview_scope_set_ids"), dedupe=True)
+                if ctx.get("preview_scope_set_ids") is not None
+                else None
+            ),
+            preview_owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
+        )
 
     def _matches_current_identity(self, context: Mapping[str, Any]) -> bool:
         current = self._context
@@ -667,6 +818,7 @@ class BatchRunContextOwner:
             queue_ids=queue_ids,
             queue_names=self._str_tuple(ctx.get("queue_names"), dedupe=False),
             completed_set_ids=completed_set_ids,
+            stale_runtime_input_set_ids=self._str_tuple(ctx.get("stale_runtime_input_set_ids"), dedupe=True),
         )
 
     def completion_cleanup_state(
@@ -821,6 +973,23 @@ class BatchRunContextOwner:
     ) -> str:
         ctx = context if isinstance(context, Mapping) else self._context
         return str(ctx.get("primary_set_id") or "").strip()
+
+    def include_mechanism_in_result_payload(
+        self,
+        *,
+        fast_mode: bool,
+        batch_set_id: str | None,
+        context: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if bool(fast_mode):
+            return False
+        set_id = str(batch_set_id or "").strip()
+        if not set_id:
+            return True
+        primary_set = self.primary_set_id(context if isinstance(context, Mapping) else None)
+        if primary_set:
+            return set_id == primary_set
+        return True
 
     def simulation_identity_for_set(
         self,
@@ -1032,7 +1201,14 @@ class BatchRunContextOwner:
         *,
         base_context: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        raw = dict(base_context or self._context or {})
+        if (
+            base_context is not None
+            and isinstance(self._context, Mapping)
+            and self._matches_current_identity(base_context)
+        ):
+            raw = dict(self._context)
+        else:
+            raw = dict(base_context or self._context or {})
         raw["active"] = bool(context.active)
         raw["request_id"] = context.request_id
         raw["run_id"] = context.run_id

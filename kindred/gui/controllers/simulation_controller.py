@@ -16,7 +16,7 @@ from kindred.core.batch_parallel import (
     batch_mechanism_signature,
     compute_effective_batch_workers,
 )
-from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome, BatchLanePool
+from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_identity import (
     SimulationIdentity,
     contained_simulation_owner_identity,
@@ -34,6 +34,7 @@ from kindred.gui.controllers.batch_dispatch_plan import (
     build_fallback_cache_key as _build_fallback_cache_key,
     build_parallel_batch_task_plan,
     build_serial_batch_dispatch_plan,
+    simulation_plan_from_payloadish,
 )
 from kindred.gui.controllers.batch_dispatch_materialization import BatchDispatchMaterializationOwner
 from kindred.gui.controllers.serial_worker_launch import (
@@ -51,7 +52,6 @@ from kindred.gui.controllers.simulation_run_preparation import (
 )
 from kindred.gui.controllers.simulation_result_materialization import SimulationResultMaterializationOwner
 from kindred.gui.controllers.simulation_completion_policy import (
-    CacheAuthorityState,
     CompletionPolicyContext,
     DirtySetState,
     PendingReplayDirective,
@@ -118,13 +118,6 @@ class _SerialBatchDispatchState:
     context: Mapping[str, Any] | None
 
 
-def _safe_int(value: object, *, default: int = 0) -> int:
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return int(default)
-
-
 def _runtime_readiness_snapshot(
     *,
     mode: str,
@@ -177,14 +170,6 @@ def build_fallback_cache_key(
         t_end,
         solver_config,
         simulation_identity=simulation_identity,
-    )
-
-
-def _default_batch_lane_pool_factory(max_workers: int, limit_blas_threads: bool):
-    """Create a warm lane pool for batch simulations (injectable in tests)."""
-    return BatchLanePool(
-        max_lanes=max(1, int(max_workers)),
-        limit_blas_threads_per_worker=bool(limit_blas_threads),
     )
 
 
@@ -265,7 +250,6 @@ class SimulationController(QtCore.QObject):
 
         # Parallel batch orchestration (warm lane owner adapter)
         self._batch_parallel = ParallelBatchExecutor(
-            lane_pool_factory=_default_batch_lane_pool_factory,
             max_parallel_workers=int(PROJECT_DEFAULTS["max_parallel_batch_workers"]),
             limit_blas_threads_per_worker=bool(PROJECT_DEFAULTS["limit_blas_threads_per_worker"]),
             record_nonfatal_exception=self._record_nonfatal_exception,
@@ -308,34 +292,15 @@ class SimulationController(QtCore.QObject):
             cache_admin=self._cache_admin,
             completion_policy=self._completion_policy,
             lifecycle_effect_owner=self._lifecycle_effect_owner,
+            result_materialization_owner=self._result_materialization_owner,
             dependencies=SimulationCompletionPublicationDependencies(
-                completion_policy_cache_state=lambda *args, **kwargs: self._completion_policy_cache_state(
-                    *args, **kwargs
-                ),
-                resolve_completion_mechanism=self._result_materialization_owner.resolve_completion_mechanism,
-                update_primary_result_materialization_contract=(
-                    self._result_materialization_owner.update_primary_result_materialization_contract
-                ),
-                remember_primary_result_mechanism=self._result_materialization_owner.remember_primary_result_mechanism,
-                include_mechanism_in_result_payload=lambda *args, **kwargs: self._include_mechanism_in_result_payload(
-                    *args, **kwargs
-                ),
-                apply_lifecycle_effects=lambda *args, **kwargs: self._apply_simulation_lifecycle_effects(
-                    *args, **kwargs
-                ),
-                record_nonfatal_exception=lambda *args, **kwargs: self._record_nonfatal_exception(*args, **kwargs),
-                queue_slider_plot_update=lambda *args, **kwargs: self.queue_slider_plot_update(*args, **kwargs),
-                finalize_explicit_batch_dirty_reset=(
-                    lambda *args, **kwargs: self._finalize_explicit_batch_dirty_reset(*args, **kwargs)
-                ),
-                flush_slider_plot_updates=lambda *args, **kwargs: self.flush_slider_plot_updates(*args, **kwargs),
-                show_scoped_batch_failure_summary=lambda *args, **kwargs: self._show_scoped_batch_failure_summary(
-                    *args, **kwargs
-                ),
-                refresh_primary_result_controls=self._result_materialization_owner.refresh_primary_result_controls,
-                has_deferred_preview_replay_intent=lambda *args, **kwargs: self._has_deferred_preview_replay_intent(
-                    *args, **kwargs
-                ),
+                apply_lifecycle_effects=self._apply_simulation_lifecycle_effects,
+                record_nonfatal_exception=self._record_nonfatal_exception,
+                queue_slider_plot_update=self.queue_slider_plot_update,
+                finalize_explicit_batch_dirty_reset=self._finalize_explicit_batch_dirty_reset,
+                flush_slider_plot_updates=self.flush_slider_plot_updates,
+                show_scoped_batch_failure_summary=self._show_scoped_batch_failure_summary,
+                has_deferred_preview_replay_intent=self._has_deferred_preview_replay_intent,
                 start_next_batch_simulation=self._start_next_batch_simulation,
             ),
         )
@@ -1265,15 +1230,6 @@ class SimulationController(QtCore.QObject):
     def _completion_policy_preview_ownership(self) -> PreviewOwnershipState:
         return self._preview_ownership
 
-    def _completion_policy_cache_state(self) -> CacheAuthorityState:
-        return CacheAuthorityState(
-            active_cache_key=self._batch_cache.active_cache_key,
-            active_cache_preview_token=self._batch_cache.active_cache_preview_token,
-            active_cache_preview_scope_set_ids=self._batch_cache.active_cache_preview_scope_set_ids,
-            active_cache_valid_set_ids=self._batch_cache.active_cache_valid_set_ids,
-            active_cache_invalidated_set_ids=self._batch_cache.active_cache_invalidated_set_ids,
-        )
-
     def _apply_completion_policy_state_patch(
         self,
         patch,
@@ -1659,17 +1615,52 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str],
         batch_set_id: Optional[str],
         cache_key: Optional[str],
+        callback_context: Mapping[str, Any] | None = None,
+        simulation_identity: Mapping[str, Any] | None = None,
+        preview_batch_cache_token: Optional[str] = None,
     ) -> SimulationCallbackIdentity:
+        resolved_context = (
+            callback_context
+            if isinstance(callback_context, Mapping)
+            else self._batch_context_owner.callback_context_snapshot()
+        )
+        set_id = str(batch_set_id or "").strip()
+        resolved_batch_set = batch_set
+        if not set_id:
+            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(resolved_context)
+            resolved_batch_set = resolved_batch_set if resolved_batch_set is not None else hinted_set
+            set_id = str(hinted_set_id or "").strip()
+        resolved_simulation_identity = simulation_identity
+        if resolved_simulation_identity is None and set_id:
+            resolved_simulation_identity = {}
+            try:
+                plan = simulation_plan_from_payloadish(
+                    self._batch_context_owner.simulation_plan_payload_for_set(set_id)
+                )
+                if plan is not None:
+                    resolved_simulation_identity = plan.simulation_identity_payload()
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "Ignoring invalid simulation plan payload for callback identity: %s",
+                    exc,
+                    exc_info=True,
+                )
+            if not resolved_simulation_identity:
+                resolved_simulation_identity = self._batch_context_owner.simulation_identity_for_set(set_id)
+        resolved_preview_token = preview_batch_cache_token
+        if resolved_preview_token is None and set_id:
+            resolved_preview_token = self._batch_context_owner.preview_batch_cache_token_for_set(set_id)
         return SimulationCallbackIdentity.capture(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
             owner_epoch=owner_epoch,
-            batch_set=batch_set,
-            batch_set_id=batch_set_id,
+            batch_set=resolved_batch_set,
+            batch_set_id=set_id or batch_set_id,
             cache_key=cache_key,
-            policy_context=self._batch_context_owner.completion_policy_context(),
-            context_snapshot=self._batch_context_owner.current_context_snapshot(),
+            callback_context=resolved_context,
+            simulation_identity=resolved_simulation_identity,
+            preview_batch_cache_token=resolved_preview_token,
         )
 
     def _record_nonfatal_exception(self, context: str, exc: BaseException) -> None:
@@ -2434,74 +2425,9 @@ class SimulationController(QtCore.QObject):
         if rows is None:
             rows = self._interactive_runtime_rows()
         rows = list(rows or ())
-        if len(rows) <= 1 or self._effective_batch_worker_count(len(rows)) <= 1:
-            return _runtime_readiness_snapshot(
-                mode="batch",
-                status="not_applicable",
-                ready=False,
-                required=False,
-                controls_ready=True,
-                polling=False,
-                message="Parallel batch runtime is not required for the current selection.",
-            )
-        required_lanes = max(1, int(self._effective_batch_worker_count(len(rows))))
-        try:
-            ready = bool(self._batch_parallel.has_ready_lane_pool(max_lanes=required_lanes))
-            snapshot = self._batch_parallel.runtime_snapshot()
-        except Exception as exc:
-            return _runtime_readiness_snapshot(
-                mode="batch",
-                status="failed",
-                ready=False,
-                failure=f"{type(exc).__name__}: {exc}",
-                message=f"Batch runtime readiness check failed: {exc}",
-                required=True,
-                controls_ready=False,
-                polling=False,
-            )
-        if ready:
-            self._parallel_batch_runtime_readiness_owner.mark_ready()
-            return _runtime_readiness_snapshot(
-                mode="batch",
-                status="ready",
-                ready=True,
-                generation=int(getattr(snapshot, "current_generation", 0) or 0),
-                required=True,
-                controls_ready=True,
-                polling=False,
-            )
-        self._parallel_batch_runtime_readiness_owner.mark_not_ready()
-        failure = getattr(snapshot, "warm_failure", None)
-        if failure:
-            return _runtime_readiness_snapshot(
-                mode="batch",
-                status="failed",
-                ready=False,
-                generation=int(getattr(snapshot, "current_generation", 0) or 0),
-                failure=str(failure),
-                message=f"Batch runtime failed to prepare. {failure}",
-                required=True,
-                controls_ready=False,
-                polling=False,
-            )
-        if bool(getattr(snapshot, "pool_stale", False)):
-            status = "stale"
-            message = "Rebuilding batch runtime..."
-        elif bool(getattr(snapshot, "has_lane_pool", False)):
-            status = "warming"
-            message = "Preparing batch runtime..."
-        else:
-            status = "missing"
-            message = "Preparing batch runtime..."
-        return _runtime_readiness_snapshot(
-            mode="batch",
-            status=status,
-            ready=False,
-            generation=int(getattr(snapshot, "current_generation", 0) or 0),
-            message=message,
-            required=True,
-            controls_ready=False,
-            polling=True,
+        return self._parallel_batch_runtime_readiness_owner.runtime_snapshot_for_selection(
+            row_count=len(rows),
+            required_lanes=max(1, int(self._effective_batch_worker_count(len(rows)))),
         )
 
     def _shutdown_batch_lane_pool(self, *, force_terminate: bool) -> None:
@@ -3547,25 +3473,6 @@ class SimulationController(QtCore.QObject):
             execution_flags=self._execution_identity_flags(fast_mode=bool(fast_mode)),
         )
 
-    def _include_mechanism_in_result_payload(
-        self,
-        *,
-        fast_mode: bool,
-        batch_set_id: Optional[str],
-        context: Optional[Mapping[str, Any]] = None,
-    ) -> bool:
-        if bool(fast_mode):
-            return False
-        set_id = str(batch_set_id or "").strip()
-        if not set_id:
-            return True
-        primary_set = self._batch_context_owner.primary_set_id(
-            context if isinstance(context, Mapping) else None
-        )
-        if primary_set:
-            return set_id == primary_set
-        return True
-
     def _resolved_initials_for_batch_row(
         self,
         *,
@@ -4052,6 +3959,7 @@ class SimulationController(QtCore.QObject):
         request_id = int(payload.request_id)
         pending_seed = payload.pending_init_seed
         pending_init_applied = bool(payload.pending_init_applied)
+        callback_context = self._batch_context_owner.callback_context_snapshot(context)
 
         for idx, set_id in enumerate(queue_ids):
             if not (0 <= idx < len(rows)):
@@ -4089,7 +3997,7 @@ class SimulationController(QtCore.QObject):
                     set_name=str(set_name),
                     queue_ids=[str(item) for item in queue_ids],
                     initials=dict(initials_dict),
-                    include_mechanism_in_result_payload=self._include_mechanism_in_result_payload(
+                    include_mechanism_in_result_payload=self._batch_context_owner.include_mechanism_in_result_payload(
                         fast_mode=bool(payload.fast_mode),
                         batch_set_id=str(set_id),
                         context=context,
@@ -4106,6 +4014,9 @@ class SimulationController(QtCore.QObject):
                     batch_set=str(set_name),
                     batch_set_id=sid,
                     cache_key=payload.cache_key,
+                    callback_context=callback_context,
+                    simulation_identity=dict(task_plan.simulation_identity or {}),
+                    preview_batch_cache_token=payload.preview_batch_cache_token_by_set_id.get(sid),
                 )
                 self._batch_parallel.submit_task(
                     task_plan.task,
@@ -4373,7 +4284,7 @@ class SimulationController(QtCore.QObject):
         run_id = int(self._run_sequence_id)
         self._active_run_id = run_id
 
-        include_mechanism_in_result_payload = self._include_mechanism_in_result_payload(
+        include_mechanism_in_result_payload = self._batch_context_owner.include_mechanism_in_result_payload(
             fast_mode=bool(fast_mode),
             batch_set_id=set_id,
             context=ctx,

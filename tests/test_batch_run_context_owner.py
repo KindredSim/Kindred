@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from kindred.gui.controllers.batch_run_context_owner import BatchRunContextOwner, BatchRunStartRequest
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
 from tests.batch_context_test_helpers import seed_batch_context
 
@@ -179,6 +180,93 @@ def test_parallel_start_payload_exposes_execution_inputs_without_raw_dict_reads(
     assert payload.preview_batch_cache_token_by_set_id == {"id1": "preview-token"}
     assert payload.pending_init_seed == {"Set 1": {"A": 1.0}}
     assert payload.pending_init_applied is False
+
+
+def test_callback_context_snapshot_excludes_heavy_execution_payload_maps():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=7,
+        request_id=11,
+        cache_key="cache-1",
+        queue_ids=["id1", "id2"],
+        queue_names=["Set 1", "Set 2"],
+        completed_set_ids=["id1"],
+        failed_set_ids=["id2"],
+        stale_runtime_input_set_ids=["id2"],
+        runtime_input_epoch=3,
+        runtime_input_global_epoch=4,
+        runtime_input_set_epoch_by_set_id={"id1": 5, "id2": 6},
+        pending_workspace_reset_set_ids=["id1"],
+        pending_dirty_reset_generation_by_set_id={"id1": 2},
+        primary_set_id="id1",
+        keep_lane_pool_alive=True,
+        preview_owner_epoch=13,
+        simulation_plan_by_set_id={"id1": {"metadata": {"set_id": "id1"}}},
+        prepared_by_set_id={"id1": {"prepared": True}},
+        mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"},
+        mechanism_signature_by_set_id={"id1": "sig-id1"},
+        simulation_identity_by_set_id={"id1": {"fingerprint": "fp-1"}},
+        preview_batch_cache_token_by_set_id={"id1": "preview-token"},
+    )
+
+    callback_context = owner.callback_context_snapshot()
+
+    assert callback_context.run_id == 7
+    assert callback_context.request_id == 11
+    assert callback_context.cache_key == "cache-1"
+    assert callback_context.queue_ids == ("id1", "id2")
+    assert callback_context.completed_set_ids == ("id1",)
+    assert callback_context.failed_set_ids == ("id2",)
+    assert callback_context.stale_runtime_input_set_ids == ("id2",)
+    assert callback_context.runtime_input_set_epoch_by_set_id == {"id1": 5, "id2": 6}
+    assert callback_context.keep_lane_pool_alive is True
+
+    heavy_names = {
+        "simulation_plan_by_set_id",
+        "prepared_by_set_id",
+        "mechanism_text_by_set_id",
+        "mechanism_signature_by_set_id",
+        "simulation_identity_by_set_id",
+        "preview_batch_cache_token_by_set_id",
+    }
+    assert heavy_names.isdisjoint(callback_context.__dataclass_fields__)
+    assert heavy_names.isdisjoint(getattr(callback_context, "__dict__", {}))
+
+
+def test_callback_identity_reuses_shared_callback_context_without_deepcopying():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=True,
+        run_id=7,
+        request_id=11,
+        cache_key="cache-1",
+        queue_ids=["id1"],
+        queue_names=["Set 1"],
+    )
+    callback_context = owner.callback_context_snapshot()
+
+    identity = SimulationCallbackIdentity.capture(
+        run_id=7,
+        fast_mode=False,
+        request_id=11,
+        owner_epoch=13,
+        batch_set="Set 1",
+        batch_set_id="id1",
+        cache_key="cache-1",
+        callback_context=callback_context,
+    )
+
+    assert identity.callback_context is callback_context
+    assert not hasattr(identity, "context_snapshot")
+    assert not hasattr(identity, "policy_context")
+    assert identity.batch_set == "Set 1"
+    assert identity.batch_set_id == "id1"
 
 
 def test_serial_next_payload_exposes_current_set_and_execution_inputs_without_raw_dict_reads():
@@ -911,6 +999,56 @@ def test_completion_policy_context_serialization_preserves_unowned_context_field
     assert policy_context.preview_owner_epoch == 4
 
 
+def test_completion_policy_serialization_from_callback_context_preserves_serial_execution_payload():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        run_id=9,
+        request_id=7,
+        cache_key="ck",
+        pos=0,
+        total=2,
+        rows=[4, 8],
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        full_dsl="reaction: A -> B; k=1",
+        solver_config={"solver": "BDF"},
+        t_end=12.5,
+        simulation_plan_by_set_id={"id2": {"metadata": {"set_id": "id2"}}},
+        mechanism_text_by_set_id={"id2": "reaction: A -> C; k=2"},
+        mechanism_signature_by_set_id={"id2": "sig-id2"},
+        simulation_identity_by_set_id={"id2": {"fingerprint": "fp-2"}},
+        prepared_by_set_id={"id2": {"prepared": "id2"}},
+        scope_identity={"scope": "selected"},
+        pending_init_seed={},
+        pending_init_applied=True,
+    )
+    callback_context = owner.callback_context_snapshot()
+    policy_context = owner.completion_policy_context(callback_context)
+    assert policy_context is not None
+
+    owner.serialize_completion_policy_context(policy_context, base_context=callback_context)
+    owner.record_serial_success(set_id="id1")
+    payload = owner.serial_next_payload()
+
+    assert payload is not None
+    assert payload.pos == 1
+    assert payload.row == 8
+    assert payload.set_id == "id2"
+    assert payload.full_dsl == "reaction: A -> B; k=1"
+    assert payload.solver_config == {"solver": "BDF"}
+    assert payload.t_end == 12.5
+    assert payload.simulation_plan_by_set_id == {"id2": {"metadata": {"set_id": "id2"}}}
+    assert payload.mechanism_text_by_set_id == {"id2": "reaction: A -> C; k=2"}
+    assert payload.mechanism_signature_by_set_id == {"id2": "sig-id2"}
+    assert payload.simulation_identity_by_set_id == {"id2": {"fingerprint": "fp-2"}}
+    assert payload.prepared_by_set_id == {"id2": {"prepared": "id2"}}
+    assert payload.scope_identity == {"scope": "selected"}
+
+
 def test_completion_policy_context_serialization_does_not_overwrite_newer_same_identity_progress():
     owner = BatchRunContextOwner()
     seed_batch_context(
@@ -955,4 +1093,4 @@ def test_completion_policy_context_serialization_does_not_overwrite_newer_same_i
     current_policy = owner.completion_policy_context()
     assert current_policy is not None
     assert current_policy.completed_set_ids == ("id1",)
-    assert owner.current_context_snapshot()["runtime_input_global_epoch"] == 2
+    assert owner.callback_context_snapshot().runtime_input_global_epoch == 2

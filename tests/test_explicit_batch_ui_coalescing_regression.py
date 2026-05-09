@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Dict
 
 import numpy as np
 import pytest
+from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.core.simulation_identity import SimulationIdentity
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from tests.batch_context_test_helpers import seed_batch_context
 
 
@@ -118,8 +122,9 @@ def test_explicit_parallel_run_triggers_final_refresh_once(main_window, monkeypa
     main_window.simulation_controller.batch_cache.active_cache_key = "explicit-final-refresh-key"
     seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=True, run_id=404, request_id=909, fast_mode=False, cache_key="explicit-final-refresh-key", primary_set_id="set9", total=2, completed_set_ids=[], queue_ids=["set1", "set2"], queue_names=["set1", "set2"])
 
+    publication_owner = main_window.simulation_controller._completion_publication_owner
+    original_deps = publication_owner._deps
     # Force no pending coalesced keys so we can assert final forced refresh behavior.
-    monkeypatch.setattr(main_window.simulation_controller, "queue_slider_plot_update", lambda **_kwargs: None, raising=True)
     monkeypatch.setattr(
         main_window.simulation_controller.ui.batch,
         "display_cached_batch_selection",
@@ -133,7 +138,11 @@ def test_explicit_parallel_run_triggers_final_refresh_once(main_window, monkeypa
         flush_calls.append(dict(kwargs))
         return None
 
-    monkeypatch.setattr(main_window.simulation_controller, "flush_slider_plot_updates", _flush, raising=True)
+    publication_owner._deps = replace(
+        original_deps,
+        queue_slider_plot_update=lambda **_kwargs: None,
+        flush_slider_plot_updates=_flush,
+    )
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=9.0),
@@ -155,6 +164,96 @@ def test_explicit_parallel_run_triggers_final_refresh_once(main_window, monkeypa
     )
 
     assert len(flush_calls) == 1
+
+
+def test_parallel_callback_completion_main_window_uses_shared_slim_context_and_per_set_identity(main_window):
+    controller = main_window.simulation_controller
+    run_id = 406
+    request_id = 912
+    cache_key = "preview-callback-main-window"
+    preview_ownership = controller._set_preview_ownership(
+        request_id=request_id,
+        target_set_ids=("id1", "id2"),
+    )
+    controller.run_state.latest_sim_request_id = request_id
+    controller.run_state.active_run_id = run_id
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=True,
+        keep_lane_pool_alive=True,
+        run_id=run_id,
+        request_id=request_id,
+        cache_key=cache_key,
+        rows=[0, 1],
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        primary_set_id="id1",
+        total=2,
+        completed_set_ids=[],
+        preview_scope_set_ids=("id1", "id2"),
+        preview_owner_epoch=preview_ownership.epoch,
+        simulation_identity_by_set_id={
+            "id1": {"schema_id": "stale-context-id1"},
+            "id2": {"schema_id": "stale-context-id2"},
+        },
+        preview_batch_cache_token_by_set_id={
+            "id1": "stale-token-id1",
+            "id2": "stale-token-id2",
+        },
+        pending_init_seed={},
+        pending_init_applied=True,
+    )
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    identity_payload_by_set_id = {
+        set_id: SimulationIdentity.build(
+            schema_id="callback-schema",
+            param_fingerprint=set_id,
+            solver_config={"solver": "BDF"},
+            t_end=1.0,
+            preview_batch_cache_token=f"callback-token-{set_id}",
+            execution_flags=("fast_mode",),
+        ).to_payload()
+        for set_id in ("id1", "id2")
+    }
+    identities = [
+        SimulationCallbackIdentity.capture(
+            run_id=run_id,
+            fast_mode=True,
+            request_id=request_id,
+            owner_epoch=preview_ownership.epoch,
+            batch_set=set_name,
+            batch_set_id=set_id,
+            cache_key=cache_key,
+            callback_context=callback_context,
+            simulation_identity=identity_payload_by_set_id[set_id],
+            preview_batch_cache_token=f"callback-token-{set_id}",
+        )
+        for set_id, set_name in (("id1", "set1"), ("id2", "set2"))
+    ]
+    assert identities[0].callback_context is identities[1].callback_context
+
+    for marker, identity in ((11.0, identities[0]), (12.0, identities[1])):
+        controller.on_simulation_complete(
+            _result_payload(marker=marker),
+            callback_identity=identity,
+        )
+
+    for set_id in ("id1", "id2"):
+        entry_result = controller.batch_cache.entry_for_set(
+            cache_key=cache_key,
+            set_id=set_id,
+            is_preview=True,
+        )
+        assert entry_result.state == "valid"
+        assert entry_result.entry is not None
+        assert entry_result.entry["simulation_identity"] == identity_payload_by_set_id[set_id]
+        assert entry_result.entry["preview_batch_cache_token"] == f"callback-token-{set_id}"
+
+    assert controller.batch_cache.active_preview_cache_key == cache_key
+    assert controller.batch_cache.preview_cache.get(BatchSimulationCache.entry_key(cache_key, "id1")) is not None
+    assert controller.batch_cache.preview_cache.get(BatchSimulationCache.entry_key(cache_key, "id2")) is not None
 
 
 def test_explicit_parallel_final_flush_preserves_valid_subset_after_earlier_timeout(main_window, monkeypatch):
