@@ -19,14 +19,12 @@ class ContainedSerialWorkerLaunchOwner:
     def __init__(
         self,
         *,
-        acquire_ready_owner_for_plan: Callable[..., Any],
-        release_owner: Callable[..., None],
+        runtime_application: Any,
         worker_factory: Callable[..., Any] | None = None,
         contained_payload_builder: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
         record_nonfatal_exception: Callable[[str, BaseException], None] | None = None,
     ) -> None:
-        self._acquire_ready_owner_for_plan = acquire_ready_owner_for_plan
-        self._release_owner = release_owner
+        self._runtime_application = runtime_application
         self._worker_factory = worker_factory
         self._contained_payload_builder = contained_payload_builder
         self._record_nonfatal_exception = record_nonfatal_exception
@@ -36,7 +34,7 @@ class ContainedSerialWorkerLaunchOwner:
             raise ValueError("Missing simulation plan payload for contained batch dispatch")
         contained_payload = self._build_contained_payload(request.plan_payload)
         identity = request.callback_identity
-        contained_owner = self._acquire_ready_owner_for_plan(
+        contained_owner = self._acquire_ready_owner(
             fast_mode=bool(identity.fast_mode),
             simulation_plan_payload=contained_payload,
         )
@@ -51,7 +49,7 @@ class ContainedSerialWorkerLaunchOwner:
             )
         except Exception:
             try:
-                self._release_owner(contained_owner, kill=False)
+                self._release_runtime_owner(contained_owner, kill=False)
             except Exception as release_exc:
                 if self._record_nonfatal_exception is not None:
                     self._record_nonfatal_exception("Failed to release simulation runtime owner", release_exc)
@@ -70,6 +68,23 @@ class ContainedSerialWorkerLaunchOwner:
         from kindred.core.simulation_containment import build_contained_simulation_plan_payload
 
         return build_contained_simulation_plan_payload(dict(plan_payload))
+
+    def _acquire_ready_owner(
+        self,
+        *,
+        fast_mode: bool,
+        simulation_plan_payload: Mapping[str, Any],
+    ) -> Any | None:
+        return self._runtime_application.acquire_ready_owner(
+            mode=self._mode_for_fast_mode(fast_mode=bool(fast_mode)),
+            payload=dict(simulation_plan_payload or {}),
+        )
+
+    def _release_runtime_owner(self, owner: Any, *, kill: bool = False) -> None:
+        self._runtime_application.release_owner(owner, kill=bool(kill))
+
+    def _mode_for_fast_mode(self, *, fast_mode: bool) -> str:
+        return "preview" if bool(fast_mode) else "ordinary"
 
     def _worker_class(self) -> Callable[..., Any]:
         if self._worker_factory is not None:

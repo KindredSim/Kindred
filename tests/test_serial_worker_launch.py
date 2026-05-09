@@ -25,18 +25,29 @@ class _RaisingWorker:
         raise RuntimeError("worker construction failed")
 
 
+class _RuntimeApplication:
+    def __init__(self, owner: object, *, release_error: Exception | None = None) -> None:
+        self.owner = owner
+        self.release_error = release_error
+        self.acquire_calls: list[dict[str, object]] = []
+        self.release_calls: list[dict[str, object]] = []
+
+    def acquire_ready_owner(self, *, mode: str, payload: dict[str, object]) -> object:
+        self.acquire_calls.append({"mode": str(mode), "payload": dict(payload)})
+        return self.owner
+
+    def release_owner(self, owner: object, *, kill: bool = False) -> None:
+        self.release_calls.append({"owner": owner, "kill": bool(kill)})
+        if self.release_error is not None:
+            raise self.release_error
+
+
 def test_contained_serial_worker_launch_stamps_callback_identity_on_worker() -> None:
     acquired_owner = object()
-    acquired_payloads: list[dict[str, object]] = []
-
-    def acquire_owner(*, fast_mode: bool, simulation_plan_payload: dict[str, object]):
-        assert fast_mode is True
-        acquired_payloads.append(dict(simulation_plan_payload))
-        return acquired_owner
+    runtime_application = _RuntimeApplication(acquired_owner)
 
     owner = ContainedSerialWorkerLaunchOwner(
-        acquire_ready_owner_for_plan=acquire_owner,
-        release_owner=lambda _owner, *, kill=False: None,
+        runtime_application=runtime_application,
         worker_factory=_Worker,
         contained_payload_builder=lambda payload: {"contained": dict(payload)},
     )
@@ -61,7 +72,9 @@ def test_contained_serial_worker_launch_stamps_callback_identity_on_worker() -> 
     )
 
     assert isinstance(worker, _Worker)
-    assert acquired_payloads == [{"contained": {"plan": "payload"}}]
+    assert runtime_application.acquire_calls == [
+        {"mode": "preview", "payload": {"contained": {"plan": "payload"}}}
+    ]
     assert worker.kwargs["owner"] is acquired_owner
     assert worker.kwargs["simulation_plan_payload"] == {"contained": {"plan": "payload"}}
     assert worker._run_id == 9
@@ -76,13 +89,11 @@ def test_contained_serial_worker_launch_stamps_callback_identity_on_worker() -> 
 
 def test_contained_serial_worker_launch_preserves_worker_failure_when_release_fails() -> None:
     release_errors: list[str] = []
-
-    def release_owner(_owner, *, kill: bool = False) -> None:
-        raise RuntimeError("release failed")
+    acquired_owner = object()
+    runtime_application = _RuntimeApplication(acquired_owner, release_error=RuntimeError("release failed"))
 
     owner = ContainedSerialWorkerLaunchOwner(
-        acquire_ready_owner_for_plan=lambda **_kwargs: object(),
-        release_owner=release_owner,
+        runtime_application=runtime_application,
         worker_factory=_RaisingWorker,
         contained_payload_builder=lambda payload: dict(payload),
         record_nonfatal_exception=lambda _message, exc: release_errors.append(str(exc)),
@@ -109,3 +120,4 @@ def test_contained_serial_worker_launch_preserves_worker_failure_when_release_fa
         )
 
     assert release_errors == ["release failed"]
+    assert runtime_application.release_calls == [{"owner": acquired_owner, "kill": False}]

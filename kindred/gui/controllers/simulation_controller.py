@@ -12,10 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 from PySide6 import QtCore
 import shiboken6
 
-from kindred.core.batch_parallel import (
-    batch_mechanism_signature,
-    compute_effective_batch_workers,
-)
+from kindred.core.batch_parallel import compute_effective_batch_workers
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_identity import (
     SimulationIdentity,
@@ -235,7 +232,6 @@ class SimulationController(QtCore.QObject):
                 preview_contained_owner_identity=self._preview_contained_owner_identity,
                 ordinary_contained_owner_identity=self._ordinary_contained_owner_identity,
                 record_run_cache_key=self._batch_cache.record_run_cache_key,
-                batch_mechanism_signature=lambda **kwargs: batch_mechanism_signature(**kwargs),
             ),
         )
         self._batch_context_owner = BatchRunContextOwner()
@@ -361,30 +357,20 @@ class SimulationController(QtCore.QObject):
             batch_parallel=self._batch_parallel,
             batch_context_owner=self._batch_context_owner,
             batch_cache=self._batch_cache,
+            completion_callback_owner=self._completion_callback_owner,
+            error_handling_owner=self._error_handling_owner,
             dependencies=ParallelBatchOutcomeDependencies(
-                active_batch_context_runtime_input_stale_for_set=(
-                    lambda **kwargs: self._active_batch_context_runtime_input_stale_for_set(**kwargs)
-                ),
-                mark_stale_runtime_input_callback_consumed=(
-                    lambda **kwargs: self._mark_stale_runtime_input_callback_consumed(**kwargs)
-                ),
-                record_nonfatal_exception=lambda *args, **kwargs: self._record_nonfatal_exception(*args, **kwargs),
+                active_batch_context_runtime_input_stale_for_set=self._active_batch_context_runtime_input_stale_for_set,
+                mark_stale_runtime_input_callback_consumed=self._mark_stale_runtime_input_callback_consumed,
+                record_nonfatal_exception=self._record_nonfatal_exception,
                 invalidate_preserved_pending_init_results_after_failed_run=(
-                    lambda **kwargs: self._invalidate_preserved_pending_init_results_after_failed_run(**kwargs)
+                    self._invalidate_preserved_pending_init_results_after_failed_run
                 ),
-                finalize_scoped_batch_success_subset=lambda ctx: self._finalize_scoped_batch_success_subset(ctx),
-                cleanup_parallel_batch_lane_pool_after_run=(
-                    lambda **kwargs: self._cleanup_parallel_batch_lane_pool_after_run(**kwargs)
-                ),
-                show_scoped_batch_failure_summary=lambda **kwargs: self._show_scoped_batch_failure_summary(**kwargs),
-                apply_explicit_failure_pending_replay_policy=(
-                    lambda **kwargs: self._apply_explicit_failure_pending_replay_policy(**kwargs)
-                ),
-                reset_parallel_batch_run_and_shutdown_lane_pool=(
-                    lambda: self._reset_parallel_batch_run_and_shutdown_lane_pool()
-                ),
-                dispatch_simulation_error=lambda *args, **kwargs: self._dispatch_simulation_error(*args, **kwargs),
-                dispatch_simulation_complete=lambda *args, **kwargs: self._dispatch_simulation_complete(*args, **kwargs),
+                finalize_scoped_batch_success_subset=self._finalize_scoped_batch_success_subset,
+                cleanup_parallel_batch_lane_pool_after_run=self._cleanup_parallel_batch_lane_pool_after_run,
+                show_scoped_batch_failure_summary=self._show_scoped_batch_failure_summary,
+                apply_explicit_failure_pending_replay_policy=self._apply_explicit_failure_pending_replay_policy,
+                reset_parallel_batch_run_and_shutdown_lane_pool=self._reset_parallel_batch_run_and_shutdown_lane_pool,
                 set_simulation_running=self._set_simulation_running,
                 set_slider_simulation_active=self._set_slider_simulation_active,
             ),
@@ -394,49 +380,32 @@ class SimulationController(QtCore.QObject):
             run_state=self._run_state,
             batch_context_owner=self._batch_context_owner,
             dependencies=SimulationSliderPreviewLaunchDependencies(
-                preview_owner_request_id=lambda: self._preview_ownership.request_id,
                 set_discarded_preview_generation=self._set_discarded_slider_preview_generation,
-                worker_is_running=lambda worker: self._worker_is_running(worker),
-                clear_pending_slider_preview_replay=(
-                    lambda *args, **kwargs: self.clear_pending_slider_preview_replay(*args, **kwargs)
-                ),
-                next_slider_preview_request_id=lambda: self._next_slider_preview_request_id(),
-                queue_pending_slider_preview_replay=(
-                    lambda *args, **kwargs: self.queue_pending_slider_preview_replay(*args, **kwargs)
-                ),
-                has_active_explicit_simulation=lambda: self._has_active_explicit_simulation(),
-                has_active_parallel_batch_work=lambda: self._has_active_parallel_batch_work(),
-                supersede_parallel_batch_run_soft=lambda: self._supersede_parallel_batch_run_soft(),
-                prune_stopped_owned_simulation_workers=lambda: self._prune_stopped_owned_simulation_workers(),
-                has_running_owned_simulation_workers=lambda: self._has_running_owned_simulation_workers(),
-                slider_target_rows_for_dispatch=(
-                    lambda *args, **kwargs: self._slider_target_rows_for_dispatch(*args, **kwargs)
-                ),
-                slider_preview_uses_parallel_batch_runtime=(
-                    lambda *args, **kwargs: self._slider_preview_uses_parallel_batch_runtime(*args, **kwargs)
-                ),
-                slider_preview_runtime_snapshot=(
-                    lambda *args, **kwargs: self._slider_preview_runtime_snapshot(*args, **kwargs)
-                ),
+                worker_is_running=self._worker_is_running,
+                clear_pending_slider_preview_replay=self.clear_pending_slider_preview_replay,
+                next_slider_preview_request_id=self._next_slider_preview_request_id,
+                queue_pending_slider_preview_replay=self.queue_pending_slider_preview_replay,
+                has_active_explicit_simulation=self._has_active_explicit_simulation,
+                has_active_parallel_batch_work=self._has_active_parallel_batch_work,
+                supersede_parallel_batch_run_soft=self._supersede_parallel_batch_run_soft,
+                prune_stopped_owned_simulation_workers=self._prune_stopped_owned_simulation_workers,
+                has_running_owned_simulation_workers=self._has_running_owned_simulation_workers,
+                slider_target_rows_for_dispatch=self._slider_target_rows_for_dispatch,
+                slider_preview_uses_parallel_batch_runtime=self._slider_preview_uses_parallel_batch_runtime,
+                slider_preview_runtime_snapshot=self._slider_preview_runtime_snapshot,
                 ensure_parallel_batch_pool_eagerly_created=(
-                    lambda *args, **kwargs: self._ensure_parallel_batch_pool_eagerly_created(*args, **kwargs)
+                    self._parallel_batch_runtime_readiness_owner.ensure
                 ),
                 ensure_interactive_simulation_runtime_available_for_mode=(
-                    lambda *args, **kwargs: self._ensure_interactive_simulation_runtime_available_for_mode(
-                        *args, **kwargs
-                    )
+                    self._ensure_interactive_simulation_runtime_available_for_mode
                 ),
-                mark_request_started=lambda request_id: self._mark_request_started(request_id),
-                run_simulation_internal=lambda **kwargs: self.run_simulation_internal(**kwargs),
+                mark_request_started=self._mark_request_started,
                 retry_slider_preview_launch=self._run_simulation_from_slider,
             ),
         )
         self._runtime_application = SimulationRuntimeApplication()
         self._contained_serial_worker_launch_owner = ContainedSerialWorkerLaunchOwner(
-            acquire_ready_owner_for_plan=lambda **kwargs: self._acquire_ready_contained_simulation_owner_for_plan(
-                **kwargs
-            ),
-            release_owner=lambda owner, *, kill=False: self._runtime_application.release_owner(owner, kill=kill),
+            runtime_application=self._runtime_application,
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
 
@@ -3696,7 +3665,15 @@ class SimulationController(QtCore.QObject):
         )
 
     def _run_simulation_from_slider(self):
-        self._slider_preview_launch_owner.run_from_slider()
+        request = self._slider_preview_launch_owner.run_from_slider()
+        if request is None:
+            return
+        self.run_simulation_internal(
+            fast_mode=True,
+            request_id=int(request.request_id),
+            batch_rows=list(request.batch_rows),
+            reuse_parallel_lane_pool=bool(request.reuse_parallel_lane_pool),
+        )
 
     def _run_simulation(self):
         if not self.ui.mechanism.auto_lock_for_run():

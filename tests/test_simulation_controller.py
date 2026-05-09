@@ -330,8 +330,8 @@ def _install_recording_contained_worker(
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingContainedWorker)
     if controller is not None:
         monkeypatch.setattr(
-            controller,
-            "_acquire_ready_contained_simulation_owner_for_plan",
+            controller._runtime_application,
+            "acquire_ready_owner",
             lambda **_kwargs: "ready-contained-owner",
         )
 
@@ -3783,14 +3783,9 @@ def test_slider_run_supersedes_active_fast_parallel_preview_for_newer_request(
     mw._batch_set_id_for_row.return_value = "id1"
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=True, request_id=int(rid_old))
 
-    def _fake_supersede() -> None:
-        controller.batch_context_owner.deactivate()
-
-    controller._supersede_parallel_batch_run_soft = MagicMock(side_effect=_fake_supersede)
-
     controller._run_simulation_from_slider()
 
-    controller._supersede_parallel_batch_run_soft.assert_called_once_with()
+    assert _batch_policy_context(controller).active is False
     controller.run_simulation_internal.assert_called_once()
     assert controller.run_simulation_internal.call_args.kwargs["request_id"] == int(rid_new)
     assert controller.run_simulation_internal.call_args.kwargs["reuse_parallel_lane_pool"] is True
@@ -4151,13 +4146,13 @@ def test_stale_lane_request_bookkeeping_does_not_abort_active_run(controller: Si
         set_name="current-set",
     )
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=11, request_id=22, fast_mode=False, cache_key="current-cache")
-    controller._on_simulation_error = MagicMock()
-    controller._on_simulation_complete = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
+    controller._completion_callback_owner.handle_completion = MagicMock()
     controller._record_nonfatal_exception = MagicMock()
 
     controller._poll_parallel_batch_completions()
 
-    controller._on_simulation_error.assert_not_called()
+    controller._error_handling_owner.handle_error.assert_not_called()
     controller._record_nonfatal_exception.assert_not_called()
     assert _batch_policy_context(controller).active is True
     assert first.close_calls == []
@@ -4168,7 +4163,7 @@ def test_stale_lane_request_bookkeeping_does_not_abort_active_run(controller: Si
     release.set()
     controller.parallel_batch.join_active_requests(timeout_s=2.0)
     controller._poll_parallel_batch_completions()
-    controller._on_simulation_complete.assert_called_once()
+    controller._completion_callback_owner.handle_completion.assert_called_once()
 
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=12, request_id=23, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
     controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
@@ -4716,7 +4711,7 @@ def test_consume_parallel_batch_outcome_success_calls_on_complete_and_clears_map
     outcome = _lane_outcome("sid", {"payload": 123})
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"})
 
-    controller._on_simulation_complete = MagicMock()
+    controller._completion_callback_owner.handle_completion = MagicMock()
     ok = _consume_parallel_batch_outcome_for_test(
         controller,
         set_id="sid",
@@ -4724,7 +4719,7 @@ def test_consume_parallel_batch_outcome_success_calls_on_complete_and_clears_map
     )
     assert ok is True
     assert not controller._batch_parallel.has_active_requests()
-    controller._on_simulation_complete.assert_called_once()
+    controller._completion_callback_owner.handle_completion.assert_called_once()
 
 
 @pytest.mark.unit
@@ -4914,8 +4909,8 @@ def test_consume_parallel_batch_outcome_on_complete_exception_reports_error_and_
     outcome = _lane_outcome("sid", {"payload": 123})
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"})
 
-    controller._on_simulation_complete = MagicMock(side_effect=RuntimeError("ui boom"))
-    controller._on_simulation_error = MagicMock()
+    controller._completion_callback_owner.handle_completion = MagicMock(side_effect=RuntimeError("ui boom"))
+    controller._error_handling_owner.handle_error = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
@@ -4924,7 +4919,7 @@ def test_consume_parallel_batch_outcome_on_complete_exception_reports_error_and_
         outcome=outcome,
     )
     assert ok is False
-    controller._on_simulation_error.assert_called_once()
+    controller._error_handling_owner.handle_error.assert_called_once()
     controller._shutdown_batch_lane_pool.assert_called_once_with(force_terminate=True)
 
 @pytest.mark.unit
@@ -4936,7 +4931,7 @@ def test_consume_parallel_batch_outcome_error_calls_on_error_and_shutdown(mw: _F
     )
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"})
 
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
@@ -4947,7 +4942,7 @@ def test_consume_parallel_batch_outcome_error_calls_on_error_and_shutdown(mw: _F
         source="callback",
     )
     assert ok is False
-    controller._on_simulation_error.assert_called_once()
+    controller._error_handling_owner.handle_error.assert_called_once()
     controller._shutdown_batch_lane_pool.assert_called_once_with(force_terminate=True)
 
 
@@ -4974,7 +4969,7 @@ def test_consume_parallel_batch_outcome_error_is_set_scoped_when_batch_sets_rema
     )
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2)
 
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
@@ -4985,7 +4980,7 @@ def test_consume_parallel_batch_outcome_error_is_set_scoped_when_batch_sets_rema
     )
 
     assert ok is True
-    controller._on_simulation_error.assert_not_called()
+    controller._error_handling_owner.handle_error.assert_not_called()
     controller._shutdown_batch_lane_pool.assert_not_called()
     assert _batch_policy_context(controller).active is True
     summary = controller.batch_context_owner.completion_summary()
@@ -5107,19 +5102,19 @@ def test_stale_batch_outcome_marks_set_failed_without_stranding_multiset_paralle
 def test_poll_parallel_batch_outcome_rejects_owner_epoch_mismatch_after_pop(
     mw: _FakeMainWindow,
     controller: SimulationController,
+    caplog,
 ):
     outcome = _lane_outcome("sid", {"payload": 123}, run_id=1, request_id=2, owner_epoch=3)
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"}, owner_epoch=4)
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck")
     controller._simulation_running = True
     controller._slider_simulation_active = True
-    controller._on_simulation_complete = MagicMock()
-    controller._record_nonfatal_exception = MagicMock()
+    controller._completion_callback_owner.handle_completion = MagicMock()
 
     controller._poll_parallel_batch_completions()
 
-    controller._on_simulation_complete.assert_not_called()
-    controller._record_nonfatal_exception.assert_called()
+    controller._completion_callback_owner.handle_completion.assert_not_called()
+    assert "Rejected stale batch lane outcome" in caplog.text
 
 
 @pytest.mark.unit
@@ -5597,7 +5592,7 @@ def test_consume_parallel_batch_outcome_exception_tears_down_pool_and_next_paral
     )
     _install_active_lane_outcomes(controller, {"sid": failed_outcome}, set_names={"sid": "set1"})
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck")
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
         controller,
@@ -5611,7 +5606,7 @@ def test_consume_parallel_batch_outcome_exception_tears_down_pool_and_next_paral
     )
 
     assert ok is False
-    controller._on_simulation_error.assert_called_once()
+    controller._error_handling_owner.handle_error.assert_called_once()
     assert _batch_policy_context(controller).active is False
     assert not controller.parallel_batch.has_lane_pool()
     assert not controller.parallel_batch.has_active_requests()
@@ -5716,13 +5711,13 @@ def test_poll_parallel_batch_outcomes_catches_unhandled_exceptions_and_shuts_dow
     _install_active_lane_outcomes(controller, {"a": outcome_a}, set_names={"a": "A"})
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=9, request_id=8, fast_mode=False, cache_key="ck")
 
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
     controller._consume_parallel_batch_outcome = MagicMock(side_effect=RuntimeError("boom"))
 
     controller._poll_parallel_batch_completions()
     controller._shutdown_batch_lane_pool.assert_called_once_with(force_terminate=True)
-    controller._on_simulation_error.assert_called_once()
+    controller._error_handling_owner.handle_error.assert_called_once()
 
 @pytest.mark.unit
 def test_flush_pending_slider_updates_for_run_stops_timers_and_finalizes(mw: _FakeMainWindow, controller: SimulationController):
@@ -6828,7 +6823,7 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
         lambda text: text.replace("initial:", "# stripped initial:"),
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -6970,7 +6965,14 @@ def test_serial_single_set_run_uses_contained_owner_lane(monkeypatch, mw: _FakeM
         setattr(controller, controller._contained_owner_attr(fast_mode=bool(fast_mode)), owner)
         return owner
 
-    monkeypatch.setattr(controller, "_acquire_ready_contained_simulation_owner_for_plan", _ready_owner)
+    monkeypatch.setattr(
+        controller._runtime_application,
+        "acquire_ready_owner",
+        lambda *, mode, payload: _ready_owner(
+            fast_mode=(str(mode) == "preview"),
+            simulation_plan_payload=payload,
+        ),
+    )
     monkeypatch.setattr(
         "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
         lambda text, default_set_name="set1": ({}, text),
@@ -6980,7 +6982,7 @@ def test_serial_single_set_run_uses_contained_owner_lane(monkeypatch, mw: _FakeM
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7324,7 +7326,7 @@ def test_interactive_runtime_availability_warms_exact_ordinary_and_preview_plans
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7406,7 +7408,7 @@ def test_interactive_runtime_ready_is_pure_and_ensure_warms_changed_payload(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7487,7 +7489,7 @@ def test_interactive_runtime_availability_does_not_apply_pending_init_migration(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7545,7 +7547,7 @@ def test_interactive_runtime_availability_uses_readiness_boundary_without_user_l
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7606,7 +7608,7 @@ def test_serial_runtime_readiness_warms_every_selected_set_owner(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7713,7 +7715,7 @@ def test_first_serial_actions_reuse_startup_ready_exact_contained_owners(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7822,7 +7824,7 @@ def test_first_ordinary_action_requires_ready_exact_contained_owner(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7902,7 +7904,7 @@ def test_contained_worker_construction_failure_releases_acquired_runtime_owner(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -7986,7 +7988,7 @@ def test_contained_worker_construction_failure_release_error_preserves_original_
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8051,7 +8053,7 @@ def test_first_preview_action_requires_ready_exact_contained_owner(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8291,7 +8293,7 @@ def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_in
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8396,7 +8398,7 @@ def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8503,7 +8505,7 @@ def test_run_simulation_internal_fast_mode_refreshes_runtime_after_multi_set_pre
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8595,7 +8597,7 @@ def test_run_simulation_internal_fast_mode_does_not_prepare_or_dirty_gui_runtime
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8693,7 +8695,7 @@ def test_runtime_readiness_only_ordinary_warm_preserves_preview_ownership(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8745,7 +8747,7 @@ def test_runtime_readiness_only_ordinary_warm_does_not_mutate_status_for_solver_
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8818,7 +8820,7 @@ def test_fast_preview_completion_uses_dispatch_time_overlay_token_snapshot(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -8895,7 +8897,7 @@ def test_run_simulation_internal_fast_mode_parallel_signatures_follow_preview_me
     mw.apply_overrides_to_state_network_dsl = MagicMock(side_effect=lambda text, *, set_id=None: str(text))
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         _signature,
     )
     monkeypatch.setattr(
@@ -8976,7 +8978,7 @@ def test_fast_mode_preview_owner_identity_uses_set_specific_staged_request_dsl(
     mw.apply_overrides_to_state_network_dsl = MagicMock(side_effect=lambda text, *, set_id=None: str(text))
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **kwargs: str(kwargs.get("mechanism_text") or ""),
     )
     monkeypatch.setattr(
@@ -9062,7 +9064,7 @@ def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_w
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -9115,7 +9117,7 @@ def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -9186,7 +9188,7 @@ def test_run_simulation_internal_explicit_cache_key_ignores_non_primary_set_fing
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -9242,7 +9244,7 @@ def test_run_simulation_internal_baseline_explicit_run_leaves_overlay_cache_toke
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -9301,7 +9303,7 @@ def test_run_simulation_internal_fast_mode_seeds_active_preview_scope_set_ids(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -10344,7 +10346,7 @@ def test_run_simulation_internal_aborts_and_unlocks_on_invalid_batch_rows(monkey
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -10414,7 +10416,7 @@ def test_run_simulation_internal_preview_mode_caps_points(monkeypatch, mw: _Fake
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -10700,7 +10702,7 @@ def test_explicit_run_worker_error_reinvalidates_preserved_pending_init_results(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -11794,7 +11796,7 @@ def test_consume_parallel_batch_outcome_error_payload_calls_on_error(controller:
     )
 
     _install_active_lane_outcomes(controller, {"sid": outcome}, set_names={"sid": "set1"})
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
         controller,
@@ -11808,7 +11810,7 @@ def test_consume_parallel_batch_outcome_error_payload_calls_on_error(controller:
     )
 
     assert ok is False
-    controller._on_simulation_error.assert_called_once()
+    controller._error_handling_owner.handle_error.assert_called_once()
 
 
 @pytest.mark.unit
@@ -11826,7 +11828,7 @@ def test_parallel_batch_stale_runtime_input_error_is_consumed_without_failure_pu
     controller._batch_cache.active_cache_invalidated_set_ids = None
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False, run_id=1, request_id=2, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], total=2, completed_set_ids=[], runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 0}, explicit_cache_valid_set_ids=("id1", "id2"), explicit_cache_invalidated_set_ids=None, pending_workspace_reset_set_ids=["id1", "id2"], pending_dirty_reset_generation_by_set_id={"id1": 1, "id2": 2})
     mw._dirty_state_generations = {"id1": 1, "id2": 2}
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
     mw.message_box_critical = MagicMock()
     mw._status_label.setText("Running 2 sets in parallel")
 
@@ -11854,7 +11856,7 @@ def test_parallel_batch_stale_runtime_input_error_is_consumed_without_failure_pu
     assert policy_context.pending_dirty_reset_generation_by_set_id == {"id2": 2}
     assert controller._batch_cache.active_cache_valid_set_ids == ("id1", "id2")
     assert controller._batch_cache.active_cache_invalidated_set_ids is None
-    controller._on_simulation_error.assert_not_called()
+    controller._error_handling_owner.handle_error.assert_not_called()
     mw.message_box_critical.assert_not_called()
     assert mw._status_label.text == "Running 2 sets in parallel"
 
@@ -11901,7 +11903,7 @@ def test_parallel_batch_all_stale_runtime_input_callbacks_finish_run_cleanly(
     mw._status_label.setText("Running 1 set in parallel")
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False, run_id=1, request_id=2, cache_key="ck", queue_ids=["id1"], queue_names=["set1"], total=1, completed_set_ids=[], runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0})
     controller.queue_pending_slider_preview_replay(target_set_ids=("id2",), request_id=9)
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
     mw.message_box_critical = MagicMock()
 
     ok = _consume_parallel_batch_outcome_for_test(
@@ -11926,7 +11928,7 @@ def test_parallel_batch_all_stale_runtime_input_callbacks_finish_run_cleanly(
     assert scheduled == [controller._run_simulation_from_slider]
     assert _pending_slider_preview_launch(controller).handoff_queued is True
     assert _pending_slider_preview_launch(controller).request_id == 9
-    controller._on_simulation_error.assert_not_called()
+    controller._error_handling_owner.handle_error.assert_not_called()
     mw.message_box_critical.assert_not_called()
 
 
@@ -11952,7 +11954,7 @@ def test_parallel_batch_multiset_all_stale_runtime_input_callbacks_finish_run_cl
     mw._sim_progress.setValue(42)
     mw._status_label.setText("Running 2 sets in parallel")
     seed_batch_context(controller.batch_context_owner, active=True, parallel=True, fast_mode=False, run_id=1, request_id=2, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], total=2, completed_set_ids=[], runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 0})
-    controller._on_simulation_error = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
     mw.message_box_critical = MagicMock()
 
     assert _consume_parallel_batch_outcome_for_test(
@@ -11993,7 +11995,7 @@ def test_parallel_batch_multiset_all_stale_runtime_input_callbacks_finish_run_cl
     assert mw._stop_btn.isEnabled() is False
     assert mw._sim_progress.value == 0
     assert mw._status_label.text == "Ready"
-    controller._on_simulation_error.assert_not_called()
+    controller._error_handling_owner.handle_error.assert_not_called()
     mw.message_box_critical.assert_not_called()
 
 
@@ -12163,7 +12165,7 @@ def test_run_simulation_internal_non_fast_mode_does_not_build_prepared_payloads(
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -12249,7 +12251,7 @@ def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -12311,7 +12313,7 @@ def test_run_simulation_internal_builds_plan_initials_from_materialization_owner
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -12410,7 +12412,7 @@ def test_run_simulation_internal_non_fast_mode_multiset_plans_do_not_inherit_pri
     mw._parse_sim_time_seconds.return_value = 10.0
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -12744,11 +12746,7 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "ordinary-owner"
-    monkeypatch.setattr(
-        controller,
-        "_acquire_ready_contained_simulation_owner_for_plan",
-        lambda **_kwargs: "ordinary-owner",
-    )
+    monkeypatch.setattr(controller._runtime_application, "acquire_ready_owner", lambda **_kwargs: "ordinary-owner")
 
     controller._start_next_batch_simulation()
 
@@ -12802,11 +12800,7 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "preview-owner"
-    monkeypatch.setattr(
-        controller,
-        "_acquire_ready_contained_simulation_owner_for_plan",
-        lambda **_kwargs: "preview-owner",
-    )
+    monkeypatch.setattr(controller._runtime_application, "acquire_ready_owner", lambda **_kwargs: "preview-owner")
 
     controller._start_next_batch_simulation()
 
@@ -12897,7 +12891,7 @@ def test_run_simulation_internal_energy_mode_builds_simulation_plans(
     )
 
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13015,7 +13009,7 @@ def test_explicit_run_worker_error_preserves_targeted_dirty_workspaces(
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13080,7 +13074,7 @@ def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_a
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13143,7 +13137,7 @@ def test_explicit_run_success_clears_targeted_concentration_overlays_by_set_id_n
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13219,7 +13213,7 @@ def test_explicit_run_success_cancels_pending_species_preview_after_targeted_ove
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13300,7 +13294,7 @@ def test_explicit_run_success_preserves_pending_slider_replay_for_non_targeted_d
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13688,7 +13682,7 @@ def test_explicit_run_success_requeues_surviving_pending_slider_replay_with_fres
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13787,7 +13781,7 @@ def test_explicit_run_success_preserves_targeted_dirty_state_edited_after_run_st
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13917,7 +13911,7 @@ def test_run_simulation_internal_invalid_initials_preserves_targeted_dirty_works
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(
@@ -13988,7 +13982,7 @@ def test_explicit_run_success_preserves_pending_species_preview_replay_when_no_t
         lambda text: text,
     )
     monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
         lambda **_kwargs: "sig",
     )
     monkeypatch.setattr(

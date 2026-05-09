@@ -376,22 +376,22 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
     ordinary_start_calls = list(ordinary_owner.start_calls)
     preview_start_calls = list(preview_owner.start_calls)
     ready_checks: list[dict[str, object]] = []
-    real_acquire_owner = main_window.simulation_controller._acquire_ready_contained_simulation_owner_for_plan
+    real_acquire_owner = main_window.simulation_controller._runtime_application.acquire_ready_owner
 
     def _record_ready_check(**kwargs):
         owner = real_acquire_owner(**kwargs)
         ready_checks.append(
             {
-                "fast_mode": bool(kwargs.get("fast_mode")),
+                "fast_mode": kwargs.get("mode") == "preview",
                 "owner": owner,
-                "payload": dict(kwargs.get("simulation_plan_payload") or {}),
+                "payload": dict(kwargs.get("payload") or {}),
             }
         )
         return owner
 
     monkeypatch.setattr(
-        main_window.simulation_controller,
-        "_acquire_ready_contained_simulation_owner_for_plan",
+        main_window.simulation_controller._runtime_application,
+        "acquire_ready_owner",
         _record_ready_check,
     )
 

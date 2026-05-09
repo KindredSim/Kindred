@@ -160,6 +160,10 @@ def _patch_main_window_test_environment(
             lambda self, **_kwargs: ready_owner,
         )
         monkeypatch.setattr(
+            "kindred.core.simulation_runtime_readiness.SimulationRuntimeApplication.acquire_ready_owner",
+            lambda self, **_kwargs: ready_owner,
+        )
+        monkeypatch.setattr(
             "kindred.gui.controllers.simulation_controller.SimulationController._interactive_simulation_runtime_snapshot",
             lambda self, *, fast_mode: RuntimeReadinessSnapshot(
                 mode="preview" if bool(fast_mode) else "ordinary",

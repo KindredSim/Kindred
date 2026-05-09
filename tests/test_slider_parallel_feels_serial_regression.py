@@ -176,8 +176,8 @@ def test_parallel_completion_consumes_completed_lane_records_in_completion_order
 
     processed: list[str] = []
     monkeypatch.setattr(
-        main_window.simulation_controller,
-        "_dispatch_simulation_complete",
+        main_window.simulation_controller._completion_callback_owner,
+        "handle_completion",
         lambda _result, **kwargs: processed.append(str(kwargs.get("batch_set_id") or "")),
         raising=True,
     )

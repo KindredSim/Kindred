@@ -35,8 +35,6 @@ class ParallelBatchOutcomeDependencies:
     show_scoped_batch_failure_summary: Callable[..., None]
     apply_explicit_failure_pending_replay_policy: Callable[..., None]
     reset_parallel_batch_run_and_shutdown_lane_pool: Callable[..., None]
-    dispatch_simulation_error: Callable[..., None]
-    dispatch_simulation_complete: Callable[..., None]
     set_simulation_running: Callable[[bool], None]
     set_slider_simulation_active: Callable[[bool], None]
 
@@ -138,12 +136,16 @@ class ParallelBatchOutcomeOwner:
         batch_parallel: Any,
         batch_context_owner: Any,
         batch_cache: Any,
+        completion_callback_owner: Any,
+        error_handling_owner: Any,
         dependencies: ParallelBatchOutcomeDependencies,
     ) -> None:
         self._ui = ui
         self._batch_parallel = batch_parallel
         self._batch_context_owner = batch_context_owner
         self._batch_cache = batch_cache
+        self._completion_callback_owner = completion_callback_owner
+        self._error_handling_owner = error_handling_owner
         self._deps = dependencies
 
     @property
@@ -286,7 +288,7 @@ class ParallelBatchOutcomeOwner:
                 error_payload=error_payload,
             ):
                 return True
-            self._deps.dispatch_simulation_error(
+            self._error_handling_owner.handle_error(
                 error_payload,
                 run_id=run_id,
                 fast_mode=fast_mode,
@@ -311,7 +313,7 @@ class ParallelBatchOutcomeOwner:
                 float(perf_counter()),
             )
         try:
-            self._deps.dispatch_simulation_complete(
+            self._completion_callback_owner.handle_completion(
                 resolution.payload,
                 run_id=run_id,
                 fast_mode=fast_mode,
@@ -320,6 +322,7 @@ class ParallelBatchOutcomeOwner:
                 batch_set=set_name,
                 batch_set_id=sid,
                 cache_key=cache_key,
+                debug_batch_parallel=bool(debug_batch_parallel),
                 callback_identity=callback_identity,
             )
         except Exception as exc:
@@ -328,7 +331,7 @@ class ParallelBatchOutcomeOwner:
                 exc,
             )
             try:
-                self._deps.dispatch_simulation_error(
+                self._error_handling_owner.handle_error(
                     f"Simulation failed:\n\n{exc}",
                     run_id=run_id,
                     fast_mode=fast_mode,

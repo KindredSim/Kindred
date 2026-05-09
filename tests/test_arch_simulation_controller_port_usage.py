@@ -590,6 +590,196 @@ def test_completion_publication_wiring_does_not_wrap_dependencies_in_lambdas() -
     )
 
 
+def test_run_preparation_wiring_does_not_wrap_dependencies_in_lambdas() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    preparation_dependency_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SimulationRunPreparationDependencies"
+    ]
+    assert len(preparation_dependency_calls) == 1
+
+    lambda_fields = [
+        keyword.arg
+        for keyword in preparation_dependency_calls[0].keywords
+        if isinstance(keyword.value, ast.Lambda)
+    ]
+    assert lambda_fields == [], (
+        "Run-preparation wiring must not hide dependencies behind controller lambda wrappers; this guard is scoped "
+        "to pass-through scaffolding and does not by itself prove final ownership for every callable dependency."
+    )
+
+
+def test_run_preparation_signature_authority_is_not_controller_dependency() -> None:
+    _controller_target, _controller_source, controller_tree = _repo_source_tree(
+        "kindred/gui/controllers/simulation_controller.py"
+    )
+    _prep_target, _prep_source, prep_tree = _repo_source_tree(
+        "kindred/gui/controllers/simulation_run_preparation.py"
+    )
+
+    controller_imported_names = {
+        alias.name
+        for node in ast.walk(controller_tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "kindred.core.batch_parallel"
+        for alias in node.names
+    }
+    controller_node = _class_node(controller_tree, "SimulationController")
+    controller_method_names = {
+        stmt.name for stmt in controller_node.body if isinstance(stmt, ast.FunctionDef)
+    }
+    preparation_dependency_calls = [
+        node
+        for node in ast.walk(controller_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SimulationRunPreparationDependencies"
+    ]
+    assert len(preparation_dependency_calls) == 1
+    preparation_keyword_fields = {keyword.arg for keyword in preparation_dependency_calls[0].keywords}
+
+    dependency_node = _class_node(prep_tree, "SimulationRunPreparationDependencies")
+    dependency_fields = {
+        stmt.target.id
+        for stmt in dependency_node.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+    prep_imported_names = {
+        alias.name
+        for node in ast.walk(prep_tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "kindred.core.batch_parallel"
+        for alias in node.names
+    }
+
+    assert "batch_mechanism_signature" not in controller_imported_names
+    assert "_run_preparation_batch_mechanism_signature" not in controller_method_names
+    assert "batch_mechanism_signature" not in preparation_keyword_fields
+    assert "batch_mechanism_signature" not in dependency_fields
+    assert "batch_mechanism_signature" in prep_imported_names
+
+
+def test_parallel_batch_outcome_uses_callback_owners_not_controller_dispatch_dependencies() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/parallel_batch_outcome.py")
+    dependency_node = _class_node(tree, "ParallelBatchOutcomeDependencies")
+    dependency_fields = {
+        stmt.target.id
+        for stmt in dependency_node.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+    owner_init = _class_method_node(tree, "ParallelBatchOutcomeOwner", "__init__")
+    init_args = {arg.arg for arg in owner_init.args.kwonlyargs}
+
+    assert "dispatch_simulation_complete" not in dependency_fields
+    assert "dispatch_simulation_error" not in dependency_fields
+    assert "completion_callback_owner" in init_args
+    assert "error_handling_owner" in init_args
+
+
+def test_parallel_batch_outcome_wiring_does_not_wrap_dependencies_in_lambdas() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    outcome_dependency_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ParallelBatchOutcomeDependencies"
+    ]
+    assert len(outcome_dependency_calls) == 1
+
+    lambda_fields = [
+        keyword.arg
+        for keyword in outcome_dependency_calls[0].keywords
+        if isinstance(keyword.value, ast.Lambda)
+    ]
+    assert lambda_fields == [], (
+        "Parallel batch outcome wiring must not hide dependencies behind controller lambda wrappers; this syntax "
+        "guard is not a claim that all remaining callback dependencies are final ownership boundaries."
+    )
+
+
+def test_slider_preview_launch_wiring_does_not_wrap_dependencies_in_lambdas() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    slider_dependency_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SimulationSliderPreviewLaunchDependencies"
+    ]
+    assert len(slider_dependency_calls) == 1
+
+    lambda_fields = [
+        keyword.arg
+        for keyword in slider_dependency_calls[0].keywords
+        if isinstance(keyword.value, ast.Lambda)
+    ]
+    assert lambda_fields == [], (
+        "Slider preview launch wiring must not hide runtime/readiness/replay dependencies behind controller lambda "
+        "wrappers; broader owner migration is guarded by responsibility-specific tests."
+    )
+
+
+def test_slider_preview_launch_reads_preview_request_from_run_state_not_dependency() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_slider_preview_launch.py")
+    dependency_node = _class_node(tree, "SimulationSliderPreviewLaunchDependencies")
+    dependency_fields = {
+        stmt.target.id
+        for stmt in dependency_node.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+
+    assert "preview_owner_request_id" not in dependency_fields
+    assert "run_simulation_internal" not in dependency_fields
+
+
+def test_contained_serial_worker_launch_wiring_does_not_wrap_dependencies_in_lambdas() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    launch_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ContainedSerialWorkerLaunchOwner"
+    ]
+    assert len(launch_calls) == 1
+
+    lambda_fields = [
+        keyword.arg
+        for keyword in launch_calls[0].keywords
+        if isinstance(keyword.value, ast.Lambda)
+    ]
+    keyword_fields = {keyword.arg for keyword in launch_calls[0].keywords}
+    assert lambda_fields == [], (
+        "Contained serial worker launch must not hide runtime acquisition behind controller lambda wrappers."
+    )
+    assert "acquire_ready_owner_for_plan" not in keyword_fields
+    assert "runtime_application" in keyword_fields
+
+
+def test_removed_controller_scaffolding_methods_do_not_reappear() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    controller_node = _class_node(tree, "SimulationController")
+    method_names = {stmt.name for stmt in controller_node.body if isinstance(stmt, ast.FunctionDef)}
+
+    removed_pass_throughs = {
+        "_slider_launch_run_simulation_internal",
+        "_parallel_outcome_record_nonfatal_exception",
+        "_slider_launch_supersede_parallel_batch_run_soft",
+        "_slider_launch_ensure_parallel_batch_pool_eagerly_created",
+        "_slider_launch_ensure_interactive_simulation_runtime_available_for_mode",
+        "_contained_serial_acquire_ready_owner_for_plan",
+        "_contained_serial_release_owner",
+        "_run_preparation_batch_mechanism_signature",
+    }
+
+    assert method_names.isdisjoint(removed_pass_throughs), (
+        "Demolished controller pass-through methods must not reappear as named wrappers; remaining controller "
+        "dependencies need responsibility-specific justification."
+    )
+
+
 def test_simulation_complete_provenance_cluster_uses_explicit_provenance_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"

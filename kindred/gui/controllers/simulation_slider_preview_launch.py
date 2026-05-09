@@ -14,8 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class SliderPreviewLaunchRunRequest:
+    request_id: int
+    batch_rows: tuple[int, ...]
+    reuse_parallel_lane_pool: bool = True
+
+
+@dataclass(frozen=True)
 class SimulationSliderPreviewLaunchDependencies:
-    preview_owner_request_id: Callable[[], int | None]
     set_discarded_preview_generation: Callable[[int | None], None]
     worker_is_running: Callable[[Any], bool]
     clear_pending_slider_preview_replay: Callable[..., None]
@@ -32,7 +38,6 @@ class SimulationSliderPreviewLaunchDependencies:
     ensure_parallel_batch_pool_eagerly_created: Callable[..., None]
     ensure_interactive_simulation_runtime_available_for_mode: Callable[..., None]
     mark_request_started: Callable[[int], int]
-    run_simulation_internal: Callable[..., None]
     retry_slider_preview_launch: Callable[[], None]
 
 
@@ -83,7 +88,7 @@ class SimulationSliderPreviewLaunchOwner:
             request_id=int(request_id),
         )
 
-    def run_from_slider(self) -> None:
+    def run_from_slider(self) -> SliderPreviewLaunchRunRequest | None:
         replay = self._pending_launch()
         if not self._has_launch_state(replay):
             if replay.handoff_queued:
@@ -95,7 +100,8 @@ class SimulationSliderPreviewLaunchOwner:
         worker = self._run_state.simulation_worker
         request_id = replay.request_id
         pending_target_set_ids = list(replay.target_set_ids)
-        owner_request_id = self._deps.preview_owner_request_id()
+        preview_ownership = getattr(self._run_state, "preview_ownership", None)
+        owner_request_id = getattr(preview_ownership, "request_id", None)
         state = self._batch_context_owner.active_batch_state()
         active_fast_parallel = bool(state is not None and state.active and state.parallel and state.fast_mode)
         active_fast_request_id = state.request_id if active_fast_parallel and state is not None else None
@@ -258,9 +264,8 @@ class SimulationSliderPreviewLaunchOwner:
         self._ui.run_ui.set_status_text("Updating simulation...")
         self._ui.run_ui.set_sim_progress_value(0)
 
-        self._deps.run_simulation_internal(
-            fast_mode=True,
+        return SliderPreviewLaunchRunRequest(
             request_id=int(request_id),
-            batch_rows=selected_rows,
+            batch_rows=tuple(int(row) for row in selected_rows),
             reuse_parallel_lane_pool=True,
         )

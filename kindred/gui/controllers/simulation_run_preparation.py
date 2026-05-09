@@ -110,7 +110,6 @@ class SimulationRunPreparationDependencies:
     preview_contained_owner_identity: Callable[..., Dict[str, Any]]
     ordinary_contained_owner_identity: Callable[..., Dict[str, Any]]
     record_run_cache_key: Callable[..., None]
-    batch_mechanism_signature: Callable[..., str]
 
 
 def build_fast_preview_solver_grid_context(
@@ -632,11 +631,11 @@ class SimulationRunDispatchPreparationOwner:
                     set_id=set_id_s
                 )
                 if isinstance(prepared_execution_payload, dict):
-                    mechanism_signature_by_set_id[set_id_s] = self._deps.batch_mechanism_signature(
+                    mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
                         simulation_identity=identity,
                     )
                 else:
-                    mechanism_signature_by_set_id[set_id_s] = self._deps.batch_mechanism_signature(
+                    mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
                         mechanism_text=str(request_mechanism_text),
                         temperature_K=float(solver_context.solver_config.get("temperature_K") or 298.15),
                         use_sparse_jacobian=bool(
@@ -664,7 +663,7 @@ class SimulationRunDispatchPreparationOwner:
                     simulation_identity=simulation_identity_by_set_id.get(set_id_s),
                 )
             else:
-                mechanism_signature_by_set_id[set_id_s] = self._deps.batch_mechanism_signature(
+                mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
                     simulation_identity=identity,
                 )
                 contained_owner_identity_by_set_id[set_id_s] = self._deps.ordinary_contained_owner_identity(
