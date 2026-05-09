@@ -19,6 +19,7 @@ from kindred.core.simulation_identity import SimulationIdentity, SimulationScope
 from kindred.gui.controllers.simulation_controller import (
     SimulationController,
 )
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.parallel_batch_executor import default_batch_lane_pool_factory
 from kindred.gui.controllers.simulation_completion_publication import CompletionCallbackState
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
@@ -1303,8 +1304,8 @@ def test_cleanup_worker_safely_disconnects_registered_qt_signal_handlers_without
     complete = MagicMock()
     error = MagicMock()
     controller.on_simulation_progress = progress
-    controller.on_simulation_complete = complete
-    controller.on_simulation_error = error
+    controller._on_simulation_complete = complete
+    controller._on_simulation_error = error
     monkeypatch.setattr(controller, "_delete_worker_if_stopped", MagicMock())
 
     controller._connect_simulation_worker_application_signals(
@@ -6445,6 +6446,142 @@ def test_start_parallel_batch_simulations_maps_submit_failure_to_affected_set(
 
 
 @pytest.mark.unit
+def test_start_parallel_batch_submit_failure_preserves_captured_callback_identity(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+    monkeypatch,
+):
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    submitted: list[dict[str, object]] = []
+    lane_pool = _RecordingLanePool(submitted)
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=1)
+    captured_identities: list[object] = []
+
+    def _raise_submit(_adapter, _task, *, set_id: str, set_name: str, **kwargs):
+        _ = _adapter, _task, set_id, set_name, kwargs
+        captured_identities.append(kwargs["callback_identity"])
+        seed_batch_context(
+            controller.batch_context_owner,
+            active=True,
+            parallel=True,
+            rows=[0],
+            queue_ids=["current-id"],
+            queue_names=["current-set"],
+            run_id=99,
+            request_id=98,
+            effective_workers=1,
+            preview_owner_epoch=97,
+            cache_key="current-cache",
+            full_dsl="reaction: A -> C; k=3",
+            solver_config={"solver": "Radau"},
+            t_end=3.0,
+            fast_mode=True,
+            pending_init_seed={},
+            pending_init_applied=True,
+            simulation_identity_by_set_id={"current-id": {"fingerprint": "current-fp"}},
+            preview_batch_cache_token_by_set_id={"current-id": "current-preview-token"},
+        )
+        raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(type(controller._batch_parallel), "submit_task", _raise_submit)
+    monkeypatch.setattr(controller, "_try_handle_scoped_batch_failure", lambda **_kwargs: False)
+    controller._on_simulation_error = MagicMock()
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        rows=[0],
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        run_id=1,
+        request_id=2,
+        effective_workers=1,
+        preview_owner_epoch=7,
+        cache_key="batch-cache",
+        full_dsl="reaction: A -> B; k=1",
+        solver_config={"solver": "BDF"},
+        t_end=10.0,
+        fast_mode=True,
+        pending_init_seed={},
+        pending_init_applied=True,
+        simulation_identity_by_set_id={"id1": {"fingerprint": "fp-1"}},
+        preview_batch_cache_token_by_set_id={"id1": "preview-token"},
+    )
+
+    controller._start_parallel_batch_simulations()
+
+    controller._on_simulation_error.assert_called_once()
+    callback_identity = controller._on_simulation_error.call_args.kwargs.get("callback_identity")
+    assert captured_identities
+    assert callback_identity is captured_identities[0]
+    assert callback_identity is not None
+    assert callback_identity.batch_set_id == "id1"
+    assert callback_identity.owner_epoch == 7
+    assert callback_identity.cache_key == "batch-cache"
+    assert callback_identity.simulation_identity == {"fingerprint": "fp-1"}
+    assert callback_identity.preview_batch_cache_token == "preview-token"
+
+
+@pytest.mark.unit
+def test_start_parallel_batch_identity_capture_failure_surfaces_original_failure(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+    monkeypatch,
+):
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    submitted: list[dict[str, object]] = []
+    lane_pool = _RecordingLanePool(submitted)
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=1)
+    handled_errors: list[object] = []
+    monkeypatch.setattr(
+        controller._error_handling_owner,
+        "handle_error",
+        lambda error_msg, **_kwargs: handled_errors.append(error_msg),
+    )
+
+    def _raise_capture(**_kwargs):
+        raise RuntimeError("identity capture failed")
+
+    monkeypatch.setattr(controller, "_capture_simulation_callback_identity", _raise_capture)
+    monkeypatch.setattr(
+        SimulationCallbackIdentity,
+        "capture",
+        classmethod(
+            lambda cls, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("capture-failure fallback must not re-enter SimulationCallbackIdentity.capture")
+            )
+        ),
+    )
+    monkeypatch.setattr(controller, "_try_handle_scoped_batch_failure", lambda **_kwargs: False)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        rows=[0],
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        run_id=1,
+        request_id=2,
+        effective_workers=1,
+        preview_owner_epoch=7,
+        cache_key="batch-cache",
+        full_dsl="reaction: A -> B; k=1",
+        solver_config={"solver": "BDF"},
+        t_end=10.0,
+        fast_mode=True,
+        pending_init_seed={},
+        pending_init_applied=True,
+    )
+
+    controller._start_parallel_batch_simulations()
+
+    assert len(handled_errors) == 1
+    error_payload = handled_errors[0]
+    assert error_payload["message"] == "identity capture failed"
+    assert error_payload["exc_type"] == "RuntimeError"
+
+
+@pytest.mark.unit
 def test_start_parallel_batch_simulations_records_preview_owner_epoch_in_submitted_lane_metadata(
     mw: _FakeMainWindow,
     controller: SimulationController,
@@ -7919,7 +8056,7 @@ def test_contained_worker_construction_failure_releases_acquired_runtime_owner(
     mw._batch_preferred_primary_set_id.return_value = "id1"
     mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
     controller._contained_simulation_owner_factory = _owner_factory
-    controller._dispatch_simulation_error = MagicMock()
+    controller._on_simulation_error = MagicMock()
 
     controller.ensure_interactive_simulation_runtimes_available(wait=True)
     ordinary_owner = controller._ordinary_simulation_owner
@@ -8003,7 +8140,7 @@ def test_contained_worker_construction_failure_release_error_preserves_original_
     mw._batch_preferred_primary_set_id.return_value = "id1"
     mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
     controller._contained_simulation_owner_factory = _owner_factory
-    controller._dispatch_simulation_error = MagicMock()
+    controller._on_simulation_error = MagicMock()
 
     controller.ensure_interactive_simulation_runtimes_available(wait=True)
     assert created_owners
@@ -8016,7 +8153,7 @@ def test_contained_worker_construction_failure_release_error_preserves_original_
         reuse_parallel_lane_pool=False,
     )
 
-    error_payload = controller._dispatch_simulation_error.call_args.args[0]
+    error_payload = controller._on_simulation_error.call_args.args[0]
     assert error_payload["message"] == "worker construction failed"
     assert error_payload["exc_type"] == "RuntimeError"
     assert "release failed" in str(controller._last_nonfatal_exception)

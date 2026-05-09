@@ -2601,6 +2601,54 @@ def test_simulation_error_callback_delegates_error_policy_to_owner() -> None:
     )
 
 
+def test_simulation_controller_has_no_completion_error_dispatch_scaffold() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    lines = source.splitlines()
+    controller = _class_node(tree, "SimulationController")
+
+    forbidden_names = {
+        "_dispatch_simulation_complete",
+        "_dispatch_simulation_error",
+    }
+    method_hits = [
+        _CallHit(method=item.name, lineno=item.lineno, line=lines[item.lineno - 1].strip())
+        for item in controller.body
+        if isinstance(item, ast.FunctionDef) and item.name in forbidden_names
+    ]
+    call_hits: list[_CallHit] = []
+    for node in ast.walk(controller):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain and chain[-1] in forbidden_names:
+            call_hits.append(
+                _CallHit(
+                    method=chain[-1],
+                    lineno=node.lineno,
+                    line=lines[node.lineno - 1].strip(),
+                )
+            )
+
+    assert method_hits == [], (
+        "Completion/error callback identity must flow through `_on_simulation_complete` and "
+        "`_on_simulation_error`; extra dispatch adapters recapture or branch identity before owner policy.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(method_hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+    assert call_hits == [], (
+        "Production controller code must not call removed completion/error dispatch adapters.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(call_hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
 def test_batch_run_context_owner_has_no_raw_context_compatibility_api() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "batch_run_context_owner.py"

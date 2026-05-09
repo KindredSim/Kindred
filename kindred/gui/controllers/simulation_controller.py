@@ -1483,97 +1483,6 @@ class SimulationController(QtCore.QObject):
             callback_identity=callback_identity,
         )
 
-    def _dispatch_simulation_complete(
-        self,
-        result: dict,
-        *,
-        run_id: Optional[int] = None,
-        fast_mode: Optional[bool] = None,
-        request_id: Optional[int] = None,
-        owner_epoch: Optional[int] = None,
-        batch_set: Optional[str] = None,
-        batch_set_id: Optional[str] = None,
-        cache_key: Optional[str] = None,
-        callback_identity: SimulationCallbackIdentity | None = None,
-    ):
-        identity = callback_identity or self._capture_simulation_callback_identity(
-            run_id=run_id,
-            fast_mode=fast_mode,
-            request_id=request_id,
-            owner_epoch=owner_epoch,
-            batch_set=batch_set,
-            batch_set_id=batch_set_id,
-            cache_key=cache_key,
-        )
-        if identity.owner_epoch is None:
-            return self.on_simulation_complete(
-                result,
-                run_id=identity.run_id,
-                fast_mode=identity.fast_mode,
-                request_id=identity.request_id,
-                batch_set=identity.batch_set,
-                batch_set_id=identity.batch_set_id,
-                cache_key=identity.cache_key,
-                callback_identity=identity,
-            )
-        return self._on_simulation_complete(
-            result,
-            run_id=identity.run_id,
-            fast_mode=identity.fast_mode,
-            request_id=identity.request_id,
-            owner_epoch=identity.owner_epoch,
-            batch_set=identity.batch_set,
-            batch_set_id=identity.batch_set_id,
-            cache_key=identity.cache_key,
-            callback_identity=identity,
-        )
-
-    def _dispatch_simulation_error(
-        self,
-        error_msg: object,
-        *,
-        run_id: Optional[int] = None,
-        fast_mode: Optional[bool] = None,
-        request_id: Optional[int] = None,
-        owner_epoch: Optional[int] = None,
-        batch_set: Optional[str] = None,
-        batch_set_id: Optional[str] = None,
-        cache_key: Optional[str] = None,
-        callback_identity: SimulationCallbackIdentity | None = None,
-    ) -> None:
-        identity = callback_identity or self._capture_simulation_callback_identity(
-            run_id=run_id,
-            fast_mode=fast_mode,
-            request_id=request_id,
-            owner_epoch=owner_epoch,
-            batch_set=batch_set,
-            batch_set_id=batch_set_id,
-            cache_key=cache_key,
-        )
-        if identity.owner_epoch is None:
-            self.on_simulation_error(
-                error_msg,
-                run_id=identity.run_id,
-                fast_mode=identity.fast_mode,
-                request_id=identity.request_id,
-                batch_set=identity.batch_set,
-                batch_set_id=identity.batch_set_id,
-                cache_key=identity.cache_key,
-                callback_identity=identity,
-            )
-            return
-        self._on_simulation_error(
-            error_msg,
-            run_id=identity.run_id,
-            fast_mode=identity.fast_mode,
-            request_id=identity.request_id,
-            owner_epoch=identity.owner_epoch,
-            batch_set=identity.batch_set,
-            batch_set_id=identity.batch_set_id,
-            cache_key=identity.cache_key,
-            callback_identity=identity,
-        )
-
     def _capture_simulation_callback_identity(
         self,
         *,
@@ -2296,7 +2205,7 @@ class SimulationController(QtCore.QObject):
             payload,
             _identity=callback_identity,
         ):
-            return self._dispatch_simulation_complete(
+            return self._on_simulation_complete(
                 payload,
                 run_id=_identity.run_id,
                 fast_mode=_identity.fast_mode,
@@ -2312,7 +2221,7 @@ class SimulationController(QtCore.QObject):
             msg,
             _identity=callback_identity,
         ):
-            return self._dispatch_simulation_error(
+            return self._on_simulation_error(
                 msg,
                 run_id=_identity.run_id,
                 fast_mode=_identity.fast_mode,
@@ -2859,7 +2768,7 @@ class SimulationController(QtCore.QObject):
             return
         if not self._batch_parallel.has_lane_pool():
             return
-        self._dispatch_simulation_error(
+        self._on_simulation_error(
             error_msg,
             run_id=int(dispatch_context.run_id),
             fast_mode=bool(dispatch_context.fast_mode),
@@ -3995,6 +3904,47 @@ class SimulationController(QtCore.QObject):
                     simulation_identity=dict(task_plan.simulation_identity or {}),
                     preview_batch_cache_token=payload.preview_batch_cache_token_by_set_id.get(sid),
                 )
+            except Exception as exc:
+                self._record_nonfatal_exception(
+                    f"Failed to capture batch lane callback identity (set_id={sid})",
+                    exc,
+                )
+                error_payload = simulation_failure_from_exception(exc, kind="simulation_containment_submission")
+                details = dict(error_payload.get("details") or {})
+                details.setdefault("source", "simulation_containment")
+                error_payload["details"] = details
+                if self._try_handle_scoped_batch_failure(
+                    set_id=sid,
+                    set_name=str(set_name),
+                    error_payload=error_payload,
+                ):
+                    continue
+                self._on_simulation_error(
+                    error_payload,
+                    fast_mode=bool(payload.fast_mode),
+                    run_id=int(run_id),
+                    request_id=int(request_id),
+                    owner_epoch=payload.preview_owner_epoch,
+                    batch_set=str(set_name),
+                    batch_set_id=sid,
+                    cache_key=str(payload.cache_key),
+                    callback_identity=SimulationCallbackIdentity(
+                        run_id=int(run_id),
+                        fast_mode=bool(payload.fast_mode) if payload.fast_mode is not None else None,
+                        request_id=int(request_id),
+                        owner_epoch=(
+                            int(payload.preview_owner_epoch)
+                            if payload.preview_owner_epoch is not None
+                            else None
+                        ),
+                        batch_set=str(set_name),
+                        batch_set_id=sid,
+                        cache_key=str(payload.cache_key),
+                        callback_context=callback_context,
+                    ),
+                )
+                return False
+            try:
                 self._batch_parallel.submit_task(
                     task_plan.task,
                     set_id=sid,
@@ -4016,7 +3966,7 @@ class SimulationController(QtCore.QObject):
                     error_payload=error_payload,
                 ):
                     continue
-                self._dispatch_simulation_error(
+                self._on_simulation_error(
                     error_payload,
                     fast_mode=bool(payload.fast_mode),
                     run_id=int(run_id),
@@ -4025,6 +3975,7 @@ class SimulationController(QtCore.QObject):
                     batch_set=str(set_name),
                     batch_set_id=sid,
                     cache_key=str(payload.cache_key),
+                    callback_identity=callback_identity,
                 )
                 return False
         return True
@@ -4104,7 +4055,7 @@ class SimulationController(QtCore.QObject):
             cache_key=str(cache_key),
         )
         if not isinstance(plan_payload, dict):
-            self._dispatch_simulation_error(
+            self._on_simulation_error(
                 simulation_failure_from_exception(
                     ValueError("Missing simulation plan payload for contained batch dispatch"),
                     kind="simulation_plan_payload",
@@ -4137,7 +4088,7 @@ class SimulationController(QtCore.QObject):
                 )
                 return False
         except Exception as exc:
-            self._dispatch_simulation_error(
+            self._on_simulation_error(
                 simulation_failure_from_exception(exc, kind="simulation_containment_payload"),
                 run_id=int(run_id),
                 fast_mode=bool(fast_mode),
