@@ -28,6 +28,28 @@ def _result_payload(*, marker: float = 1.0) -> Dict[str, Any]:
     }
 
 
+def _callback_identity(
+    main_window,
+    *,
+    run_id: int,
+    request_id: int,
+    batch_set: str,
+    batch_set_id: str,
+    cache_key: str,
+    callback_context=None,
+) -> SimulationCallbackIdentity:
+    return main_window.simulation_controller._capture_simulation_callback_identity(
+        run_id=run_id,
+        fast_mode=False,
+        request_id=request_id,
+        owner_epoch=None,
+        batch_set=batch_set,
+        batch_set_id=batch_set_id,
+        cache_key=cache_key,
+        callback_context=callback_context,
+    )
+
+
 def test_explicit_parallel_completions_do_not_redraw_per_completion(main_window, monkeypatch):
     main_window.simulation_controller.run_state.latest_sim_request_id = 501
     main_window.simulation_controller.run_state.active_run_id = 88
@@ -46,24 +68,27 @@ def test_explicit_parallel_completions_do_not_redraw_per_completion(main_window,
         return True
 
     monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
+    callback_context = main_window.simulation_controller.batch_context_owner.callback_context_snapshot()
+    identities = {
+        sid: _callback_identity(
+            main_window,
+            run_id=88,
+            request_id=501,
+            batch_set=sid,
+            batch_set_id=sid,
+            cache_key="explicit-coalesce-key",
+            callback_context=callback_context,
+        )
+        for sid in ("set2", "set3")
+    }
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=2.0),
-        run_id=88,
-        fast_mode=False,
-        request_id=501,
-        batch_set="set2",
-        batch_set_id="set2",
-        cache_key="explicit-coalesce-key",
+        callback_identity=identities["set2"],
     )
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=3.0),
-        run_id=88,
-        fast_mode=False,
-        request_id=501,
-        batch_set="set3",
-        batch_set_id="set3",
-        cache_key="explicit-coalesce-key",
+        callback_identity=identities["set3"],
     )
 
     assert display_calls == []
@@ -94,16 +119,24 @@ def test_explicit_coalesced_flush_batches_multiple_set_ids(main_window, monkeypa
         return True
 
     monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
-
-    for sid in ("set2", "set3", "set4"):
-        main_window.simulation_controller.on_simulation_complete(
-            _result_payload(marker=4.0),
+    callback_context = main_window.simulation_controller.batch_context_owner.callback_context_snapshot()
+    identities = {
+        sid: _callback_identity(
+            main_window,
             run_id=303,
-            fast_mode=False,
             request_id=777,
             batch_set=sid,
             batch_set_id=sid,
             cache_key="explicit-batch-key",
+            callback_context=callback_context,
+        )
+        for sid in ("set2", "set3", "set4")
+    }
+
+    for sid in ("set2", "set3", "set4"):
+        main_window.simulation_controller.on_simulation_complete(
+            _result_payload(marker=4.0),
+            callback_identity=identities[sid],
         )
 
     assert set(main_window.simulation_controller.plot_coalescer.pending.set_ids) == {"set2", "set3", "set4"}
@@ -143,24 +176,27 @@ def test_explicit_parallel_run_triggers_final_refresh_once(main_window, monkeypa
         queue_slider_plot_update=lambda **_kwargs: None,
         flush_slider_plot_updates=_flush,
     )
+    callback_context = main_window.simulation_controller.batch_context_owner.callback_context_snapshot()
+    identities = {
+        sid: _callback_identity(
+            main_window,
+            run_id=404,
+            request_id=909,
+            batch_set=sid,
+            batch_set_id=sid,
+            cache_key="explicit-final-refresh-key",
+            callback_context=callback_context,
+        )
+        for sid in ("set1", "set2")
+    }
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=9.0),
-        run_id=404,
-        fast_mode=False,
-        request_id=909,
-        batch_set="set1",
-        batch_set_id="set1",
-        cache_key="explicit-final-refresh-key",
+        callback_identity=identities["set1"],
     )
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=10.0),
-        run_id=404,
-        fast_mode=False,
-        request_id=909,
-        batch_set="set2",
-        batch_set_id="set2",
-        cache_key="explicit-final-refresh-key",
+        callback_identity=identities["set2"],
     )
 
     assert len(flush_calls) == 1
@@ -275,15 +311,23 @@ def test_explicit_parallel_final_flush_preserves_valid_subset_after_earlier_time
         return False
 
     monkeypatch.setattr(batch_port, "display_cached_batch_selection", _display, raising=True)
+    callback_context = main_window.simulation_controller.batch_context_owner.callback_context_snapshot()
+    identities = {
+        sid: _callback_identity(
+            main_window,
+            run_id=405,
+            request_id=910,
+            batch_set=sid,
+            batch_set_id=sid,
+            cache_key="explicit-final-subset-key",
+            callback_context=callback_context,
+        )
+        for sid in ("set1", "set2")
+    }
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=2.0),
-        run_id=405,
-        fast_mode=False,
-        request_id=910,
-        batch_set="set2",
-        batch_set_id="set2",
-        cache_key="explicit-final-subset-key",
+        callback_identity=identities["set2"],
     )
 
     timer = main_window.simulation_controller.plot_coalescer.timer
@@ -295,12 +339,7 @@ def test_explicit_parallel_final_flush_preserves_valid_subset_after_earlier_time
 
     main_window.simulation_controller.on_simulation_complete(
         _result_payload(marker=3.0),
-        run_id=405,
-        fast_mode=False,
-        request_id=910,
-        batch_set="set1",
-        batch_set_id="set1",
-        cache_key="explicit-final-subset-key",
+        callback_identity=identities["set1"],
     )
 
     assert len(display_calls) == 2

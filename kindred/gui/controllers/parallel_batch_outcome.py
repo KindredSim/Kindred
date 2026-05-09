@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -271,6 +272,24 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_stop_button_enabled(False)
             return False
 
+        if callback_identity is None or callback_context is None:
+            self._deps.record_nonfatal_exception(
+                (
+                    "Missing callback identity for active parallel batch outcome "
+                    f"(run_id={int(run_id)} request_id={int(request_id)} set_id={sid} source={str(source)})"
+                ),
+                RuntimeError("missing parallel batch callback identity"),
+            )
+            self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
+            self._deps.set_simulation_running(False)
+            self._deps.set_slider_simulation_active(False)
+            self._ui.slider.set_slider_triggered_simulation(False)
+            self._ui.run_ui.set_sim_progress_value(0)
+            self._ui.run_ui.set_run_button_enabled(True)
+            self._ui.run_ui.set_stop_button_enabled(False)
+            self._ui.run_ui.set_status_text("Batch simulation failed")
+            return False
+
         if self._deps.active_batch_context_runtime_input_stale_for_set(
             batch_set_id=sid,
             context=callback_context,
@@ -333,14 +352,24 @@ class ParallelBatchOutcomeOwner:
             try:
                 self._error_handling_owner.handle_error(
                     f"Simulation failed:\n\n{exc}",
-                    run_id=run_id,
-                    fast_mode=fast_mode,
-                    request_id=request_id,
-                    owner_epoch=owner_epoch,
-                    batch_set=set_name,
-                    batch_set_id=sid,
-                    cache_key=cache_key,
-                    callback_identity=callback_identity,
+                    run_id=run_id if callback_identity is not None else None,
+                    fast_mode=fast_mode if callback_identity is not None else None,
+                    request_id=request_id if callback_identity is not None else None,
+                    owner_epoch=owner_epoch if callback_identity is not None else None,
+                    batch_set=set_name if callback_identity is not None else None,
+                    batch_set_id=sid if callback_identity is not None else None,
+                    cache_key=cache_key if callback_identity is not None else None,
+                    callback_identity=callback_identity
+                    or SimulationCallbackIdentity.capture(
+                        run_id=run_id,
+                        fast_mode=fast_mode,
+                        request_id=request_id,
+                        owner_epoch=owner_epoch,
+                        batch_set=set_name,
+                        batch_set_id=sid,
+                        cache_key=cache_key,
+                        callback_context=callback_context,
+                    ),
                 )
             except Exception as ui_exc:
                 self._deps.record_nonfatal_exception(

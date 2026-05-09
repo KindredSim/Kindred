@@ -280,6 +280,12 @@ class SimulationCompletionPublicationOwner:
                 cache_state=self._completion_policy_cache_state(),
                 cache_key=state.cache_key,
             )
+            if isinstance(state.ctx, Mapping):
+                state.ctx = self._batch_context_owner.callback_context_with_cache_truth(
+                    state.ctx,
+                    state.policy_context,
+                )
+                return
             state.ctx = self._batch_context_owner.serialize_completion_policy_context(
                 state.policy_context,
                 base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
@@ -298,7 +304,7 @@ class SimulationCompletionPublicationOwner:
             if self._batch_context_owner.include_mechanism_in_result_payload(
                 fast_mode=bool(state.is_preview),
                 batch_set_id=state.batch_set_id,
-                context=state.ctx,
+                context=state.ctx if isinstance(state.ctx, Mapping) else {},
             )
             else None
         )
@@ -387,11 +393,13 @@ class SimulationCompletionPublicationOwner:
                 owned_species = list(completion.mechanism.species_names())
             except Exception:
                 owned_species = None
-        selected_sets = self._ui.batch.batch_set_ids_for_scope("selected")
+        selected_sets = []
         prefer = None
-        current_row = self._ui.batch.batch_current_row()
-        if current_row is not None:
-            prefer = self._ui.batch.batch_set_id_for_row(int(current_row))
+        if isinstance(state.ctx, Mapping):
+            selected_sets = self._ui.batch.batch_set_ids_for_scope("selected")
+            current_row = self._ui.batch.batch_current_row()
+            if current_row is not None:
+                prefer = self._ui.batch.batch_set_id_for_row(int(current_row))
         self._ui.results.publish_simulation_completion_result(
             t=completion.t,
             series=completion.series,
@@ -496,21 +504,26 @@ class SimulationCompletionPublicationOwner:
         completion: CompletionResultState,
         state: CompletionCallbackState,
     ) -> bool:
+        if not isinstance(state.ctx, Mapping):
+            return not self._active_current_context()
         completion_state = self._batch_context_owner.completion_state(
-            state.ctx if isinstance(state.ctx, Mapping) else None
+            state.ctx
         )
         if completion_state is None or not completion_state.active:
             return True
         total = max(1, int(completion_state.total or len(completion_state.queue_ids) or 1))
         if state.stale_fast_handoff_after_display:
-            state.ctx = self._batch_context_owner.deactivate_if_active(
-                state.ctx if isinstance(state.ctx, Mapping) else None
-            )
+            state.ctx = self._batch_context_owner.deactivate_if_active(state.ctx)
             return True
         if isinstance(state.ctx, Mapping) and not self._batch_context_owner.context_matches_current_run_identity(
             state.ctx
         ):
             return True
+        if state.policy_context is not None and isinstance(state.ctx, Mapping):
+            state.ctx = self._batch_context_owner.serialize_completion_policy_context(
+                state.policy_context,
+                base_context=state.ctx,
+            )
         if completion_state.parallel:
             transition = self._batch_context_owner.record_parallel_success(
                 set_id=state.batch_set_id,
@@ -604,10 +617,11 @@ class SimulationCompletionPublicationOwner:
         has_deferred_preview_replay = self._deps.has_deferred_preview_replay_intent()
         if has_deferred_preview_replay:
             logger.debug("Processing pending slider update after completion")
+        cleanup_context = state.ctx if isinstance(state.ctx, Mapping) else {}
         self._deps.apply_lifecycle_effects(
             self._lifecycle_effect_owner.successful_completion_final_effects(
                 cleanup_state=self._batch_context_owner.completion_cleanup_state(
-                    state.ctx if isinstance(state.ctx, Mapping) else None
+                    cleanup_context
                 ),
                 stale_fast_handoff_after_display=bool(state.stale_fast_handoff_after_display),
                 has_deferred_preview_replay=bool(has_deferred_preview_replay),
@@ -665,7 +679,18 @@ class SimulationCompletionPublicationOwner:
         return context
 
     def _is_primary(self, state: CompletionCallbackState) -> bool:
-        primary_set = self._batch_context_owner.primary_set_id(state.ctx)
+        if not isinstance(state.ctx, Mapping):
+            return not self._active_current_context()
+        primary_set = self._batch_context_owner.primary_set_id(
+            state.ctx
+        )
         if not primary_set:
             return True
         return bool(state.batch_set_id is not None and str(state.batch_set_id) == str(primary_set))
+
+    def _active_current_context(self) -> bool:
+        try:
+            current_state = self._batch_context_owner.completion_state()
+        except Exception:
+            return False
+        return bool(current_state is not None and current_state.active)

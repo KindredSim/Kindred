@@ -110,6 +110,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
     explicit_cache_preview_scope_set_ids: tuple[str, ...] | None = None
     explicit_cache_valid_set_ids: tuple[str, ...] | None = None
     explicit_cache_invalidated_set_ids: tuple[str, ...] | None = None
+    explicit_cache_truth_generation: int | None = None
     preview_scope_set_ids: tuple[str, ...] | None = None
     preview_owner_epoch: int | None = None
 
@@ -143,6 +144,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
             "explicit_cache_preview_scope_set_ids": self.explicit_cache_preview_scope_set_ids,
             "explicit_cache_valid_set_ids": self.explicit_cache_valid_set_ids,
             "explicit_cache_invalidated_set_ids": self.explicit_cache_invalidated_set_ids,
+            "explicit_cache_truth_generation": self.explicit_cache_truth_generation,
             "preview_scope_set_ids": self.preview_scope_set_ids,
             "preview_owner_epoch": self.preview_owner_epoch,
         }
@@ -535,6 +537,7 @@ class BatchRunContextOwner:
                 if ctx.get("explicit_cache_invalidated_set_ids") is not None
                 else None
             ),
+            explicit_cache_truth_generation=self._optional_int(ctx.get("explicit_cache_truth_generation")),
             preview_scope_set_ids=(
                 self._str_tuple(ctx.get("preview_scope_set_ids"), dedupe=True)
                 if ctx.get("preview_scope_set_ids") is not None
@@ -596,6 +599,31 @@ class BatchRunContextOwner:
                 if str(context.get(key) or "") != str(current.get(key) or ""):
                     return False
         return True
+
+    def current_run_identity_matches_callback(
+        self,
+        *,
+        run_id: Any = None,
+        request_id: Any = None,
+        cache_key: Any = None,
+    ) -> bool:
+        current = self._context
+        if not isinstance(current, Mapping) or not self._coerce_bool(current.get("active")):
+            return True
+        checks = (
+            ("run_id", run_id),
+            ("request_id", request_id),
+            ("cache_key", cache_key),
+        )
+        has_identity = False
+        for key, value in checks:
+            current_value = current.get(key)
+            if current_value is None:
+                continue
+            has_identity = True
+            if value is None or str(value or "") != str(current_value or ""):
+                return False
+        return bool(has_identity)
 
     def load_context(self, seed: BatchContextSeed) -> None:
         self._context = seed.to_context()
@@ -1213,11 +1241,99 @@ class BatchRunContextOwner:
         callback_context: Mapping[str, Any] | None,
         policy_context: CompletionPolicyContext | None,
     ) -> CompletionPolicyContext | None:
-        if isinstance(callback_context, Mapping) and self.context_matches_current_run_identity(callback_context):
-            current_context = self.completion_policy_context()
-            if current_context is not None:
-                return current_context
-        return policy_context or self.completion_policy_context(callback_context)
+        context = policy_context
+        if context is None and isinstance(callback_context, Mapping):
+            context = self.completion_policy_context(callback_context)
+        if context is None:
+            return None
+        if isinstance(callback_context, Mapping):
+            current = self.completion_policy_context(self._context)
+            current_completed = set(current.completed_set_ids) if current is not None else set()
+            context_completed = set(context.completed_set_ids)
+            current_invalidated = (
+                set(current.explicit_cache_invalidated_set_ids or ())
+                if current is not None
+                else set()
+            )
+            context_invalidated = set(context.explicit_cache_invalidated_set_ids or ())
+            current_valid = (
+                set(current.explicit_cache_valid_set_ids or ())
+                if current is not None
+                else set()
+            )
+            context_valid = set(context.explicit_cache_valid_set_ids or ())
+            current_preview_scope = (
+                set(current.explicit_cache_preview_scope_set_ids or ())
+                if current is not None
+                else set()
+            )
+            context_preview_scope = set(context.explicit_cache_preview_scope_set_ids or ())
+            callback_context_has_cache_truth = bool(
+                self._optional_int(callback_context.get("explicit_cache_truth_generation")) is not None
+            )
+            equal_completion_failure_truth = bool(
+                current_completed == context_completed
+                and current_invalidated == context_invalidated
+            )
+            current_has_newer_publication_truth = bool(
+                current is not None
+                and not callback_context_has_cache_truth
+                and (
+                    bool(current_completed - context_completed)
+                    or bool(current_invalidated - context_invalidated)
+                    or (
+                        equal_completion_failure_truth
+                        and (
+                            bool(current_valid != context_valid)
+                            or bool(current_preview_scope != context_preview_scope)
+                        )
+                    )
+                    or (
+                        equal_completion_failure_truth
+                        and
+                        current.explicit_cache_preview_token != context.explicit_cache_preview_token
+                        and current.explicit_cache_preview_token is not None
+                    )
+                )
+            )
+            if (
+                current is not None
+                and current_has_newer_publication_truth
+                and self.context_matches_current_run_identity(callback_context)
+            ):
+                return context.evolve(
+                    completed_set_ids=current.completed_set_ids,
+                    pending_workspace_reset_set_ids=current.pending_workspace_reset_set_ids,
+                    pending_dirty_reset_generation_by_set_id=dict(
+                        current.pending_dirty_reset_generation_by_set_id
+                    ),
+                    explicit_cache_preview_token=current.explicit_cache_preview_token,
+                    explicit_cache_preview_scope_set_ids=current.explicit_cache_preview_scope_set_ids,
+                    explicit_cache_valid_set_ids=current.explicit_cache_valid_set_ids,
+                    explicit_cache_invalidated_set_ids=current.explicit_cache_invalidated_set_ids,
+                )
+        return context
+
+    def callback_context_with_cache_truth(
+        self,
+        callback_context: Mapping[str, Any],
+        cache_truth_context: CompletionPolicyContext,
+    ) -> BatchCallbackContext:
+        base = self.callback_context_snapshot(callback_context).to_context()
+        base.update(
+            {
+                "explicit_cache_preview_token": cache_truth_context.explicit_cache_preview_token,
+                "explicit_cache_preview_scope_set_ids": cache_truth_context.explicit_cache_preview_scope_set_ids,
+                "explicit_cache_valid_set_ids": cache_truth_context.explicit_cache_valid_set_ids,
+                "explicit_cache_invalidated_set_ids": cache_truth_context.explicit_cache_invalidated_set_ids,
+                "explicit_cache_truth_generation": self._int_value(
+                    base.get("explicit_cache_truth_generation"),
+                    default=0,
+                )
+                + 1,
+            }
+        )
+        return self.callback_context_snapshot(base)
 
     def serialize_completion_policy_context(
         self,
@@ -1257,6 +1373,8 @@ class BatchRunContextOwner:
         raw["explicit_cache_preview_scope_set_ids"] = context.explicit_cache_preview_scope_set_ids
         raw["explicit_cache_valid_set_ids"] = context.explicit_cache_valid_set_ids
         raw["explicit_cache_invalidated_set_ids"] = context.explicit_cache_invalidated_set_ids
+        if "explicit_cache_truth_generation" in raw:
+            raw["explicit_cache_truth_generation"] = raw.get("explicit_cache_truth_generation")
         raw["preview_scope_set_ids"] = context.preview_scope_set_ids
         raw["preview_owner_epoch"] = context.preview_owner_epoch
         if base_context is None or self._matches_current_identity(raw):

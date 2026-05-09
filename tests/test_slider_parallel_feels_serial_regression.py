@@ -235,23 +235,35 @@ def test_slider_parallel_plot_updates_are_coalesced_per_ui_tick(main_window, mon
         "fallback_message": None,
     }
 
-    main_window.simulation_controller.on_simulation_complete(
-        result,
+    callback_context = main_window.simulation_controller.batch_context_owner.callback_context_snapshot()
+    set2_identity = main_window.simulation_controller._capture_simulation_callback_identity(
         run_id=77,
         fast_mode=True,
         request_id=101,
+        owner_epoch=1,
         batch_set="set2",
         batch_set_id="set2",
         cache_key="coalesce-key",
+        callback_context=callback_context,
     )
-    main_window.simulation_controller.on_simulation_complete(
-        result,
+    set3_identity = main_window.simulation_controller._capture_simulation_callback_identity(
         run_id=77,
         fast_mode=True,
         request_id=101,
+        owner_epoch=1,
         batch_set="set3",
         batch_set_id="set3",
         cache_key="coalesce-key",
+        callback_context=callback_context,
+    )
+
+    main_window.simulation_controller.on_simulation_complete(
+        result,
+        callback_identity=set2_identity,
+    )
+    main_window.simulation_controller.on_simulation_complete(
+        result,
+        callback_identity=set3_identity,
     )
 
     assert display_calls == []

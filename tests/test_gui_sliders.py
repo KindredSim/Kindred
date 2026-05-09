@@ -3378,6 +3378,15 @@ def test_direct_species_cell_edit_clears_visible_multiset_without_invalidating_u
                 edited_set_id: 0,
                 unaffected_set_id: 0,
             }, cache_key=explicit_key, queue_ids=[edited_set_id, unaffected_set_id], queue_names=["edited", "unaffected"], rows=[0, 1], pos=0, total=2)
+    callback_identity = controller._capture_simulation_callback_identity(
+        run_id=old_run_id,
+        fast_mode=False,
+        request_id=old_request_id,
+        owner_epoch=None,
+        batch_set=None,
+        batch_set_id=edited_set_id,
+        cache_key=explicit_key,
+    )
 
     assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
     qt_app.processEvents()
@@ -3389,11 +3398,7 @@ def test_direct_species_cell_edit_clears_visible_multiset_without_invalidating_u
 
     controller.on_simulation_complete(
         _completion_payload_with_a_series([42.0, 43.0]),
-        run_id=old_run_id,
-        fast_mode=False,
-        request_id=old_request_id,
-        batch_set_id=edited_set_id,
-        cache_key=explicit_key,
+        callback_identity=callback_identity,
     )
     _assert_selection_plot_cleared(main_window)
 
@@ -5168,6 +5173,15 @@ def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_s
     execution_state = batch_owner.execution_payload_state()
     flush_context = batch_owner.completion_flush_context()
     mechanism_text_by_set_id = dict(execution_state.mechanism_text_by_set_id or {})
+    callback_identity = main_window.simulation_controller._capture_simulation_callback_identity(
+        run_id=int(main_window.simulation_controller._active_run_id),
+        fast_mode=False,
+        request_id=int(flush_context.request_id or 0),
+        owner_epoch=None,
+        batch_set=str(main_window.batch_set_name_for_id(set_id) or ""),
+        batch_set_id=set_id,
+        cache_key=str(flush_context.cache_key or ""),
+    )
 
     result = {
         "t": np.linspace(0.0, 1.0, 3),
@@ -5183,12 +5197,7 @@ def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_s
     }
     main_window.simulation_controller._on_simulation_complete(
         result,
-        run_id=int(main_window.simulation_controller._active_run_id),
-        fast_mode=False,
-        request_id=int(flush_context.request_id or 0),
-        batch_set=str(main_window.batch_set_name_for_id(set_id) or ""),
-        batch_set_id=set_id,
-        cache_key=str(flush_context.cache_key or ""),
+        callback_identity=callback_identity,
     )
     qt_app.processEvents()
 
@@ -5240,6 +5249,15 @@ def test_run_selected_completion_preserves_surviving_pending_slider_replay_after
     execution_state = batch_owner.execution_payload_state()
     flush_context = batch_owner.completion_flush_context()
     mechanism_text_by_set_id = dict(execution_state.mechanism_text_by_set_id or {})
+    callback_identity = controller._capture_simulation_callback_identity(
+        run_id=int(controller._active_run_id),
+        fast_mode=False,
+        request_id=int(flush_context.request_id or 0),
+        owner_epoch=None,
+        batch_set=str(main_window.batch_set_name_for_id(set0_id) or ""),
+        batch_set_id=set0_id,
+        cache_key=str(flush_context.cache_key or ""),
+    )
     result = {
         "t": np.linspace(0.0, 1.0, 3),
         "Y": np.asarray([[1.0, 0.5, 0.1], [0.0, 0.5, 0.9]], dtype=float),
@@ -5255,12 +5273,7 @@ def test_run_selected_completion_preserves_surviving_pending_slider_replay_after
 
     controller._on_simulation_complete(
         result,
-        run_id=int(controller._active_run_id),
-        fast_mode=False,
-        request_id=int(flush_context.request_id or 0),
-        batch_set=str(main_window.batch_set_name_for_id(set0_id) or ""),
-        batch_set_id=set0_id,
-        cache_key=str(flush_context.cache_key or ""),
+        callback_identity=callback_identity,
     )
 
     pending_after = controller.run_state.pending_slider_preview_launch

@@ -2220,15 +2220,19 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
     seed_batch_context(main_window.simulation_controller.batch_context_owner, active=True, parallel=False, run_id=8, request_id=21, fast_mode=False, cache_key=cache_key, queue_ids=[newer_id], queue_names=[
                 str(main_window.batch_set_name_for_id(newer_id) or newer_id),
             ], primary_set_id=newer_id, total=1, explicit_cache_valid_set_ids=(newer_id,))
-
-    main_window.simulation_controller.on_simulation_complete(
-        _fake_sim_result(marker=2.0),
+    callback_identity = main_window.simulation_controller._capture_simulation_callback_identity(
         run_id=8,
         fast_mode=False,
         request_id=21,
+        owner_epoch=None,
         batch_set=str(main_window.batch_set_name_for_id(newer_id) or newer_id),
         batch_set_id=newer_id,
         cache_key=cache_key,
+    )
+
+    main_window.simulation_controller.on_simulation_complete(
+        _fake_sim_result(marker=2.0),
+        callback_identity=callback_identity,
     )
     qt_app.processEvents()
 

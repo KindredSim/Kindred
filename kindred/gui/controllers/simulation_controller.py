@@ -2534,13 +2534,7 @@ class SimulationController(QtCore.QObject):
                 context,
                 batch_set_id=batch_set_id,
             )
-        set_id = str(batch_set_id or "").strip()
-        return self._batch_context_owner.active_runtime_input_stale_for_set(
-            batch_set_id=set_id,
-            current_global_epoch=int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0),
-            current_set_epoch=self._runtime_input_set_epoch(set_id),
-            current_epoch=int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0),
-        )
+        return False
 
     def _mark_stale_runtime_input_callback_consumed(
         self,
@@ -2768,8 +2762,7 @@ class SimulationController(QtCore.QObject):
             return
         if not self._batch_parallel.has_lane_pool():
             return
-        self._on_simulation_error(
-            error_msg,
+        callback_identity = SimulationCallbackIdentity.capture(
             run_id=int(dispatch_context.run_id),
             fast_mode=bool(dispatch_context.fast_mode),
             request_id=int(dispatch_context.request_id),
@@ -2777,6 +2770,11 @@ class SimulationController(QtCore.QObject):
             batch_set="",
             batch_set_id="",
             cache_key=str(dispatch_context.cache_key),
+            callback_context=self._batch_context_owner.callback_context_snapshot(),
+        )
+        self._on_simulation_error(
+            error_msg,
+            callback_identity=callback_identity,
         )
 
     def _scoped_batch_failure_detail_lines(
@@ -3135,22 +3133,22 @@ class SimulationController(QtCore.QObject):
             timer.stop()
 
     def _poll_parallel_batch_completions(self) -> None:
-        runtime_snapshot = self._batch_parallel.runtime_snapshot()
-        active_parallel = bool(runtime_snapshot.active)
-        if not active_parallel and not self._batch_parallel.has_active_requests():
-            if self._batch_parallel.is_pool_stale:
-                self._shutdown_batch_lane_pool(force_terminate=False)
-            self._stop_batch_completion_poll_timer_if_idle()
-            if self._has_deferred_preview_replay_intent():
-                self._schedule_deferred_preview_replay_handoff_once()
-            return
-
-        run_id = int(runtime_snapshot.run_id) if active_parallel else 0
-        request_id = int(runtime_snapshot.request_id) if active_parallel else 0
-        fast_mode = bool(runtime_snapshot.fast_mode) if active_parallel else False
-        cache_key = str(runtime_snapshot.cache_key or "") if active_parallel else ""
-
         try:
+            runtime_snapshot = self._batch_parallel.runtime_snapshot()
+            active_parallel = bool(runtime_snapshot.active)
+            if not active_parallel and not self._batch_parallel.has_active_requests():
+                if self._batch_parallel.is_pool_stale:
+                    self._shutdown_batch_lane_pool(force_terminate=False)
+                self._stop_batch_completion_poll_timer_if_idle()
+                if self._has_deferred_preview_replay_intent():
+                    self._schedule_deferred_preview_replay_handoff_once()
+                return
+
+            run_id = int(runtime_snapshot.run_id) if active_parallel else 0
+            request_id = int(runtime_snapshot.request_id) if active_parallel else 0
+            fast_mode = bool(runtime_snapshot.fast_mode) if active_parallel else False
+            cache_key = str(runtime_snapshot.cache_key or "") if active_parallel else ""
+
             for polled in self._batch_parallel.poll_completed_records():
                 sid = str(polled.set_id or "")
                 completion_record = polled.record
@@ -3182,15 +3180,7 @@ class SimulationController(QtCore.QObject):
             # the application recoverable.
             self._record_nonfatal_exception("Unhandled exception while polling parallel batch completions", exc)
             try:
-                self._on_simulation_error(
-                    f"Simulation failed:\n\n{exc}",
-                    run_id=run_id,
-                    fast_mode=fast_mode,
-                    request_id=request_id,
-                    batch_set="",
-                    batch_set_id="",
-                    cache_key=cache_key,
-                )
+                self._surface_current_parallel_batch_pool_failure_to_ui(f"Simulation failed:\n\n{exc}")
             except Exception as ui_exc:
                 self._record_nonfatal_exception("Failed to surface polling exception to UI", ui_exc)
             self._shutdown_batch_lane_pool(force_terminate=True)
@@ -3981,7 +3971,8 @@ class SimulationController(QtCore.QObject):
         return True
 
     def _abort_for_unready_interactive_runtime(self, *, fast_mode: bool, context: Mapping[str, Any]) -> None:
-        self._batch_context_owner.deactivate_if_active(context)
+        if isinstance(context, Mapping):
+            self._batch_context_owner.deactivate_if_active(context)
         self._simulation_running = False
         self._slider_simulation_active = False
         self.ui.run_ui.set_runtime_backed_run_controls_ready(False)
@@ -4668,7 +4659,7 @@ class SimulationController(QtCore.QObject):
         cache_key: Optional[str] = None,
         callback_identity: SimulationCallbackIdentity | None = None,
     ):
-        identity = callback_identity or self._capture_simulation_callback_identity(
+        identity = callback_identity or SimulationCallbackIdentity.capture(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
@@ -4676,6 +4667,7 @@ class SimulationController(QtCore.QObject):
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
+            callback_context=None,
         )
         self._completion_callback_owner.handle_completion(
             result,
@@ -4703,7 +4695,7 @@ class SimulationController(QtCore.QObject):
         cache_key: Optional[str] = None,
         callback_identity: SimulationCallbackIdentity | None = None,
     ):
-        identity = callback_identity or self._capture_simulation_callback_identity(
+        identity = callback_identity or SimulationCallbackIdentity.capture(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
@@ -4711,6 +4703,7 @@ class SimulationController(QtCore.QObject):
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
+            callback_context=None,
         )
         self._error_handling_owner.handle_error(
             error_msg,
@@ -4741,7 +4734,8 @@ class SimulationController(QtCore.QObject):
             status_text = "Preview unavailable. Adjust sliders or run again."
         logger.warning("Preview simulation failed without modal: %s", error_text)
 
-        self._batch_context_owner.deactivate_if_active(context)
+        if isinstance(context, Mapping):
+            self._batch_context_owner.deactivate_if_active(context)
         self._apply_simulation_lifecycle_effects(
             self._lifecycle_effect_owner.current_preview_failure_effects(
                 status_text=str(status_text),

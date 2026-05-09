@@ -206,6 +206,12 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
     )
     assert len(lane_pools) == 1
     _wait_for_submission_count(lane_pools[0], len(names))
+    old_callback_identity_by_set_id = {}
+    for sub in _simulation_submissions(lane_pools[0]):
+        task = dict(sub.args[0] if sub.args else {})
+        sid = str(task.get("set_id") or "")
+        metadata = main_window.simulation_controller.parallel_batch.active_request_metadata(sid)
+        old_callback_identity_by_set_id[sid] = metadata.get("callback_identity")
 
     main_window.simulation_controller._shutdown_batch_lane_pool(force_terminate=True)
     main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
@@ -218,6 +224,12 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
     )
     assert len(lane_pools) == 2
     _wait_for_submission_count(lane_pools[1], len(names))
+    new_callback_identity_by_set_id = {}
+    for sub in _simulation_submissions(lane_pools[1]):
+        task = dict(sub.args[0] if sub.args else {})
+        sid = str(task.get("set_id") or "")
+        metadata = main_window.simulation_controller.parallel_batch.active_request_metadata(sid)
+        new_callback_identity_by_set_id[sid] = metadata.get("callback_identity")
 
     old_pool = lane_pools[0]
     new_pool = lane_pools[1]
@@ -229,6 +241,8 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
 
     stale_task = dict(_simulation_submissions(old_pool)[0].args[0] if _simulation_submissions(old_pool)[0].args else {})
     stale_sid = str(stale_task.get("set_id") or "")
+    stale_callback_identity = old_callback_identity_by_set_id[stale_sid]
+    assert stale_callback_identity is not None
     main_window.simulation_controller.on_simulation_complete(
         {
             "run_id": int(stale_task.get("run_id") or 0),
@@ -244,12 +258,7 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
             "fallback_occurred": False,
             "fallback_message": None,
         },
-        run_id=int(stale_task.get("run_id") or 0),
-        fast_mode=False,
-        request_id=int(stale_task.get("request_id") or 0),
-        batch_set=str(stale_task.get("set_name") or stale_sid),
-        batch_set_id=stale_sid,
-        cache_key=cache_key,
+        callback_identity=stale_callback_identity,
     )
 
     assert (
@@ -264,6 +273,8 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
     for sub in _simulation_submissions(new_pool):
         task = dict(sub.args[0] if sub.args else {})
         sid = str(task.get("set_id") or "")
+        callback_identity = new_callback_identity_by_set_id[sid]
+        assert callback_identity is not None
         main_window.simulation_controller.on_simulation_complete(
             {
                 "run_id": int(task.get("run_id") or 0),
@@ -279,12 +290,7 @@ def test_new_run_cancels_old_lane_pool_and_rejects_stale_results(main_window, mo
                 "fallback_occurred": False,
                 "fallback_message": None,
             },
-            run_id=int(task.get("run_id") or 0),
-            fast_mode=False,
-            request_id=int(task.get("request_id") or 0),
-            batch_set=str(task.get("set_name") or sid),
-            batch_set_id=sid,
-            cache_key=cache_key,
+            callback_identity=callback_identity,
         )
 
     cached_payloads = []
