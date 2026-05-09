@@ -935,12 +935,11 @@ def test_run_simulation_internal_queue_context_cluster_uses_explicit_batch_port(
     ("method_name", "expected_methods"),
     (
         ("_start_parallel_batch_simulations", set()),
-        ("_submit_parallel_batch_tasks", {"batch_initials_for_row"}),
+        ("_submit_parallel_batch_tasks", set()),
         (
             "_start_next_batch_simulation",
             {
                 "batch_set_name_for_id",
-                "batch_initials_for_row",
             },
         ),
         ("_abort_serial_batch_for_invalid_initials", {"batch_model_validate_rows"}),
@@ -997,24 +996,48 @@ def test_simulation_controller_launch_validation_cluster_uses_explicit_batch_por
     )
 
 
+def test_batch_dispatch_materialization_owner_owns_batch_initials_and_preview_overlay() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "batch_dispatch_materialization.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    fn = _class_method_node(tree, "BatchDispatchMaterializationOwner", "materialize_initials")
+
+    calls = {
+        chain
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and (chain := _attribute_chain(node.func)) is not None
+    }
+    assert ("self", "_batch", "batch_initials_for_row") in calls
+    assert ("self", "_slider", "preview_initials_for_row") in calls
+
+
 def test_simulation_complete_completion_reconciliation_cluster_uses_explicit_batch_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
     owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
+    materialization_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_result_materialization.py"
     assert controller_target.is_file(), f"Expected file at {controller_target}"
     assert owner_target.is_file(), f"Expected file at {owner_target}"
+    assert materialization_target.is_file(), f"Expected file at {materialization_target}"
 
-    controller_source = controller_target.read_text(encoding="utf-8")
-    controller_tree = ast.parse(controller_source, filename=str(controller_target))
     owner_source = owner_target.read_text(encoding="utf-8")
     owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    materialization_source = materialization_target.read_text(encoding="utf-8")
+    materialization_tree = ast.parse(materialization_source, filename=str(materialization_target))
     method_specs = (
         (owner_target, owner_tree, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "resolve_batch_identity")),
         (
-            controller_target,
-            controller_tree,
-            controller_source.splitlines(),
-            _simulation_controller_method_node(controller_tree, "_remember_primary_result_mechanism"),
+            materialization_target,
+            materialization_tree,
+            materialization_source.splitlines(),
+            _class_method_node(
+                materialization_tree,
+                "SimulationResultMaterializationOwner",
+                "remember_primary_result_mechanism",
+            ),
         ),
     )
 
@@ -1066,20 +1089,24 @@ def test_simulation_complete_mechanism_helpers_cluster_uses_explicit_mechanism_h
     repo_root = Path(__file__).resolve().parents[1]
     controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
     owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
+    materialization_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_result_materialization.py"
     assert controller_target.is_file(), f"Expected file at {controller_target}"
     assert owner_target.is_file(), f"Expected file at {owner_target}"
+    assert materialization_target.is_file(), f"Expected file at {materialization_target}"
 
     controller_source = controller_target.read_text(encoding="utf-8")
     controller_tree = ast.parse(controller_source, filename=str(controller_target))
     owner_source = owner_target.read_text(encoding="utf-8")
     owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    materialization_source = materialization_target.read_text(encoding="utf-8")
+    materialization_tree = ast.parse(materialization_source, filename=str(materialization_target))
     method_specs = (
         (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_finalize_explicit_batch_dirty_reset")),
         (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "apply_pending_init")),
         (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "apply_pending_init_guard")),
-        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_update_primary_result_materialization_contract")),
-        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_remember_primary_result_mechanism")),
-        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_refresh_primary_result_controls")),
+        (materialization_target, materialization_source.splitlines(), _class_method_node(materialization_tree, "SimulationResultMaterializationOwner", "update_primary_result_materialization_contract")),
+        (materialization_target, materialization_source.splitlines(), _class_method_node(materialization_tree, "SimulationResultMaterializationOwner", "remember_primary_result_mechanism")),
+        (materialization_target, materialization_source.splitlines(), _class_method_node(materialization_tree, "SimulationResultMaterializationOwner", "refresh_primary_result_controls")),
     )
 
     flattened_hits: list[_CallHit] = []
@@ -1427,6 +1454,100 @@ def test_start_run_context_and_dispatch_delegates_start_request_construction() -
     )
 
 
+def test_start_parallel_batch_simulations_delegates_runtime_readiness_decision() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    source = target.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(target))
+    lines = source.splitlines()
+    fn = _simulation_controller_method_node(tree, "_start_parallel_batch_simulations")
+
+    forbidden_names = {
+        "current_max_workers",
+        "has_lane_pool",
+        "has_ready_lane_pool",
+        "ensure_lane_pool",
+        "is_pool_stale",
+    }
+    delegated = False
+    hits: list[_CallHit] = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            chain = _attribute_chain(node.func)
+            if chain == ("self", "_parallel_batch_runtime_readiness_owner", "run_start_availability"):
+                delegated = True
+            if chain and chain[0:2] == ("self", "_batch_parallel") and chain[-1] in forbidden_names:
+                hits.append(
+                    _CallHit(
+                        method=chain[-1],
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
+                )
+        elif isinstance(node, ast.Attribute):
+            chain = _attribute_chain(node)
+            if chain and chain[0:2] == ("self", "_batch_parallel") and chain[-1] in forbidden_names:
+                hits.append(
+                    _CallHit(
+                        method=chain[-1],
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
+                )
+
+    assert delegated is True, (
+        "`SimulationController._start_parallel_batch_simulations` must ask "
+        "`ParallelBatchRuntimeReadinessOwner` for run-path readiness instead of recomputing lane-pool truth inline."
+    )
+    assert hits == [], (
+        "`SimulationController._start_parallel_batch_simulations` must not duplicate parallel batch runtime readiness "
+        "truth from the batch executor; that decision belongs to `ParallelBatchRuntimeReadinessOwner`.\n"
+        + "\n".join(
+            f"{target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(hits, key=lambda hit: (hit.lineno, hit.method))
+        )
+    )
+
+
+def test_completion_materialization_policy_is_not_controller_local() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_result_materialization.py"
+    assert controller_target.is_file(), f"Expected file at {controller_target}"
+    assert owner_target.is_file(), f"Expected file at {owner_target}"
+
+    controller_source = controller_target.read_text(encoding="utf-8")
+    controller_tree = ast.parse(controller_source, filename=str(controller_target))
+    owner_source = owner_target.read_text(encoding="utf-8")
+    owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    controller_methods = {
+        node.name
+        for node in ast.walk(controller_tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    materialization_methods = {
+        "resolve_completion_mechanism",
+        "update_primary_result_materialization_contract",
+        "remember_primary_result_mechanism",
+        "refresh_primary_result_controls",
+    }
+
+    assert not (controller_methods & {f"_{name}" for name in materialization_methods}), (
+        "Completion materialization policy must live in `SimulationResultMaterializationOwner`, not as "
+        "controller-local callback dependencies."
+    )
+    _class_method_node(owner_tree, "SimulationResultMaterializationOwner", "resolve_completion_mechanism")
+    _class_method_node(
+        owner_tree,
+        "SimulationResultMaterializationOwner",
+        "update_primary_result_materialization_contract",
+    )
+    _class_method_node(owner_tree, "SimulationResultMaterializationOwner", "remember_primary_result_mechanism")
+    _class_method_node(owner_tree, "SimulationResultMaterializationOwner", "refresh_primary_result_controls")
+
+
 def test_simulation_controller_has_no_flattened_mechanism_helpers_port_usage() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
@@ -1466,9 +1587,13 @@ def test_simulation_controller_slider_cluster_uses_explicit_slider_port() -> Non
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
     prep_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_run_preparation.py"
     callback_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_callback.py"
+    materialization_target = repo_root / "kindred" / "gui" / "controllers" / "batch_dispatch_materialization.py"
+    result_materialization_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_result_materialization.py"
     assert target.is_file(), f"Expected file at {target}"
     assert prep_target.is_file(), f"Expected file at {prep_target}"
     assert callback_target.is_file(), f"Expected file at {callback_target}"
+    assert materialization_target.is_file(), f"Expected file at {materialization_target}"
+    assert result_materialization_target.is_file(), f"Expected file at {result_materialization_target}"
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
@@ -1479,6 +1604,12 @@ def test_simulation_controller_slider_cluster_uses_explicit_slider_port() -> Non
     callback_source = callback_target.read_text(encoding="utf-8")
     callback_tree = ast.parse(callback_source, filename=str(callback_target))
     callback_lines = callback_source.splitlines()
+    materialization_source = materialization_target.read_text(encoding="utf-8")
+    materialization_tree = ast.parse(materialization_source, filename=str(materialization_target))
+    materialization_lines = materialization_source.splitlines()
+    result_materialization_source = result_materialization_target.read_text(encoding="utf-8")
+    result_materialization_tree = ast.parse(result_materialization_source, filename=str(result_materialization_target))
+    result_materialization_lines = result_materialization_source.splitlines()
 
     flattened_hits: list[_CallHit] = []
     explicit_methods: set[str] = set()
@@ -1523,6 +1654,39 @@ def test_simulation_controller_slider_cluster_uses_explicit_slider_port() -> Non
             method_hits, method_explicit = _collect_port_usage(
                 item,
                 prep_lines,
+                explicit_port="slider",
+                methods=SLIDER_TARGET_METHODS,
+            )
+            flattened_hits.extend(method_hits)
+            explicit_methods.update(method_explicit)
+    materialize_fn = _class_method_node(
+        materialization_tree,
+        "BatchDispatchMaterializationOwner",
+        "materialize_initials",
+    )
+    for node in ast.walk(materialize_fn):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain == ("self", "_slider", "preview_initials_for_row"):
+            explicit_methods.add("preview_initials_for_row")
+        elif chain == ("self", "ui", "preview_initials_for_row"):
+            flattened_hits.append(
+                _CallHit(
+                    method="preview_initials_for_row",
+                    lineno=node.lineno,
+                    line=materialization_lines[node.lineno - 1].strip(),
+                )
+            )
+    for node in ast.walk(result_materialization_tree):
+        if not isinstance(node, ast.ClassDef) or node.name != "SimulationResultMaterializationOwner":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            method_hits, method_explicit = _collect_port_usage(
+                item,
+                result_materialization_lines,
                 explicit_port="slider",
                 methods=SLIDER_TARGET_METHODS,
             )
@@ -1606,15 +1770,17 @@ def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
     owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
+    materialization_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_result_materialization.py"
     assert controller_target.is_file(), f"Expected file at {controller_target}"
     assert owner_target.is_file(), f"Expected file at {owner_target}"
+    assert materialization_target.is_file(), f"Expected file at {materialization_target}"
 
-    controller_source = controller_target.read_text(encoding="utf-8")
-    controller_tree = ast.parse(controller_source, filename=str(controller_target))
     owner_source = owner_target.read_text(encoding="utf-8")
     owner_tree = ast.parse(owner_source, filename=str(owner_target))
+    materialization_source = materialization_target.read_text(encoding="utf-8")
+    materialization_tree = ast.parse(materialization_source, filename=str(materialization_target))
     method_specs = (
-        (controller_target, controller_source.splitlines(), _simulation_controller_method_node(controller_tree, "_resolve_completion_mechanism")),
+        (materialization_target, materialization_source.splitlines(), _class_method_node(materialization_tree, "SimulationResultMaterializationOwner", "resolve_completion_mechanism")),
         (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "publish_annotations_and_provenance")),
     )
     flattened_hits: list[_CallHit] = []
@@ -1805,7 +1971,7 @@ def test_simulation_completion_builders_do_not_publish_or_apply_effects() -> Non
 
 def test_simulation_completion_variable_runtime_policy_uses_runtime_port_not_mechanism_helpers() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_result_materialization.py"
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
     lines = source.splitlines()
@@ -1822,12 +1988,16 @@ def test_simulation_completion_variable_runtime_policy_uses_runtime_port_not_mec
     }
     hits: list[_CallHit] = []
     for method_name in checked_methods:
-        fn = _simulation_controller_method_node(tree, method_name)
+        fn = _class_method_node(
+            tree,
+            "SimulationResultMaterializationOwner",
+            method_name.lstrip("_"),
+        )
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
                 continue
             chain = _attribute_chain(node.func)
-            if len(chain or ()) == 4 and chain[:3] == ("self", "ui", "mechanism_helpers") and chain[3] in runtime_methods:
+            if len(chain or ()) == 4 and chain[:3] == ("self", "_ui", "mechanism_helpers") and chain[3] in runtime_methods:
                 hits.append(
                     _CallHit(
                         method=f"{method_name}:{chain[3]}",
@@ -2435,17 +2605,23 @@ def test_run_simulation_internal_final_batch_residue_uses_explicit_batch_port() 
 def test_start_next_batch_simulation_dispatches_only_contained_plan_workers() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    owner_target = repo_root / "kindred" / "gui" / "controllers" / "serial_worker_launch.py"
     assert target.is_file(), f"Expected file at {target}"
+    assert owner_target.is_file(), f"Expected file at {owner_target}"
 
     source = target.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(target))
+    owner_source = owner_target.read_text(encoding="utf-8")
+    owner_tree = ast.parse(owner_source, filename=str(owner_target))
     fn = _simulation_controller_method_node(tree, "_start_next_batch_simulation")
     helper_fn = _simulation_controller_method_node(tree, "_start_contained_serial_batch_worker")
     lines = source.splitlines()
+    owner_lines = owner_source.splitlines()
 
     legacy_hits: list[_CallHit] = []
     contained_hits: list[_CallHit] = []
     helper_calls: list[_CallHit] = []
+    owner_calls: list[_CallHit] = []
     for node in ast.walk(fn):
         if not isinstance(node, ast.Call):
             continue
@@ -2506,17 +2682,63 @@ def test_start_next_batch_simulation_dispatches_only_contained_plan_workers() ->
                     )
                 )
             elif chain == ("ContainedSimulationWorker",):
-                contained_hits.append(
+                legacy_hits.append(
                     _CallHit(
                         method="ContainedSimulationWorker",
                         lineno=node.lineno,
                         line=lines[node.lineno - 1].strip(),
                     )
                 )
+            elif chain == ("self", "_contained_serial_worker_launch_owner", "create_worker"):
+                owner_calls.append(
+                    _CallHit(
+                        method="_contained_serial_worker_launch_owner.create_worker",
+                        lineno=node.lineno,
+                        line=lines[node.lineno - 1].strip(),
+                    )
+                )
+
+    owner_worker_class = _class_method_node(owner_tree, "ContainedSerialWorkerLaunchOwner", "_worker_class")
+    owner_create_worker = _class_method_node(owner_tree, "ContainedSerialWorkerLaunchOwner", "create_worker")
+    for node in ast.walk(owner_worker_class):
+        if isinstance(node, ast.ImportFrom) and node.module == "kindred.gui.simulation_worker":
+            imported_names = {alias.name for alias in node.names}
+            if "ContainedSimulationWorker" in imported_names:
+                contained_hits.append(
+                    _CallHit(
+                        method="ContainedSimulationWorker",
+                        lineno=node.lineno,
+                        line=owner_lines[node.lineno - 1].strip(),
+                    )
+                )
+            if "SimulationWorker" in imported_names:
+                legacy_hits.append(
+                    _CallHit(
+                        method="SimulationWorker",
+                        lineno=node.lineno,
+                        line=owner_lines[node.lineno - 1].strip(),
+                    )
+                )
+    for node in ast.walk(owner_create_worker):
+        if not isinstance(node, ast.Call):
+            continue
+        chain = _attribute_chain(node.func)
+        if chain == ("SimulationWorker",):
+            legacy_hits.append(
+                _CallHit(
+                    method="SimulationWorker",
+                    lineno=node.lineno,
+                    line=owner_lines[node.lineno - 1].strip(),
+                )
+            )
 
     assert helper_calls, (
         "Guardrail expectation changed: `SimulationController._start_next_batch_simulation` must delegate contained "
         "worker launch to `_start_contained_serial_batch_worker` instead of constructing the worker inline."
+    )
+    assert owner_calls, (
+        "Guardrail expectation changed: `_start_contained_serial_batch_worker` must delegate contained worker "
+        "materialization to `ContainedSerialWorkerLaunchOwner` instead of constructing the worker inline."
     )
     assert contained_hits, (
         "Guardrail expectation changed: serial batch launch must dispatch queued serial batch runs through the "

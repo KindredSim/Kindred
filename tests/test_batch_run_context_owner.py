@@ -324,6 +324,75 @@ def test_deactivate_if_active_owns_context_activity_transition():
     assert owner.completion_policy_context().queue_ids == ("id1",)
 
 
+def test_deactivate_if_active_ignores_stale_identity_context():
+    owner = BatchRunContextOwner()
+    seed_batch_context(owner, active=True, run_id=5, request_id=7, cache_key="current")
+
+    inactive = owner.deactivate_if_active({
+        "active": True,
+        "run_id": 5,
+        "request_id": 7,
+        "cache_key": "stale",
+    })
+
+    assert inactive["active"] is True
+    assert inactive["cache_key"] == "current"
+
+
+def test_deactivate_if_active_ignores_stale_same_identity_progress_context():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        run_id=5,
+        request_id=7,
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        completed_set_ids=["id1"],
+        runtime_input_global_epoch=2,
+    )
+
+    inactive = owner.deactivate_if_active({
+        "active": True,
+        "run_id": 5,
+        "request_id": 7,
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "completed_set_ids": [],
+        "runtime_input_global_epoch": 1,
+    })
+
+    assert inactive["active"] is True
+    assert inactive["completed_set_ids"] == ["id1"]
+    assert inactive["runtime_input_global_epoch"] == 2
+
+
+def test_context_matches_current_run_identity_ignores_progress_but_rejects_cache_turnover():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        run_id=5,
+        request_id=7,
+        cache_key="ck",
+        completed_set_ids=["id1"],
+        runtime_input_global_epoch=2,
+    )
+
+    assert owner.context_matches_current_run_identity({
+        "run_id": 5,
+        "request_id": 7,
+        "cache_key": "ck",
+        "completed_set_ids": [],
+        "runtime_input_global_epoch": 1,
+    })
+    assert not owner.context_matches_current_run_identity({
+        "run_id": 5,
+        "request_id": 7,
+        "cache_key": "other",
+    })
+
+
 def test_simulation_controller_tests_do_not_read_pending_reset_raw_context_fields():
     from pathlib import Path
 
@@ -840,3 +909,50 @@ def test_completion_policy_context_serialization_preserves_unowned_context_field
     assert policy_context.queue_ids == ("id1", "id2")
     assert policy_context.pending_init_seed == {"set2": {"A": 1.5}}
     assert policy_context.preview_owner_epoch == 4
+
+
+def test_completion_policy_context_serialization_does_not_overwrite_newer_same_identity_progress():
+    owner = BatchRunContextOwner()
+    seed_batch_context(
+        owner,
+        active=True,
+        run_id=9,
+        request_id=7,
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        completed_set_ids=["id1"],
+        runtime_input_global_epoch=2,
+    )
+    stale_base = {
+        "active": True,
+        "run_id": 9,
+        "request_id": 7,
+        "cache_key": "ck",
+        "queue_ids": ["id1", "id2"],
+        "queue_names": ["set1", "set2"],
+        "completed_set_ids": [],
+        "runtime_input_global_epoch": 1,
+    }
+    context = CompletionPolicyContext(
+        active=True,
+        request_id=7,
+        run_id=9,
+        fast_mode=False,
+        parallel=True,
+        keep_lane_pool_alive=False,
+        queue_ids=("id1", "id2"),
+        queue_names=("set1", "set2"),
+        total=2,
+        pos=0,
+        primary_set_id="id1",
+        completed_set_ids=(),
+    )
+
+    serialized = owner.serialize_completion_policy_context(context, base_context=stale_base)
+
+    assert serialized["completed_set_ids"] == []
+    assert serialized["runtime_input_global_epoch"] == 1
+    current_policy = owner.completion_policy_context()
+    assert current_policy is not None
+    assert current_policy.completed_set_ids == ("id1",)
+    assert owner.current_context_snapshot()["runtime_input_global_epoch"] == 2

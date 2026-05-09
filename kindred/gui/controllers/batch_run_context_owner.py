@@ -389,6 +389,63 @@ class BatchRunContextOwner:
     def _current_context(self) -> Dict[str, Any]:
         return deepcopy(self._context)
 
+    def current_context_snapshot(self) -> Dict[str, Any]:
+        return self._current_context()
+
+    def _matches_current_identity(self, context: Mapping[str, Any]) -> bool:
+        current = self._context
+        if not isinstance(current, Mapping):
+            return True
+        has_identity = any(key in context or key in current for key in ("run_id", "request_id", "cache_key"))
+        if not has_identity:
+            return True
+        for key in ("run_id", "request_id", "cache_key"):
+            if key in context or key in current:
+                if str(context.get(key) or "") != str(current.get(key) or ""):
+                    return False
+        for key in (
+            "queue_ids",
+            "completed_set_ids",
+            "failed_set_ids",
+            "stale_runtime_input_set_ids",
+        ):
+            if key in context or key in current:
+                if self._str_tuple(context.get(key), dedupe=False) != self._str_tuple(
+                    current.get(key), dedupe=False
+                ):
+                    return False
+        for key in ("pos", "runtime_input_epoch", "runtime_input_global_epoch"):
+            if key in context or key in current:
+                if str(context.get(key) or "") != str(current.get(key) or ""):
+                    return False
+        if "runtime_input_set_epoch_by_set_id" in context or "runtime_input_set_epoch_by_set_id" in current:
+            if {
+                str(set_id): self._int_value(value, default=0)
+                for set_id, value in dict(context.get("runtime_input_set_epoch_by_set_id") or {}).items()
+            } != {
+                str(set_id): self._int_value(value, default=0)
+                for set_id, value in dict(current.get("runtime_input_set_epoch_by_set_id") or {}).items()
+            }:
+                return False
+        return True
+
+    def context_matches_current_identity(self, context: Mapping[str, Any] | None) -> bool:
+        if not isinstance(context, Mapping):
+            return True
+        return self._matches_current_identity(context)
+
+    def context_matches_current_run_identity(self, context: Mapping[str, Any] | None) -> bool:
+        if not isinstance(context, Mapping):
+            return True
+        current = self._context
+        if not isinstance(current, Mapping):
+            return True
+        for key in ("run_id", "request_id", "cache_key"):
+            if key in context or key in current:
+                if str(context.get(key) or "") != str(current.get(key) or ""):
+                    return False
+        return True
+
     def load_context(self, seed: BatchContextSeed) -> None:
         self._context = seed.to_context()
 
@@ -913,6 +970,8 @@ class BatchRunContextOwner:
         ctx = context if isinstance(context, Mapping) else self._context
         if not isinstance(ctx, Mapping):
             return self._current_context()
+        if isinstance(context, Mapping) and not self._matches_current_identity(context):
+            return self._current_context()
         if not self._coerce_bool(ctx.get("active")):
             return deepcopy(dict(ctx))
         self._context = dict(ctx)
@@ -1000,8 +1059,10 @@ class BatchRunContextOwner:
         raw["explicit_cache_invalidated_set_ids"] = context.explicit_cache_invalidated_set_ids
         raw["preview_scope_set_ids"] = context.preview_scope_set_ids
         raw["preview_owner_epoch"] = context.preview_owner_epoch
-        self._context = raw
-        return self._current_context()
+        if base_context is None or self._matches_current_identity(raw):
+            self._context = raw
+            return self._current_context()
+        return deepcopy(raw)
 
     def completion_summary(
         self,

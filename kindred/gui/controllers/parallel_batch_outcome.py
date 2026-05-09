@@ -240,6 +240,9 @@ class ParallelBatchOutcomeOwner:
         )
         set_name = resolution.set_name
         owner_epoch = resolution.owner_epoch
+        callback_identity = meta.get("callback_identity")
+        callback_context = getattr(callback_identity, "context_snapshot", None)
+        callback_context = callback_context if isinstance(callback_context, Mapping) else None
         self._batch_parallel.discard_request(sid)
 
         if resolution.stale:
@@ -266,8 +269,14 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_stop_button_enabled(False)
             return False
 
-        if self._deps.active_batch_context_runtime_input_stale_for_set(batch_set_id=sid):
-            self._deps.mark_stale_runtime_input_callback_consumed(batch_set_id=sid)
+        if self._deps.active_batch_context_runtime_input_stale_for_set(
+            batch_set_id=sid,
+            context=callback_context,
+        ):
+            self._deps.mark_stale_runtime_input_callback_consumed(
+                batch_set_id=sid,
+                context=callback_context,
+            )
             return True
         if resolution.failed:
             error_payload = dict(resolution.error_payload or {})
@@ -286,6 +295,7 @@ class ParallelBatchOutcomeOwner:
                 batch_set=set_name,
                 batch_set_id=sid,
                 cache_key=cache_key,
+                callback_identity=callback_identity,
             )
             self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
             return False
@@ -310,6 +320,7 @@ class ParallelBatchOutcomeOwner:
                 batch_set=set_name,
                 batch_set_id=sid,
                 cache_key=cache_key,
+                callback_identity=callback_identity,
             )
         except Exception as exc:
             self._deps.record_nonfatal_exception(
@@ -326,6 +337,7 @@ class ParallelBatchOutcomeOwner:
                     batch_set=set_name,
                     batch_set_id=sid,
                     cache_key=cache_key,
+                    callback_identity=callback_identity,
                 )
             except Exception as ui_exc:
                 self._deps.record_nonfatal_exception(

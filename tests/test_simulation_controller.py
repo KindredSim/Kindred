@@ -20,6 +20,7 @@ from kindred.gui.controllers.simulation_controller import (
     SimulationController,
     _default_batch_lane_pool_factory,
 )
+from kindred.gui.controllers.simulation_completion_publication import CompletionCallbackState
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.ports import SliderReplayIntent, SimulationUiPorts
@@ -114,6 +115,7 @@ def _install_active_lane_outcomes(
     *,
     set_names: dict[str, str] | None = None,
     owner_epoch: int = 1,
+    callback_identities: dict[str, object] | None = None,
 ) -> None:
     class _StaticLanePool:
         def __init__(self, lane_outcomes: dict[str, BatchLaneOutcome]) -> None:
@@ -150,6 +152,7 @@ def _install_active_lane_outcomes(
             set_id=str(sid),
             set_name=(set_names or {}).get(sid, sid),
             expected_owner_epoch=owner_epoch,
+            callback_identity=(callback_identities or {}).get(str(sid)),
         )
     controller.parallel_batch.join_active_requests(timeout_s=2.0)
 
@@ -1916,6 +1919,11 @@ def test_stale_fast_completion_treats_same_request_as_superseded_after_owner_epo
     controller._slider_simulation_active = True
     controller.run_state.preview_ownership = PreviewOwnershipState(
         request_id=7,
+        epoch=3,
+        target_set_ids=("captured-id",),
+    )
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
         epoch=4,
         target_set_ids=("id2",),
     )
@@ -2012,6 +2020,193 @@ def test_worker_signal_completion_uses_captured_owner_epoch_after_context_turnov
 
     assert _batch_policy_context(controller).active is False
     assert scheduled == [controller._run_simulation_from_slider]
+
+
+@pytest.mark.unit
+def test_worker_signal_completion_uses_captured_cache_key_after_context_turnover(
+    controller: SimulationController,
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=3,
+        target_set_ids=("id2",),
+    )
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=3,
+        target_set_ids=("id2",),
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        request_id=7,
+        preview_owner_epoch=3,
+        cache_key="initial-current-cache",
+        queue_ids=["id2"],
+        queue_names=["set2"],
+    )
+    controller.batch_cache.active_preview_cache_key = "active-cache-after-turnover"
+    controller._queue_slider_plot_update = MagicMock()
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=5,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        set_name="set2",
+        set_id="id2",
+        cache_key="captured-preview-cache",
+    )
+    controller.batch_context_owner.record_cache_key("current-context-cache-after-turnover")
+
+    worker.result_ready.emit(_successful_result_payload())
+
+    controller._queue_slider_plot_update.assert_called_once()
+    assert controller._queue_slider_plot_update.call_args.kwargs["cache_key"] == "captured-preview-cache"
+
+
+@pytest.mark.unit
+def test_worker_signal_completion_uses_captured_context_identity_after_context_turnover(
+    controller: SimulationController,
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=3,
+        target_set_ids=("id2",),
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        request_id=7,
+        preview_owner_epoch=3,
+        cache_key="captured-preview-cache",
+        queue_ids=["id2"],
+        queue_names=["set2"],
+        pos=0,
+        total=1,
+        primary_set_id="id2",
+        simulation_identity_by_set_id={"id2": {"schema_id": "captured-schema"}},
+        preview_batch_cache_token_by_set_id={"id2": "captured-token"},
+    )
+    published: list[dict[str, object]] = []
+    controller._cache_admin.publish_completion_cache = lambda **kwargs: published.append(dict(kwargs))
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=5,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        set_name="set2",
+        set_id="id2",
+        cache_key="captured-preview-cache",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        request_id=7,
+        preview_owner_epoch=3,
+        cache_key="current-preview-cache",
+        queue_ids=["id2"],
+        queue_names=["set2"],
+        pos=0,
+        total=1,
+        primary_set_id="id2",
+        simulation_identity_by_set_id={"id2": {"schema_id": "current-schema"}},
+        preview_batch_cache_token_by_set_id={"id2": "current-token"},
+    )
+
+    worker.result_ready.emit(_successful_result_payload())
+
+    assert published
+    assert published[0]["cache_key"] == "captured-preview-cache"
+    assert published[0]["simulation_identity"] == {"schema_id": "captured-schema"}
+    assert published[0]["preview_batch_cache_token"] == "captured-token"
+
+
+@pytest.mark.unit
+def test_completion_missing_set_fallback_uses_captured_context_after_context_turnover(
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 7
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=3,
+        target_set_ids=("captured-id",),
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        request_id=7,
+        preview_owner_epoch=3,
+        cache_key="captured-preview-cache",
+        queue_ids=["captured-id"],
+        queue_names=["captured-set"],
+        pos=0,
+        total=1,
+        primary_set_id="captured-id",
+        simulation_identity_by_set_id={"captured-id": {"schema_id": "captured-schema"}},
+        preview_batch_cache_token_by_set_id={"captured-id": "captured-token"},
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=5,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=3,
+        batch_set=None,
+        batch_set_id=None,
+        cache_key="captured-preview-cache",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        request_id=7,
+        preview_owner_epoch=3,
+        cache_key="current-preview-cache",
+        queue_ids=["current-id"],
+        queue_names=["current-set"],
+        pos=0,
+        total=1,
+        primary_set_id="current-id",
+        simulation_identity_by_set_id={"current-id": {"schema_id": "current-schema"}},
+        preview_batch_cache_token_by_set_id={"current-id": "current-token"},
+    )
+    published: list[dict[str, object]] = []
+    controller._cache_admin.publish_completion_cache = lambda **kwargs: published.append(dict(kwargs))
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        callback_identity=identity,
+    )
+
+    assert published
+    assert published[0]["set_id"] == "captured-id"
+    assert published[0]["simulation_identity"] == {"schema_id": "captured-schema"}
+    assert published[0]["preview_batch_cache_token"] == "captured-token"
 
 
 @pytest.mark.unit
@@ -4436,6 +4631,185 @@ def test_consume_parallel_batch_outcome_success_calls_on_complete_and_clears_map
     assert not controller._batch_parallel.has_active_requests()
     controller._on_simulation_complete.assert_called_once()
 
+
+@pytest.mark.unit
+def test_consume_parallel_batch_outcome_uses_captured_context_for_runtime_stale_after_progress_turnover(
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 0, "id2": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 1},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=[],
+        primary_set_id="id1",
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    outcome = _lane_outcome("id2", _successful_result_payload(), run_id=3, request_id=5)
+    _install_active_lane_outcomes(
+        controller,
+        {"id2": outcome},
+        set_names={"id2": "set2"},
+        callback_identities={"id2": identity},
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 2},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=["id1"],
+        primary_set_id="id1",
+    )
+    controller._cache_admin.publish_completion_cache_truth = MagicMock()
+    controller._cache_admin.publish_completion_cache = MagicMock()
+    controller.ui.results.publish_simulation_completion_result = MagicMock()
+
+    ok = _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="id2",
+        outcome=outcome,
+        run_id=3,
+        request_id=5,
+        cache_key="ck",
+        source="callback",
+    )
+
+    assert ok is True
+    current = controller.batch_context_owner.current_context_snapshot()
+    assert current["active"] is False
+    assert current["completed_set_ids"] == ["id1", "id2"]
+    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    controller._cache_admin.publish_completion_cache_truth.assert_not_called()
+    controller._cache_admin.publish_completion_cache.assert_not_called()
+    controller.ui.results.publish_simulation_completion_result.assert_not_called()
+
+
+@pytest.mark.unit
+def test_consume_parallel_batch_outcome_error_uses_captured_context_for_runtime_stale_after_progress_turnover(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    critical = MagicMock(return_value=QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", critical)
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 0, "id2": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 1},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=[],
+        primary_set_id="id1",
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    outcome = _lane_outcome(
+        "id2",
+        success=False,
+        run_id=3,
+        request_id=5,
+        failure={"kind": "internal_error", "message": "stale boom"},
+    )
+    _install_active_lane_outcomes(
+        controller,
+        {"id2": outcome},
+        set_names={"id2": "set2"},
+        callback_identities={"id2": identity},
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 2},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=["id1"],
+        primary_set_id="id1",
+    )
+
+    ok = _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="id2",
+        outcome=outcome,
+        run_id=3,
+        request_id=5,
+        cache_key="ck",
+        source="callback",
+    )
+
+    assert ok is True
+    current = controller.batch_context_owner.current_context_snapshot()
+    assert current["active"] is False
+    assert current["completed_set_ids"] == ["id1", "id2"]
+    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    critical.assert_not_called()
+    assert mw._status_label.text != "Simulation failed"
+
+
 @pytest.mark.unit
 def test_consume_parallel_batch_outcome_on_complete_exception_reports_error_and_shutdown(
     mw: _FakeMainWindow, controller: SimulationController
@@ -4667,12 +5041,31 @@ def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
         }
     )
     success_lane_outcome = _lane_outcome("ok", success_result)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2, pending_workspace_reset_set_ids=["bad", "ok"], pending_dirty_reset_generation_by_set_id={"bad": 1, "ok": 1}, explicit_cache_valid_set_ids=("bad", "ok"))
+    failed_identity = controller._capture_simulation_callback_identity(
+        run_id=1,
+        fast_mode=False,
+        request_id=2,
+        owner_epoch=None,
+        batch_set="Bad Set",
+        batch_set_id="bad",
+        cache_key="ck",
+    )
+    success_identity = controller._capture_simulation_callback_identity(
+        run_id=1,
+        fast_mode=False,
+        request_id=2,
+        owner_epoch=None,
+        batch_set="OK Set",
+        batch_set_id="ok",
+        cache_key="ck",
+    )
     _install_active_lane_outcomes(
         controller,
         {"bad": failed_lane_outcome, "ok": success_lane_outcome},
         set_names={"bad": "Bad Set", "ok": "OK Set"},
+        callback_identities={"bad": failed_identity, "ok": success_identity},
     )
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, run_id=1, request_id=2, fast_mode=False, cache_key="ck", queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], total=2, pending_workspace_reset_set_ids=["bad", "ok"], pending_dirty_reset_generation_by_set_id={"bad": 1, "ok": 1}, explicit_cache_valid_set_ids=("bad", "ok"))
     controller._active_run_id = 1
     controller._latest_sim_request_id = 2
     controller.batch_cache.active_cache_key = "ck"
@@ -4681,6 +5074,8 @@ def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
     mw.reset_mechanism_workspaces.return_value = True
     mw.discard_concentration_overlays_for_set_ids.return_value = True
     mw.message_box_critical = MagicMock()
+    publish_truth_spy = MagicMock(wraps=controller._cache_admin.publish_completion_cache_truth)
+    controller._cache_admin.publish_completion_cache_truth = publish_truth_spy
 
     assert _consume_parallel_batch_outcome_for_test(
         controller,
@@ -4713,9 +5108,71 @@ def test_parallel_batch_final_success_preserves_prior_scoped_failure_status(
 
     assert mw._status_label.text == "Batch completed with 1 failed set(s)"
     assert "Simulation complete:" not in mw._status_label.text
+    publish_truth_spy.assert_called()
+    assert publish_truth_spy.call_args.kwargs["active_cache_valid_set_ids"] == ("ok",)
+    assert publish_truth_spy.call_args.kwargs["active_cache_invalidated_set_ids"] == ("bad",)
+    assert controller.batch_cache.active_cache_valid_set_ids == ("ok",)
+    assert controller.batch_cache.active_cache_invalidated_set_ids == ("bad",)
     mw.reset_mechanism_workspaces.assert_called_once_with(["ok"])
     mw.discard_concentration_overlays_for_set_ids.assert_called_once_with(["ok"])
     mw.message_box_critical.assert_called_once()
+
+
+@pytest.mark.unit
+def test_completion_publication_cache_truth_uses_current_mutable_cache_context_for_captured_identity(
+    controller: SimulationController,
+):
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        queue_ids=["bad", "ok"],
+        queue_names=["Bad Set", "OK Set"],
+        total=2,
+        explicit_cache_valid_set_ids=("bad", "ok"),
+    )
+    stale_policy_context = controller.batch_context_owner.completion_policy_context()
+    assert stale_policy_context is not None
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        queue_ids=["bad", "ok"],
+        queue_names=["Bad Set", "OK Set"],
+        total=2,
+        completed_set_ids=["bad"],
+        explicit_cache_valid_set_ids=("ok",),
+        explicit_cache_invalidated_set_ids=("bad",),
+    )
+    current_snapshot = controller.batch_context_owner.current_context_snapshot()
+    publish_truth_spy = MagicMock(wraps=controller._cache_admin.publish_completion_cache_truth)
+    controller._cache_admin.publish_completion_cache_truth = publish_truth_spy
+    state = CompletionCallbackState(
+        run_id=1,
+        request_id=2,
+        batch_set="OK Set",
+        batch_set_id="ok",
+        cache_key="ck",
+        policy_context=stale_policy_context,
+        ctx=current_snapshot,
+        shutdown_requested=False,
+        is_preview=False,
+        slider_triggered=False,
+        explicit_batch_coalescing=False,
+    )
+
+    controller._completion_publication_owner.publish_cache_truth(state)
+
+    assert publish_truth_spy.call_args.kwargs["active_cache_valid_set_ids"] == ("ok",)
+    assert publish_truth_spy.call_args.kwargs["active_cache_invalidated_set_ids"] == ("bad",)
 
 
 @pytest.mark.unit
@@ -5893,6 +6350,41 @@ def test_start_parallel_batch_simulations_maps_submit_failure_to_affected_set(
     assert "bad" in completion_state.completed_set_ids
     assert controller._batch_parallel.active_request_count() == 1
     assert submitted == []
+
+
+@pytest.mark.unit
+def test_start_parallel_batch_simulations_records_preview_owner_epoch_in_submitted_lane_metadata(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    submitted: list[dict[str, object]] = []
+    lane_pool = _RecordingLanePool(submitted)
+    _install_ready_batch_lane_pool(controller, lane_pool, max_lanes=1)
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        rows=[0],
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        run_id=1,
+        request_id=2,
+        effective_workers=1,
+        preview_owner_epoch=7,
+        full_dsl="reaction: A -> B; k=1",
+        solver_config={"solver": "BDF"},
+        t_end=10.0,
+        fast_mode=True,
+        pending_init_seed={},
+        pending_init_applied=True,
+    )
+
+    controller._start_parallel_batch_simulations()
+
+    metadata = controller._batch_parallel.active_request_metadata("id1")
+    assert metadata["preview_owner_epoch"] == 7
+    assert metadata["callback_identity"].owner_epoch == 7
 
 
 @pytest.mark.unit
@@ -8922,8 +9414,12 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_com
     controller._active_run_id = 3
     controller.run_state.latest_sim_request_id = 11
     mw._batch_current_row.return_value = None
-    monkeypatch.setattr(controller, "_resolve_completion_mechanism", MagicMock(return_value=None))
-    monkeypatch.setattr(controller, "_update_primary_result_materialization_contract", MagicMock(return_value=False))
+    monkeypatch.setattr(controller._result_materialization_owner, "resolve_completion_mechanism", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        controller._result_materialization_owner,
+        "update_primary_result_materialization_contract",
+        MagicMock(return_value=False),
+    )
 
     controller.parallel_batch_pool_settings_changed()
 
@@ -10198,6 +10694,306 @@ def test_on_simulation_error_ignores_stale_runtime_input_epoch_before_ui_publica
 
 
 @pytest.mark.unit
+def test_completion_uses_captured_context_for_runtime_stale_after_context_turnover(
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1},
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 2},
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    cache_truth = MagicMock()
+    cache_entry = MagicMock()
+    display = MagicMock()
+    annotations = MagicMock()
+    provenance = MagicMock()
+    controller._cache_admin.publish_completion_cache_truth = cache_truth
+    controller._cache_admin.publish_completion_cache = cache_entry
+    controller.ui.results.publish_simulation_completion_result = display
+    controller.ui.results.publish_completion_intervention_annotations = annotations
+    controller.ui.provenance.publish_simulation_completion_provenance = provenance
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        callback_identity=identity,
+    )
+
+    cache_truth.assert_not_called()
+    cache_entry.assert_not_called()
+    display.assert_not_called()
+    annotations.assert_not_called()
+    provenance.assert_not_called()
+    current = controller.batch_context_owner.current_context_snapshot()
+    assert current["runtime_input_set_epoch_by_set_id"] == {"id1": 2}
+    assert "stale_runtime_input_set_ids" not in current
+
+
+@pytest.mark.unit
+def test_error_uses_captured_context_for_runtime_stale_after_context_turnover(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    critical = MagicMock(return_value=QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", critical)
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1},
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="ck",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 2},
+        cache_key="ck",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+
+    controller._on_simulation_error(
+        "stale boom",
+        callback_identity=identity,
+    )
+
+    critical.assert_not_called()
+    assert mw._status_label.text != "Simulation failed"
+    current = controller.batch_context_owner.current_context_snapshot()
+    assert current["active"] is True
+    assert current["runtime_input_set_epoch_by_set_id"] == {"id1": 2}
+    assert "stale_runtime_input_set_ids" not in current
+
+
+@pytest.mark.unit
+def test_parallel_stale_runtime_completion_consumes_current_batch_after_progress_turnover(
+    controller: SimulationController,
+):
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 0, "id2": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 1},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=[],
+        primary_set_id="id1",
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 2},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=["id1"],
+        primary_set_id="id1",
+    )
+    controller._cache_admin.publish_completion_cache_truth = MagicMock()
+    controller._cache_admin.publish_completion_cache = MagicMock()
+    controller.ui.results.publish_simulation_completion_result = MagicMock()
+
+    controller._on_simulation_complete(
+        _successful_result_payload(),
+        callback_identity=identity,
+    )
+
+    current = controller.batch_context_owner.current_context_snapshot()
+    assert current["active"] is False
+    assert current["completed_set_ids"] == ["id1", "id2"]
+    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    controller._cache_admin.publish_completion_cache_truth.assert_not_called()
+    controller._cache_admin.publish_completion_cache.assert_not_called()
+    controller.ui.results.publish_simulation_completion_result.assert_not_called()
+
+
+@pytest.mark.unit
+def test_parallel_stale_runtime_error_consumes_current_batch_after_progress_turnover(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    critical = MagicMock(return_value=QtWidgets.QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", critical)
+    controller._latest_sim_request_id = 5
+    controller._active_run_id = 3
+    controller._simulation_running = True
+    controller._slider_simulation_active = False
+    controller._simulation_worker = _FakeWorker(running=False, wait_returns=True)
+    controller._authoritative_runtime_input_epoch = 2
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 0, "id2": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 1},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=[],
+        primary_set_id="id1",
+    )
+    identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set2",
+        batch_set_id="id2",
+        cache_key="ck",
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 0, "id2": 2},
+        cache_key="ck",
+        queue_ids=["id1", "id2"],
+        queue_names=["set1", "set2"],
+        rows=[0, 1],
+        pos=0,
+        total=2,
+        completed_set_ids=["id1"],
+        primary_set_id="id1",
+    )
+
+    controller._on_simulation_error(
+        "stale boom",
+        callback_identity=identity,
+    )
+
+    current = controller.batch_context_owner.current_context_snapshot()
+    assert current["active"] is False
+    assert current["completed_set_ids"] == ["id1", "id2"]
+    assert current["stale_runtime_input_set_ids"] == ["id2"]
+    critical.assert_not_called()
+    assert mw._status_label.text != "Simulation failed"
+
+
+@pytest.mark.unit
 def test_scoped_runtime_input_supersede_rejects_affected_completion_but_accepts_unaffected(
     mw: _FakeMainWindow,
     controller: SimulationController,
@@ -11111,6 +11907,62 @@ def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
     mw.preview_initials_for_row.assert_not_called()
     mw._prepare_slider_runtime.assert_not_called()
     mw._apply_slider_overrides_to_bindings.assert_not_called()
+
+
+@pytest.mark.unit
+def test_run_simulation_internal_builds_plan_initials_from_materialization_owner(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    from kindred.core.simulation_plan import SimulationPlan
+
+    class _Text:
+        def toPlainText(self) -> str:
+            return "reaction: A -> B; k=1"
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.side_effect = ["id1"]
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0}
+    mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
+    mw._parse_sim_time_seconds.return_value = 10.0
+    controller._batch_dispatch_materialization_owner.materialize_initials = MagicMock(return_value={"A": 9.0})
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_lane_pool = MagicMock()
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0], reuse_parallel_lane_pool=False)
+
+    simulation_plan_by_set_id = controller.batch_context_owner.execution_payload_state().simulation_plan_by_set_id
+    request = SimulationPlan.from_payload(simulation_plan_by_set_id["id1"]).to_execution_request().to_payload()
+    assert request["initials"] == {"A": 9.0}
+    controller._batch_dispatch_materialization_owner.materialize_initials.assert_called_once_with(
+        row=0,
+        set_name="set1",
+        fast_mode=False,
+        pending_init_seed={},
+        pending_init_applied=False,
+    )
+
 
 @pytest.mark.unit
 def test_run_simulation_internal_non_fast_mode_multiset_plans_do_not_inherit_primary_dsl(

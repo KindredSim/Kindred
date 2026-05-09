@@ -32,7 +32,7 @@ def _default_lane_pool_factory(max_lanes: int, limit_blas_threads: bool) -> Batc
 class ParallelBatchExecutor:
     """Temporary controller adapter over the non-GUI batch runtime session."""
 
-    __slots__ = ("_runtime_session",)
+    __slots__ = ("_runtime_session", "_active_callback_identity_by_set_id")
 
     def __init__(
         self,
@@ -51,6 +51,7 @@ class ParallelBatchExecutor:
             lane_pool=lane_pool,
         )
         self._runtime_session = BatchRuntimeSession(runtime_owner)
+        self._active_callback_identity_by_set_id: Dict[str, Any] = {}
 
     @property
     def _runtime_owner(self) -> BatchRuntimeLaneOwner:
@@ -108,6 +109,7 @@ class ParallelBatchExecutor:
         active_timeout_s: float = 60.0,
         cache_key: str = "",
     ) -> None:
+        self._active_callback_identity_by_set_id.clear()
         self._runtime_session.begin(
             BatchRuntimeSessionRequest(
                 run_id=int(run_id),
@@ -151,15 +153,24 @@ class ParallelBatchExecutor:
         return self._runtime_session.lane_pool_token()
 
     def active_request_metadata(self, set_id: str) -> Dict[str, Any]:
-        return self._runtime_session.active_request_metadata(set_id)
+        sid = str(set_id or "")
+        metadata = self._runtime_session.active_request_metadata(sid)
+        callback_identity = self._active_callback_identity_by_set_id.get(sid)
+        if callback_identity is not None:
+            metadata["callback_identity"] = callback_identity
+        return metadata
 
     def discard_request(self, set_id: str) -> None:
-        self._runtime_session.discard_request(set_id)
+        sid = str(set_id or "")
+        self._active_callback_identity_by_set_id.pop(sid, None)
+        self._runtime_session.discard_request(sid)
 
     def reset_active_run_state(self) -> None:
+        self._active_callback_identity_by_set_id.clear()
         self._runtime_owner.reset_active_run_state()
 
     def reset_run_state(self) -> None:
+        self._active_callback_identity_by_set_id.clear()
         self._runtime_owner.reset_run_state()
 
     def drain_completion_queue(self) -> None:
@@ -198,14 +209,23 @@ class ParallelBatchExecutor:
         set_id: str,
         set_name: str,
         expected_owner_epoch: object = None,
+        callback_identity: object = None,
     ) -> BatchRequestHandle:
         expected_lane_owner_epoch = None if expected_owner_epoch is None else int(expected_owner_epoch)
-        return self._runtime_session.submit_task(
-            task,
-            set_id=str(set_id or ""),
-            set_name=str(set_name or set_id or ""),
-            expected_owner_epoch=expected_lane_owner_epoch,
-        )
+        sid = str(set_id or "")
+        if callback_identity is not None:
+            self._active_callback_identity_by_set_id[sid] = callback_identity
+        try:
+            handle = self._runtime_session.submit_task(
+                task,
+                set_id=sid,
+                set_name=str(set_name or set_id or ""),
+                expected_owner_epoch=expected_lane_owner_epoch,
+            )
+        except Exception:
+            self._active_callback_identity_by_set_id.pop(sid, None)
+            raise
+        return handle
 
     def shutdown(
         self,
@@ -213,6 +233,7 @@ class ParallelBatchExecutor:
         force_terminate: bool,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None:
+        self._active_callback_identity_by_set_id.clear()
         self._runtime_session.shutdown(
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=record_nonfatal_exception,

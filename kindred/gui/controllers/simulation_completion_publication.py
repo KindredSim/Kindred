@@ -251,7 +251,7 @@ class SimulationCompletionPublicationOwner:
             )
             return
         cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
-            context=state.policy_context or self._batch_context_owner.completion_policy_context(state.ctx),
+            context=self._explicit_cache_policy_context(state),
             cache_state=self._deps.completion_policy_cache_state(),
             cache_key=state.cache_key,
         )
@@ -535,7 +535,13 @@ class SimulationCompletionPublicationOwner:
             return True
         total = max(1, int(completion_state.total or len(completion_state.queue_ids) or 1))
         if state.stale_fast_handoff_after_display:
-            state.ctx = self._batch_context_owner.deactivate()
+            state.ctx = self._batch_context_owner.deactivate_if_active(
+                state.ctx if isinstance(state.ctx, Mapping) else None
+            )
+            return True
+        if isinstance(state.ctx, Mapping) and not self._batch_context_owner.context_matches_current_run_identity(
+            state.ctx
+        ):
             return True
         if completion_state.parallel:
             transition = self._batch_context_owner.record_parallel_success(
@@ -659,11 +665,30 @@ class SimulationCompletionPublicationOwner:
         if state.is_preview or state.policy_context is None:
             return None, False
         cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
-            context=state.policy_context,
+            context=self._explicit_cache_policy_context(state),
             cache_state=self._deps.completion_policy_cache_state(),
             cache_key=state.cache_key,
         )
         return cache_reconciliation.redraw_valid_set_ids, bool(cache_reconciliation.has_redraw_subset)
+
+    def _explicit_cache_policy_context(self, state: CompletionCallbackState) -> CompletionPolicyContext:
+        if isinstance(state.ctx, Mapping) and self._batch_context_owner.context_matches_current_run_identity(
+            state.ctx
+        ):
+            current_context = self._batch_context_owner.completion_policy_context()
+            if current_context is not None:
+                return current_context
+        context = state.policy_context or self._batch_context_owner.completion_policy_context(state.ctx)
+        if context is None:
+            return CompletionPolicyContext(
+                active=False,
+                request_id=state.request_id,
+                run_id=state.run_id,
+                fast_mode=bool(state.is_preview),
+                parallel=False,
+                keep_lane_pool_alive=False,
+            )
+        return context
 
     def _cache_plan_for_set(self, state: CompletionCallbackState) -> SimulationPlan | None:
         try:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Mapping, Optional
 
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_completion_publication import CompletionCallbackState
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,16 @@ class SimulationCompletionCallbackOwner:
         batch_set_id: Optional[str],
         cache_key: Optional[str],
         debug_batch_parallel: bool,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ) -> None:
+        if callback_identity is not None:
+            run_id = callback_identity.run_id
+            fast_mode = callback_identity.fast_mode
+            request_id = callback_identity.request_id
+            owner_epoch = callback_identity.owner_epoch
+            batch_set = callback_identity.batch_set
+            batch_set_id = callback_identity.batch_set_id
+            cache_key = callback_identity.cache_key
         active_run_id = int(self._deps.active_run_id())
         shutdown_requested = bool(self._deps.shutdown_requested())
         if run_id is not None and int(run_id) != active_run_id:
@@ -67,25 +77,39 @@ class SimulationCompletionCallbackOwner:
             )
             return
 
-        ctx: Mapping[str, Any] | None = None
+        ctx: Mapping[str, Any] | None = (
+            callback_identity.context_snapshot
+            if callback_identity is not None and isinstance(callback_identity.context_snapshot, Mapping)
+            else None
+        )
         if batch_set is None or batch_set_id is None:
-            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item()
+            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(ctx)
             if batch_set is None:
                 batch_set = hinted_set
             if batch_set_id is None:
                 batch_set_id = hinted_set_id
         if batch_set_id is None and isinstance(batch_set, str):
             batch_set_id = self._ui.batch.batch_set_id_for_name(batch_set)
-        if self._deps.active_batch_context_runtime_input_stale_for_set(batch_set_id=batch_set_id):
+        if self._deps.active_batch_context_runtime_input_stale_for_set(
+            batch_set_id=batch_set_id,
+            context=ctx if isinstance(ctx, Mapping) else None,
+        ):
             logger.debug(
                 "Ignoring stale simulation completion (batch_set_id=%s, current_global_epoch=%s)",
                 str(batch_set_id or ""),
                 int(self._deps.current_global_epoch()),
             )
-            self._deps.mark_stale_runtime_input_callback_consumed(batch_set_id=batch_set_id)
+            self._deps.mark_stale_runtime_input_callback_consumed(
+                batch_set_id=batch_set_id,
+                context=ctx if isinstance(ctx, Mapping) else None,
+            )
             return
 
-        policy_context = self._batch_context_owner.completion_policy_context()
+        policy_context = (
+            callback_identity.policy_context
+            if callback_identity is not None and callback_identity.policy_context is not None
+            else self._batch_context_owner.completion_policy_context()
+        )
         latest_request_id = int(self._deps.latest_request_id())
         callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
@@ -151,7 +175,10 @@ class SimulationCompletionCallbackOwner:
             bool(stale_fast_decision.defer_context_deactivation_until_after_display),
         )
 
-        self._deps.apply_completion_policy_state_patch(stale_fast_decision.state_patch)
+        self._deps.apply_completion_policy_state_patch(
+            stale_fast_decision.state_patch,
+            base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
+        )
         if stale_fast_decision.display_current_preview:
             state.stale_fast_handoff_after_display = bool(
                 stale_fast_decision.defer_context_deactivation_until_after_display

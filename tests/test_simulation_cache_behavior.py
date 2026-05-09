@@ -2071,6 +2071,10 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
         sub for sub in simulation_submissions[2:] if str(sub.args[0].get("set_id") or "") == str(primary_id)
     )
     replay_task = dict(replay_submission.args[0])
+    replay_metadata = main_window.simulation_controller.parallel_batch.active_request_metadata(primary_id)
+    replay_identity = replay_metadata.get("callback_identity")
+    assert replay_metadata["preview_owner_epoch"] == replay_identity.owner_epoch
+    assert replay_metadata["owner_epoch"] is None
     replay_submission.complete(
         {
             "run_id": int(replay_task.get("run_id") or 0),

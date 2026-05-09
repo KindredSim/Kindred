@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Mapping, Optional
 
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     is_cancelled_failure,
@@ -58,7 +59,18 @@ class SimulationErrorHandlingOwner:
         owner_epoch: Optional[int],
         batch_set: Optional[str],
         batch_set_id: Optional[str],
+        cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ) -> None:
+        _ = cache_key
+        if callback_identity is not None:
+            run_id = callback_identity.run_id
+            fast_mode = callback_identity.fast_mode
+            request_id = callback_identity.request_id
+            owner_epoch = callback_identity.owner_epoch
+            batch_set = callback_identity.batch_set
+            batch_set_id = callback_identity.batch_set_id
+            cache_key = callback_identity.cache_key
         error_payload = coerce_simulation_failure(error_msg)
         error_text = simulation_failure_user_message(error_payload)
         error_detail_text = simulation_failure_detail_text(error_payload)
@@ -73,9 +85,13 @@ class SimulationErrorHandlingOwner:
             )
             return
         latest_request_id = int(self._deps.latest_request_id())
-        ctx = None
+        ctx = (
+            callback_identity.context_snapshot
+            if callback_identity is not None and isinstance(callback_identity.context_snapshot, Mapping)
+            else None
+        )
         if batch_set is None or batch_set_id is None:
-            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item()
+            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(ctx)
             if batch_set is None:
                 batch_set = hinted_set
             if batch_set_id is None:
@@ -84,6 +100,7 @@ class SimulationErrorHandlingOwner:
             batch_set_id = self._ui.batch.batch_set_id_for_name(batch_set)
         if self._deps.active_batch_context_runtime_input_stale_for_set(
             batch_set_id=batch_set_id,
+            context=ctx if isinstance(ctx, Mapping) else None,
         ):
             logger.debug(
                 "Ignoring stale simulation error (batch_set_id=%s, current_global_epoch=%s): %s",
@@ -91,9 +108,16 @@ class SimulationErrorHandlingOwner:
                 int(self._deps.current_global_epoch()),
                 error_text,
             )
-            self._deps.mark_stale_runtime_input_callback_consumed(batch_set_id=batch_set_id)
+            self._deps.mark_stale_runtime_input_callback_consumed(
+                batch_set_id=batch_set_id,
+                context=ctx if isinstance(ctx, Mapping) else None,
+            )
             return
-        policy_context = self._batch_context_owner.completion_policy_context()
+        policy_context = (
+            callback_identity.policy_context
+            if callback_identity is not None and callback_identity.policy_context is not None
+            else self._batch_context_owner.completion_policy_context()
+        )
         callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
             context=policy_context,
@@ -131,6 +155,7 @@ class SimulationErrorHandlingOwner:
 
             self._deps.apply_completion_policy_state_patch(
                 stale_fast_decision.state_patch,
+                base_context=ctx if isinstance(ctx, Mapping) else None,
             )
             self._deps.apply_lifecycle_effects(
                 self._lifecycle_effect_owner.superseded_fast_error_effects(

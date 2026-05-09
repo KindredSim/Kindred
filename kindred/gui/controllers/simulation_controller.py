@@ -9,7 +9,6 @@ import os
 from time import perf_counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-import numpy as np
 from PySide6 import QtCore
 import shiboken6
 
@@ -36,6 +35,11 @@ from kindred.gui.controllers.batch_dispatch_plan import (
     build_parallel_batch_task_plan,
     build_serial_batch_dispatch_plan,
 )
+from kindred.gui.controllers.batch_dispatch_materialization import BatchDispatchMaterializationOwner
+from kindred.gui.controllers.serial_worker_launch import (
+    ContainedSerialWorkerLaunchOwner,
+    ContainedSerialWorkerLaunchRequest,
+)
 from kindred.gui.controllers.simulation_run_preparation import (
     RunDispatchContext,
     RunMechanismContext,
@@ -45,6 +49,7 @@ from kindred.gui.controllers.simulation_run_preparation import (
     SimulationRunPreparationPorts,
     build_run_start_context,
 )
+from kindred.gui.controllers.simulation_result_materialization import SimulationResultMaterializationOwner
 from kindred.gui.controllers.simulation_completion_policy import (
     CacheAuthorityState,
     CompletionPolicyContext,
@@ -54,8 +59,8 @@ from kindred.gui.controllers.simulation_completion_policy import (
     PolicyStatePatch,
     RunActivitySnapshot,
     SimulationCompletionPolicy,
-    pending_initial_seed_for_set,
 )
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_completion_callback import (
     SimulationCompletionCallbackDependencies,
     SimulationCompletionCallbackOwner,
@@ -111,16 +116,6 @@ class _SerialBatchDispatchState:
     cache_key: str
     worker_signature: str | None
     context: Mapping[str, Any] | None
-
-
-def _try_float(value: object) -> Optional[float]:
-    try:
-        out = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not np.isfinite(out):
-        return None
-    return float(out)
 
 
 def _safe_int(value: object, *, default: int = 0) -> int:
@@ -259,6 +254,10 @@ class SimulationController(QtCore.QObject):
             ),
         )
         self._batch_context_owner = BatchRunContextOwner()
+        self._batch_dispatch_materialization_owner = BatchDispatchMaterializationOwner(
+            batch=self.ui.batch,
+            slider=self.ui.slider,
+        )
         self._authoritative_mechanism_transition_epoch = 0
         self._authoritative_runtime_input_epoch = 0
         self._authoritative_runtime_input_global_epoch = 0
@@ -298,6 +297,10 @@ class SimulationController(QtCore.QObject):
         self._batch_runtime_lane_budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
         self._completion_policy = SimulationCompletionPolicy()
         self._lifecycle_effect_owner = SimulationLifecycleEffectOwner()
+        self._result_materialization_owner = SimulationResultMaterializationOwner(
+            ui=self.ui,
+            record_nonfatal_exception=self._record_nonfatal_exception,
+        )
         self._completion_publication_owner = SimulationCompletionPublicationOwner(
             ui=self.ui,
             batch_context_owner=self._batch_context_owner,
@@ -309,15 +312,11 @@ class SimulationController(QtCore.QObject):
                 completion_policy_cache_state=lambda *args, **kwargs: self._completion_policy_cache_state(
                     *args, **kwargs
                 ),
-                resolve_completion_mechanism=lambda *args, **kwargs: self._resolve_completion_mechanism(
-                    *args, **kwargs
-                ),
+                resolve_completion_mechanism=self._result_materialization_owner.resolve_completion_mechanism,
                 update_primary_result_materialization_contract=(
-                    lambda *args, **kwargs: self._update_primary_result_materialization_contract(*args, **kwargs)
+                    self._result_materialization_owner.update_primary_result_materialization_contract
                 ),
-                remember_primary_result_mechanism=lambda *args, **kwargs: self._remember_primary_result_mechanism(
-                    *args, **kwargs
-                ),
+                remember_primary_result_mechanism=self._result_materialization_owner.remember_primary_result_mechanism,
                 include_mechanism_in_result_payload=lambda *args, **kwargs: self._include_mechanism_in_result_payload(
                     *args, **kwargs
                 ),
@@ -333,9 +332,7 @@ class SimulationController(QtCore.QObject):
                 show_scoped_batch_failure_summary=lambda *args, **kwargs: self._show_scoped_batch_failure_summary(
                     *args, **kwargs
                 ),
-                refresh_primary_result_controls=lambda *args, **kwargs: self._refresh_primary_result_controls(
-                    *args, **kwargs
-                ),
+                refresh_primary_result_controls=self._result_materialization_owner.refresh_primary_result_controls,
                 has_deferred_preview_replay_intent=lambda *args, **kwargs: self._has_deferred_preview_replay_intent(
                     *args, **kwargs
                 ),
@@ -470,6 +467,13 @@ class SimulationController(QtCore.QObject):
             ),
         )
         self._runtime_application = SimulationRuntimeApplication()
+        self._contained_serial_worker_launch_owner = ContainedSerialWorkerLaunchOwner(
+            acquire_ready_owner_for_plan=lambda **kwargs: self._acquire_ready_contained_simulation_owner_for_plan(
+                **kwargs
+            ),
+            release_owner=lambda owner, *, kill=False: self._runtime_application.release_owner(owner, kill=kill),
+            record_nonfatal_exception=self._record_nonfatal_exception,
+        )
 
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
@@ -1518,6 +1522,7 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ):
         return self._on_simulation_complete(
             result,
@@ -1527,6 +1532,7 @@ class SimulationController(QtCore.QObject):
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
+            callback_identity=callback_identity,
         )
 
     def on_simulation_error(
@@ -1539,6 +1545,7 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ) -> None:
         self._on_simulation_error(
             error_msg,
@@ -1548,6 +1555,7 @@ class SimulationController(QtCore.QObject):
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
+            callback_identity=callback_identity,
         )
 
     def _dispatch_simulation_complete(
@@ -1561,25 +1569,38 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ):
-        if owner_epoch is None:
-            return self.on_simulation_complete(
-                result,
-                run_id=run_id,
-                fast_mode=fast_mode,
-                request_id=request_id,
-                batch_set=batch_set,
-                batch_set_id=batch_set_id,
-                cache_key=cache_key,
-            )
-        return self._on_simulation_complete(
-            result,
+        identity = callback_identity or self._capture_simulation_callback_identity(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
             owner_epoch=owner_epoch,
             batch_set=batch_set,
             batch_set_id=batch_set_id,
+            cache_key=cache_key,
+        )
+        if identity.owner_epoch is None:
+            return self.on_simulation_complete(
+                result,
+                run_id=identity.run_id,
+                fast_mode=identity.fast_mode,
+                request_id=identity.request_id,
+                batch_set=identity.batch_set,
+                batch_set_id=identity.batch_set_id,
+                cache_key=identity.cache_key,
+                callback_identity=identity,
+            )
+        return self._on_simulation_complete(
+            result,
+            run_id=identity.run_id,
+            fast_mode=identity.fast_mode,
+            request_id=identity.request_id,
+            owner_epoch=identity.owner_epoch,
+            batch_set=identity.batch_set,
+            batch_set_id=identity.batch_set_id,
+            cache_key=identity.cache_key,
+            callback_identity=identity,
         )
 
     def _dispatch_simulation_error(
@@ -1593,26 +1614,62 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ) -> None:
-        if owner_epoch is None:
-            self.on_simulation_error(
-                error_msg,
-                run_id=run_id,
-                fast_mode=fast_mode,
-                request_id=request_id,
-                batch_set=batch_set,
-                batch_set_id=batch_set_id,
-                cache_key=cache_key,
-            )
-            return
-        self._on_simulation_error(
-            error_msg,
+        identity = callback_identity or self._capture_simulation_callback_identity(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
             owner_epoch=owner_epoch,
             batch_set=batch_set,
             batch_set_id=batch_set_id,
+            cache_key=cache_key,
+        )
+        if identity.owner_epoch is None:
+            self.on_simulation_error(
+                error_msg,
+                run_id=identity.run_id,
+                fast_mode=identity.fast_mode,
+                request_id=identity.request_id,
+                batch_set=identity.batch_set,
+                batch_set_id=identity.batch_set_id,
+                cache_key=identity.cache_key,
+                callback_identity=identity,
+            )
+            return
+        self._on_simulation_error(
+            error_msg,
+            run_id=identity.run_id,
+            fast_mode=identity.fast_mode,
+            request_id=identity.request_id,
+            owner_epoch=identity.owner_epoch,
+            batch_set=identity.batch_set,
+            batch_set_id=identity.batch_set_id,
+            cache_key=identity.cache_key,
+            callback_identity=identity,
+        )
+
+    def _capture_simulation_callback_identity(
+        self,
+        *,
+        run_id: Optional[int],
+        fast_mode: Optional[bool],
+        request_id: Optional[int],
+        owner_epoch: Optional[int],
+        batch_set: Optional[str],
+        batch_set_id: Optional[str],
+        cache_key: Optional[str],
+    ) -> SimulationCallbackIdentity:
+        return SimulationCallbackIdentity.capture(
+            run_id=run_id,
+            fast_mode=fast_mode,
+            request_id=request_id,
+            owner_epoch=owner_epoch,
+            batch_set=batch_set,
+            batch_set_id=batch_set_id,
+            cache_key=cache_key,
+            policy_context=self._batch_context_owner.completion_policy_context(),
+            context_snapshot=self._batch_context_owner.current_context_snapshot(),
         )
 
     def _record_nonfatal_exception(self, context: str, exc: BaseException) -> None:
@@ -2265,47 +2322,46 @@ class SimulationController(QtCore.QObject):
         self._disconnect_simulation_worker_application_signals(worker)
         connected_handlers = list(getattr(worker, _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR, ()) or ())
         progress_handler = self.on_simulation_progress
+        callback_identity = self._capture_simulation_callback_identity(
+            run_id=run_id,
+            fast_mode=fast_mode,
+            request_id=request_id,
+            owner_epoch=owner_epoch,
+            batch_set=set_name,
+            batch_set_id=set_id,
+            cache_key=cache_key,
+        )
 
         def result_handler(
             payload,
-            _rid=run_id,
-            _fast=bool(fast_mode),
-            _req=int(request_id),
-            _owner_epoch=owner_epoch,
-            _set=set_name,
-            _sid=set_id,
-            _key=cache_key,
+            _identity=callback_identity,
         ):
             return self._dispatch_simulation_complete(
                 payload,
-                run_id=_rid,
-                fast_mode=_fast,
-                request_id=_req,
-                owner_epoch=_owner_epoch,
-                batch_set=_set,
-                batch_set_id=_sid,
-                cache_key=_key,
+                run_id=_identity.run_id,
+                fast_mode=_identity.fast_mode,
+                request_id=_identity.request_id,
+                owner_epoch=_identity.owner_epoch,
+                batch_set=_identity.batch_set,
+                batch_set_id=_identity.batch_set_id,
+                cache_key=_identity.cache_key,
+                callback_identity=_identity,
             )
 
         def error_handler(
             msg,
-            _rid=run_id,
-            _fast=bool(fast_mode),
-            _req=int(request_id),
-            _owner_epoch=owner_epoch,
-            _set=set_name,
-            _sid=set_id,
-            _key=cache_key,
+            _identity=callback_identity,
         ):
             return self._dispatch_simulation_error(
                 msg,
-                run_id=_rid,
-                fast_mode=_fast,
-                request_id=_req,
-                owner_epoch=_owner_epoch,
-                batch_set=_set,
-                batch_set_id=_sid,
-                cache_key=_key,
+                run_id=_identity.run_id,
+                fast_mode=_identity.fast_mode,
+                request_id=_identity.request_id,
+                owner_epoch=_identity.owner_epoch,
+                batch_set=_identity.batch_set,
+                batch_set_id=_identity.batch_set_id,
+                cache_key=_identity.cache_key,
+                callback_identity=_identity,
             )
 
         for signal_name, handler in (
@@ -2667,7 +2723,13 @@ class SimulationController(QtCore.QObject):
         self,
         *,
         batch_set_id: Optional[str],
+        context: Optional[Mapping[str, Any]] = None,
     ) -> bool:
+        if isinstance(context, Mapping):
+            return self._runtime_input_context_stale_for_set(
+                context,
+                batch_set_id=batch_set_id,
+            )
         set_id = str(batch_set_id or "").strip()
         return self._batch_context_owner.active_runtime_input_stale_for_set(
             batch_set_id=set_id,
@@ -2680,9 +2742,12 @@ class SimulationController(QtCore.QObject):
         self,
         *,
         batch_set_id: Optional[str],
+        context: Optional[Mapping[str, Any]] = None,
     ) -> None:
         set_id = str(batch_set_id or "").strip()
         if not set_id:
+            return
+        if isinstance(context, Mapping) and not self._batch_context_owner.context_matches_current_run_identity(context):
             return
         transition = self._batch_context_owner.record_parallel_stale_callback_consumed_if_active(set_id=set_id)
         if transition is None:
@@ -3510,17 +3575,13 @@ class SimulationController(QtCore.QObject):
         pending_init_applied: bool,
         include_preview_initials: bool,
     ) -> Dict[str, float]:
-        initials_dict = self.ui.batch.batch_initials_for_row(int(row))
-        pending_seed_for_set = pending_initial_seed_for_set(pending_init_seed, set_name=str(set_name))
-        if pending_seed_for_set and (not bool(pending_init_applied)):
-            for sp, val in pending_seed_for_set.items():
-                float_val = _try_float(val)
-                if float_val is None:
-                    continue
-                initials_dict[str(sp)] = float_val
-        if bool(include_preview_initials):
-            return self.ui.slider.preview_initials_for_row(int(row), initials_dict)
-        return initials_dict
+        return self._batch_dispatch_materialization_owner.materialize_initials(
+            row=int(row),
+            set_name=str(set_name),
+            fast_mode=bool(include_preview_initials),
+            pending_init_seed=pending_init_seed,
+            pending_init_applied=bool(pending_init_applied),
+        )
 
     def _invalidate_preserved_pending_init_results_after_failed_run(
         self,
@@ -3849,38 +3910,20 @@ class SimulationController(QtCore.QObject):
         max_workers = max(1, int(payload.effective_workers))
 
         prior_lane_pool_token = self._batch_parallel.lane_pool_token()
-        try:
-            existing_capacity = self._batch_parallel.current_max_workers
-            pool_already_warmed = bool(
-                self._batch_parallel.has_lane_pool()
-                and (not self._batch_parallel.is_pool_stale)
-                and existing_capacity is not None
-                and int(existing_capacity) >= int(max_workers)
-                and self._batch_parallel.has_ready_lane_pool(max_lanes=int(max_workers))
-            )
-            if pool_already_warmed:
-                lane_pool = self._batch_parallel.ensure_lane_pool(max_lanes=int(max_workers))
+        availability = self._parallel_batch_runtime_readiness_owner.run_start_availability(
+            required_lanes=int(max_workers)
+        )
+        lane_pool = availability.lane_pool
+        if not availability.ready:
+            if availability.error is not None:
+                logger.warning("Parallel batch lane pool unavailable: %s", availability.error)
+                self._handle_parallel_batch_runtime_check_failed(availability.error)
             else:
-                batch_runtime_state = self._batch_parallel.runtime_snapshot()
-                runtime_snapshot = _runtime_readiness_snapshot(
-                    mode="batch",
-                    status="warming",
-                    ready=False,
-                    generation=int(getattr(batch_runtime_state, "current_generation", 0) or 0),
-                    message="Preparing batch runtime...",
-                    required=True,
-                    controls_ready=False,
-                    polling=True,
-                )
                 self._handle_parallel_batch_runtime_waiting(
                     rows=rows,
                     queue_ids=queue_ids,
-                    runtime_snapshot=runtime_snapshot,
+                    runtime_snapshot=availability.snapshot,
                 )
-                return
-        except Exception as exc:
-            logger.warning("Parallel batch lane pool unavailable: %s", exc)
-            self._handle_parallel_batch_runtime_check_failed(exc)
             return
         waiting_state = self._batch_context_owner.active_batch_state()
         if waiting_state is not None and waiting_state.runtime_waiting:
@@ -4016,7 +4059,13 @@ class SimulationController(QtCore.QObject):
             row = int(rows[idx])
             set_name = str(queue_names[idx]) if 0 <= idx < len(queue_names) else str(set_id)
             try:
-                initials_dict = self.ui.batch.batch_initials_for_row(row)
+                initials_dict = self._batch_dispatch_materialization_owner.materialize_initials(
+                    row=row,
+                    set_name=str(set_name),
+                    fast_mode=bool(payload.fast_mode),
+                    pending_init_seed=pending_seed,
+                    pending_init_applied=bool(pending_init_applied),
+                )
             except Exception as exc:
                 self.ui.dialogs.message_box_warning(
                     "Invalid Initial Conditions",
@@ -4032,15 +4081,6 @@ class SimulationController(QtCore.QObject):
                 self._slider_simulation_active = False
                 self._invalidate_preserved_pending_init_results_after_failed_run(ctx=ctx)
                 return False
-            pending_seed_for_set = pending_initial_seed_for_set(pending_seed, set_name=str(set_name))
-            if pending_seed_for_set and (not pending_init_applied):
-                for sp, val in pending_seed_for_set.items():
-                    float_val = _try_float(val)
-                    if float_val is None:
-                        continue
-                    initials_dict[str(sp)] = float_val
-            if payload.fast_mode:
-                initials_dict = self.ui.slider.preview_initials_for_row(row, initials_dict)
 
             task_plan = build_parallel_batch_task_plan(
                 ParallelBatchTaskInput(
@@ -4058,10 +4098,20 @@ class SimulationController(QtCore.QObject):
             )
             sid = str(set_id)
             try:
+                callback_identity = self._capture_simulation_callback_identity(
+                    run_id=payload.run_id,
+                    fast_mode=payload.fast_mode,
+                    request_id=payload.request_id,
+                    owner_epoch=payload.preview_owner_epoch,
+                    batch_set=str(set_name),
+                    batch_set_id=sid,
+                    cache_key=payload.cache_key,
+                )
                 self._batch_parallel.submit_task(
                     task_plan.task,
                     set_id=sid,
                     set_name=str(set_name),
+                    callback_identity=callback_identity,
                 )
             except Exception as exc:
                 self._record_nonfatal_exception(
@@ -4156,6 +4206,15 @@ class SimulationController(QtCore.QObject):
         include_mechanism_in_result_payload: bool,
         worker_signature: str | None,
     ) -> bool:
+        callback_identity = self._capture_simulation_callback_identity(
+            run_id=int(run_id),
+            fast_mode=bool(fast_mode),
+            request_id=int(request_id),
+            owner_epoch=owner_epoch,
+            batch_set=str(set_name),
+            batch_set_id=str(set_id),
+            cache_key=str(cache_key),
+        )
         if not isinstance(plan_payload, dict):
             self._dispatch_simulation_error(
                 simulation_failure_from_exception(
@@ -4169,40 +4228,27 @@ class SimulationController(QtCore.QObject):
                 batch_set=str(set_name),
                 batch_set_id=str(set_id),
                 cache_key=str(cache_key),
+                callback_identity=callback_identity,
             )
             return False
 
-        contained_owner = None
         try:
-            from kindred.core.simulation_containment import build_contained_simulation_plan_payload
-            from kindred.gui.simulation_worker import ContainedSimulationWorker
-
-            contained_plan_payload = build_contained_simulation_plan_payload(dict(plan_payload))
-            contained_owner = self._acquire_ready_contained_simulation_owner_for_plan(
-                fast_mode=bool(fast_mode),
-                simulation_plan_payload=contained_plan_payload,
+            self._simulation_worker = self._contained_serial_worker_launch_owner.create_worker(
+                ContainedSerialWorkerLaunchRequest(
+                    plan_payload=plan_payload,
+                    callback_identity=callback_identity,
+                    include_mechanism_in_result_payload=bool(include_mechanism_in_result_payload),
+                    worker_signature=worker_signature,
+                    parent=self,
+                )
             )
-            if contained_owner is None:
+            if self._simulation_worker is None:
                 self._abort_for_unready_interactive_runtime(
                     fast_mode=bool(fast_mode),
                     context=context or {},
                 )
                 return False
-            self._simulation_worker = ContainedSimulationWorker(
-                owner=contained_owner,
-                simulation_plan_payload=contained_plan_payload,
-                include_mechanism_in_result_payload=include_mechanism_in_result_payload,
-                parent=self,
-            )
         except Exception as exc:
-            if contained_owner is not None:
-                try:
-                    self._runtime_application.release_owner(contained_owner, kill=False)
-                except Exception as release_exc:
-                    self._record_nonfatal_exception(
-                        "Failed to release acquired simulation runtime owner after worker construction failure",
-                        release_exc,
-                    )
             self._dispatch_simulation_error(
                 simulation_failure_from_exception(exc, kind="simulation_containment_payload"),
                 run_id=int(run_id),
@@ -4212,18 +4258,9 @@ class SimulationController(QtCore.QObject):
                 batch_set=str(set_name),
                 batch_set_id=str(set_id),
                 cache_key=str(cache_key),
+                callback_identity=callback_identity,
             )
             return False
-
-        self._simulation_worker._run_id = int(run_id)  # type: ignore[attr-defined]
-        self._simulation_worker._request_id = int(request_id)  # type: ignore[attr-defined]
-        self._simulation_worker._fast_mode = bool(fast_mode)  # type: ignore[attr-defined]
-        self._simulation_worker._batch_set_name = str(set_name)  # type: ignore[attr-defined]
-        self._simulation_worker._batch_set_id = str(set_id)  # type: ignore[attr-defined]
-        self._simulation_worker._batch_cache_key = str(cache_key)  # type: ignore[attr-defined]
-        if worker_signature:
-            self._simulation_worker._batch_mechanism_signature = str(worker_signature)  # type: ignore[attr-defined]
-        self._simulation_worker._simulation_plan = dict(plan_payload)  # type: ignore[attr-defined]
 
         self._connect_simulation_worker_application_signals(
             self._simulation_worker,
@@ -4300,7 +4337,13 @@ class SimulationController(QtCore.QObject):
         row = int(payload.row)
 
         try:
-            initials_dict = self.ui.batch.batch_initials_for_row(row)
+            initials_dict = self._batch_dispatch_materialization_owner.materialize_initials(
+                row=row,
+                set_name=str(set_name),
+                fast_mode=bool(payload.fast_mode),
+                pending_init_seed=payload.pending_init_seed,
+                pending_init_applied=bool(payload.pending_init_applied),
+            )
         except Exception as exc:
             self._abort_serial_batch_for_invalid_initials(
                 row=int(row),
@@ -4311,17 +4354,7 @@ class SimulationController(QtCore.QObject):
                 exc=exc,
             )
             return
-        pending_seed = payload.pending_init_seed
-        pending_seed_for_set = pending_initial_seed_for_set(pending_seed, set_name=str(set_name))
-        if pending_seed_for_set and (not bool(payload.pending_init_applied)):
-            for sp, val in pending_seed_for_set.items():
-                float_val = _try_float(val)
-                if float_val is None:
-                    continue
-                initials_dict[str(sp)] = float_val
         fast_mode = bool(payload.fast_mode)
-        if bool(fast_mode):
-            initials_dict = self.ui.slider.preview_initials_for_row(row, initials_dict)
 
         request_id = int(payload.request_id)
         dispatch_state = self._serial_batch_dispatch_state(
@@ -4783,123 +4816,6 @@ class SimulationController(QtCore.QObject):
         finally:
             self._processing_progress = False
 
-    def _resolve_completion_mechanism(
-        self,
-        *,
-        mechanism: object | None,
-        mechanism_text: str,
-        solver_config: Mapping[str, Any],
-        is_preview: bool,
-        is_primary: bool,
-    ) -> object | None:
-        if mechanism is not None:
-            return mechanism
-        if bool(is_preview) or (not bool(is_primary)):
-            return None
-        mechanism_text_s = str(mechanism_text or "")
-        if not mechanism_text_s.strip():
-            return None
-        try:
-            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-            from kindred.core.units import UnitsModel
-
-            temp_for_parse = float((solver_config or {}).get("temperature_K") or self.ui.solver.temperature_spinbox_value())
-            return parse_dsl_to_mechanism(
-                mechanism_text_s,
-                initials={},
-                units=UnitsModel(temperature_K=temp_for_parse, energy_unit="kJ/mol"),
-            )
-        except Exception:
-            return None
-
-    def _update_primary_result_materialization_contract(
-        self,
-        *,
-        mechanism: object | None,
-        mechanism_text: str,
-        solver_config: Mapping[str, Any],
-        is_preview: bool,
-        is_primary: bool,
-    ) -> bool:
-        energy_mode = bool(
-            mechanism is not None
-            and (
-                self.ui.runtime.is_energy_mode_mechanism(mechanism)
-                or self.ui.runtime.dsl_has_computational_mode_generated_block(str(mechanism_text))
-            )
-        )
-        if (not bool(is_primary)) or bool(is_preview):
-            return energy_mode
-        if energy_mode and mechanism is not None and self.ui.solver.dsl_global_temperature_K(str(mechanism_text)) is not None:
-            self.ui.runtime.sync_energy_mode_temperature_from_mechanism(mechanism)
-        elif energy_mode:
-            self.ui.mechanism_helpers.set_temperature_override_state(
-                enabled=True,
-                tooltip="Temperature for thermodynamic calculations (energy mode: add T=... to override).",
-            )
-            T_spin = float(self.ui.solver.temperature_spinbox_value())
-            self.ui.mechanism_helpers.set_temperature_mode_indicator_text(
-                f"Temperature: {T_spin:.2f} K (energy mode: set T=... in DSL)"
-            )
-        else:
-            self.ui.mechanism_helpers.set_temperature_override_state(
-                enabled=True,
-                tooltip="Temperature for thermodynamic calculations",
-            )
-            self.ui.mechanism_helpers.update_temperature_mode_indicator()
-        return energy_mode
-
-    def _remember_primary_result_mechanism(
-        self,
-        *,
-        mechanism: object,
-        mechanism_text: str,
-        solver_config: Mapping[str, Any],
-    ) -> None:
-        self.ui.mechanism_helpers.remember_last_mechanism(mechanism, str(mechanism_text), dict(solver_config or {}))
-        try:
-            self.ui.batch.sync_batch_species_columns(
-                mechanism.species_names(),
-                preserve_active_cache=True,
-            )
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                "Failed to sync batch species columns after primary simulation completion",
-                exc,
-            )
-
-    def _refresh_primary_result_controls(
-        self,
-        *,
-        mechanism: object | None,
-        energy_mode: bool,
-        slider_triggered: bool,
-        is_primary: bool,
-    ) -> None:
-        if not bool(is_primary):
-            return
-        if bool(energy_mode) and mechanism is not None:
-            self.ui.runtime.populate_energy_mode_variables_from_mechanism(
-                mechanism,
-                refresh_sliders=bool((not self.ui.slider.suppress_slider_refresh()) and (not bool(slider_triggered))),
-                preserve_visibility=True,
-            )
-            if bool(slider_triggered):
-                self.ui.slider.set_slider_triggered_simulation(False)
-            return
-        if self.ui.slider.suppress_slider_refresh():
-            if bool(slider_triggered):
-                logger.debug("Suppressed slider refresh during live drag")
-                self.ui.slider.set_slider_triggered_simulation(False)
-            return
-        if not bool(slider_triggered):
-            self.ui.runtime.extract_and_populate_variables(
-                preserve_visibility=True
-            )
-            return
-        self.ui.slider.set_slider_triggered_simulation(False)
-        logger.debug("Skipped variable extraction (slider-triggered simulation)")
-
     def _on_simulation_complete(
         self,
         result: dict,
@@ -4911,9 +4827,9 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ):
-        self._completion_callback_owner.handle_completion(
-            result,
+        identity = callback_identity or self._capture_simulation_callback_identity(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
@@ -4921,7 +4837,18 @@ class SimulationController(QtCore.QObject):
             batch_set=batch_set,
             batch_set_id=batch_set_id,
             cache_key=cache_key,
+        )
+        self._completion_callback_owner.handle_completion(
+            result,
+            run_id=identity.run_id,
+            fast_mode=identity.fast_mode,
+            request_id=identity.request_id,
+            owner_epoch=identity.owner_epoch,
+            batch_set=identity.batch_set,
+            batch_set_id=identity.batch_set_id,
+            cache_key=identity.cache_key,
             debug_batch_parallel=bool(getattr(self, "_debug_batch_parallel", False)),
+            callback_identity=identity,
         )
 
     def _on_simulation_error(
@@ -4935,15 +4862,27 @@ class SimulationController(QtCore.QObject):
         batch_set: Optional[str] = None,
         batch_set_id: Optional[str] = None,
         cache_key: Optional[str] = None,
+        callback_identity: SimulationCallbackIdentity | None = None,
     ):
-        self._error_handling_owner.handle_error(
-            error_msg,
+        identity = callback_identity or self._capture_simulation_callback_identity(
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
             owner_epoch=owner_epoch,
             batch_set=batch_set,
             batch_set_id=batch_set_id,
+            cache_key=cache_key,
+        )
+        self._error_handling_owner.handle_error(
+            error_msg,
+            run_id=identity.run_id,
+            fast_mode=identity.fast_mode,
+            request_id=identity.request_id,
+            owner_epoch=identity.owner_epoch,
+            batch_set=identity.batch_set,
+            batch_set_id=identity.batch_set_id,
+            cache_key=identity.cache_key,
+            callback_identity=identity,
         )
 
     def _handle_current_preview_simulation_failure(
