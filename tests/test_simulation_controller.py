@@ -1346,6 +1346,76 @@ def test_set_simulation_cache_caps_clamps_and_persists(mw: _FakeMainWindow, cont
     mw._settings.setValue.assert_any_call("simulation/preview_cache_cap", 7)
 
 @pytest.mark.unit
+def test_new_contained_owner_uses_blas_thread_limit_setting(controller: SimulationController):
+    from kindred.core.runtime_defaults import contained_child_blas_thread_env
+
+    controller.parallel_batch.limit_blas_threads_per_worker = True
+    limited_owner = controller._new_contained_simulation_owner(
+        fast_mode=False,
+        simulation_plan_payload={},
+    )
+    try:
+        assert (
+            limited_owner._runtime_owner._kernel_owner._handler_spec.env
+            == contained_child_blas_thread_env(enabled=True)
+        )
+    finally:
+        limited_owner.close(kill=True)
+
+    controller.parallel_batch.limit_blas_threads_per_worker = False
+    unlimited_owner = controller._new_contained_simulation_owner(
+        fast_mode=False,
+        simulation_plan_payload={},
+    )
+    try:
+        assert unlimited_owner._runtime_owner._kernel_owner._handler_spec.env == {}
+    finally:
+        unlimited_owner.close(kill=True)
+
+
+@pytest.mark.unit
+def test_contained_owner_identity_tracks_blas_thread_limit_setting(controller: SimulationController):
+    solver_config = {"solver": "BDF", "grid": {"N": 100}, "use_sparse_jacobian": True}
+
+    controller.parallel_batch.limit_blas_threads_per_worker = True
+    limited_ordinary = controller._ordinary_contained_owner_identity(
+        owner_mechanism_text="A -> B ; k=1",
+        solver_config=solver_config,
+        t_end=10.0,
+        set_id="set-1",
+    )
+    limited_preview = controller._preview_contained_owner_identity(
+        owner_mechanism_text="A -> B ; k=1",
+        solver_config=solver_config,
+        t_end=10.0,
+        set_id="set-1",
+        parameter_names=[],
+    )
+
+    controller.parallel_batch.limit_blas_threads_per_worker = False
+    unlimited_ordinary = controller._ordinary_contained_owner_identity(
+        owner_mechanism_text="A -> B ; k=1",
+        solver_config=solver_config,
+        t_end=10.0,
+        set_id="set-1",
+    )
+    unlimited_preview = controller._preview_contained_owner_identity(
+        owner_mechanism_text="A -> B ; k=1",
+        solver_config=solver_config,
+        t_end=10.0,
+        set_id="set-1",
+        parameter_names=[],
+    )
+
+    assert limited_ordinary["contained_child_blas_threads_limited"] is True
+    assert limited_preview["contained_child_blas_threads_limited"] is True
+    assert unlimited_ordinary["contained_child_blas_threads_limited"] is False
+    assert unlimited_preview["contained_child_blas_threads_limited"] is False
+    assert limited_ordinary != unlimited_ordinary
+    assert limited_preview != unlimited_preview
+
+
+@pytest.mark.unit
 def test_simulation_cache_stats_surfaces_failures(controller: SimulationController):
     controller.batch_cache.stats_best_effort = MagicMock(side_effect=RuntimeError("boom"))
     result = controller.simulation_cache_stats()

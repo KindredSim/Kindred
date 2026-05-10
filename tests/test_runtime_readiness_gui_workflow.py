@@ -37,6 +37,143 @@ def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
     return handle.center()
 
 
+def test_pasted_mechanism_runs_through_real_gui_containment(main_window, qtbot, monkeypatch):
+    pasted_mechanism = "\n".join(
+        [
+            "A + P <-> AP ; kf=3.36754083941719, kr=570.66866334033",
+            "AP + A -> Yhomo ; k=2.85637523118533",
+            "AP + C -> Ycross ; k=6.12353944129432",
+            "Ycross -> W + PO ; k=3.38995486494911",
+            "Ycross + AOH -> W + PO + AOH ; k=594.987218120352",
+            "Ycross <-> cRC + P ; kf=246.760262840548, kr=0.000345754465818857",
+            "Yhomo <-> hRC + P ; kf=0.115577821567633, kr=7.15661303584695e-05",
+            "Yhomo <-> Int1 + O ; kf=0.343876308825573, kr=146.010119598909",
+            "O + C <-> CO ; kf=2.51126830291685, kr=1.2249717736491",
+            "Int1 + CO -> Cy + P + C + AOH ; k=182.155770839817",
+            "Int1 + O -> Cy + P + AOH ; k=15.5756009257786",
+        ]
+    )
+    controller = main_window.simulation_controller
+    captured: dict[str, object] = {}
+    original_complete = controller._on_simulation_complete
+    original_error = controller._on_simulation_error
+
+    def _complete(payload, *args, **kwargs):
+        captured["complete"] = dict(payload or {})
+        return original_complete(payload, *args, **kwargs)
+
+    def _error(payload, *args, **kwargs):
+        captured["error"] = payload
+        return original_error(payload, *args, **kwargs)
+
+    monkeypatch.setattr(controller, "_on_simulation_complete", _complete)
+    monkeypatch.setattr(controller, "_on_simulation_error", _error)
+
+    main_window._load_preset_mechanism("M1")
+    assert main_window._set_mechanism_edit_locked(False)
+    editor = main_window._mechanism_editor._reactions_text
+    editor.selectAll()
+    QtWidgets.QApplication.clipboard().setText(pasted_mechanism)
+    editor.paste()
+    controller.ensure_interactive_simulation_runtimes_available(wait=True)
+    controller.run_simulation()
+
+    qtbot.waitUntil(lambda: bool(captured), timeout=30000)
+
+    assert "error" not in captured
+    assert "complete" in captured
+    payload = captured["complete"]
+    assert isinstance(payload, dict)
+    assert len(payload.get("species_names") or []) == 15
+
+
+def test_preset_warmed_then_pasted_mechanism_run_uses_new_ordinary_owner(
+    main_window,
+    qtbot,
+    qt_app,
+    monkeypatch,
+):
+    from kindred.core.simulation_containment import (
+        contained_owner_identity_payload,
+        contained_owner_payloads_match,
+    )
+
+    pasted_mechanism = "\n".join(
+        [
+            "A + P <-> AP ; kf=3.36754083941719, kr=570.66866334033",
+            "AP + A -> Yhomo ; k=2.85637523118533",
+            "AP + C -> Ycross ; k=6.12353944129432",
+            "Ycross -> W + PO ; k=3.38995486494911",
+            "Ycross + AOH -> W + PO + AOH ; k=594.987218120352",
+            "Ycross <-> cRC + P ; kf=246.760262840548, kr=0.000345754465818857",
+            "Yhomo <-> hRC + P ; kf=0.115577821567633, kr=7.15661303584695e-05",
+            "Yhomo <-> Int1 + O ; kf=0.343876308825573, kr=146.010119598909",
+            "O + C <-> CO ; kf=2.51126830291685, kr=1.2249717736491",
+            "Int1 + CO -> Cy + P + C + AOH ; k=182.155770839817",
+            "Int1 + O -> Cy + P + AOH ; k=15.5756009257786",
+        ]
+    )
+    controller = main_window.simulation_controller
+    captured: dict[str, object] = {}
+    original_complete = controller._on_simulation_complete
+    original_error = controller._on_simulation_error
+
+    def _complete(payload, *args, **kwargs):
+        captured["complete"] = dict(payload or {})
+        return original_complete(payload, *args, **kwargs)
+
+    def _error(payload, *args, **kwargs):
+        captured["error"] = payload
+        return original_error(payload, *args, **kwargs)
+
+    monkeypatch.setattr(controller, "_on_simulation_complete", _complete)
+    monkeypatch.setattr(controller, "_on_simulation_error", _error)
+
+    main_window.show()
+    qtbot.waitUntil(lambda: main_window.isVisible(), timeout=1000)
+    main_window._load_preset_mechanism("M1")
+    qt_app.processEvents()
+    qtbot.waitUntil(
+        lambda: controller.interactive_simulation_runtime_snapshot(fast_mode=False).ready,
+        timeout=30000,
+    )
+    preset_payloads = controller._interactive_runtime_plan_payloads_for_mode(fast_mode=False)
+    assert len(preset_payloads) == 1
+    preset_payload = dict(preset_payloads[0])
+    preset_owner = controller._runtime_application.ready_owner(
+        mode="ordinary",
+        payload=preset_payload,
+    )
+    assert preset_owner is not None
+    preset_identity = contained_owner_identity_payload(preset_payload)
+
+    assert main_window._set_mechanism_edit_locked(False)
+    editor = main_window._mechanism_editor._reactions_text
+    editor.selectAll()
+    QtWidgets.QApplication.clipboard().setText(pasted_mechanism)
+    editor.paste()
+    qt_app.processEvents()
+
+    controller.run_simulation()
+    qtbot.waitUntil(lambda: bool(captured), timeout=40000)
+
+    assert "error" not in captured
+    payload = captured.get("complete")
+    assert isinstance(payload, dict)
+    assert len(payload.get("species_names") or []) == 15
+
+    pasted_payloads = controller._interactive_runtime_plan_payloads_for_mode(fast_mode=False)
+    assert len(pasted_payloads) == 1
+    pasted_payload = dict(pasted_payloads[0])
+    pasted_identity = contained_owner_identity_payload(pasted_payload)
+    assert not contained_owner_payloads_match(preset_payload, pasted_payload)
+    assert pasted_identity != preset_identity
+    assert controller._runtime_application.ready_owner(
+        mode="ordinary",
+        payload=pasted_payload,
+    ) is not preset_owner
+
+
 def test_initial_condition_add_select_reselect_is_passive_runtime_work(
     main_window,
     qtbot,

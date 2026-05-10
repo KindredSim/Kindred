@@ -448,6 +448,7 @@ def contained_simulation_owner_identity(
     set_id: str,
     parameter_names: Sequence[str] = (),
     simulation_identity: SimulationIdentity | Mapping[str, Any] | None = None,
+    contained_child_blas_threads_limited: bool = True,
 ) -> dict[str, Any]:
     """Build the payload identity that decides contained runtime owner reuse.
 
@@ -469,6 +470,7 @@ def contained_simulation_owner_identity(
         "solver": solver_identity.to_payload(),
         "t_end": float(t_end),
         "set_id": str(set_id or ""),
+        "contained_child_blas_threads_limited": bool(contained_child_blas_threads_limited),
     }
     if mode == "preview":
         payload["structural_mechanism_digest"] = _preview_structural_mechanism_digest(

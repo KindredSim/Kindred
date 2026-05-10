@@ -79,6 +79,7 @@ from kindred.gui.controllers.simulation_slider_preview_launch import (
     SimulationSliderPreviewLaunchOwner,
 )
 from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.core.runtime_defaults import contained_child_blas_thread_env
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
 from kindred.gui.controllers.parallel_batch_runtime_readiness_owner import (
     ParallelBatchRuntimeReadinessOwner,
@@ -1908,6 +1909,14 @@ class SimulationController(QtCore.QObject):
     def _contained_owner_mode(self, *, fast_mode: bool) -> str:
         return "preview" if bool(fast_mode) else "ordinary"
 
+    def _contained_child_blas_threads_limited(self) -> bool:
+        return bool(self.parallel_batch.limit_blas_threads_per_worker)
+
+    def _contained_child_handler_env(self) -> Dict[str, str]:
+        return contained_child_blas_thread_env(
+            enabled=self._contained_child_blas_threads_limited()
+        )
+
     def _new_contained_simulation_owner(
         self,
         *,
@@ -1930,6 +1939,7 @@ class SimulationController(QtCore.QObject):
         kwargs: Dict[str, Any] = {}
         if timeout_s is not None:
             kwargs["active_timeout_s"] = float(timeout_s)
+        kwargs["handler_env"] = self._contained_child_handler_env()
         return WarmSimulationOwner(owner_plan_payload, **kwargs)
 
     def _contained_simulation_owner(
@@ -3543,6 +3553,7 @@ class SimulationController(QtCore.QObject):
             set_id=str(set_id or ""),
             parameter_names=parameter_names,
             simulation_identity=simulation_identity,
+            contained_child_blas_threads_limited=self._contained_child_blas_threads_limited(),
         )
 
     def _ordinary_contained_owner_identity(
@@ -3561,6 +3572,7 @@ class SimulationController(QtCore.QObject):
             t_end=float(t_end),
             set_id=str(set_id or ""),
             simulation_identity=simulation_identity,
+            contained_child_blas_threads_limited=self._contained_child_blas_threads_limited(),
         )
 
     def _run_simulation_from_slider(self):

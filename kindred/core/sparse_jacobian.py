@@ -38,6 +38,13 @@ __all__ = [
 ]
 
 
+def _pow_overflow_to_inf(base: float, exponent: float) -> float:
+    try:
+        return math.pow(base, exponent)
+    except OverflowError:
+        return math.inf
+
+
 class SparsityInfo:
     """
     Information about Jacobian sparsity pattern.
@@ -301,20 +308,31 @@ def build_sparse_jacobian(
         Output is written in-place to `out` (same shape as term_idx).
         """
         if term_idx.size == 0:
-            out.fill(0.0)
+            for out_pos in range(int(out.size)):
+                out[out_pos] = 0.0
             return
 
-        np.take(y, term_idx, out=y_terms)
-        np.greater(y_terms, SMALL, out=valid_terms)
-        np.logical_and(valid_terms, term_nonzero_mask, out=valid_terms)
+        monomial = float(rate_const)
+        for term_pos in range(int(term_idx.size)):
+            y_value = float(y[int(term_idx[term_pos])])
+            order = float(term_order[term_pos])
+            active = bool(term_nonzero_mask[term_pos]) and y_value > SMALL
+            y_terms[term_pos] = y_value
+            valid_terms[term_pos] = active
+            if active:
+                term_value = _pow_overflow_to_inf(y_value, order)
+            elif bool(term_nonzero_mask[term_pos]):
+                term_value = 0.0
+            else:
+                term_value = 1.0
+            term_vals[term_pos] = term_value
+            monomial *= term_value
 
-        term_vals.fill(1.0)
-        term_vals[term_nonzero_mask] = 0.0
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            np.power(y_terms, term_order, out=term_vals, where=valid_terms)
-            monomial = float(rate_const) * float(np.prod(term_vals, dtype=float))
-            out.fill(0.0)
-            out[valid_terms] = monomial * term_order[valid_terms] / y_terms[valid_terms]
+        for term_pos in range(int(out.size)):
+            if bool(valid_terms[term_pos]) and monomial != 0.0:
+                out[term_pos] = monomial * float(term_order[term_pos]) / float(y_terms[term_pos])
+            else:
+                out[term_pos] = 0.0
 
     # Build list of steps (irreversible reactions + equilibria) with precomputed offsets into J.data.
     reaction_steps = []
@@ -443,11 +461,15 @@ def build_sparse_jacobian(
 
         Notes
         -----
-        The returned sparse array is reused between calls for performance; do not
-        retain it across calls if you need an immutable snapshot.
+        Internal sparse storage is reused between calls, but callers receive a
+        matrix snapshot so solver internals cannot observe later mutations.
         """
-        y_arr = np.asarray(y, dtype=float).reshape(-1)
-        jac_data.fill(0.0)
+        if isinstance(y, np.ndarray) and y.ndim == 1:
+            y_arr = y
+        else:
+            y_arr = np.asarray(y, dtype=float).reshape(-1)
+        for data_pos in range(int(jac_data.size)):
+            jac_data[data_pos] = 0.0
 
         for (
             k,
@@ -473,11 +495,13 @@ def build_sparse_jacobian(
                 derivs,
             )
             if derivs.size:
-                nonzero = derivs != 0.0
-                if np.any(nonzero):
-                    offsets = offsets_by_term[nonzero]
-                    updates = derivs[nonzero, None] * stoich_vals[None, :]
-                    np.add.at(jac_data, offsets, updates)
+                for term_pos in range(int(derivs.size)):
+                    deriv = float(derivs[term_pos])
+                    if deriv == 0.0:
+                        continue
+                    offsets = offsets_by_term[term_pos]
+                    for row_pos in range(int(stoich_vals.size)):
+                        jac_data[int(offsets[row_pos])] += deriv * float(stoich_vals[row_pos])
 
         for (
             kf,
@@ -502,7 +526,8 @@ def build_sparse_jacobian(
             stoich_vals,
             offsets_by_col,
         ) in equilibrium_steps:
-            net_derivs.fill(0.0)
+            for deriv_pos in range(int(net_derivs.size)):
+                net_derivs[deriv_pos] = 0.0
             _monomial_derivatives_inplace(
                 kf,
                 fwd_idx,
@@ -526,18 +551,22 @@ def build_sparse_jacobian(
                 rev_derivs,
             )
             if fwd_derivs.size:
-                net_derivs[fwd_pos] += fwd_derivs
+                for deriv_pos in range(int(fwd_derivs.size)):
+                    net_derivs[int(fwd_pos[deriv_pos])] += float(fwd_derivs[deriv_pos])
             if rev_derivs.size:
-                net_derivs[rev_pos] -= rev_derivs
+                for deriv_pos in range(int(rev_derivs.size)):
+                    net_derivs[int(rev_pos[deriv_pos])] -= float(rev_derivs[deriv_pos])
 
             if net_derivs.size:
-                nonzero = net_derivs != 0.0
-                if np.any(nonzero):
-                    offsets = offsets_by_col[nonzero]
-                    updates = net_derivs[nonzero, None] * stoich_vals[None, :]
-                    np.add.at(jac_data, offsets, updates)
+                for col_pos in range(int(net_derivs.size)):
+                    deriv = float(net_derivs[col_pos])
+                    if deriv == 0.0:
+                        continue
+                    offsets = offsets_by_col[col_pos]
+                    for row_pos in range(int(stoich_vals.size)):
+                        jac_data[int(offsets[row_pos])] += deriv * float(stoich_vals[row_pos])
 
-        return J
+        return J.copy()
 
     return jacobian
 

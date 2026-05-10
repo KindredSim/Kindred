@@ -4,6 +4,7 @@ import importlib
 import multiprocessing
 import os
 import queue
+import tempfile
 import threading
 import time
 import traceback
@@ -18,6 +19,7 @@ _DEFAULT_ACTIVE_TIMEOUT_S = 60.0
 _DEFAULT_EVENT_HISTORY_LIMIT = 256
 _POLL_INTERVAL_S = 0.02
 _PROCESS_JOIN_TIMEOUT_S = 0.5
+_PROCESS_START_ENV_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,106 @@ def _apply_env(env: Mapping[str, str]) -> None:
         os.environ[str(name)] = str(value)
 
 
+def _child_fatal_diagnostic_path(pid: int) -> str:
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"kindred-contained-child-{int(pid)}.faulthandler.log",
+    )
+
+
+def _enable_child_fatal_diagnostics(*, owner_epoch: int) -> Callable[[], None] | None:
+    try:
+        import atexit
+        import faulthandler
+    except Exception:
+        return None
+
+    pid = int(os.getpid())
+    path = _child_fatal_diagnostic_path(pid)
+    handle = None
+    try:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        handle = open(path, "w", encoding="utf-8", buffering=1)
+        handle.write("Kindred containment child fatal diagnostics\n")
+        handle.write(f"pid={pid}\n")
+        handle.write(f"owner_epoch={int(owner_epoch)}\n")
+        handle.flush()
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        return None
+
+    cleaned = False
+
+    def _cleanup() -> None:
+        nonlocal cleaned
+        if cleaned:
+            return
+        cleaned = True
+        try:
+            if faulthandler.is_enabled():
+                faulthandler.disable()
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except (FileNotFoundError, OSError):
+            pass
+
+    atexit.register(_cleanup)
+    return _cleanup
+
+
+def _child_fatal_diagnostic_report(proc: multiprocessing.Process) -> str:
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        return ""
+    path = _child_fatal_diagnostic_path(int(pid))
+    if not os.path.exists(path):
+        return ""
+    report = [f"Child diagnostic log: {path}"]
+    try:
+        content = open(path, "r", encoding="utf-8", errors="replace").read().strip()
+    except OSError as exc:
+        report.append(f"Unable to read diagnostic log: {exc}")
+    else:
+        if content:
+            report.append(content)
+        else:
+            report.append("Diagnostic log is empty.")
+    return "\n".join(report)
+
+
+def _start_process_with_env(process: multiprocessing.Process, env: Mapping[str, str]) -> None:
+    env_s = {str(name): str(value) for name, value in dict(env or {}).items()}
+    with _PROCESS_START_ENV_LOCK:
+        if not env_s:
+            process.start()
+            return
+        previous = {name: os.environ.get(name) for name in env_s}
+        try:
+            for name, value in env_s.items():
+                os.environ[name] = value
+            process.start()
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
 def _import_from_path(import_path: str) -> Callable[..., Any]:
     module_name, sep, attr_name = str(import_path).partition(":")
     if not sep:
@@ -210,6 +312,7 @@ def _containment_child_main(
     output_queue: Any,
     owner_epoch: int,
 ) -> None:
+    cleanup_fatal_diagnostics = _enable_child_fatal_diagnostics(owner_epoch=int(owner_epoch))
     try:
         _apply_env(dict(handler_spec.env or {}))
         factory = _import_from_path(handler_spec.import_path)
@@ -284,6 +387,9 @@ def _containment_child_main(
                 "failure": _failure_from_exception(exc, kind="containment_startup"),
             }
         )
+    finally:
+        if cleanup_fatal_diagnostics is not None:
+            cleanup_fatal_diagnostics()
 
 
 def _process_was_started(proc: multiprocessing.Process) -> bool:
@@ -388,7 +494,7 @@ class ContainmentKernelOwner:
             )
             self._process = process
             self._events.append(ContainmentKernelEvent(kind="owner_starting", owner_epoch=int(self._owner_epoch)))
-            process.start()
+            _start_process_with_env(process, self._handler_spec.env)
         if wait:
             self._wait_for_ready(cancellation_check=cancellation_check)
 
@@ -644,7 +750,11 @@ class ContainmentKernelOwner:
         if proc.is_alive():
             return
         _join_started_process(proc, timeout=0.1)
-        raise ContainmentKernelProtocolError(f"Contained child exited unexpectedly with code {proc.exitcode}.")
+        message = f"Contained child exited unexpectedly with code {proc.exitcode}."
+        diagnostic_report = _child_fatal_diagnostic_report(proc)
+        if diagnostic_report:
+            message = f"{message}\n{diagnostic_report}"
+        raise ContainmentKernelProtocolError(message)
 
     @staticmethod
     def _cancel_requested(cancellation_check: Optional[Callable[[], bool]]) -> bool:

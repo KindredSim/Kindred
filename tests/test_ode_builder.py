@@ -1,8 +1,10 @@
 from decimal import Decimal
+import inspect
 
 import numpy as np
 import pytest
 
+from kindred.core import ode_builder
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.mechanism import Equilibrium, Mechanism
 from kindred.core.simulator.common import derive_equilibrium_rates
@@ -10,6 +12,29 @@ from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
 
 pytestmark = pytest.mark.unit
+
+
+def test_stoichiometric_flux_product_is_blas_free_and_returns_stable_result():
+    stoich = np.array(
+        [
+            [-1.0, 0.0, 2.0],
+            [1.0, -1.0, 0.0],
+        ],
+        dtype=float,
+    )
+    rates = np.array([3.0, 5.0, 7.0], dtype=float)
+
+    result = ode_builder._stoichiometric_flux_product(stoich, rates)
+    expected = stoich @ rates
+    np.testing.assert_allclose(result, expected)
+
+    rates[:] = 0.0
+    np.testing.assert_allclose(result, expected)
+
+    source = inspect.getsource(ode_builder._stoichiometric_flux_product)
+    assert "@" not in source
+    assert ".dot" not in source
+    assert "matmul" not in source
 
 
 def test_equilibrium_net_rates_avoid_inf_minus_inf_cancellation():

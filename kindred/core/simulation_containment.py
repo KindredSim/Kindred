@@ -22,6 +22,7 @@ from kindred.core.containment_kernel import (
     ContainmentKernelChildFailure,
     ContainmentKernelProtocolError,
     ContainmentKernelStartupTimeout,
+    _start_process_with_env,
 )
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_failure import (
@@ -39,6 +40,7 @@ from kindred.core.simulation_preparation import (
 from kindred.core.simulation_result_finalization import build_finalized_simulation_result_payload
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 from kindred.core.simulation_runtime_service import SimulationRuntimeOwner
+from kindred.core.runtime_defaults import contained_child_blas_thread_env
 
 _DEFAULT_SIMULATION_ACTIVE_TIMEOUT_S = 60.0
 _OWNER_READY_TIMEOUT_S = 30.0
@@ -585,6 +587,24 @@ def _simulation_owner_child(
         )
 
 
+def _simulation_owner_child_with_env(
+    child_target: Callable[..., Any],
+    handler_env: Mapping[str, str],
+    simulation_plan_payload: Mapping[str, Any],
+    input_queue: multiprocessing.Queue,
+    output_queue: multiprocessing.Queue,
+    owner_epoch: int,
+) -> None:
+    for name, value in dict(handler_env or {}).items():
+        os.environ[str(name)] = str(value)
+    child_target(
+        simulation_plan_payload,
+        input_queue,
+        output_queue,
+        owner_epoch,
+    )
+
+
 class WarmSimulationOwner:
     def __init__(
         self,
@@ -595,6 +615,7 @@ class WarmSimulationOwner:
         accept_timeout_s: float = _OWNER_ACCEPT_TIMEOUT_S,
         mp_context: Optional[multiprocessing.context.BaseContext] = None,
         child_target: Optional[Callable[..., Any]] = None,
+        handler_env: Optional[Mapping[str, str]] = None,
     ) -> None:
         self._simulation_plan_payload = dict(simulation_plan_payload)
         self._active_timeout_s = max(0.001, float(active_timeout_s))
@@ -602,6 +623,11 @@ class WarmSimulationOwner:
         self._accept_timeout_s = max(0.001, float(accept_timeout_s))
         self._mp_context = mp_context or multiprocessing.get_context("spawn")
         self._child_target = child_target or _simulation_owner_child
+        self._handler_env = (
+            contained_child_blas_thread_env()
+            if handler_env is None
+            else dict(handler_env)
+        )
         self._process: Optional[multiprocessing.Process] = None
         self._input_queue: Optional[multiprocessing.Queue] = None
         self._output_queue: Optional[multiprocessing.Queue] = None
@@ -613,6 +639,7 @@ class WarmSimulationOwner:
             self._runtime_owner = SimulationRuntimeOwner(
                 handler_import_path="kindred.core.simulation_containment:create_simulation_child_handler",
                 startup_payload=dict(self._simulation_plan_payload),
+                handler_env=dict(self._handler_env),
                 ready_timeout_s=self._ready_timeout_s,
                 accept_timeout_s=self._accept_timeout_s,
                 mp_context=self._mp_context,
@@ -839,16 +866,21 @@ class WarmSimulationOwner:
         self._owner_epoch += 1
         self._input_queue = self._mp_context.Queue()
         self._output_queue = self._mp_context.Queue()
-        self._process = self._mp_context.Process(
-            target=self._child_target,
-            args=(
-                dict(self._simulation_plan_payload),
-                self._input_queue,
-                self._output_queue,
-                int(self._owner_epoch),
-            ),
+        target = self._child_target
+        args = (
+            dict(self._simulation_plan_payload),
+            self._input_queue,
+            self._output_queue,
+            int(self._owner_epoch),
         )
-        self._process.start()
+        if self._handler_env:
+            target = _simulation_owner_child_with_env
+            args = (self._child_target, dict(self._handler_env), *args)
+        self._process = self._mp_context.Process(
+            target=target,
+            args=args,
+        )
+        _start_process_with_env(self._process, self._handler_env)
 
         deadline = time.monotonic() + self._ready_timeout_s
         while True:

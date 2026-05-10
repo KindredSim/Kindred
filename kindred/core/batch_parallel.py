@@ -20,6 +20,7 @@ from kindred.core.simulation_result_payload import (
     build_simulation_success_payload,
 )
 from kindred.core.runtime_defaults import (
+    CONTAINED_CHILD_BLAS_THREAD_ENV_VARS,
     MAX_PARALLEL_WORKERS_CEILING,
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
@@ -57,13 +58,7 @@ __all__ = [
     "run_batch_simulation_task",
 ]
 
-BLAS_THREAD_ENV_VARS: Tuple[str, ...] = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-)
+BLAS_THREAD_ENV_VARS: Tuple[str, ...] = tuple(CONTAINED_CHILD_BLAS_THREAD_ENV_VARS)
 
 _WORKER_CACHE_MAXSIZE = 8
 _WORKER_PREPARED_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()

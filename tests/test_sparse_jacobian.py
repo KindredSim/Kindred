@@ -1,6 +1,9 @@
+import inspect
+
 import numpy as np
 import pytest
 
+from kindred.core import sparse_jacobian
 from kindred.core.mechanism import Mechanism
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.sparse_jacobian import HAS_SCIPY_SPARSE, build_sparse_jacobian, detect_sparsity_pattern
@@ -10,8 +13,21 @@ pytestmark = pytest.mark.unit
 
 
 
+def test_sparse_jacobian_runtime_callback_avoids_numpy_native_update_boundaries():
+    source = inspect.getsource(sparse_jacobian.build_sparse_jacobian)
+    helper_source = source.split("    def _monomial_derivatives_inplace", 1)[1].split(
+        "    # Build list", 1
+    )[0]
+    jacobian_source = source.split("    def jacobian", 1)[1].split("    return jacobian", 1)[0]
+
+    for token in ("np.take", "np.logical_and", "np.power", "np.prod"):
+        assert token not in helper_source
+    for token in ("np.any(", "np.add.at"):
+        assert token not in jacobian_source
+
+
 @pytest.mark.skipif(not HAS_SCIPY_SPARSE, reason="scipy.sparse is required")
-def test_sparse_jacobian_reuses_structure_and_mutates_in_place():
+def test_sparse_jacobian_returns_stable_matrix_snapshots():
     mech = Mechanism()
     mech.add_species("A", 1.0)
     mech.add_species("B", 2.0)
@@ -42,9 +58,29 @@ def test_sparse_jacobian_reuses_structure_and_mutates_in_place():
     J2 = jac(0.0, y2)
     J2_snapshot = J2.toarray().copy()
 
-    assert J2 is J1
-    assert J2.data is J1.data
+    assert J2 is not J1
+    assert J2.data is not J1.data
+    np.testing.assert_allclose(J1.toarray(), J1_snapshot)
     assert not np.allclose(J1_snapshot, J2_snapshot)
+
+
+@pytest.mark.skipif(not HAS_SCIPY_SPARSE, reason="scipy.sparse is required")
+def test_sparse_jacobian_overflowing_power_returns_inf_derivatives():
+    mech = Mechanism()
+    mech.add_species("A", 0.0)
+    mech.add_species("B", 0.0)
+    mech.add_reaction({"A": -2.0, "B": 1.0}, rate=1.0)
+
+    jac = build_sparse_jacobian(mech, detect_sparsity_pattern(mech))
+    species_idx = {name: idx for idx, name in enumerate(mech.species_names())}
+
+    y = np.zeros(len(species_idx), dtype=float)
+    y[species_idx["A"]] = 1.0e200
+
+    J = jac(0.0, y).toarray()
+
+    assert np.isneginf(J[species_idx["A"], species_idx["A"]])
+    assert np.isposinf(J[species_idx["B"], species_idx["A"]])
 
 
 @pytest.mark.skipif(not HAS_SCIPY_SPARSE, reason="scipy.sparse is required")

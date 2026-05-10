@@ -17,6 +17,14 @@ from tests.test_containment_kernel import _ACCEPT_TIMEOUT_S, _READY_TIMEOUT_S, _
 
 pytestmark = pytest.mark.unit
 
+_EXPECTED_CONTAINED_CHILD_BLAS_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
+
 
 class _BatchContainmentTestHandler:
     def __init__(self, startup_payload: Mapping[str, Any]) -> None:
@@ -80,7 +88,7 @@ class _BatchContainmentTestHandler:
                 time.sleep(0.05)
         if behavior == "env_probe":
             numpy_preimported = "numpy" in sys.modules
-            env_before_numpy = {name: os.environ.get(name) for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")}
+            env_before_numpy = {name: os.environ.get(name) for name in _EXPECTED_CONTAINED_CHILD_BLAS_ENV}
             import numpy  # noqa: F401
 
             return {
@@ -301,7 +309,24 @@ def test_batch_lane_sets_blas_env_before_child_imports_numpy() -> None:
         )
         assert outcome.success is True
         assert outcome.payload["numpy_preimported"] is False
-        assert outcome.payload["env_before_numpy"] == {"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
+        assert outcome.payload["env_before_numpy"] == _EXPECTED_CONTAINED_CHILD_BLAS_ENV
+    finally:
+        lane.close(kill=True)
+
+
+def test_batch_lane_can_disable_blas_env_caps() -> None:
+    from kindred.core.batch_containment import WarmBatchSimulationLane
+
+    lane = WarmBatchSimulationLane(
+        lane_id="lane-env-disabled",
+        handler_import_path="tests.test_batch_containment:make_batch_containment_test_handler",
+        limit_blas_threads_per_worker=False,
+        mp_context=_mp_context(),
+        ready_timeout_s=_READY_TIMEOUT_S,
+        accept_timeout_s=_ACCEPT_TIMEOUT_S,
+    )
+    try:
+        assert lane._owner._kernel_owner._handler_spec.env == {}
     finally:
         lane.close(kill=True)
 

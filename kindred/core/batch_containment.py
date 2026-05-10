@@ -19,6 +19,7 @@ from kindred.core.containment_kernel import (
     ContainmentKernelProtocolError,
     ContainmentKernelStartupTimeout,
 )
+from kindred.core.runtime_defaults import contained_child_blas_thread_env
 from kindred.core.simulation_runtime_service import SimulationRuntimeOwner
 
 _DEFAULT_BATCH_HANDLER_IMPORT_PATH = "kindred.core.batch_containment:make_batch_simulation_handler"
@@ -26,15 +27,6 @@ _DEFAULT_READY_TIMEOUT_S = 30.0
 _DEFAULT_ACCEPT_TIMEOUT_S = 10.0
 _DEFAULT_ACTIVE_TIMEOUT_S = 60.0
 _DEFAULT_EVENT_HISTORY_LIMIT = 256
-
-_BLAS_THREAD_ENV_VARS: tuple[str, ...] = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-)
-
 
 @dataclass(frozen=True)
 class BatchLaneOutcome:
@@ -155,9 +147,7 @@ def make_batch_simulation_handler(startup_payload: Mapping[str, Any]) -> _BatchS
 
 
 def _batch_handler_env(*, limit_blas_threads_per_worker: bool) -> dict[str, str]:
-    if not bool(limit_blas_threads_per_worker):
-        return {}
-    return {name: "1" for name in _BLAS_THREAD_ENV_VARS}
+    return contained_child_blas_thread_env(enabled=bool(limit_blas_threads_per_worker))
 
 
 def _format_exception(exc: BaseException) -> str:

@@ -423,6 +423,9 @@ def test_batch_task_surfaces_solver_validation_from_preparation_owner_after_prep
 
 def test_blas_thread_limit_sets_worker_env(monkeypatch):
     from kindred.core.batch_parallel import BLAS_THREAD_ENV_VARS, apply_worker_blas_limits
+    from kindred.core.runtime_defaults import CONTAINED_CHILD_BLAS_THREAD_ENV_VARS
+
+    assert BLAS_THREAD_ENV_VARS == CONTAINED_CHILD_BLAS_THREAD_ENV_VARS
 
     env: Dict[str, str] = {}
     apply_worker_blas_limits(enabled=True, environ=env)

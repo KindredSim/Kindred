@@ -6,6 +6,8 @@ import os
 import queue
 import subprocess  # nosec B404 - tests invoke the local interpreter with controlled args
 import sys
+import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -114,6 +116,8 @@ class _KernelTestHandler:
         if behavior == "hang_after_accept":
             while True:
                 time.sleep(0.05)
+        if behavior == "hard_exit":
+            os._exit(int(request.get("exit_code") or 87))
         if behavior == "cancelled":
             from kindred.core.containment_kernel import ContainmentHandlerResponse
 
@@ -146,6 +150,90 @@ def _owner(*, startup_payload: Mapping[str, Any] | None = None, **kwargs: Any):
         mp_context=_require_spawn_primitive_support(),
         **kwargs,
     )
+
+
+class _EnvCapturingQueue:
+    def put(self, _message: Mapping[str, Any]) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def join_thread(self) -> None:
+        return None
+
+
+class _EnvCapturingProcess:
+    def __init__(self, *, env_names: tuple[str, ...], captured: list[dict[str, str | None]]) -> None:
+        self._env_names = tuple(env_names)
+        self._captured = captured
+        self.pid: int | None = None
+
+    def start(self) -> None:
+        self._captured.append({name: os.environ.get(name) for name in self._env_names})
+        self.pid = 12345
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, timeout: float | None = None) -> None:
+        _ = timeout
+
+
+class _EnvCapturingContext:
+    def __init__(self, *, env_names: tuple[str, ...]) -> None:
+        self.env_names = tuple(env_names)
+        self.captured: list[dict[str, str | None]] = []
+
+    def Queue(self) -> _EnvCapturingQueue:
+        return _EnvCapturingQueue()
+
+    def Process(self, **_kwargs: Any) -> _EnvCapturingProcess:
+        return _EnvCapturingProcess(env_names=self.env_names, captured=self.captured)
+
+
+class _RaisingEnvCapturingProcess(_EnvCapturingProcess):
+    def start(self) -> None:
+        self._captured.append({name: os.environ.get(name) for name in self._env_names})
+        raise RuntimeError("start boom")
+
+
+class _ConcurrentEnvCapturingProcess:
+    def __init__(self, *, env_names: tuple[str, ...], captured: list[dict[str, str | None]]) -> None:
+        self._env_names = tuple(env_names)
+        self._captured = captured
+
+    def start(self) -> None:
+        self._captured.append({name: os.environ.get(name) for name in self._env_names})
+
+
+class _NestedConcurrentStartProcess:
+    def __init__(self, *, env_name: str) -> None:
+        self._env_name = str(env_name)
+        self.inner_captured: list[dict[str, str | None]] = []
+        self.inner_started = threading.Event()
+        self.inner_finished = threading.Event()
+        self.inner_finished_during_outer_start = False
+        self.inner_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        from kindred.core.containment_kernel import _start_process_with_env
+
+        inner = _ConcurrentEnvCapturingProcess(
+            env_names=(self._env_name,),
+            captured=self.inner_captured,
+        )
+
+        def _run_inner_start() -> None:
+            self.inner_started.set()
+            _start_process_with_env(inner, {})
+            self.inner_finished.set()
+
+        self.inner_thread = threading.Thread(target=_run_inner_start)
+        self.inner_thread.start()
+        assert self.inner_started.wait(timeout=1.0)
+        time.sleep(0.05)
+        self.inner_finished_during_outer_start = self.inner_finished.is_set()
 
 
 def test_kernel_import_is_stdlib_lazy() -> None:
@@ -181,6 +269,88 @@ print(json.dumps({
         "simulation_containment": False,
         "fitting_containment": False,
     }
+
+
+def test_kernel_applies_handler_env_during_process_start_and_restores_parent(monkeypatch) -> None:
+    from kindred.core.containment_kernel import ContainmentHandlerSpec, ContainmentKernelOwner
+
+    env_names = ("KINDRED_TEST_PRESTART_NEW", "KINDRED_TEST_PRESTART_EXISTING")
+    monkeypatch.delenv("KINDRED_TEST_PRESTART_NEW", raising=False)
+    monkeypatch.setenv("KINDRED_TEST_PRESTART_EXISTING", "parent")
+    mp_context = _EnvCapturingContext(env_names=env_names)
+
+    owner = ContainmentKernelOwner(
+        ContainmentHandlerSpec(
+            import_path="tests.test_containment_kernel:make_kernel_test_handler",
+            env={
+                "KINDRED_TEST_PRESTART_NEW": "child",
+                "KINDRED_TEST_PRESTART_EXISTING": "child",
+            },
+        ),
+        mp_context=mp_context,  # type: ignore[arg-type]
+        ready_timeout_s=_READY_TIMEOUT_S,
+        accept_timeout_s=_ACCEPT_TIMEOUT_S,
+    )
+
+    owner.start(wait=False)
+    owner.close(kill=True)
+
+    assert mp_context.captured == [
+        {
+            "KINDRED_TEST_PRESTART_NEW": "child",
+            "KINDRED_TEST_PRESTART_EXISTING": "child",
+        }
+    ]
+    assert os.environ.get("KINDRED_TEST_PRESTART_NEW") is None
+    assert os.environ.get("KINDRED_TEST_PRESTART_EXISTING") == "parent"
+
+
+def test_kernel_restores_handler_env_when_process_start_raises(monkeypatch) -> None:
+    from kindred.core.containment_kernel import _start_process_with_env
+
+    env_names = ("KINDRED_TEST_PRESTART_RAISE_NEW", "KINDRED_TEST_PRESTART_RAISE_EXISTING")
+    monkeypatch.delenv("KINDRED_TEST_PRESTART_RAISE_NEW", raising=False)
+    monkeypatch.setenv("KINDRED_TEST_PRESTART_RAISE_EXISTING", "parent")
+    captured: list[dict[str, str | None]] = []
+    process = _RaisingEnvCapturingProcess(env_names=env_names, captured=captured)
+
+    with pytest.raises(RuntimeError, match="start boom"):
+        _start_process_with_env(
+            process,  # type: ignore[arg-type]
+            {
+                "KINDRED_TEST_PRESTART_RAISE_NEW": "child",
+                "KINDRED_TEST_PRESTART_RAISE_EXISTING": "child",
+            },
+        )
+
+    assert captured == [
+        {
+            "KINDRED_TEST_PRESTART_RAISE_NEW": "child",
+            "KINDRED_TEST_PRESTART_RAISE_EXISTING": "child",
+        }
+    ]
+    assert os.environ.get("KINDRED_TEST_PRESTART_RAISE_NEW") is None
+    assert os.environ.get("KINDRED_TEST_PRESTART_RAISE_EXISTING") == "parent"
+
+
+def test_kernel_serializes_empty_env_process_start_against_temporary_parent_env(monkeypatch) -> None:
+    from kindred.core.containment_kernel import _start_process_with_env
+
+    env_name = "KINDRED_TEST_PRESTART_CONCURRENT"
+    monkeypatch.delenv(env_name, raising=False)
+    outer = _NestedConcurrentStartProcess(env_name=env_name)
+
+    _start_process_with_env(
+        outer,  # type: ignore[arg-type]
+        {env_name: "child"},
+    )
+    assert outer.inner_thread is not None
+    outer.inner_thread.join(timeout=1.0)
+
+    assert outer.inner_finished_during_outer_start is False
+    assert outer.inner_finished.is_set() is True
+    assert outer.inner_captured == [{env_name: None}]
+    assert os.environ.get(env_name) is None
 
 
 def test_kernel_ready_and_accepted_request_succeeds() -> None:
@@ -267,6 +437,49 @@ def test_kernel_active_timeout_starts_after_accepted_and_restarts_epoch() -> Non
         assert owner.owner_epoch == 2
     finally:
         owner.close(kill=True)
+
+
+def test_kernel_unexpected_child_exit_reports_faulthandler_diagnostic_path() -> None:
+    from kindred.core.containment_kernel import (
+        ContainmentHandlerSpec,
+        ContainmentKernelOwner,
+        ContainmentKernelProtocolError,
+    )
+
+    class _ExitedProcess:
+        pid = 123456
+        exitcode = 87
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            _ = timeout
+
+    diagnostic_path = Path(tempfile.gettempdir()) / "kindred-contained-child-123456.faulthandler.log"
+    diagnostic_path.write_text(
+        "Kindred containment child fatal diagnostics\npid=123456\nowner_epoch=1\n",
+        encoding="utf-8",
+    )
+    owner = ContainmentKernelOwner(
+        ContainmentHandlerSpec(import_path="tests.test_containment_kernel:make_kernel_test_handler")
+    )
+    try:
+        owner._process = _ExitedProcess()  # type: ignore[assignment]
+        with pytest.raises(ContainmentKernelProtocolError) as exc_info:
+            owner._raise_if_process_exited()
+
+        message = str(exc_info.value)
+        assert "Contained child exited unexpectedly with code 87." in message
+        assert "Child diagnostic log:" in message
+        assert str(diagnostic_path) in message
+        assert "owner_epoch=1" in message
+    finally:
+        owner.close(kill=True)
+        try:
+            diagnostic_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def test_kernel_rejects_stale_replies_before_current_result() -> None:

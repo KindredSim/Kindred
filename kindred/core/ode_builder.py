@@ -27,6 +27,27 @@ logger = logging.getLogger(__name__)
 __all__ = ["RateBinding", "build_ode_rhs_from_mechanism"]
 
 
+def _stoichiometric_flux_product(
+    stoichiometry: np.ndarray,
+    rates: np.ndarray,
+    *,
+    workspace: Optional[np.ndarray] = None,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compute species fluxes without entering the BLAS matrix-vector path."""
+    stoich_arr = np.asarray(stoichiometry, dtype=float)
+    rate_arr = np.asarray(rates, dtype=float).reshape(-1)
+    if workspace is None:
+        products = np.multiply(stoich_arr, rate_arr)
+    else:
+        products = workspace
+        np.multiply(stoich_arr, rate_arr, out=products)
+    if out is None:
+        return np.sum(products, axis=1, dtype=float)
+    np.sum(products, axis=1, out=out)
+    return out.copy()
+
+
 def build_ode_rhs_from_mechanism(
     mechanism: Mechanism
 ) -> Callable[..., np.ndarray]:
@@ -51,7 +72,7 @@ def build_ode_rhs_from_mechanism(
     - Reactions contribute: rate = k * ∏[reactants]^stoich
     - Equilibria remain a single reversible step with rate = v_fwd - v_rev
       (stoichiometry is not duplicated into two irreversible columns).
-    - Stoichiometry determines species changes via matrix multiplication
+    - Stoichiometry determines species changes via a BLAS-free reduction.
     """
     species_names = mechanism.species_names()
     n_species = len(species_names)
@@ -438,6 +459,8 @@ def build_ode_rhs_from_mechanism(
     log_rate_forward = np.empty(n_steps, dtype=float)
     log_rate_reverse = np.empty(n_steps, dtype=float)
     net_rates = np.empty(n_steps, dtype=float)
+    stoich_rate_buffer = np.empty_like(S)
+    stoich_flux = np.empty(n_species, dtype=float)
 
     def _stable_diff_exp_logs(log_f: np.ndarray, log_r: np.ndarray, out: np.ndarray) -> None:
         """
@@ -461,7 +484,7 @@ def build_ode_rhs_from_mechanism(
             out[mask] = sign * mag
 
     def ode_rhs(t: float, y: np.ndarray, *, T: Optional[float] = None) -> np.ndarray:
-        """ODE right-hand side: dy/dt = S @ r(y, T)."""
+        """ODE right-hand side from stoichiometry and reaction rates."""
         y_arr = y
         T_eval = default_temperature if T is None else float(T)
         k_forward = k_forward_dyn
@@ -495,7 +518,12 @@ def build_ode_rhs_from_mechanism(
             forward_buffer.fill(1.0)
             np.power(y_arr, exp_forward, out=forward_buffer, where=forward_mask)
             rates_forward = k_forward * forward_buffer.prod(axis=1)
-            return S @ rates_forward
+            return _stoichiometric_flux_product(
+                S,
+                rates_forward,
+                workspace=stoich_rate_buffer,
+                out=stoich_flux,
+            )
 
         # Reversible/equilibrium path: work in log-space and combine stably.
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -519,6 +547,11 @@ def build_ode_rhs_from_mechanism(
             np.add(log_k_reverse_dyn, log_prod_reverse, out=log_rate_reverse)
 
         _stable_diff_exp_logs(log_rate_forward, log_rate_reverse, net_rates)
-        return S @ net_rates
+        return _stoichiometric_flux_product(
+            S,
+            net_rates,
+            workspace=stoich_rate_buffer,
+            out=stoich_flux,
+        )
 
     return ode_rhs

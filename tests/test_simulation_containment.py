@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import queue
 import time
 from typing import Any, Callable, Mapping, MutableMapping, Optional
@@ -14,6 +15,13 @@ pytestmark = pytest.mark.unit
 
 _OWNER_TEST_READY_TIMEOUT_S = 2.0
 _OWNER_TEST_ACCEPT_TIMEOUT_S = 2.0
+_EXPECTED_CONTAINED_CHILD_BLAS_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
 
 
 def _process_context() -> multiprocessing.context.BaseContext:
@@ -207,6 +215,24 @@ def _warm_owner_test_child(
         request_id = int(message.get("request_id", -1))
         payload = dict(message.get("payload") or {})
         behavior = str(payload.get("behavior") or "echo")
+        if behavior == "env_echo":
+            env_names = [str(name) for name in (payload.get("env_names") or [])]
+            output_queue.put(
+                {
+                    "kind": "accepted",
+                    "owner_epoch": int(owner_epoch),
+                    "request_id": request_id,
+                }
+            )
+            output_queue.put(
+                {
+                    "kind": "result",
+                    "owner_epoch": int(owner_epoch),
+                    "request_id": request_id,
+                    "payload": {"env": {name: os.environ.get(name) for name in env_names}},
+                }
+            )
+            continue
         if behavior == "stale_then_result":
             output_queue.put(
                 {
@@ -288,6 +314,43 @@ def test_spawn_capability_guard_probes_queue_semaphore_and_process_start_join():
     mp_context = _require_spawn_primitive_support()
 
     assert mp_context.get_start_method() == "spawn"
+
+
+def test_warm_simulation_owner_sets_blas_env_for_runtime_child():
+    from kindred.core.simulation_containment import WarmSimulationOwner
+
+    owner = WarmSimulationOwner({})
+
+    try:
+        runtime_owner = owner._runtime_owner
+        assert runtime_owner is not None
+        assert runtime_owner._kernel_owner._handler_spec.env == _EXPECTED_CONTAINED_CHILD_BLAS_ENV
+    finally:
+        owner.close(kill=True)
+
+
+def test_warm_simulation_owner_custom_child_target_applies_handler_env():
+    from kindred.core.simulation_containment import WarmSimulationOwner
+
+    owner = WarmSimulationOwner(
+        {},
+        child_target=_warm_owner_test_child,
+        handler_env={"KINDRED_TEST_CHILD_ENV": "applied"},
+        mp_context=_require_spawn_queue_support(),
+        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
+        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
+        active_timeout_s=1.0,
+    )
+    try:
+        result = owner.solve(
+            {
+                "behavior": "env_echo",
+                "env_names": ["KINDRED_TEST_CHILD_ENV"],
+            }
+        )
+        assert result["env"] == {"KINDRED_TEST_CHILD_ENV": "applied"}
+    finally:
+        owner.close(kill=True)
 
 
 def test_warm_simulation_owner_delayed_ready_is_startup_timeout_not_active_timeout():
