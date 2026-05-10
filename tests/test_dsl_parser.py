@@ -56,9 +56,10 @@ class TestBasicReactions:
 
         assert len(mechanism.reactions) == 1
         rxn = mechanism.reactions[0]
-        assert rxn.stoich["A"] == -1.0
-        assert rxn.stoich["B"] == -1.0
-        assert rxn.stoich["C"] == 1.0
+        assert rxn.reactants == {"A": 1.0, "B": 1.0}
+        assert rxn.products == {"C": 1.0}
+        assert rxn.rate_orders == {"A": 1.0, "B": 1.0}
+        assert rxn.net_stoich == {"A": -1.0, "B": -1.0, "C": 1.0}
 
     def test_stoichiometric_coefficients(self):
         """Test non-unity stoichiometric coefficients."""
@@ -70,8 +71,10 @@ class TestBasicReactions:
         mechanism = parse_dsl_to_mechanism(dsl, initials={})
 
         rxn = mechanism.reactions[0]
-        assert rxn.stoich["A"] == -2.0
-        assert rxn.stoich["B"] == 1.0
+        assert rxn.reactants == {"A": 2.0}
+        assert rxn.products == {"B": 1.0}
+        assert rxn.rate_orders == {"A": 2.0}
+        assert rxn.net_stoich == {"A": -2.0, "B": 1.0}
 
     def test_optional_asterisk_and_alternative_arrows(self):
         dsl = """

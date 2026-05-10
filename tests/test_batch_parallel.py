@@ -50,16 +50,21 @@ def _batch_task_with_plan(task: dict) -> dict:
     return copied
 
 
-def test_mechanism_clone_copies_mutable_containers_and_shares_rate_objects():
+def test_mechanism_clone_copies_and_freezes_step_containers_and_shares_rate_objects():
     rate_obj = object()
 
     mech = Mechanism()
     mech.add_species("A", 0.0)
     mech.add_species("B", 0.0)
-    mech.add_reaction({"A": -1.0, "B": 1.0}, rate=rate_obj, overrides={"kappa": 1.0})
+    mech.add_reaction(
+        reactants={"A": 1.0},
+        products={"B": 1.0},
+        rate=rate_obj,
+        overrides={"kappa": 1.0},
+    )
     mech.add_equilibrium(
-        {"A": -1.0},
         {"A": 1.0},
+        {"B": 1.0},
         Keq=1.0,
         metadata={"tag": "eq1"},
     )
@@ -75,13 +80,15 @@ def test_mechanism_clone_copies_mutable_containers_and_shares_rate_objects():
 
     assert cloned.reactions[0] is not mech.reactions[0]
     assert cloned.reactions[0].rate is rate_obj
-    assert cloned.reactions[0].stoich is not mech.reactions[0].stoich
+    assert cloned.reactions[0].reactants is not mech.reactions[0].reactants
+    assert cloned.reactions[0].products is not mech.reactions[0].products
     assert cloned.reactions[0].overrides is not mech.reactions[0].overrides
     assert cloned.equilibria[0].metadata is not mech.equilibria[0].metadata
 
     cloned.set_initial("A", 2.0)
     cloned.metadata["touched"] = True
-    cloned.reactions[0].overrides["kappa"] = 2.0
+    with pytest.raises(TypeError):
+        cloned.reactions[0].overrides["kappa"] = 2.0
 
     assert mech.species["A"].initial_conc == 0.0
     assert mech.metadata.get("touched") is None

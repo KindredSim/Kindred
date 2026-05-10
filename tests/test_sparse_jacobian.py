@@ -34,7 +34,7 @@ def test_sparse_jacobian_returns_stable_matrix_snapshots():
     mech.add_species("C", 0.0)
 
     # A + B -> C; r = k * A * B
-    mech.add_reaction({"A": -1.0, "B": -1.0, "C": 1.0}, rate=2.0)
+    mech.add_reaction(reactants={"A": 1.0, "B": 1.0}, products={"C": 1.0}, rate=2.0)
 
     info = detect_sparsity_pattern(mech)
     jac = build_sparse_jacobian(mech, info)
@@ -69,7 +69,7 @@ def test_sparse_jacobian_overflowing_power_returns_inf_derivatives():
     mech = Mechanism()
     mech.add_species("A", 0.0)
     mech.add_species("B", 0.0)
-    mech.add_reaction({"A": -2.0, "B": 1.0}, rate=1.0)
+    mech.add_reaction(reactants={"A": 2.0}, products={"B": 1.0}, rate=1.0)
 
     jac = build_sparse_jacobian(mech, detect_sparsity_pattern(mech))
     species_idx = {name: idx for idx, name in enumerate(mech.species_names())}

@@ -90,13 +90,6 @@ def build_mechanism_from_ir(
         reactants = dict(getattr(step, "reactants", {}) or {})
         products = dict(getattr(step, "products", {}) or {})
 
-        # Build stoichiometry (products - reactants)
-        stoich: Dict[str, float] = {}
-        for sp, coef in reactants.items():
-            stoich[sp] = -float(coef)
-        for sp, coef in products.items():
-            stoich[sp] = stoich.get(sp, 0.0) + float(coef)
-
         model = str(getattr(step, "model", "Eyring") or "Eyring")
 
         rxn_overrides: Dict[str, object] = {}
@@ -192,7 +185,12 @@ def build_mechanism_from_ir(
             )
         else:
             rxn_index = len(mechanism.reactions)
-            mechanism.add_reaction(stoich, rate=float(getattr(step, "kf")), overrides=rxn_overrides or None)
+            mechanism.add_reaction(
+                reactants=reactants,
+                products=products,
+                rate=float(getattr(step, "kf")),
+                overrides=rxn_overrides or None,
+            )
 
         # Record canonical step-index mapping for downstream layers (GUI/algebra/fitting).
         arrow = "<->" if is_equilibrium_step else "->"
@@ -255,7 +253,13 @@ def build_mechanism_from_ir(
                 mechanism.add_species(sp_name, init_conc)
 
         for rxn in state_mechanism.reactions:
-            mechanism.add_reaction(rxn.stoich, rate=rxn.rate)
+            mechanism.add_reaction(
+                reactants=rxn.reactants,
+                products=rxn.products,
+                rate=rxn.rate,
+                rate_orders=rxn.rate_orders,
+                overrides=rxn.overrides,
+            )
 
         for eq in state_mechanism.equilibria:
             mechanism.add_equilibrium(

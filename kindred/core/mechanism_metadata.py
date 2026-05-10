@@ -167,7 +167,9 @@ class EquilibriumMetadataView:
             if coerced is not None:
                 explicit_rates_f.append(coerced)
         forward_model = meta.get(EquilibriumMetadataKeys.FORWARD_MODEL)
-        if not isinstance(forward_model, dict):
+        if isinstance(forward_model, Mapping):
+            forward_model = dict(forward_model)
+        else:
             forward_model = None
 
         dG = meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)

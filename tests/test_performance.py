@@ -36,8 +36,8 @@ class TestSparsityDetection:
         mech.add_species('C', 0.0)
 
         # Linear chain: A -> B -> C
-        mech.add_reaction({'A': -1.0, 'B': 1.0}, rate=1.0)
-        mech.add_reaction({'B': -1.0, 'C': 1.0}, rate=0.5)
+        mech.add_reaction(reactants={'A': 1.0}, products={'B': 1.0}, rate=1.0)
+        mech.add_reaction(reactants={'B': 1.0}, products={'C': 1.0}, rate=0.5)
 
         info = detect_sparsity_pattern(mech)
 
@@ -53,8 +53,8 @@ class TestSparsityDetection:
         mech.add_species('B', 0.0)
 
         # All species interact
-        mech.add_reaction({'A': -1.0, 'B': 1.0}, rate=1.0)
-        mech.add_reaction({'B': -1.0, 'A': 1.0}, rate=0.5)
+        mech.add_reaction(reactants={'A': 1.0}, products={'B': 1.0}, rate=1.0)
+        mech.add_reaction(reactants={'B': 1.0}, products={'A': 1.0}, rate=0.5)
 
         info = detect_sparsity_pattern(mech)
 
@@ -69,7 +69,7 @@ class TestSparsityDetection:
 
         # Add linear chain reactions
         for i in range(9):
-            mech.add_reaction({f'S{i}': -1.0, f'S{i+1}': 1.0}, rate=1.0)
+            mech.add_reaction(reactants={f'S{i}': 1.0}, products={f'S{i+1}': 1.0}, rate=1.0)
 
         ratio = estimate_sparsity_ratio(mech)
 
@@ -83,13 +83,13 @@ class TestSparsityDetection:
         mech.add_species('B', 0.0)
         mech.add_species('C', 0.0)
 
-        mech.add_reaction({'A': -1.0, 'B': 1.0}, rate=1.0)
+        mech.add_reaction(reactants={'A': 1.0}, products={'B': 1.0}, rate=1.0)
 
         info = detect_sparsity_pattern(mech)
 
-        # A and B should be coupled
-        assert 'B' in info.coupling_graph['A']
+        # B changes depend on A; A does not depend on product concentration B.
         assert 'A' in info.coupling_graph['B']
+        assert 'B' not in info.coupling_graph['A']
 
         # C should only be coupled with itself (diagonal)
         assert info.coupling_graph['C'] == {'C'}

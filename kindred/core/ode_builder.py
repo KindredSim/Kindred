@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import logging
+from collections.abc import Mapping as MappingABC
 from typing import Callable, Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
@@ -289,7 +290,7 @@ def build_ode_rhs_from_mechanism(
     for i_step, (step_type, step_obj) in enumerate(steps):
         if step_type == "reaction":
             rxn = step_obj  # type: ignore[assignment]
-            vec = rxn.stoich_vector(species_names)
+            vec = rxn.net_stoich_vector(species_names)
             S[:, i_step] = vec
 
             overrides = getattr(rxn, "overrides", {}) or {}
@@ -349,10 +350,9 @@ def build_ode_rhs_from_mechanism(
 
                     k_forward_base[i_step] = float(k_const)
 
-            for sp_name, stoich_coef in rxn.stoich.items():
-                if stoich_coef < 0:  # Reactant
-                    idx = species_index[sp_name]
-                    exp_forward[i_step, idx] = abs(stoich_coef)
+            for sp_name, order in rxn.rate_orders.items():
+                idx = species_index[sp_name]
+                exp_forward[i_step, idx] = float(order)
 
         elif step_type == "equilibrium":
             eq = step_obj  # type: ignore[assignment]
@@ -365,7 +365,8 @@ def build_ode_rhs_from_mechanism(
 
             eq_meta = EquilibriumMetadataView.from_metadata(meta, default_fast=bool(eq.fast))
             forward_model = eq_meta.forward_model
-            reverse_model = meta.get("reverse_model") if isinstance(meta.get("reverse_model"), dict) else None
+            reverse_model_raw = meta.get("reverse_model")
+            reverse_model = dict(reverse_model_raw) if isinstance(reverse_model_raw, MappingABC) else None
             explicit_rates_meta = list(eq_meta.explicit_rates)
             user_kf = bool(eq_meta.user_provided_kf)
             user_kr = bool(eq_meta.user_provided_kr)

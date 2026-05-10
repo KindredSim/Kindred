@@ -138,12 +138,11 @@ def detect_sparsity_pattern(mechanism: Mechanism) -> SparsityInfo:
 
     # Process reactions
     for rxn in mechanism.reactions:
-        # Get all species in this reaction
-        rxn_species = list(rxn.stoich.keys())
+        affected_species = list(rxn.net_stoich.keys())
+        dependency_species = list(rxn.rate_orders.keys())
 
-        # Couple all species in this reaction with each other
-        for sp1 in rxn_species:
-            coupling_graph[sp1].update(rxn_species)
+        for sp1 in affected_species:
+            coupling_graph[sp1].update(dependency_species)
 
     # Process equilibria
     for eq in mechanism.equilibria:
@@ -316,10 +315,9 @@ def build_sparse_jacobian(
         for term_pos in range(int(term_idx.size)):
             y_value = float(y[int(term_idx[term_pos])])
             order = float(term_order[term_pos])
-            active = bool(term_nonzero_mask[term_pos]) and y_value > SMALL
             y_terms[term_pos] = y_value
-            valid_terms[term_pos] = active
-            if active:
+            valid_terms[term_pos] = bool(term_nonzero_mask[term_pos])
+            if y_value > SMALL and bool(term_nonzero_mask[term_pos]):
                 term_value = _pow_overflow_to_inf(y_value, order)
             elif bool(term_nonzero_mask[term_pos]):
                 term_value = 0.0
@@ -329,17 +327,35 @@ def build_sparse_jacobian(
             monomial *= term_value
 
         for term_pos in range(int(out.size)):
-            if bool(valid_terms[term_pos]) and monomial != 0.0:
-                out[term_pos] = monomial * float(term_order[term_pos]) / float(y_terms[term_pos])
-            else:
+            if not bool(valid_terms[term_pos]):
                 out[term_pos] = 0.0
+                continue
+            if monomial != 0.0 and float(y_terms[term_pos]) > SMALL:
+                out[term_pos] = monomial * float(term_order[term_pos]) / float(y_terms[term_pos])
+                continue
+            deriv = float(rate_const) * float(term_order[term_pos])
+            for factor_pos in range(int(term_idx.size)):
+                y_value = float(y_terms[factor_pos])
+                exponent = float(term_order[factor_pos])
+                if factor_pos == term_pos:
+                    exponent -= 1.0
+                if exponent == 0.0:
+                    factor = 1.0
+                elif y_value > SMALL:
+                    factor = _pow_overflow_to_inf(y_value, exponent)
+                elif exponent > 0.0:
+                    factor = 0.0
+                else:
+                    factor = math.inf
+                deriv *= factor
+            out[term_pos] = float(deriv)
 
     # Build list of steps (irreversible reactions + equilibria) with precomputed offsets into J.data.
     reaction_steps = []
     equilibrium_steps = []
 
     for rxn in mechanism.reactions:
-        vec = np.asarray(rxn.stoich_vector(species_names), dtype=float)
+        vec = np.asarray(rxn.net_stoich_vector(species_names), dtype=float)
         stoich_rows = np.flatnonzero(vec).astype(np.int64, copy=False)
         stoich_vals = vec[stoich_rows].astype(float, copy=False)
 
@@ -347,9 +363,8 @@ def build_sparse_jacobian(
         k = float(rate_obj()) if callable(rate_obj) else float(rate_obj)
 
         term_pairs = [
-            (species_index[sp_name], abs(stoich_coef))
-            for sp_name, stoich_coef in rxn.stoich.items()
-            if stoich_coef < 0
+            (species_index[sp_name], float(order))
+            for sp_name, order in rxn.rate_orders.items()
         ]
         if term_pairs:
             term_idx = np.fromiter((p[0] for p in term_pairs), dtype=np.int64, count=len(term_pairs))
@@ -597,7 +612,7 @@ def estimate_sparsity_ratio(mechanism: Mechanism) -> float:
     n_reactions = len(mechanism.reactions) + len(mechanism.equilibria)
 
     for rxn in mechanism.reactions:
-        total_participations += len(rxn.stoich)
+        total_participations += len(set(rxn.net_stoich) | set(rxn.rate_orders))
 
     for eq in mechanism.equilibria:
         total_participations += len(eq.stoich_forward) + len(eq.stoich_back)

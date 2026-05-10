@@ -524,12 +524,18 @@ def generate_mechanism_hash(mechanism: Any) -> str:
         hasher.update(name.encode('utf-8'))
         hasher.update(_encode(species.initial_conc))
 
-    # Hash reactions (stoichiometry + rate info)
+    # Hash reactions (physical sides, rate law, net stoichiometry, and rate info)
     for rxn in mechanism.reactions:
-        # Sort stoichiometry for deterministic order
-        for name in sorted(rxn.stoich.keys()):
-            coeff = rxn.stoich[name]
-            hasher.update(f"{name}:{coeff}".encode('utf-8'))
+        for label, mapping in (
+            ("reactants", rxn.reactants),
+            ("products", rxn.products),
+            ("rate_orders", rxn.rate_orders),
+            ("net_stoich", rxn.net_stoich),
+        ):
+            hasher.update(label.encode("utf-8"))
+            for name in sorted(mapping.keys()):
+                coeff = mapping[name]
+                hasher.update(f"{name}:{coeff}".encode('utf-8'))
 
         # Hash rate (convert to string representation)
         rate_str = _hash_rate_obj(rxn.rate) if rxn.rate is not None else "None"

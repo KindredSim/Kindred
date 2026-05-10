@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping as MappingABC
 import logging
 import math
 import re
@@ -508,13 +509,13 @@ class MainWindowVariableRuntime:
 
     def is_energy_mode_mechanism(self, mechanism: object) -> bool:
         meta = getattr(mechanism, "metadata", {}) or {}
-        if not isinstance(meta, dict):
+        if not isinstance(meta, MappingABC):
             return False
         sn = meta.get("state_network")
-        if not isinstance(sn, dict):
+        if not isinstance(sn, MappingABC):
             return False
-        states = sn.get("states") if isinstance(sn, dict) else None
-        edges = sn.get("edges") if isinstance(sn, dict) else None
+        states = sn.get("states")
+        edges = sn.get("edges")
         return bool(states or edges)
 
     def dsl_has_computational_mode_generated_block(self, dsl_text: str) -> bool:
@@ -549,7 +550,7 @@ class MainWindowVariableRuntime:
     def sync_energy_mode_temperature_from_mechanism(self, mechanism: object) -> None:
         mw = self._mw
         meta = getattr(mechanism, "metadata", {}) or {}
-        if not isinstance(meta, dict):
+        if not isinstance(meta, MappingABC):
             return
         try:
             temperature_k = float(meta.get("temperature_K"))
@@ -587,7 +588,7 @@ class MainWindowVariableRuntime:
 
         meta = getattr(mechanism, "metadata", {}) or {}
         energy_unit = "kJ/mol"
-        if isinstance(meta, dict) and meta.get("energy_unit"):
+        if isinstance(meta, MappingABC) and meta.get("energy_unit"):
             energy_unit = str(meta.get("energy_unit"))
 
         from kindred.core.constants import R as r_j_per_mol_k
@@ -602,7 +603,7 @@ class MainWindowVariableRuntime:
         unit_conv = UnitsModel(energy_unit=energy_unit) if UnitsModel is not None else None  # type: ignore[call-arg]
 
         temperature_k: float | None = None
-        if isinstance(meta, dict) and meta.get("temperature_K") is not None:
+        if isinstance(meta, MappingABC) and meta.get("temperature_K") is not None:
             try:
                 temperature_k = float(meta.get("temperature_K"))
             except Exception:
@@ -616,7 +617,7 @@ class MainWindowVariableRuntime:
         ts_channels: list[dict[str, object]] = []
         for eq in list(getattr(mechanism, "equilibria", []) or []):
             eq_meta = getattr(eq, "metadata", {}) or {}
-            if not isinstance(eq_meta, dict):
+            if not isinstance(eq_meta, MappingABC):
                 continue
             if str(eq_meta.get("source") or "") != "state_network":
                 continue

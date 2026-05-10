@@ -29,13 +29,12 @@ def _build_reference_rhs(mechanism):
 
     for i_step, (step_type, step_obj) in enumerate(steps):
         if step_type == "reaction":
-            S[:, i_step] = step_obj.stoich_vector(species_names)
+            S[:, i_step] = step_obj.net_stoich_vector(species_names)
             rate_obj = step_obj.rate
             k = float(rate_obj()) if callable(rate_obj) else float(rate_obj)
             reactant_info = [
-                (species_index[name], abs(coeff))
-                for name, coeff in step_obj.stoich.items()
-                if coeff < 0
+                (species_index[name], order)
+                for name, order in step_obj.rate_orders.items()
             ]
 
             def make_rate(constant, reactants):

@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow, pytest.mark.real_runtime_readiness]
 
@@ -37,13 +39,25 @@ def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
     return handle.center()
 
 
+def _assert_aoh_same_side_step(mechanism: object) -> None:
+    reactions = list(getattr(mechanism, "reactions", []) or [])
+    aoh_step = next(
+        reaction
+        for reaction in reactions
+        if float(reaction.rate) == pytest.approx(594.987218120352)
+    )
+    assert aoh_step.reactants == {"Ycross": 1.0, "AOH": 1.0}
+    assert aoh_step.products == {"W": 1.0, "PO": 1.0, "AOH": 1.0}
+    assert aoh_step.rate_orders == {"Ycross": 1.0, "AOH": 1.0}
+    assert aoh_step.net_stoich == {"Ycross": -1.0, "W": 1.0, "PO": 1.0}
+
+
 def test_pasted_mechanism_runs_through_real_gui_containment(main_window, qtbot, monkeypatch):
     pasted_mechanism = "\n".join(
         [
             "A + P <-> AP ; kf=3.36754083941719, kr=570.66866334033",
             "AP + A -> Yhomo ; k=2.85637523118533",
             "AP + C -> Ycross ; k=6.12353944129432",
-            "Ycross -> W + PO ; k=3.38995486494911",
             "Ycross + AOH -> W + PO + AOH ; k=594.987218120352",
             "Ycross <-> cRC + P ; kf=246.760262840548, kr=0.000345754465818857",
             "Yhomo <-> hRC + P ; kf=0.115577821567633, kr=7.15661303584695e-05",
@@ -57,6 +71,8 @@ def test_pasted_mechanism_runs_through_real_gui_containment(main_window, qtbot, 
     captured: dict[str, object] = {}
     original_complete = controller._on_simulation_complete
     original_error = controller._on_simulation_error
+    parsed = parse_dsl_to_mechanism(pasted_mechanism, initials={})
+    _assert_aoh_same_side_step(parsed)
 
     def _complete(payload, *args, **kwargs):
         captured["complete"] = dict(payload or {})
@@ -85,6 +101,7 @@ def test_pasted_mechanism_runs_through_real_gui_containment(main_window, qtbot, 
     payload = captured["complete"]
     assert isinstance(payload, dict)
     assert len(payload.get("species_names") or []) == 15
+    _assert_aoh_same_side_step(payload.get("mechanism"))
 
 
 def test_preset_warmed_then_pasted_mechanism_run_uses_new_ordinary_owner(
@@ -103,7 +120,6 @@ def test_preset_warmed_then_pasted_mechanism_run_uses_new_ordinary_owner(
             "A + P <-> AP ; kf=3.36754083941719, kr=570.66866334033",
             "AP + A -> Yhomo ; k=2.85637523118533",
             "AP + C -> Ycross ; k=6.12353944129432",
-            "Ycross -> W + PO ; k=3.38995486494911",
             "Ycross + AOH -> W + PO + AOH ; k=594.987218120352",
             "Ycross <-> cRC + P ; kf=246.760262840548, kr=0.000345754465818857",
             "Yhomo <-> hRC + P ; kf=0.115577821567633, kr=7.15661303584695e-05",
@@ -117,6 +133,8 @@ def test_preset_warmed_then_pasted_mechanism_run_uses_new_ordinary_owner(
     captured: dict[str, object] = {}
     original_complete = controller._on_simulation_complete
     original_error = controller._on_simulation_error
+    parsed = parse_dsl_to_mechanism(pasted_mechanism, initials={})
+    _assert_aoh_same_side_step(parsed)
 
     def _complete(payload, *args, **kwargs):
         captured["complete"] = dict(payload or {})
@@ -161,6 +179,7 @@ def test_preset_warmed_then_pasted_mechanism_run_uses_new_ordinary_owner(
     payload = captured.get("complete")
     assert isinstance(payload, dict)
     assert len(payload.get("species_names") or []) == 15
+    _assert_aoh_same_side_step(payload.get("mechanism"))
 
     pasted_payloads = controller._interactive_runtime_plan_payloads_for_mode(fast_mode=False)
     assert len(pasted_payloads) == 1

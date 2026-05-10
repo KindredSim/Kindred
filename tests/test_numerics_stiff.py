@@ -56,9 +56,9 @@ def test_robertson_stiff_system_uses_implicit_solver():
     assert np.all(np.isfinite(result.Y))
     assert np.all(total_mass <= 1.0 + 1e-6)
     assert np.all(total_mass >= -1e-9)
-    assert result.Y[c_idx, -1] > 0.9  # C dominates at long times
+    assert result.Y[c_idx, -1] == pytest.approx(0.663123, rel=1e-5)
     assert result.Y[b_idx, -1] < 1e-4
-    assert result.Y[a_idx, -1] < 1e-3
+    assert result.Y[a_idx, -1] == pytest.approx(0.336875, rel=1e-5)
 
 
 def test_stiff_solver_failure_raises_without_rk4(monkeypatch):

@@ -34,7 +34,11 @@ def test_state_network_generated_steps_must_not_introduce_canonical_named_bindin
         mech = Mechanism()
         mech.add_species("A", 0.0)
         mech.add_species("B", 0.0)
-        mech.add_reaction({"A": -1.0, "B": 1.0}, rate=RateBinding(name=binding_name, value=1.0))
+        mech.add_reaction(
+            reactants={"A": 1.0},
+            products={"B": 1.0},
+            rate=RateBinding(name=binding_name, value=1.0),
+        )
         return mech
 
     monkeypatch.setattr(snc, "convert_state_network_to_mechanism", _fake_convert)
@@ -58,7 +62,11 @@ def test_state_network_generated_steps_must_not_introduce_any_non_numeric_bindin
         mech = Mechanism()
         mech.add_species("A", 0.0)
         mech.add_species("B", 0.0)
-        mech.add_reaction({"A": -1.0, "B": 1.0}, rate=RateBinding(name="state_rate", value=1.0))
+        mech.add_reaction(
+            reactants={"A": 1.0},
+            products={"B": 1.0},
+            rate=RateBinding(name="state_rate", value=1.0),
+        )
         return mech
 
     monkeypatch.setattr(snc, "convert_state_network_to_mechanism", _fake_convert)
