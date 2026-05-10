@@ -1281,6 +1281,54 @@ class MainWindow(
             return
         self._make_simulation_runtime_available_after_startup(wait=bool(wait))
 
+    def _simulation_runtime_settings_snapshot(self) -> Dict[str, object]:
+        solver_contract = load_solver_contract()
+        solver_label = str(self._initial_solver or solver_contract.default_solver_name).strip()
+        return {
+            "solver": str(solver_label or solver_contract.default_solver_name),
+            "rtol": float(self._initial_rtol or 1e-6),
+            "atol": float(self._initial_atol or 1e-12),
+            "use_sparse_jacobian": bool(self._use_sparse_jacobian),
+            "wegscheider_cyclicity_enabled": bool(self._wegscheider_cyclicity_enabled),
+            "max_parallel_batch_workers": int(self._sim_controller.parallel_batch.max_parallel_workers),
+            "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
+            "limit_blas_threads_per_worker": bool(
+                self._sim_controller.parallel_batch.limit_blas_threads_per_worker
+            ),
+            "slider_preview_solver": str(self._mechanism_editor.slider_solver_value() or "BDF"),
+            "slider_preview_points": int(self._mechanism_editor.slider_points_value()),
+        }
+
+    def _simulation_batch_runtime_pool_settings_snapshot(self) -> Dict[str, object]:
+        return {
+            "max_parallel_batch_workers": int(self._sim_controller.parallel_batch.max_parallel_workers),
+            "batch_runtime_lane_budget": int(self._sim_controller.batch_runtime_lane_budget),
+            "limit_blas_threads_per_worker": bool(
+                self._sim_controller.parallel_batch.limit_blas_threads_per_worker
+            ),
+        }
+
+    def _refresh_simulation_runtime_after_inputs_changed(
+        self,
+        *,
+        batch_runtime_pool_inputs_changed: bool = True,
+        schedule_runtime_availability: bool = True,
+        force_when_hidden: bool = False,
+    ) -> None:
+        if self.isVisible():
+            self._set_runtime_backed_controls_ready(False)
+        if bool(batch_runtime_pool_inputs_changed):
+            self._sim_controller.simulation_runtime_inputs_changed()
+        else:
+            self._sim_controller.simulation_runtime_inputs_changed(
+                batch_runtime_pool_inputs_changed=False
+            )
+        if bool(schedule_runtime_availability):
+            self._schedule_simulation_runtime_availability_refresh(
+                wait=False,
+                force_when_hidden=bool(force_when_hidden),
+            )
+
     def _make_simulation_runtime_available_after_startup(self, *, wait: bool = False) -> None:
         if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
             return
@@ -4051,27 +4099,46 @@ class MainWindow(
     def _apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
         """Populate the UI from serialized project data."""
         self._suppress_preference_updates = True
+        simulation_runtime_settings_changed = False
+        batch_runtime_pool_settings_changed = False
         self._authoritative_mechanism_runtime_refresh_defer_depth = (
             int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) + 1
         )
         try:
-            self._apply_project_payload_inner(data, record_undo=record_undo)
+            (
+                simulation_runtime_settings_changed,
+                batch_runtime_pool_settings_changed,
+            ) = self._apply_project_payload_inner(data, record_undo=record_undo)
         finally:
             self._authoritative_mechanism_runtime_refresh_defer_depth = max(
                 0,
                 int(getattr(self, "_authoritative_mechanism_runtime_refresh_defer_depth", 0) or 0) - 1,
             )
             self._suppress_preference_updates = False
+        if simulation_runtime_settings_changed:
+            self._refresh_simulation_runtime_after_inputs_changed(
+                batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed),
+                schedule_runtime_availability=False,
+            )
         if not self._schedule_pending_authoritative_mechanism_runtime_refresh():
             self._schedule_simulation_runtime_availability_refresh(wait=False)
 
-    def _apply_project_payload_inner(self, data: Dict[str, Any], *, record_undo: bool = True) -> None:
+    def _apply_project_payload_inner(
+        self,
+        data: Dict[str, Any],
+        *,
+        record_undo: bool = True,
+    ) -> tuple[bool, bool]:
         from kindred.core.batch_initial_conditions import (
             BatchInitialConditionsStore,
             migrate_reaction_dsl_initial_concentration_sets,
         )
         from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel
 
+        previous_runtime_settings = self._simulation_runtime_settings_snapshot()
+        previous_batch_runtime_pool_settings = (
+            self._simulation_batch_runtime_pool_settings_snapshot()
+        )
         project_version = int(data.get('project_schema_version', 1))
         if project_version > PROJECT_SCHEMA_VERSION:
             QtWidgets.QMessageBox.warning(
@@ -4166,9 +4233,6 @@ class MainWindow(
         self._wegscheider_cyclicity_enabled = bool(
             data.get('wegscheider_cyclicity_enabled', _pref('wegscheider_cyclicity_enabled'))
         )
-        previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
-        previous_batch_runtime_lane_budget = int(self._sim_controller.batch_runtime_lane_budget)
-        previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
         try:
             self._sim_controller.parallel_batch.max_parallel_workers = min(
                 int(MAX_PARALLEL_WORKERS_CEILING),
@@ -4186,13 +4250,6 @@ class MainWindow(
         self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
             data.get('limit_blas_threads_per_worker', _pref('limit_blas_threads_per_worker'))
         )
-        if (
-            previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
-            or previous_batch_runtime_lane_budget != int(self._sim_controller.batch_runtime_lane_budget)
-            or previous_limit_blas_threads
-            != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
-        ):
-            self._sim_controller.parallel_batch_pool_settings_changed()
         if 'use_advanced_dsl' in data:
             logger.info(
                 "Loaded legacy project flag use_advanced_dsl=%s (ignored; advanced DSL always enabled)",
@@ -4226,6 +4283,12 @@ class MainWindow(
             for key in FITTING_DEFAULTS_KEYS
             if key in data and data[key] is not None
         }
+        runtime_settings_changed = self._simulation_runtime_settings_snapshot() != previous_runtime_settings
+        batch_runtime_pool_settings_changed = (
+            self._simulation_batch_runtime_pool_settings_snapshot()
+            != previous_batch_runtime_pool_settings
+        )
+        return runtime_settings_changed, batch_runtime_pool_settings_changed
 
     def apply_project_payload(self, data: Dict[str, Any], *, record_undo: bool = True) -> bool:
         """Public project apply API for controllers (avoid reaching into `_` helpers)."""
@@ -8552,6 +8615,10 @@ class MainWindow(
 
         if dialog.exec():
             settings = dialog.get_settings()
+            previous_simulation_runtime_settings = self._simulation_runtime_settings_snapshot()
+            previous_batch_runtime_pool_settings = (
+                self._simulation_batch_runtime_pool_settings_snapshot()
+            )
             current_solver = str(self._initial_solver or solver_contract.default_solver_name)
             current_rtol = float(self._initial_rtol or 1e-6)
             current_atol = float(self._initial_atol or 1e-12)
@@ -8615,9 +8682,6 @@ class MainWindow(
                 self._use_sparse_jacobian = bool(settings['use_sparse_jacobian'])
             if 'wegscheider_cyclicity_enabled' in settings:
                 self._wegscheider_cyclicity_enabled = bool(settings['wegscheider_cyclicity_enabled'])
-            previous_max_parallel_workers = int(self._sim_controller.parallel_batch.max_parallel_workers)
-            previous_batch_runtime_lane_budget = int(self._sim_controller.batch_runtime_lane_budget)
-            previous_limit_blas_threads = bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
             if 'max_parallel_batch_workers' in settings:
                 try:
                     self._sim_controller.parallel_batch.max_parallel_workers = min(
@@ -8648,13 +8712,6 @@ class MainWindow(
                 self._sim_controller.parallel_batch.limit_blas_threads_per_worker = bool(
                     settings['limit_blas_threads_per_worker']
                 )
-            if (
-                previous_max_parallel_workers != int(self._sim_controller.parallel_batch.max_parallel_workers)
-                or previous_batch_runtime_lane_budget != int(self._sim_controller.batch_runtime_lane_budget)
-                or previous_limit_blas_threads
-                != bool(self._sim_controller.parallel_batch.limit_blas_threads_per_worker)
-            ):
-                self._sim_controller.parallel_batch_pool_settings_changed()
             if 'result_cache_cap' in settings or 'preview_cache_cap' in settings:
                 self.set_simulation_cache_caps(
                     result_cap=int(
@@ -8743,6 +8800,14 @@ class MainWindow(
                         except RuntimeError as exc:
                             logger.debug("Failed to show solver settings refresh error in status bar: %s", exc, exc_info=True)
                             self._status_bar = None
+            if self._simulation_runtime_settings_snapshot() != previous_simulation_runtime_settings:
+                batch_runtime_pool_settings_changed = (
+                    self._simulation_batch_runtime_pool_settings_snapshot()
+                    != previous_batch_runtime_pool_settings
+                )
+                self._refresh_simulation_runtime_after_inputs_changed(
+                    batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_settings_changed)
+                )
 
     def _open_temperature_schedule_editor(self):
         """Open temperature schedule editor dialog."""

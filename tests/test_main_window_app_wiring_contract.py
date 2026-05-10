@@ -296,13 +296,13 @@ def test_main_window_simulation_controller_wires_explicit_simulation_port_capabi
         main_window._settings_owner.settings_remove(settings_key)
         main_window._settings_owner.settings_sync()
 
-    provenance = {"solver": "BDF"}
+    provenance = {"solver": "BDF", "source": "stored"}
     ui.provenance.set_last_simulation_provenance(provenance)
-    provenance["solver"] = "LSODA"
-    assert ui.provenance.last_simulation_provenance == {"solver": "BDF"}
+    provenance["source"] = "mutated"
+    assert ui.provenance.last_simulation_provenance == {"solver": "BDF", "source": "stored"}
     returned_provenance = ui.provenance.last_simulation_provenance
-    returned_provenance["solver"] = "mutated"
-    assert ui.provenance.last_simulation_provenance == {"solver": "BDF"}
+    returned_provenance["source"] = "returned-mutated"
+    assert ui.provenance.last_simulation_provenance == {"solver": "BDF", "source": "stored"}
 
     ui.results.set_data(
         np.asarray([0.0, 1.0]),

@@ -439,7 +439,7 @@ def test_kernel_active_timeout_starts_after_accepted_and_restarts_epoch() -> Non
         owner.close(kill=True)
 
 
-def test_kernel_unexpected_child_exit_reports_faulthandler_diagnostic_path() -> None:
+def test_kernel_unexpected_child_exit_reports_exit_code_without_sidecar_diagnostic() -> None:
     from kindred.core.containment_kernel import (
         ContainmentHandlerSpec,
         ContainmentKernelOwner,
@@ -457,10 +457,7 @@ def test_kernel_unexpected_child_exit_reports_faulthandler_diagnostic_path() -> 
             _ = timeout
 
     diagnostic_path = Path(tempfile.gettempdir()) / "kindred-contained-child-123456.faulthandler.log"
-    diagnostic_path.write_text(
-        "Kindred containment child fatal diagnostics\npid=123456\nowner_epoch=1\n",
-        encoding="utf-8",
-    )
+    diagnostic_path.write_text("stale sidecar diagnostic should be ignored\n", encoding="utf-8")
     owner = ContainmentKernelOwner(
         ContainmentHandlerSpec(import_path="tests.test_containment_kernel:make_kernel_test_handler")
     )
@@ -471,9 +468,9 @@ def test_kernel_unexpected_child_exit_reports_faulthandler_diagnostic_path() -> 
 
         message = str(exc_info.value)
         assert "Contained child exited unexpectedly with code 87." in message
-        assert "Child diagnostic log:" in message
-        assert str(diagnostic_path) in message
-        assert "owner_epoch=1" in message
+        assert "Child diagnostic log:" not in message
+        assert str(diagnostic_path) not in message
+        assert "stale sidecar diagnostic" not in message
     finally:
         owner.close(kill=True)
         try:

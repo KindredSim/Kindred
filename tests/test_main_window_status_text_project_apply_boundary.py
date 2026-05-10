@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
 from kindred.core.simulation_identity import canonical_initials_fingerprint
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
+from kindred.gui.controllers.simulation_controller import SimulationRuntimeInputsChangeOutcome
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
 from kindred.gui.project_schema import PROJECT_DEFAULTS
@@ -782,9 +783,32 @@ def test_apply_project_payload_missing_simulation_keys_use_user_preferences(main
     )
 
 
-def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_change(main_window):
-    calls: list[None] = []
-    main_window._sim_controller.parallel_batch_pool_settings_changed = lambda: calls.append(None)
+def test_apply_project_payload_refreshes_runtime_after_final_project_settings(main_window, monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def _snapshot(event: str) -> None:
+        calls.append(
+            {
+                "event": str(event),
+                "solver": str(main_window._initial_solver),
+                "rtol": float(main_window._initial_rtol),
+                "max_workers": int(main_window._sim_controller.parallel_batch.max_parallel_workers),
+                "lane_budget": int(main_window._sim_controller.batch_runtime_lane_budget),
+                "limit_blas": bool(main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker),
+            }
+        )
+
+    monkeypatch.setattr(
+        main_window._sim_controller,
+        "simulation_runtime_inputs_changed",
+        lambda: _snapshot("controller_refresh"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False, force_when_hidden=False: _snapshot("readiness_schedule"),
+    )
     main_window._sim_controller.parallel_batch.max_parallel_workers = 2
     main_window._sim_controller.batch_runtime_lane_budget = 2
     main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker = True
@@ -792,6 +816,8 @@ def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_ch
     payload = {
         "mechanism": "A -> B; k=1",
         "batch_initial_conditions": {"sets": {"set1": {"A": 1.0}}, "species": ["A"]},
+        "solver": "Radau",
+        "rtol": 2e-6,
         "max_parallel_batch_workers": 7,
         "batch_runtime_lane_budget": 5,
         "limit_blas_threads_per_worker": False,
@@ -802,7 +828,24 @@ def test_apply_project_payload_invalidates_parallel_pool_when_worker_settings_ch
     assert int(main_window._sim_controller.parallel_batch.max_parallel_workers) == 7
     assert int(main_window._sim_controller.batch_runtime_lane_budget) == 5
     assert bool(main_window._sim_controller.parallel_batch.limit_blas_threads_per_worker) is False
-    assert calls == [None]
+    assert calls == [
+        {
+            "event": "controller_refresh",
+            "solver": "Radau",
+            "rtol": pytest.approx(2e-6),
+            "max_workers": 7,
+            "lane_budget": 5,
+            "limit_blas": False,
+        },
+        {
+            "event": "readiness_schedule",
+            "solver": "Radau",
+            "rtol": pytest.approx(2e-6),
+            "max_workers": 7,
+            "lane_budget": 5,
+            "limit_blas": False,
+        },
+    ]
 
 
 def test_apply_project_payload_clamps_parallel_workers_to_shared_ceiling(main_window):
@@ -1121,7 +1164,7 @@ def test_project_apply_schedules_runtime_warm_without_blocking_visible_load(main
     monkeypatch.setattr(
         main_window,
         "_apply_project_payload_inner",
-        lambda data, *, record_undo=True: apply_calls.append("apply"),
+        lambda data, *, record_undo=True: (apply_calls.append("apply"), (False, False))[1],
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
@@ -1289,6 +1332,280 @@ def test_draft_reactions_typing_does_not_notify_active_fit_windows(main_window):
     main_window._on_reactions_text_changed_for_main_window()
 
     assert notifications == []
+
+
+def test_solver_settings_runtime_change_truthfully_gates_visible_runtime_controls(
+    main_window,
+    monkeypatch,
+):
+    class _FakeDialog:
+        def __init__(self, _parent, *, cache_port=None):
+            self._settings = {}
+            self._cache_port = cache_port
+
+        def set_settings(self, settings):
+            self._settings = dict(settings or {})
+
+        def exec(self):
+            return True
+
+        def get_settings(self):
+            updated = dict(self._settings)
+            updated["limit_blas_threads_per_worker"] = not bool(
+                updated.get("limit_blas_threads_per_worker", True)
+            )
+            return updated
+
+    controller_calls: list[dict[str, bool | str]] = []
+    interactive_warms: list[bool] = []
+    batch_warms: list[bool] = []
+    scheduled: list[tuple[int, object]] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+
+    monkeypatch.setattr(
+        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
+        _FakeDialog,
+    )
+    monkeypatch.setattr(
+        QtCore.QTimer,
+        "singleShot",
+        lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "simulation_runtime_inputs_changed",
+        lambda: controller_calls.append(
+            {
+                "event": "controller_refresh",
+                "run_enabled": bool(main_window._run_btn.isEnabled()),
+                "sliders_enabled": bool(main_window._mechanism_editor._variable_sliders.isEnabled()),
+            }
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=False,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=False),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=False),
+    )
+
+    main_window._open_solver_settings()
+
+    assert controller_calls == [
+        {
+            "event": "controller_refresh",
+            "run_enabled": False,
+            "sliders_enabled": False,
+        }
+    ]
+    assert interactive_warms
+    assert all(wait is False for wait in interactive_warms)
+    assert batch_warms
+    assert all(wait is False for wait in batch_warms)
+    assert not main_window._run_btn.isEnabled()
+    assert not main_window._mechanism_editor._variable_sliders.isEnabled()
+    assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
+
+
+def test_solver_settings_solver_only_change_does_not_invalidate_batch_pool(
+    main_window,
+    monkeypatch,
+):
+    class _FakeDialog:
+        def __init__(self, _parent, *, cache_port=None):
+            self._settings = {}
+            self._cache_port = cache_port
+
+        def set_settings(self, settings):
+            self._settings = dict(settings or {})
+
+        def exec(self):
+            return True
+
+        def get_settings(self):
+            updated = dict(self._settings)
+            updated["solver"] = "Radau"
+            updated["rtol"] = 2e-6
+            return updated
+
+    batch_pool_settings_changes: list[str] = []
+    interactive_warms: list[bool] = []
+    scheduled: list[tuple[bool, bool]] = []
+
+    monkeypatch.setattr(
+        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
+        _FakeDialog,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "_parallel_batch_pool_settings_changed",
+        lambda: batch_pool_settings_changes.append("batch-pool-settings-changed"),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_interactive_simulation_runtimes_available",
+        lambda *, wait=False: interactive_warms.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "parallel_batch_runtime_ready",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False, force_when_hidden=False: scheduled.append(
+            (bool(wait), bool(force_when_hidden))
+        ),
+    )
+
+    main_window._open_solver_settings()
+
+    assert batch_pool_settings_changes == []
+    assert interactive_warms == [False]
+    assert scheduled == [(False, False)]
+
+
+def test_solver_settings_debounce_only_change_does_not_refresh_runtime(
+    main_window,
+    monkeypatch,
+):
+    class _FakeDialog:
+        def __init__(self, _parent, *, cache_port=None):
+            self._settings = {}
+            self._cache_port = cache_port
+
+        def set_settings(self, settings):
+            self._settings = dict(settings or {})
+
+        def exec(self):
+            return True
+
+        def get_settings(self):
+            updated = dict(self._settings)
+            updated["parameter_preview_debounce_ms"] = 35
+            updated["equilibrium_preview_debounce_ms"] = 90
+            return updated
+
+    controller_calls: list[str] = []
+    scheduled: list[tuple[bool, bool]] = []
+    batch_warms: list[bool] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+
+    monkeypatch.setattr(
+        "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
+        _FakeDialog,
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "simulation_runtime_inputs_changed",
+        lambda: controller_calls.append("runtime-inputs-changed"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False, force_when_hidden=False: scheduled.append(
+            (bool(wait), bool(force_when_hidden))
+        ),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_parallel_batch_pool_eagerly_created",
+        lambda *, wait=False: batch_warms.append(bool(wait)),
+    )
+
+    main_window._open_solver_settings()
+
+    settings = main_window._settings_owner.qsettings
+    assert settings.value("simulation/parameter_preview_debounce_ms", type=int) == 35
+    assert settings.value("simulation/equilibrium_preview_debounce_ms", type=int) == 90
+    assert controller_calls == []
+    assert scheduled == []
+    assert batch_warms == []
+    assert main_window._run_btn.isEnabled()
+    assert main_window._mechanism_editor._variable_sliders.isEnabled()
+
+
+def test_runtime_input_refresh_still_schedules_availability_when_batch_is_draining(
+    main_window,
+    monkeypatch,
+):
+    scheduled: list[tuple[bool, bool]] = []
+
+    main_window.show()
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
+
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "simulation_runtime_inputs_changed",
+        lambda: SimulationRuntimeInputsChangeOutcome(
+            interactive_runtime_refresh_requested=True,
+            batch_pool_shut_down=False,
+            batch_pool_marked_stale_draining=True,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False, force_when_hidden=False: scheduled.append(
+            (bool(wait), bool(force_when_hidden))
+        ),
+    )
+
+    main_window._refresh_simulation_runtime_after_inputs_changed()
+
+    assert scheduled == [(False, False)]
+    assert not main_window._run_btn.isEnabled()
+    assert not main_window._mechanism_editor._variable_sliders.isEnabled()
 
 
 def test_authoritative_mechanism_commit_notifies_active_fit_windows_once(main_window, monkeypatch):
@@ -1831,7 +2148,8 @@ def test_project_apply_defers_authoritative_rewarm_until_payload_finishes(
             events.append("apply_inner_start"),
             main_window._apply_authoritative_mechanism_transition(schedule_runtime_refresh=False),
             events.append("apply_inner_done"),
-        ),
+            (False, False),
+        )[-1],
     )
     monkeypatch.setattr(
         main_window.simulation_controller,

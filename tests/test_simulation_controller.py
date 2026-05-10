@@ -8340,6 +8340,90 @@ def test_interactive_runtime_availability_warms_exact_ordinary_and_preview_plans
 
 
 @pytest.mark.unit
+def test_simulation_runtime_inputs_changed_invalidates_blas_dependent_serial_runtimes(
+    monkeypatch,
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    class _Owner:
+        def __init__(self, payload: dict[str, object], *, fast_mode: bool) -> None:
+            self.payload = dict(payload)
+            self.fast_mode = bool(fast_mode)
+            self.ready = False
+            self.start_calls: list[dict[str, object]] = []
+            self.close_calls: list[bool] = []
+
+        @property
+        def simulation_plan_payload(self) -> dict[str, object]:
+            return dict(self.payload)
+
+        @property
+        def is_ready(self) -> bool:
+            return bool(self.ready)
+
+        def start(self, *, wait: bool = True) -> None:
+            self.start_calls.append({"wait": bool(wait)})
+            self.ready = True
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    created: list[_Owner] = []
+
+    def _factory(*, fast_mode: bool, simulation_plan_payload: dict[str, object]) -> _Owner:
+        owner = _Owner(dict(simulation_plan_payload), fast_mode=bool(fast_mode))
+        created.append(owner)
+        return owner
+
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_run_preparation.migrate_reaction_dsl_initial_concentration_sets",
+        lambda text, default_set_name="set1": ({}, text),
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_run_preparation.batch_mechanism_signature",
+        lambda **_kwargs: "sig",
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+    mw._get_mechanism_text.return_value = "reaction: A -> B; k=1"
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
+    controller._contained_simulation_owner_factory = _factory
+    controller.parallel_batch.limit_blas_threads_per_worker = True
+
+    controller.ensure_interactive_simulation_runtimes_available(wait=True)
+    initial_ordinary = controller._ordinary_simulation_owner
+    initial_preview = controller._preview_simulation_owner
+    assert [
+        owner.payload["metadata"]["contained_owner_identity"]["contained_child_blas_threads_limited"]
+        for owner in created
+    ] == [True, True]
+
+    controller.parallel_batch.limit_blas_threads_per_worker = False
+    controller.simulation_runtime_inputs_changed()
+
+    assert initial_ordinary.close_calls == [False]
+    assert initial_preview.close_calls == [False]
+    assert len(created) == 4
+    assert [
+        owner.payload["metadata"]["contained_owner_identity"]["contained_child_blas_threads_limited"]
+        for owner in created[2:]
+    ] == [False, False]
+    assert controller._ordinary_simulation_owner is created[2]
+    assert controller._preview_simulation_owner is created[3]
+
+
+@pytest.mark.unit
 def test_interactive_runtime_ready_is_pure_and_ensure_warms_changed_payload(
     monkeypatch,
     mw: _FakeMainWindow,
@@ -10722,7 +10806,7 @@ def test_parallel_batch_pool_settings_changed_shuts_down_idle_pool_immediately(
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     seed_batch_context(controller.batch_context_owner)
 
-    controller.parallel_batch_pool_settings_changed()
+    controller._parallel_batch_pool_settings_changed()
 
     assert fake.close_calls == [False]
     assert not controller.parallel_batch.has_lane_pool()
@@ -10774,7 +10858,7 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_until_parallel_com
         MagicMock(return_value=False),
     )
 
-    controller.parallel_batch_pool_settings_changed()
+    controller._parallel_batch_pool_settings_changed()
 
     assert controller.parallel_batch.lane_pool_token() == id(current)
     assert controller.parallel_batch.is_pool_stale is True
@@ -10860,7 +10944,7 @@ def test_parallel_batch_pool_settings_changed_defers_shutdown_for_superseded_inf
     assert started.wait(timeout=1.0)
 
     cancelled, running = controller.parallel_batch.soft_supersede()
-    controller.parallel_batch_pool_settings_changed()
+    controller._parallel_batch_pool_settings_changed()
 
     assert (cancelled, running) == (0, 1)
     assert controller.parallel_batch.has_active_requests()
@@ -10906,7 +10990,7 @@ def test_ensure_parallel_batch_pool_eagerly_created_only_once(
     controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
     first_token = controller.parallel_batch.lane_pool_token()
     controller.ensure_parallel_batch_pool_eagerly_created()
-    controller.parallel_batch_pool_settings_changed()
+    controller._parallel_batch_pool_settings_changed()
     controller.ensure_parallel_batch_pool_eagerly_created()
     assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
     controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)

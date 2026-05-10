@@ -817,12 +817,11 @@ class BatchRuntimeLaneOwner:
         requested_lanes = max(1, int(max_lanes))
         pool = self.lane_pool
         if pool is not None and self._pool_stale:
+            if self.has_active_requests():
+                return pool
             force_terminate = (
-                self.has_active_requests()
-                or (
-                    self._current_max_workers is not None
-                    and requested_lanes > int(self._current_max_workers)
-                )
+                self._current_max_workers is not None
+                and requested_lanes > int(self._current_max_workers)
             )
             self.shutdown(
                 force_terminate=bool(force_terminate),
@@ -865,6 +864,8 @@ class BatchRuntimeLaneOwner:
 
     def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True) -> Any:
         pool = self.ensure_lane_pool(max_lanes=int(max_lanes))
+        if self._pool_stale and self.has_active_requests():
+            return pool
         try:
             warm_lanes = getattr(pool, "warm_lanes", None)
             if callable(warm_lanes):

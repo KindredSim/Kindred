@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -437,7 +436,7 @@ def test_blas_thread_limit_sets_worker_env(monkeypatch):
     assert env2["OMP_NUM_THREADS"] == "8"
 
 
-def test_open_solver_settings_wires_parallel_batch_controls(main_window, monkeypatch):
+def test_open_solver_settings_refreshes_runtime_after_final_settings_apply(main_window, monkeypatch):
     class _FakeDialog:
         def __init__(self, _parent, *, cache_port=None):
             self._settings = {}
@@ -451,23 +450,73 @@ def test_open_solver_settings_wires_parallel_batch_controls(main_window, monkeyp
 
         def get_settings(self):
             return {
-                "solver": "BDF",
-                "rtol": 1e-6,
+                "solver": "Radau",
+                "rtol": 2e-6,
                 "atol": 1e-12,
                 "use_sparse_jacobian": False,
                 "max_parallel_batch_workers": 7,
                 "limit_blas_threads_per_worker": False,
+                "slider_preview_solver": "Radau",
+                "slider_preview_points": 375,
             }
+
+    observations: list[dict[str, object]] = []
+
+    def _snapshot(event: str) -> None:
+        observations.append(
+            {
+                "event": str(event),
+                "solver": str(main_window._initial_solver),
+                "rtol": float(main_window._initial_rtol),
+                "slider_preview_solver": str(main_window._mechanism_editor.slider_solver_value()),
+                "slider_preview_points": int(main_window._mechanism_editor.slider_points_value()),
+                "max_workers": int(main_window.simulation_controller.parallel_batch.max_parallel_workers),
+                "limit_blas": bool(
+                    main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker
+                ),
+            }
+        )
 
     monkeypatch.setattr(
         "kindred.gui.widgets.solver_settings.SolverSettingsDialog",
         _FakeDialog,
     )
-    main_window.simulation_controller.parallel_batch_pool_settings_changed = MagicMock()
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "simulation_runtime_inputs_changed",
+        lambda: _snapshot("controller_refresh"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_window,
+        "_schedule_simulation_runtime_availability_refresh",
+        lambda *, wait=False, force_when_hidden=False: _snapshot("readiness_schedule"),
+    )
+
     main_window._open_solver_settings()
+
     assert int(main_window.simulation_controller.parallel_batch.max_parallel_workers) == 7
     assert bool(main_window.simulation_controller.parallel_batch.limit_blas_threads_per_worker) is False
-    main_window.simulation_controller.parallel_batch_pool_settings_changed.assert_called_once_with()
+    assert observations == [
+        {
+            "event": "controller_refresh",
+            "solver": "Radau",
+            "rtol": pytest.approx(2e-6),
+            "slider_preview_solver": "Radau",
+            "slider_preview_points": 375,
+            "max_workers": 7,
+            "limit_blas": False,
+        },
+        {
+            "event": "readiness_schedule",
+            "solver": "Radau",
+            "rtol": pytest.approx(2e-6),
+            "slider_preview_solver": "Radau",
+            "slider_preview_points": 375,
+            "max_workers": 7,
+            "limit_blas": False,
+        },
+    ]
 
 
 def test_open_solver_settings_notifies_active_fit_windows_for_runtime_changes(main_window, monkeypatch):

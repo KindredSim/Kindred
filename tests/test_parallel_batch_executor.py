@@ -460,7 +460,7 @@ def test_ensure_lane_pool_recreates_stale_pool_even_when_worker_count_matches() 
 
 
 @pytest.mark.unit
-def test_ensure_lane_pool_force_closes_stale_pool_with_active_requests_even_without_resize() -> None:
+def test_ensure_lane_pool_keeps_stale_pool_draining_with_active_requests() -> None:
     release = threading.Event()
 
     class _BlockingLanePool:
@@ -509,9 +509,15 @@ def test_ensure_lane_pool_force_closes_stale_pool_with_active_requests_even_with
 
     second_pool = batch.ensure_lane_pool(max_lanes=2)
 
-    assert second_pool is not first_pool
-    assert first_pool.close_calls == [True]
+    assert second_pool is first_pool
+    assert first_pool.close_calls == []
+    assert batch.is_pool_stale is True
+    release.set()
     handle.join(timeout=1.0)
+    batch.poll_completed_records()
+    replacement_pool = batch.ensure_lane_pool(max_lanes=2)
+    assert replacement_pool is not first_pool
+    assert first_pool.close_calls == [False]
     batch.shutdown(force_terminate=True, record_nonfatal_exception=lambda _msg, _exc: None)
 
 

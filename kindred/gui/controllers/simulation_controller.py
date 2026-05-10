@@ -108,6 +108,12 @@ __all__ = ["SimulationController"]
 _WORKER_APPLICATION_SIGNAL_HANDLERS_ATTR = "_kindred_controller_worker_signal_handlers"
 
 
+@dataclass(frozen=True)
+class SimulationRuntimeInputsChangeOutcome:
+    interactive_runtime_refresh_requested: bool
+    batch_pool_shut_down: bool
+    batch_pool_marked_stale_draining: bool
+
 @dataclass
 class _SerialBatchDispatchState:
     plan_payload: Dict[str, Any] | None
@@ -1382,8 +1388,14 @@ class SimulationController(QtCore.QObject):
     def shutdown_batch_lane_pool(self, *, force_terminate: bool) -> None:
         self._shutdown_batch_lane_pool(force_terminate=force_terminate)
 
-    def parallel_batch_pool_settings_changed(self) -> None:
-        self._parallel_batch_pool_settings_changed()
+    def simulation_runtime_inputs_changed(
+        self,
+        *,
+        batch_runtime_pool_inputs_changed: bool = True,
+    ) -> SimulationRuntimeInputsChangeOutcome:
+        return self._simulation_runtime_inputs_changed(
+            batch_runtime_pool_inputs_changed=bool(batch_runtime_pool_inputs_changed)
+        )
 
     def ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
         self._ensure_parallel_batch_pool_eagerly_created(wait=bool(wait))
@@ -2342,12 +2354,30 @@ class SimulationController(QtCore.QObject):
             return True
         return bool(self._batch_parallel.has_active_requests())
 
-    def _parallel_batch_pool_settings_changed(self) -> None:
+    def _parallel_batch_pool_settings_changed(self) -> str:
         if self._has_active_parallel_batch_work():
             self._batch_parallel.mark_pool_stale()
             self._parallel_batch_runtime_readiness_owner.mark_not_ready()
-            return
+            return "marked_stale_draining"
+        had_pool = bool(self._batch_parallel.has_lane_pool())
         self._shutdown_batch_lane_pool(force_terminate=False)
+        return "shut_down" if had_pool else "idle_no_pool"
+
+    def _simulation_runtime_inputs_changed(
+        self,
+        *,
+        batch_runtime_pool_inputs_changed: bool = True,
+    ) -> SimulationRuntimeInputsChangeOutcome:
+        if bool(batch_runtime_pool_inputs_changed):
+            batch_outcome = self._parallel_batch_pool_settings_changed()
+        else:
+            batch_outcome = "unchanged"
+        self.ensure_interactive_simulation_runtimes_available(wait=False)
+        return SimulationRuntimeInputsChangeOutcome(
+            interactive_runtime_refresh_requested=True,
+            batch_pool_shut_down=batch_outcome == "shut_down",
+            batch_pool_marked_stale_draining=batch_outcome == "marked_stale_draining",
+        )
 
     def _ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
         self._parallel_batch_runtime_readiness_owner.ensure(wait=bool(wait))
