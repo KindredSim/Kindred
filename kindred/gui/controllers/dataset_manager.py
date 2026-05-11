@@ -264,6 +264,7 @@ class DatasetManager:
         try:
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
             from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
+            from kindred.core.simulator.wegscheider_symbolic import UnresolvedWegscheiderCyclicityError
 
             mech = parse_dsl_to_mechanism(cleaned, initials={})
             if isinstance(getattr(mech, "metadata", None), dict):
@@ -283,9 +284,10 @@ class DatasetManager:
             scalar_info_meta = (getattr(mech, "metadata", {}) or {}).get("scalar_param_info") or {}
             if isinstance(scalar_info_meta, dict):
                 scalar_info = {str(k): dict(v) for k, v in scalar_info_meta.items() if isinstance(v, dict)}
-        except Exception as exc:
-            # If parsing/algebra fails, fall back to reaction-only scan.
-            logger.debug("Parameter-algebra scan failed; continuing with reaction-only scan: %s", exc)
+        except UnresolvedWegscheiderCyclicityError as exc:
+            raise DatasetManagerError(str(exc)) from exc
+        except Exception:
+            raise
 
         params: List[Dict[str, Any]] = []
 
@@ -314,8 +316,9 @@ class DatasetManager:
                 if n is None:
                     continue
                 context = str(entry.get("context") or "")
-                derive_rate = str(entry.get("derive_rate") or "")
                 has_Keq_param = bool(entry.get("has_Keq_param"))
+                raw_derive_rate = str(entry.get("derive_rate") or "")
+                derive_rate = raw_derive_rate if raw_derive_rate in {"kf", "kr"} else ("kr" if has_Keq_param else "")
 
                 if kind == "reaction":
                     name = f"k{n}"
@@ -382,7 +385,7 @@ class DatasetManager:
                                 }
                             )
 
-                    # KeqN only when explicitly represented/used (Keq_input stored in metadata)
+                    # Show KeqN only when the source explicitly represents it or algebra uses it.
                     if has_Keq_param:
                         Keq_name = f"Keq{n}"
                         if Keq_name not in constrained:

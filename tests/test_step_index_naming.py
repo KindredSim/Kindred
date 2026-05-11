@@ -20,7 +20,7 @@ def test_canonical_step_names_mixed_mechanism_no_K_param():
         ]
     )
     mech = parse_dsl_to_mechanism(dsl, initials={})
-    assert canonical_parameter_names(mech) == {"k1", "kf2", "kr2", "k3"}
+    assert canonical_parameter_names(mech) == {"k1", "kf2", "kr2", "Keq2", "k3"}
     # Guard against regressions to per-type ordinal naming (reactions-only and equilibria-only counters).
     assert canonical_parameter_names(mech) != {"k1", "k2", "kf1", "kr1"}
 

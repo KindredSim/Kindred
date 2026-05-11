@@ -237,6 +237,9 @@ class MainWindow(
             apply_overrides_to_text=self._apply_overrides_to_text,
             apply_overrides_to_state_network_dsl=self._apply_overrides_to_state_network_dsl,
             apply_parameter_overrides_to_dsl=self._apply_parameter_overrides_to_dsl,
+            apply_wegscheider_resolution_source_rewrite=(
+                self._apply_wegscheider_resolution_source_rewrite
+            ),
         )
         self._simulation_solver_owner = SimulationSolverOwner(
             initial_solver_getter=lambda: self._initial_solver,
@@ -4489,6 +4492,15 @@ class MainWindow(
             bool(record_undo),
         )
 
+    def _apply_wegscheider_resolution_source_rewrite(self, reactions_text: str) -> None:
+        self._set_authoritative_mechanism_editor_texts(
+            reactions_text=str(reactions_text),
+            state_network_dsl=str(self.mechanism_state_network_dsl_raw() or ""),
+            description="Resolve Wegscheider cyclicity",
+            apply_transition=True,
+            transition_source="wegscheider_resolution",
+        )
+
     def finalize_authoritative_mechanism_widget_write(self, *, dispatch_consumers: bool) -> None:
         self._sync_mechanism_session_owner_after_authoritative_widget_write(
             dispatch_consumers=bool(dispatch_consumers)
@@ -4931,66 +4943,29 @@ class MainWindow(
     ) -> Dict[str, Any]:
         """Simulate a mechanism synchronously and return the time-series payload."""
         from kindred.core.exceptions import SimulationError
-        from kindred.core.ode_builder import build_ode_rhs_from_mechanism
-        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-        from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
-        from kindred.core.simulator.solvers import SimulationRequest, solve_ode
-        from kindred.core.units import UnitsModel
+        from kindred.core.simulation_preparation import prepare_simulation_worker_run
+        from kindred.core.simulator.solvers import solve_ode
 
         solver_cfg = self._get_solver_settings()
         temperature = self._temperature_spinbox.value()
-
-        units = UnitsModel(temperature_K=temperature)
-        mechanism = parse_dsl_to_mechanism(mechanism_text, initials=initials or {}, units=units)
-        _ = apply_parameter_algebra_to_mechanism(mechanism_text, mechanism=mechanism, require_mutable=False)
-        species_names = mechanism.species_names()
-        y0 = np.array([mechanism.species[sp].initial_conc for sp in species_names])
-        rhs = build_ode_rhs_from_mechanism(mechanism)
-
-        temperature_schedule = None
-        intervention_schedule = None
-        try:
-            meta = getattr(mechanism, "metadata", {}) or {}
-            if isinstance(meta, dict):
-                temperature_schedule = meta.get("temperature_schedule")
-                intervention_schedule = meta.get("intervention_schedule")
-        except Exception:
-            temperature_schedule = None
-            intervention_schedule = None
-
-        jacobian_func = None
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
-
-        solver_name = str(solver_cfg.get("solver") or DEFAULT_SOLVER_NAME).upper()
-        if solver_cfg.get("use_sparse_jacobian") and solver_name in {"RADAU", "BDF"}:
-            try:
-                from kindred.core.sparse_jacobian import build_sparse_jacobian
-
-                jacobian_func = build_sparse_jacobian(mechanism)
-                logger.info("Sparse Jacobian enabled for helper simulation (%s)", solver_name)
-            except Exception as exc:
-                logger.warning("Sparse Jacobian unavailable: %s", exc)
-                jacobian_func = None
-                solver_cfg["use_sparse_jacobian"] = False
-
-        request = SimulationRequest(
-            rhs=rhs,
+        solver_cfg = {
+            **dict(solver_cfg or {}),
+            "temperature_K": float(temperature),
+            "grid": {"N": max(2, int(num_points))},
+        }
+        prepared = prepare_simulation_worker_run(
+            mechanism_text=str(mechanism_text or ""),
+            initials=dict(initials or {}),
             t_span=(0.0, float(t_end)),
-            y0=y0,
-            solver=solver_cfg["solver"],
-            rtol=solver_cfg["rtol"],
-            atol=solver_cfg["atol"],
-            grid={"N": max(2, int(num_points))},
-            jacobian_func=jacobian_func,
-            temperature_schedule=temperature_schedule,
-            intervention_schedule=intervention_schedule,
-            species_names=tuple(species_names),
+            solver_config=solver_cfg,
         )
         try:
-            result = solve_ode(request)
+            result = solve_ode(prepared.request)
         except SimulationError as exc:
             logger.error("Synchronous simulation failed: %s", exc)
             raise
+        mechanism = prepared.mechanism
+        species_names = list(prepared.species_names)
         species_data = {name: result.Y[idx, :].copy() for idx, name in enumerate(species_names)}
         algebra_scalars: Dict[str, float] = {}
         try:
@@ -5015,6 +4990,7 @@ class MainWindow(
             "algebra_scalars": dict(algebra_scalars),
             "mechanism": mechanism,
             "solver_config": solver_cfg,
+            "solver_provenance": dict(getattr(result, "provenance", {}) or {}),
         }
 
     def _run_dataset_simulation(self, dsl_text: str) -> Dict[str, Any]:

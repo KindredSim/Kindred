@@ -300,6 +300,8 @@ class SimulationIdentity:
     intervention_schedule_fingerprint: str = ""
     preview_batch_cache_token: str = ""
     execution_flags: tuple[str, ...] = ()
+    symbolic_jacobian_identity: Optional[dict[str, Any]] = None
+    symbolic_wegscheider_identity: Optional[dict[str, Any]] = None
     version: int = 2
 
     @classmethod
@@ -314,17 +316,33 @@ class SimulationIdentity:
         intervention_schedule_fingerprint: str = "",
         preview_batch_cache_token: str = "",
         execution_flags: Sequence[str] = (),
+        symbolic_jacobian_identity: Mapping[str, Any] | None = None,
+        symbolic_wegscheider_identity: Mapping[str, Any] | None = None,
     ) -> "SimulationIdentity":
         flags = tuple(sorted({str(flag) for flag in (execution_flags or ()) if str(flag)}))
+        solver_identity = SimulationSolverIdentity.from_solver_config(solver_config)
+        intervention_fp = str(intervention_schedule_fingerprint or "")
+        symbolic_identity = (
+            dict(symbolic_jacobian_identity) or None
+            if isinstance(symbolic_jacobian_identity, Mapping)
+            else None
+        )
+        wegscheider_identity = (
+            dict(symbolic_wegscheider_identity) or None
+            if isinstance(symbolic_wegscheider_identity, Mapping)
+            else None
+        )
         return cls(
             schema_id=str(schema_id or ""),
             param_fingerprint=str(param_fingerprint or ""),
             canonical_initials_fingerprint=str(canonical_initials_fingerprint or ""),
-            solver=SimulationSolverIdentity.from_solver_config(solver_config),
+            solver=solver_identity,
             t_end=float(t_end),
-            intervention_schedule_fingerprint=str(intervention_schedule_fingerprint or ""),
+            intervention_schedule_fingerprint=intervention_fp,
             preview_batch_cache_token=str(preview_batch_cache_token or ""),
             execution_flags=flags,
+            symbolic_jacobian_identity=symbolic_identity,
+            symbolic_wegscheider_identity=wegscheider_identity,
         )
 
     @classmethod
@@ -344,10 +362,20 @@ class SimulationIdentity:
             intervention_schedule_fingerprint=str(payload.get("intervention_schedule_fingerprint") or ""),
             preview_batch_cache_token=str(payload.get("preview_batch_cache_token") or ""),
             execution_flags=tuple(str(flag) for flag in (payload.get("execution_flags") or ()) if str(flag)),
+            symbolic_jacobian_identity=(
+                dict(payload.get("symbolic_jacobian_identity") or {})
+                if isinstance(payload.get("symbolic_jacobian_identity"), Mapping)
+                else None
+            ),
+            symbolic_wegscheider_identity=(
+                dict(payload.get("symbolic_wegscheider_identity") or {})
+                if isinstance(payload.get("symbolic_wegscheider_identity"), Mapping)
+                else None
+            ),
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "version": int(self.version),
             "schema_id": str(self.schema_id),
             "param_fingerprint": str(self.param_fingerprint),
@@ -358,6 +386,11 @@ class SimulationIdentity:
             "preview_batch_cache_token": str(self.preview_batch_cache_token),
             "execution_flags": list(self.execution_flags),
         }
+        if self.symbolic_jacobian_identity:
+            payload["symbolic_jacobian_identity"] = dict(self.symbolic_jacobian_identity)
+        if self.symbolic_wegscheider_identity:
+            payload["symbolic_wegscheider_identity"] = dict(self.symbolic_wegscheider_identity)
+        return payload
 
     def cache_key(self) -> str:
         return hashlib.sha256(_canonical_json_bytes(self.to_payload())).hexdigest()
@@ -377,6 +410,10 @@ class SimulationIdentity:
             "use_sparse_jacobian": bool(self.solver.use_sparse_jacobian),
             "wegscheider_cyclicity_enabled": bool(self.solver.wegscheider_cyclicity_enabled),
         }
+        if self.symbolic_jacobian_identity:
+            payload["symbolic_jacobian_identity"] = dict(self.symbolic_jacobian_identity)
+        if self.symbolic_wegscheider_identity:
+            payload["symbolic_wegscheider_identity"] = dict(self.symbolic_wegscheider_identity)
         return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 

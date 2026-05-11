@@ -14,7 +14,7 @@ import hashlib
 import logging
 import numbers
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -39,6 +39,7 @@ from kindred.core.simulation_preparation import (
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, SimulationRequest
+from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,28 @@ def _prepared_metadata_from_evaluator(value) -> Optional[PreparedSimulationMetad
 def _parameter_origin_for(name: str, origins: Optional[Mapping[str, str]]) -> str:
     origin = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR) or "").strip()
     return origin or FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
+
+
+def _intervention_schedule_parameter_names(schedule: object) -> set[str]:
+    try:
+        payload = schedule.to_payload()  # type: ignore[attr-defined]
+    except Exception:
+        return set()
+    names: set[str] = set()
+
+    def _walk(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if str(key).endswith("_param") and str(item or "").strip():
+                    names.add(str(item))
+                else:
+                    _walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _walk(item)
+
+    _walk(payload)
+    return names
 
 
 def _coerce_consumed_parameter_value(
@@ -460,11 +483,15 @@ class PreparedFittingExecutionContext:
     def execution_request(self) -> SimulationExecutionRequest:
         return self.simulation_plan.execution_request
 
-    def clone(self) -> "PreparedFittingExecutionContext":
+    def clone(
+        self,
+        *,
+        prepared_metadata: PreparedSimulationMetadata | Mapping[str, Any] | None = None,
+    ) -> "PreparedFittingExecutionContext":
         return type(self)(
             simulation_plan=SimulationPlan.from_payload(copy.deepcopy(self.simulation_plan.to_payload())),
             requested_param_names=list(self.requested_param_names),
-            prepared_metadata=self.prepared_metadata,
+            prepared_metadata=self.prepared_metadata if prepared_metadata is None else prepared_metadata,
             temperature_K=float(self.temperature_K),
             initial_prefix=str(self.initial_prefix),
         )
@@ -619,6 +646,7 @@ class SerialFittingEvaluator:
         )
 
     def to_process_payload(self) -> Dict[str, Any]:
+        self._ensure_prepared()
         payload = {
             "simulation_plan": self._context.simulation_plan.to_payload(),
             "requested_param_names": list(self._context.requested_param_names),
@@ -745,6 +773,9 @@ class SerialFittingEvaluator:
 
         initial_overrides: Dict[str, float] = {}
         shared_values: Dict[str, float] = {}
+        schedule_param_names = _intervention_schedule_parameter_names(
+            prepared_run.request.intervention_schedule
+        )
         for key, raw_val in param_map.items():
             name = str(key)
             if name.startswith(self._context.initial_prefix):
@@ -759,6 +790,16 @@ class SerialFittingEvaluator:
                 )
             else:
                 if name not in self._bindings:
+                    if name in schedule_param_names:
+                        continue
+                    if name in set(self._context.requested_param_names or ()):
+                        raise FitSimulationError(
+                            (
+                                f"Requested fitting parameter {name!r} is unavailable after preparation; "
+                                "it may be algebra-derived or unsupported as a fitted dimension."
+                            ),
+                            details={"fatal": True, "stage": "parameter_binding"},
+                        )
                     continue
                 shared_values[name] = _coerce_consumed_parameter_value(
                     name=name,
@@ -803,10 +844,12 @@ class SerialFittingEvaluator:
             atol=float(prepared_run.request.atol),
             grid=dict(prepared_run.request.grid or {}),
             jacobian_func=prepared_run.request.jacobian_func,
+            jac_sparsity=prepared_run.request.jac_sparsity,
             temperature_schedule=prepared_run.request.temperature_schedule,
             intervention_schedule=intervention_schedule,
             species_names=tuple(prepared_run.species_names),
             events=tuple(events) if events else None,
+            symbolic_wegscheider_identity=prepared_run.request.symbolic_wegscheider_identity,
         )
         try:
             result = _solve_request(request)
@@ -897,6 +940,28 @@ class SerialFittingEvaluator:
         if not isinstance(bindings, Mapping):
             raise FitSimulationError("Structured fitting payload is missing mutable bindings.", details={"fatal": True})
         self._prepared_run = prepared_run
+        symbolic_identity = symbolic_jacobian_identity_payload(prepared_run.request.jacobian_func)
+        symbolic_wegscheider_identity = getattr(
+            prepared_run.request,
+            "symbolic_wegscheider_identity",
+            None,
+        )
+        if symbolic_identity:
+            self._context = self._context.clone(
+                prepared_metadata=replace(
+                    self._context.prepared_metadata,
+                    symbolic_jacobian_identity=dict(symbolic_identity),
+                )
+            )
+            self._kindred_fitting_execution_context = self._context
+        if isinstance(symbolic_wegscheider_identity, Mapping) and symbolic_wegscheider_identity:
+            self._context = self._context.clone(
+                prepared_metadata=replace(
+                    self._context.prepared_metadata,
+                    symbolic_wegscheider_identity=dict(symbolic_wegscheider_identity),
+                )
+            )
+            self._kindred_fitting_execution_context = self._context
         self._bindings = dict(bindings)
         self._species_index = {name: idx for idx, name in enumerate(prepared_run.species_names)}
         self._raise_if_cancel_requested()

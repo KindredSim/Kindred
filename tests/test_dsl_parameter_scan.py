@@ -62,13 +62,13 @@ def test_scan_namespace_matches_global_step_indexing():
 
     ir = _parse_dsl_ir(dsl)
 
-    assert _scan_mechanism_param_names(ir) == {"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"}
+    assert _scan_mechanism_param_names(ir) == {"k1", "kf2", "kr2", "Keq2", "kf3", "kr3", "Keq3"}
 
 
-def test_scan_namespace_omits_keq_without_explicit_keq_input():
+def test_scan_namespace_includes_keq_for_every_reversible_step():
     ir = _parse_dsl_ir("equilibrium: A <-> B; kf=6; kr=2\n")
 
-    assert _scan_mechanism_param_names(ir) == {"kf1", "kr1"}
+    assert _scan_mechanism_param_names(ir) == {"kf1", "kr1", "Keq1"}
 
 
 def test_scan_namespace_includes_keq_for_reversible_reaction_with_explicit_keq():
@@ -81,8 +81,8 @@ def test_scan_namespace_includes_keq_for_reversible_reaction_with_explicit_keq()
     ("dsl", "expected"),
     [
         ("reaction: A -> B; k=1\n", {"k1"}),
-        ("reaction: A <-> B; kf=6; kr=2\n", {"kf1", "kr1"}),
-        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1"}),
+        ("reaction: A <-> B; kf=6; kr=2\n", {"kf1", "kr1", "Keq1"}),
+        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1", "Keq1"}),
         ("equilibrium: A <-> B; kf=6; K=3\n", {"kf1", "kr1", "Keq1"}),
     ],
 )

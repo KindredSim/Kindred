@@ -649,28 +649,34 @@ class FittingRuntimeReadinessController:
     def _finalize_identity_for_accepted_launch(self, identity: FittingRuntimeIdentity) -> FittingRuntimeIdentity:
         if identity is None:
             return identity
-        if identity.stamp.get("prepared_simulation"):
+        prepared_simulation = self._prepared_simulation_meta(identity.fit_evaluator)
+        if identity.stamp.get("prepared_simulation") and prepared_simulation is None:
             return replace(
                 identity,
                 fit_evaluator_factory=None,
-                launch_request_hash=str(identity.launch_request_hash or identity.stamp_hash or ""),
+                launch_request_hash=str(identity.stamp_hash or ""),
             )
-        prepared_simulation = self._prepared_simulation_meta(identity.fit_evaluator)
         if prepared_simulation is None:
             return replace(
                 identity,
                 fit_evaluator_factory=None,
-                launch_request_hash=str(identity.launch_request_hash or identity.stamp_hash or ""),
+                launch_request_hash=str(identity.stamp_hash or ""),
             )
         stamp = finalize_global_fit_run_stamp_prepared_simulation(identity.stamp, prepared_simulation)
         stamp_hash = hash_global_fit_run_stamp(stamp)
+        launch_request_hash = str(identity.launch_request_hash or identity.stamp_hash or "")
+        if (
+            prepared_simulation.symbolic_jacobian_identity
+            or prepared_simulation.symbolic_wegscheider_identity
+        ):
+            launch_request_hash = str(stamp_hash)
         return replace(
             identity,
             stamp=stamp,
             stamp_hash=str(stamp_hash),
             stamp_short=str(stamp_hash)[:12],
             fit_evaluator_factory=None,
-            launch_request_hash=str(identity.launch_request_hash or identity.stamp_hash or ""),
+            launch_request_hash=launch_request_hash,
         )
 
     @staticmethod

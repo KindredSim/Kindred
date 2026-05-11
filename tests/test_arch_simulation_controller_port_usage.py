@@ -192,6 +192,8 @@ SETTINGS_TARGET_METHODS = {
 DIALOGS_TARGET_METHODS = {
     "message_box_warning",
     "message_box_critical",
+    "message_box_question",
+    "choose_wegscheider_resolution",
 }
 
 REMAINING_SOLVER_TARGET_METHODS = {
@@ -222,6 +224,7 @@ MECHANISM_TARGET_METHODS = {
     "get_mechanism_text",
     "simulation_schema_id",
     "simulation_param_fingerprint",
+    "apply_wegscheider_resolution_source_rewrite",
 }
 
 RUNTIME_TARGET_METHODS = {
@@ -884,6 +887,7 @@ def test_simulation_controller_init_uses_explicit_settings_port() -> None:
     ("method_name", "expected_methods"),
     (
         ("_run_simulation", {"message_box_warning"}),
+        ("_resolve_wegscheider_cyclicity_for_run_or_abort", {"choose_wegscheider_resolution", "message_box_warning"}),
         ("_start_parallel_batch_simulations", set()),
         ("_submit_parallel_batch_tasks", {"message_box_warning"}),
         ("_start_next_batch_simulation", set()),
@@ -935,6 +939,7 @@ def test_simulation_controller_dialog_clusters_use_explicit_dialogs_port(
     ("method_name", "expected_methods"),
     (
         ("_run_simulation", {"parse_sim_time_seconds"}),
+        ("_resolve_wegscheider_cyclicity_for_run_or_abort", {"wegscheider_cyclicity_enabled"}),
         (
             "_run_solver_context_or_abort",
             set(),
@@ -1109,6 +1114,13 @@ def test_simulation_run_preparation_owners_use_explicit_ports(
             {
                 "auto_lock_for_run",
                 "is_mechanism_ready_for_run",
+            },
+        ),
+        (
+            "_resolve_wegscheider_cyclicity_for_run_or_abort",
+            {
+                "apply_wegscheider_resolution_source_rewrite",
+                "mechanism_reactions_text_raw",
             },
         ),
             ("_on_simulation_complete", set()),

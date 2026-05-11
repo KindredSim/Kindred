@@ -43,6 +43,8 @@ from kindred.core.simulator.solvers import (
     normalize_solver_name,
     solve_ode,
 )
+from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
+from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,8 @@ __all__ = [
     "prepare_fitting_objective_context",
     "prepare_bound_mechanism",
     "prepare_simulation_worker_run",
+    "symbolic_jacobian_identity_for_execution_text",
+    "symbolic_wegscheider_identity_for_execution_text",
 ]
 
 
@@ -151,6 +155,7 @@ class PreparedSimulationRun:
     temperature_schedule: TemperatureScheduleProtocol | None
     intervention_schedule: InterventionSchedule | None
     jacobian_func: Any
+    jac_sparsity: Any
     initials_for_algebra: Optional[Dict[str, float]]
     warnings: List[str]
     request: Any
@@ -176,9 +181,11 @@ class PreparedSimulationMetadata:
     wegscheider_cyclicity_enabled: bool
     initial_prefix: str
     intervention_schedule_fingerprint: str = ""
+    symbolic_jacobian_identity: Optional[Dict[str, Any]] = None
+    symbolic_wegscheider_identity: Optional[Dict[str, Any]] = None
 
     def to_serializable_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "version": int(self.version),
             "mechanism_text_sha256": str(self.mechanism_text_sha256),
             "mechanism_text_len": int(self.mechanism_text_len),
@@ -198,6 +205,11 @@ class PreparedSimulationMetadata:
             "initial_prefix": str(self.initial_prefix),
             "intervention_schedule_fingerprint": str(self.intervention_schedule_fingerprint or ""),
         }
+        if self.symbolic_jacobian_identity:
+            payload["symbolic_jacobian_identity"] = dict(self.symbolic_jacobian_identity)
+        if self.symbolic_wegscheider_identity:
+            payload["symbolic_wegscheider_identity"] = dict(self.symbolic_wegscheider_identity)
+        return payload
 
     @classmethod
     def from_mapping(cls, meta: Mapping[str, Any]) -> "PreparedSimulationMetadata":
@@ -240,6 +252,16 @@ class PreparedSimulationMetadata:
             ),
             initial_prefix=str(meta.get("initial_prefix") or ""),
             intervention_schedule_fingerprint=str(meta.get("intervention_schedule_fingerprint") or ""),
+            symbolic_jacobian_identity=(
+                dict(meta.get("symbolic_jacobian_identity") or {})
+                if isinstance(meta.get("symbolic_jacobian_identity"), Mapping)
+                else None
+            ),
+            symbolic_wegscheider_identity=(
+                dict(meta.get("symbolic_wegscheider_identity") or {})
+                if isinstance(meta.get("symbolic_wegscheider_identity"), Mapping)
+                else None
+            ),
         )
 
 
@@ -256,6 +278,7 @@ class PreparedFittingObjectiveContext:
     compiled_algebra: Any
     initials_for_algebra: Dict[str, float]
     temperature_K: float
+    warnings: List[str] = field(default_factory=list)
 
 
 _INTERVENTION_SCHEDULE_UNSET = object()
@@ -522,6 +545,8 @@ class _PreparedRunContext:
     solver_config: _PreparedSolverConfig
     temperature_schedule: TemperatureScheduleProtocol | None
     jacobian_func: Any
+    jac_sparsity: Any
+    symbolic_jacobian_identity: Optional[Dict[str, Any]]
     algebra_text: Optional[str]
     warnings: Tuple[str, ...]
 
@@ -585,6 +610,24 @@ def metadata_view_for_mechanism(
         mechanism,
         temperature_schedule_override=temperature_schedule_override,
     )
+
+
+def _mechanism_has_dynamic_rate_bindings(mechanism: Any) -> bool:
+    for reaction in getattr(mechanism, "reactions", []) or []:
+        value = getattr(reaction, "rate", None)
+        if isinstance(value, RateBinding) or callable(value):
+            return True
+    for equilibrium in getattr(mechanism, "equilibria", []) or []:
+        for attr_name in ("kf", "kr", "Keq"):
+            value = getattr(equilibrium, attr_name, None)
+            if isinstance(value, RateBinding) or callable(value):
+                return True
+        meta = getattr(equilibrium, "metadata", {}) or {}
+        if isinstance(meta, Mapping):
+            keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+            if isinstance(keq_input, RateBinding) or callable(keq_input):
+                return True
+    return False
 
 
 def _prepare_preparation_failure(stage: str, message: object) -> SimulationPreparationError:
@@ -831,7 +874,7 @@ def _apply_parameter_overrides_to_prepared_mechanism(
             apply_parameter_algebra_spec_to_mechanism(
                 spec,
                 mechanism=mechanism,
-                require_mutable=False,
+                require_mutable=True,
             )
     return _ParameterOverrideApplication(
         rebuild_rhs=bool(override_applied),
@@ -858,13 +901,19 @@ def _canonical_step_override_name(mechanism: Any, name: str) -> str:
         return ""
     try:
         from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+        from kindred.core.simulator.step_indexing import lookup_step_param_target
 
         resolution = build_namespace_from_mechanism(mechanism).resolve(name_s)
     except Exception:
         return name_s
     if resolution.equilibrium_conflict_name is not None:
         return name_s
-    return str(resolution.canonical_name or name_s)
+    if resolution.canonical_name:
+        return str(resolution.canonical_name)
+    alias = {"k": "k1", "kf": "kf1", "kr": "kr1", "K": "Keq1", "Keq": "Keq1"}.get(name_s)
+    if alias and lookup_step_param_target(mechanism, alias) is not None:
+        return alias
+    return name_s
 
 
 def _apply_scalar_parameter_override_to_prepared_mechanism(
@@ -1016,33 +1065,246 @@ def _build_prepared_run_context(
     warnings: List[str] = []
 
     jacobian_func = jacobian_func_override
-    if (
-        jacobian_func is None
-        and temperature_schedule is not None
-        and solver_config.use_sparse_jacobian
-        and str(solver_config.solver).upper() in {"RADAU", "BDF"}
-    ):
-        message = "Sparse Jacobian disabled for scheduled-temperature run; falling back to dense Jacobian."
+    jac_sparsity = None
+    symbolic_jacobian_identity = symbolic_jacobian_identity_payload(jacobian_func)
+
+    def _build_sparsity_hint() -> Any:
+        try:
+            from kindred.core.sparse_jacobian import detect_sparsity_pattern
+
+            return detect_sparsity_pattern(mechanism).pattern
+        except Exception as sparsity_exc:
+            logger.warning(
+                "Jacobian sparsity hint unavailable; using solver default without sparsity hint: %s",
+                sparsity_exc,
+                exc_info=True,
+            )
+            return None
+
+    if jacobian_func is not None and not symbolic_jacobian_identity:
+        message = (
+            "Ignored non-symbolic Jacobian callable from prepared payload; "
+            "using generated symbolic Jacobian or solver default Jacobian handling."
+        )
         logger.warning("%s", message)
         warnings.append(message)
-    elif jacobian_func is None and solver_config.use_sparse_jacobian and str(solver_config.solver).upper() in {"RADAU", "BDF"}:
-        try:
-            from kindred.core.sparse_jacobian import build_sparse_jacobian
+        jacobian_func = None
 
-            jacobian_func = build_sparse_jacobian(mechanism)
-        except Exception as exc:
-            message = f"Sparse Jacobian unavailable; falling back to dense Jacobian: {exc}"
-            logger.warning("%s", message, exc_info=True)
-            warnings.append(message)
+    implicit_jacobian_solver = str(solver_config.solver).upper() in {"RADAU", "BDF"}
+    if temperature_schedule is not None and (
+        symbolic_jacobian_identity
+        or (solver_config.use_sparse_jacobian and implicit_jacobian_solver)
+    ):
+        message = "Symbolic Jacobian disabled for scheduled-temperature run; using solver default Jacobian handling."
+        logger.warning("%s", message)
+        warnings.append(message)
+        jacobian_func = None
+        symbolic_jacobian_identity = None
+        jac_sparsity = None
+    analytical_jacobian_requested = (
+        jacobian_func is None
+        and solver_config.use_sparse_jacobian
+        and implicit_jacobian_solver
+        and temperature_schedule is None
+    )
+    if (
+        solver_config.use_sparse_jacobian
+        and implicit_jacobian_solver
+        and temperature_schedule is None
+        and _mechanism_has_dynamic_rate_bindings(mechanism)
+    ):
+        message = (
+            "Symbolic Jacobian disabled for dynamic rate bindings; "
+            "using solver default Jacobian handling."
+        )
+        logger.warning("%s", message)
+        warnings.append(message)
+        jacobian_func = None
+        symbolic_jacobian_identity = None
+        jac_sparsity = _build_sparsity_hint()
+    elif analytical_jacobian_requested:
+        try:
+            from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+            symbolic_artifact = build_symbolic_jacobian_artifact(mechanism)
+            jacobian_func = symbolic_artifact.jacobian_func
+            symbolic_jacobian_identity = symbolic_artifact.identity.to_payload()
+        except UnsupportedSymbolicExpressionError as exc:
+            symbolic_message = f"Symbolic Jacobian unsupported; using solver default Jacobian handling: {exc}"
+            logger.warning("%s", symbolic_message, exc_info=True)
+            warnings.append(symbolic_message)
             jacobian_func = None
+            jac_sparsity = _build_sparsity_hint()
 
     return _PreparedRunContext(
         solver_config=solver_config,
         temperature_schedule=temperature_schedule,
         jacobian_func=jacobian_func,
+        jac_sparsity=jac_sparsity,
+        symbolic_jacobian_identity=symbolic_jacobian_identity,
         algebra_text=getattr(mech_meta, "algebra_text", None),
         warnings=tuple(warnings),
     )
+
+
+def _apply_execution_parameter_algebra_and_cyclicity(
+    *,
+    mechanism: Any,
+    mechanism_text: str,
+    structured_prepared_request: bool,
+    prepared_solver_config: _PreparedSolverConfig,
+    require_mutable: bool,
+) -> None:
+    from kindred.core.simulator.parameter_algebra import (
+        apply_parameter_algebra_spec_to_mechanism,
+        apply_parameter_algebra_to_mechanism,
+        parameter_algebra_spec_from_mechanism,
+    )
+    from kindred.core.simulator.wegscheider_symbolic import (
+        UnresolvedWegscheiderCyclicityError,
+        validate_wegscheider_cyclicity_resolved,
+    )
+
+    try:
+        if structured_prepared_request:
+            spec = parameter_algebra_spec_from_mechanism(mechanism)
+            if spec is not None:
+                _ = apply_parameter_algebra_spec_to_mechanism(
+                    spec,
+                    mechanism=mechanism,
+                    require_mutable=bool(require_mutable),
+                )
+            elif prepared_solver_config.wegscheider_cyclicity_enabled:
+                validate_wegscheider_cyclicity_resolved(mechanism)
+        elif mechanism_text:
+            _ = apply_parameter_algebra_to_mechanism(
+                mechanism_text,
+                mechanism=mechanism,
+                require_mutable=bool(require_mutable),
+            )
+        else:
+            spec = parameter_algebra_spec_from_mechanism(mechanism)
+            if spec is not None:
+                _ = apply_parameter_algebra_spec_to_mechanism(
+                    spec,
+                    mechanism=mechanism,
+                    require_mutable=bool(require_mutable),
+                )
+            elif prepared_solver_config.wegscheider_cyclicity_enabled:
+                validate_wegscheider_cyclicity_resolved(mechanism)
+    except UnresolvedWegscheiderCyclicityError as exc:
+        raise SimulationPreparationError("wegscheider_cyclicity", str(exc)) from exc
+    except Exception as exc:
+        raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
+
+    if prepared_solver_config.wegscheider_cyclicity_enabled and bool(
+        getattr(mechanism, "equilibria", []) or []
+    ):
+        try:
+            report = validate_wegscheider_cyclicity_resolved(mechanism)
+        except UnresolvedWegscheiderCyclicityError as exc:
+            raise SimulationPreparationError("wegscheider_cyclicity", str(exc)) from exc
+        except Exception as exc:
+            raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
+        if report.cycles:
+            meta = getattr(mechanism, "metadata", None)
+            if isinstance(meta, dict):
+                meta["symbolic_wegscheider_identity"] = dict(report.symbolic_identity)
+
+
+def symbolic_jacobian_identity_for_execution_text(
+    *,
+    mechanism_text: str,
+    solver_config: Mapping[str, Any] | None,
+) -> Optional[Dict[str, Any]]:
+    solver_cfg = dict(solver_config or {})
+    prepared_solver_config = _build_solver_config(
+        solver_input=str(solver_cfg.get("solver") or DEFAULT_SOLVER_NAME),
+        rtol=solver_cfg.get("rtol", 1e-6),
+        atol=solver_cfg.get("atol", 1e-12),
+        grid=solver_cfg.get("grid", {"N": 100}) or {"N": 100},
+        use_sparse_jacobian=bool(
+            solver_cfg.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
+        ),
+        wegscheider_cyclicity_enabled=bool(
+            solver_cfg.get(
+                MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
+                WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+            )
+        ),
+    )
+    if not prepared_solver_config.use_sparse_jacobian:
+        return None
+    if str(prepared_solver_config.solver or "").upper() not in {"BDF", "RADAU"}:
+        return None
+
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+    from kindred.core.units import UnitsModel
+
+    units = UnitsModel(temperature_K=float(solver_cfg.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15)))
+    mechanism = parse_dsl_to_mechanism(str(mechanism_text or ""), initials={}, units=units)
+    meta = getattr(mechanism, "metadata", None)
+    if isinstance(meta, dict):
+        meta[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED] = bool(
+            prepared_solver_config.wegscheider_cyclicity_enabled
+        )
+    _apply_execution_parameter_algebra_and_cyclicity(
+        mechanism=mechanism,
+        mechanism_text=str(mechanism_text or ""),
+        structured_prepared_request=False,
+        prepared_solver_config=prepared_solver_config,
+        require_mutable=False,
+    )
+    context = _build_prepared_run_context(
+        mechanism=mechanism,
+        solver_config=prepared_solver_config,
+    )
+    return dict(context.symbolic_jacobian_identity or {}) or None
+
+
+def symbolic_wegscheider_identity_for_execution_text(
+    *,
+    mechanism_text: str,
+    solver_config: Mapping[str, Any] | None,
+) -> Optional[Dict[str, Any]]:
+    solver_cfg = dict(solver_config or {})
+    prepared_solver_config = _build_solver_config(
+        solver_input=str(solver_cfg.get("solver") or DEFAULT_SOLVER_NAME),
+        rtol=solver_cfg.get("rtol", 1e-6),
+        atol=solver_cfg.get("atol", 1e-12),
+        grid=solver_cfg.get("grid", {"N": 100}) or {"N": 100},
+        use_sparse_jacobian=bool(
+            solver_cfg.get("use_sparse_jacobian", USE_SPARSE_JACOBIAN_DEFAULT)
+        ),
+        wegscheider_cyclicity_enabled=bool(
+            solver_cfg.get(
+                MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED,
+                WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
+            )
+        ),
+    )
+    if not prepared_solver_config.wegscheider_cyclicity_enabled:
+        return None
+
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+    from kindred.core.units import UnitsModel
+
+    units = UnitsModel(temperature_K=float(solver_cfg.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15)))
+    mechanism = parse_dsl_to_mechanism(str(mechanism_text or ""), initials={}, units=units)
+    meta = getattr(mechanism, "metadata", None)
+    if isinstance(meta, dict):
+        meta[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED] = True
+    _apply_execution_parameter_algebra_and_cyclicity(
+        mechanism=mechanism,
+        mechanism_text=str(mechanism_text or ""),
+        structured_prepared_request=False,
+        prepared_solver_config=prepared_solver_config,
+        require_mutable=False,
+    )
+    meta = getattr(mechanism, "metadata", {}) or {}
+    if isinstance(meta, Mapping) and isinstance(meta.get("symbolic_wegscheider_identity"), Mapping):
+        return dict(meta.get("symbolic_wegscheider_identity") or {}) or None
+    return None
 
 
 def prepare_simulation_worker_run(
@@ -1063,7 +1325,7 @@ def prepare_simulation_worker_run(
     - Temperature schedule coercion (DSL schedule takes precedence)
     - Parameter algebra application
     - Metadata flags (e.g. Wegscheider cyclicity enablement)
-    - Sparse Jacobian construction (when requested and supported by solver)
+    - Generated symbolic Jacobian construction when supported by the solver path
     """
 
     request_payload = coerce_simulation_execution_request(execution_request)
@@ -1164,43 +1426,24 @@ def prepare_simulation_worker_run(
             prepared_solver_config.wegscheider_cyclicity_enabled
         )
 
-    try:
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-            apply_parameter_algebra_to_mechanism,
-            parameter_algebra_spec_from_mechanism,
-        )
-
-        if structured_prepared_request:
-            spec = parameter_algebra_spec_from_mechanism(mechanism)
-            if spec is not None:
-                _ = apply_parameter_algebra_spec_to_mechanism(
-                    spec,
-                    mechanism=mechanism,
-                    require_mutable=bool(require_mutable),
-                )
-        elif mechanism_text:
-            _ = apply_parameter_algebra_to_mechanism(
-                mechanism_text,
-                mechanism=mechanism,
-                require_mutable=bool(require_mutable),
-            )
-        else:
-            spec = parameter_algebra_spec_from_mechanism(mechanism)
-            if spec is not None:
-                _ = apply_parameter_algebra_spec_to_mechanism(
-                    spec,
-                    mechanism=mechanism,
-                    require_mutable=bool(require_mutable),
-                )
-    except Exception as exc:
-        raise SimulationPreparationError("parameter_algebra", str(exc)) from exc
+    _apply_execution_parameter_algebra_and_cyclicity(
+        mechanism=mechanism,
+        mechanism_text=str(mechanism_text or ""),
+        structured_prepared_request=bool(structured_prepared_request),
+        prepared_solver_config=prepared_solver_config,
+        require_mutable=bool(require_mutable),
+    )
 
     if request_payload is not None and request_payload.parameter_overrides:
         try:
+            override_names = sorted(str(name) for name in request_payload.parameter_overrides.keys())
+            internal_names = _internal_parameter_algebra_binding_names(
+                mechanism,
+                requested_names=override_names,
+            )
             _bind_parameters_to_mechanism(
                 mechanism,
-                sorted(str(name) for name in request_payload.parameter_overrides.keys()),
+                sorted(set(override_names) | set(internal_names)),
             )
             apply_parameter_overrides_to_prepared_mechanism(
                 mechanism,
@@ -1255,6 +1498,11 @@ def prepare_simulation_worker_run(
 
     temperature_schedule = prepared_context.temperature_schedule
     jacobian_func = prepared_context.jacobian_func
+    jac_sparsity = prepared_context.jac_sparsity
+    symbolic_wegscheider_identity = None
+    meta = getattr(mechanism, "metadata", {}) or {}
+    if isinstance(meta, Mapping) and isinstance(meta.get("symbolic_wegscheider_identity"), Mapping):
+        symbolic_wegscheider_identity = dict(meta.get("symbolic_wegscheider_identity") or {})
 
     try:
         initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
@@ -1270,11 +1518,13 @@ def prepare_simulation_worker_run(
         atol=float(prepared_solver_config.atol),
         grid=prepared_solver_config.grid,
         jacobian_func=jacobian_func,
+        jac_sparsity=jac_sparsity,
         events=list(events) if events is not None else None,
         temperature_schedule=temperature_schedule,
         intervention_schedule=intervention_schedule,
         species_names=tuple(species_names),
         progress_callback=progress_callback,
+        symbolic_wegscheider_identity=symbolic_wegscheider_identity,
     )
 
     return PreparedSimulationRun(
@@ -1287,6 +1537,7 @@ def prepare_simulation_worker_run(
         temperature_schedule=temperature_schedule,
         intervention_schedule=intervention_schedule,
         jacobian_func=jacobian_func,
+        jac_sparsity=jac_sparsity,
         initials_for_algebra=initials_for_algebra,
         warnings=list(prepared_context.warnings),
         request=request,
@@ -1301,7 +1552,8 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
     bindings: Dict[str, RateBinding] = {}
 
     for raw_name in names:
-        name = _canonical_step_override_name(mech, str(raw_name))
+        raw_name_s = str(raw_name)
+        name = _canonical_step_override_name(mech, raw_name_s)
         target = lookup_step_param_target(mech, name)
         if target is None:
             continue
@@ -1346,8 +1598,66 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
             meta = dict(getattr(eq, "metadata", {}) or {})
             meta[EquilibriumMetadataKeys.KEQ_INPUT] = binding
             mech.equilibria[idx] = replace(eq, metadata=meta)
+        if raw_name_s and raw_name_s != name:
+            bindings[raw_name_s] = binding
 
     return bindings
+
+
+def _internal_parameter_algebra_binding_names(
+    mechanism: Any,
+    requested_names: Iterable[str] = (),
+) -> set[str]:
+    try:
+        from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
+        from kindred.core.simulator.step_indexing import get_step_index_map
+    except Exception:
+        return set()
+    try:
+        spec = parameter_algebra_spec_from_mechanism(mechanism)
+    except Exception:
+        spec = None
+    constrained = {
+        str(stmt.name)
+        for stmt in ((getattr(spec, "param_statements", None) or ()) if spec is not None else ())
+        if re.match(r"^(k|kf|kr|Keq)\d+$", str(stmt.name))
+    }
+    constrained_keq_targets = {name for name in constrained if re.match(r"^Keq\d+$", name)}
+    active_keq_names = set(constrained_keq_targets)
+    requested_canonical = {
+        _canonical_step_override_name(mechanism, str(name))
+        for name in (requested_names or ())
+        if str(name or "").strip()
+    }
+    k_derived: set[str] = set()
+    try:
+        step_entries = list(get_step_index_map(mechanism))
+    except Exception:
+        step_entries = []
+    for entry in step_entries:
+        if str(entry.get("kind") or "") != "equilibrium":
+            continue
+        step_idx_raw = entry.get("step_index")
+        if isinstance(step_idx_raw, int):
+            n = int(step_idx_raw)
+        elif isinstance(step_idx_raw, str) and step_idx_raw.isdigit():
+            n = int(step_idx_raw)
+        else:
+            continue
+        keq_name = f"Keq{n}"
+        if bool(entry.get("has_Keq_param")) and (
+            keq_name in requested_canonical
+            or f"kf{n}" in requested_canonical
+            or f"kr{n}" in requested_canonical
+        ):
+            active_keq_names.add(keq_name)
+        if keq_name not in active_keq_names:
+            continue
+        derive_rate = str(entry.get("derive_rate") or "kr")
+        if derive_rate not in {"kf", "kr"}:
+            derive_rate = "kr"
+        k_derived.add(f"{derive_rate}{n}")
+    return (constrained - constrained_keq_targets) | k_derived
 
 
 @dataclass
@@ -1693,11 +2003,12 @@ def prepare_bound_mechanism(
             for stmt in (spec.param_statements or [])
             if re.match(r"^(k|kf|kr|Keq)\d+$", str(stmt.name))
         }
+        constrained_keq_targets = {str(name) for name in constrained if re.match(r"^Keq\d+$", str(name))}
+        constrained_mutable_targets = set(constrained) - constrained_keq_targets
+        active_keq_names = set(constrained_keq_targets)
         k_derived = set()
         for entry in get_step_index_map(mechanism):
             if str(entry.get("kind") or "") != "equilibrium":
-                continue
-            if not bool(entry.get("has_Keq_param")):
                 continue
             step_idx_raw = entry.get("step_index")
             if isinstance(step_idx_raw, int):
@@ -1706,24 +2017,49 @@ def prepare_bound_mechanism(
                 n = int(step_idx_raw)
             else:
                 continue
+            keq_name = f"Keq{n}"
+            if bool(entry.get("has_Keq_param")):
+                active_keq_names.add(keq_name)
+            if keq_name not in active_keq_names:
+                continue
             derive_rate = str(entry.get("derive_rate") or "kr")
             if derive_rate not in {"kf", "kr"}:
                 derive_rate = "kr"
             k_derived.add(f"{derive_rate}{n}")
 
-        wegscheider_derived = set()
-        if bool(wegscheider_cyclicity_enabled):
-            from kindred.core.simulator.wegscheider import derived_parameter_names_for_cyclicity
-
-            wegscheider_derived = derived_parameter_names_for_cyclicity(
-                mechanism,
-                constrained_param_names={str(x) for x in constrained},
+        requested = {
+            _canonical_step_override_name(mechanism, str(name))
+            for name in (param_names or [])
+            if str(name or "").strip()
+        }
+        requested_dependent_keq = sorted(str(name) for name in (requested & constrained_keq_targets))
+        if requested_dependent_keq:
+            raise SimulationPreparationError(
+                "parameter_algebra",
+                (
+                    "Dependent equilibrium parameter(s) cannot be fitted directly "
+                    "because Wegscheider/algebra constraints overwrite them: "
+                    + ", ".join(requested_dependent_keq)
+                ),
             )
-        requested = set(param_names or [])
+        requested_derived_rates = sorted(str(name) for name in (requested & k_derived))
+        if requested_derived_rates:
+            raise SimulationPreparationError(
+                "parameter_algebra",
+                (
+                    "Derived equilibrium rate parameter(s) cannot be fitted directly "
+                    "because Keq/algebra constraints overwrite them: "
+                    + ", ".join(requested_derived_rates)
+                ),
+            )
         mech_bind_names = sorted(
             {
                 str(n)
-                for n in (requested | constrained | k_derived | wegscheider_derived)
+                for n in (
+                    (requested - constrained_keq_targets - k_derived)
+                    | constrained_mutable_targets
+                    | k_derived
+                )
                 if re.match(r"^(k|kf|kr|Keq)\d+$", str(n))
             }
         )
@@ -1733,11 +2069,21 @@ def prepare_bound_mechanism(
         ) from exc
 
     bindings = _bind_parameters_to_mechanism(mechanism, mech_bind_names)
+    for raw_name in param_names or []:
+        raw_name_s = str(raw_name or "").strip()
+        canonical_name = _canonical_step_override_name(mechanism, raw_name_s)
+        if raw_name_s and canonical_name in bindings:
+            bindings.setdefault(raw_name_s, bindings[canonical_name])
 
     try:
         from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
+        from kindred.core.simulator.wegscheider_symbolic import UnresolvedWegscheiderCyclicityError
 
         _ = apply_parameter_algebra_to_mechanism(mechanism_text, mechanism=mechanism, require_mutable=True)
+    except UnresolvedWegscheiderCyclicityError as exc:
+        raise _fit_simulation_error_from_preparation_error(
+            _prepare_preparation_failure("wegscheider_cyclicity", exc)
+        ) from exc
     except Exception as exc:
         raise _fit_simulation_error_from_preparation_error(
             _prepare_preparation_failure("parameter_algebra", exc)
@@ -1873,9 +2219,17 @@ def prepare_fitting_objective_context(
         rtol=float(prepared_solver_config.rtol),
         atol=float(prepared_solver_config.atol),
         t_eval=np.asarray(t_exp, dtype=float).reshape(-1),
+        jacobian_func=prepared_run_context.jacobian_func,
+        jac_sparsity=prepared_run_context.jac_sparsity,
         temperature_schedule=prepared_run_context.temperature_schedule,
         intervention_schedule=intervention_schedule,
         species_names=tuple(bound.species_names),
+        symbolic_wegscheider_identity=(
+            dict(getattr(bound.mechanism, "metadata", {}).get("symbolic_wegscheider_identity") or {})
+            if isinstance(getattr(bound.mechanism, "metadata", {}), Mapping)
+            and isinstance(getattr(bound.mechanism, "metadata", {}).get("symbolic_wegscheider_identity"), Mapping)
+            else None
+        ),
     )
     initials_for_algebra = {
         name: float(bound.y0[idx]) for idx, name in enumerate(bound.species_names)
@@ -1890,6 +2244,7 @@ def prepare_fitting_objective_context(
         compiled_algebra=compiled_algebra,
         initials_for_algebra=initials_for_algebra,
         temperature_K=float(temperature_K),
+        warnings=list(prepared_run_context.warnings),
     )
 
 
@@ -1972,11 +2327,12 @@ def build_prepared_simulation_func(
     temperature_schedule: Optional[TemperatureScheduleProtocol] = None
     intervention_schedule: Optional[InterventionSchedule] = None
     jacobian_func = None
+    jac_sparsity = None
     last_shared_fp: Optional[Tuple[Tuple[str, float], ...]] = None
     compiled_algebra: Optional[CompiledAlgebraSeries] = None
 
     def _ensure_prepared() -> None:
-        nonlocal bound, species_index, temperature_schedule, intervention_schedule, jacobian_func, compiled_algebra
+        nonlocal bound, species_index, temperature_schedule, intervention_schedule, jacobian_func, jac_sparsity, compiled_algebra, prepared_meta
         if bound is not None:
             return
         bound = prepare_bound_mechanism(
@@ -1995,6 +2351,20 @@ def build_prepared_simulation_func(
         )
         temperature_schedule = prepared_context.temperature_schedule
         jacobian_func = prepared_context.jacobian_func
+        jac_sparsity = prepared_context.jac_sparsity
+        if prepared_context.symbolic_jacobian_identity:
+            prepared_meta = replace(
+                prepared_meta,
+                symbolic_jacobian_identity=dict(prepared_context.symbolic_jacobian_identity),
+            )
+            simulation_func._kindred_prepared_simulation_meta = prepared_meta  # type: ignore[attr-defined]
+        meta = getattr(bound.mechanism, "metadata", {}) or {}
+        if isinstance(meta, Mapping) and isinstance(meta.get("symbolic_wegscheider_identity"), Mapping):
+            prepared_meta = replace(
+                prepared_meta,
+                symbolic_wegscheider_identity=dict(meta.get("symbolic_wegscheider_identity") or {}),
+            )
+            simulation_func._kindred_prepared_simulation_meta = prepared_meta  # type: ignore[attr-defined]
         try:
             intervention_schedule = _metadata_view_for_mechanism(bound.mechanism).intervention_schedule
             if intervention_schedule is not None:
@@ -2083,9 +2453,16 @@ def build_prepared_simulation_func(
             atol=float(prepared_solver_config.atol),
             grid={"N": grid_n},
             jacobian_func=jacobian_func,
+            jac_sparsity=jac_sparsity,
             temperature_schedule=temperature_schedule,
             intervention_schedule=intervention_schedule,
             species_names=tuple(bound.species_names),
+            symbolic_wegscheider_identity=(
+                dict(getattr(bound.mechanism, "metadata", {}).get("symbolic_wegscheider_identity") or {})
+                if isinstance(getattr(bound.mechanism, "metadata", {}), Mapping)
+                and isinstance(getattr(bound.mechanism, "metadata", {}).get("symbolic_wegscheider_identity"), Mapping)
+                else None
+            ),
         )
         result = _solve_request(request)
         species_payload = {name: result.Y[idx, :].copy() for idx, name in enumerate(bound.species_names)}

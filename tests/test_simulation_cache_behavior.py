@@ -58,6 +58,7 @@ def test_simulation_cache_admin_publishes_completion_cache_entry_and_preview_ide
         fallback_occurred=False,
         fallback_message=None,
         solver_provenance={"interventions": []},
+        warnings=[{"kind": "preparation_warning", "message": "symbolic disabled"}],
         preview_scope_set_ids=("id1",),
     )
 
@@ -67,6 +68,7 @@ def test_simulation_cache_admin_publishes_completion_cache_entry_and_preview_ide
     payload = cache.entry_for_set(cache_key="preview-token", set_id="id1", is_preview=True).entry
     assert isinstance(payload, dict)
     np.testing.assert_allclose(np.asarray(payload["t"]), t)
+    assert payload["warnings"] == [{"kind": "preparation_warning", "message": "symbolic disabled"}]
 
 def _select_rows(main_window, rows: list[int]) -> None:
     from PySide6 import QtCore

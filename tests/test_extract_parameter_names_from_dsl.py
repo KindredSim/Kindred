@@ -74,7 +74,7 @@ def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_step():
         extract_parameter_names_from_dsl(dsl)
 
 
-def test_extract_parameter_names_from_dsl_accepts_k_alias_on_equilibrium_without_explicit_keq():
+def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_without_explicit_keq():
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; kf=6.0; kr=2.0",
@@ -83,9 +83,8 @@ def test_extract_parameter_names_from_dsl_accepts_k_alias_on_equilibrium_without
         ]
     )
 
-    names = extract_parameter_names_from_dsl(dsl)
-
-    assert "kf1" in names
+    with pytest.raises(DSLError, match="Keq1"):
+        extract_parameter_names_from_dsl(dsl)
 
 
 def test_extract_parameter_names_from_dsl_accepts_keq_name_for_reversible_reaction_with_explicit_keq():

@@ -121,6 +121,7 @@ def _make_minimal_preview_host() -> object:
     return SimpleNamespace(
         is_mechanism_valid_for_preview=lambda: True,
         _status_label=SimpleNamespace(setText=lambda value: None),
+        _refresh_batch_display_from_focus_and_shown=lambda: None,
     )
 
 
@@ -171,6 +172,20 @@ def test_main_window_preview_session_owns_preview_state(main_window) -> None:
         assert field_name in owner.__dict__, (
             f"Preview-session owner must physically store {field_name}."
         )
+
+
+def test_invalid_preview_state_surfaces_unresolved_wegscheider_cyclicity_reason() -> None:
+    messages: list[str] = []
+    host = _make_minimal_preview_host()
+    host._status_label = SimpleNamespace(setText=lambda value: messages.append(str(value)))
+    host._variable_runtime = SimpleNamespace(
+        slider_runtime_unavailable_reason=lambda: "unresolved Wegscheider cyclicity"
+    )
+    owner = MainWindowPreviewSession(host)
+
+    owner._show_invalid_preview_state()
+
+    assert messages == ["Unresolved Wegscheider cyclicity."]
 
 
 def test_main_window_no_longer_exposes_preview_session_compatibility_aliases(main_window) -> None:

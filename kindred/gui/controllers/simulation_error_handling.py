@@ -212,17 +212,28 @@ class SimulationErrorHandlingOwner:
             if isinstance(preview_failure_details, Mapping)
             else ""
         )
+        preview_failure_stage = (
+            str(preview_failure_details.get("stage") or "").strip().lower()
+            if isinstance(preview_failure_details, Mapping)
+            else ""
+        )
         status_only_preview_failure = (
             preview_failure_kind == "timeout"
             or preview_failure_kind.endswith("_timeout")
             or preview_failure_kind.startswith("simulation_containment")
             or preview_failure_source == "simulation_containment"
+            or preview_failure_stage == "wegscheider_cyclicity"
         )
         if bool(fast_mode) and not cancelled and status_only_preview_failure:
             if isinstance(ctx, Mapping):
+                preview_error_text = error_text
+                if preview_failure_stage == "wegscheider_cyclicity":
+                    preview_error_text = str(
+                        error_payload.get("message") or "Unresolved Wegscheider cyclicity."
+                    )
                 self._deps.handle_current_preview_simulation_failure(
                     error_payload,
-                    error_text=error_text,
+                    error_text=preview_error_text,
                     error_detail_text=error_detail_text,
                     context=ctx,
                 )

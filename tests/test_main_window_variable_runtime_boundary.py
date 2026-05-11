@@ -614,6 +614,30 @@ def test_prepare_slider_runtime_builds_structured_energy_bindings_from_raw_state
 
 
 @pytest.mark.unit
+def test_prepare_slider_runtime_records_wegscheider_cyclicity_block_reason() -> None:
+    host = _FakeRuntimeHost(
+        reactions_text="\n".join(
+            [
+                "equilibrium: A <-> B ; kf=1 ; K=2",
+                "equilibrium: B <-> C ; kf=1 ; K=3",
+                "equilibrium: C <-> A ; kf=1 ; K=7",
+                "initial: A=1",
+                "initial: B=0",
+                "initial: C=0",
+            ]
+        ),
+        wegscheider_enabled=True,
+    )
+    host._slider_overrides = {"Keq1": 2.0}
+    runtime = MainWindowVariableRuntime(host)
+
+    prepared = runtime.prepare_slider_runtime(set_id="set-a")
+
+    assert prepared is None
+    assert runtime.slider_runtime_unavailable_reason() == "unresolved Wegscheider cyclicity"
+
+
+@pytest.mark.unit
 def test_main_window_source_no_longer_reaches_through_run_state_for_variable_metadata() -> None:
     source = (REPO_ROOT / "kindred" / "gui" / "main_window.py").read_text(encoding="utf-8")
     runtime_source = (REPO_ROOT / "kindred" / "gui" / "main_window_variable_runtime.py").read_text(encoding="utf-8")

@@ -63,6 +63,8 @@ class SimulationProvenanceOwner:
         series: Mapping[str, Any],
         algebra_scalars: Mapping[str, Any] | None = None,
         dataset_overlays: Any = None,
+        solver_provenance: Mapping[str, Any] | None = None,
+        warnings: Sequence[Mapping[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         species_list = [str(name) for name in species_names]
         provenance: Dict[str, Any] = {
@@ -91,6 +93,18 @@ class SimulationProvenanceOwner:
             provenance["algebra_scalars"] = dict(algebra_scalars)
         if dataset_overlays is not None:
             provenance["dataset_overlays"] = dataset_overlays
+        if isinstance(solver_provenance, Mapping) and solver_provenance:
+            provenance["solver_provenance"] = dict(solver_provenance)
+            symbolic_identity = solver_provenance.get("symbolic_jacobian_identity")
+            if isinstance(symbolic_identity, Mapping):
+                provenance["symbolic_jacobian_identity"] = dict(symbolic_identity)
+            wegscheider_identity = solver_provenance.get("symbolic_wegscheider_identity")
+            if isinstance(wegscheider_identity, Mapping):
+                provenance["symbolic_wegscheider_identity"] = dict(wegscheider_identity)
+            if "symbolic_jacobian" in solver_provenance:
+                provenance["symbolic_jacobian"] = bool(solver_provenance.get("symbolic_jacobian"))
+        if warnings:
+            provenance["warnings"] = [dict(item) for item in warnings if isinstance(item, Mapping)]
         fit_meta = self.last_fit_metadata()
         if fit_meta:
             provenance["fit"] = fit_meta

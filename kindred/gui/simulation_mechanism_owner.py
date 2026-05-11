@@ -20,6 +20,7 @@ class SimulationMechanismOwner:
         apply_overrides_to_text: Callable[..., str],
         apply_overrides_to_state_network_dsl: Callable[..., str],
         apply_parameter_overrides_to_dsl: Callable[[str, Dict[str, float]], str],
+        apply_wegscheider_resolution_source_rewrite: Callable[[str], None] | None = None,
     ) -> None:
         self._mechanism_session_owner_getter = mechanism_session_owner_getter
         self._mechanism_editor_getter = mechanism_editor_getter
@@ -30,6 +31,7 @@ class SimulationMechanismOwner:
         self._apply_overrides_to_text = apply_overrides_to_text
         self._apply_overrides_to_state_network_dsl = apply_overrides_to_state_network_dsl
         self._apply_parameter_overrides_to_dsl = apply_parameter_overrides_to_dsl
+        self._apply_wegscheider_resolution_source_rewrite = apply_wegscheider_resolution_source_rewrite
 
     def auto_lock_for_run(self) -> bool:
         if not bool(self._mechanism_locked_getter()):
@@ -128,6 +130,11 @@ class SimulationMechanismOwner:
 
     def get_mechanism_text(self) -> str:
         return self._simulation_schema_text()
+
+    def apply_wegscheider_resolution_source_rewrite(self, reactions_text: str) -> None:
+        if self._apply_wegscheider_resolution_source_rewrite is None:
+            raise RuntimeError("Wegscheider resolution source rewrite is unavailable.")
+        self._apply_wegscheider_resolution_source_rewrite(str(reactions_text))
 
     def _simulation_schema_text(self) -> str:
         reactions_text = self.mechanism_reactions_text_raw()

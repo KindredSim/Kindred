@@ -29,6 +29,7 @@ from typing import (
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
+from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
 
 from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
 from kindred.core.intervention_schedule import (
@@ -49,7 +50,7 @@ from kindred.core.exceptions import (
     create_solver_error,
 )
 from kindred.core.time_grid import build_time_grid
-from .jacobian import JacobianConfig, compute_jacobian
+from .jacobian import JacobianConfig
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ class SimulationRequest:
     grid: Optional[Mapping[str, float | int]] = None
     rosenbrock_jacobian: JacobianConfig = JacobianConfig()
     jacobian_func: Optional[Callable[[float, np.ndarray], np.ndarray]] = None
+    jac_sparsity: Optional[Any] = None
     events: Optional[Iterable[Callable[[float, np.ndarray], float]]] = None
     event_terminal: Optional[Iterable[bool]] = None
     positivity: Optional[str] = None
@@ -107,6 +109,7 @@ class SimulationRequest:
     temperature_schedule: TemperatureScheduleProtocol | None = None
     intervention_schedule: InterventionSchedule | Mapping[str, Any] | None = None
     species_names: Optional[Tuple[str, ...]] = None
+    symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -180,29 +183,6 @@ def normalize_solver_name(name: object) -> Tuple[str, Optional[str]]:
     name is mapped to a supported solver.
     """
     return _scipy_method_for(name)
-
-
-def _unpack_banded_jacobian(J: np.ndarray, *, ml: int, mu: int) -> np.ndarray:
-    n = J.shape[1]
-    Jd = np.zeros((n, n), float)
-    for j in range(n):
-        i_min = max(0, j - mu)
-        i_max = min(n - 1, j + ml)
-        band_rows = slice(mu + i_min - j, mu + i_max - j + 1)
-        Jd[i_min : i_max + 1, j] = J[band_rows, j]
-    return Jd
-
-
-def _make_scipy_jac(rhs: Callable[[float, np.ndarray], np.ndarray], cfg: "JacobianConfig"):
-    def jac(t: float, y: np.ndarray) -> np.ndarray:
-        J, kind = compute_jacobian(rhs, t, y, cfg=cfg)
-        J_arr = np.asarray(J, dtype=float)
-        if kind.startswith("banded("):
-            ml, mu = cfg.validate_for(J_arr.shape[1])
-            return _unpack_banded_jacobian(J_arr, ml=ml, mu=mu)
-        return J_arr
-
-    return jac
 
 
 class _TemperatureInjectedRhs:
@@ -315,6 +295,7 @@ def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> tuple[Rhs2,
 
 
 def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
+    symbolic_identity = symbolic_jacobian_identity_payload(req.jacobian_func)
     prov: Dict[str, object] = {
         "solver_requested": req.solver,
         "rtol": float(req.rtol),
@@ -328,11 +309,16 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
             "ml": getattr(req.rosenbrock_jacobian, "ml", None),
             "mu": getattr(req.rosenbrock_jacobian, "mu", None),
         },
-        "custom_jacobian": bool(req.jacobian_func),
+        "symbolic_jacobian": bool(symbolic_identity),
+        "jacobian_sparsity_hint": req.jac_sparsity is not None,
         "positivity": (req.positivity or None),
         "pos_indices": (list(req.pos_indices) if req.pos_indices is not None else None),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
+    if symbolic_identity:
+        prov["symbolic_jacobian_identity"] = dict(symbolic_identity)
+    if isinstance(req.symbolic_wegscheider_identity, Mapping) and req.symbolic_wegscheider_identity:
+        prov["symbolic_wegscheider_identity"] = dict(req.symbolic_wegscheider_identity)
     schedule = coerce_intervention_schedule(req.intervention_schedule)
     prov["has_intervention_schedule"] = schedule is not None
     if schedule is not None:
@@ -417,8 +403,11 @@ def _execute_scipy(
     if events_list is not None:
         base_kwargs["events"] = events_list
 
-    jac_callable = req.jacobian_func or _make_scipy_jac(rhs_for_jac, req.rosenbrock_jacobian)
+    jac_callable = req.jacobian_func
+    jac_sparsity = req.jac_sparsity
     banded_jacobian_active = (
+        jac_callable is not None
+        and
         getattr(req.rosenbrock_jacobian, "mode", None) == "banded"
         and req.rosenbrock_jacobian.ml is not None
         and req.rosenbrock_jacobian.mu is not None
@@ -427,12 +416,14 @@ def _execute_scipy(
     def _kwargs_for_method(method_name: str) -> Dict[str, Any]:
         kwargs = dict(base_kwargs)
         kwargs["method"] = method_name
-        if method_name in ("Radau", "BDF"):
+        if method_name in ("Radau", "BDF") and jac_callable is not None:
             kwargs["jac"] = jac_callable
             if banded_jacobian_active:
                 # SciPy implicit solvers expect an n x n Jacobian when a jac
                 # callable is supplied; jac_sparsity is ignored in that case.
                 kwargs.pop("jac_sparsity", None)
+        elif method_name in ("Radau", "BDF") and jac_sparsity is not None:
+            kwargs["jac_sparsity"] = jac_sparsity
         else:
             kwargs.pop("jac", None)
             kwargs.pop("jac_sparsity", None)
@@ -934,7 +925,10 @@ def _execute_with_intervention_schedule(
     segment_count = 0
     segment_solvers: list[str] = []
     segment_alternatives: list[str] = []
-    custom_jacobian_disabled = False
+    segment_symbolic_jacobians: list[bool] = []
+    segment_sparsity_hints: list[bool] = []
+    symbolic_jacobian_disabled = False
+    symbolic_jacobian_used = False
     terminal_stop = False
     trigger_events = tuple(schedule.trigger_events)
     trigger_counts = [0 for _ in trigger_events]
@@ -1008,9 +1002,13 @@ def _execute_with_intervention_schedule(
             )
             segment_events = events_tuple + trigger_callables
             seg_req = segment_req_base
+            segment_symbolic_identity = symbolic_jacobian_identity_payload(segment_req_base.jacobian_func)
             if active_intervals and segment_req_base.jacobian_func is not None:
-                custom_jacobian_disabled = True
-                seg_req = replace(seg_req, jacobian_func=None)
+                if segment_symbolic_identity:
+                    symbolic_jacobian_disabled = True
+                seg_req = replace(seg_req, jacobian_func=None, jac_sparsity=None)
+            elif active_intervals and segment_req_base.jac_sparsity is not None:
+                seg_req = replace(seg_req, jac_sparsity=None)
             if trigger_callables:
                 segment_terminal_flags = tuple(
                     _event_terminal_flags(segment_req_base, events_tuple)
@@ -1022,6 +1020,13 @@ def _execute_with_intervention_schedule(
                 )
             seg_req = _request_for_internal_segment(seg_req, t0=sub_start, t1=sub_end)
             seg_prov: Dict[str, object] = dict(prov)
+            seg_symbolic_identity = symbolic_jacobian_identity_payload(seg_req.jacobian_func)
+            seg_prov["symbolic_jacobian"] = bool(seg_symbolic_identity)
+            seg_prov["jacobian_sparsity_hint"] = seg_req.jac_sparsity is not None
+            if seg_symbolic_identity:
+                seg_prov["symbolic_jacobian_identity"] = dict(seg_symbolic_identity)
+            else:
+                seg_prov.pop("symbolic_jacobian_identity", None)
             seg_prov["intervention_segment_index"] = int(segment_count)
             seg_out = _execute_scipy(
                 seg_req,
@@ -1038,6 +1043,11 @@ def _execute_with_intervention_schedule(
             segment_count += 1
             fallback_occurred = fallback_occurred or bool(seg_out.fallback_occurred)
             fallback_message = fallback_message or seg_out.fallback_message
+            symbolic_jacobian_used = symbolic_jacobian_used or bool(
+                seg_out.provenance.get("symbolic_jacobian")
+            )
+            segment_symbolic_jacobians.append(bool(seg_out.provenance.get("symbolic_jacobian")))
+            segment_sparsity_hints.append(bool(seg_out.provenance.get("jacobian_sparsity_hint")))
             segment_solver = str(seg_out.provenance.get("solver_used") or method)
             segment_solvers.append(segment_solver)
             alternative = seg_out.provenance.get("solver_alternative_used")
@@ -1178,13 +1188,25 @@ def _execute_with_intervention_schedule(
         prov["solver_used"] = method
     if segment_solvers:
         prov["intervention_segment_solvers"] = list(segment_solvers)
+    if segment_sparsity_hints and any(segment_sparsity_hints) != all(segment_sparsity_hints):
+        prov["intervention_segment_jacobian_sparsity_hints"] = list(segment_sparsity_hints)
+        prov["intervention_jacobian_sparsity_hint_partially_disabled"] = True
+    elif segment_sparsity_hints:
+        prov["jacobian_sparsity_hint"] = bool(segment_sparsity_hints[-1])
     distinct_alternatives = list(dict.fromkeys(segment_alternatives))
     if len(distinct_alternatives) == 1:
         prov["solver_alternative_used"] = distinct_alternatives[0]
     elif distinct_alternatives:
         prov["solver_alternative_used"] = list(distinct_alternatives)
-    if custom_jacobian_disabled:
-        prov["intervention_custom_jacobian_disabled"] = True
+    if symbolic_jacobian_disabled:
+        prov["intervention_symbolic_jacobian_disabled"] = True
+        if segment_symbolic_jacobians:
+            prov["intervention_segment_symbolic_jacobians"] = list(segment_symbolic_jacobians)
+        if symbolic_jacobian_used:
+            prov["intervention_symbolic_jacobian_partially_disabled"] = True
+        if not symbolic_jacobian_used:
+            prov["symbolic_jacobian"] = False
+            prov.pop("symbolic_jacobian_identity", None)
     prov["intervention_segments"] = int(segment_count)
     if trigger_provenance:
         prov["intervention_trigger_events"] = list(trigger_provenance)

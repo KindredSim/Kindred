@@ -139,6 +139,147 @@ def test_prepare_fitting_execution_context_preserves_solver_flags_in_execution_r
     assert context.prepared_metadata.wegscheider_cyclicity_enabled is True
 
 
+def test_serial_fitting_evaluator_updates_metadata_with_actual_symbolic_jacobian_identity() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=True,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    _ = evaluator({"init:A": 1.0})
+
+    identity = evaluator.prepared_metadata.symbolic_jacobian_identity
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+    assert identity["fingerprint"]
+
+
+def test_serial_fitting_process_payload_includes_actual_symbolic_jacobian_identity() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=True,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    payload = evaluator.to_process_payload()
+
+    identity = payload["prepared_metadata"]["symbolic_jacobian_identity"]
+    assert identity["kind"] == "jacobian"
+    assert identity["artifact_fingerprint"]
+
+
+def test_serial_fitting_solver_request_carries_symbolic_wegscheider_identity(monkeypatch) -> None:
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.simulator.solvers import SimulationOutput
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=2.0; K=2.0",
+            "equilibrium: B <-> C; kf=3.0; K=3.0",
+            "equilibrium: C <-> A; kf=1.0; K=1.0",
+            "param Keq3 = 1 / (Keq1 * Keq2)",
+            "init: A=1.0, B=0.0, C=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        t_end=1.0,
+        num_points=3,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=True,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    captured = {}
+
+    def _capture_request(request):
+        captured["symbolic_wegscheider_identity"] = request.symbolic_wegscheider_identity
+        t = np.linspace(float(request.t_span[0]), float(request.t_span[1]), 3)
+        y0 = np.asarray(request.y0, dtype=float).reshape(-1)
+        return SimulationOutput(
+            t=t,
+            Y=np.vstack([np.full_like(t, value) for value in y0]),
+            provenance={},
+        )
+
+    monkeypatch.setattr(fitting_evaluation, "_solve_request", _capture_request)
+
+    evaluator({})
+
+    identity = captured["symbolic_wegscheider_identity"]
+    assert identity is not None
+    assert identity["kind"] == "wegscheider_cyclicity"
+    assert identity["fingerprint"]
+
+
+def test_prepare_fitting_execution_context_rejects_dependent_wegscheider_keq_parameter() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=2.0; K=2.0",
+            "equilibrium: B <-> C; kf=3.0; K=3.0",
+            "equilibrium: C <-> A; kf=1.0; K=1.0",
+            "param Keq3 = 1 / (Keq1 * Keq2)",
+            "init: A=1.0, B=0.0, C=0.0",
+        ]
+    )
+
+    with pytest.raises(FitSimulationError) as excinfo:
+        prepare_fitting_execution_context(
+            mechanism_text=mechanism_text,
+            param_names=["Keq1", "Keq2", "Keq3"],
+            t_end=1.0,
+            num_points=5,
+            solver="BDF",
+            rtol=1e-6,
+            atol=1e-12,
+            use_sparse_jacobian=True,
+            wegscheider_cyclicity_enabled=True,
+            initial_prefix="init:",
+        )
+
+    assert "Dependent equilibrium parameter" in str(excinfo.value)
+
+
 def test_serial_fitting_evaluator_runs_from_structured_context() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 

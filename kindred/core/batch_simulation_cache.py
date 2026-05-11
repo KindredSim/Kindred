@@ -312,6 +312,7 @@ class BatchSimulationCache:
         fallback_occurred: bool = False,
         fallback_message: Any = None,
         solver_provenance: Optional[Mapping[str, Any]] = None,
+        warnings: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Optional[str]:
         entry = build_batch_cache_entry(
             t=t,
@@ -325,6 +326,7 @@ class BatchSimulationCache:
             fallback_occurred=bool(fallback_occurred),
             fallback_message=fallback_message,
             solver_provenance=solver_provenance,
+            warnings=warnings,
         )
         return self.put_batch_cache_entry(
             cache_key=cache_key,

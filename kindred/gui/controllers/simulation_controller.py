@@ -250,6 +250,8 @@ class SimulationController(QtCore.QObject):
         self._authoritative_runtime_input_epoch = 0
         self._authoritative_runtime_input_global_epoch = 0
         self._authoritative_runtime_input_set_epoch_by_set_id: Dict[str, int] = {}
+        self._symbolic_jacobian_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._symbolic_wegscheider_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 
         # Parallel batch orchestration (warm lane owner adapter)
         self._batch_parallel = ParallelBatchExecutor(
@@ -419,6 +421,10 @@ class SimulationController(QtCore.QObject):
     # ------------------------------------------------------------------
     # Public interface (MainWindow boundary)
     # ------------------------------------------------------------------
+    @property
+    def authoritative_mechanism_transition_epoch(self) -> int:
+        return int(self._authoritative_mechanism_transition_epoch)
+
     @property
     def _batch_parallel(self):
         return self._batch_parallel_adapter
@@ -3352,6 +3358,97 @@ class SimulationController(QtCore.QObject):
         except Exception:
             return hashlib.sha256(str(mechanism_text or "").encode("utf-8", "surrogatepass")).hexdigest()
 
+    def _symbolic_jacobian_identity_for_set(
+        self,
+        *,
+        set_id: str,
+        solver_config: Mapping[str, Any],
+        fast_mode: bool,
+    ) -> Mapping[str, Any]:
+        solver_name = str(dict(solver_config or {}).get("solver") or "").strip().lower()
+        if solver_name not in {"bdf", "radau"}:
+            return {}
+        if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
+            return {}
+        if bool(fast_mode) and self.ui.mechanism.slider_overrides(set_id=str(set_id)):
+            return {}
+        try:
+            mechanism_text = self._request_mechanism_text_for_set(
+                set_id=str(set_id),
+                has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+            )
+            solver_identity = repr(
+                {
+                    "solver": str(dict(solver_config or {}).get("solver") or ""),
+                    "use_sparse_jacobian": bool(
+                        dict(solver_config or {}).get("use_sparse_jacobian", False)
+                    ),
+                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
+                    "wegscheider_cyclicity_enabled": bool(
+                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
+                    ),
+                }
+            )
+            cache_key = (str(mechanism_text or ""), solver_identity)
+            cached = self._symbolic_jacobian_identity_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+            from kindred.core.simulation_preparation import (
+                symbolic_jacobian_identity_for_execution_text,
+            )
+
+            payload = symbolic_jacobian_identity_for_execution_text(
+                mechanism_text=str(mechanism_text or ""),
+                solver_config=dict(solver_config or {}),
+            )
+            if not payload:
+                return {}
+            self._symbolic_jacobian_identity_cache[cache_key] = dict(payload)
+            return dict(payload)
+        except Exception:
+            return {}
+
+    def _symbolic_wegscheider_identity_for_set(
+        self,
+        *,
+        set_id: str,
+        solver_config: Mapping[str, Any],
+        fast_mode: bool,
+    ) -> Mapping[str, Any]:
+        if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
+            return {}
+        try:
+            mechanism_text = self._request_mechanism_text_for_set(
+                set_id=str(set_id),
+                has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+            )
+            solver_identity = repr(
+                {
+                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
+                    "wegscheider_cyclicity_enabled": bool(
+                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
+                    ),
+                }
+            )
+            cache_key = (str(mechanism_text or ""), solver_identity)
+            cached = self._symbolic_wegscheider_identity_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+            from kindred.core.simulation_preparation import (
+                symbolic_wegscheider_identity_for_execution_text,
+            )
+
+            payload = symbolic_wegscheider_identity_for_execution_text(
+                mechanism_text=str(mechanism_text or ""),
+                solver_config=dict(solver_config or {}),
+            )
+            if not payload:
+                return {}
+            self._symbolic_wegscheider_identity_cache[cache_key] = dict(payload)
+            return dict(payload)
+        except Exception:
+            return {}
+
     def _simulation_identity_for_set(
         self,
         *,
@@ -3379,6 +3476,16 @@ class SimulationController(QtCore.QObject):
             ),
             preview_batch_cache_token=preview_token,
             execution_flags=self._execution_identity_flags(fast_mode=bool(fast_mode)),
+            symbolic_jacobian_identity=self._symbolic_jacobian_identity_for_set(
+                set_id=str(set_id),
+                solver_config=solver_config,
+                fast_mode=bool(fast_mode),
+            ),
+            symbolic_wegscheider_identity=self._symbolic_wegscheider_identity_for_set(
+                set_id=str(set_id),
+                solver_config=solver_config,
+                fast_mode=bool(fast_mode),
+            ),
         )
 
     def _resolved_initials_for_batch_row(
@@ -3649,6 +3756,8 @@ class SimulationController(QtCore.QObject):
         except ValueError as exc:
             self.ui.dialogs.message_box_warning("Invalid t_end", f"Fix t_end before running:\n\n{exc}")
             return
+        if not self._resolve_wegscheider_cyclicity_for_run_or_abort():
+            return
 
         runtime_snapshot = self._selected_run_runtime_snapshot()
         if bool(runtime_snapshot.required) and not bool(runtime_snapshot.ready):
@@ -3693,6 +3802,48 @@ class SimulationController(QtCore.QObject):
             batch_rows=rows_to_run,
             reuse_parallel_lane_pool=bool(len(rows_to_run) > 1),
         )
+
+    def _resolve_wegscheider_cyclicity_for_run_or_abort(self) -> bool:
+        if not bool(self.ui.solver.wegscheider_cyclicity_enabled()):
+            return True
+
+        from kindred.gui.wegscheider_resolution import resolve_wegscheider_cyclicity_for_gui
+
+        prompt_shown = {"value": False}
+
+        def _choose_resolution(title: str, message: str, choices: Mapping[str, Any]) -> Mapping[str, str] | None:
+            prompt_shown["value"] = True
+            return self.ui.dialogs.choose_wegscheider_resolution(
+                str(title),
+                str(message),
+                choices,
+            )
+
+        try:
+            resolution = resolve_wegscheider_cyclicity_for_gui(
+                self.ui.mechanism.mechanism_reactions_text_raw(),
+                enabled=True,
+                choose_resolution=_choose_resolution,
+            )
+        except Exception as exc:
+            self.ui.dialogs.message_box_warning(
+                "Wegscheider Cyclicity",
+                f"Cannot resolve Wegscheider cyclicity automatically:\n\n{exc}",
+            )
+            self.ui.run_ui.set_status_text("Cannot run: unresolved Wegscheider cyclicity.")
+            return False
+
+        if resolution is None:
+            if bool(prompt_shown["value"]):
+                self.ui.run_ui.set_status_text("Run cancelled: unresolved Wegscheider cyclicity.")
+                return False
+            return True
+
+        self.ui.mechanism.apply_wegscheider_resolution_source_rewrite(
+            resolution.rewritten_reactions_text
+        )
+        self.ui.run_ui.set_status_text("Applied Wegscheider cyclicity resolution.")
+        return True
 
     # ------------------------------------------------------------------
     # Core execution
@@ -4768,10 +4919,18 @@ class SimulationController(QtCore.QObject):
         context: Optional[Mapping[str, Any]],
     ) -> None:
         kind = str(error_payload.get("kind") or "").strip().lower()
+        details = error_payload.get("details")
+        stage = (
+            str(details.get("stage") or "").strip().lower()
+            if isinstance(details, Mapping)
+            else ""
+        )
         if error_detail_text:
             logger.warning("%s", error_detail_text)
         if kind == "timeout":
             status_text = "Preview timed out. Adjust sliders or run again."
+        elif stage == "wegscheider_cyclicity":
+            status_text = str(error_payload.get("message") or "Unresolved Wegscheider cyclicity.")
         else:
             status_text = "Preview unavailable. Adjust sliders or run again."
         logger.warning("Preview simulation failed without modal: %s", error_text)

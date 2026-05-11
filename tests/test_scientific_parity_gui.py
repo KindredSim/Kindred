@@ -44,6 +44,44 @@ def test_analysis_simulation_honors_temperature_schedule_in_dsl(main_window):
     assert b_sched > b_iso * 5.0
 
 
+def test_analysis_simulation_disables_symbolic_jacobian_for_temperature_schedule(
+    main_window,
+    monkeypatch,
+):
+    from kindred.core.simulator.solvers import SimulationOutput
+
+    captured: dict[str, object] = {}
+
+    def _fake_solve_ode(request):
+        captured["temperature_schedule"] = request.temperature_schedule
+        captured["jacobian_func"] = request.jacobian_func
+        return SimulationOutput(
+            t=np.asarray([0.0, 1.0], dtype=float),
+            Y=np.asarray([[1.0, 1.0], [0.0, 0.0]], dtype=float),
+            provenance={},
+        )
+
+    monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve_ode)
+    main_window._initial_solver = "BDF"
+    main_window._use_sparse_jacobian = True
+
+    main_window._simulate_mechanism(
+        "\n".join(
+                [
+                "temp_step: t=[0,0.5,1], T=[300,310]",
+                "reaction: A -> B; k=1",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        t_end=1.0,
+        num_points=3,
+    )
+
+    assert captured["temperature_schedule"] is not None
+    assert captured["jacobian_func"] is None
+
+
 @pytest.mark.integration
 def test_analysis_simulation_honors_temp_response_schedule_in_dsl(main_window):
     dsl_with_response = "\n".join(

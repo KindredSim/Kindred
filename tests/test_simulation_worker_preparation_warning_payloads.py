@@ -31,7 +31,7 @@ def test_simulation_worker_emits_preparation_warning_payload(monkeypatch, qtbot)
             mechanism=_DummyMechanism(),
             species_names=["A"],
             initials_for_algebra={"A": 1.0},
-            warnings=["Sparse Jacobian unavailable; falling back to dense Jacobian: sparsity blew up"],
+            warnings=["Symbolic Jacobian unsupported; using solver default Jacobian handling: unsupported rate law"],
             request=SimpleNamespace(solver="BDF"),
             solver_warning=None,
             solver_input="BDF",
@@ -63,4 +63,4 @@ def test_simulation_worker_emits_preparation_warning_payload(monkeypatch, qtbot)
     assert isinstance(warnings, list) and len(warnings) == 1
     assert warnings[0]["kind"] == "preparation_warning"
     assert warnings[0]["details"]["stage"] == "prepare_run_context"
-    assert "Sparse Jacobian unavailable" in warnings[0]["message"]
+    assert "Symbolic Jacobian unsupported" in warnings[0]["message"]

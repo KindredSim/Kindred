@@ -366,6 +366,124 @@ def test_run_stamp_hash_changes_with_prepared_intervention_schedule_fingerprint(
     assert hash_global_fit_run_stamp(first) != hash_global_fit_run_stamp(second)
 
 
+def test_run_stamp_hash_changes_with_prepared_symbolic_jacobian_identity():
+    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    kwargs = {
+        "dataset_rows": [{"id": "ds1", "label": "ds1", "include": True, "weight": 1.0}],
+        "included_ids": ["ds1"],
+        "applied_fit_targets": {"ds1": ["A"]},
+        "weights_used": {"ds1": 1.0},
+        "weight_mode": "custom",
+        "fit_config": {
+            "parameters": {"k1": 0.2},
+            "bounds": {"k1": (0.01, 1.0)},
+            "log10_params": {"k1": False},
+            "fixed_params": {},
+            "method": "trf",
+            "max_nfev": 10,
+            "seed": 42,
+            "parallel_starts": 4,
+        },
+        "mechanism_text": "reaction: A -> B; k=0.2",
+        "reactions_text": "reaction: A -> B; k=0.2",
+    }
+
+    base = dict(
+        version=1,
+        mechanism_text_sha256="abc",
+        mechanism_text_len=1,
+        param_names=[],
+        t_end=1.0,
+        num_points=6,
+        temperature_K=298.15,
+        solver_requested="BDF",
+        solver_normalized="BDF",
+        solver_warning=None,
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )
+    first_meta = PreparedSimulationMetadata(
+        **base,
+        symbolic_jacobian_identity={"kind": "jacobian", "fingerprint": "first"},
+    )
+    second_meta = PreparedSimulationMetadata(
+        **base,
+        symbolic_jacobian_identity={"kind": "jacobian", "fingerprint": "second"},
+    )
+
+    first = build_global_fit_run_stamp(prepared_simulation=first_meta, **kwargs)
+    second = build_global_fit_run_stamp(prepared_simulation=second_meta, **kwargs)
+
+    assert first["prepared_simulation"]["symbolic_jacobian_identity"]["fingerprint"] == "first"
+    assert second["prepared_simulation"]["symbolic_jacobian_identity"]["fingerprint"] == "second"
+    assert hash_global_fit_run_stamp(first) != hash_global_fit_run_stamp(second)
+
+
+def test_run_stamp_hash_changes_with_prepared_symbolic_wegscheider_identity():
+    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    kwargs = {
+        "dataset_rows": [],
+        "included_ids": [],
+        "applied_fit_targets": {},
+        "weights_used": None,
+        "weight_mode": "equal",
+        "fit_config": {
+            "parameters": {"k1": 0.2},
+            "bounds": {"k1": (0.01, 1.0)},
+            "log10_params": {"k1": False},
+            "fixed_params": {},
+            "method": "trf",
+        },
+        "mechanism_text": "reaction: A -> B; k=0.2",
+        "reactions_text": "reaction: A -> B; k=0.2",
+    }
+    base = dict(
+        version=1,
+        mechanism_text_sha256="abc",
+        mechanism_text_len=1,
+        param_names=[],
+        t_end=1.0,
+        num_points=6,
+        temperature_K=298.15,
+        solver_requested="BDF",
+        solver_normalized="BDF",
+        solver_warning=None,
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=True,
+        initial_prefix="init:",
+    )
+    first_meta = PreparedSimulationMetadata(
+        **base,
+        symbolic_wegscheider_identity={
+            "kind": "wegscheider_cyclicity",
+            "fingerprint": "first",
+        },
+    )
+    second_meta = PreparedSimulationMetadata(
+        **base,
+        symbolic_wegscheider_identity={
+            "kind": "wegscheider_cyclicity",
+            "fingerprint": "second",
+        },
+    )
+
+    first = build_global_fit_run_stamp(prepared_simulation=first_meta, **kwargs)
+    second = build_global_fit_run_stamp(prepared_simulation=second_meta, **kwargs)
+
+    assert first["prepared_simulation"]["symbolic_wegscheider_identity"]["fingerprint"] == "first"
+    assert second["prepared_simulation"]["symbolic_wegscheider_identity"]["fingerprint"] == "second"
+    assert hash_global_fit_run_stamp(first) != hash_global_fit_run_stamp(second)
+
+
 def test_build_global_fit_run_stamp_rejects_incomplete_prepared_simulation_mapping():
     from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp
 

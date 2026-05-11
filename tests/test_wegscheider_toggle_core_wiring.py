@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 
+from kindred.core.exceptions import FitSimulationError
 from kindred.core.fitting_objective import build_fitting_objective
 from kindred.core.simulation_preparation import prepare_bound_mechanism
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
@@ -16,25 +17,29 @@ def _as_float(x):
 def _triangle_dsl() -> str:
     return "\n".join(
         [
-            "equilibrium: A <-> B; kf=2.0; kr=1.0",
-            "equilibrium: B <-> C; kf=3.0; kr=1.0",
-            "equilibrium: C <-> A; kf=1.0; kr=1.0",
+            "equilibrium: A <-> B; kf=2.0; K=2.0",
+            "equilibrium: B <-> C; kf=3.0; K=3.0",
+            "equilibrium: C <-> A; kf=1.0; K=1.0",
+            "param Keq3 = 1 / (Keq1 * Keq2)",
             "init: A=1.0, B=0.0, C=0.0",
         ]
     )
 
 
-def test_prepare_bound_mechanism_binds_wegscheider_dependents_when_enabled():
+def test_prepare_bound_mechanism_binds_symbolic_wegscheider_inputs_when_enabled():
     dsl = _triangle_dsl()
     bound = prepare_bound_mechanism(
         mechanism_text=dsl,
-        param_names=["kf1", "kr1", "kf2", "kr2", "kf3"],  # omit kr3 (expected dependent)
+        param_names=["Keq1", "Keq2", "kf3"],
         temperature_K=298.15,
         initials={},
         use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=True,
     )
 
+    assert "Keq1" in bound.bindings
+    assert "Keq2" in bound.bindings
+    assert "Keq3" not in bound.bindings
     assert "kr3" in bound.bindings
 
     mech = bound.mechanism
@@ -44,7 +49,22 @@ def test_prepare_bound_mechanism_binds_wegscheider_dependents_when_enabled():
     assert kf3 / kr3 == pytest.approx(1.0 / 6.0, rel=0, abs=1e-15)
 
     constrained = (getattr(mech, "metadata", {}) or {}).get("constrained_params") or {}
-    assert "kr3" in constrained
+    assert constrained["Keq3"]["constraint_reason"] == "algebra"
+    assert "kr3" not in constrained
+
+
+def test_prepare_bound_mechanism_rejects_wegscheider_derived_rate_as_fit_parameter():
+    dsl = _triangle_dsl()
+
+    with pytest.raises(FitSimulationError, match="Derived equilibrium rate parameter"):
+        prepare_bound_mechanism(
+            mechanism_text=dsl,
+            param_names=["Keq1", "Keq2", "kf3", "kr3"],
+            temperature_K=298.15,
+            initials={},
+            use_advanced_dsl=True,
+            wegscheider_cyclicity_enabled=True,
+        )
 
 
 def test_build_fitting_objective_accepts_toggle_and_enforces_cyclicity():
@@ -55,7 +75,7 @@ def test_build_fitting_objective_accepts_toggle_and_enforces_cyclicity():
 
     objective = build_fitting_objective(
         mechanism_text=dsl,
-        param_names=["kf1", "kr1", "kf2", "kr2", "kf3"],  # omit kr3 (expected dependent)
+        param_names=["Keq1", "Keq2", "kf3"],
         t_exp=t_exp,
         y_exp=y_exp,
         target_species="A",
@@ -67,7 +87,7 @@ def test_build_fitting_objective_accepts_toggle_and_enforces_cyclicity():
         wegscheider_cyclicity_enabled=True,
     )
 
-    residuals = objective(np.array([2.0, 1.0, 3.0, 1.0, 1.0], dtype=float))
+    residuals = objective(np.array([2.0, 3.0, 1.0], dtype=float))
     assert np.asarray(residuals).shape == y_exp.shape
 
     fn = getattr(objective, "_fn", None)

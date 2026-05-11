@@ -59,35 +59,37 @@ def test_simulation_preparation_error_carries_stage_metadata() -> None:
     assert str(exc) == "bad dsl"
 
 
-def test_prepare_simulation_worker_run_reports_sparse_jacobian_fallback(monkeypatch) -> None:
+def test_prepare_simulation_worker_run_uses_symbolic_jacobian_for_constant_temperature_arrhenius() -> None:
     from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
-    monkeypatch.setattr(
-        "kindred.core.sparse_jacobian.build_sparse_jacobian",
-        lambda _mechanism: (_ for _ in ()).throw(RuntimeError("sparsity blew up")),
-    )
-
     prepared = prepare_simulation_worker_run(
-        mechanism_text="reaction: A -> B; k=0.2\ninitial: A=1.0\ninitial: B=0.0",
+        mechanism_text="\n".join(
+            [
+                "energy=kJ/mol",
+                "reaction: A -> B; A=1e3; Ea=50",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
         initials={"A": 1.0, "B": 0.0},
         t_span=(0.0, 1.0),
         solver_config={"solver": "BDF", "use_sparse_jacobian": True, "grid": {"N": 5}},
     )
 
-    assert prepared.jacobian_func is None
-    assert prepared.warnings == [
-        "Sparse Jacobian unavailable; falling back to dense Jacobian: sparsity blew up"
-    ]
+    identity = getattr(prepared.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+    assert prepared.warnings == []
 
 
-def test_prepare_simulation_worker_run_disables_sparse_jacobian_for_temperature_schedule(monkeypatch) -> None:
+def test_prepare_simulation_worker_run_disables_symbolic_jacobian_for_temperature_schedule(monkeypatch) -> None:
     from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
     called = {"n": 0}
 
     def _build_sparse(_mechanism):
         called["n"] += 1
-        raise AssertionError("sparse Jacobian builder should not be called for scheduled temperature")
+        raise AssertionError("legacy sparse Jacobian builder should not be called for scheduled temperature")
 
     monkeypatch.setattr("kindred.core.sparse_jacobian.build_sparse_jacobian", _build_sparse)
 
@@ -108,9 +110,10 @@ def test_prepare_simulation_worker_run_disables_sparse_jacobian_for_temperature_
 
     assert called["n"] == 0
     assert prepared.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
     assert prepared.temperature_schedule is not None
     assert prepared.warnings == [
-        "Sparse Jacobian disabled for scheduled-temperature run; falling back to dense Jacobian."
+        "Symbolic Jacobian disabled for scheduled-temperature run; using solver default Jacobian handling."
     ]
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any, Callable, Dict, List, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -72,6 +72,8 @@ class SimulationBatchOwner:
         self._set_status_text = set_status_text
         self._update_batch_row_controls_state = update_batch_row_controls_state
         self._sync_batch_species_columns = sync_batch_species_columns
+        self._symbolic_jacobian_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._symbolic_wegscheider_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 
     def batch_rows_for_scope(self, scope: str) -> List[int]:
         return [int(row) for row in (self._batch_rows_for_scope(str(scope)) or [])]
@@ -547,6 +549,98 @@ class SimulationBatchOwner:
         except Exception:
             return None
 
+    def _symbolic_jacobian_identity_for_preview(
+        self,
+        *,
+        set_id: str,
+        mechanism_text: str,
+        solver_config: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        solver_name = str(dict(solver_config or {}).get("solver") or "").strip().lower()
+        if solver_name not in {"bdf", "radau"}:
+            return {}
+        if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
+            return {}
+        if not bool(self._mechanism_owner.has_slider_overrides()):
+            return {}
+        if self._normalized_slider_overrides(set_id=str(set_id)):
+            return {}
+        try:
+            mechanism_identity_text = strip_reaction_dsl_initial_concentrations(
+                str(mechanism_text or "")
+            )
+            solver_identity = repr(
+                {
+                    "solver": str(dict(solver_config or {}).get("solver") or ""),
+                    "use_sparse_jacobian": bool(
+                        dict(solver_config or {}).get("use_sparse_jacobian", False)
+                    ),
+                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
+                    "wegscheider_cyclicity_enabled": bool(
+                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
+                    ),
+                }
+            )
+            cache_key = (mechanism_identity_text, solver_identity)
+            cached = self._symbolic_jacobian_identity_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+            from kindred.core.simulation_preparation import (
+                symbolic_jacobian_identity_for_execution_text,
+            )
+
+            payload = symbolic_jacobian_identity_for_execution_text(
+                mechanism_text=mechanism_identity_text,
+                solver_config=dict(solver_config or {}),
+            )
+            if not payload:
+                return {}
+            self._symbolic_jacobian_identity_cache[cache_key] = dict(payload)
+            return dict(payload)
+        except Exception:
+            return {}
+
+    def _symbolic_wegscheider_identity_for_preview(
+        self,
+        *,
+        mechanism_text: str,
+        solver_config: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if not bool(dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)):
+            return {}
+        if not bool(self._mechanism_owner.has_slider_overrides()):
+            return {}
+        try:
+            mechanism_identity_text = strip_reaction_dsl_initial_concentrations(
+                str(mechanism_text or "")
+            )
+            solver_identity = repr(
+                {
+                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
+                    "wegscheider_cyclicity_enabled": bool(
+                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
+                    ),
+                }
+            )
+            cache_key = (mechanism_identity_text, solver_identity)
+            cached = self._symbolic_wegscheider_identity_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+            from kindred.core.simulation_preparation import (
+                symbolic_wegscheider_identity_for_execution_text,
+            )
+
+            payload = symbolic_wegscheider_identity_for_execution_text(
+                mechanism_text=mechanism_identity_text,
+                solver_config=dict(solver_config or {}),
+            )
+            if not payload:
+                return {}
+            self._symbolic_wegscheider_identity_cache[cache_key] = dict(payload)
+            return dict(payload)
+        except Exception:
+            return {}
+
     def current_workspace_preview_identity(self, *, set_id: str) -> SimulationIdentity:
         mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
         expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
@@ -602,6 +696,15 @@ class SimulationBatchOwner:
             intervention_schedule_fingerprint=intervention_schedule_fingerprint,
             preview_batch_cache_token=expected_overlay_token,
             execution_flags=("fast_mode",),
+            symbolic_jacobian_identity=self._symbolic_jacobian_identity_for_preview(
+                set_id=str(set_id),
+                mechanism_text=mechanism_text,
+                solver_config=expected_solver_config,
+            ),
+            symbolic_wegscheider_identity=self._symbolic_wegscheider_identity_for_preview(
+                mechanism_text=mechanism_text,
+                solver_config=expected_solver_config,
+            ),
         )
 
     def current_workspace_preview_context(

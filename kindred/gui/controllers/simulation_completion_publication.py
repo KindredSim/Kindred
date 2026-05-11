@@ -43,6 +43,7 @@ class CompletionResultState:
     base_species_count: int | None
     mechanism_text: str
     solver_config: Mapping[str, Any]
+    warnings: Sequence[Any]
     fallback_occurred: bool
     fallback_message: object | None
     series: Dict[str, Any]
@@ -158,6 +159,7 @@ class SimulationCompletionPublicationOwner:
         mechanism_text = str(result.get("mechanism_text", ""))
         solver_config = result.get("solver_config", {})
         solver_config_map = solver_config if isinstance(solver_config, Mapping) else {}
+        warnings = result.get("warnings") or []
         return CompletionResultState(
             t=t,
             Y=Y,
@@ -169,6 +171,7 @@ class SimulationCompletionPublicationOwner:
             base_species_count=base_species_count,
             mechanism_text=mechanism_text,
             solver_config=solver_config_map,
+            warnings=warnings if isinstance(warnings, Sequence) and not isinstance(warnings, (str, bytes)) else (),
             fallback_occurred=bool(result.get("fallback_occurred")),
             fallback_message=result.get("fallback_message"),
             series={str(species_name): Y[i, :] for i, species_name in enumerate(species_names)},
@@ -328,6 +331,11 @@ class SimulationCompletionPublicationOwner:
             fallback_occurred=bool(completion.fallback_occurred),
             fallback_message=completion.fallback_message,
             solver_provenance=completion.solver_provenance,
+            warnings=[
+                dict(warning)
+                for warning in completion.warnings
+                if isinstance(warning, Mapping)
+            ],
         )
 
     def apply_pending_init(
@@ -480,6 +488,8 @@ class SimulationCompletionPublicationOwner:
             series=completion.series,
             algebra_scalars=completion.algebra_scalars,
             dataset_overlays=dataset_overlays,
+            solver_provenance=completion.solver_provenance,
+            warnings=completion.warnings,
         )
 
     def apply_pending_init_guard(

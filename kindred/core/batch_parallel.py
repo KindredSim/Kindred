@@ -367,6 +367,14 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         if include_mechanism_in_result_payload
         else build_secondary_simulation_success_payload
     )
+    prepared_warning_payloads = [
+        build_simulation_failure(
+            "preparation_warning",
+            str(message),
+            details={"stage": "prepare_run_context"},
+        )
+        for message in (getattr(prepared, "warnings", None) or [])
+    ]
     payload_kwargs: Dict[str, Any] = {
         "result": result,
         "y": extended_y,
@@ -374,7 +382,7 @@ def _run_batch_simulation_task_impl(task: Mapping[str, Any]) -> Dict[str, Any]:
         "base_species_count": int(base_species_count),
         "algebra_scalars": algebra_scalars,
         "algebra_errors": algebra_errors,
-        "warnings": [],
+        "warnings": prepared_warning_payloads,
         "solver": str(prepared.request.solver),
         "mechanism_text": mechanism_text,
         "solver_config": {

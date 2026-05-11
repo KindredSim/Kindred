@@ -307,7 +307,7 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
     if prepared_meta is None:
         return None
     serialized = prepared_meta.to_serializable_dict()
-    return {
+    block = {
         "mechanism_text_sha256": str(serialized.get("mechanism_text_sha256") or ""),
         "mechanism_text_len": int(serialized.get("mechanism_text_len") or 0),
         "param_names": sorted({str(x) for x in (serialized.get("param_names") or []) if str(x).strip()}),
@@ -323,6 +323,13 @@ def _normalize_prepared_simulation_block(prepared_simulation: Optional[object]) 
         "initial_prefix": str(serialized.get("initial_prefix") or ""),
         "intervention_schedule_fingerprint": str(serialized.get("intervention_schedule_fingerprint") or ""),
     }
+    symbolic_jacobian_identity = serialized.get("symbolic_jacobian_identity")
+    if isinstance(symbolic_jacobian_identity, Mapping):
+        block["symbolic_jacobian_identity"] = dict(symbolic_jacobian_identity)
+    symbolic_wegscheider_identity = serialized.get("symbolic_wegscheider_identity")
+    if isinstance(symbolic_wegscheider_identity, Mapping):
+        block["symbolic_wegscheider_identity"] = dict(symbolic_wegscheider_identity)
+    return block
 
 
 def build_global_fit_run_stamp(

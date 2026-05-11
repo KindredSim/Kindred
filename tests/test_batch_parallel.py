@@ -223,7 +223,7 @@ def test_run_batch_simulation_task_returns_structured_error_payload_on_solver_fa
     payload = batch_parallel.run_batch_simulation_task(
         _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "BDF"},
+            "solver_config": {"solver": "BDF", "use_sparse_jacobian": False},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -256,6 +256,36 @@ def test_run_batch_simulation_task_uses_shared_preparation_failure_payload_for_i
     stack_trace = str(payload["error"]["context"].get("stack_trace") or "")
     assert "SimulationPreparationError" in stack_trace
     assert "could not convert string to float: 'bad'" in stack_trace
+
+
+def test_run_batch_simulation_task_publishes_symbolic_jacobian_identity_from_solver_path():
+    payload = batch_parallel.run_batch_simulation_task(
+        _batch_task_with_plan({
+            "mechanism_text": "\n".join(
+                [
+                    "reaction: A -> B; k=0.7",
+                    "reaction: B -> C; k=0.2",
+                    "initial: A=1.0",
+                    "initial: B=0.0",
+                    "initial: C=0.0",
+                ]
+            ),
+            "solver_config": {
+                "solver": "BDF",
+                "use_sparse_jacobian": True,
+                "temperature_K": 298.15,
+            },
+            "t_span": (0.0, 0.5),
+            "t_end": 0.5,
+            "set_id": "id1",
+            "set_name": "set1",
+        })
+    )
+
+    assert payload["success"] is True
+    symbolic_identity = payload["provenance"]["symbolic_jacobian_identity"]
+    assert symbolic_identity["kind"] == "jacobian"
+    assert symbolic_identity["artifact_fingerprint"]
 
 
 def test_compute_effective_batch_workers_caps_requested_workers_at_shared_ceiling(monkeypatch):
@@ -322,7 +352,7 @@ def test_run_batch_simulation_task_reports_algebra_errors_with_shared_schema(mon
     payload = batch_parallel.run_batch_simulation_task(
         _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "BDF"},
+            "solver_config": {"solver": "BDF", "use_sparse_jacobian": False},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -471,7 +501,7 @@ def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(mon
     payload = batch_parallel.run_batch_simulation_task(
         _batch_task_with_plan({
             "mechanism_text": "reaction: A -> A; k=1",
-            "solver_config": {"solver": "BDF"},
+            "solver_config": {"solver": "BDF", "use_sparse_jacobian": False},
             "t_end": 1.0,
             "set_id": "id1",
             "set_name": "set1",
@@ -484,6 +514,38 @@ def test_run_batch_simulation_task_emits_worker_style_success_payload_fields(mon
     assert payload["solver"] == "BDF"
     assert payload["nfev"] == 17
     assert payload["provenance"] == {"path": "batch"}
+
+
+def test_run_batch_simulation_task_uses_symbolic_jacobian_for_constant_temperature_arrhenius(monkeypatch):
+    class _FakeResult:
+        t = np.asarray([0.0, 1.0], dtype=float)
+        Y = np.asarray([[1.0, 0.5], [0.0, 0.5]], dtype=float)
+        nfev = 17
+        provenance = {"path": "batch"}
+        fallback_occurred = False
+        fallback_message = None
+
+    monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", lambda _req: _FakeResult())
+
+    payload = batch_parallel.run_batch_simulation_task(
+        _batch_task_with_plan({
+            "mechanism_text": "\n".join(
+                [
+                    "energy=kJ/mol",
+                    "reaction: A -> B; A=1e3; Ea=50",
+                    "initial: A=1.0",
+                    "initial: B=0.0",
+                ]
+            ),
+            "solver_config": {"solver": "BDF"},
+            "t_end": 1.0,
+            "set_id": "id1",
+            "set_name": "set1",
+        })
+    )
+
+    assert payload["success"] is True
+    assert payload["warnings"] == []
 
 
 def test_run_batch_simulation_task_uses_text_path_for_plan_without_prepared_payload(monkeypatch):

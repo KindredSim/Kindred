@@ -4,6 +4,7 @@ import inspect
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
+from types import SimpleNamespace
 import warnings
 from typing import Any, Callable, Optional
 from unittest.mock import MagicMock
@@ -182,6 +183,38 @@ def _timeout_failure_outcome(set_id: str, seconds: float = 0.2) -> BatchLaneOutc
             ),
         },
     )
+
+
+_WEGSCHEIDER_GUI_UNRESOLVED = "\n".join(
+    [
+        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; K=2",
+        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; K=3",
+        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; K=7",
+        "init: PBMproduct=1, Methidequinone=0, Methidequinone_CIS=0, Amine=0",
+    ]
+)
+
+
+class _EditableText:
+    def __init__(self, text: str = "") -> None:
+        self._text = str(text)
+
+    def toPlainText(self) -> str:
+        return self._text
+
+    def setPlainText(self, text: str) -> None:
+        self._text = str(text)
+
+
+class _MinimalMechanismEditor:
+    def __init__(self, text: str) -> None:
+        self._reactions_text = _EditableText(text)
+
+    def slider_points_value(self) -> int:
+        return 100
+
+    def slider_solver_value(self) -> str:
+        return "BDF"
 
 
 def _install_active_lane_outcomes(
@@ -571,6 +604,36 @@ class _FakeMainWindow(QtCore.QObject):
             full_message = f"{full_message}\n\nDetails:\n{details}"
         QtWidgets.QMessageBox.critical(None, str(title), full_message)
 
+    def message_box_question(self, title: str, message: str, *, accept_label: str = "Apply") -> bool:
+        self._message_box_questions.append(
+            {
+                "title": str(title),
+                "message": str(message),
+                "accept_label": str(accept_label),
+            }
+        )
+        return bool(self._message_box_question_response)
+
+    def choose_wegscheider_resolution(
+        self,
+        title: str,
+        message: str,
+        choices: dict[str, list[dict[str, str]]],
+    ) -> dict[str, str] | None:
+        self._wegscheider_resolution_choice_prompts.append(
+            {
+                "title": str(title),
+                "message": str(message),
+                "choices": {
+                    str(cycle_id): [dict(item) for item in options]
+                    for cycle_id, options in dict(choices or {}).items()
+                },
+            }
+        )
+        if self._wegscheider_resolution_choice_response is None:
+            return None
+        return dict(self._wegscheider_resolution_choice_response)
+
     def mechanism_reactions_text_raw(self) -> str:
         editor = getattr(self, "_mechanism_editor", None)
         if editor is not None and hasattr(editor, "_reactions_text"):
@@ -656,6 +719,14 @@ class _FakeMainWindow(QtCore.QObject):
             str(new_text),
             str(description),
             bool(record_undo),
+        )
+
+    def apply_wegscheider_resolution_source_rewrite(self, reactions_text: str) -> None:
+        self._wegscheider_resolution_rewrites.append(str(reactions_text))
+        self.set_mechanism_reactions_text_with_optional_undo(
+            str(reactions_text),
+            "Resolve Wegscheider cyclicity",
+            record_undo=True,
         )
 
     def stop_slider_release_commit_timer(self) -> None:
@@ -1008,6 +1079,8 @@ class _FakeMainWindow(QtCore.QObject):
         series: dict[str, object],
         algebra_scalars: Optional[dict[str, object]] = None,
         dataset_overlays: object = None,
+        solver_provenance: Optional[dict[str, object]] = None,
+        warnings: Optional[list[dict[str, object]]] = None,
     ) -> dict[str, Any]:
         ctc_values = {str(name): 1.0 for name in series}
         self.set_last_simulation_ctc(ctc_values)
@@ -1039,6 +1112,13 @@ class _FakeMainWindow(QtCore.QObject):
             provenance["algebra_scalars"] = dict(algebra_scalars)
         if dataset_overlays is not None:
             provenance["dataset_overlays"] = dataset_overlays
+        if solver_provenance:
+            provenance["solver_provenance"] = dict(solver_provenance)
+            symbolic_identity = solver_provenance.get("symbolic_jacobian_identity")
+            if isinstance(symbolic_identity, dict):
+                provenance["symbolic_jacobian_identity"] = dict(symbolic_identity)
+        if warnings:
+            provenance["warnings"] = [dict(item) for item in warnings]
         fit_meta = self.last_fit_metadata()
         if fit_meta:
             provenance["fit"] = fit_meta
@@ -1139,6 +1219,11 @@ def mw(qt_app) -> _FakeMainWindow:
     window._preview_unavailable_messages = []
     window._use_sparse_jacobian = False
     window._wegscheider_cyclicity_enabled = False
+    window._message_box_question_response = True
+    window._message_box_questions = []
+    window._wegscheider_resolution_rewrites = []
+    window._wegscheider_resolution_choice_response = None
+    window._wegscheider_resolution_choice_prompts = []
 
     window._batch_store = MagicMock()
     window._batch_store.row_count.return_value = 0
@@ -1265,6 +1350,271 @@ def controller(mw: _FakeMainWindow) -> SimulationController:
         with suppress(RuntimeError, TypeError):
             if timer is not None and timer.isActive():
                 timer.stop()
+
+
+def _configure_single_selected_set(mw: _FakeMainWindow) -> None:
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_store.visible_species.return_value = ["PBMproduct"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_ids_for_scope.return_value = ["set1"]
+    mw._shown_batch_set_ids.return_value = ["set1"]
+    mw._batch_current_row.return_value = 0
+    mw._batch_set_id_for_row.return_value = "set1"
+    mw._batch_set_name_for_id.return_value = "set1"
+    mw._batch_preferred_primary_set_id.return_value = "set1"
+
+
+def _install_mechanism_editor_text(mw: _FakeMainWindow, text: str) -> None:
+    editor = _MinimalMechanismEditor(str(text))
+    mw._mechanism_editor = editor
+    mw._get_mechanism_text = MagicMock(return_value=str(text))
+
+    def _set_text_with_optional_undo(widget: object, new_text: str, _description: str, _record_undo: bool) -> None:
+        widget.setPlainText(str(new_text))
+        mw._get_mechanism_text = MagicMock(return_value=str(new_text))
+
+    mw._set_text_with_optional_undo = MagicMock(side_effect=_set_text_with_optional_undo)
+
+
+@pytest.mark.unit
+def test_run_accepts_wegscheider_resolution_and_rewrites_source_before_dispatch(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    _configure_single_selected_set(mw)
+    _install_mechanism_editor_text(mw, _WEGSCHEIDER_GUI_UNRESOLVED)
+    mw._wegscheider_cyclicity_enabled = True
+    mw._wegscheider_resolution_choice_response = {"cycle_1": "Keq3"}
+    controller._selected_run_runtime_snapshot = MagicMock(
+        return_value=SimpleNamespace(required=False, ready=True, message="")
+    )
+    controller.run_simulation_internal = MagicMock()
+
+    controller.run_simulation()
+
+    assert mw._wegscheider_resolution_choice_prompts
+    assert mw._wegscheider_resolution_choice_prompts[0]["title"] == "Resolve Wegscheider Cyclicity"
+    assert len(mw._wegscheider_resolution_rewrites) == 1
+    rewritten = mw.mechanism_reactions_text_raw()
+    assert "param Keq3 = 1 / (Keq1 * Keq2)" in rewritten
+    assert "Running simulation..." == mw._status_label.text
+    controller.run_simulation_internal.assert_called_once()
+
+
+@pytest.mark.unit
+def test_run_cancelled_wegscheider_resolution_preserves_source_and_blocks_dispatch(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    _configure_single_selected_set(mw)
+    _install_mechanism_editor_text(mw, _WEGSCHEIDER_GUI_UNRESOLVED)
+    mw._wegscheider_cyclicity_enabled = True
+    mw._wegscheider_resolution_choice_response = None
+    controller._selected_run_runtime_snapshot = MagicMock(
+        return_value=SimpleNamespace(required=False, ready=True, message="")
+    )
+    controller.run_simulation_internal = MagicMock()
+
+    controller.run_simulation()
+
+    assert mw._wegscheider_resolution_choice_prompts
+    assert mw._wegscheider_resolution_rewrites == []
+    assert mw.mechanism_reactions_text_raw() == _WEGSCHEIDER_GUI_UNRESOLVED
+    assert "Run cancelled: unresolved Wegscheider cyclicity." == mw._status_label.text
+    controller.run_simulation_internal.assert_not_called()
+
+
+@pytest.mark.unit
+def test_run_uses_user_selected_wegscheider_dependent_parameter(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    _configure_single_selected_set(mw)
+    _install_mechanism_editor_text(mw, _WEGSCHEIDER_GUI_UNRESOLVED)
+    mw._wegscheider_cyclicity_enabled = True
+    mw._wegscheider_resolution_choice_response = {"cycle_1": "Keq2"}
+    controller._selected_run_runtime_snapshot = MagicMock(
+        return_value=SimpleNamespace(required=False, ready=True, message="")
+    )
+    controller.run_simulation_internal = MagicMock()
+
+    controller.run_simulation()
+
+    prompt = mw._wegscheider_resolution_choice_prompts[0]
+    offered_parameters = {
+        item["parameter_name"]
+        for item in prompt["choices"]["cycle_1"]
+    }
+    assert offered_parameters == {"Keq1", "Keq2", "Keq3"}
+    rewritten = mw.mechanism_reactions_text_raw()
+    assert "param Keq2 =" in rewritten
+    assert "param Keq3 =" not in rewritten
+    controller.run_simulation_internal.assert_called_once()
+
+
+@pytest.mark.unit
+def test_simulation_identity_for_supported_symbolic_jacobian_uses_actual_artifact(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "# Algebra",
+            "param k1 = 0.5",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    solver_config = {
+        "solver": "BDF",
+        "grid": {"N": 12},
+        "temperature_K": 298.15,
+        "use_sparse_jacobian": True,
+    }
+    _install_mechanism_editor_text(mw, mechanism_text)
+
+    identity = controller._simulation_identity_for_set(
+        set_id="set1",
+        solver_config=solver_config,
+        t_end=5.0,
+        fast_mode=False,
+    )
+    request_mechanism_text = controller._request_mechanism_text_for_set(
+        set_id="set1",
+        has_slider_overrides=False,
+    )
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=request_mechanism_text,
+        initials={},
+        t_span=(0.0, 5.0),
+        solver_config=solver_config,
+    )
+
+    symbolic = identity.to_payload()["symbolic_jacobian_identity"]
+    expected = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity")
+    assert symbolic["kind"] == "jacobian"
+    assert symbolic["backend_name"] == "sympy"
+    assert symbolic["artifact_fingerprint"]
+    assert symbolic["source_fingerprint"]
+    assert symbolic == expected
+
+
+@pytest.mark.unit
+def test_symbolic_jacobian_identity_cache_keys_include_wegscheider_cyclicity_mode(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    _install_mechanism_editor_text(mw, _WEGSCHEIDER_GUI_UNRESOLVED)
+    base_solver_config = {
+        "solver": "BDF",
+        "grid": {"N": 12},
+        "temperature_K": 298.15,
+        "use_sparse_jacobian": True,
+    }
+
+    cyclicity_off_identity = controller._symbolic_jacobian_identity_for_set(
+        set_id="set1",
+        solver_config={**base_solver_config, "wegscheider_cyclicity_enabled": False},
+        fast_mode=False,
+    )
+    cyclicity_on_identity = controller._symbolic_jacobian_identity_for_set(
+        set_id="set1",
+        solver_config={**base_solver_config, "wegscheider_cyclicity_enabled": True},
+        fast_mode=False,
+    )
+
+    assert cyclicity_off_identity["kind"] == "jacobian"
+    assert cyclicity_on_identity == {}
+
+
+@pytest.mark.unit
+def test_fast_preview_identity_omits_symbolic_jacobian_for_slider_parameter_overrides(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    _install_mechanism_editor_text(mw, mechanism_text)
+    mw._slider_overrides = {"k1": 0.4}
+    mw._simulation_param_fingerprints = {"set1": "slider-k1"}
+
+    identity = controller._simulation_identity_for_set(
+        set_id="set1",
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 12},
+            "temperature_K": 298.15,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+        t_end=5.0,
+        fast_mode=True,
+    )
+
+    assert "symbolic_jacobian_identity" not in identity.to_payload()
+
+
+@pytest.mark.unit
+def test_batch_preview_identity_omits_symbolic_jacobian_for_slider_parameter_overrides() -> None:
+    from kindred.gui.simulation_batch_owner import SimulationBatchOwner
+
+    mechanism_owner = MagicMock()
+    mechanism_owner.has_slider_overrides.return_value = True
+    mechanism_owner.slider_overrides.return_value = {"k1": 0.4}
+    owner = SimulationBatchOwner(
+        batch_rows_for_scope=lambda _scope: [],
+        batch_set_ids_for_scope=lambda _scope: [],
+        shown_batch_set_ids=lambda: [],
+        slider_edit_target_set_ids=lambda: [],
+        focused_batch_set_id=lambda: None,
+        batch_current_row=lambda: None,
+        batch_set_id_for_row=lambda _row: None,
+        batch_set_name_for_id=lambda _set_id: None,
+        batch_set_id_for_name=lambda _name: None,
+        batch_preferred_primary_set_id=lambda _rows: None,
+        batch_cache_key=lambda *args, **kwargs: "cache",
+        batch_cache_getter=lambda: None,
+        batch_store=MagicMock(),
+        batch_model=MagicMock(),
+        batch_initials_for_row=lambda _row: {},
+        preview_session=MagicMock(),
+        mechanism_owner=mechanism_owner,
+        solver_owner=MagicMock(),
+        results_controller_getter=lambda: None,
+        set_status_text=lambda _text: None,
+        update_batch_row_controls_state=lambda: None,
+        sync_batch_species_columns=lambda *args, **kwargs: None,
+    )
+
+    payload = owner._symbolic_jacobian_identity_for_preview(
+        set_id="set1",
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 12},
+            "temperature_K": 298.15,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+
+    assert payload == {}
+
 
 @pytest.mark.unit
 def test_default_batch_lane_pool_factory_creates_warm_lane_pool():
@@ -2276,6 +2626,12 @@ def test_completion_missing_callback_context_does_not_use_current_queue_or_stale
     controller._latest_sim_request_id = 7
     controller._active_run_id = 5
     controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=0,
+        target_set_ids=("id2",),
+    )
     controller._slider_simulation_active = False
     controller.ui.run_ui.set_run_button_enabled(False)
     controller.ui.run_ui.set_stop_button_enabled(True)
@@ -2667,6 +3023,58 @@ def test_worker_signal_completion_uses_captured_context_identity_after_context_t
     assert published[0]["cache_key"] == "captured-preview-cache"
     assert published[0]["simulation_identity"] == {"schema_id": "captured-schema"}
     assert published[0]["preview_batch_cache_token"] == "captured-token"
+
+
+@pytest.mark.unit
+def test_worker_signal_completion_preserves_warning_payloads_in_completion_cache(
+    controller: SimulationController,
+):
+    worker = _QtSignalWorker(running=False)
+    controller._latest_sim_request_id = 7
+    controller._active_run_id = 5
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller.run_state.preview_ownership = PreviewOwnershipState(
+        request_id=7,
+        epoch=0,
+        target_set_ids=("id2",),
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        request_id=7,
+        preview_owner_epoch=0,
+        cache_key="captured-preview-cache",
+        queue_ids=["id2"],
+        queue_names=["set2"],
+        pos=0,
+        total=1,
+        primary_set_id="id2",
+        simulation_identity_by_set_id={"id2": {"schema_id": "captured-schema"}},
+        preview_batch_cache_token_by_set_id={"id2": "captured-token"},
+    )
+    published: list[dict[str, object]] = []
+    controller._cache_admin.publish_completion_cache = lambda **kwargs: published.append(dict(kwargs))
+
+    controller._connect_simulation_worker_application_signals(
+        worker,
+        run_id=5,
+        fast_mode=True,
+        request_id=7,
+        owner_epoch=0,
+        set_name="set2",
+        set_id="id2",
+        cache_key="captured-preview-cache",
+    )
+    payload = _successful_result_payload()
+    payload["warnings"] = [{"kind": "preparation_warning", "message": "symbolic disabled"}]
+
+    worker.result_ready.emit(payload)
+
+    assert published
+    assert published[0]["warnings"] == [{"kind": "preparation_warning", "message": "symbolic disabled"}]
 
 
 @pytest.mark.unit
@@ -3680,6 +4088,55 @@ def test_current_contained_preview_child_failure_is_status_only_dirty_no_preview
     assert mw._preview_unavailable_messages == ["Preview unavailable. Adjust sliders or run again."]
     assert controller._simulation_running is False
     assert controller._slider_simulation_active is False
+
+
+@pytest.mark.unit
+def test_current_preview_wegscheider_cyclicity_failure_is_status_only_dirty_no_preview(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    controller._active_run_id = 53
+    controller._latest_sim_request_id = 16
+    controller._simulation_running = True
+    controller._slider_simulation_active = True
+    controller._preview_ownership = PreviewOwnershipState(
+        request_id=16,
+        epoch=10,
+        target_set_ids=("id1",),
+    )
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=True,
+        run_id=53,
+        request_id=16,
+        preview_owner_epoch=10,
+        queue_ids=["id1"],
+        queue_names=["Set 1"],
+    )
+    mw.message_box_critical = MagicMock()
+
+    _error_with_callback_identity(
+        controller,
+        build_simulation_failure(
+            "preparation_error",
+            "Unresolved Wegscheider cyclicity.",
+            details={"stage": "wegscheider_cyclicity"},
+        ),
+        run_id=53,
+        fast_mode=True,
+        request_id=16,
+        owner_epoch=10,
+        batch_set="Set 1",
+        batch_set_id="id1",
+    )
+
+    mw.message_box_critical.assert_not_called()
+    assert mw._preview_unavailable_messages == ["Unresolved Wegscheider cyclicity."]
+    assert controller._simulation_running is False
+    assert controller._slider_simulation_active is False
+
 
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_active_after_stale_error(

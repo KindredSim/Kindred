@@ -117,6 +117,21 @@ def test_solver_settings_dialog_factory_defaults_match_schema_and_cache_defaults
     assert dialog._spin_preview_cache_cap.value() == int(BatchSimulationCache.preview_cache_cap)
 
 
+def test_solver_settings_wegscheider_copy_describes_symbolic_validation_not_rate_derivation(qt_app):
+    dialog = SolverSettingsDialog()
+
+    copy = " ".join(
+        [
+            dialog._wegscheider_checkbox.toolTip(),
+            dialog._wegscheider_help.text(),
+        ]
+    ).lower()
+    assert "symbolic" in copy
+    assert "cycle" in copy
+    assert "reverse rate" not in copy
+    assert "deriving" not in copy
+
+
 def test_solver_settings_dialog_caps_worker_count_at_shared_ceiling(qt_app):
     from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
     from kindred.gui.widgets import solver_settings

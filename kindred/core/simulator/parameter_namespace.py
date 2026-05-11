@@ -145,19 +145,18 @@ def _iter_canonical_items(
                 ),
                 source_index=descriptor.source_index,
             )
-        if descriptor.has_explicit_keq:
-            name = f"Keq{step_index}"
-            yield MechanismParameterNamespaceItem(
+        name = f"Keq{step_index}"
+        yield MechanismParameterNamespaceItem(
+            canonical_name=name,
+            info=MechanismParameterInfo(
                 canonical_name=name,
-                info=MechanismParameterInfo(
-                    canonical_name=name,
-                    step_index=step_index,
-                    step_kind=step_kind,
-                    role="Keq",
-                    has_explicit_keq=True,
-                ),
-                source_index=descriptor.source_index,
-            )
+                step_index=step_index,
+                step_kind=step_kind,
+                role="Keq",
+                has_explicit_keq=bool(descriptor.has_explicit_keq),
+            ),
+            source_index=descriptor.source_index,
+        )
 
 
 def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> MechanismParameterNamespace:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Mapping, NotRequired, Optional, TypedDict, cast
+from typing import Any, Dict, Literal, Mapping, NotRequired, Optional, Sequence, TypedDict, cast
 
 import numpy as np
 
@@ -21,6 +21,7 @@ class BatchCacheEntryV1(TypedDict):
     fallback_occurred: bool
     fallback_message: Any
     solver_provenance: Dict[str, Any]
+    warnings: list[dict[str, Any]]
 
 
 class PlotOverlayEntryV1(TypedDict):
@@ -72,6 +73,7 @@ def build_batch_cache_entry(
     fallback_occurred: bool = False,
     fallback_message: Any = None,
     solver_provenance: Optional[Mapping[str, Any]] = None,
+    warnings: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> BatchCacheEntryV1:
     scalars: Dict[str, float] = {}
     if isinstance(algebra_scalars, Mapping):
@@ -96,6 +98,7 @@ def build_batch_cache_entry(
         "fallback_occurred": bool(fallback_occurred),
         "fallback_message": fallback_message,
         "solver_provenance": dict(solver_provenance or {}),
+        "warnings": [dict(item) for item in (warnings or []) if isinstance(item, Mapping)],
     }
 
 
@@ -121,6 +124,7 @@ def read_batch_cache_entry(payload: object) -> BatchCacheEntryReadResult:
             fallback_occurred=bool(payload.get("fallback_occurred")),
             fallback_message=payload.get("fallback_message"),
             solver_provenance=cast(Optional[Mapping[str, Any]], payload.get("solver_provenance")),
+            warnings=cast(Optional[Sequence[Mapping[str, Any]]], payload.get("warnings")),
         )
     except Exception:
         return BatchCacheEntryReadResult("invalid")

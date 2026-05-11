@@ -35,6 +35,7 @@ class MainWindowVariableRuntime:
         self._slider_runtime: Optional[BoundMechanism] = None
         self._slider_runtime_dirty = True
         self._suppress_slider_runtime_invalidation = False
+        self._slider_runtime_unavailable_reason = ""
 
     def variable_metadata(self) -> Dict[str, Dict[str, object]]:
         return {str(name): dict(meta or {}) for name, meta in self._variable_metadata.items()}
@@ -57,6 +58,9 @@ class MainWindowVariableRuntime:
     def set_slider_runtime_dirty(self, value: bool) -> None:
         self._slider_runtime_dirty = bool(value)
 
+    def slider_runtime_unavailable_reason(self) -> str:
+        return str(self._slider_runtime_unavailable_reason or "")
+
     def suppress_slider_runtime_invalidation(self) -> bool:
         return bool(self._suppress_slider_runtime_invalidation)
 
@@ -66,6 +70,7 @@ class MainWindowVariableRuntime:
     def clear_prepared_slider_runtime(self, *, dirty: bool = True) -> None:
         self._slider_runtime = None
         self._slider_runtime_dirty = bool(dirty)
+        self._slider_runtime_unavailable_reason = ""
 
     def _normalize_visibility_scope_value(self, value: object) -> object:
         if value is None or isinstance(value, (bool, int, str)):
@@ -474,10 +479,19 @@ class MainWindowVariableRuntime:
             )
         except Exception as exc:
             logger.error("Failed to prepare slider runtime: %s", exc)
+            details = getattr(exc, "details", None)
+            failure = details.get("failure") if isinstance(details, MappingABC) else None
+            failure_details = failure.get("details") if isinstance(failure, MappingABC) else None
+            stage = failure_details.get("stage") if isinstance(failure_details, MappingABC) else None
+            if str(stage or "") == "wegscheider_cyclicity" or "Wegscheider cyclicity" in str(exc):
+                self._slider_runtime_unavailable_reason = "unresolved Wegscheider cyclicity"
+            else:
+                self._slider_runtime_unavailable_reason = ""
             return None
 
         self._slider_runtime = runtime
         self._slider_runtime_dirty = False
+        self._slider_runtime_unavailable_reason = ""
         return runtime
 
     def apply_slider_overrides_to_bindings(

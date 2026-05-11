@@ -134,10 +134,12 @@ class SolverSettingsDialog(QtWidgets.QDialog):
 
         self._wegscheider_checkbox = QtWidgets.QCheckBox("Thermodynamic cyclicity (Wegscheider)")
         self._wegscheider_checkbox.setChecked(bool(PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"]))
-        self._wegscheider_checkbox.setToolTip("Enforce detailed balance by deriving some reverse rates from thermodynamic constraints.")
+        self._wegscheider_checkbox.setToolTip(
+            "Validate symbolic Wegscheider cycle constraints before simulation."
+        )
         solver_section_layout.addWidget(self._wegscheider_checkbox)
         self._wegscheider_help = QtWidgets.QLabel(
-            "Enforce ln(kf/kr) cycle constraints by deriving some reversible rates."
+            "Validate symbolic ln(kf/kr) cycle constraints and offer source-level resolution when needed."
         )
         self._wegscheider_help.setStyleSheet("font-size: 11px;")
         self._wegscheider_help.setWordWrap(True)

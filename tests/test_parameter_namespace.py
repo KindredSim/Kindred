@@ -20,7 +20,7 @@ pytestmark = pytest.mark.unit
     ("dsl", "expected"),
     [
         ("reaction: A -> B; k=1\n", {"k1"}),
-        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1"}),
+        ("equilibrium: A <-> B; kf=6; kr=2\n", {"kf1", "kr1", "Keq1"}),
         ("reaction: A <-> B; kf=6; Keq=3\n", {"kf1", "kr1", "Keq1"}),
     ],
 )
@@ -36,13 +36,13 @@ def test_ir_and_mechanism_namespace_builders_match_for_canonical_names(dsl, expe
     assert ir_namespace.flat_names() == mechanism_namespace.flat_names()
 
 
-def test_ir_and_mechanism_builders_omit_keq_without_explicit_keq():
+def test_ir_and_mechanism_builders_include_keq_for_every_equilibrium():
     dsl = "equilibrium: A <-> B; kf=6; kr=2\n"
     ir = _parse_dsl_ir(dsl)
     mechanism = parse_dsl_to_mechanism(dsl, initials={})
 
-    assert build_namespace_from_ir_steps(ir.steps).flat_names() == {"kf1", "kr1"}
-    assert build_namespace_from_mechanism(mechanism).flat_names() == {"kf1", "kr1"}
+    assert build_namespace_from_ir_steps(ir.steps).flat_names() == {"kf1", "kr1", "Keq1"}
+    assert build_namespace_from_mechanism(mechanism).flat_names() == {"kf1", "kr1", "Keq1"}
 
 
 def test_ir_and_mechanism_builders_include_keq_for_explicit_keq():

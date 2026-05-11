@@ -116,7 +116,7 @@ def test_solve_ode_scipy_path_injects_temperature_calls_progress_sets_note_and_c
     assert float(out.Y[0, 0]) == 0.0
 
 
-def test_solve_ode_scipy_bdf_omits_jac_sparsity_for_banded_and_clamps_selected_indices(monkeypatch):
+def test_solve_ode_scipy_bdf_uses_solver_default_when_no_symbolic_jacobian(monkeypatch):
     seen = {}
 
     def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
@@ -142,11 +142,36 @@ def test_solve_ode_scipy_bdf_omits_jac_sparsity_for_banded_and_clamps_selected_i
     out = solvers.solve_ode(req)
 
     assert seen["method"] == "BDF"
-    assert "jac" in seen
+    assert "jac" not in seen
     assert "jac_sparsity" not in seen
-    jac_dense = seen["jac"](0.0, np.array([1.0]))
-    assert jac_dense.shape == (1, 1)
     assert float(out.Y[0, 0]) == 0.0
+
+
+def test_solve_ode_scipy_bdf_accepts_sparsity_hint_without_supplied_jacobian(monkeypatch):
+    seen = {}
+    sparsity = np.asarray([[True, False], [True, True]], dtype=bool)
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        seen.update(kwargs)
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval), np.zeros_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: np.asarray([-y[0], y[0] - y[1]], dtype=float),
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0, 0.0]),
+            solver="BDF",
+            t_eval=np.array([0.0, 0.5, 1.0]),
+            jac_sparsity=sparsity,
+        )
+    )
+
+    assert "jac" not in seen
+    assert seen["jac_sparsity"] is sparsity
 
 
 def test_solve_ode_builds_time_grid_and_passes_solver_kwargs(monkeypatch):
@@ -234,18 +259,7 @@ def test_normalize_solver_name_handles_unknown_inputs(solver_name, expected):
     assert solvers.normalize_solver_name(solver_name) == expected
 
 
-def test_make_scipy_jac_converts_real_banded_storage_to_dense():
-    cfg = JacobianConfig(mode="banded", ml=1, mu=1)
-    jac = solvers._make_scipy_jac(
-        lambda _t, y: np.array([-2.0 * y[0] + y[1], y[0] - 3.0 * y[1]]),
-        cfg,
-    )
-    Jd = jac(0.0, np.array([1.0, 2.0]))
-    assert Jd.shape == (2, 2)
-    assert np.allclose(Jd, np.array([[-2.0, 1.0], [1.0, -3.0]]))
-
-
-def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
+def test_solve_ode_temperature_schedule_is_used_for_solver_rhs(monkeypatch):
     seen_T = []
 
     class TempSchedule:
@@ -260,7 +274,9 @@ def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
         return -y
 
     def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
-        kwargs["jac"](t_span[0], np.asarray(y0, float))
+        assert "jac" not in kwargs
+        assert "jac_sparsity" not in kwargs
+        fun(t_span[0], np.asarray(y0, float))
         t_eval = np.asarray(kwargs["t_eval"], float)
         y = np.vstack([np.ones_like(t_eval)])
         return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
@@ -281,25 +297,26 @@ def test_solve_ode_temperature_schedule_is_used_for_jacobian_rhs(monkeypatch):
     assert seen_T
 
 
-def test_solve_ode_intervention_interval_jacobian_uses_scheduled_rhs(monkeypatch):
-    custom_jacobian_calls = []
-    generated_jacobian_calls = []
+def test_solve_ode_intervention_interval_symbolic_jacobian_uses_scheduled_rhs(monkeypatch):
+    symbolic_jacobian_calls = []
 
-    def fake_compute_jacobian(rhs, t, y, *, cfg):
-        generated_jacobian_calls.append((float(t), np.asarray(rhs(t, y), dtype=float).copy()))
-        return np.eye(1), "dense"
+    def forbidden_symbolic_jacobian(_t: float, _y: np.ndarray):
+        symbolic_jacobian_calls.append(True)
+        raise AssertionError("base symbolic jacobian does not include intervention interval semantics")
 
-    def forbidden_custom_jacobian(_t: float, _y: np.ndarray):
-        custom_jacobian_calls.append(True)
-        raise AssertionError("custom jacobian does not include intervention interval semantics")
+    setattr(
+        forbidden_symbolic_jacobian,
+        "_kindred_symbolic_jacobian_identity",
+        {"kind": "jacobian", "artifact_fingerprint": "test"},
+    )
 
     def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
-        kwargs["jac"](t_span[0], np.asarray(y0, float))
+        assert "jac" not in kwargs
+        fun(t_span[0], np.asarray(y0, float))
         t_eval = np.asarray(kwargs["t_eval"], float)
         y = np.vstack([np.ones_like(t_eval)])
         return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
 
-    monkeypatch.setattr(solvers, "compute_jacobian", fake_compute_jacobian)
     monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
 
     out = solvers.solve_ode(
@@ -309,7 +326,7 @@ def test_solve_ode_intervention_interval_jacobian_uses_scheduled_rhs(monkeypatch
             y0=np.array([1.0]),
             solver="BDF",
             grid={"N": 2},
-            jacobian_func=forbidden_custom_jacobian,
+            jacobian_func=forbidden_symbolic_jacobian,
             species_names=("A",),
             intervention_schedule={
                 "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 1.0, "rate": 2.0}]
@@ -317,10 +334,9 @@ def test_solve_ode_intervention_interval_jacobian_uses_scheduled_rhs(monkeypatch
         )
     )
 
-    assert custom_jacobian_calls == []
-    assert generated_jacobian_calls
+    assert symbolic_jacobian_calls == []
     assert out.provenance["has_intervention_schedule"] is True
-    assert out.provenance["intervention_custom_jacobian_disabled"] is True
+    assert out.provenance["intervention_symbolic_jacobian_disabled"] is True
 
 
 def test_solve_ode_empty_intervention_schedule_object_is_noop_without_species_names():

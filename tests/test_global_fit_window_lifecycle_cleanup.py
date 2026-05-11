@@ -443,6 +443,174 @@ def test_fit_runtime_readiness_accepts_infinite_bounds_for_non_de_methods(qt_app
         qt_app.processEvents()
 
 
+def test_fit_runtime_readiness_finalizes_existing_stamp_with_actual_symbolic_identity(qt_app):
+    from dataclasses import replace
+
+    from kindred.core.simulation_preparation import PreparedSimulationMetadata
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, FittingRuntimeReadinessController
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    evaluator = _basic_serial_fitting_evaluator()
+    stale_meta = evaluator.prepared_metadata
+    actual_meta = replace(
+        stale_meta,
+        symbolic_jacobian_identity={"kind": "jacobian", "fingerprint": "actual"},
+    )
+    evaluator._context = evaluator._context.clone(prepared_metadata=actual_meta)
+    evaluator._kindred_fitting_execution_context = evaluator._context
+    assert isinstance(evaluator.prepared_metadata, PreparedSimulationMetadata)
+
+    stale_stamp = build_global_fit_run_stamp(
+        prepared_simulation=stale_meta,
+        dataset_rows=[],
+        included_ids=[],
+        applied_fit_targets={},
+        weights_used=None,
+        weight_mode="equal",
+        fit_config={},
+        mechanism_text=_basic_mechanism_text(),
+        reactions_text=_basic_mechanism_text(),
+    )
+    stale_hash = hash_global_fit_run_stamp(stale_stamp)
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=evaluator,
+        stamp=stale_stamp,
+        stamp_hash=stale_hash,
+        stamp_short=stale_hash[:12],
+        lane_count=1,
+        readiness_required=False,
+    )
+    controller = FittingRuntimeReadinessController(
+        session_factory=lambda _fit_evaluator, lane_count: None,
+        finished_callback=lambda: None,
+    )
+
+    finalized = controller._finalize_identity_for_accepted_launch(identity)
+
+    prepared_block = finalized.stamp["prepared_simulation"]
+    assert prepared_block["symbolic_jacobian_identity"]["fingerprint"] == "actual"
+    assert finalized.stamp_hash != stale_hash
+    assert finalized.launch_request_hash == finalized.stamp_hash
+
+
+def test_fit_runtime_readiness_rejects_launch_hash_after_prepared_symbolic_identity_changes(qt_app):
+    from dataclasses import replace
+
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, FittingRuntimeReadinessController
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    evaluator = _basic_serial_fitting_evaluator()
+    stale_meta = evaluator.prepared_metadata
+    actual_meta = replace(
+        stale_meta,
+        symbolic_jacobian_identity={"kind": "jacobian", "fingerprint": "actual"},
+    )
+    evaluator._context = evaluator._context.clone(prepared_metadata=actual_meta)
+    evaluator._kindred_fitting_execution_context = evaluator._context
+    stale_stamp = build_global_fit_run_stamp(
+        prepared_simulation=stale_meta,
+        dataset_rows=[],
+        included_ids=[],
+        applied_fit_targets={},
+        weights_used=None,
+        weight_mode="equal",
+        fit_config={},
+        mechanism_text=_basic_mechanism_text(),
+        reactions_text=_basic_mechanism_text(),
+    )
+    stale_hash = hash_global_fit_run_stamp(stale_stamp)
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=evaluator,
+        stamp=stale_stamp,
+        stamp_hash=stale_hash,
+        stamp_short=stale_hash[:12],
+        lane_count=1,
+        readiness_required=True,
+    )
+    controller = FittingRuntimeReadinessController(
+        session_factory=lambda _fit_evaluator, lane_count: None,
+        finished_callback=lambda: None,
+    )
+    finalized = controller._finalize_identity_for_accepted_launch(identity)
+    stale_request = replace(identity, fit_evaluator=None)
+
+    assert controller._same_ready_identity(finalized, stale_request) is False
+    controller._ready_identity = finalized
+    assert controller.ready_identity_for(stale_hash) is None
+    assert controller.ready_identity_for(finalized.stamp_hash) is finalized
+
+
+def test_fit_runtime_readiness_rejects_launch_hash_after_prepared_wegscheider_identity_changes(qt_app):
+    from dataclasses import replace
+
+    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, FittingRuntimeReadinessController
+    from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
+
+    evaluator = _basic_serial_fitting_evaluator()
+    stale_meta = evaluator.prepared_metadata
+    actual_meta = replace(
+        stale_meta,
+        symbolic_wegscheider_identity={
+            "kind": "wegscheider_cyclicity",
+            "fingerprint": "actual",
+        },
+    )
+    evaluator._context = evaluator._context.clone(prepared_metadata=actual_meta)
+    evaluator._kindred_fitting_execution_context = evaluator._context
+    stale_stamp = build_global_fit_run_stamp(
+        prepared_simulation=stale_meta,
+        dataset_rows=[],
+        included_ids=[],
+        applied_fit_targets={},
+        weights_used=None,
+        weight_mode="equal",
+        fit_config={},
+        mechanism_text=_basic_mechanism_text(),
+        reactions_text=_basic_mechanism_text(),
+    )
+    stale_hash = hash_global_fit_run_stamp(stale_stamp)
+    identity = FittingRuntimeIdentity(
+        datasets=(),
+        config={},
+        dataset_overrides=(),
+        weights=None,
+        requested_solver="BDF",
+        requested_rtol=1e-6,
+        requested_atol=1e-12,
+        fit_evaluator=evaluator,
+        stamp=stale_stamp,
+        stamp_hash=stale_hash,
+        stamp_short=stale_hash[:12],
+        lane_count=1,
+        readiness_required=True,
+    )
+    controller = FittingRuntimeReadinessController(
+        session_factory=lambda _fit_evaluator, lane_count: None,
+        finished_callback=lambda: None,
+    )
+    finalized = controller._finalize_identity_for_accepted_launch(identity)
+
+    assert finalized.stamp["prepared_simulation"]["symbolic_wegscheider_identity"]["fingerprint"] == "actual"
+    assert finalized.launch_request_hash == finalized.stamp_hash
+    controller._ready_identity = finalized
+    assert controller.ready_identity_for(stale_hash) is None
+    assert controller.ready_identity_for(finalized.stamp_hash) is finalized
+
+
 def test_fit_runtime_readiness_still_blocks_de_infinite_bounds(qt_app):
     window = _build_window()
     try:

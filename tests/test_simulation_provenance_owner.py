@@ -32,11 +32,25 @@ def test_publish_simulation_completion_provenance_owns_ctc_and_metadata() -> Non
         series={"A": np.asarray([1.0, 0.0], dtype=float)},
         algebra_scalars={"S": 1.0},
         dataset_overlays=[{"name": "overlay"}],
+        solver_provenance={
+            "symbolic_jacobian": True,
+            "symbolic_jacobian_identity": {"kind": "jacobian", "fingerprint": "abc"},
+            "symbolic_wegscheider_identity": {
+                "kind": "wegscheider_cyclicity",
+                "fingerprint": "proof",
+            },
+        },
+        warnings=[{"kind": "preparation_warning", "message": "symbolic fallback"}],
     )
 
     assert provenance["datasets"] == {"datasets": ["d1"]}
     assert provenance["fit"] == {"run": "fit-1"}
     assert provenance["algebra_scalars"] == {"S": 1.0}
+    assert provenance["symbolic_jacobian"] is True
+    assert provenance["symbolic_jacobian_identity"]["fingerprint"] == "abc"
+    assert provenance["symbolic_wegscheider_identity"]["fingerprint"] == "proof"
+    assert provenance["solver_provenance"]["symbolic_jacobian"] is True
+    assert provenance["warnings"] == [{"kind": "preparation_warning", "message": "symbolic fallback"}]
     assert owner.last_simulation_provenance == provenance
     assert set(owner.last_simulation_ctc) == {"A"}
     assert provenance["ctc"]["tail_strategy"] == "38"

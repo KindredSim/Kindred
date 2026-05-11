@@ -41,6 +41,7 @@ class SimulationCacheAdmin:
         fallback_occurred: bool = False,
         fallback_message: Any = None,
         solver_provenance: Mapping[str, Any] | None = None,
+        warnings: Sequence[Mapping[str, Any]] | None = None,
         preview_scope_set_ids: Sequence[str] | None = None,
     ) -> SimulationCachePublicationResult:
         normalized_key = str(cache_key or "").strip() or None
@@ -68,6 +69,7 @@ class SimulationCacheAdmin:
                 fallback_occurred=bool(fallback_occurred),
                 fallback_message=fallback_message,
                 solver_provenance=solver_provenance,
+                warnings=warnings,
             )
         return SimulationCachePublicationResult(
             cache_key=normalized_key,

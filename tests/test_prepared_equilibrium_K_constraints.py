@@ -1,6 +1,11 @@
 import pytest
 
-from kindred.core.simulation_preparation import prepare_bound_mechanism
+from kindred.core.simulation_preparation import (
+    SimulationExecutionRequest,
+    prepared_simulation_run_for_execution_request,
+    prepare_bound_mechanism,
+    prepare_simulation_worker_run,
+)
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
 
 pytestmark = pytest.mark.unit
@@ -97,6 +102,62 @@ def test_prepared_rhs_uses_updated_equilibrium_binding_values():
 
     assert dy0[0] == pytest.approx(-(1.0 * 1.0 - 0.25 * 1.0))
     assert dy1[0] == pytest.approx(-(1.0 * 1.0 - 0.5 * 1.0))
+
+
+def test_prepared_execution_overrides_preserve_internal_derived_rate_bindings():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B ; kf=1, K=4",
+            "init: A=1, B=1",
+        ]
+    )
+    bound = prepare_bound_mechanism(
+        mechanism_text=dsl,
+        param_names=["kf1", "Keq1"],
+        temperature_K=300.0,
+        initials={},
+        use_advanced_dsl=True,
+    )
+    prepared_payload = bound.as_execution_payload(include_rhs=True)
+    solver_config = {
+        "solver": "BDF",
+        "grid": {"N": 5},
+        "use_sparse_jacobian": True,
+        "temperature_K": 300.0,
+    }
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=dsl,
+        solver_config=solver_config,
+        prepared_payload=prepared_payload,
+    )
+
+    first = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=prepared_payload,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=solver_config,
+            mechanism_text=dsl,
+            parameter_overrides={"kf1": 8.0, "Keq1": 4.0},
+        ),
+    )
+    second = prepared_simulation_run_for_execution_request(
+        first,
+        SimulationExecutionRequest(
+            prepared_payload=prepared_payload,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=solver_config,
+            mechanism_text=dsl,
+            parameter_overrides={"kf1": 12.0, "Keq1": 3.0},
+        ),
+    )
+
+    assert "kr1" in bound.bindings
+    assert callable(bound.bindings["kr1"])
+    assert bound.bindings["kr1"]() == pytest.approx(4.0)
+    assert second.request.rhs is not None
 
 
 def test_prepared_energy_fast_equilibrium_keeps_explicit_K_mutable():

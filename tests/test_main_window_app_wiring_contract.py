@@ -157,7 +157,12 @@ def _assert_default_shell_contract(main_window) -> None:
 
 
 _SIMULATION_PORT_METHODS = {
-    "dialogs": ("message_box_warning", "message_box_critical"),
+    "dialogs": (
+        "message_box_warning",
+        "message_box_critical",
+        "message_box_question",
+        "choose_wegscheider_resolution",
+    ),
     "settings": ("settings_set_value", "settings_sync"),
     "run_ui": (
         "run_button_is_enabled",
@@ -183,6 +188,7 @@ _SIMULATION_PORT_METHODS = {
         "mechanism_reactions_text_raw",
         "get_mechanism_text",
         "apply_parameter_overrides_to_dsl",
+        "apply_wegscheider_resolution_source_rewrite",
     ),
     "solver": (
         "parse_sim_time_seconds",

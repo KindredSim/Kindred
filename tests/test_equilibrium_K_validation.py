@@ -83,7 +83,7 @@ def test_equilibrium_kr_and_K_derives_kf_deterministically():
     assert canonical_parameter_names(mech) == {"kf1", "kr1", "Keq1"}
 
 
-def test_equilibrium_kf_kr_without_K_does_not_expose_K_param():
+def test_equilibrium_kf_kr_without_K_still_has_canonical_keq_param():
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; kf=4.0; kr=2.0",
@@ -92,7 +92,7 @@ def test_equilibrium_kf_kr_without_K_does_not_expose_K_param():
         ]
     )
     mech = parse_dsl_to_mechanism(dsl, initials={})
-    assert canonical_parameter_names(mech) == {"kf1", "kr1"}
+    assert canonical_parameter_names(mech) == {"kf1", "kr1", "Keq1"}
 
 
 def test_equilibrium_defensively_copies_and_freezes_mutable_inputs() -> None:

@@ -835,6 +835,74 @@ def test_run_auto_locks_and_proceeds_for_state_network_only_mechanism(main_windo
     main_window.simulation_controller.run_simulation_internal.assert_called_once()
 
 
+def test_run_wegscheider_resolution_accept_uses_authoritative_transition(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    text = "\n".join(
+        [
+            "equilibrium: A <-> B ; kf=1 ; K=2",
+            "equilibrium: B <-> C ; kf=1 ; K=3",
+            "equilibrium: C <-> A ; kf=1 ; K=7",
+            "initial: A=1",
+            "initial: B=0",
+            "initial: C=0",
+        ]
+    )
+    main_window._force_lock_editor()
+    main_window._mechanism_editor._reactions_text.setPlainText(text)
+    main_window._wegscheider_cyclicity_enabled = True
+    before_epoch = int(main_window.simulation_controller.authoritative_mechanism_transition_epoch)
+    monkeypatch.setattr(
+        main_window._simulation_dialogs,
+        "choose_wegscheider_resolution",
+        lambda _title, _message, _choices: {"cycle_1": "Keq3"},
+    )
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    assert "param Keq3 = 1 / (Keq1 * Keq2)" in main_window.mechanism_reactions_text_raw()
+    assert int(main_window.simulation_controller.authoritative_mechanism_transition_epoch) > before_epoch
+    main_window.simulation_controller.run_simulation_internal.assert_called_once()
+
+
+def test_run_wegscheider_resolution_cancel_preserves_authoritative_source_and_transition(
+    main_window,
+    monkeypatch,
+    qt_app,
+):
+    text = "\n".join(
+        [
+            "equilibrium: A <-> B ; kf=1 ; K=2",
+            "equilibrium: B <-> C ; kf=1 ; K=3",
+            "equilibrium: C <-> A ; kf=1 ; K=7",
+            "initial: A=1",
+            "initial: B=0",
+            "initial: C=0",
+        ]
+    )
+    main_window._force_lock_editor()
+    main_window._mechanism_editor._reactions_text.setPlainText(text)
+    main_window._wegscheider_cyclicity_enabled = True
+    before_epoch = int(main_window.simulation_controller.authoritative_mechanism_transition_epoch)
+    monkeypatch.setattr(
+        main_window._simulation_dialogs,
+        "choose_wegscheider_resolution",
+        lambda _title, _message, _choices: None,
+    )
+    main_window.simulation_controller.run_simulation_internal = MagicMock()
+
+    main_window.simulation_controller.run_simulation()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_reactions_text_raw() == text
+    assert int(main_window.simulation_controller.authoritative_mechanism_transition_epoch) == before_epoch
+    main_window.simulation_controller.run_simulation_internal.assert_not_called()
+
+
 def test_mechanism_editor_run_button_stays_reactions_gated_for_state_network_only_mechanism(
     main_window,
     monkeypatch,

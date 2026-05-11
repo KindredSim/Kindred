@@ -61,6 +61,15 @@ class SimulationDialogsPort(Protocol):
 
     def message_box_critical(self, title: str, message: str, *, details: Optional[str] = None) -> None: ...
 
+    def message_box_question(self, title: str, message: str, *, accept_label: str = "Apply") -> bool: ...
+
+    def choose_wegscheider_resolution(
+        self,
+        title: str,
+        message: str,
+        choices: Mapping[str, Sequence[Mapping[str, str]]],
+    ) -> Optional[Dict[str, str]]: ...
+
 
 class SimulationSettingsPort(Protocol):
     def settings_set_value(self, key: str, value: object) -> None: ...
@@ -263,6 +272,8 @@ class SimulationMechanismPort(Protocol):
     def apply_parameter_overrides_to_dsl(self, mechanism_text: str, parameters: Dict[str, float]) -> str: ...
 
     def get_mechanism_text(self) -> str: ...
+
+    def apply_wegscheider_resolution_source_rewrite(self, reactions_text: str) -> None: ...
 
 
 class SimulationSolverPort(Protocol):

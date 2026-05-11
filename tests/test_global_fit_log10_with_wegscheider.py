@@ -16,22 +16,23 @@ def _as_float(x):
 def test_global_fit_log10_params_respect_wegscheider_constraints():
     dsl = "\n".join(
         [
-            "equilibrium: A <-> B; kf=2.0; kr=1.0",
-            "equilibrium: B <-> C; kf=3.0; kr=1.0",
-            "equilibrium: C <-> A; kf=1.0; kr=1.0",
+            "equilibrium: A <-> B; kf=2.0; K=2.0",
+            "equilibrium: B <-> C; kf=3.0; K=3.0",
+            "equilibrium: C <-> A; kf=1.0; K=1.0",
+            "param Keq3 = 1 / (Keq1 * Keq2)",
             "init: A=1.0, B=0.0, C=0.0",
         ]
     )
 
     bound = prepare_bound_mechanism(
         mechanism_text=dsl,
-        param_names=["kf1", "kr1", "kf2", "kr2", "kf3", "kr3"],
+        param_names=["Keq1", "Keq2", "kf3"],
         temperature_K=298.15,
         initials={},
         use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=True,
     )
     mech = bound.mechanism
-    mech.metadata["wegscheider_cyclicity_enabled"] = True
 
     t = np.array([0.0, 1.0], dtype=float)
     datasets = [
@@ -54,16 +55,13 @@ def test_global_fit_log10_params_respect_wegscheider_constraints():
     result = fit_global(
         sim,
         datasets,
-        shared_params={"kf1": 2.0, "kr1": 1.0, "kf2": 3.0, "kr2": 1.0, "kf3": 1.0, "kr3": 1.0},
+        shared_params={"Keq1": 2.0, "Keq2": 3.0, "kf3": 1.0},
         bounds={
-            "kf1": (1e-6, 1e6),
-            "kr1": (1e-6, 1e6),
-            "kf2": (1e-6, 1e6),
-            "kr2": (1e-6, 1e6),
+            "Keq1": (1e-6, 1e6),
+            "Keq2": (1e-6, 1e6),
             "kf3": (1e-6, 1e6),
-            "kr3": (1e-6, 1e6),
         },
-        log10_params={"kf1": True},
+        log10_params={"Keq1": True},
         method="trf",
         max_nfev=2,
     )

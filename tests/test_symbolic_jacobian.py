@@ -1,0 +1,557 @@
+from __future__ import annotations
+
+from dataclasses import replace
+import types
+
+import numpy as np
+import pytest
+
+from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+from kindred.core.simulation_preparation import (
+    SimulationExecutionRequest,
+    build_prepared_simulation_func,
+    coerce_prepared_simulation_metadata,
+    prepare_bound_mechanism,
+    prepare_fitting_objective_context,
+    prepare_simulation_worker_run,
+)
+from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.sparse_jacobian import build_sparse_jacobian
+
+
+pytestmark = pytest.mark.unit
+
+
+SUPPORTED_DSL = "\n".join(
+    [
+        "reaction: A + B -> C; k=0.7",
+        "reaction: C -> A; k=0.2",
+        "equilibrium: B <-> C; kf=1.1; kr=0.4",
+        "init: A=1.2, B=0.9, C=0.1",
+    ]
+)
+
+
+def test_symbolic_jacobian_matches_existing_sparse_jacobian_for_supported_subset():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    mechanism = parse_dsl_to_mechanism(SUPPORTED_DSL, initials={})
+    artifact = build_symbolic_jacobian_artifact(mechanism)
+    sparse = build_sparse_jacobian(mechanism)
+
+    y = np.asarray([1.2, 0.9, 0.1], dtype=float)
+    symbolic_matrix = np.asarray(artifact.jacobian_func(0.0, y), dtype=float)
+    sparse_matrix = np.asarray(sparse(0.0, y).toarray(), dtype=float)
+
+    np.testing.assert_allclose(symbolic_matrix, sparse_matrix, rtol=1e-10, atol=1e-12)
+    assert artifact.identity.kind == "jacobian"
+    assert artifact.identity.fingerprint
+
+
+def test_symbolic_jacobian_matches_finite_difference_rhs_for_supported_subset():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    mechanism = parse_dsl_to_mechanism(SUPPORTED_DSL, initials={})
+    rhs = build_ode_rhs_from_mechanism(mechanism)
+    artifact = build_symbolic_jacobian_artifact(mechanism)
+
+    y = np.asarray([1.2, 0.9, 0.1], dtype=float)
+    symbolic_matrix = np.asarray(artifact.jacobian_func(0.0, y), dtype=float)
+    fd_matrix = np.zeros_like(symbolic_matrix)
+    eps_base = 1e-7
+    for col in range(y.size):
+        eps = eps_base * max(1.0, abs(float(y[col])))
+        y_plus = y.copy()
+        y_minus = y.copy()
+        y_plus[col] += eps
+        y_minus[col] -= eps
+        fd_matrix[:, col] = (rhs(0.0, y_plus) - rhs(0.0, y_minus)) / (2.0 * eps)
+
+    np.testing.assert_allclose(symbolic_matrix, fd_matrix, rtol=1e-6, atol=1e-8)
+
+
+def test_bdf_preparation_uses_generated_symbolic_jacobian_callable():
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=SUPPORTED_DSL,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert callable(prepared.request.jacobian_func)
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+
+
+def test_scheduled_temperature_disables_generated_symbolic_jacobian_truthfully():
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=SUPPORTED_DSL + "\ntemp_step: t=[0,0.5,1.0], T=[298,310]",
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+
+    assert prepared.temperature_schedule is not None
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
+    assert any("scheduled-temperature" in warning for warning in prepared.warnings)
+
+
+def test_scheduled_temperature_with_dynamic_bindings_omits_sparsity_hint():
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            mechanism_text=SUPPORTED_DSL + "\ntemp_step: t=[0,0.5,1.0], T=[298,310]",
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 4},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            parameter_overrides={"k1": 0.8},
+        )
+    )
+
+    assert prepared.temperature_schedule is not None
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
+    assert any("scheduled-temperature" in warning for warning in prepared.warnings)
+
+
+@pytest.mark.parametrize("solver", ["BDF", "Radau"])
+def test_implicit_solver_receives_generated_symbolic_jacobian_callable(monkeypatch, solver):
+    from kindred.core.simulator import solvers
+
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=SUPPORTED_DSL,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": solver,
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+    received = {}
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        received["jac"] = kwargs.get("jac")
+        kwargs["jac"](t_span[0], np.asarray(y0, dtype=float))
+        t_eval = np.asarray(kwargs["t_eval"], dtype=float)
+        return types.SimpleNamespace(
+            success=True,
+            message="ok",
+            t=t_eval,
+            y=np.repeat(np.asarray(y0, dtype=float).reshape(-1, 1), t_eval.size, axis=1),
+            t_events=[],
+        )
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    result = solvers.solve_ode(prepared.request)
+
+    assert received["jac"] is prepared.request.jacobian_func
+    assert result.provenance["symbolic_jacobian"] is True
+    assert result.provenance["symbolic_jacobian_identity"]["kind"] == "jacobian"
+
+
+def test_active_intervention_interval_disables_symbolic_jacobian_through_segment_logic(monkeypatch):
+    from kindred.core.simulator import solvers
+
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=SUPPORTED_DSL,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 3},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+    assert prepared.request.jacobian_func is not None
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        assert "jac" not in kwargs
+        fun(t_span[0], np.asarray(y0, dtype=float))
+        t_eval = np.asarray(kwargs["t_eval"], dtype=float)
+        return types.SimpleNamespace(
+            success=True,
+            message="ok",
+            t=t_eval,
+            y=np.repeat(np.asarray(y0, dtype=float).reshape(-1, 1), t_eval.size, axis=1),
+            t_events=[],
+        )
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    result = solvers.solve_ode(
+        replace(
+            prepared.request,
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.0, "end": 1.0, "rate": 0.1}]
+            },
+        )
+    )
+
+    assert result.provenance["has_intervention_schedule"] is True
+    assert result.provenance["intervention_symbolic_jacobian_disabled"] is True
+    assert result.provenance["symbolic_jacobian"] is False
+    assert "symbolic_jacobian_identity" not in result.provenance
+
+
+def test_mixed_intervention_segments_record_partial_symbolic_jacobian_disable(monkeypatch):
+    from kindred.core.simulator import solvers
+
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=SUPPORTED_DSL,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+    symbolic_jacobian = prepared.request.jacobian_func
+    jacobian_receipts = []
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        jacobian_receipts.append(kwargs.get("jac") is symbolic_jacobian)
+        t_eval = np.asarray(kwargs["t_eval"], dtype=float)
+        return types.SimpleNamespace(
+            success=True,
+            message="ok",
+            t=t_eval,
+            y=np.repeat(np.asarray(y0, dtype=float).reshape(-1, 1), t_eval.size, axis=1),
+            t_events=[],
+        )
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    result = solvers.solve_ode(
+        replace(
+            prepared.request,
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.5, "end": 1.0, "rate": 0.1}]
+            },
+        )
+    )
+
+    assert jacobian_receipts == [True, False]
+    assert result.provenance["symbolic_jacobian"] is True
+    assert result.provenance["intervention_symbolic_jacobian_disabled"] is True
+    assert result.provenance["intervention_symbolic_jacobian_partially_disabled"] is True
+    assert result.provenance["intervention_segment_symbolic_jacobians"] == [True, False]
+    assert result.provenance["symbolic_jacobian_identity"]["kind"] == "jacobian"
+
+
+def test_constant_temperature_arrhenius_uses_generated_symbolic_jacobian():
+    prepared = prepare_simulation_worker_run(
+        mechanism_text="\n".join(
+            [
+                "energy=kJ/mol",
+                "reaction: A -> B ; A=1e3 ; Ea=50",
+                "init: A=1, B=0",
+            ]
+        ),
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+    assert prepared.warnings == []
+
+
+def test_mixed_intervention_segments_keep_arrhenius_symbolic_jacobian_provenance(monkeypatch):
+    from kindred.core.simulator import solvers
+
+    prepared = prepare_simulation_worker_run(
+        mechanism_text="\n".join(
+            [
+                "energy=kJ/mol",
+                "reaction: A -> B ; A=1e3 ; Ea=50",
+                "init: A=1, B=0",
+            ]
+        ),
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
+    symbolic_jacobian = prepared.request.jacobian_func
+    symbolic_identity = getattr(symbolic_jacobian, "_kindred_symbolic_jacobian_identity", None)
+    assert symbolic_jacobian is not None
+    assert symbolic_identity is not None
+    jacobian_receipts = []
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        jacobian_receipts.append(kwargs.get("jac") is symbolic_jacobian)
+        t_eval = np.asarray(kwargs["t_eval"], dtype=float)
+        return types.SimpleNamespace(
+            success=True,
+            message="ok",
+            t=t_eval,
+            y=np.repeat(np.asarray(y0, dtype=float).reshape(-1, 1), t_eval.size, axis=1),
+            t_events=[],
+        )
+
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+
+    result = solvers.solve_ode(
+        replace(
+            prepared.request,
+            intervention_schedule={
+                "intervals": [{"kind": "source", "species": "A", "start": 0.5, "end": 1.0, "rate": 0.1}]
+            },
+        )
+    )
+
+    assert jacobian_receipts == [True, False]
+    assert result.provenance["symbolic_jacobian"] is True
+    assert result.provenance["intervention_symbolic_jacobian_disabled"] is True
+    assert result.provenance["intervention_segment_symbolic_jacobians"] == [True, False]
+    assert result.provenance["symbolic_jacobian_identity"] == symbolic_identity
+
+
+def test_prepared_metadata_records_symbolic_jacobian_identity_after_first_use():
+    simulation_func = build_prepared_simulation_func(
+        mechanism_text=SUPPORTED_DSL,
+        param_names=[],
+        t_end=1.0,
+        num_points=4,
+        solver="BDF",
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    simulation_func({})
+    metadata = coerce_prepared_simulation_metadata(
+        getattr(simulation_func, "_kindred_prepared_simulation_meta")
+    )
+
+    assert metadata is not None
+    assert metadata.symbolic_jacobian_identity is not None
+    assert metadata.symbolic_jacobian_identity["kind"] == "jacobian"
+
+
+def test_fitting_objective_context_uses_generated_symbolic_jacobian_callable():
+    prepared = prepare_fitting_objective_context(
+        mechanism_text=SUPPORTED_DSL,
+        param_names=[],
+        t_exp=np.asarray([0.0, 0.5, 1.0], dtype=float),
+        target_species="C",
+        solver="BDF",
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+
+
+def test_fitting_objective_context_uses_symbolic_jacobian_for_arrhenius_rates():
+    prepared = prepare_fitting_objective_context(
+        mechanism_text="\n".join(
+            [
+                "energy=kJ/mol",
+                "reaction: A -> B ; A=1e3 ; Ea=50",
+                "init: A=1, B=0",
+            ]
+        ),
+        param_names=[],
+        t_exp=np.asarray([0.0, 0.5, 1.0], dtype=float),
+        target_species="B",
+        solver="BDF",
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+    assert prepared.warnings == []
+
+
+def test_fitting_objective_context_disables_jacobian_for_mutable_rate_bindings():
+    prepared = prepare_fitting_objective_context(
+        mechanism_text=SUPPORTED_DSL,
+        param_names=["k1"],
+        t_exp=np.asarray([0.0, 0.5, 1.0], dtype=float),
+        target_species="C",
+        solver="BDF",
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is not None
+    assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+
+
+def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_binding():
+    prepared = prepare_fitting_objective_context(
+        mechanism_text="\n".join(
+            [
+                "equilibrium: A <-> B; kf=1.0; K=2.0",
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        param_names=["Keq1"],
+        t_exp=np.asarray([0.0, 0.5, 1.0], dtype=float),
+        target_species="B",
+        solver="BDF",
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is not None
+    assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+
+
+def test_execution_request_prepared_payload_rebuilds_symbolic_jacobian_for_batch_path():
+    bound = prepare_bound_mechanism(
+        mechanism_text=SUPPORTED_DSL,
+        param_names=[],
+        wegscheider_cyclicity_enabled=False,
+    )
+    execution_request = SimulationExecutionRequest(
+        prepared_payload=bound.as_serializable_execution_payload(),
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 4},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+        mechanism_text=SUPPORTED_DSL,
+    )
+
+    prepared = prepare_simulation_worker_run(execution_request=execution_request)
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+
+
+def test_execution_request_prepared_payload_drops_non_symbolic_jacobian_callable():
+    def fake_jac(_t, y):
+        return np.eye(len(y), dtype=float)
+
+    bound = prepare_bound_mechanism(
+        mechanism_text=SUPPORTED_DSL,
+        param_names=[],
+        wegscheider_cyclicity_enabled=False,
+    )
+    payload = dict(bound.as_serializable_execution_payload())
+    payload["jacobian_func"] = fake_jac
+
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=payload,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 4},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            mechanism_text="",
+        )
+    )
+
+    assert prepared.request.jacobian_func is not fake_jac
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+    assert identity is not None
+    assert any("non-symbolic Jacobian callable" in warning for warning in prepared.warnings)
+
+
+def test_symbolic_jacobian_artifact_identity_changes_with_source_rates():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    first = build_symbolic_jacobian_artifact(parse_dsl_to_mechanism(SUPPORTED_DSL, initials={}))
+    changed = build_symbolic_jacobian_artifact(
+        parse_dsl_to_mechanism(SUPPORTED_DSL.replace("k=0.7", "k=0.8"), initials={})
+    )
+
+    assert first.identity.fingerprint != changed.identity.fingerprint
+
+
+def test_symbolic_jacobian_artifact_identity_ignores_initial_concentration_values():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    first = build_symbolic_jacobian_artifact(
+        parse_dsl_to_mechanism("reaction: A -> B; k=1", initials={"A": 1.0, "B": 0.0})
+    )
+    changed_initials = build_symbolic_jacobian_artifact(
+        parse_dsl_to_mechanism(
+            "reaction: A -> B; k=1",
+            initials={"A": 3.0, "B": 2.0},
+        )
+    )
+
+    assert first.identity.to_payload() == changed_initials.identity.to_payload()
+
+
+def test_symbolic_jacobian_rejects_unsupported_dynamic_rate_binding():
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_reaction(reactants={"A": 1.0}, products={"B": 1.0}, rate=lambda: 1.0)
+
+    with pytest.raises(UnsupportedSymbolicExpressionError):
+        build_symbolic_jacobian_artifact(mechanism)
+
+
+def test_symbolic_jacobian_rejects_nonpositive_direct_mechanism_keq_derivation():
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_equilibrium(
+        stoich_forward={"A": 1.0},
+        stoich_back={"B": 1.0},
+        kr=1.0,
+        Keq=0.0,
+    )
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="Keq"):
+        build_symbolic_jacobian_artifact(mechanism)

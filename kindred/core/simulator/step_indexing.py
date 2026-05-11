@@ -4,9 +4,7 @@ Canonical global step-index naming helpers.
 Canonical rule:
 - Every kinetic step in DSL order gets a 1-based index N.
 - Reaction step -> parameter kN
-- Equilibrium step -> parameters kfN and krN
-- Equilibrium constant parameter KeqN exists only when explicitly represented/used
-  (currently: when the DSL provided K=... on that step; stored as metadata Keq_input).
+- Equilibrium step -> parameters kfN, krN, and KeqN
 
 Policy:
 - State-network generated steps are excluded from the step-index map to avoid
@@ -105,8 +103,6 @@ def lookup_step_param_target(
             return ("reaction", idx, "k", entry)
         if role in {"kf", "kr", "Keq"}:
             if kind != "equilibrium":
-                return None
-            if role == "Keq" and not bool(entry.get("has_Keq_param")):
                 return None
             idx_raw = entry.get("equilibrium_index")
             idx, ok = try_parse_int(idx_raw)

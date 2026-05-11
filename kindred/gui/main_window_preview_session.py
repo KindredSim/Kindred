@@ -113,7 +113,18 @@ class MainWindowPreviewSession:
         mw = self._mw
         self._clear_active_preview_cache_state()
         mw._refresh_batch_display_from_focus_and_shown()
-        mw._status_label.setText("Mechanism invalid — no preview available.")
+        reason = ""
+        variable_runtime = getattr(mw, "_variable_runtime", None)
+        reason_getter = getattr(variable_runtime, "slider_runtime_unavailable_reason", None)
+        if callable(reason_getter):
+            try:
+                reason = str(reason_getter() or "")
+            except Exception:
+                reason = ""
+        if reason == "unresolved Wegscheider cyclicity":
+            mw._status_label.setText("Unresolved Wegscheider cyclicity.")
+        else:
+            mw._status_label.setText("Mechanism invalid — no preview available.")
 
     def show_preview_unavailable_for_dirty_state(self, message: str) -> None:
         mw = self._mw

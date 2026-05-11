@@ -1,7 +1,6 @@
 import pytest
 
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
 
 pytestmark = pytest.mark.unit
@@ -9,6 +8,8 @@ pytestmark = pytest.mark.unit
 
 
 def test_wegscheider_inconsistent_fixed_cycle_raises_when_enabled():
+    from kindred.core.simulator.wegscheider_symbolic import UnresolvedWegscheiderCyclicityError
+
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; kf=1.0; K=2.0",
@@ -20,5 +21,5 @@ def test_wegscheider_inconsistent_fixed_cycle_raises_when_enabled():
     mech = parse_dsl_to_mechanism(dsl, initials={})
     mech.metadata["wegscheider_cyclicity_enabled"] = True
 
-    with pytest.raises(DSLError, match="Wegscheider cyclicity constraints are unsatisfiable"):
+    with pytest.raises(UnresolvedWegscheiderCyclicityError, match="unresolved Wegscheider cyclicity"):
         apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
