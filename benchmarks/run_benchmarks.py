@@ -4,7 +4,6 @@ Benchmark runner for Kindred performance testing.
 
 Runs performance benchmarks on mechanisms of varying sizes to:
 - Measure simulation time and memory usage
-- Compare dense vs sparse Jacobian performance
 - Test scalability with mechanism size
 - Detect performance regressions
 
@@ -33,9 +32,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.solvers import solve_ode, SimulationRequest
-from kindred.core.sparse_jacobian import (
-    estimate_sparsity_ratio,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +43,6 @@ class BenchmarkResult:
     mechanism_name: str
     n_species: int
     n_reactions: int
-    sparsity_ratio: float
     integration_time: float  # seconds
     peak_memory_mb: float  # MB
     n_steps: int
@@ -113,13 +108,9 @@ def benchmark_simulation(
     n_species = len(mechanism.species_names())
     n_reactions = len(mechanism.reactions) + len(mechanism.equilibria)
 
-    # Estimate sparsity
-    sparsity_ratio = estimate_sparsity_ratio(mechanism)
-
     logger.info(
         f"Benchmarking {mechanism_name}: "
-        f"{n_species} species, {n_reactions} reactions, "
-        f"sparsity={sparsity_ratio:.1%}"
+        f"{n_species} species, {n_reactions} reactions"
     )
 
     # Build ODE system
@@ -173,7 +164,6 @@ def benchmark_simulation(
         mechanism_name=mechanism_name,
         n_species=n_species,
         n_reactions=n_reactions,
-        sparsity_ratio=sparsity_ratio,
         integration_time=elapsed_time,
         peak_memory_mb=peak_memory,
         n_steps=n_steps,
@@ -237,7 +227,6 @@ def run_benchmark_suite(
                     mechanism_name=mech_file.stem,
                     n_species=0,
                     n_reactions=0,
-                    sparsity_ratio=0.0,
                     integration_time=0.0,
                     peak_memory_mb=0.0,
                     n_steps=0,
@@ -262,7 +251,6 @@ def run_benchmark_suite(
             "min_time_s": min(r.integration_time for r in successful),
             "max_time_s": max(r.integration_time for r in successful),
             "total_memory_mb": sum(r.peak_memory_mb for r in successful),
-            "avg_sparsity": np.mean([r.sparsity_ratio for r in successful]),
         }
     else:
         summary = {
@@ -290,7 +278,6 @@ def run_benchmark_suite(
         logger.info(f"Average time: {summary['avg_time_s']:.3f}s")
         logger.info(f"Time range: {summary['min_time_s']:.3f}s - {summary['max_time_s']:.3f}s")
         logger.info(f"Total memory: {summary['total_memory_mb']:.2f}MB")
-        logger.info(f"Average sparsity: {summary['avg_sparsity']:.1%}")
 
     logger.info("=" * 70)
 

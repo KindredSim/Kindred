@@ -24,9 +24,6 @@ from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 # Fitting modules
 from kindred.core.analysis.global_fitting import fit_global
 
-# Performance modules
-from kindred.core.sparse_jacobian import detect_sparsity_pattern, build_sparse_jacobian
-
 # Exceptions and logging
 from kindred.core.exceptions import (
     ValidationError,
@@ -318,36 +315,6 @@ class TestLoggingIntegration:
 
         # expensive_operation was called because we needed the message
         assert len(expensive_called) >= 0  # May or may not be called depending on log level
-
-
-# ----------------------- Performance Integration -------------------------------
-
-
-class TestPerformanceIntegration:
-    """Test performance optimizations in workflows."""
-
-    def test_sparse_jacobian_workflow(self, complex_mechanism_dsl):
-        """Test sparse Jacobian detection and usage."""
-        # Parse mechanism
-        mechanism = parse_dsl_to_mechanism(complex_mechanism_dsl)
-
-        # Detect sparsity
-        sparsity_info = detect_sparsity_pattern(mechanism)
-
-        assert sparsity_info.n_nonzero > 0
-        assert 0 <= sparsity_info.sparsity_ratio <= 1.0
-
-        # Build sparse Jacobian
-        sparse_jac = build_sparse_jacobian(mechanism, sparsity_info)
-
-        # Test evaluation
-        species_names = list(mechanism.species.keys())
-        y = np.array([mechanism.species[sp].initial_conc for sp in species_names])
-
-        J = sparse_jac(0, y)
-
-        # Should be sparse matrix
-        assert hasattr(J, 'toarray')  # scipy.sparse matrix
 
 
 # --------------------------- Cache Integration ---------------------------------

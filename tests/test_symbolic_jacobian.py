@@ -16,7 +16,8 @@ from kindred.core.simulation_preparation import (
     prepare_simulation_worker_run,
 )
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-from kindred.core.sparse_jacobian import build_sparse_jacobian
+from kindred.core.simulator.solvers import solve_ode
+from kindred.io.resources import get_preset_mechanism
 
 
 pytestmark = pytest.mark.unit
@@ -30,22 +31,6 @@ SUPPORTED_DSL = "\n".join(
         "init: A=1.2, B=0.9, C=0.1",
     ]
 )
-
-
-def test_symbolic_jacobian_matches_existing_sparse_jacobian_for_supported_subset():
-    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
-
-    mechanism = parse_dsl_to_mechanism(SUPPORTED_DSL, initials={})
-    artifact = build_symbolic_jacobian_artifact(mechanism)
-    sparse = build_sparse_jacobian(mechanism)
-
-    y = np.asarray([1.2, 0.9, 0.1], dtype=float)
-    symbolic_matrix = np.asarray(artifact.jacobian_func(0.0, y), dtype=float)
-    sparse_matrix = np.asarray(sparse(0.0, y).toarray(), dtype=float)
-
-    np.testing.assert_allclose(symbolic_matrix, sparse_matrix, rtol=1e-10, atol=1e-12)
-    assert artifact.identity.kind == "jacobian"
-    assert artifact.identity.fingerprint
 
 
 def test_symbolic_jacobian_matches_finite_difference_rhs_for_supported_subset():
@@ -68,6 +53,42 @@ def test_symbolic_jacobian_matches_finite_difference_rhs_for_supported_subset():
         fd_matrix[:, col] = (rhs(0.0, y_plus) - rhs(0.0, y_minus)) / (2.0 * eps)
 
     np.testing.assert_allclose(symbolic_matrix, fd_matrix, rtol=1e-6, atol=1e-8)
+
+
+def test_symbolic_jacobian_matches_finite_difference_for_same_side_catalyst():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A + E -> B + E; k=2.0",
+                "init: A=3.0, E=5.0, B=0.0",
+            ]
+        ),
+        initials={},
+    )
+    rhs = build_ode_rhs_from_mechanism(mechanism)
+    artifact = build_symbolic_jacobian_artifact(mechanism)
+
+    species_index = {name: idx for idx, name in enumerate(mechanism.species_names())}
+    y = np.zeros(len(species_index), dtype=float)
+    y[species_index["A"]] = 3.0
+    y[species_index["E"]] = 5.0
+    symbolic_matrix = np.asarray(artifact.jacobian_func(0.0, y), dtype=float)
+    fd_matrix = np.zeros_like(symbolic_matrix)
+    eps_base = 1e-7
+    for col in range(y.size):
+        eps = eps_base * max(1.0, abs(float(y[col])))
+        y_plus = y.copy()
+        y_minus = y.copy()
+        y_plus[col] += eps
+        y_minus[col] -= eps
+        fd_matrix[:, col] = (rhs(0.0, y_plus) - rhs(0.0, y_minus)) / (2.0 * eps)
+
+    np.testing.assert_allclose(symbolic_matrix, fd_matrix, rtol=1e-6, atol=1e-8)
+    assert symbolic_matrix[species_index["A"], species_index["E"]] == pytest.approx(-6.0)
+    assert symbolic_matrix[species_index["B"], species_index["E"]] == pytest.approx(6.0)
+    assert symbolic_matrix[species_index["E"], species_index["E"]] == pytest.approx(0.0)
 
 
 def test_bdf_preparation_uses_generated_symbolic_jacobian_callable():
@@ -414,8 +435,96 @@ def test_fitting_objective_context_disables_jacobian_for_mutable_rate_bindings()
     )
 
     assert prepared.request.jacobian_func is None
-    assert prepared.request.jac_sparsity is not None
+    assert prepared.request.jac_sparsity is None
     assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+
+
+def test_dynamic_rate_binding_sparse_preparation_omits_jacobian_and_sparsity_hint():
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            mechanism_text="\n".join(
+                [
+                    "reaction: A -> B; k=1.0",
+                    "init: A=1.0, B=0.0",
+                ]
+            ),
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 5},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            parameter_overrides={"k1": 2.0},
+        )
+    )
+
+    result = solve_ode(prepared.request)
+
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
+    assert result.provenance["symbolic_jacobian"] is False
+    assert result.provenance["jacobian_sparsity_hint"] is False
+    assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+
+
+def test_m1_sparse_dynamic_preview_uses_no_jacobian_data_and_no_sparsity_provenance():
+    m1_without_algebra = "\n".join(
+        line
+        for line in get_preset_mechanism("M1").splitlines()
+        if not line.strip().startswith("let ") and "Algebra" not in line
+    )
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            mechanism_text=m1_without_algebra,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 20},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            parameter_overrides={"k1": 2.0},
+        )
+    )
+
+    result = solve_ode(prepared.request)
+
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
+    assert np.asarray(result.Y).shape == (2, 20)
+    assert result.provenance["symbolic_jacobian"] is False
+    assert result.provenance["jacobian_sparsity_hint"] is False
+
+
+def test_m9_sparse_dynamic_preview_uses_no_jacobian_data_and_no_sparsity_provenance():
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            mechanism_text=get_preset_mechanism("M9"),
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 20},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            parameter_overrides={"kf1": 2.0},
+        )
+    )
+
+    result = solve_ode(prepared.request)
+
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
+    assert np.asarray(result.Y).shape == (8, 20)
+    assert result.provenance["symbolic_jacobian"] is False
+    assert result.provenance["jacobian_sparsity_hint"] is False
 
 
 def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_binding():
@@ -434,7 +543,7 @@ def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_bindi
     )
 
     assert prepared.request.jacobian_func is None
-    assert prepared.request.jac_sparsity is not None
+    assert prepared.request.jac_sparsity is None
     assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
 
 

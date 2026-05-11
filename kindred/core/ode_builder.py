@@ -244,8 +244,7 @@ def build_ode_rhs_from_mechanism(
                     kf_val = float(kr_val) * float(Keq_T)
                 elif Keq_T is not None and kr_val is None and not self._fast_flag:
                     # Preserve the long-standing programmatic Keq-only contract for
-                    # non-fast equilibria by using the same deterministic anchor
-                    # as the sparse Jacobian path.
+                    # non-fast equilibria by using a deterministic forward-rate anchor.
                     Keq_T = _require_positive_finite_runtime_Keq(Keq_T)
                     kf_val = 1.0
                 else:

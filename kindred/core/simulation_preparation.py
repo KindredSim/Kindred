@@ -831,6 +831,18 @@ def _apply_parameter_overrides_to_prepared_mechanism(
 
     from kindred.core.simulator.step_indexing import lookup_step_param_target
 
+    internal_names = _internal_parameter_algebra_binding_names(
+        mechanism,
+        requested_names=[name for name, _value in override_items],
+    )
+    internal_names = {
+        name
+        for name in internal_names
+        if not _prepared_parameter_override_can_apply(mechanism, name)
+    }
+    if internal_names:
+        _bind_parameters_to_mechanism(mechanism, sorted(internal_names))
+
     override_applied = False
     for name, value in override_items:
         target_name = _canonical_step_override_name(mechanism, name)
@@ -921,16 +933,18 @@ def _apply_scalar_parameter_override_to_prepared_mechanism(
     name: str,
     value: float,
 ) -> bool:
+    from kindred.core.rate_binding import RateBinding
+
     meta = getattr(mechanism, "metadata", None)
     if not isinstance(meta, dict):
         return False
     scalar_known = False
     scalar_bindings = meta.get("scalar_param_bindings")
-    if isinstance(scalar_bindings, dict) and name in scalar_bindings:
-        setter = getattr(scalar_bindings.get(name), "set", None)
-        if callable(setter):
-            setter(float(value))
-            scalar_known = True
+    if not isinstance(scalar_bindings, dict):
+        scalar_bindings = {}
+        meta["scalar_param_bindings"] = scalar_bindings
+    if name in scalar_bindings:
+        scalar_known = True
     scalar_params = meta.get("scalar_params")
     if not isinstance(scalar_params, dict):
         scalar_params = {}
@@ -942,6 +956,12 @@ def _apply_scalar_parameter_override_to_prepared_mechanism(
         scalar_known = True
     if not scalar_known:
         return False
+    binding = scalar_bindings.get(name)
+    setter = getattr(binding, "set", None)
+    if callable(setter):
+        setter(float(value))
+    else:
+        scalar_bindings[str(name)] = RateBinding(name=str(name), value=float(value))
     scalar_params[str(name)] = float(value)
     return True
 
@@ -1068,19 +1088,6 @@ def _build_prepared_run_context(
     jac_sparsity = None
     symbolic_jacobian_identity = symbolic_jacobian_identity_payload(jacobian_func)
 
-    def _build_sparsity_hint() -> Any:
-        try:
-            from kindred.core.sparse_jacobian import detect_sparsity_pattern
-
-            return detect_sparsity_pattern(mechanism).pattern
-        except Exception as sparsity_exc:
-            logger.warning(
-                "Jacobian sparsity hint unavailable; using solver default without sparsity hint: %s",
-                sparsity_exc,
-                exc_info=True,
-            )
-            return None
-
     if jacobian_func is not None and not symbolic_jacobian_identity:
         message = (
             "Ignored non-symbolic Jacobian callable from prepared payload; "
@@ -1121,7 +1128,7 @@ def _build_prepared_run_context(
         warnings.append(message)
         jacobian_func = None
         symbolic_jacobian_identity = None
-        jac_sparsity = _build_sparsity_hint()
+        jac_sparsity = None
     elif analytical_jacobian_requested:
         try:
             from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
@@ -1134,7 +1141,7 @@ def _build_prepared_run_context(
             logger.warning("%s", symbolic_message, exc_info=True)
             warnings.append(symbolic_message)
             jacobian_func = None
-            jac_sparsity = _build_sparsity_hint()
+            jac_sparsity = None
 
     return _PreparedRunContext(
         solver_config=solver_config,
@@ -1660,6 +1667,32 @@ def _internal_parameter_algebra_binding_names(
     return (constrained - constrained_keq_targets) | k_derived
 
 
+def _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
+    mechanism: Any,
+    requested_names: Iterable[str] = (),
+) -> None:
+    requested = {
+        _canonical_step_override_name(mechanism, str(name))
+        for name in (requested_names or ())
+        if str(name or "").strip()
+    }
+    algebra_owned = sorted(
+        str(name)
+        for name in (requested & _internal_parameter_algebra_binding_names(mechanism))
+        if re.match(r"^(k|kf|kr)\d+$", str(name))
+    )
+    if not algebra_owned:
+        return
+    raise SimulationPreparationError(
+        "parameter_algebra",
+        (
+            "Requested algebra-owned mechanism parameter(s) cannot be fitted directly "
+            "because parameter algebra overwrites them: "
+            + ", ".join(algebra_owned)
+        ),
+    )
+
+
 @dataclass
 class _StateNetworkEnergyBindingState:
     units: Any
@@ -2158,6 +2191,10 @@ def prepare_fitting_objective_context(
             use_advanced_dsl=True,
             wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         )
+        _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
+            bound.mechanism,
+            param_names,
+        )
     except SimulationPreparationError as exc:
         raise _fit_simulation_error_from_preparation_error(exc) from exc
     if not isinstance(bound, BoundMechanism):
@@ -2343,6 +2380,13 @@ def build_prepared_simulation_func(
             use_advanced_dsl=True,
             wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         )
+        try:
+            _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
+                bound.mechanism,
+                param_names,
+            )
+        except SimulationPreparationError as exc:
+            raise _fit_simulation_error_from_preparation_error(exc) from exc
         species_index = {name: idx for idx, name in enumerate(bound.species_names)}
         prepared_context = _build_prepared_run_context(
             mechanism=bound.mechanism,

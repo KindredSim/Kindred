@@ -20,11 +20,6 @@ from kindred.core.simulation_preparation import (
     prepared_simulation_run_for_execution_request,
 )
 from kindred.core.simulation_identity import SimulationIdentity
-from kindred.core.sparse_jacobian import (
-    HAS_SCIPY_SPARSE,
-    build_sparse_jacobian,
-    detect_sparsity_pattern,
-)
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 
 
@@ -156,34 +151,6 @@ def test_reduced_net_reaction_keeps_full_reactant_order() -> None:
     assert mechanism.reactions[0].net_stoich == {"B": -1.0, "C": 1.0}
     assert values["B"] == pytest.approx(-48.0)
     assert values["C"] == pytest.approx(48.0)
-
-
-@pytest.mark.skipif(not HAS_SCIPY_SPARSE, reason="scipy.sparse is required")
-def test_sparse_jacobian_tracks_same_side_catalyst_dependencies() -> None:
-    mechanism = parse_dsl_to_mechanism(CATALYST_TEXT, initials={})
-    names = mechanism.species_names()
-    idx = _species_index(mechanism)
-
-    pattern = detect_sparsity_pattern(mechanism)
-    jacobian = build_sparse_jacobian(mechanism, pattern)
-    y = np.zeros(len(names), dtype=float)
-    y[idx["A"]] = 3.0
-    y[idx["E"]] = 5.0
-
-    matrix = jacobian(0.0, y).toarray()
-
-    assert "E" in pattern.coupling_graph["A"]
-    assert "E" in pattern.coupling_graph["B"]
-    assert matrix[idx["A"], idx["E"]] == pytest.approx(-6.0)
-    assert matrix[idx["B"], idx["E"]] == pytest.approx(6.0)
-    assert matrix[idx["E"], idx["E"]] == pytest.approx(0.0)
-
-    y[idx["E"]] = 0.0
-    zero_catalyst_matrix = jacobian(0.0, y).toarray()
-    assert zero_catalyst_matrix[idx["A"], idx["A"]] == pytest.approx(0.0)
-    assert zero_catalyst_matrix[idx["B"], idx["A"]] == pytest.approx(0.0)
-    assert zero_catalyst_matrix[idx["A"], idx["E"]] == pytest.approx(-6.0)
-    assert zero_catalyst_matrix[idx["B"], idx["E"]] == pytest.approx(6.0)
 
 
 def test_serialization_and_hash_distinguish_same_side_catalyst_from_uncatalyzed_net() -> None:
@@ -381,42 +348,6 @@ def test_reversible_same_side_catalyst_ode_math_preserves_both_directions(
     assert values["A"] == pytest.approx(-20.0)
     assert values["B"] == pytest.approx(20.0)
     assert values["E"] == pytest.approx(0.0)
-
-
-@pytest.mark.parametrize("prefix", ["reaction", "equilibrium"])
-@pytest.mark.skipif(not HAS_SCIPY_SPARSE, reason="scipy.sparse is required")
-def test_sparse_jacobian_tracks_reversible_same_side_catalyst_dependencies(prefix: str) -> None:
-    mechanism = parse_dsl_to_mechanism(_reversible_catalyst_text(prefix), initials={})
-    idx = _species_index(mechanism)
-    y = np.zeros(len(idx), dtype=float)
-    y[idx["A"]] = 3.0
-    y[idx["E"]] = 5.0
-    y[idx["B"]] = 4.0
-
-    pattern = detect_sparsity_pattern(mechanism)
-    matrix = build_sparse_jacobian(mechanism, pattern)(0.0, y).toarray()
-
-    assert "E" in pattern.coupling_graph["A"]
-    assert "E" in pattern.coupling_graph["B"]
-    assert matrix[idx["A"], idx["A"]] == pytest.approx(-10.0)
-    assert matrix[idx["A"], idx["B"]] == pytest.approx(2.5)
-    assert matrix[idx["A"], idx["E"]] == pytest.approx(-4.0)
-    assert matrix[idx["B"], idx["A"]] == pytest.approx(10.0)
-    assert matrix[idx["B"], idx["B"]] == pytest.approx(-2.5)
-    assert matrix[idx["B"], idx["E"]] == pytest.approx(4.0)
-    assert matrix[idx["E"], idx["A"]] == pytest.approx(0.0)
-    assert matrix[idx["E"], idx["B"]] == pytest.approx(0.0)
-    assert matrix[idx["E"], idx["E"]] == pytest.approx(0.0)
-
-    y[idx["E"]] = 0.0
-    zero_catalyst_matrix = build_sparse_jacobian(mechanism, pattern)(0.0, y).toarray()
-    assert zero_catalyst_matrix[idx["A"], idx["A"]] == pytest.approx(0.0)
-    assert zero_catalyst_matrix[idx["A"], idx["B"]] == pytest.approx(0.0)
-    assert zero_catalyst_matrix[idx["A"], idx["E"]] == pytest.approx(-4.0)
-    assert zero_catalyst_matrix[idx["B"], idx["A"]] == pytest.approx(0.0)
-    assert zero_catalyst_matrix[idx["B"], idx["B"]] == pytest.approx(0.0)
-    assert zero_catalyst_matrix[idx["B"], idx["E"]] == pytest.approx(4.0)
-    assert zero_catalyst_matrix[idx["E"], idx["E"]] == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize("prefix", ["reaction", "equilibrium"])

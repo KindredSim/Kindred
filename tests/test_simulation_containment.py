@@ -704,6 +704,61 @@ def test_warm_simulation_owner_preserves_gui_algebra_outputs_in_result_payload()
         owner.close(kill=True)
 
 
+def test_warm_simulation_owner_preview_sparse_dynamic_override_omits_jacobian_hint():
+    from kindred.core.simulation_containment import (
+        WarmSimulationOwner,
+        build_contained_simulation_plan_payload,
+    )
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+    from kindred.core.simulation_preparation import SimulationExecutionRequest
+
+    mp_context = _require_spawn_primitive_support()
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 6},
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+        mechanism_text=mechanism_text,
+        parameter_overrides={"k1": 2.0},
+        simulation_identity={"schema_id": "preview-sparse-dynamic", "param_fingerprint": "k1=2"},
+    )
+    plan = SimulationPlan.from_execution_request(
+        request,
+        execution_mode="preview",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+    )
+    contained_payload = build_contained_simulation_plan_payload(plan)
+    owner = WarmSimulationOwner(
+        contained_payload,
+        mp_context=mp_context,
+        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
+        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
+        active_timeout_s=5.0,
+    )
+
+    try:
+        payload = owner.solve({"include_mechanism_in_result_payload": False})
+
+        assert payload["success"] is True
+        assert payload["species_names"] == ["A", "B"]
+        assert np.asarray(payload["Y"]).shape == (2, 6)
+        assert payload["provenance"]["symbolic_jacobian"] is False
+        assert payload["provenance"]["jacobian_sparsity_hint"] is False
+    finally:
+        owner.close(kill=True)
+
+
 def test_warm_simulation_owner_ignores_stale_result_before_current_acceptance():
     from kindred.core.simulation_containment import WarmSimulationOwner
 

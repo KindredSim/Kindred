@@ -2216,7 +2216,7 @@ class MainWindow(
         time_part = f"{sim_time:g} s" if isinstance(sim_time, float) else f"{sim_time_raw or '?'} s"
         summary = f"Solver: {solver_display} • rtol={rtol:.1e} • atol={atol:.1e} • Points: {points:,} • Time: {time_part}"
         if self._use_sparse_jacobian and str(solver_method).upper() in {"RADAU", "BDF"}:
-            summary += " • Sparse J"
+            summary += " • Symbolic J"
         self._solver_summary_label.setText(summary)
 
     def _on_temperature_user_edit(self, value: float) -> None:

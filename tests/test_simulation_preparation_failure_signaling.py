@@ -82,16 +82,8 @@ def test_prepare_simulation_worker_run_uses_symbolic_jacobian_for_constant_tempe
     assert prepared.warnings == []
 
 
-def test_prepare_simulation_worker_run_disables_symbolic_jacobian_for_temperature_schedule(monkeypatch) -> None:
+def test_prepare_simulation_worker_run_disables_symbolic_jacobian_for_temperature_schedule() -> None:
     from kindred.core.simulation_preparation import prepare_simulation_worker_run
-
-    called = {"n": 0}
-
-    def _build_sparse(_mechanism):
-        called["n"] += 1
-        raise AssertionError("legacy sparse Jacobian builder should not be called for scheduled temperature")
-
-    monkeypatch.setattr("kindred.core.sparse_jacobian.build_sparse_jacobian", _build_sparse)
 
     prepared = prepare_simulation_worker_run(
         mechanism_text="\n".join(
@@ -108,7 +100,6 @@ def test_prepare_simulation_worker_run_disables_symbolic_jacobian_for_temperatur
         solver_config={"solver": "BDF", "use_sparse_jacobian": True, "grid": {"N": 5}},
     )
 
-    assert called["n"] == 0
     assert prepared.jacobian_func is None
     assert prepared.request.jac_sparsity is None
     assert prepared.temperature_schedule is not None

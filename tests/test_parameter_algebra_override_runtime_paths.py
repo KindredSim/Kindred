@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from kindred.core.batch_parallel import run_batch_simulation_task
+from kindred.core.exceptions import FitSimulationError
 from kindred.core.fitting_evaluation import (
     SerialFittingEvaluator,
     evaluate_fitting_series,
@@ -12,6 +13,7 @@ from kindred.core.fitting_evaluation import (
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
+    build_prepared_simulation_func,
     prepared_simulation_run_for_execution_request,
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
@@ -664,3 +666,181 @@ def test_reused_prepared_preview_recomputes_algebra_after_step_override() -> Non
             rtol=1e-6,
             atol=1e-8,
         )
+
+
+def test_execution_request_scalar_override_updates_mutable_algebra_source() -> None:
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "init: A=1.0, B=0.0",
+            "param scale = 1.0",
+            "param k1 = scale",
+        ]
+    )
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=dict(_SOLVER_CONFIG),
+            mechanism_text=mechanism_text,
+            parameter_overrides={"scale": 2.0},
+        )
+    )
+
+    rate = prepared.mechanism.reactions[0].rate
+    result = solve_ode(prepared.request)
+    control = solve_ode(
+        prepare_simulation_worker_run(
+            mechanism_text="reaction: A -> B; k=2.0\ninit: A=1.0, B=0.0",
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=dict(_SOLVER_CONFIG),
+        ).request
+    )
+
+    assert float(rate() if callable(rate) else rate) == pytest.approx(2.0)
+    np.testing.assert_allclose(
+        np.asarray(result.Y, dtype=float)[:, -1],
+        np.asarray(control.Y, dtype=float)[:, -1],
+        rtol=1e-6,
+        atol=1e-8,
+    )
+
+
+def test_prepared_reuse_scalar_override_updates_mutable_algebra_source() -> None:
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "init: A=1.0, B=0.0",
+            "param scale = 1.0",
+            "param k1 = scale",
+        ]
+    )
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=dict(_SOLVER_CONFIG),
+            mechanism_text=mechanism_text,
+        )
+    )
+
+    changed = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=dict(_SOLVER_CONFIG),
+            mechanism_text=mechanism_text,
+            parameter_overrides={"scale": 2.0},
+        ),
+    )
+    rate = changed.mechanism.reactions[0].rate
+    result = solve_ode(changed.request)
+    control = solve_ode(
+        prepare_simulation_worker_run(
+            mechanism_text="reaction: A -> B; k=2.0\ninit: A=1.0, B=0.0",
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config=dict(_SOLVER_CONFIG),
+        ).request
+    )
+
+    assert float(rate() if callable(rate) else rate) == pytest.approx(2.0)
+    np.testing.assert_allclose(
+        np.asarray(result.Y, dtype=float)[:, -1],
+        np.asarray(control.Y, dtype=float)[:, -1],
+        rtol=1e-6,
+        atol=1e-8,
+    )
+
+
+def test_prepare_fitting_execution_context_rejects_algebra_owned_rate_as_requested_fit_parameter() -> None:
+    with pytest.raises(FitSimulationError, match="algebra-owned mechanism parameter"):
+        prepare_fitting_execution_context(
+            mechanism_text="\n".join(
+                [
+                    "reaction: A -> B; k=1.0",
+                    "init: A=1.0, B=0.0",
+                    "param scale = 1.0",
+                    "param k1 = scale",
+                ]
+            ),
+            param_names=["k1"],
+            t_end=1.0,
+            num_points=5,
+            temperature_K=298.15,
+            solver="BDF",
+            rtol=1e-8,
+            atol=1e-10,
+            use_sparse_jacobian=False,
+            wegscheider_cyclicity_enabled=False,
+            initial_prefix="init:",
+        )
+
+
+def test_build_prepared_simulation_func_rejects_algebra_owned_rate_as_fit_parameter() -> None:
+    simulation_func = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+                "param scale = 1.0",
+                "param k1 = scale",
+            ]
+        ),
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-8,
+        atol=1e-10,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )
+
+    with pytest.raises(FitSimulationError, match="algebra-owned mechanism parameter"):
+        simulation_func({"k1": 2.0})
+
+
+def test_prepare_bound_mechanism_keeps_internal_algebra_owned_rate_binding_for_scalar_fit_dimension() -> None:
+    bound = prepare_bound_mechanism(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+                "param scale = 1.0",
+                "param k1 = scale",
+            ]
+        ),
+        param_names=["scale"],
+        temperature_K=298.15,
+        initials={},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    bound.bindings["scale"].set(2.0)
+    from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_to_mechanism
+
+    apply_parameter_algebra_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+                "param scale = 1.0",
+                "param k1 = scale",
+            ]
+        ),
+        mechanism=bound.mechanism,
+        require_mutable=True,
+    )
+
+    assert "scale" in bound.bindings
+    assert "k1" in bound.bindings
+    assert bound.bindings["k1"]() == pytest.approx(2.0)

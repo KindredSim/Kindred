@@ -4,8 +4,8 @@ Simulation Settings dialog.
 Current dialog contract
 -----------------------
 - Exposes SciPy `solve_ivp` solver selection restricted to `Radau` and `BDF`,
-  plus tolerances (rtol/atol) and the sparse-J toggle for supported stiff
-  solvers.
+  plus tolerances (rtol/atol) and the generated-symbolic-Jacobian toggle for
+  supported stiff solvers.
 - Exposes slider-preview defaults separately from the main run controls:
   preview solver, preview point count, and preview debounce timings.
 - Does NOT expose temperature, t_end, or point-grid controls (those are surfaced
@@ -127,9 +127,11 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         row.addStretch(1)
         solver_section_layout.addLayout(row)
 
-        self._sparse_checkbox = QtWidgets.QCheckBox("Use sparse Jacobian (Radau/BDF only)")
+        self._sparse_checkbox = QtWidgets.QCheckBox("Use generated symbolic Jacobian (Radau/BDF only)")
         self._sparse_checkbox.setChecked(bool(PROJECT_DEFAULTS["use_sparse_jacobian"]))
-        self._sparse_checkbox.setToolTip("Use sparse matrix format for the Jacobian. Faster for large mechanisms.")
+        self._sparse_checkbox.setToolTip(
+            "Use a generated symbolic Jacobian when the mechanism is supported; unsupported cases use solver defaults."
+        )
         solver_section_layout.addWidget(self._sparse_checkbox)
 
         self._wegscheider_checkbox = QtWidgets.QCheckBox("Thermodynamic cyclicity (Wegscheider)")

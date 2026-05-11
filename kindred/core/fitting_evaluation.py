@@ -30,11 +30,14 @@ from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
     _build_solver_config,
+    _fit_simulation_error_from_preparation_error,
+    _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     _solve_request,
     coerce_prepared_simulation_metadata,
     metadata_view_for_mechanism,
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
+    SimulationPreparationError,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
@@ -536,6 +539,13 @@ def prepare_fitting_execution_context(
         use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
+    try:
+        _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
+            bound.mechanism,
+            param_names,
+        )
+    except SimulationPreparationError as exc:
+        raise _fit_simulation_error_from_preparation_error(exc) from exc
     prepared_payload = dict(bound.as_serializable_execution_payload())
     prepared_payload["bindings"] = dict(bound.bindings)
     intervention_schedule = coerce_intervention_schedule(prepared_payload.get("intervention_schedule"))

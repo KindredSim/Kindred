@@ -132,6 +132,31 @@ def test_solver_settings_wegscheider_copy_describes_symbolic_validation_not_rate
     assert "deriving" not in copy
 
 
+def test_solver_settings_jacobian_copy_describes_symbolic_generation_not_sparse_fallback(qt_app):
+    dialog = SolverSettingsDialog()
+
+    copy = " ".join(
+        [
+            dialog._sparse_checkbox.text(),
+            dialog._sparse_checkbox.toolTip(),
+        ]
+    ).lower()
+    assert "symbolic jacobian" in copy
+    assert "solver defaults" in copy
+    assert "sparse matrix" not in copy
+
+
+def test_solver_summary_describes_symbolic_jacobian_not_sparse_fallback(main_window):
+    main_window._initial_solver = "BDF"
+    main_window._use_sparse_jacobian = True
+
+    main_window._update_solver_summary_label()
+
+    summary = main_window._solver_summary_label.text()
+    assert "Symbolic J" in summary
+    assert "Sparse J" not in summary
+
+
 def test_solver_settings_dialog_caps_worker_count_at_shared_ceiling(qt_app):
     from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
     from kindred.gui.widgets import solver_settings
