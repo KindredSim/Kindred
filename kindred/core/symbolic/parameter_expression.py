@@ -4,15 +4,17 @@ from dataclasses import dataclass
 import ast
 import hashlib
 import json
-import re
 from typing import Any
 
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, ParameterAssignment
 
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
-
-_PROTECTED_NAMES = {"T", "T0"}
+from .namespaces import (
+    SymbolicParameterNamespaceContext,
+    make_parameter_namespace_context,
+    reject_unsupported_parameter_symbol_source,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,34 +23,28 @@ class SymbolicExpression:
     normalized_source: str
     canonical_identifiers: tuple[str, ...]
     fingerprint: str
+    symbol_context: dict[str, object]
 
 
 def _unsupported(message: str) -> UnsupportedSymbolicExpressionError:
     return UnsupportedSymbolicExpressionError(message)
 
 
-def _canonical_identifier(name: str, spec: ParameterAlgebraSpec) -> str:
-    name_s = str(name)
-    if name_s in _PROTECTED_NAMES:
-        raise _unsupported(f"Protected runtime symbol {name_s!r} is not supported in symbolic proof.")
-    if name_s in spec.scalar_input_names:
-        return name_s
-    resolution = spec.mechanism_namespace.resolve(name_s)
-    if resolution.canonical_name is not None:
-        return resolution.canonical_name
-    if name_s in spec.param_assignment_names():
-        return name_s
-    raise _unsupported(f"Unknown symbolic identifier {name_s!r}.")
+def _coerce_parameter_namespace(
+    *,
+    spec: ParameterAlgebraSpec | None,
+    namespace: SymbolicParameterNamespaceContext | None,
+) -> SymbolicParameterNamespaceContext:
+    if namespace is not None:
+        return namespace
+    if spec is None:
+        raise _unsupported("Symbolic parameter expression requires a parameter namespace context.")
+    return make_parameter_namespace_context(spec)
 
 
-def _normalize_source(expr_src: str, spec: ParameterAlgebraSpec) -> str:
+def _normalize_source(expr_src: str, namespace: SymbolicParameterNamespaceContext) -> str:
     source = str(expr_src or "").strip()
-    if not source:
-        raise _unsupported("Empty symbolic expression is not supported.")
-    if "[" in source or "]" in source:
-        raise _unsupported("Species references are not supported in symbolic proof.")
-    if re.search(r"\b(if|else|and|or|not)\b", source):
-        raise _unsupported("Dynamic or logical expressions are not supported in symbolic proof.")
+    reject_unsupported_parameter_symbol_source(source)
     source = source.replace("^", "**")
     try:
         tree = ast.parse(source, mode="eval")
@@ -57,7 +53,7 @@ def _normalize_source(expr_src: str, spec: ParameterAlgebraSpec) -> str:
     _validate_ast(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
-            node.id = _canonical_identifier(node.id, spec)
+            node.id = namespace.resolve_identifier(node.id)
     return ast.unparse(tree)
 
 
@@ -101,9 +97,11 @@ def _fingerprint(payload: dict[str, object]) -> str:
 def translate_parameter_expression(
     assignment: ParameterAssignment,
     *,
-    spec: ParameterAlgebraSpec,
+    spec: ParameterAlgebraSpec | None = None,
+    namespace: SymbolicParameterNamespaceContext | None = None,
 ) -> SymbolicExpression:
-    normalized = _normalize_source(assignment.expr_src, spec)
+    parameter_namespace = _coerce_parameter_namespace(spec=spec, namespace=namespace)
+    normalized = _normalize_source(assignment.expr_src, parameter_namespace)
     try:
         tree = ast.parse(normalized, mode="eval")
     except SyntaxError as exc:
@@ -111,6 +109,7 @@ def translate_parameter_expression(
     _validate_ast(tree)
     sympy = require_sympy()
     identifiers = _identifier_order(tree)
+    symbol_context = parameter_namespace.to_expression_payload(identifiers)
     locals_map = {name: sympy.Symbol(name) for name in identifiers}
     try:
         expression = sympy.sympify(normalized, locals=locals_map, rational=True)
@@ -122,6 +121,7 @@ def translate_parameter_expression(
             "name": str(assignment.name),
             "normalized_source": str(expression),
             "identifiers": identifiers,
+            "symbol_context": symbol_context,
             "backend": metadata.to_payload(),
         }
     )
@@ -130,4 +130,5 @@ def translate_parameter_expression(
         normalized_source=str(expression),
         canonical_identifiers=identifiers,
         fingerprint=fingerprint,
+        symbol_context=symbol_context,
     )

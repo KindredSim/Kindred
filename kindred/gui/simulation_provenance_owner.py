@@ -98,6 +98,9 @@ class SimulationProvenanceOwner:
             symbolic_identity = solver_provenance.get("symbolic_jacobian_identity")
             if isinstance(symbolic_identity, Mapping):
                 provenance["symbolic_jacobian_identity"] = dict(symbolic_identity)
+            symbolic_status = solver_provenance.get("symbolic_jacobian_status")
+            if isinstance(symbolic_status, Mapping):
+                provenance["symbolic_jacobian_status"] = dict(symbolic_status)
             wegscheider_identity = solver_provenance.get("symbolic_wegscheider_identity")
             if isinstance(wegscheider_identity, Mapping):
                 provenance["symbolic_wegscheider_identity"] = dict(wegscheider_identity)

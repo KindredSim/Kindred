@@ -29,7 +29,7 @@ from typing import (
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
-from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
+from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
 from kindred.core.intervention_schedule import (
@@ -110,6 +110,7 @@ class SimulationRequest:
     intervention_schedule: InterventionSchedule | Mapping[str, Any] | None = None
     species_names: Optional[Tuple[str, ...]] = None
     symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
+    symbolic_jacobian_status: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -295,7 +296,11 @@ def _prepare_rhs(req: SimulationRequest, *, t0: float, t1: float) -> tuple[Rhs2,
 
 
 def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
-    symbolic_identity = symbolic_jacobian_identity_payload(req.jacobian_func)
+    symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+        jacobian_func=req.jacobian_func,
+        jac_sparsity=req.jac_sparsity,
+        status=req.symbolic_jacobian_status,
+    )
     prov: Dict[str, object] = {
         "solver_requested": req.solver,
         "rtol": float(req.rtol),
@@ -309,14 +314,12 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
             "ml": getattr(req.rosenbrock_jacobian, "ml", None),
             "mu": getattr(req.rosenbrock_jacobian, "mu", None),
         },
-        "symbolic_jacobian": bool(symbolic_identity),
-        "jacobian_sparsity_hint": req.jac_sparsity is not None,
         "positivity": (req.positivity or None),
         "pos_indices": (list(req.pos_indices) if req.pos_indices is not None else None),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
-    if symbolic_identity:
-        prov["symbolic_jacobian_identity"] = dict(symbolic_identity)
+    prov.update(symbolic_jacobian.provenance_fields())
+    prov["jacobian_sparsity_hint"] = req.jac_sparsity is not None
     if isinstance(req.symbolic_wegscheider_identity, Mapping) and req.symbolic_wegscheider_identity:
         prov["symbolic_wegscheider_identity"] = dict(req.symbolic_wegscheider_identity)
     schedule = coerce_intervention_schedule(req.intervention_schedule)
@@ -337,12 +340,25 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
     return prov
 
 
-def _scrub_unused_jacobian_provenance(prov: Dict[str, object], *, method: str) -> None:
+def _scrub_unused_jacobian_provenance(
+    prov: Dict[str, object],
+    *,
+    method: str,
+    req: SimulationRequest,
+) -> None:
     if str(method) in {"Radau", "BDF"}:
         return
-    prov["symbolic_jacobian"] = False
+    disabled_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+        jacobian_func=req.jacobian_func,
+        jac_sparsity=req.jac_sparsity,
+        status=req.symbolic_jacobian_status,
+    ).with_runtime_disabled(
+        partially=False,
+        code="non-implicit-solver",
+        reason=f"Symbolic Jacobian disabled because solver {method} does not consume Jacobian callables.",
+    )
     prov.pop("symbolic_jacobian_identity", None)
-    prov["jacobian_sparsity_hint"] = False
+    prov.update(disabled_symbolic_jacobian.provenance_fields())
 
 
 def _implicit_scipy_alternatives(primary: str) -> List[str]:
@@ -1010,9 +1026,13 @@ def _execute_with_intervention_schedule(
             )
             segment_events = events_tuple + trigger_callables
             seg_req = segment_req_base
-            segment_symbolic_identity = symbolic_jacobian_identity_payload(segment_req_base.jacobian_func)
+            segment_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+                jacobian_func=segment_req_base.jacobian_func,
+                jac_sparsity=segment_req_base.jac_sparsity,
+                status=segment_req_base.symbolic_jacobian_status,
+            )
             if active_intervals and segment_req_base.jacobian_func is not None:
-                if segment_symbolic_identity:
+                if segment_symbolic_jacobian.has_executable_jacobian:
                     symbolic_jacobian_disabled = True
                 seg_req = replace(seg_req, jacobian_func=None, jac_sparsity=None)
             elif active_intervals and segment_req_base.jac_sparsity is not None:
@@ -1028,13 +1048,14 @@ def _execute_with_intervention_schedule(
                 )
             seg_req = _request_for_internal_segment(seg_req, t0=sub_start, t1=sub_end)
             seg_prov: Dict[str, object] = dict(prov)
-            seg_symbolic_identity = symbolic_jacobian_identity_payload(seg_req.jacobian_func)
-            seg_prov["symbolic_jacobian"] = bool(seg_symbolic_identity)
+            seg_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+                jacobian_func=seg_req.jacobian_func,
+                jac_sparsity=seg_req.jac_sparsity,
+                status=seg_req.symbolic_jacobian_status,
+            )
+            seg_prov.pop("symbolic_jacobian_identity", None)
+            seg_prov.update(seg_symbolic_jacobian.provenance_fields())
             seg_prov["jacobian_sparsity_hint"] = seg_req.jac_sparsity is not None
-            if seg_symbolic_identity:
-                seg_prov["symbolic_jacobian_identity"] = dict(seg_symbolic_identity)
-            else:
-                seg_prov.pop("symbolic_jacobian_identity", None)
             seg_prov["intervention_segment_index"] = int(segment_count)
             seg_out = _execute_scipy(
                 seg_req,
@@ -1210,11 +1231,20 @@ def _execute_with_intervention_schedule(
         prov["intervention_symbolic_jacobian_disabled"] = True
         if segment_symbolic_jacobians:
             prov["intervention_segment_symbolic_jacobians"] = list(segment_symbolic_jacobians)
+        runtime_symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+            jacobian_func=req.jacobian_func,
+            jac_sparsity=req.jac_sparsity,
+            status=req.symbolic_jacobian_status,
+        ).with_runtime_disabled(
+            partially=bool(symbolic_jacobian_used),
+            code="active-intervention-interval",
+            reason="Symbolic Jacobian disabled for active intervention interval segments.",
+        )
         if symbolic_jacobian_used:
             prov["intervention_symbolic_jacobian_partially_disabled"] = True
         if not symbolic_jacobian_used:
-            prov["symbolic_jacobian"] = False
             prov.pop("symbolic_jacobian_identity", None)
+        prov.update(runtime_symbolic_jacobian.provenance_fields())
     prov["intervention_segments"] = int(segment_count)
     if trigger_provenance:
         prov["intervention_trigger_events"] = list(trigger_provenance)
@@ -1260,7 +1290,7 @@ def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys:
     prov = _build_provenance(req, t_eval=t_eval)
 
     method, note = _scipy_method_for(req.solver)
-    _scrub_unused_jacobian_provenance(prov, method=method)
+    _scrub_unused_jacobian_provenance(prov, method=method, req=req)
     schedule = coerce_intervention_schedule(req.intervention_schedule)
     if schedule is not None:
         return _execute_with_intervention_schedule(

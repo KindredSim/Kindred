@@ -159,7 +159,7 @@ def test_solve_ode_scipy_bdf_accepts_sparsity_hint_without_supplied_jacobian(mon
 
     monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
 
-    solvers.solve_ode(
+    out = solvers.solve_ode(
         solvers.SimulationRequest(
             rhs=lambda _t, y: np.asarray([-y[0], y[0] - y[1]], dtype=float),
             t_span=(0.0, 1.0),
@@ -172,6 +172,7 @@ def test_solve_ode_scipy_bdf_accepts_sparsity_hint_without_supplied_jacobian(mon
 
     assert "jac" not in seen
     assert seen["jac_sparsity"] is sparsity
+    assert out.provenance["jacobian_sparsity_hint"] is True
 
 
 def test_solve_ode_non_implicit_solver_does_not_claim_unused_symbolic_jacobian(monkeypatch):
@@ -211,6 +212,12 @@ def test_solve_ode_non_implicit_solver_does_not_claim_unused_symbolic_jacobian(m
             t_eval=np.array([0.0, 0.5, 1.0]),
             jacobian_func=symbolic_jacobian,
             jac_sparsity=sparsity,
+            symbolic_jacobian_status={
+                "kind": "jacobian",
+                "state": "supported",
+                "code": "supported",
+                "reason": "Symbolic Jacobian supported.",
+            },
         )
     )
 
@@ -220,6 +227,12 @@ def test_solve_ode_non_implicit_solver_does_not_claim_unused_symbolic_jacobian(m
     assert out.provenance["symbolic_jacobian"] is False
     assert "symbolic_jacobian_identity" not in out.provenance
     assert out.provenance["jacobian_sparsity_hint"] is False
+    assert out.provenance["symbolic_jacobian_status"] == {
+        "kind": "jacobian",
+        "state": "disabled",
+        "code": "non-implicit-solver",
+        "reason": "Symbolic Jacobian disabled because solver RK45 does not consume Jacobian callables.",
+    }
 
 
 def test_solve_ode_builds_time_grid_and_passes_solver_kwargs(monkeypatch):

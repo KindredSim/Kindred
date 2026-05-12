@@ -7,12 +7,14 @@ import numpy as np
 import pytest
 
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+from kindred.core.rate_binding import RateBinding
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_prepared_simulation_func,
     coerce_prepared_simulation_metadata,
     prepare_bound_mechanism,
     prepare_fitting_objective_context,
+    prepared_simulation_run_for_execution_request,
     prepare_simulation_worker_run,
 )
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
@@ -252,6 +254,206 @@ def test_scheduled_temperature_with_dynamic_bindings_omits_sparsity_hint():
     assert any("scheduled-temperature" in warning for warning in prepared.warnings)
 
 
+@pytest.mark.parametrize("dg_expr", ["-5", "0"])
+def test_warm_structure_cache_does_not_reuse_symbolic_jacobian_for_unsupported_dg_equilibrium(dg_expr: str):
+    from kindred.core.simulation_preparation import clear_symbolic_jacobian_structure_cache
+
+    supported_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=2.0; Keq=4.0",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+    unsupported_text = "\n".join(
+        [
+            f"equilibrium: A <-> B; kf=2.0; dG_eq={dg_expr}",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+    solver_config = {
+        "solver": "BDF",
+        "grid": {"N": 5},
+        "use_sparse_jacobian": True,
+        "wegscheider_cyclicity_enabled": False,
+    }
+
+    clear_symbolic_jacobian_structure_cache()
+    cold_unsupported = prepare_simulation_worker_run(
+        mechanism_text=unsupported_text,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config=solver_config,
+    )
+
+    assert cold_unsupported.request.jacobian_func is None
+    assert cold_unsupported.request.jac_sparsity is None
+    assert any("Symbolic Jacobian unsupported" in warning for warning in cold_unsupported.warnings)
+
+    clear_symbolic_jacobian_structure_cache()
+    supported = prepare_simulation_worker_run(
+        mechanism_text=supported_text,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config=solver_config,
+    )
+    warm_unsupported = prepare_simulation_worker_run(
+        mechanism_text=unsupported_text,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config=solver_config,
+    )
+
+    assert callable(supported.request.jacobian_func)
+    assert warm_unsupported.request.jacobian_func is None
+    assert warm_unsupported.request.jac_sparsity is None
+    assert any("Symbolic Jacobian unsupported" in warning for warning in warm_unsupported.warnings)
+
+
+def test_bind_failure_records_unsupported_status_not_preflight_supported(monkeypatch):
+    import kindred.core.simulation_preparation as simulation_preparation
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+
+    def fail_bind(**_kwargs):
+        raise UnsupportedSymbolicExpressionError("snapshot binding failed")
+
+    monkeypatch.setattr(
+        simulation_preparation,
+        "_bind_symbolic_jacobian_for_current_mechanism",
+        fail_bind,
+    )
+
+    prepared = prepare_simulation_worker_run(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        initials={},
+        t_span=(0.0, 0.1),
+        solver_config={"solver": "BDF", "use_sparse_jacobian": True, "grid": {"N": 5}},
+    )
+
+    assert prepared.request.jacobian_func is None
+    assert prepared.request.jac_sparsity is None
+    assert prepared.request.symbolic_jacobian_status == {
+        "kind": "jacobian",
+        "state": "unsupported",
+        "code": "binding-failed",
+        "reason": "snapshot binding failed",
+    }
+
+    result = solve_ode(prepared.request)
+
+    assert result.provenance["symbolic_jacobian"] is False
+    assert result.provenance["symbolic_jacobian_status"] == prepared.request.symbolic_jacobian_status
+
+
+def test_prepared_reuse_refreshes_symbolic_status_after_rebuild_bind_failure(monkeypatch):
+    import kindred.core.simulation_preparation as simulation_preparation
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+
+    solver_config = {"solver": "BDF", "use_sparse_jacobian": True, "grid": {"N": 5}}
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 0.1),
+            solver_config=solver_config,
+            mechanism_text="reaction: A -> B; k=1.0",
+            parameter_overrides={"k1": 1.0},
+        )
+    )
+
+    assert prepared.request.jacobian_func is not None
+    assert prepared.request.symbolic_jacobian_status == {
+        "kind": "jacobian",
+        "state": "supported",
+        "code": "supported",
+        "reason": "Symbolic Jacobian supported.",
+    }
+
+    def fail_bind(**_kwargs):
+        raise UnsupportedSymbolicExpressionError("reuse binding failed")
+
+    monkeypatch.setattr(
+        simulation_preparation,
+        "_bind_symbolic_jacobian_for_current_mechanism",
+        fail_bind,
+    )
+
+    changed = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 0.1),
+            solver_config=solver_config,
+            mechanism_text="reaction: A -> B; k=1.0",
+            parameter_overrides={"k1": 2.0},
+        ),
+    )
+
+    assert changed.request.jacobian_func is None
+    assert changed.request.jac_sparsity is None
+    assert changed.request.symbolic_jacobian_status == {
+        "kind": "jacobian",
+        "state": "unsupported",
+        "code": "binding-failed",
+        "reason": "reuse binding failed",
+    }
+
+
+def test_fitting_unsupported_symbolic_jacobian_runs_numerically_after_supported_cache_warm():
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.simulation_preparation import clear_symbolic_jacobian_structure_cache
+
+    supported_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=2.0; Keq=4.0",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+    unsupported_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=2.0; dG_eq=-5",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+    solver_config = {
+        "solver": "BDF",
+        "grid": {"N": 5},
+        "use_sparse_jacobian": True,
+        "wegscheider_cyclicity_enabled": False,
+    }
+
+    clear_symbolic_jacobian_structure_cache()
+    warm_supported = prepare_simulation_worker_run(
+        mechanism_text=supported_text,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config=solver_config,
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=unsupported_text,
+        param_names=["kf1"],
+        t_end=1.0,
+        num_points=3,
+        solver="BDF",
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    assert callable(warm_supported.request.jacobian_func)
+
+    evaluator = SerialFittingEvaluator(context)
+    result = evaluator({"kf1": 2.0})
+
+    assert np.asarray(result.t, dtype=float).shape == (3,)
+    assert set(result.species) == {"A", "B"}
+    assert evaluator.prepared_metadata.symbolic_jacobian_identity is None
+
+
 @pytest.mark.parametrize("solver", ["BDF", "Radau"])
 def test_implicit_solver_receives_generated_symbolic_jacobian_callable(monkeypatch, solver):
     from kindred.core.simulator import solvers
@@ -333,6 +535,12 @@ def test_active_intervention_interval_disables_symbolic_jacobian_through_segment
     assert result.provenance["intervention_symbolic_jacobian_disabled"] is True
     assert result.provenance["symbolic_jacobian"] is False
     assert "symbolic_jacobian_identity" not in result.provenance
+    assert result.provenance["symbolic_jacobian_status"] == {
+        "kind": "jacobian",
+        "state": "disabled",
+        "code": "active-intervention-interval",
+        "reason": "Symbolic Jacobian disabled for active intervention interval segments.",
+    }
 
 
 def test_mixed_intervention_segments_record_partial_symbolic_jacobian_disable(monkeypatch):
@@ -380,6 +588,12 @@ def test_mixed_intervention_segments_record_partial_symbolic_jacobian_disable(mo
     assert result.provenance["intervention_symbolic_jacobian_partially_disabled"] is True
     assert result.provenance["intervention_segment_symbolic_jacobians"] == [True, False]
     assert result.provenance["symbolic_jacobian_identity"]["kind"] == "jacobian"
+    assert result.provenance["symbolic_jacobian_status"] == {
+        "kind": "jacobian",
+        "state": "partially_disabled",
+        "code": "active-intervention-interval",
+        "reason": "Symbolic Jacobian disabled for active intervention interval segments.",
+    }
 
 
 def test_constant_temperature_arrhenius_uses_generated_symbolic_jacobian():
@@ -661,7 +875,13 @@ def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_bindi
 
     assert prepared.request.jacobian_func is None
     assert prepared.request.jac_sparsity is None
-    assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+    assert any("Keq input" in warning for warning in prepared.warnings)
+    assert prepared.request.symbolic_jacobian_status == {
+        "kind": "jacobian",
+        "state": "unsupported",
+        "code": "unsupported-keq-input",
+        "reason": "Symbolic Jacobian does not support dynamic or non-finite Keq input for equilibrium 1.",
+    }
 
 
 def test_fitting_candidate_values_use_symbolic_snapshot_identity_when_supported():
@@ -836,6 +1056,91 @@ def test_symbolic_jacobian_rejects_unsupported_dynamic_rate_binding():
 
     with pytest.raises(UnsupportedSymbolicExpressionError):
         build_symbolic_jacobian_artifact(mechanism)
+
+
+def test_symbolic_support_preflight_rejects_dynamic_rate_before_structure_fingerprint():
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import symbolic_jacobian_structure_fingerprint_for_mechanism
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_reaction(reactants={"A": 1.0}, products={"B": 1.0}, rate=lambda: 1.0)
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="dynamic"):
+        symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism)
+
+
+def test_symbolic_support_preflight_rejects_nonfinite_rate_binding_before_structure_fingerprint():
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.rate_binding import RateBinding
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import symbolic_jacobian_structure_fingerprint_for_mechanism
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_reaction(reactants={"A": 1.0}, products={"B": 1.0}, rate=RateBinding("k1", float("nan")))
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="non-finite"):
+        symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"forward_model": {"type": "Arrhenius"}},
+        {"reverse_model": {"type": "Arrhenius"}},
+    ],
+)
+def test_symbolic_support_preflight_rejects_equilibrium_model_metadata_before_structure_fingerprint(metadata):
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import symbolic_jacobian_structure_fingerprint_for_mechanism
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_equilibrium(
+        stoich_forward={"A": 1.0},
+        stoich_back={"B": 1.0},
+        kf=1.0,
+        kr=0.5,
+        metadata=metadata,
+    )
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="Temperature-dependent equilibrium"):
+        symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism)
+
+
+@pytest.mark.parametrize(
+    "keq_input",
+    [
+        RateBinding("Keq1", 2.0),
+        lambda: 2.0,
+    ],
+)
+def test_symbolic_support_preflight_rejects_mutable_keq_input_before_structure_fingerprint(keq_input):
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import symbolic_jacobian_structure_fingerprint_for_mechanism
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_equilibrium(
+        stoich_forward={"A": 1.0},
+        stoich_back={"B": 1.0},
+        kf=1.0,
+        kr=0.5,
+        Keq=2.0,
+        metadata={EquilibriumMetadataKeys.KEQ_INPUT: keq_input},
+    )
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="Keq input"):
+        symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism)
 
 
 def test_symbolic_jacobian_rejects_nonpositive_direct_mechanism_keq_derivation():

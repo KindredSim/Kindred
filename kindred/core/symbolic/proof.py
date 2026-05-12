@@ -9,6 +9,7 @@ from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, 
 
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
+from .namespaces import SymbolicProductIdentityProofContext, make_product_identity_proof_context
 from .parameter_expression import translate_parameter_expression
 
 
@@ -17,6 +18,7 @@ class SymbolicProofResult:
     proven: bool
     reason: str
     fingerprint: str
+    symbol_context: dict[str, object]
 
 
 def _fingerprint(payload: Mapping[str, object]) -> str:
@@ -39,12 +41,18 @@ def prove_product_identity(
     *,
     target_factors: Mapping[str, int],
     candidate: ParameterAssignment,
-    spec: ParameterAlgebraSpec,
+    spec: ParameterAlgebraSpec | None = None,
+    proof_context: SymbolicProductIdentityProofContext | None = None,
 ) -> SymbolicProofResult:
+    if proof_context is None:
+        if spec is None:
+            raise UnsupportedSymbolicExpressionError("Symbolic proof requires a proof context.")
+        proof_context = make_product_identity_proof_context(target_factors=target_factors, spec=spec)
     sympy = require_sympy()
     metadata = get_symbolic_backend_metadata()
-    assignments = {str(stmt.name): stmt for stmt in spec.param_statements or []}
+    assignments = dict(proof_context.assignments)
     translation_fingerprints: dict[str, str] = {}
+    proof_context_payload = proof_context.to_payload()
 
     def expand_assignment(name: str, stack: tuple[str, ...] = ()):
         if name in stack:
@@ -54,7 +62,10 @@ def prove_product_identity(
         assignment = assignments.get(name)
         if assignment is None:
             return sympy.Symbol(str(name))
-        translated_assignment = translate_parameter_expression(assignment, spec=spec)
+        translated_assignment = translate_parameter_expression(
+            assignment,
+            namespace=proof_context.parameter_namespace,
+        )
         translation_fingerprints[str(name)] = translated_assignment.fingerprint
         substitutions = {
             dep_name: expand_assignment(dep_name, stack + (name,))
@@ -68,7 +79,10 @@ def prove_product_identity(
         )
 
     try:
-        translated = translate_parameter_expression(candidate, spec=spec)
+        translated = translate_parameter_expression(
+            candidate,
+            namespace=proof_context.parameter_namespace,
+        )
         translation_fingerprints[str(candidate.name)] = translated.fingerprint
         candidate_expr = translated.expression.xreplace(
             {
@@ -86,9 +100,10 @@ def prove_product_identity(
                 "assignment_sources": _assignment_sources(assignments),
                 "backend": metadata.to_payload(),
                 "reason": "unsupported",
+                "symbol_context": proof_context_payload,
             }
         )
-        return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint)
+        return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint, symbol_context=proof_context_payload)
 
     candidate_name = str(candidate.name)
     target_expr = sympy.Integer(1)
@@ -108,9 +123,10 @@ def prove_product_identity(
                 "assignment_sources": _assignment_sources(assignments),
                 "backend": metadata.to_payload(),
                 "reason": "unsupported",
+                "symbol_context": proof_context_payload,
             }
         )
-        return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint)
+        return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint, symbol_context=proof_context_payload)
     proven = bool(simplified == 0)
     reason = "identity" if proven else "not_identity"
     fingerprint = _fingerprint(
@@ -122,6 +138,7 @@ def prove_product_identity(
             "target_factors": dict(sorted((str(k), int(v)) for k, v in target_factors.items())),
             "backend": metadata.to_payload(),
             "reason": reason,
+            "symbol_context": proof_context_payload,
         }
     )
-    return SymbolicProofResult(proven=proven, reason=reason, fingerprint=fingerprint)
+    return SymbolicProofResult(proven=proven, reason=reason, fingerprint=fingerprint, symbol_context=proof_context_payload)

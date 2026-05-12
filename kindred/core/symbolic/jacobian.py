@@ -9,12 +9,14 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.parameter_namespace import canonical_name_for_mechanism_step_parameter
 
 from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
+from .namespaces import make_evaluation_snapshot_context, make_state_symbol_context, symbolic_status_payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +28,8 @@ class SymbolicJacobianArtifact:
     jacobian_func: Callable[[float, np.ndarray], np.ndarray]
     parameter_symbols: tuple[str, ...] = ()
     evaluation_snapshot: tuple[tuple[str, float], ...] = ()
+    state_symbol_context: Mapping[str, Any] | None = None
+    evaluation_snapshot_context: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,20 +41,15 @@ class SymbolicJacobianStructure:
     structure_fingerprint: str
     artifact_fingerprint: str
     _compiled: Callable[..., Any]
+    state_symbol_context: Mapping[str, Any]
 
     def bind(self, parameter_values: Mapping[str, object] | None = None) -> SymbolicJacobianArtifact:
         snapshot = _coerce_snapshot_values(
             self.parameter_symbols,
             parameter_values,
         )
-        snapshot_fingerprint = _fingerprint(
-            {
-                "parameter_values": [
-                    [name, f"{value:.17g}"]
-                    for name, value in snapshot
-                ]
-            }
-        )
+        snapshot_context = make_evaluation_snapshot_context(snapshot).to_payload()
+        snapshot_fingerprint = str(snapshot_context["fingerprint"])
         metadata = get_symbolic_backend_metadata()
         identity = SymbolicArtifactIdentity.jacobian(
             metadata,
@@ -77,7 +76,26 @@ class SymbolicJacobianStructure:
             jacobian_func=jacobian_func,
             parameter_symbols=self.parameter_symbols,
             evaluation_snapshot=snapshot,
+            state_symbol_context=dict(self.state_symbol_context),
+            evaluation_snapshot_context=snapshot_context,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolicJacobianSupport:
+    supported: bool
+    code: str
+    reason: str
+    payload: Mapping[str, Any]
+
+    def raise_if_unsupported(self) -> None:
+        if not self.supported:
+            raise UnsupportedSymbolicExpressionError(self.reason)
+
+    def to_status_payload(self) -> dict[str, str]:
+        state = "supported" if self.supported else "unsupported"
+        reason = self.reason if self.reason else "Symbolic Jacobian supported."
+        return symbolic_status_payload(kind="jacobian", state=state, code=self.code, reason=reason)
 
 
 class _ParameterRegistry:
@@ -289,19 +307,147 @@ def _equilibrium_rate_expr(
     *,
     equilibrium_index: int,
 ) -> Any:
-    meta = dict(getattr(eq, "metadata", {}) or {})
-    if meta.get("forward_model") or meta.get("reverse_model") or meta.get("dG_eq_J_per_mol"):
-        raise UnsupportedSymbolicExpressionError("Temperature-dependent equilibrium models are not supported yet.")
     kf, kr = _equilibrium_rates(mechanism, eq, registry, equilibrium_index=equilibrium_index)
     forward = kf * _power_product(sympy, symbols, getattr(eq, "stoich_forward", {}) or {})
     reverse = kr * _power_product(sympy, symbols, getattr(eq, "stoich_back", {}) or {})
     return forward - reverse
 
 
+def _unsupported_support(code: str, reason: str, payload: Mapping[str, Any]) -> SymbolicJacobianSupport:
+    return SymbolicJacobianSupport(
+        supported=False,
+        code=str(code),
+        reason=str(reason),
+        payload=dict(payload),
+    )
+
+
+def _symbolic_snapshot_scalar_value(value: object) -> float | None:
+    try:
+        if isinstance(value, RateBinding):
+            scalar = float(value())
+        else:
+            scalar = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(scalar):
+        return None
+    return float(scalar)
+
+
+def _symbolic_snapshot_value_kind(value: object) -> str:
+    if callable(value) and not isinstance(value, RateBinding):
+        return "callable"
+    if _symbolic_snapshot_scalar_value(value) is None:
+        return "unsupported"
+    return "snapshot_scalar"
+
+
+def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobianSupport:
+    species_names_func = getattr(mechanism, "species_names", None)
+    if not callable(species_names_func):
+        return _unsupported_support(
+            "missing-species",
+            "Symbolic Jacobian requires a Kindred mechanism with species_names().",
+            {"reactions": [], "equilibria": []},
+        )
+    species_names = tuple(str(name) for name in species_names_func())
+    if not species_names:
+        return _unsupported_support(
+            "missing-species",
+            "Symbolic Jacobian requires at least one species.",
+            {"reactions": [], "equilibria": []},
+        )
+
+    reactions_payload = []
+    unsupported_code = ""
+    unsupported_reason = ""
+    for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
+        rate_kind = _symbolic_snapshot_value_kind(getattr(rxn, "rate", None))
+        reactions_payload.append(
+            {
+                "index": idx,
+                "rate_value_kind": rate_kind,
+            }
+        )
+        if not unsupported_code and rate_kind != "snapshot_scalar":
+            unsupported_code = "dynamic-rate"
+            unsupported_reason = f"Symbolic Jacobian does not support dynamic or non-finite reaction rate k{idx}."
+    equilibria_payload = []
+    for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
+        meta = dict(getattr(eq, "metadata", {}) or {})
+        kf = getattr(eq, "kf", None)
+        kr = getattr(eq, "kr", None)
+        keq = getattr(eq, "Keq", None)
+        keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+        kf_kind = _symbolic_snapshot_value_kind(kf) if kf is not None else "missing"
+        kr_kind = _symbolic_snapshot_value_kind(kr) if kr is not None else "missing"
+        keq_kind = _symbolic_snapshot_value_kind(keq) if keq is not None else "missing"
+        keq_input_kind = _symbolic_snapshot_value_kind(keq_input) if keq_input is not None else "missing"
+        has_forward_model = bool(meta.get(EquilibriumMetadataKeys.FORWARD_MODEL))
+        has_reverse_model = bool(meta.get("reverse_model"))
+        has_dg_eq = bool(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None)
+        equilibria_payload.append(
+            {
+                "index": idx,
+                "kf_value_kind": kf_kind,
+                "kr_value_kind": kr_kind,
+                "Keq_value_kind": keq_kind,
+                "Keq_input_value_kind": keq_input_kind,
+                "has_forward_model": has_forward_model,
+                "has_reverse_model": has_reverse_model,
+                "has_dG_eq_J_per_mol": has_dg_eq,
+            }
+        )
+        if unsupported_code:
+            continue
+        if has_forward_model or has_reverse_model or has_dg_eq:
+            unsupported_code = "temperature-dependent-equilibrium"
+            unsupported_reason = "Temperature-dependent equilibrium models are outside symbolic Jacobian support."
+            continue
+        if keq_input is not None and (
+            isinstance(keq_input, RateBinding)
+            or callable(keq_input)
+            or keq_input_kind != "snapshot_scalar"
+        ):
+            unsupported_code = "unsupported-keq-input"
+            unsupported_reason = f"Symbolic Jacobian does not support dynamic or non-finite Keq input for equilibrium {idx}."
+            continue
+        supported_pair = False
+        if kf is not None and kr is not None:
+            supported_pair = kf_kind == "snapshot_scalar" and kr_kind == "snapshot_scalar"
+        elif kf is not None and keq is not None:
+            supported_pair = kf_kind == "snapshot_scalar" and keq_kind == "snapshot_scalar"
+        elif kr is not None and keq is not None:
+            supported_pair = kr_kind == "snapshot_scalar" and keq_kind == "snapshot_scalar"
+        if not supported_pair:
+            unsupported_code = "unsupported-equilibrium-parameters"
+            unsupported_reason = f"Symbolic Jacobian is missing finite equilibrium parameters for equilibrium {idx}."
+            continue
+        if keq is not None and keq_kind == "snapshot_scalar":
+            keq_scalar = _symbolic_snapshot_scalar_value(keq)
+            if keq_scalar is None or keq_scalar <= 0.0:
+                unsupported_code = "unsupported-equilibrium-keq"
+                unsupported_reason = f"Symbolic Jacobian requires positive Keq for equilibrium {idx}."
+    payload = {
+        "reactions": reactions_payload,
+        "equilibria": equilibria_payload,
+    }
+    if unsupported_code:
+        return _unsupported_support(unsupported_code, unsupported_reason, payload)
+    return SymbolicJacobianSupport(
+        supported=True,
+        code="supported",
+        reason="",
+        payload=payload,
+    )
+
+
 def _structure_identity_payload(
     mechanism: Mechanism,
     species_names: tuple[str, ...],
     parameter_symbols: tuple[str, ...],
+    support_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     reactions_payload = []
     for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
@@ -361,6 +507,7 @@ def _structure_identity_payload(
         "parameter_symbols": list(parameter_symbols),
         "reactions": reactions_payload,
         "equilibria": equilibria_payload,
+        "symbolic_support": dict(support_payload),
     }
 
 
@@ -484,6 +631,8 @@ def _parameter_values_for_mechanism(
 
 
 def symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism: Mechanism) -> str:
+    support = classify_symbolic_jacobian_support(mechanism)
+    support.raise_if_unsupported()
     species_names_func = getattr(mechanism, "species_names", None)
     if not callable(species_names_func):
         raise UnsupportedSymbolicExpressionError(
@@ -493,10 +642,12 @@ def symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism: Mechanism) 
     if not species_names:
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
     parameter_symbols = _structure_parameter_symbols(mechanism)
-    return _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols))
+    return _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols, support.payload))
 
 
 def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
+    support = classify_symbolic_jacobian_support(mechanism)
+    support.raise_if_unsupported()
     sympy = require_sympy()
     species_names_func = getattr(mechanism, "species_names", None)
     if not callable(species_names_func):
@@ -506,7 +657,8 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
     species_names = tuple(str(name) for name in species_names_func())
     if not species_names:
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
-    state_symbols = tuple(sympy.Symbol(f"y_{idx}") for idx, _name in enumerate(species_names))
+    state_context = make_state_symbol_context(species_names)
+    state_symbols = tuple(sympy.Symbol(name) for name in state_context.symbol_names)
     symbol_by_species = dict(zip(species_names, state_symbols))
     registry = _ParameterRegistry(sympy)
     rhs = [sympy.Integer(0) for _name in species_names]
@@ -545,7 +697,7 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
     rhs_strings = tuple(str(sympy.simplify(expr)) for expr in rhs_matrix)
     jacobian_strings = tuple(tuple(str(sympy.simplify(jacobian_matrix[i, j])) for j in range(len(species_names))) for i in range(len(species_names)))
     parameter_symbols = registry.parameter_names
-    structure_fingerprint = _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols))
+    structure_fingerprint = _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols, support.payload))
     artifact_fingerprint = _fingerprint(
         {
             "rhs": rhs_strings,
@@ -563,6 +715,7 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         structure_fingerprint=structure_fingerprint,
         artifact_fingerprint=artifact_fingerprint,
         _compiled=compiled,
+        state_symbol_context=state_context.to_payload(),
     )
 
 

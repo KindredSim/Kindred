@@ -33,8 +33,10 @@ from kindred.core.simulation_preparation import (
     _build_solver_config,
     _fit_simulation_error_from_preparation_error,
     _mechanism_supports_dynamic_symbolic_snapshot,
+    _prepared_metadata_with_symbolic_jacobian,
     _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     _solve_request,
+    _symbolic_jacobian_for_bind_failure,
     coerce_prepared_simulation_metadata,
     metadata_view_for_mechanism,
     prepare_bound_mechanism,
@@ -44,8 +46,8 @@ from kindred.core.simulation_preparation import (
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, SimulationRequest
-from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 logger = logging.getLogger(__name__)
 
@@ -849,8 +851,11 @@ class SerialFittingEvaluator:
                     details={"fatal": False, "stage": "intervention_schedule"},
                 ) from exc
 
-        jacobian_func = prepared_run.request.jacobian_func
-        jac_sparsity = prepared_run.request.jac_sparsity
+        symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+            jacobian_func=prepared_run.request.jacobian_func,
+            jac_sparsity=prepared_run.request.jac_sparsity,
+            status=prepared_run.request.symbolic_jacobian_status,
+        )
         prepared_solver_config = self._prepared_solver_config
         if (
             prepared_solver_config is not None
@@ -865,17 +870,26 @@ class SerialFittingEvaluator:
                     prepared_solver_config=prepared_solver_config,
                     temperature_K=float(self._context.temperature_K),
                 )
-                jac_sparsity = None
+                symbolic_jacobian = SymbolicJacobianExecution.supported(
+                    jacobian_func=jacobian_func,
+                    identity=symbolic_identity,
+                )
                 self._context = self._context.clone(
-                    prepared_metadata=replace(
+                    prepared_metadata=_prepared_metadata_with_symbolic_jacobian(
                         self._context.prepared_metadata,
-                        symbolic_jacobian_identity=dict(symbolic_identity),
+                        symbolic_jacobian,
                     )
                 )
                 self._kindred_fitting_execution_context = self._context
-            except UnsupportedSymbolicExpressionError:
-                jacobian_func = None
-                jac_sparsity = None
+            except UnsupportedSymbolicExpressionError as exc:
+                symbolic_jacobian = _symbolic_jacobian_for_bind_failure(prepared_run.mechanism, exc)
+                self._context = self._context.clone(
+                    prepared_metadata=_prepared_metadata_with_symbolic_jacobian(
+                        self._context.prepared_metadata,
+                        symbolic_jacobian,
+                    )
+                )
+                self._kindred_fitting_execution_context = self._context
 
         request = SimulationRequest(
             rhs=prepared_run.request.rhs,
@@ -885,8 +899,7 @@ class SerialFittingEvaluator:
             rtol=float(prepared_run.request.rtol),
             atol=float(prepared_run.request.atol),
             grid=dict(prepared_run.request.grid or {}),
-            jacobian_func=jacobian_func,
-            jac_sparsity=jac_sparsity,
+            **symbolic_jacobian.to_request_kwargs(),
             temperature_schedule=prepared_run.request.temperature_schedule,
             intervention_schedule=intervention_schedule,
             species_names=tuple(prepared_run.species_names),
@@ -990,17 +1003,21 @@ class SerialFittingEvaluator:
         if not isinstance(bindings, Mapping):
             raise FitSimulationError("Structured fitting payload is missing mutable bindings.", details={"fatal": True})
         self._prepared_run = prepared_run
-        symbolic_identity = symbolic_jacobian_identity_payload(prepared_run.request.jacobian_func)
+        symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
+            jacobian_func=prepared_run.request.jacobian_func,
+            jac_sparsity=prepared_run.request.jac_sparsity,
+            status=prepared_run.request.symbolic_jacobian_status,
+        )
         symbolic_wegscheider_identity = getattr(
             prepared_run.request,
             "symbolic_wegscheider_identity",
             None,
         )
-        if symbolic_identity:
+        if symbolic_jacobian.status or symbolic_jacobian.identity:
             self._context = self._context.clone(
-                prepared_metadata=replace(
+                prepared_metadata=_prepared_metadata_with_symbolic_jacobian(
                     self._context.prepared_metadata,
-                    symbolic_jacobian_identity=dict(symbolic_identity),
+                    symbolic_jacobian,
                 )
             )
             self._kindred_fitting_execution_context = self._context
