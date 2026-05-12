@@ -9,7 +9,9 @@ import numpy as np
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
 from kindred.gui.fitting.constants import DEFAULT_PARALLEL_STARTS, FITTING_DEFAULT_SOLVER, INITIAL_PREFIX
 
@@ -344,6 +346,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._prepared_param_names = list(prepared_param_names)
         self._last_fit_params: Dict[str, float] = {}
         self._staged_dataset_params: Dict[str, Dict[str, float]] = {}
+        self._last_steps_dialog: QtWidgets.QDialog | None = None
         # Callable getters
         self._selected_dataset_ids_getter = selected_dataset_ids_getter
         self._dataset_entries_getter = dataset_entries_getter
@@ -403,9 +406,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._remove_param_button = QtWidgets.QPushButton("Remove")
         self._remove_param_button.clicked.connect(self._remove_selected_parameters)
         self._remove_param_button.setEnabled(False)
+        self._view_steps_button = QtWidgets.QPushButton("View Steps")
+        self._view_steps_button.setObjectName("global_fit_parameters_view_steps")
+        self._view_steps_button.clicked.connect(self._show_mechanism_steps_dialog)
         self._param_table.itemSelectionChanged.connect(self._update_remove_button_state)
         action_row.addWidget(self._add_param_button)
         action_row.addWidget(self._remove_param_button)
+        action_row.addWidget(self._view_steps_button)
         action_row.addStretch()
         params_layout.addLayout(action_row)
 
@@ -839,6 +846,56 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         self._populate_parameter_table()
         self.runtimeInputsChanged.emit()
+
+    def _show_mechanism_steps_dialog(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Mechanism Steps")
+        dialog.setModal(False)
+        dialog.resize(620, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        text = QtWidgets.QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        text.setPlainText(self._mechanism_steps_reference_text())
+        layout.addWidget(text, stretch=1)
+
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close, dialog)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        self._last_steps_dialog = dialog
+        dialog.show()
+
+    def _mechanism_steps_reference_text(self) -> str:
+        reaction_text = str(self._reactions_text_getter() or "")
+        try:
+            mechanism = parse_dsl_to_mechanism(reaction_text, initials={})
+            step_map = get_step_index_map(mechanism)
+        except Exception as exc:
+            return f"Mechanism steps are unavailable until the Reactions text parses.\n\n{exc}"
+
+        lines: list[str] = ["Mechanism Steps", ""]
+        if not step_map:
+            lines.append("No mechanism steps found.")
+        else:
+            for entry in step_map:
+                try:
+                    step_index = int(entry.get("step_index"))
+                except Exception:
+                    continue
+                context = str(entry.get("context") or "").strip()
+                if not context:
+                    context = str(entry.get("kind") or "step")
+                lines.append(f"Step {step_index}    {context}")
+
+        lines.extend(
+            [
+                "",
+                "Parameter names use the step number: kN, kfN, krN, and KeqN refer to Step N.",
+            ]
+        )
+        return "\n".join(lines)
 
     def _add_rate_parameter(self, name: str) -> None:
         present = {

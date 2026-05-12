@@ -295,6 +295,90 @@ def test_ic_state_survives_bulk_action(qt_app):
         qt_app.processEvents()
 
 
+def test_copy_targets_to_compatible_stages_pending_only_and_preserves_other_state(qt_app):
+    t = np.linspace(0, 1, 5)
+    entries = [
+        {
+            "id": "ds1", "label": "DS 1", "t": t,
+            "species_data": {"A": t, "B": t + 1.0},
+            "selected_species": ["A"],
+            "include": True,
+        },
+        {
+            "id": "ds2", "label": "DS 2", "t": t,
+            "species_data": {"A": t * 2.0, "B": t * 3.0},
+            "selected_species": ["A"],
+            "include": True,
+        },
+        {
+            "id": "ds3", "label": "DS 3", "t": t,
+            "species_data": {"A": t * 4.0},
+            "selected_species": ["A"],
+            "include": True,
+        },
+        {
+            "id": "ds4", "label": "DS 4", "t": t,
+            "species_data": {"A": t * 5.0, "B": t * 6.0},
+            "selected_species": ["A"],
+            "include": True,
+        },
+    ]
+    mgr = _make_manager(["A", "B"], by_dataset={
+        "ds1": {"initial_conditions": {"A": 1.0, "B": 2.0}},
+        "ds2": {"initial_conditions": {"A": 3.0, "B": 4.0}},
+        "ds3": {"initial_conditions": {"A": 5.0, "B": 6.0}},
+        "ds4": {"initial_conditions": {"A": 7.0, "B": 8.0}},
+    })
+    tbl = _make_table(
+        entries=entries,
+        species=["A", "B"],
+        manager=mgr,
+        included_ids=["ds1", "ds2", "ds3"],
+    )
+    messages: list[str] = []
+    tbl.statusMessage.connect(messages.append)
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._fit_targets_selection_pending["ds1"] = {"A", "B"}
+        tbl._fit_target_weights_pending["ds2"]["A"] = 9.0
+        ds2_ic_before = deepcopy(tbl._ic_pending["ds2"])
+
+        tbl._copy_targets_to_compatible_datasets()
+        qt_app.processEvents()
+
+        assert tbl._fit_targets_selection_pending["ds2"] == {"A", "B"}
+        assert tbl._fit_targets_selection_pending["ds3"] == {"A"}
+        assert tbl._fit_targets_selection_pending["ds4"] == {"A"}
+        assert tbl._fit_targets_selection_applied["ds2"] == ["A"]
+        assert tbl._fit_target_weights_pending["ds2"]["A"] == pytest.approx(9.0)
+        assert tbl._ic_pending["ds2"] == ds2_ic_before
+        assert tbl._fit_targets_dirty is True
+        assert messages[-1].startswith("Copied targets to 1 dataset; skipped 1")
+
+        tbl._apply_changes()
+        assert tbl._fit_targets_selection_applied["ds2"] == ["A", "B"]
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
+def test_copy_targets_to_compatible_noops_on_empty_source_selection(qt_app):
+    entries = _make_entries(selected=[])
+    tbl = _make_table(entries=entries)
+    messages: list[str] = []
+    tbl.statusMessage.connect(messages.append)
+    try:
+        tbl.load_for_dataset("ds1")
+        tbl._fit_targets_selection_pending["ds1"] = set()
+
+        tbl._copy_targets_to_compatible_datasets()
+
+        assert messages[-1] == "No targets selected to copy"
+    finally:
+        tbl.close()
+        qt_app.processEvents()
+
+
 def test_ic_state_survives_tab_revisit(qt_app):
     mgr = _make_manager(["A", "B"])
     tbl = _make_table(manager=mgr)

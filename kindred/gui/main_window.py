@@ -599,7 +599,19 @@ class MainWindow(
                 display_clear_scope_is_global=outcome.display_clear_scope_is_global,
                 clear_cached_mechanism=bool(outcome.runtime_invalidation_required),
             )
-        if not (outcome.runtime_input_invalidation_required and not outcome.runtime_invalidation_required):
+        transition_suppressed_noop = (
+            str(transition_source or "authoritative_change") == "authoritative_change"
+            and bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+                or self._variable_runtime.suppress_slider_runtime_invalidation()
+            )
+            and not bool(outcome.runtime_invalidation_required)
+            and not bool(outcome.runtime_input_invalidation_required)
+        )
+        if (
+            not transition_suppressed_noop
+            and not (outcome.runtime_input_invalidation_required and not outcome.runtime_invalidation_required)
+        ):
             self._refresh_authoritative_mechanism_derived_ui()
         if outcome.readiness_schedule_required:
             self._schedule_simulation_runtime_availability_refresh(wait=False)
@@ -855,6 +867,9 @@ class MainWindow(
             owner.cancel_edit_session()
             self._restore_mechanism_widgets_from_owner_canonical()
         self._refresh_mechanism_edit_lock_ui()
+        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+        if callable(validate):
+            validate()
         return True
 
     def _try_lock_mechanism_editor(self) -> bool:
@@ -864,11 +879,17 @@ class MainWindow(
         if owner.edit_session_active:
             self._sync_mechanism_session_owner_from_widgets(authoritative=False)
             if not owner.commit_edit_session():
+                validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+                if callable(validate):
+                    validate()
                 return False
         elif not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
             return False
         self._apply_authoritative_mechanism_transition()
         self._refresh_mechanism_edit_lock_ui()
+        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+        if callable(validate):
+            validate()
         return True
 
     def _set_mechanism_edit_locked(self, locked: bool) -> bool:
@@ -1482,6 +1503,9 @@ class MainWindow(
         paths), so MainWindow's `textChanged`-wired invalidation is not guaranteed to run.
         """
         self._sync_mechanism_session_owner_after_authoritative_widget_write(dispatch_consumers=False)
+        validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
+        if callable(validate):
+            validate()
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         try:
             self._mechanism_editor._variable_sliders.clear()
@@ -2699,22 +2723,41 @@ class MainWindow(
             if not self._guard_slider_transaction_invalidation(action_text=f"Loading preset {preset_id}"):
                 self._status_label.setText("Canceled preset load")
                 return
-            old_text = self._mechanism_editor._reactions_text.toPlainText()
+            previous_authoritative_suppress = bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+            )
+            previous_text_signal_suppress = bool(
+                getattr(self, "_suppress_programmatic_text_change_signals", False)
+            )
+            self._suppress_authoritative_mechanism_input_change = True
+            self._suppress_programmatic_text_change_signals = True
+            try:
+                self._mechanism_editor._set_validation_state("validating")
+            except Exception:
+                logger.debug("Failed to mark preset mechanism validation as pending", exc_info=True)
+            reactions_widget = self._mechanism_editor._reactions_text
+            old_text = reactions_widget.toPlainText()
             command = SetMechanismTextCommand(
-                self._mechanism_editor._reactions_text,
+                reactions_widget,
                 mechanism_text,
                 old_text,
                 f"Load preset {preset_id}"
             )
-            previous_authoritative_suppress = bool(
-                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
-            )
-            self._suppress_authoritative_mechanism_input_change = True
+            reactions_document = reactions_widget.document()
+            previous_widget_block = reactions_widget.blockSignals(True)
+            previous_document_block = reactions_document.blockSignals(True)
             try:
                 self._undo_stack.push(command)
             finally:
+                reactions_document.blockSignals(previous_document_block)
+                reactions_widget.blockSignals(previous_widget_block)
                 self._suppress_authoritative_mechanism_input_change = previous_authoritative_suppress
-            self._on_programmatic_mechanism_load()
+            try:
+                self._on_programmatic_mechanism_load()
+                if getattr(self._mechanism_editor, "_current_validation_state", "") == "validating":
+                    self._mechanism_editor._validate_dsl()
+            finally:
+                self._suppress_programmatic_text_change_signals = previous_text_signal_suppress
             self._status_label.setText(f"Loaded preset mechanism: {preset_id}")
             logger.info(f"Loaded preset mechanism: {preset_id}")
 
@@ -4090,7 +4133,20 @@ class MainWindow(
 
         if record_undo:
             command = SetMechanismTextCommand(widget, new_text, current_text, description)
-            self._undo_stack.push(command)
+            if bool(
+                getattr(self, "_suppress_authoritative_mechanism_input_change", False)
+                and getattr(self, "_suppress_programmatic_text_change_signals", False)
+            ):
+                document = widget.document()
+                previous_widget_block = widget.blockSignals(True)
+                previous_document_block = document.blockSignals(True)
+                try:
+                    self._undo_stack.push(command)
+                finally:
+                    document.blockSignals(previous_document_block)
+                    widget.blockSignals(previous_widget_block)
+            else:
+                self._undo_stack.push(command)
         else:
             widget.blockSignals(True)
             try:

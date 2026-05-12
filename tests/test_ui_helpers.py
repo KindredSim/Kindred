@@ -3,9 +3,11 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtGui import QDoubleValidator
 
 from kindred.gui.ui_helpers import (
+    make_bounded_label,
     make_placeholder_label,
     make_pyqtgraph_fallback_widget,
     make_scroll_area,
+    set_bounded_label_text,
     setup_scientific_validator,
 )
 
@@ -38,6 +40,28 @@ def test_make_placeholder_label_is_centered_and_muted(qt_app, qtbot):
     assert "background: transparent" in style
     assert "padding: 0" in style
     assert label.parent() is parent
+
+
+def test_set_bounded_label_text_elides_display_and_preserves_tooltip(qt_app, qtbot):
+    label = QtWidgets.QLabel()
+    qtbot.addWidget(label)
+    full = "Selected dataset: " + ("very-long-name-" * 20)
+
+    set_bounded_label_text(label, full, max_width=120)
+
+    assert label.maximumWidth() == 120
+    assert label.toolTip() == full
+    assert label.text() != full
+    assert len(label.text()) < len(full)
+
+
+def test_make_bounded_label_applies_initial_text(qt_app, qtbot):
+    label = make_bounded_label("hello", max_width=96)
+    qtbot.addWidget(label)
+
+    assert label.text() == "hello"
+    assert label.toolTip() == ""
+    assert label.maximumWidth() == 96
 
 def test_make_pyqtgraph_fallback_widget_returns_centered_red_warning(qt_app, qtbot):
     parent = QtWidgets.QWidget()

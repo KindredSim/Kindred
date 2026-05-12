@@ -337,6 +337,14 @@ def _build_provenance(req: SimulationRequest, *, t_eval: np.ndarray) -> Dict[str
     return prov
 
 
+def _scrub_unused_jacobian_provenance(prov: Dict[str, object], *, method: str) -> None:
+    if str(method) in {"Radau", "BDF"}:
+        return
+    prov["symbolic_jacobian"] = False
+    prov.pop("symbolic_jacobian_identity", None)
+    prov["jacobian_sparsity_hint"] = False
+
+
 def _implicit_scipy_alternatives(primary: str) -> List[str]:
     order = {
         "BDF": ["Radau"],
@@ -1252,6 +1260,7 @@ def solve_ode(req: SimulationRequest | Mapping[str, Any], *, allow_unknown_keys:
     prov = _build_provenance(req, t_eval=t_eval)
 
     method, note = _scipy_method_for(req.solver)
+    _scrub_unused_jacobian_provenance(prov, method=method)
     schedule = coerce_intervention_schedule(req.intervention_schedule)
     if schedule is not None:
         return _execute_with_intervention_schedule(

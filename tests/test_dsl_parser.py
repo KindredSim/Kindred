@@ -9,6 +9,8 @@ Tests cover:
 - Error handling with enhanced messages
 """
 
+import logging
+
 import pytest
 from kindred.core.simulator.dsl import (
     parse_dsl_to_mechanism,
@@ -43,6 +45,22 @@ class TestBasicReactions:
         assert "B" in mechanism.species
         assert mechanism.species["A"].initial_conc == 1.0
         assert mechanism.species["B"].initial_conc == 0.0
+
+    def test_successful_mechanism_build_is_not_logged_at_info(self, caplog):
+        """Routine parsing should not spam user-facing INFO logs."""
+        dsl = """
+        reaction: A -> B; k=1.5
+        [A] = 1.0
+        [B] = 0.0
+        """
+
+        with caplog.at_level(logging.INFO, logger="kindred.core.simulator.dsl_build"):
+            parse_dsl_to_mechanism(dsl, initials={})
+
+        assert all(
+            "Built mechanism from DSL reactions" not in record.getMessage()
+            for record in caplog.records
+        )
 
     def test_bimolecular_reaction(self):
         """Test bimolecular reaction."""

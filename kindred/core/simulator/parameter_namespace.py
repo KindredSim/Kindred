@@ -235,6 +235,47 @@ def build_namespace_from_mechanism(mechanism: object) -> MechanismParameterNames
     return _build_namespace(_mechanism_step_descriptors(mechanism))
 
 
+def canonical_name_for_mechanism_step_parameter(
+    mechanism: object,
+    *,
+    kind: str,
+    item_index: int,
+    role: str,
+    fallback_name: str,
+) -> str:
+    metadata = getattr(mechanism, "metadata", None)
+    if not isinstance(metadata, dict):
+        return str(fallback_name)
+    raw_mapping = metadata.get("step_index_map")
+    if not isinstance(raw_mapping, list):
+        return str(fallback_name)
+    index_key = "reaction_index" if str(kind) == "reaction" else "equilibrium_index"
+    step_index: int | None = None
+    for raw_entry in raw_mapping:
+        if not isinstance(raw_entry, dict):
+            continue
+        if str(raw_entry.get("kind") or "") != str(kind):
+            continue
+        parsed_item_index, item_ok = try_parse_int(raw_entry.get(index_key))
+        parsed_step_index, step_ok = try_parse_int(raw_entry.get("step_index"))
+        if not item_ok or not step_ok:
+            continue
+        if int(parsed_item_index) != int(item_index):
+            continue
+        step_index = int(parsed_step_index)
+        break
+    if step_index is None or step_index <= 0:
+        return str(fallback_name)
+
+    role_s = str(role)
+    candidate = f"{role_s}{step_index}"
+    namespace = build_namespace_from_mechanism(mechanism)
+    resolved = namespace.resolve(candidate)
+    if resolved.canonical_name is not None:
+        return str(resolved.canonical_name)
+    return str(fallback_name)
+
+
 def build_namespace_from_ir_steps(steps: Sequence[object]) -> MechanismParameterNamespace:
     descriptors: list[_NamespaceStepDescriptor] = []
     for step_index, step in enumerate(steps, start=1):

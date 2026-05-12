@@ -1482,12 +1482,7 @@ if PYQTGRAPH_AVAILABLE:
             """Return the current display color for a resolved overlay dataset column."""
             color_manager = ColorManager.instance()
             color_key = str(species_key or "").strip()
-            current_species_color = color_manager.get_current_species_color(color_key)
-            color = (
-                current_species_color
-                if current_species_color is not None
-                else color_manager.get_non_species_color(color_key)
-            )
+            color = color_manager.get_display_series_color(color_key)
             return (int(color.red()), int(color.green()), int(color.blue()))
 
         def refresh_overlay_presentation_for_current_roster(self) -> None:
@@ -1528,6 +1523,8 @@ if PYQTGRAPH_AVAILABLE:
             if owned_species_key is not None:
                 return color_manager.resolve_current_species_key(owned_species_key) is not None
             if color_manager.resolve_current_species_key(entry.resolved_y_column) is not None:
+                return True
+            if str(entry.species or "") == str(entry.resolved_y_column or ""):
                 return True
             return str(entry.resolved_y_column or "") in self._series
 
@@ -2111,6 +2108,45 @@ if PYQTGRAPH_AVAILABLE:
                         )
                     )
 
+                if x_name == "t":
+                    selected_columns = (
+                        set(enabled_species.keys())
+                        if enabled_species is not None
+                        else set(species_payload.keys())
+                    )
+                    resolved_columns = {entry.resolved_y_column for entry in overlays if entry.dataset == dataset_name}
+                    color_manager = ColorManager.instance()
+                    owned_species = tuple(str(name) for name in (self._owned_species_keys or set()) if str(name))
+                    for raw_column in sorted(selected_columns - resolved_columns):
+                        if (
+                            color_manager.resolve_known_species_key(str(raw_column), owned_species) is not None
+                            or color_manager.resolve_current_species_key(str(raw_column)) is not None
+                        ):
+                            continue
+                        y_source = species_payload.get(raw_column)
+                        if y_source is None:
+                            continue
+                        y_array = np.asarray(y_source, dtype=float).reshape(-1)
+                        if y_array.size == 0:
+                            warnings.append(f"{dataset_name}: '{raw_column}' has no data")
+                            continue
+                        if y_array.shape[0] != x_array.shape[0]:
+                            warnings.append(
+                                f"{dataset_name}: '{raw_column}' length ({y_array.shape[0]}) != '{x_name}' ({x_array.shape[0]})"
+                            )
+                            continue
+                        overlays.append(
+                            _OverlaySeries(
+                                dataset_name,
+                                str(raw_column),
+                                x_array,
+                                y_array,
+                                x_name,
+                                resolved_x_column,
+                                str(raw_column),
+                            )
+                        )
+
             return overlays, warnings
 
         def _draw_overlay_series(self, overlays: List[_OverlaySeries]) -> None:
@@ -2455,6 +2491,7 @@ if PYQTGRAPH_AVAILABLE:
 
         def _on_overlay_selection_changed(self, _names: List[str]) -> None:
             """Redraw when overlay checklist changes."""
+            self._assign_colors()
             self._update_plot()
 
         def _on_overlay_style_changed(self) -> None:

@@ -984,6 +984,49 @@ def test_batch_table_visual_order_places_state_controls_before_set_name(main_win
     assert _visual_headers(table, model)[:5] == ["Slider", "Show", "Set Name", "A (M)", "B (M)"]
     assert main_window._mechanism_editor._slider_edit_targets_label.text() == "Slider edit targets: set1"
 
+
+def test_slider_target_summary_is_visibly_bounded_with_full_tooltip(main_window):
+    long_name = "selected-set-" + ("very-long-name-" * 12)
+    main_window._batch_store.set_set_name(0, long_name)
+    main_window._refresh_slider_edit_targets_summary()
+
+    label = main_window._mechanism_editor._slider_edit_targets_label
+
+    assert label.maximumWidth() <= 360
+    assert label.toolTip() == f"Slider edit targets: {long_name}"
+    assert label.text() != label.toolTip()
+    assert len(label.text()) < len(label.toolTip())
+
+
+def test_batch_initial_conditions_auto_fit_caps_user_content_columns(main_window):
+    long_species = "Species" + ("VeryLong" * 18)
+    long_set = "Set" + ("VeryLong" * 18)
+    main_window._batch_model.set_species([long_species])
+    main_window._batch_store.set_set_name(0, long_set)
+    main_window._batch_table._apply_column_presentation()
+
+    table = main_window._batch_table
+
+    assert table.columnWidth(0) <= 220
+    assert table.columnWidth(1) <= 160
+    assert table.horizontalHeader().maximumSectionSize() <= 220
+
+
+def test_species_slider_row_label_is_bounded(main_window, qt_app):
+    long_species = "Species" + ("VeryLong" * 18)
+    main_window._batch_model.set_species([long_species])
+    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0])
+    panel = main_window._mechanism_editor.species_sliders_widget()
+    panel.rebuild_from_current_row()
+    qt_app.processEvents()
+
+    entry = panel._rows[long_species]
+    label = entry.container.findChildren(QtWidgets.QLabel)[0]
+
+    assert label.maximumWidth() <= 240
+    assert label.toolTip() == long_species
+    assert label.text() != long_species
+
 def test_focus_change_preserves_explicit_target_membership_without_accumulating_focus(main_window):
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")

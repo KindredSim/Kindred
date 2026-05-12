@@ -35,6 +35,7 @@ class SimulationLifecycleEffects:
     status_text: str | None = None
     progress_value: int | None = None
     algebra_status_text: str | None = None
+    algebra_status_details: str | None = None
     clear_algebra_status: bool = False
     repaint_widgets: bool = False
     stop_debounce_timers: bool = False
@@ -73,9 +74,49 @@ class SimulationLifecycleEffectOwner:
             return SimulationLifecycleEffects(algebra_status_text="")
         ok = max(0, len(list(species_names or ())) - int(base_species_count or 0))
         err = len([error for error in algebra_errors if isinstance(error, Mapping)])
+        first = next((error for error in algebra_errors if isinstance(error, Mapping)), None)
+        first_summary = SimulationLifecycleEffectOwner._format_algebra_error_summary(first)
+        details = SimulationLifecycleEffectOwner._format_algebra_error_details(algebra_errors)
+        summary = f"Algebra: {ok} ok, {err} error" + ("s" if err != 1 else "")
+        if first_summary:
+            summary = f"{summary} - {first_summary}"
         return SimulationLifecycleEffects(
-            algebra_status_text=f"Algebra: {ok} ok, {err} error" + ("s" if err != 1 else "")
+            algebra_status_text=summary,
+            algebra_status_details=details,
         )
+
+    @staticmethod
+    def _format_algebra_error_summary(error: Mapping[object, object] | None) -> str:
+        if not isinstance(error, Mapping):
+            return ""
+        message = str(error.get("message") or "").strip()
+        if not message:
+            return ""
+        name = str(error.get("name") or "").strip()
+        if name:
+            return f"{name}: {message}"
+        return message
+
+    @staticmethod
+    def _format_algebra_error_details(algebra_errors: Sequence[object]) -> str:
+        lines: list[str] = []
+        for index, error in enumerate(algebra_errors or (), start=1):
+            if not isinstance(error, Mapping):
+                continue
+            summary = SimulationLifecycleEffectOwner._format_algebra_error_summary(error)
+            if not summary:
+                continue
+            location_parts = []
+            if error.get("line") is not None:
+                location_parts.append(f"line {error.get('line')}")
+            if error.get("col") is not None:
+                location_parts.append(f"col {error.get('col')}")
+            location = f" ({', '.join(location_parts)})" if location_parts else ""
+            lines.append(f"{index}. {summary}{location}")
+            line_text = str(error.get("line_text") or "").strip()
+            if line_text:
+                lines.append(f"   {line_text}")
+        return "\n".join(lines)
 
     @staticmethod
     def completion_status_effect(

@@ -9,6 +9,8 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
+from kindred.core.rate_binding import RateBinding
+from kindred.core.simulator.parameter_namespace import canonical_name_for_mechanism_step_parameter
 
 from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
 from .backend import get_symbolic_backend_metadata, require_sympy
@@ -22,6 +24,113 @@ class SymbolicJacobianArtifact:
     jacobian_expressions: tuple[tuple[str, ...], ...]
     identity: SymbolicArtifactIdentity
     jacobian_func: Callable[[float, np.ndarray], np.ndarray]
+    parameter_symbols: tuple[str, ...] = ()
+    evaluation_snapshot: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolicJacobianStructure:
+    species_names: tuple[str, ...]
+    parameter_symbols: tuple[str, ...]
+    rhs_expressions: tuple[str, ...]
+    jacobian_expressions: tuple[tuple[str, ...], ...]
+    structure_fingerprint: str
+    artifact_fingerprint: str
+    _compiled: Callable[..., Any]
+
+    def bind(self, parameter_values: Mapping[str, object] | None = None) -> SymbolicJacobianArtifact:
+        snapshot = _coerce_snapshot_values(
+            self.parameter_symbols,
+            parameter_values,
+        )
+        snapshot_fingerprint = _fingerprint(
+            {
+                "parameter_values": [
+                    [name, f"{value:.17g}"]
+                    for name, value in snapshot
+                ]
+            }
+        )
+        metadata = get_symbolic_backend_metadata()
+        identity = SymbolicArtifactIdentity.jacobian(
+            metadata,
+            source_fingerprint=self.structure_fingerprint,
+            artifact_fingerprint=self.artifact_fingerprint,
+            structure_fingerprint=self.structure_fingerprint,
+            evaluation_snapshot_fingerprint=snapshot_fingerprint,
+            parameter_symbols=self.parameter_symbols,
+        )
+        parameter_tuple = tuple(value for _name, value in snapshot)
+
+        def jacobian_func(_t: float, y: np.ndarray) -> np.ndarray:
+            values = np.asarray(y, dtype=float).reshape(-1)
+            if values.size != len(self.species_names):
+                raise ValueError(f"symbolic jacobian expected {len(self.species_names)} state values, got {values.size}")
+            return np.asarray(self._compiled(*values, *parameter_tuple), dtype=float)
+
+        setattr(jacobian_func, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, identity.to_payload())
+        return SymbolicJacobianArtifact(
+            species_names=self.species_names,
+            rhs_expressions=self.rhs_expressions,
+            jacobian_expressions=self.jacobian_expressions,
+            identity=identity,
+            jacobian_func=jacobian_func,
+            parameter_symbols=self.parameter_symbols,
+            evaluation_snapshot=snapshot,
+        )
+
+
+class _ParameterRegistry:
+    def __init__(self, sympy: Any) -> None:
+        self._sympy = sympy
+        self._symbols: dict[str, Any] = {}
+        self._values: dict[str, float] = {}
+
+    def parameter(self, value: object, *, label: str, default_name: str) -> Any:
+        name = str(getattr(value, "name", None) or default_name or label).strip()
+        if not name:
+            name = str(default_name or label)
+        scalar = _finite_scalar(value, label=label)
+        existing = self._values.get(name)
+        if existing is not None and not math.isclose(existing, scalar, rel_tol=0.0, abs_tol=0.0):
+            raise UnsupportedSymbolicExpressionError(
+                f"Conflicting values for symbolic parameter {name!r}."
+            )
+        self._values[name] = scalar
+        symbol = self._symbols.get(name)
+        if symbol is None:
+            symbol = self._sympy.Symbol(name)
+            self._symbols[name] = symbol
+        return symbol
+
+    @property
+    def parameter_names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._symbols.keys()))
+
+    @property
+    def parameter_values(self) -> tuple[tuple[str, float], ...]:
+        return tuple((name, float(self._values[name])) for name in self.parameter_names)
+
+
+def _canonical_step_parameter_name(
+    mechanism: Mechanism,
+    *,
+    kind: str,
+    item_index: int,
+    role: str,
+    fallback_name: str,
+    value: object = None,
+) -> str:
+    explicit_name = str(getattr(value, "name", None) or "").strip()
+    if explicit_name:
+        return explicit_name
+    return canonical_name_for_mechanism_step_parameter(
+        mechanism,
+        kind=kind,
+        item_index=int(item_index),
+        role=role,
+        fallback_name=str(fallback_name),
+    )
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -53,6 +162,8 @@ def _source_identity_payload(mechanism: Mechanism, species_names: tuple[str, ...
 
 
 def _finite_scalar(value: object, *, label: str) -> float:
+    if isinstance(value, RateBinding):
+        value = value()
     if callable(value):
         raise UnsupportedSymbolicExpressionError(f"Dynamic callable {label} is not supported for symbolic Jacobian.")
     try:
@@ -62,6 +173,20 @@ def _finite_scalar(value: object, *, label: str) -> float:
     if not math.isfinite(out):
         raise UnsupportedSymbolicExpressionError(f"{label} must be finite.")
     return out
+
+
+def _coerce_snapshot_values(
+    parameter_symbols: tuple[str, ...],
+    parameter_values: Mapping[str, object] | None,
+) -> tuple[tuple[str, float], ...]:
+    supplied = dict(parameter_values or {})
+    out: list[tuple[str, float]] = []
+    for name in parameter_symbols:
+        raw = supplied.get(name)
+        if raw is None:
+            raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
+        out.append((name, _finite_scalar(raw, label=f"symbolic parameter {name}")))
+    return tuple(out)
 
 
 def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, object]) -> Any:
@@ -74,46 +199,304 @@ def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, 
     return expr
 
 
-def _reaction_rate_expr(sympy: Any, rxn: Reaction, symbols: Mapping[str, Any]) -> Any:
-    rate = _finite_scalar(getattr(rxn, "rate", None), label="reaction rate")
-    return sympy.Float(rate) * _power_product(sympy, symbols, getattr(rxn, "rate_orders", {}) or {})
+def _reaction_rate_expr(
+    sympy: Any,
+    mechanism: Mechanism,
+    rxn: Reaction,
+    symbols: Mapping[str, Any],
+    registry: _ParameterRegistry,
+    *,
+    reaction_index: int,
+) -> Any:
+    rate_value = getattr(rxn, "rate", None)
+    rate = registry.parameter(
+        rate_value,
+        label="reaction rate",
+        default_name=_canonical_step_parameter_name(
+            mechanism,
+            kind="reaction",
+            item_index=int(reaction_index),
+            role="k",
+            fallback_name=f"k{int(reaction_index) + 1}",
+            value=rate_value,
+        ),
+    )
+    return rate * _power_product(sympy, symbols, getattr(rxn, "rate_orders", {}) or {})
 
 
-def _equilibrium_rates(eq: Equilibrium) -> tuple[float, float]:
+def _equilibrium_rates(
+    mechanism: Mechanism,
+    eq: Equilibrium,
+    registry: _ParameterRegistry,
+    *,
+    equilibrium_index: int,
+) -> tuple[Any, Any]:
     kf = getattr(eq, "kf", None)
     kr = getattr(eq, "kr", None)
     keq = getattr(eq, "Keq", None)
+    kf_name = _canonical_step_parameter_name(
+        mechanism,
+        kind="equilibrium",
+        item_index=int(equilibrium_index),
+        role="kf",
+        fallback_name=f"kf{int(equilibrium_index) + 1}",
+        value=kf,
+    )
+    kr_name = _canonical_step_parameter_name(
+        mechanism,
+        kind="equilibrium",
+        item_index=int(equilibrium_index),
+        role="kr",
+        fallback_name=f"kr{int(equilibrium_index) + 1}",
+        value=kr,
+    )
+    keq_name = _canonical_step_parameter_name(
+        mechanism,
+        kind="equilibrium",
+        item_index=int(equilibrium_index),
+        role="Keq",
+        fallback_name=f"Keq{int(equilibrium_index) + 1}",
+        value=keq,
+    )
     if kf is None and kr is not None and keq is not None:
-        kr_val = _finite_scalar(kr, label="equilibrium kr")
+        kr_symbol = registry.parameter(kr, label="equilibrium kr", default_name=kr_name)
         keq_val = _finite_scalar(keq, label="equilibrium Keq")
         if keq_val <= 0.0:
             raise UnsupportedSymbolicExpressionError("equilibrium Keq must be positive.")
-        return float(kr_val * keq_val), float(kr_val)
+        keq_symbol = registry.parameter(keq, label="equilibrium Keq", default_name=keq_name)
+        return kr_symbol * keq_symbol, kr_symbol
     if kr is None and kf is not None and keq is not None:
-        kf_val = _finite_scalar(kf, label="equilibrium kf")
+        kf_symbol = registry.parameter(kf, label="equilibrium kf", default_name=kf_name)
         keq_val = _finite_scalar(keq, label="equilibrium Keq")
         if keq_val <= 0.0:
             raise UnsupportedSymbolicExpressionError("equilibrium Keq must be positive.")
-        return float(kf_val), float(kf_val / keq_val)
+        keq_symbol = registry.parameter(keq, label="equilibrium Keq", default_name=keq_name)
+        return kf_symbol, kf_symbol / keq_symbol
     if kf is None or kr is None:
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires explicit equilibrium kf/kr or one rate plus Keq.")
     return (
-        _finite_scalar(kf, label="equilibrium kf"),
-        _finite_scalar(kr, label="equilibrium kr"),
+        registry.parameter(kf, label="equilibrium kf", default_name=kf_name),
+        registry.parameter(kr, label="equilibrium kr", default_name=kr_name),
     )
 
 
-def _equilibrium_rate_expr(sympy: Any, eq: Equilibrium, symbols: Mapping[str, Any]) -> Any:
+def _equilibrium_rate_expr(
+    sympy: Any,
+    mechanism: Mechanism,
+    eq: Equilibrium,
+    symbols: Mapping[str, Any],
+    registry: _ParameterRegistry,
+    *,
+    equilibrium_index: int,
+) -> Any:
     meta = dict(getattr(eq, "metadata", {}) or {})
     if meta.get("forward_model") or meta.get("reverse_model") or meta.get("dG_eq_J_per_mol"):
         raise UnsupportedSymbolicExpressionError("Temperature-dependent equilibrium models are not supported yet.")
-    kf, kr = _equilibrium_rates(eq)
-    forward = sympy.Float(kf) * _power_product(sympy, symbols, getattr(eq, "stoich_forward", {}) or {})
-    reverse = sympy.Float(kr) * _power_product(sympy, symbols, getattr(eq, "stoich_back", {}) or {})
+    kf, kr = _equilibrium_rates(mechanism, eq, registry, equilibrium_index=equilibrium_index)
+    forward = kf * _power_product(sympy, symbols, getattr(eq, "stoich_forward", {}) or {})
+    reverse = kr * _power_product(sympy, symbols, getattr(eq, "stoich_back", {}) or {})
     return forward - reverse
 
 
-def build_symbolic_jacobian_artifact(mechanism: Mechanism) -> SymbolicJacobianArtifact:
+def _structure_identity_payload(
+    mechanism: Mechanism,
+    species_names: tuple[str, ...],
+    parameter_symbols: tuple[str, ...],
+) -> dict[str, Any]:
+    reactions_payload = []
+    for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
+        rate = getattr(rxn, "rate", None)
+        reactions_payload.append(
+            {
+                "index": idx,
+                "reactants": dict(getattr(rxn, "reactants", {}) or {}),
+                "products": dict(getattr(rxn, "products", {}) or {}),
+                "rate_orders": dict(getattr(rxn, "rate_orders", {}) or {}),
+                "net_stoich": dict(getattr(rxn, "net_stoich", {}) or {}),
+                "rate_parameter": _canonical_step_parameter_name(
+                    mechanism,
+                    kind="reaction",
+                    item_index=idx - 1,
+                    role="k",
+                    fallback_name=f"k{idx}",
+                    value=rate,
+                ),
+            }
+        )
+    equilibria_payload = []
+    for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
+        equilibria_payload.append(
+            {
+                "index": idx,
+                "stoich_forward": dict(getattr(eq, "stoich_forward", {}) or {}),
+                "stoich_back": dict(getattr(eq, "stoich_back", {}) or {}),
+                "kf_parameter": _canonical_step_parameter_name(
+                    mechanism,
+                    kind="equilibrium",
+                    item_index=idx - 1,
+                    role="kf",
+                    fallback_name=f"kf{idx}",
+                    value=getattr(eq, "kf", None),
+                ) if getattr(eq, "kf", None) is not None else None,
+                "kr_parameter": _canonical_step_parameter_name(
+                    mechanism,
+                    kind="equilibrium",
+                    item_index=idx - 1,
+                    role="kr",
+                    fallback_name=f"kr{idx}",
+                    value=getattr(eq, "kr", None),
+                ) if getattr(eq, "kr", None) is not None else None,
+                "keq_parameter": _canonical_step_parameter_name(
+                    mechanism,
+                    kind="equilibrium",
+                    item_index=idx - 1,
+                    role="Keq",
+                    fallback_name=f"Keq{idx}",
+                    value=getattr(eq, "Keq", None),
+                ) if getattr(eq, "Keq", None) is not None else None,
+            }
+        )
+    return {
+        "species_names": species_names,
+        "parameter_symbols": list(parameter_symbols),
+        "reactions": reactions_payload,
+        "equilibria": equilibria_payload,
+    }
+
+
+def _structure_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
+    parameter_names: set[str] = set()
+    for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
+        rate = getattr(rxn, "rate", None)
+        parameter_names.add(
+            _canonical_step_parameter_name(
+                mechanism,
+                kind="reaction",
+                item_index=int(reaction_index),
+                role="k",
+                fallback_name=f"k{int(reaction_index) + 1}",
+                value=rate,
+            )
+        )
+    for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
+        kf = getattr(eq, "kf", None)
+        kr = getattr(eq, "kr", None)
+        keq = getattr(eq, "Keq", None)
+        kf_name = _canonical_step_parameter_name(
+            mechanism,
+            kind="equilibrium",
+            item_index=int(equilibrium_index),
+            role="kf",
+            fallback_name=f"kf{int(equilibrium_index) + 1}",
+            value=kf,
+        )
+        kr_name = _canonical_step_parameter_name(
+            mechanism,
+            kind="equilibrium",
+            item_index=int(equilibrium_index),
+            role="kr",
+            fallback_name=f"kr{int(equilibrium_index) + 1}",
+            value=kr,
+        )
+        keq_name = _canonical_step_parameter_name(
+            mechanism,
+            kind="equilibrium",
+            item_index=int(equilibrium_index),
+            role="Keq",
+            fallback_name=f"Keq{int(equilibrium_index) + 1}",
+            value=keq,
+        )
+        if kf is None and kr is not None and keq is not None:
+            parameter_names.update((kr_name, keq_name))
+            continue
+        if kr is None and kf is not None and keq is not None:
+            parameter_names.update((kf_name, keq_name))
+            continue
+        if kf is not None and kr is not None:
+            parameter_names.update((kf_name, kr_name))
+            continue
+    return tuple(sorted(parameter_names))
+
+
+def _parameter_values_for_mechanism(
+    mechanism: Mechanism,
+    parameter_symbols: tuple[str, ...],
+) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
+        rate = getattr(rxn, "rate", None)
+        name = _canonical_step_parameter_name(
+            mechanism,
+            kind="reaction",
+            item_index=int(reaction_index),
+            role="k",
+            fallback_name=f"k{int(reaction_index) + 1}",
+            value=rate,
+        )
+        values[name] = _finite_scalar(rate, label=f"symbolic parameter {name}")
+    for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
+        kf = getattr(eq, "kf", None)
+        kr = getattr(eq, "kr", None)
+        keq = getattr(eq, "Keq", None)
+        kf_name = _canonical_step_parameter_name(
+            mechanism,
+            kind="equilibrium",
+            item_index=int(equilibrium_index),
+            role="kf",
+            fallback_name=f"kf{int(equilibrium_index) + 1}",
+            value=kf,
+        )
+        kr_name = _canonical_step_parameter_name(
+            mechanism,
+            kind="equilibrium",
+            item_index=int(equilibrium_index),
+            role="kr",
+            fallback_name=f"kr{int(equilibrium_index) + 1}",
+            value=kr,
+        )
+        keq_name = _canonical_step_parameter_name(
+            mechanism,
+            kind="equilibrium",
+            item_index=int(equilibrium_index),
+            role="Keq",
+            fallback_name=f"Keq{int(equilibrium_index) + 1}",
+            value=keq,
+        )
+        if kf is None and kr is not None and keq is not None:
+            values[kr_name] = _finite_scalar(kr, label=f"symbolic parameter {kr_name}")
+            values[keq_name] = _finite_scalar(keq, label=f"symbolic parameter {keq_name}")
+            continue
+        if kr is None and kf is not None and keq is not None:
+            values[kf_name] = _finite_scalar(kf, label=f"symbolic parameter {kf_name}")
+            values[keq_name] = _finite_scalar(keq, label=f"symbolic parameter {keq_name}")
+            continue
+        if kf is not None and kr is not None:
+            values[kf_name] = _finite_scalar(kf, label=f"symbolic parameter {kf_name}")
+            values[kr_name] = _finite_scalar(kr, label=f"symbolic parameter {kr_name}")
+            continue
+
+    out: dict[str, float] = {}
+    for name in parameter_symbols:
+        if name not in values:
+            raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
+        out[str(name)] = float(values[name])
+    return out
+
+
+def symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism: Mechanism) -> str:
+    species_names_func = getattr(mechanism, "species_names", None)
+    if not callable(species_names_func):
+        raise UnsupportedSymbolicExpressionError(
+            "Symbolic Jacobian requires a Kindred mechanism with species_names()."
+        )
+    species_names = tuple(str(name) for name in species_names_func())
+    if not species_names:
+        raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
+    parameter_symbols = _structure_parameter_symbols(mechanism)
+    return _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols))
+
+
+def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
     sympy = require_sympy()
     species_names_func = getattr(mechanism, "species_names", None)
     if not callable(species_names_func):
@@ -125,16 +508,31 @@ def build_symbolic_jacobian_artifact(mechanism: Mechanism) -> SymbolicJacobianAr
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
     state_symbols = tuple(sympy.Symbol(f"y_{idx}") for idx, _name in enumerate(species_names))
     symbol_by_species = dict(zip(species_names, state_symbols))
+    registry = _ParameterRegistry(sympy)
     rhs = [sympy.Integer(0) for _name in species_names]
     species_index = {name: idx for idx, name in enumerate(species_names)}
 
-    for rxn in getattr(mechanism, "reactions", []) or []:
-        rate_expr = _reaction_rate_expr(sympy, rxn, symbol_by_species)
+    for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
+        rate_expr = _reaction_rate_expr(
+            sympy,
+            mechanism,
+            rxn,
+            symbol_by_species,
+            registry,
+            reaction_index=reaction_index,
+        )
         for species_name, coeff in getattr(rxn, "net_stoich", {}).items():
             rhs[species_index[str(species_name)]] += sympy.Float(float(coeff)) * rate_expr
 
-    for eq in getattr(mechanism, "equilibria", []) or []:
-        rate_expr = _equilibrium_rate_expr(sympy, eq, symbol_by_species)
+    for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
+        rate_expr = _equilibrium_rate_expr(
+            sympy,
+            mechanism,
+            eq,
+            symbol_by_species,
+            registry,
+            equilibrium_index=equilibrium_index,
+        )
         for species_name in species_names:
             coeff = float(getattr(eq, "stoich_back", {}).get(species_name, 0.0)) - float(
                 getattr(eq, "stoich_forward", {}).get(species_name, 0.0)
@@ -146,32 +544,28 @@ def build_symbolic_jacobian_artifact(mechanism: Mechanism) -> SymbolicJacobianAr
     jacobian_matrix = rhs_matrix.jacobian(sympy.Matrix(state_symbols))
     rhs_strings = tuple(str(sympy.simplify(expr)) for expr in rhs_matrix)
     jacobian_strings = tuple(tuple(str(sympy.simplify(jacobian_matrix[i, j])) for j in range(len(species_names))) for i in range(len(species_names)))
-    source_fingerprint = _fingerprint(_source_identity_payload(mechanism, species_names))
+    parameter_symbols = registry.parameter_names
+    structure_fingerprint = _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols))
     artifact_fingerprint = _fingerprint(
         {
             "rhs": rhs_strings,
             "jacobian": jacobian_strings,
+            "parameter_symbols": list(parameter_symbols),
         }
     )
-    metadata = get_symbolic_backend_metadata()
-    identity = SymbolicArtifactIdentity.jacobian(
-        metadata,
-        source_fingerprint=source_fingerprint,
-        artifact_fingerprint=artifact_fingerprint,
-    )
-    compiled = sympy.lambdify(state_symbols, jacobian_matrix, modules="numpy")
-
-    def jacobian_func(_t: float, y: np.ndarray) -> np.ndarray:
-        values = np.asarray(y, dtype=float).reshape(-1)
-        if values.size != len(species_names):
-            raise ValueError(f"symbolic jacobian expected {len(species_names)} state values, got {values.size}")
-        return np.asarray(compiled(*values), dtype=float)
-
-    setattr(jacobian_func, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, identity.to_payload())
-    return SymbolicJacobianArtifact(
+    parameter_sympy_symbols = tuple(sympy.Symbol(name) for name in parameter_symbols)
+    compiled = sympy.lambdify((*state_symbols, *parameter_sympy_symbols), jacobian_matrix, modules="numpy")
+    return SymbolicJacobianStructure(
         species_names=species_names,
+        parameter_symbols=parameter_symbols,
         rhs_expressions=rhs_strings,
         jacobian_expressions=jacobian_strings,
-        identity=identity,
-        jacobian_func=jacobian_func,
+        structure_fingerprint=structure_fingerprint,
+        artifact_fingerprint=artifact_fingerprint,
+        _compiled=compiled,
     )
+
+
+def build_symbolic_jacobian_artifact(mechanism: Mechanism) -> SymbolicJacobianArtifact:
+    structure = build_symbolic_jacobian_structure(mechanism)
+    return structure.bind(_parameter_values_for_mechanism(mechanism, structure.parameter_symbols))

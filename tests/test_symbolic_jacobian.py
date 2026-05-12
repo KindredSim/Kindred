@@ -55,6 +55,105 @@ def test_symbolic_jacobian_matches_finite_difference_rhs_for_supported_subset():
     np.testing.assert_allclose(symbolic_matrix, fd_matrix, rtol=1e-6, atol=1e-8)
 
 
+def test_symbolic_jacobian_structure_binds_distinct_immutable_parameter_snapshots():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=2.0, B=0.0",
+            ]
+        ),
+        initials={},
+    )
+
+    structure = build_symbolic_jacobian_structure(mechanism)
+    first = structure.bind({"k1": 1.0})
+    second = structure.bind({"k1": 3.0})
+    first_payload = first.identity.to_payload()
+    second_payload = second.identity.to_payload()
+
+    assert first_payload["structure_fingerprint"] == second_payload["structure_fingerprint"]
+    assert first_payload["evaluation_snapshot_fingerprint"] != second_payload["evaluation_snapshot_fingerprint"]
+    assert first_payload["parameter_symbols"] == ["k1"]
+    np.testing.assert_allclose(first.jacobian_func(0.0, np.asarray([2.0, 0.0])), [[-1.0, 0.0], [1.0, 0.0]])
+    np.testing.assert_allclose(second.jacobian_func(0.0, np.asarray([2.0, 0.0])), [[-3.0, 0.0], [3.0, 0.0]])
+
+
+def test_symbolic_jacobian_structure_does_not_carry_default_parameter_values():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=2.0, B=0.0",
+            ]
+        ),
+        initials={},
+    )
+
+    structure = build_symbolic_jacobian_structure(mechanism)
+
+    assert not hasattr(structure, "default_parameter_values")
+    with pytest.raises(Exception, match="Missing symbolic parameter value"):
+        structure.bind()
+
+
+def test_symbolic_jacobian_uses_global_step_parameter_names_for_mixed_mechanisms():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "equilibrium: B <-> C; kf=2.0; kr=0.5",
+                "init: A=1.0, B=0.0, C=0.0",
+            ]
+        ),
+        initials={},
+    )
+
+    structure = build_symbolic_jacobian_structure(mechanism)
+    artifact = structure.bind({"k1": 1.0, "kf2": 4.0, "kr2": 0.25})
+    identity = artifact.identity.to_payload()
+
+    assert identity["parameter_symbols"] == ["k1", "kf2", "kr2"]
+    assert artifact.evaluation_snapshot == (("k1", 1.0), ("kf2", 4.0), ("kr2", 0.25))
+    np.testing.assert_allclose(
+        artifact.jacobian_func(0.0, np.asarray([1.0, 2.0, 3.0])),
+        [
+            [-1.0, 0.0, 0.0],
+            [1.0, -4.0, 0.25],
+            [0.0, 4.0, -0.25],
+        ],
+    )
+
+
+def test_symbolic_jacobian_rate_binding_snapshot_identity_changes_after_mutation():
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.rate_binding import RateBinding
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+
+    binding = RateBinding("k1", 1.0)
+    mechanism = Mechanism()
+    mechanism.add_species("A", 2.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_reaction(reactants={"A": 1.0}, products={"B": 1.0}, rate=binding)
+
+    first = build_symbolic_jacobian_artifact(mechanism)
+    binding.set(3.0)
+    second = build_symbolic_jacobian_artifact(mechanism)
+    first_payload = first.identity.to_payload()
+    second_payload = second.identity.to_payload()
+
+    assert first_payload["structure_fingerprint"] == second_payload["structure_fingerprint"]
+    assert first_payload["evaluation_snapshot_fingerprint"] != second_payload["evaluation_snapshot_fingerprint"]
+    np.testing.assert_allclose(first.jacobian_func(0.0, np.asarray([2.0, 0.0])), [[-1.0, 0.0], [1.0, 0.0]])
+    np.testing.assert_allclose(second.jacobian_func(0.0, np.asarray([2.0, 0.0])), [[-3.0, 0.0], [3.0, 0.0]])
+
+
 def test_symbolic_jacobian_matches_finite_difference_for_same_side_catalyst():
     from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
 
@@ -424,7 +523,7 @@ def test_fitting_objective_context_uses_symbolic_jacobian_for_arrhenius_rates():
     assert prepared.warnings == []
 
 
-def test_fitting_objective_context_disables_jacobian_for_mutable_rate_bindings():
+def test_fitting_objective_context_uses_snapshot_jacobian_for_supported_mutable_rate_bindings():
     prepared = prepare_fitting_objective_context(
         mechanism_text=SUPPORTED_DSL,
         param_names=["k1"],
@@ -434,12 +533,17 @@ def test_fitting_objective_context_disables_jacobian_for_mutable_rate_bindings()
         wegscheider_cyclicity_enabled=False,
     )
 
-    assert prepared.request.jacobian_func is None
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert identity is not None
+    assert identity["kind"] == "jacobian"
+    assert "k1" in identity["parameter_symbols"]
+    assert identity["evaluation_snapshot_fingerprint"]
     assert prepared.request.jac_sparsity is None
-    assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+    assert not any("dynamic rate bindings" in warning for warning in prepared.warnings)
 
 
-def test_dynamic_rate_binding_sparse_preparation_omits_jacobian_and_sparsity_hint():
+def test_dynamic_rate_binding_sparse_preparation_generates_symbolic_after_concrete_override():
     prepared = prepare_simulation_worker_run(
         execution_request=SimulationExecutionRequest(
             prepared_payload=None,
@@ -463,14 +567,19 @@ def test_dynamic_rate_binding_sparse_preparation_omits_jacobian_and_sparsity_hin
 
     result = solve_ode(prepared.request)
 
-    assert prepared.request.jacobian_func is None
+    assert callable(prepared.request.jacobian_func)
     assert prepared.request.jac_sparsity is None
-    assert result.provenance["symbolic_jacobian"] is False
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+    assert identity is not None
+    assert identity["parameter_symbols"] == ["k1"]
+    assert identity["evaluation_snapshot_fingerprint"]
+    assert result.provenance["symbolic_jacobian"] is True
     assert result.provenance["jacobian_sparsity_hint"] is False
-    assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+    assert result.provenance["symbolic_jacobian_identity"]["evaluation_snapshot_fingerprint"] == identity["evaluation_snapshot_fingerprint"]
+    assert not any("dynamic rate bindings" in warning for warning in prepared.warnings)
 
 
-def test_m1_sparse_dynamic_preview_uses_no_jacobian_data_and_no_sparsity_provenance():
+def test_m1_sparse_dynamic_preview_uses_symbolic_jacobian_after_concrete_override():
     m1_without_algebra = "\n".join(
         line
         for line in get_preset_mechanism("M1").splitlines()
@@ -494,14 +603,18 @@ def test_m1_sparse_dynamic_preview_uses_no_jacobian_data_and_no_sparsity_provena
 
     result = solve_ode(prepared.request)
 
-    assert prepared.request.jacobian_func is None
+    assert callable(prepared.request.jacobian_func)
     assert prepared.request.jac_sparsity is None
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+    assert identity is not None
+    assert identity["evaluation_snapshot_fingerprint"]
     assert np.asarray(result.Y).shape == (2, 20)
-    assert result.provenance["symbolic_jacobian"] is False
+    assert result.provenance["symbolic_jacobian"] is True
     assert result.provenance["jacobian_sparsity_hint"] is False
+    assert not any("dynamic rate bindings" in warning for warning in prepared.warnings)
 
 
-def test_m9_sparse_dynamic_preview_uses_no_jacobian_data_and_no_sparsity_provenance():
+def test_m9_sparse_dynamic_preview_uses_symbolic_jacobian_after_concrete_override():
     prepared = prepare_simulation_worker_run(
         execution_request=SimulationExecutionRequest(
             prepared_payload=None,
@@ -520,11 +633,15 @@ def test_m9_sparse_dynamic_preview_uses_no_jacobian_data_and_no_sparsity_provena
 
     result = solve_ode(prepared.request)
 
-    assert prepared.request.jacobian_func is None
+    assert callable(prepared.request.jacobian_func)
     assert prepared.request.jac_sparsity is None
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+    assert identity is not None
+    assert identity["evaluation_snapshot_fingerprint"]
     assert np.asarray(result.Y).shape == (8, 20)
-    assert result.provenance["symbolic_jacobian"] is False
+    assert result.provenance["symbolic_jacobian"] is True
     assert result.provenance["jacobian_sparsity_hint"] is False
+    assert not any("dynamic rate bindings" in warning for warning in prepared.warnings)
 
 
 def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_binding():
@@ -545,6 +662,80 @@ def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_bindi
     assert prepared.request.jacobian_func is None
     assert prepared.request.jac_sparsity is None
     assert any("dynamic rate bindings" in warning for warning in prepared.warnings)
+
+
+def test_fitting_candidate_values_use_symbolic_snapshot_identity_when_supported():
+    prepared = prepare_fitting_objective_context(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        param_names=["k1"],
+        t_exp=np.asarray([0.0, 0.5, 1.0], dtype=float),
+        target_species="B",
+        solver="BDF",
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    identity = getattr(prepared.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert identity is not None
+    assert identity["parameter_symbols"] == ["k1"]
+    assert identity["evaluation_snapshot_fingerprint"]
+    assert prepared.request.jac_sparsity is None
+
+
+def test_batch_per_set_parameter_snapshots_do_not_share_symbolic_identity():
+    first = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            mechanism_text="\n".join(
+                [
+                    "reaction: A -> B; k=1.0",
+                    "init: A=1.0, B=0.0",
+                ]
+            ),
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 5},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            parameter_overrides={"k1": 1.5},
+        )
+    )
+    second = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            mechanism_text="\n".join(
+                [
+                    "reaction: A -> B; k=1.0",
+                    "init: A=1.0, B=0.0",
+                ]
+            ),
+            initials={},
+            t_span=(0.0, 1.0),
+            solver_config={
+                "solver": "BDF",
+                "grid": {"N": 5},
+                "use_sparse_jacobian": True,
+                "wegscheider_cyclicity_enabled": False,
+            },
+            parameter_overrides={"k1": 2.5},
+        )
+    )
+
+    first_identity = getattr(first.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+    second_identity = getattr(second.request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+
+    assert first_identity is not None
+    assert second_identity is not None
+    assert first_identity["structure_fingerprint"] == second_identity["structure_fingerprint"]
+    assert first_identity["evaluation_snapshot_fingerprint"] != second_identity["evaluation_snapshot_fingerprint"]
 
 
 def test_execution_request_prepared_payload_rebuilds_symbolic_jacobian_for_batch_path():

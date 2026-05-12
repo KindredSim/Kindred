@@ -72,7 +72,6 @@ class SimulationBatchOwner:
         self._set_status_text = set_status_text
         self._update_batch_row_controls_state = update_batch_row_controls_state
         self._sync_batch_species_columns = sync_batch_species_columns
-        self._symbolic_jacobian_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._symbolic_wegscheider_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 
     def batch_rows_for_scope(self, scope: str) -> List[int]:
@@ -563,28 +562,11 @@ class SimulationBatchOwner:
             return {}
         if not bool(self._mechanism_owner.has_slider_overrides()):
             return {}
-        if self._normalized_slider_overrides(set_id=str(set_id)):
-            return {}
         try:
             mechanism_identity_text = strip_reaction_dsl_initial_concentrations(
                 str(mechanism_text or "")
             )
-            solver_identity = repr(
-                {
-                    "solver": str(dict(solver_config or {}).get("solver") or ""),
-                    "use_sparse_jacobian": bool(
-                        dict(solver_config or {}).get("use_sparse_jacobian", False)
-                    ),
-                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
-                    "wegscheider_cyclicity_enabled": bool(
-                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
-                    ),
-                }
-            )
-            cache_key = (mechanism_identity_text, solver_identity)
-            cached = self._symbolic_jacobian_identity_cache.get(cache_key)
-            if cached is not None:
-                return dict(cached)
+            parameter_overrides = self._normalized_slider_overrides(set_id=str(set_id))
             from kindred.core.simulation_preparation import (
                 symbolic_jacobian_identity_for_execution_text,
             )
@@ -592,10 +574,10 @@ class SimulationBatchOwner:
             payload = symbolic_jacobian_identity_for_execution_text(
                 mechanism_text=mechanism_identity_text,
                 solver_config=dict(solver_config or {}),
+                parameter_overrides=parameter_overrides,
             )
             if not payload:
                 return {}
-            self._symbolic_jacobian_identity_cache[cache_key] = dict(payload)
             return dict(payload)
         except Exception:
             return {}
@@ -643,6 +625,10 @@ class SimulationBatchOwner:
 
     def current_workspace_preview_identity(self, *, set_id: str) -> SimulationIdentity:
         mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
+        symbolic_mechanism_text = self._mechanism_text_for_workspace_selection(
+            set_id=str(set_id),
+            apply_parameter_overrides=False,
+        )
         expected_solver_config, expected_t_end, expected_overlay_token = self._current_workspace_preview_context(
             set_id=str(set_id),
             mechanism_text=mechanism_text,
@@ -698,7 +684,7 @@ class SimulationBatchOwner:
             execution_flags=("fast_mode",),
             symbolic_jacobian_identity=self._symbolic_jacobian_identity_for_preview(
                 set_id=str(set_id),
-                mechanism_text=mechanism_text,
+                mechanism_text=symbolic_mechanism_text,
                 solver_config=expected_solver_config,
             ),
             symbolic_wegscheider_identity=self._symbolic_wegscheider_identity_for_preview(
@@ -1022,14 +1008,19 @@ class SimulationBatchOwner:
             return BatchCacheEntryReadResult("invalid")
         return BatchCacheEntryReadResult("missing")
 
-    def _mechanism_text_for_workspace_selection(self, *, set_id: str) -> str:
+    def _mechanism_text_for_workspace_selection(
+        self,
+        *,
+        set_id: str,
+        apply_parameter_overrides: bool = True,
+    ) -> str:
         reactions_text = self._mechanism_owner.mechanism_reactions_text_raw()
-        if self._mechanism_owner.has_slider_overrides():
+        if self._mechanism_owner.has_slider_overrides() and bool(apply_parameter_overrides):
             reactions_text = self._mechanism_owner.apply_overrides_to_text(reactions_text, set_id=str(set_id))
         reactions_text = strip_reaction_dsl_initial_concentrations(reactions_text)
 
         state_network_dsl = self._mechanism_owner.mechanism_state_network_dsl_raw()
-        if self._mechanism_owner.has_slider_overrides():
+        if self._mechanism_owner.has_slider_overrides() and bool(apply_parameter_overrides):
             state_network_dsl = self._mechanism_owner.apply_overrides_to_state_network_dsl(
                 state_network_dsl,
                 set_id=str(set_id),
@@ -1038,7 +1029,7 @@ class SimulationBatchOwner:
         full_dsl = reactions_text
         if state_network_dsl.strip():
             full_dsl += "\n\n# State Network\n" + state_network_dsl
-        if self._mechanism_owner.has_slider_overrides():
+        if self._mechanism_owner.has_slider_overrides() and bool(apply_parameter_overrides):
             full_dsl = self._mechanism_owner.apply_parameter_overrides_to_dsl(
                 full_dsl,
                 self._normalized_slider_overrides(set_id=str(set_id)),

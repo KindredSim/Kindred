@@ -560,9 +560,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._bulk_invert_button = QtWidgets.QPushButton("Invert", group)
         self._bulk_invert_button.setObjectName("global_fit_fit_targets_bulk_invert")
         self._bulk_invert_button.clicked.connect(lambda: self._apply_bulk_action("invert"))
+        self._copy_targets_button = QtWidgets.QPushButton("Copy Targets to Compatible", group)
+        self._copy_targets_button.setObjectName("global_fit_fit_targets_copy_compatible")
+        self._copy_targets_button.clicked.connect(self._copy_targets_to_compatible_datasets)
         bulk_row.addWidget(self._bulk_all_button)
         bulk_row.addWidget(self._bulk_none_button)
         bulk_row.addWidget(self._bulk_invert_button)
+        bulk_row.addWidget(self._copy_targets_button)
         bulk_row.addStretch(1)
         self._footer.body_layout.addLayout(bulk_row)
 
@@ -678,6 +682,53 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._fit_targets_selection_pending[ds_id] = updated
         self._sync_visible_include_states()
         self._update_combined_dirty_state()
+
+    def _copy_targets_to_compatible_datasets(self) -> None:
+        source_id = str(self._current_dataset_id or "").strip()
+        if not source_id:
+            return
+        selected = {
+            str(name)
+            for name in self._fit_targets_selection_pending.get(source_id, set())
+            if str(name).strip()
+        }
+        if not selected:
+            self.statusMessage.emit("No targets selected to copy")
+            return
+
+        included_ids = [
+            str(ds_id)
+            for ds_id in (self._included_dataset_ids_getter() or [])
+            if str(ds_id).strip() and str(ds_id) != source_id
+        ]
+        copied: list[str] = []
+        skipped: dict[str, list[str]] = {}
+        for ds_id in included_ids:
+            available = set(self._fit_targets_available_by_dataset.get(ds_id, []))
+            missing = sorted(selected - available)
+            if missing:
+                skipped[ds_id] = missing
+                continue
+            self._fit_targets_selection_pending[str(ds_id)] = set(selected)
+            copied.append(str(ds_id))
+
+        self._sync_visible_include_states()
+        self._update_combined_dirty_state()
+        self.statusMessage.emit(self._copy_targets_status_message(copied, skipped))
+
+    @staticmethod
+    def _copy_targets_status_message(copied: Sequence[str], skipped: Dict[str, list[str]]) -> str:
+        copied_count = len(list(copied or ()))
+        skipped_count = len(dict(skipped or {}))
+        dataset_word = "dataset" if copied_count == 1 else "datasets"
+        message = f"Copied targets to {copied_count} {dataset_word}"
+        if skipped_count:
+            first_missing = next(iter(dict(skipped).values()), [])
+            first = ", ".join(str(name) for name in first_missing[:2])
+            extra = len(first_missing) - min(len(first_missing), 2)
+            missing_summary = first + (f" + {extra} more" if extra > 0 else "")
+            message += f"; skipped {skipped_count} missing {missing_summary}"
+        return message
 
     # ------------------------------------------------------------------
     # Table population
@@ -1433,6 +1484,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._footer.setEnabled(not running)
         for btn in (getattr(self, "_bulk_all_button", None),
                     getattr(self, "_bulk_none_button", None),
-                    getattr(self, "_bulk_invert_button", None)):
+                    getattr(self, "_bulk_invert_button", None),
+                    getattr(self, "_copy_targets_button", None)):
             if btn is not None:
                 btn.setEnabled(not running)

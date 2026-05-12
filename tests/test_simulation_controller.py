@@ -26,6 +26,7 @@ from kindred.gui.controllers.simulation_completion_publication import Completion
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.main_window_mechanism_helpers import MainWindowMechanismHelpers
 from kindred.gui.ports import SliderReplayIntent, SimulationUiPorts
+from kindred.gui.simulation_run_ui_owner import SimulationRunUiOwner
 from kindred.gui.simulation_worker import SimulationWorker
 from tests.worker_stubs import make_stubborn_worker
 from tests.batch_context_test_helpers import seed_batch_context
@@ -50,6 +51,28 @@ class _RecordingLanePool:
 
     def close(self, *, kill: bool = False) -> None:
         self.close_calls.append(bool(kill))
+
+
+@pytest.mark.unit
+def test_simulation_run_ui_owner_clears_algebra_status_tooltip(qt_app) -> None:
+    owner = SimulationRunUiOwner(
+        schedule_runtime_availability_refresh=lambda **_kwargs: None,
+        results_table_getter=lambda: None,
+    )
+    algebra_label = QtWidgets.QLabel()
+    owner.bind_widgets(
+        run_button=QtWidgets.QPushButton(),
+        stop_button=QtWidgets.QPushButton(),
+        progress=QtWidgets.QProgressBar(),
+        status_label=QtWidgets.QLabel(),
+        algebra_status_label=algebra_label,
+    )
+
+    owner.set_algebra_status_text("Algebra: 1 ok, 1 error", details="bad algebra")
+    owner.set_algebra_status_text("")
+
+    assert algebra_label.text() == ""
+    assert algebra_label.toolTip() == ""
 
 
 def _join_active_batch_requests(controller: SimulationController) -> None:
@@ -592,8 +615,10 @@ class _FakeMainWindow(QtCore.QObject):
         self._sim_progress.repaint()
         self._status_label.repaint()
 
-    def set_algebra_status_text(self, text: str) -> None:
+    def set_algebra_status_text(self, text: str, *, details: Optional[str] = None) -> None:
         self._algebra_status_label.setText(str(text))
+        if hasattr(self._algebra_status_label, "setToolTip"):
+            self._algebra_status_label.setToolTip(str(details or ""))
 
     def message_box_warning(self, title: str, message: str) -> None:
         QtWidgets.QMessageBox.warning(None, str(title), str(message))
@@ -1504,7 +1529,7 @@ def test_simulation_identity_for_supported_symbolic_jacobian_uses_actual_artifac
 
 
 @pytest.mark.unit
-def test_symbolic_jacobian_identity_cache_keys_include_wegscheider_cyclicity_mode(
+def test_symbolic_jacobian_identity_respects_wegscheider_cyclicity_mode(
     controller: SimulationController,
     mw: _FakeMainWindow,
 ) -> None:
@@ -1532,7 +1557,7 @@ def test_symbolic_jacobian_identity_cache_keys_include_wegscheider_cyclicity_mod
 
 
 @pytest.mark.unit
-def test_fast_preview_identity_omits_symbolic_jacobian_for_slider_parameter_overrides(
+def test_fast_preview_identity_includes_symbolic_snapshot_for_slider_parameter_overrides(
     controller: SimulationController,
     mw: _FakeMainWindow,
 ) -> None:
@@ -1546,6 +1571,12 @@ def test_fast_preview_identity_omits_symbolic_jacobian_for_slider_parameter_over
     _install_mechanism_editor_text(mw, mechanism_text)
     mw._slider_overrides = {"k1": 0.4}
     mw._simulation_param_fingerprints = {"set1": "slider-k1"}
+    mw._apply_parameter_overrides_to_dsl = MagicMock(
+        side_effect=lambda text, parameters: str(text).replace(
+            "k=0.2",
+            f"k={float(parameters['k1'])}",
+        )
+    )
 
     identity = controller._simulation_identity_for_set(
         set_id="set1",
@@ -1560,11 +1591,35 @@ def test_fast_preview_identity_omits_symbolic_jacobian_for_slider_parameter_over
         fast_mode=True,
     )
 
-    assert "symbolic_jacobian_identity" not in identity.to_payload()
+    symbolic_identity = identity.to_payload()["symbolic_jacobian_identity"]
+    assert symbolic_identity["kind"] == "jacobian"
+    assert symbolic_identity["parameter_symbols"] == ["k1"]
+    assert symbolic_identity["evaluation_snapshot_fingerprint"]
+
+    mw._slider_overrides = {"k1": 0.8}
+    mw._simulation_param_fingerprints = {"set1": "slider-k1-updated"}
+    updated_identity = controller._simulation_identity_for_set(
+        set_id="set1",
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 12},
+            "temperature_K": 298.15,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+        t_end=5.0,
+        fast_mode=True,
+    )
+    updated_symbolic_identity = updated_identity.to_payload()["symbolic_jacobian_identity"]
+    assert symbolic_identity["structure_fingerprint"] == updated_symbolic_identity["structure_fingerprint"]
+    assert (
+        symbolic_identity["evaluation_snapshot_fingerprint"]
+        != updated_symbolic_identity["evaluation_snapshot_fingerprint"]
+    )
 
 
 @pytest.mark.unit
-def test_batch_preview_identity_omits_symbolic_jacobian_for_slider_parameter_overrides() -> None:
+def test_batch_preview_identity_includes_symbolic_snapshot_for_slider_parameter_overrides() -> None:
     from kindred.gui.simulation_batch_owner import SimulationBatchOwner
 
     mechanism_owner = MagicMock()
@@ -1612,8 +1667,31 @@ def test_batch_preview_identity_omits_symbolic_jacobian_for_slider_parameter_ove
             "wegscheider_cyclicity_enabled": False,
         },
     )
+    mechanism_owner.slider_overrides.return_value = {"k1": 0.8}
+    updated_payload = owner._symbolic_jacobian_identity_for_preview(
+        set_id="set1",
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 12},
+            "temperature_K": 298.15,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+    )
 
-    assert payload == {}
+    assert payload["backend_name"] == "sympy"
+    assert payload["parameter_symbols"] == ["k1"]
+    assert payload["structure_fingerprint"]
+    assert payload["evaluation_snapshot_fingerprint"]
+    assert payload["structure_fingerprint"] == updated_payload["structure_fingerprint"]
+    assert payload["evaluation_snapshot_fingerprint"] != updated_payload["evaluation_snapshot_fingerprint"]
 
 
 @pytest.mark.unit
@@ -3430,7 +3508,7 @@ def test_on_simulation_complete_uses_base_species_count_for_algebra_status_witho
         cache_key="preview-cache",
     )
 
-    assert mw._algebra_status_label.text == "Algebra: 1 ok, 1 error"
+    assert mw._algebra_status_label.text == "Algebra: 1 ok, 1 error - bad algebra"
 
 @pytest.mark.unit
 def test_on_simulation_complete_prefers_payload_base_species_count_over_mechanism_for_algebra_status(
@@ -3469,7 +3547,7 @@ def test_on_simulation_complete_prefers_payload_base_species_count_over_mechanis
         cache_key="preview-cache",
     )
 
-    assert mw._algebra_status_label.text == "Algebra: 1 ok, 1 error"
+    assert mw._algebra_status_label.text == "Algebra: 1 ok, 1 error - bad algebra"
 
 @pytest.mark.unit
 def test_invalidate_slider_preview_work_keeps_explicit_run_ui_active_when_full_run_still_in_flight(

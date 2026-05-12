@@ -337,12 +337,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             species_dict = (payload or {}).get("species") or {}
             for species_key in species_dict.keys():
                 key = (str(dataset_name), str(species_key))
-                current_species_color = color_manager.get_current_species_color(str(species_key))
-                refreshed[key] = (
-                    current_species_color
-                    if current_species_color is not None
-                    else color_manager.get_non_species_color(str(species_key))
-                )
+                refreshed[key] = color_manager.get_display_series_color(str(species_key))
         self._species_colors = refreshed
 
         for key, button in list(self._color_buttons.items()):
@@ -413,16 +408,31 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                 self.selectionChanged.emit(self.selected_datasets())
 
     def _create_color_button(self, dataset_name: str, species_key: str) -> QtWidgets.QPushButton:
-        """Create a read-only swatch button for a dataset species."""
+        """Create a swatch button for the globally owned species color."""
         btn = QtWidgets.QPushButton()
         btn.setFixedSize(30, 20)
-        btn.setToolTip(f"{species_key} uses a globally owned species color.")
+        btn.setToolTip(f"Set global display color for {species_key}.")
         btn.setFlat(True)
 
         key = (dataset_name, species_key)
+        btn.clicked.connect(lambda _checked=False, k=key: self._choose_species_color(k))
         self._update_color_button_appearance(btn, key)
 
         return btn
+
+    def _choose_species_color(self, key: Tuple[str, str]) -> None:
+        current = self._species_colors.get(key)
+        color = QtWidgets.QColorDialog.getColor(
+            current if current is not None else QtGui.QColor(0, 0, 0),
+            self,
+            "Choose Species Color",
+        )
+        if not color.isValid():
+            return
+        _dataset_name, species_key = key
+        ColorManager.instance().set_species_color_override(str(species_key), color)
+        self.refresh_color_swatches()
+        self.selectionChanged.emit(self.selected_datasets())
 
     def _update_color_button_appearance(self, btn: QtWidgets.QPushButton, key: Tuple[str, str]) -> None:
         """Update button to show current color as a swatch."""

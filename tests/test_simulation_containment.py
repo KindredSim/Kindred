@@ -753,7 +753,7 @@ def test_warm_simulation_owner_preview_sparse_dynamic_override_omits_jacobian_hi
         assert payload["success"] is True
         assert payload["species_names"] == ["A", "B"]
         assert np.asarray(payload["Y"]).shape == (2, 6)
-        assert payload["provenance"]["symbolic_jacobian"] is False
+        assert payload["provenance"]["symbolic_jacobian"] is True
         assert payload["provenance"]["jacobian_sparsity_hint"] is False
     finally:
         owner.close(kill=True)

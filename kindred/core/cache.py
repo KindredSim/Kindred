@@ -47,6 +47,7 @@ import numpy as np
 
 from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.lru_cache import LRUCache
+from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from kindred.core.simulator.solvers import SimulationRequest
@@ -873,6 +874,9 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
             intervention_schedule_fp = str(intervention_schedule.fingerprint)
             intervention_species_names = tuple(str(name) for name in (getattr(req, "species_names", None) or ()))
 
+    symbolic_jacobian_identity = symbolic_jacobian_identity_payload(getattr(req, "jacobian_func", None))
+    symbolic_wegscheider_identity = getattr(req, "symbolic_wegscheider_identity", None)
+
     payload = (
         tuple(map(float, req.t_span)),
         y0_tuple,
@@ -881,7 +885,8 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
         float(req.atol),
         grid_items,
         t_eval_tuple,
-        bool(getattr(req, "jacobian_func", None)),
+        dict(symbolic_jacobian_identity or {}) if symbolic_jacobian_identity else bool(getattr(req, "jacobian_func", None)),
+        dict(symbolic_wegscheider_identity or {}) if isinstance(symbolic_wegscheider_identity, Mapping) else None,
         jac_tag,
         schedule_fp,
         intervention_schedule_fp,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, Sequence
 
 from PySide6 import QtCore, QtGui
@@ -65,6 +66,7 @@ class ColorManager:
         self._species_slots: dict[str, int] = {}
         self._registered_species_roster: tuple[str, ...] = ()
         self._current_roster_preview_slots: dict[str, int] = {}
+        self._species_color_overrides: dict[str, QtGui.QColor] = {}
         self._species_palette: tuple[QtGui.QColor, ...] = self._build_species_palette()
 
     @classmethod
@@ -184,6 +186,9 @@ class ColorManager:
         canonical = self.resolve_species_key(species_name, known_species=known_species)
         if not canonical:
             return QtGui.QColor(*self._NON_SPECIES_PALETTE[0])
+        override = self._species_color_overrides.get(canonical)
+        if override is not None:
+            return QtGui.QColor(override)
         current_slot = self._registered_roster_slot(canonical)
         if current_slot is not None:
             return self._species_color_for_slot(current_slot)
@@ -198,10 +203,36 @@ class ColorManager:
         canonical = self.resolve_current_species_key(species_name, known_species=known_species)
         if not canonical:
             return None
+        override = self._species_color_overrides.get(canonical)
+        if override is not None:
+            return QtGui.QColor(override)
         current_slot = self._registered_roster_slot(canonical)
         if current_slot is not None:
             return self._species_color_for_slot(current_slot)
         return self._species_color_for_key(canonical)
+
+    def get_display_series_color(
+        self,
+        series_name: str,
+        *,
+        known_species: Sequence[str] | None = None,
+    ) -> QtGui.QColor:
+        """
+        Return the effective display color for a species or dataset column.
+
+        Current-roster species keep species-owned palette and alias semantics.
+        Non-roster dataset columns remain neutral unless the user set an exact
+        display override for that raw column key.
+        """
+        raw = str(series_name or "").strip()
+        current_species_color = self.get_current_species_color(raw, known_species=known_species)
+        if current_species_color is not None:
+            return current_species_color
+        canonical = self.resolve_species_key(raw, known_species=known_species)
+        override = self._species_color_overrides.get(canonical)
+        if override is not None:
+            return QtGui.QColor(override)
+        return self.get_non_species_color(raw)
 
     def get_species_rgb(
         self,
@@ -218,6 +249,38 @@ class ColorManager:
             return QtGui.QColor(*self._NON_SPECIES_PALETTE[0])
         idx = sum(ord(ch) for ch in key) % len(self._NON_SPECIES_PALETTE)
         return QtGui.QColor(*self._NON_SPECIES_PALETTE[idx])
+
+    def set_species_color_override(
+        self,
+        species_name: str,
+        color: str | Sequence[int] | QtGui.QColor,
+        *,
+        known_species: Sequence[str] | None = None,
+    ) -> None:
+        canonical = self.resolve_species_key(species_name, known_species=known_species)
+        if not canonical:
+            raise ValueError("Species color override requires a species name.")
+        self._species_color_overrides[canonical] = self._coerce_override_color(color)
+
+    def clear_species_color_override(
+        self,
+        species_name: str,
+        *,
+        known_species: Sequence[str] | None = None,
+    ) -> None:
+        canonical = self.resolve_species_key(species_name, known_species=known_species)
+        if canonical:
+            self._species_color_overrides.pop(canonical, None)
+
+    def clear_species_color_overrides(self) -> None:
+        self._species_color_overrides.clear()
+
+    def species_color_override_rgb(self, species_name: str) -> tuple[int, int, int] | None:
+        canonical = self.resolve_species_key(species_name)
+        color = self._species_color_overrides.get(canonical)
+        if color is None:
+            return None
+        return (int(color.red()), int(color.green()), int(color.blue()))
 
     def get_dataset_symbol(self, dataset_index: int) -> str:
         return self._DATASET_SYMBOLS[int(dataset_index) % len(self._DATASET_SYMBOLS)]
@@ -236,6 +299,31 @@ class ColorManager:
             seen.add(name)
             cleaned.append(name)
         return cleaned
+
+    @staticmethod
+    def _coerce_override_color(color: str | Sequence[int] | QtGui.QColor) -> QtGui.QColor:
+        if isinstance(color, QtGui.QColor):
+            qcolor = QtGui.QColor(color)
+        elif isinstance(color, str):
+            raw = str(color).strip()
+            if re.fullmatch(r"#[0-9A-Fa-f]{6}", raw):
+                qcolor = QtGui.QColor(raw)
+            else:
+                match = re.fullmatch(
+                    r"(?:rgb\()?\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*[, ]\s*(\d{1,3})\s*\)?",
+                    raw,
+                )
+                if not match:
+                    raise ValueError(f"Invalid species color: {color!r}")
+                qcolor = QtGui.QColor(*(int(part) for part in match.groups()))
+        else:
+            parts = list(color)
+            if len(parts) != 3:
+                raise ValueError("RGB species color overrides must have exactly three components.")
+            qcolor = QtGui.QColor(*(int(part) for part in parts))
+        if not qcolor.isValid():
+            raise ValueError(f"Invalid species color: {color!r}")
+        return qcolor
 
     def _resolution_roster(self, known_species: Sequence[str] | None) -> tuple[str, ...]:
         if self._registered_species_roster:

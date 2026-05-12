@@ -250,7 +250,6 @@ class SimulationController(QtCore.QObject):
         self._authoritative_runtime_input_epoch = 0
         self._authoritative_runtime_input_global_epoch = 0
         self._authoritative_runtime_input_set_epoch_by_set_id: Dict[str, int] = {}
-        self._symbolic_jacobian_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._symbolic_wegscheider_identity_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 
         # Parallel batch orchestration (warm lane owner adapter)
@@ -866,7 +865,10 @@ class SimulationController(QtCore.QObject):
             self.ui.run_ui.set_sim_progress_value(int(effects.progress_value))
         if effects.algebra_status_text is not None:
             try:
-                self.ui.run_ui.set_algebra_status_text(str(effects.algebra_status_text))
+                self.ui.run_ui.set_algebra_status_text(
+                    str(effects.algebra_status_text),
+                    details=effects.algebra_status_details,
+                )
             except Exception as exc:
                 self._record_nonfatal_exception(
                     "Failed to apply algebra status label simulation lifecycle effect",
@@ -3370,29 +3372,17 @@ class SimulationController(QtCore.QObject):
             return {}
         if not bool(dict(solver_config or {}).get("use_sparse_jacobian", False)):
             return {}
-        if bool(fast_mode) and self.ui.mechanism.slider_overrides(set_id=str(set_id)):
-            return {}
         try:
             mechanism_text = self._request_mechanism_text_for_set(
                 set_id=str(set_id),
                 has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+                apply_parameter_overrides=False,
             )
-            solver_identity = repr(
-                {
-                    "solver": str(dict(solver_config or {}).get("solver") or ""),
-                    "use_sparse_jacobian": bool(
-                        dict(solver_config or {}).get("use_sparse_jacobian", False)
-                    ),
-                    "temperature_K": dict(solver_config or {}).get("temperature_K"),
-                    "wegscheider_cyclicity_enabled": bool(
-                        dict(solver_config or {}).get("wegscheider_cyclicity_enabled", True)
-                    ),
-                }
+            parameter_overrides = (
+                self.ui.mechanism.slider_overrides(set_id=str(set_id))
+                if bool(fast_mode) and self.ui.mechanism.has_slider_overrides()
+                else {}
             )
-            cache_key = (str(mechanism_text or ""), solver_identity)
-            cached = self._symbolic_jacobian_identity_cache.get(cache_key)
-            if cached is not None:
-                return dict(cached)
             from kindred.core.simulation_preparation import (
                 symbolic_jacobian_identity_for_execution_text,
             )
@@ -3400,10 +3390,10 @@ class SimulationController(QtCore.QObject):
             payload = symbolic_jacobian_identity_for_execution_text(
                 mechanism_text=str(mechanism_text or ""),
                 solver_config=dict(solver_config or {}),
+                parameter_overrides=parameter_overrides,
             )
             if not payload:
                 return {}
-            self._symbolic_jacobian_identity_cache[cache_key] = dict(payload)
             return dict(payload)
         except Exception:
             return {}
@@ -3542,9 +3532,10 @@ class SimulationController(QtCore.QObject):
         *,
         set_id: str,
         has_slider_overrides: bool,
+        apply_parameter_overrides: bool = True,
     ) -> str:
         set_reactions_text = self.ui.mechanism.mechanism_reactions_text_raw()
-        if has_slider_overrides:
+        if has_slider_overrides and bool(apply_parameter_overrides):
             set_reactions_text = self.ui.mechanism.apply_overrides_to_text(
                 set_reactions_text,
                 set_id=str(set_id),
@@ -3552,7 +3543,7 @@ class SimulationController(QtCore.QObject):
         set_reactions_text = strip_reaction_dsl_initial_concentrations(set_reactions_text)
 
         set_state_network_dsl = self.ui.mechanism.mechanism_state_network_dsl_raw()
-        if has_slider_overrides:
+        if has_slider_overrides and bool(apply_parameter_overrides):
             set_state_network_dsl = self.ui.mechanism.apply_overrides_to_state_network_dsl(
                 set_state_network_dsl,
                 set_id=str(set_id),
@@ -3561,7 +3552,7 @@ class SimulationController(QtCore.QObject):
         request_mechanism_text = set_reactions_text
         if set_state_network_dsl.strip():
             request_mechanism_text += "\n\n# State Network\n" + set_state_network_dsl
-        if has_slider_overrides:
+        if has_slider_overrides and bool(apply_parameter_overrides):
             request_mechanism_text = self._apply_parameter_override_fallback_to_dsl(
                 request_mechanism_text,
                 set_id=str(set_id),

@@ -13,6 +13,8 @@ __all__ = [
 
 
 _INVALID_BRUSH = QtGui.QBrush(QtGui.QColor(255, 210, 210))
+_MAX_SET_NAME_COLUMN_WIDTH = 220
+_MAX_SPECIES_COLUMN_WIDTH = 160
 
 
 class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
@@ -417,6 +419,10 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             self.resizeColumnToContents(column)
             if column == 0 and self.columnWidth(column) < set_name_min:
                 self.setColumnWidth(column, set_name_min)
+            max_width = _MAX_SET_NAME_COLUMN_WIDTH if column == 0 else _MAX_SPECIES_COLUMN_WIDTH
+            if self.columnWidth(column) > max_width:
+                self.setColumnWidth(column, max_width)
+        self.horizontalHeader().setMaximumSectionSize(_MAX_SET_NAME_COLUMN_WIDTH)
 
     def _control_index_at_event(self, event: QtGui.QMouseEvent) -> QtCore.QModelIndex | None:
         if event.button() != QtCore.Qt.LeftButton:

@@ -94,6 +94,39 @@ def test_color_manager_lookup_does_not_mutate_registered_species_roster() -> Non
     assert _rgb(manager.get_species_color("A_conc", known_species=["A_conc"])) == _rgb(manager.get_species_color("A"))
 
 
+def test_color_manager_species_color_overrides_accept_hex_and_rgb_and_reset() -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+    manager.set_species_roster(["A", "B"])
+    default_a = _rgb(manager.get_species_color("A"))
+
+    manager.set_species_color_override("A", "#123456")
+    manager.set_species_color_override("B", "10, 20, 30")
+
+    assert _rgb(manager.get_species_color("A")) == (18, 52, 86)
+    assert manager.get_species_rgb("B") == (10, 20, 30)
+
+    manager.clear_species_color_override("A")
+    assert _rgb(manager.get_species_color("A")) == default_a
+
+
+def test_color_manager_override_uses_canonical_species_alias_and_rejects_invalid() -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+    manager.set_species_roster(["A"])
+
+    manager.set_species_color_override("A_conc", (1, 2, 3))
+    assert _rgb(manager.get_species_color("A")) == (1, 2, 3)
+    assert _rgb(manager.get_species_color("A_conc", known_species=["A_conc"])) == (1, 2, 3)
+
+    with pytest.raises(ValueError):
+        manager.set_species_color_override("A", "not-a-color")
+
+
 def test_color_manager_current_roster_preview_colors_do_not_drift_after_unrelated_slot_growth() -> None:
     from kindred.gui.color_manager import ColorManager
 
@@ -344,6 +377,66 @@ def test_dataset_plot_panel_uses_global_species_colors_for_data_and_model(qt_app
 
 
 @pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
+def test_species_color_override_updates_main_overlay_dataset_and_grid_plots(qt_app) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+    manager.set_species_roster(["A"])
+    manager.set_species_color_override("A", "#010203")
+    expected = (1, 2, 3)
+    t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+    a = np.asarray([1.0, 0.5, 0.2], dtype=float)
+
+    panel_cls = get_plot_panel_class()
+    panel = panel_cls()
+    dataset_panel = DatasetPlotPanel(dataset_name="ds1")
+    grid = GridPlotView()
+    try:
+        panel.set_data(t, {"A": a}, label="set1", overlays=[], owned_species=["A"])
+        panel.set_overlay_catalog({"ds1": {"t": t, "species": {"A": a}}})
+        panel._overlay_panel.reconcile_selection(
+            previous_selected_datasets=[],
+            previous_enabled_species={},
+            include_dataset_ids=["ds1"],
+            ordered_dataset_ids=["ds1"],
+            allow_default_include=True,
+            emit=True,
+        )
+        dataset_panel.set_data(t, a, xlabel="Time", ylabel="A", all_species={"A": a})
+        dataset_panel.plot_simulation_results(t, {"A": a * 0.9})
+        grid.set_datasets([
+            {
+                "name": "ds1",
+                "data_x": t,
+                "data_y": a,
+                "model_x": t,
+                "model_y": a * 0.9,
+                "model_series": {"A": a * 0.9},
+                "all_species": {"A": a},
+                "current_species": "A",
+            }
+        ])
+        qt_app.processEvents()
+
+        assert panel._colors["A"] == expected
+        assert _brush_rgb(panel._overlay_items[("ds1", "A")].opts["brush"]) == expected
+        backend = dataset_panel._plot_panel
+        assert _brush_rgb(backend._dataset_scatter_items["A"].opts["brush"]) == expected
+        assert _pen_rgb(backend._dataset_model_items["A"].opts["pen"]) == expected
+        assert _pen_rgb(grid._plot_series_items[0]["A::model"].opts["pen"]) == expected
+
+        exported = panel.export_payload()
+        assert exported is not None
+        assert "colors" not in exported
+    finally:
+        panel.close()
+        dataset_panel.close()
+        grid.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
 def test_main_plot_owned_species_roster_shrink_preserves_surviving_species_colors(qt_app) -> None:
     from kindred.gui.color_manager import ColorManager
 
@@ -437,6 +530,134 @@ def test_overlay_selector_swatches_canonicalize_dataset_aliases_to_species_color
         expected = _rgb(manager.get_species_color("A"))
         assert _rgb(colors[("ds1", "A")]) == expected
         assert _rgb(colors[("ds2", "A_conc")]) == expected
+    finally:
+        panel.close()
+        qt_app.processEvents()
+
+
+def test_overlay_swatch_click_sets_global_species_color_override(qt_app, monkeypatch) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+    manager.set_current_species_roster(["A"])
+    panel = DatasetOverlayPanel()
+    try:
+        panel.set_datasets({"ds1": {"species": {"A": np.asarray([1.0])}}})
+        emitted: list[list[str]] = []
+        panel.selectionChanged.connect(lambda names: emitted.append(list(names)))
+        monkeypatch.setattr(
+            "kindred.gui.widgets.dataset_overlay_panel.QtWidgets.QColorDialog.getColor",
+            lambda *args, **kwargs: QtGui.QColor(4, 5, 6),
+        )
+
+        button = panel._color_buttons[("ds1", "A")]
+        button.click()
+
+        assert manager.get_species_rgb("A") == (4, 5, 6)
+        assert _rgb(panel.species_colors()[("ds1", "A")]) == (4, 5, 6)
+        assert emitted
+    finally:
+        panel.close()
+        qt_app.processEvents()
+
+
+def test_overlay_swatch_click_updates_unmatched_column_without_current_roster(qt_app, monkeypatch) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    panel = DatasetOverlayPanel()
+    try:
+        panel.set_datasets({"ds1": {"species": {"unmatched_signal": np.asarray([1.0])}}})
+        monkeypatch.setattr(
+            "kindred.gui.widgets.dataset_overlay_panel.QtWidgets.QColorDialog.getColor",
+            lambda *args, **kwargs: QtGui.QColor(4, 5, 6),
+        )
+
+        panel._color_buttons[("ds1", "unmatched_signal")].click()
+
+        assert _rgb(panel.species_colors()[("ds1", "unmatched_signal")]) == (4, 5, 6)
+    finally:
+        panel.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
+def test_overlay_swatch_click_recolors_existing_unmatched_overlay_item(qt_app, monkeypatch) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    panel_cls = get_plot_panel_class()
+    panel = panel_cls()
+    try:
+        t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+        signal = np.asarray([1.0, 0.5, 0.25], dtype=float)
+        panel.set_data(t, {"A": signal}, label="set1", overlays=[], owned_species=["A"])
+        panel.set_overlay_catalog({"ds1": {"t": t, "species": {"unmatched_signal": signal}}})
+        panel._overlay_panel.reconcile_selection(
+            previous_selected_datasets=[],
+            previous_enabled_species={},
+            include_dataset_ids=["ds1"],
+            ordered_dataset_ids=["ds1"],
+            allow_default_include=True,
+            emit=True,
+        )
+        qt_app.processEvents()
+
+        original = _brush_rgb(panel._overlay_items[("ds1", "unmatched_signal")].opts["brush"])
+        assert original != (4, 5, 6)
+        monkeypatch.setattr(
+            "kindred.gui.widgets.dataset_overlay_panel.QtWidgets.QColorDialog.getColor",
+            lambda *args, **kwargs: QtGui.QColor(4, 5, 6),
+        )
+
+        panel._overlay_panel._color_buttons[("ds1", "unmatched_signal")].click()
+        qt_app.processEvents()
+
+        assert _brush_rgb(panel._overlay_items[("ds1", "unmatched_signal")].opts["brush"]) == (4, 5, 6)
+    finally:
+        panel.close()
+        qt_app.processEvents()
+
+
+@pytest.mark.skipif(not is_pyqtgraph_available(), reason="pyqtgraph not installed")
+def test_overlay_swatch_click_recolors_existing_main_and_simulation_lines(qt_app, monkeypatch) -> None:
+    from kindred.gui.color_manager import ColorManager
+
+    ColorManager.reset_for_tests()
+    manager = ColorManager.instance()
+    manager.set_current_species_roster(["A"])
+    panel_cls = get_plot_panel_class()
+    panel = panel_cls()
+    try:
+        t = np.asarray([0.0, 1.0, 2.0], dtype=float)
+        a = np.asarray([1.0, 0.5, 0.25], dtype=float)
+        panel.set_data(
+            t,
+            {"A": a},
+            label="set1",
+            overlays=[{"label": "set2", "t": t, "series": {"A": a * 0.8}}],
+            owned_species=["A"],
+        )
+        panel.set_overlay_catalog({"ds1": {"t": t, "species": {"A": a}}})
+        qt_app.processEvents()
+
+        original = panel._colors["A"]
+        assert original != (4, 5, 6)
+        monkeypatch.setattr(
+            "kindred.gui.widgets.dataset_overlay_panel.QtWidgets.QColorDialog.getColor",
+            lambda *args, **kwargs: QtGui.QColor(4, 5, 6),
+        )
+
+        panel._overlay_panel._color_buttons[("ds1", "A")].click()
+        qt_app.processEvents()
+
+        primary_key = panel._format_species_set_label("A", "set1")
+        overlay_key = panel._format_species_set_label("A", "set2")
+        assert manager.get_species_rgb("A") == (4, 5, 6)
+        assert panel._colors["A"] == (4, 5, 6)
+        assert _pen_rgb(panel._plot_items[primary_key].opts["pen"]) == (4, 5, 6)
+        assert _pen_rgb(panel._plot_items[overlay_key].opts["pen"]) == (4, 5, 6)
     finally:
         panel.close()
         qt_app.processEvents()

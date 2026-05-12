@@ -61,3 +61,20 @@ def test_on_slider_changed_at_edges_does_not_throw_and_preserves_bounds(qtbot):
 
     assert sliders._value_to_slider_pos("k1", 1e-12) == min_pos
     assert sliders._value_to_slider_pos("k1", 1e12) == max_pos
+
+
+def test_variable_slider_label_is_bounded_and_preserves_full_tooltip(qtbot):
+    widget = VariableSliders()
+    qtbot.addWidget(widget)
+    long_name = "rate_" + ("very_long_" * 18)
+    long_label = "metadata " + ("label " * 24)
+
+    widget.set_variables(
+        {long_name: 1.0},
+        metadata={long_name: {"label": long_label, "unit": "M/s", "scale": "linear"}},
+    )
+
+    label = widget._labels[long_name]
+    assert label.maximumWidth() <= 260
+    assert label.toolTip() == f"{long_name} ({long_label}) [M/s]"
+    assert label.text() != label.toolTip()

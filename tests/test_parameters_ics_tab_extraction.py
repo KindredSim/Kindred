@@ -8,7 +8,13 @@ from PySide6 import QtWidgets
 pytestmark = [pytest.mark.gui]
 
 
-def _make_tab(*, entries=None, species=None, integration_defaults=("BDF", 1e-6, 1e-12)):
+def _make_tab(
+    *,
+    entries=None,
+    species=None,
+    integration_defaults=("BDF", 1e-6, 1e-12),
+    reactions_text="",
+):
     from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 
     if entries is None:
@@ -33,7 +39,7 @@ def _make_tab(*, entries=None, species=None, integration_defaults=("BDF", 1e-6, 
         dataset_entries_getter=lambda: list(entries),
         worker_running_getter=lambda: False,
         dataset_manager_getter=lambda: None,
-        reactions_text_getter=lambda: "",
+        reactions_text_getter=lambda: str(reactions_text),
         integration_defaults=integration_defaults,
         config_defaults={},
         initial_parameter_defaults_getter=initial_parameter_defaults_getter,
@@ -178,6 +184,40 @@ def test_ic_applied_handler_updates_parameter_state(qt_app):
         assert len(init_a_rows) == 1
         assert init_a_rows[0]["fit"] is True
         assert init_a_rows[0]["value"] == 5.0
+    finally:
+        tab.close()
+        qt_app.processEvents()
+
+
+def test_view_steps_dialog_lists_mechanism_steps_read_only(qt_app, qtbot):
+    reactions_text = "\n".join(
+        [
+            "reaction: A + OH -> AO; k=1.0",
+            "equilibrium: C + O <-> CO; kf=2.0; kr=0.5",
+            "reaction: P -> Q; k=0.2",
+            "init: A=1, OH=1, AO=0, C=1, O=1, CO=0, P=1, Q=0",
+        ]
+    )
+    tab = _make_tab(
+        species=["A", "OH", "AO", "C", "O", "CO", "P", "Q"],
+        reactions_text=reactions_text,
+    )
+    try:
+        before_state = tab.get_parameter_state()
+        tab._show_mechanism_steps_dialog()
+        dialog = tab._last_steps_dialog
+        qtbot.addWidget(dialog)
+
+        assert dialog.windowTitle() == "Mechanism Steps"
+        text = dialog.findChild(QtWidgets.QPlainTextEdit)
+        assert text is not None
+        assert text.isReadOnly() is True
+        body = text.toPlainText()
+        assert "Step 1    A + OH -> AO" in body
+        assert "Step 2    C + O <-> CO" in body
+        assert "Step 3    P -> Q" in body
+        assert "kN, kfN, krN, and KeqN refer to Step N" in body
+        assert tab.get_parameter_state() == before_state
     finally:
         tab.close()
         qt_app.processEvents()

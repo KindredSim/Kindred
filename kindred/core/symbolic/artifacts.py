@@ -32,6 +32,9 @@ class SymbolicArtifactIdentity:
     source_fingerprint: str
     artifact_fingerprint: str
     fingerprint: str
+    structure_fingerprint: str = ""
+    evaluation_snapshot_fingerprint: str = ""
+    parameter_symbols: tuple[str, ...] = ()
 
     @classmethod
     def none(cls, metadata: SymbolicBackendMetadata) -> "SymbolicArtifactIdentity":
@@ -42,6 +45,9 @@ class SymbolicArtifactIdentity:
             "profile_version": metadata.profile_version,
             "source_fingerprint": "",
             "artifact_fingerprint": "",
+            "structure_fingerprint": "",
+            "evaluation_snapshot_fingerprint": "",
+            "parameter_symbols": [],
         }
         return cls(
             kind="none",
@@ -50,6 +56,9 @@ class SymbolicArtifactIdentity:
             profile_version=metadata.profile_version,
             source_fingerprint="",
             artifact_fingerprint="",
+            structure_fingerprint="",
+            evaluation_snapshot_fingerprint="",
+            parameter_symbols=(),
             fingerprint=_fingerprint(payload),
         )
 
@@ -60,7 +69,11 @@ class SymbolicArtifactIdentity:
         *,
         source_fingerprint: str,
         artifact_fingerprint: str,
+        structure_fingerprint: str = "",
+        evaluation_snapshot_fingerprint: str = "",
+        parameter_symbols: tuple[str, ...] | list[str] = (),
     ) -> "SymbolicArtifactIdentity":
+        normalized_parameter_symbols = tuple(str(name) for name in (parameter_symbols or ()) if str(name))
         payload = {
             "kind": "jacobian",
             "backend_name": metadata.backend_name,
@@ -68,6 +81,9 @@ class SymbolicArtifactIdentity:
             "profile_version": metadata.profile_version,
             "source_fingerprint": str(source_fingerprint or ""),
             "artifact_fingerprint": str(artifact_fingerprint or ""),
+            "structure_fingerprint": str(structure_fingerprint or source_fingerprint or ""),
+            "evaluation_snapshot_fingerprint": str(evaluation_snapshot_fingerprint or ""),
+            "parameter_symbols": list(normalized_parameter_symbols),
         }
         return cls(
             kind="jacobian",
@@ -76,6 +92,9 @@ class SymbolicArtifactIdentity:
             profile_version=metadata.profile_version,
             source_fingerprint=str(source_fingerprint or ""),
             artifact_fingerprint=str(artifact_fingerprint or ""),
+            structure_fingerprint=str(structure_fingerprint or source_fingerprint or ""),
+            evaluation_snapshot_fingerprint=str(evaluation_snapshot_fingerprint or ""),
+            parameter_symbols=normalized_parameter_symbols,
             fingerprint=_fingerprint(payload),
         )
 
@@ -87,5 +106,8 @@ class SymbolicArtifactIdentity:
             "profile_version": self.profile_version,
             "source_fingerprint": self.source_fingerprint,
             "artifact_fingerprint": self.artifact_fingerprint,
+            "structure_fingerprint": self.structure_fingerprint,
+            "evaluation_snapshot_fingerprint": self.evaluation_snapshot_fingerprint,
+            "parameter_symbols": list(self.parameter_symbols),
             "fingerprint": self.fingerprint,
         }

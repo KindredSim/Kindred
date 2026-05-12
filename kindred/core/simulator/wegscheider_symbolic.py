@@ -18,6 +18,7 @@ from kindred.core.simulator.parameter_algebra_spec import (
     strip_inline_comment,
 )
 from kindred.core.simulator.step_indexing import get_step_index_map
+from kindred.core.symbolic.backend import get_symbolic_backend_metadata
 from kindred.core.symbolic.proof import prove_product_identity
 
 __all__ = [
@@ -57,6 +58,7 @@ class WegscheiderCyclicityReport:
 
     @property
     def symbolic_identity(self) -> dict[str, Any]:
+        metadata = get_symbolic_backend_metadata()
         cycles_payload = [
             {
                 "cycle_id": str(cycle.cycle_id),
@@ -69,11 +71,53 @@ class WegscheiderCyclicityReport:
             }
             for cycle in self.cycles
         ]
+        source_cycles_payload = [
+            {
+                "cycle_id": str(cycle.cycle_id),
+                "step_indices": list(cycle.step_indices),
+                "equilibrium_indices": list(cycle.equilibrium_indices),
+                "coefficients": list(cycle.coefficients),
+                "parameter_names": list(cycle.parameter_names),
+            }
+            for cycle in self.cycles
+        ]
         payload: dict[str, Any] = {
             "kind": "wegscheider_cyclicity",
+            "backend_name": metadata.backend_name,
+            "backend_version": metadata.backend_version,
+            "profile_version": metadata.profile_version,
             "cycles": cycles_payload,
             "resolved": bool(self.is_resolved),
         }
+        source_payload = {
+            "kind": "wegscheider_cyclicity_source",
+            "cycles": source_cycles_payload,
+        }
+        payload["source_fingerprint"] = hashlib.sha256(
+            json.dumps(
+                source_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        payload["artifact_fingerprint"] = hashlib.sha256(
+            json.dumps(
+                {
+                    "kind": "wegscheider_cyclicity_proof",
+                    "resolved": bool(self.is_resolved),
+                    "proof_fingerprints": [
+                        item.get("proof_fingerprint")
+                        for item in cycles_payload
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
         payload["fingerprint"] = hashlib.sha256(
             json.dumps(
                 payload,

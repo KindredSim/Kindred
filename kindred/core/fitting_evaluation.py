@@ -29,8 +29,10 @@ from kindred.core.intervention_schedule import InterventionScheduleError, coerce
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
+    _bind_symbolic_jacobian_for_current_mechanism,
     _build_solver_config,
     _fit_simulation_error_from_preparation_error,
+    _mechanism_supports_dynamic_symbolic_snapshot,
     _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     _solve_request,
     coerce_prepared_simulation_metadata,
@@ -43,6 +45,7 @@ from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, SimulationRequest
 from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
+from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 
 logger = logging.getLogger(__name__)
 
@@ -625,6 +628,7 @@ class SerialFittingEvaluator:
         self._bindings: Dict[str, Any] = {}
         self._species_index: Dict[str, int] = {}
         self._last_shared_fp: Optional[Tuple[Tuple[str, float], ...]] = None
+        self._prepared_solver_config = None
         self._parameter_algebra_spec = None
         self._compiled_algebra = None
         self._kindred_fitting_execution_context = self._context
@@ -845,6 +849,34 @@ class SerialFittingEvaluator:
                     details={"fatal": False, "stage": "intervention_schedule"},
                 ) from exc
 
+        jacobian_func = prepared_run.request.jacobian_func
+        jac_sparsity = prepared_run.request.jac_sparsity
+        prepared_solver_config = self._prepared_solver_config
+        if (
+            prepared_solver_config is not None
+            and bool(getattr(prepared_solver_config, "use_sparse_jacobian", False))
+            and str(getattr(prepared_solver_config, "solver", prepared_run.request.solver)).upper() in {"BDF", "RADAU"}
+            and prepared_run.request.temperature_schedule is None
+            and _mechanism_supports_dynamic_symbolic_snapshot(prepared_run.mechanism)
+        ):
+            try:
+                jacobian_func, symbolic_identity = _bind_symbolic_jacobian_for_current_mechanism(
+                    mechanism=prepared_run.mechanism,
+                    prepared_solver_config=prepared_solver_config,
+                    temperature_K=float(self._context.temperature_K),
+                )
+                jac_sparsity = None
+                self._context = self._context.clone(
+                    prepared_metadata=replace(
+                        self._context.prepared_metadata,
+                        symbolic_jacobian_identity=dict(symbolic_identity),
+                    )
+                )
+                self._kindred_fitting_execution_context = self._context
+            except UnsupportedSymbolicExpressionError:
+                jacobian_func = None
+                jac_sparsity = None
+
         request = SimulationRequest(
             rhs=prepared_run.request.rhs,
             t_span=tuple(map(float, prepared_run.request.t_span)),
@@ -853,8 +885,8 @@ class SerialFittingEvaluator:
             rtol=float(prepared_run.request.rtol),
             atol=float(prepared_run.request.atol),
             grid=dict(prepared_run.request.grid or {}),
-            jacobian_func=prepared_run.request.jacobian_func,
-            jac_sparsity=prepared_run.request.jac_sparsity,
+            jacobian_func=jacobian_func,
+            jac_sparsity=jac_sparsity,
             temperature_schedule=prepared_run.request.temperature_schedule,
             intervention_schedule=intervention_schedule,
             species_names=tuple(prepared_run.species_names),
@@ -945,6 +977,14 @@ class SerialFittingEvaluator:
         self._raise_if_cancel_requested()
         prepared_run = prepare_simulation_worker_run(execution_request=self._context.execution_request)
         self._raise_if_cancel_requested()
+        self._prepared_solver_config = _build_solver_config(
+            solver_input=str(prepared_run.request.solver),
+            rtol=float(prepared_run.request.rtol),
+            atol=float(prepared_run.request.atol),
+            grid=dict(prepared_run.request.grid or {}),
+            use_sparse_jacobian=bool(self._context.prepared_metadata.use_sparse_jacobian),
+            wegscheider_cyclicity_enabled=bool(self._context.prepared_metadata.wegscheider_cyclicity_enabled),
+        )
         prepared_payload = dict(self._context.execution_request.prepared_payload or {})
         bindings = prepared_payload.get("bindings") or {}
         if not isinstance(bindings, Mapping):

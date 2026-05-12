@@ -224,7 +224,7 @@ def build_mechanism_from_ir(
 
     mechanism.metadata["step_index_map"] = step_index_map
 
-    logger.info(
+    logger.debug(
         "Built mechanism from DSL reactions: %s species, %s reactions, %s equilibria",
         len(mechanism.species),
         len(mechanism.reactions),
@@ -233,7 +233,7 @@ def build_mechanism_from_ir(
 
     # Convert state network to additional reactions if present
     if getattr(net, "states")() or getattr(net, "edges")():
-        logger.info("Converting state network to reactions...")
+        logger.debug("Converting state network to reactions...")
         from .state_network_converter import convert_state_network_to_mechanism
 
         rxn_start = len(mechanism.reactions)
@@ -307,7 +307,7 @@ def build_mechanism_from_ir(
             _check_value(getattr(eq, "kr", None), where=f"State-network equilibrium[{i}].kr")
             _check_value(getattr(eq, "Keq", None), where=f"State-network equilibrium[{i}].Keq")
 
-        logger.info(
+        logger.debug(
             "After state network integration: %s species, %s reactions, %s equilibria",
             len(mechanism.species),
             len(mechanism.reactions),

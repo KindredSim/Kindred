@@ -174,6 +174,54 @@ def test_solve_ode_scipy_bdf_accepts_sparsity_hint_without_supplied_jacobian(mon
     assert seen["jac_sparsity"] is sparsity
 
 
+def test_solve_ode_non_implicit_solver_does_not_claim_unused_symbolic_jacobian(monkeypatch):
+    from kindred.core.symbolic.artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR
+
+    seen = {}
+
+    def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
+        seen.update(kwargs)
+        t_eval = np.asarray(kwargs["t_eval"], float)
+        y = np.vstack([np.ones_like(t_eval)])
+        return types.SimpleNamespace(success=True, message="ok", t=t_eval, y=y, t_events=[])
+
+    def symbolic_jacobian(_t, _y):
+        return np.asarray([[-1.0]], dtype=float)
+
+    setattr(
+        symbolic_jacobian,
+        SYMBOLIC_JACOBIAN_IDENTITY_ATTR,
+        {
+            "kind": "jacobian",
+            "fingerprint": "symbolic-jacobian",
+            "structure_fingerprint": "structure",
+            "evaluation_snapshot_fingerprint": "snapshot",
+        },
+    )
+    sparsity = np.asarray([[True]], dtype=bool)
+    monkeypatch.setattr(solvers, "_solve_ivp", fake_solve_ivp)
+    monkeypatch.setattr(solvers, "_scipy_method_for", lambda _name: ("RK45", None))
+
+    out = solvers.solve_ode(
+        solvers.SimulationRequest(
+            rhs=lambda _t, y: -y,
+            t_span=(0.0, 1.0),
+            y0=np.array([1.0]),
+            solver="RK45",
+            t_eval=np.array([0.0, 0.5, 1.0]),
+            jacobian_func=symbolic_jacobian,
+            jac_sparsity=sparsity,
+        )
+    )
+
+    assert seen["method"] == "RK45"
+    assert "jac" not in seen
+    assert "jac_sparsity" not in seen
+    assert out.provenance["symbolic_jacobian"] is False
+    assert "symbolic_jacobian_identity" not in out.provenance
+    assert out.provenance["jacobian_sparsity_hint"] is False
+
+
 def test_solve_ode_builds_time_grid_and_passes_solver_kwargs(monkeypatch):
     seen = {}
 

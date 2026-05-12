@@ -41,6 +41,46 @@ def _sha256_text(value: object) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def _symbolic_jacobian_structure_payload(identity: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(identity, Mapping) or not identity:
+        return {}
+    payload = {
+        "kind": str(identity.get("kind") or ""),
+        "backend_name": str(identity.get("backend_name") or ""),
+        "backend_version": str(identity.get("backend_version") or ""),
+        "profile_version": str(identity.get("profile_version") or ""),
+        "source_fingerprint": str(identity.get("source_fingerprint") or ""),
+        "structure_fingerprint": str(
+            identity.get("structure_fingerprint")
+            or identity.get("source_fingerprint")
+            or ""
+        ),
+        "artifact_fingerprint": str(identity.get("artifact_fingerprint") or ""),
+        "parameter_symbols": [
+            str(name)
+            for name in (identity.get("parameter_symbols") or ())
+            if str(name)
+        ],
+    }
+    return payload if payload["kind"] else {}
+
+
+def _symbolic_wegscheider_source_payload(identity: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(identity, Mapping) or not identity:
+        return {}
+    source_fingerprint = str(identity.get("source_fingerprint") or "")
+    if not source_fingerprint:
+        return dict(identity)
+    payload = {
+        "kind": str(identity.get("kind") or ""),
+        "backend_name": str(identity.get("backend_name") or ""),
+        "backend_version": str(identity.get("backend_version") or ""),
+        "profile_version": str(identity.get("profile_version") or ""),
+        "source_fingerprint": source_fingerprint,
+    }
+    return payload if payload["kind"] else {}
+
+
 def canonical_initials_fingerprint(initials: Mapping[str, Any] | None) -> str:
     if not isinstance(initials, Mapping):
         return ""
@@ -411,9 +451,13 @@ class SimulationIdentity:
             "wegscheider_cyclicity_enabled": bool(self.solver.wegscheider_cyclicity_enabled),
         }
         if self.symbolic_jacobian_identity:
-            payload["symbolic_jacobian_identity"] = dict(self.symbolic_jacobian_identity)
+            structure_payload = _symbolic_jacobian_structure_payload(self.symbolic_jacobian_identity)
+            if structure_payload:
+                payload["symbolic_jacobian_structure_identity"] = structure_payload
         if self.symbolic_wegscheider_identity:
-            payload["symbolic_wegscheider_identity"] = dict(self.symbolic_wegscheider_identity)
+            source_payload = _symbolic_wegscheider_source_payload(self.symbolic_wegscheider_identity)
+            if source_payload:
+                payload["symbolic_wegscheider_source_identity"] = source_payload
         return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 

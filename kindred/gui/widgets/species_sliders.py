@@ -13,7 +13,7 @@ from PySide6.QtCore import Signal
 
 from kindred.gui.species_sliders_logic import compute_row_max, compute_slider_max_option_c, try_nonneg_finite
 from kindred.gui.widgets.batch_initial_conditions_table import BatchInitialConditionsTableModel, BatchInitialConditionsTableView
-from ..ui_helpers import make_placeholder_label, make_scroll_area
+from ..ui_helpers import make_bounded_label, make_placeholder_label, make_scroll_area
 
 __all__ = ["BatchSpeciesSliders"]
 
@@ -577,7 +577,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(8)
-        name_label = QtWidgets.QLabel(str(species))
+        name_label = make_bounded_label(str(species), container, max_width=240)
         font = name_label.font()
         font.setBold(True)
         name_label.setFont(font)

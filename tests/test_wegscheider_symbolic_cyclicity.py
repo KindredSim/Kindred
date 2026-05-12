@@ -149,7 +149,44 @@ def test_symbolic_wegscheider_report_records_proof_identity():
     assert cycle.resolved_proof_fingerprint
     assert report.symbolic_identity["kind"] == "wegscheider_cyclicity"
     assert report.symbolic_identity["fingerprint"]
+    assert report.symbolic_identity["backend_name"] == "sympy"
+    assert report.symbolic_identity["backend_version"]
+    assert report.symbolic_identity["profile_version"]
+    assert report.symbolic_identity["source_fingerprint"]
+    assert report.symbolic_identity["artifact_fingerprint"]
     assert report.symbolic_identity["cycles"][0]["proof_fingerprint"] == cycle.resolved_proof_fingerprint
+
+
+def test_symbolic_wegscheider_source_identity_excludes_resolution_artifacts():
+    from kindred.core.simulator.wegscheider_symbolic import WegscheiderCycle, WegscheiderCyclicityReport
+
+    unresolved = WegscheiderCyclicityReport(
+        cycles=(
+            WegscheiderCycle(
+                cycle_id="cycle-1",
+                step_indices=(1, 2, 3),
+                equilibrium_indices=(0, 1, 2),
+                coefficients=(1, 1, 1),
+                parameter_names=("Keq1", "Keq2", "Keq3"),
+            ),
+        )
+    )
+    resolved = WegscheiderCyclicityReport(
+        cycles=(
+            WegscheiderCycle(
+                cycle_id="cycle-1",
+                step_indices=(1, 2, 3),
+                equilibrium_indices=(0, 1, 2),
+                coefficients=(1, 1, 1),
+                parameter_names=("Keq1", "Keq2", "Keq3"),
+                resolved_by="Keq3",
+                resolved_proof_fingerprint="proof-fingerprint",
+            ),
+        )
+    )
+
+    assert unresolved.symbolic_identity["source_fingerprint"] == resolved.symbolic_identity["source_fingerprint"]
+    assert unresolved.symbolic_identity["artifact_fingerprint"] != resolved.symbolic_identity["artifact_fingerprint"]
 
 
 def test_fractional_stoichiometry_is_not_truncated_into_false_cycle():

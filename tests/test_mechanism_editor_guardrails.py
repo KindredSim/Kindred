@@ -81,6 +81,9 @@ def _set_invalid_reactions_text(main_window, qt_app) -> None:
 
 def _set_valid_reactions_text(main_window, qt_app, text: str = "T=400\nreaction: A -> B; k=1.0") -> None:
     main_window._mechanism_editor._reactions_text.setPlainText(str(text))
+    if not main_window.mechanism_editing_locked():
+        _process_events_bounded(qt_app, iterations=1)
+        return
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=True)
 
 
@@ -467,14 +470,14 @@ def test_consumer_guards_resume_main_window_work_after_successful_lock(main_wind
     _set_valid_reactions_text(main_window, qt_app)
     qt_app.processEvents()
 
-    assert calls == ["validate"]
+    assert calls == []
     assert main_window._temperature_spinbox.value() == pytest.approx(298.15)
 
     main_window._mechanism_edit_lock_action.trigger()
     qt_app.processEvents()
 
     assert main_window.mechanism_editing_locked() is True
-    assert calls[0] == "validate"
+    assert "validate" in calls
     assert calls.count("temperature") == 1
     assert calls.count("overlay") == 1
     assert any(call.startswith("supersede:") for call in calls)
@@ -1285,16 +1288,42 @@ def test_programmatic_load_while_unlocked_restores_guarded_main_window_work(main
     assert any(call.startswith("supersede:") for call in calls)
 
 
-def test_validation_label_stays_live_while_unlocked(main_window, monkeypatch, qt_app):
+def test_unlocked_draft_edit_does_not_schedule_validation(main_window, monkeypatch, qt_app):
     _unlock_reactions_editing(main_window, monkeypatch)
 
-    _set_invalid_reactions_text(main_window, qt_app)
-    deadline = time.monotonic() + 1.5
-    while time.monotonic() < deadline and "Error:" not in main_window._mechanism_editor._validation_label.text():
+    main_window._mechanism_editor._reactions_text.setPlainText("this line does not parse")
+    _process_events_bounded(qt_app, iterations=1)
+
+    assert "Validating" not in main_window._mechanism_editor._validation_label.text()
+    assert "Editing draft" in main_window._mechanism_editor._validation_label.text()
+
+    deadline = time.monotonic() + 0.8
+    while time.monotonic() < deadline:
         _process_events_bounded(qt_app, iterations=1)
         time.sleep(0.01)
 
     assert main_window.mechanism_editing_locked() is False
+    assert main_window._mechanism_editor.is_mechanism_valid() is False
+    label_text = main_window._mechanism_editor._validation_label.text()
+    assert "Editing draft" in label_text
+    assert "pause" not in label_text.lower()
+    assert "Error:" not in label_text
+
+
+def test_failed_lock_attempt_surfaces_invalid_draft_error(main_window, monkeypatch, qt_app):
+    _unlock_reactions_editing(main_window, monkeypatch)
+
+    main_window._mechanism_editor._reactions_text.setPlainText("this line does not parse")
+    _process_events_bounded(qt_app, iterations=1)
+
+    assert "Editing draft" in main_window._mechanism_editor._validation_label.text()
+    assert "Error:" not in main_window._mechanism_editor._validation_label.text()
+
+    main_window._mechanism_edit_lock_action.trigger()
+    qt_app.processEvents()
+
+    assert main_window.mechanism_editing_locked() is False
+    assert main_window._mechanism_edit_lock_action.isChecked() is True
     assert main_window._mechanism_editor.is_mechanism_valid() is False
     assert "Error:" in main_window._mechanism_editor._validation_label.text()
 

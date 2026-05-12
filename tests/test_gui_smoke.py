@@ -75,6 +75,25 @@ def test_loading_preset_populates_editor(main_window):
     assert ("reaction:" in text.lower()) or ("->" in text), "Preset should include reaction text"
 
 
+def test_loading_preset_does_not_rebuild_mechanism_for_suppressed_intermediate_writes(main_window, monkeypatch):
+    """Programmatic preset loading should parse once for final UI state, not each intermediate write."""
+    from kindred.core.simulator import dsl_build
+
+    build_count = 0
+    original_build = dsl_build.build_mechanism_from_ir
+
+    def counting_build(*args, **kwargs):
+        nonlocal build_count
+        build_count += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(dsl_build, "build_mechanism_from_ir", counting_build)
+
+    main_window._load_preset_mechanism("M1")
+
+    assert build_count <= 3
+
+
 def test_arrhenius_mechanism_runs_by_default(main_window):
     """Arrhenius-style DSL parses and simulates without any toggle."""
     dsl_text = "\n".join([

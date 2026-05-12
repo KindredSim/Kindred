@@ -45,6 +45,12 @@ from kindred.core.simulator.solvers import (
 )
 from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+from kindred.core.symbolic.structure_cache import (
+    clear_symbolic_jacobian_structure_cache,
+    get_or_build_symbolic_jacobian_structure,
+    symbolic_jacobian_structure_cache_key,
+    symbolic_jacobian_structure_cache_stats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +68,9 @@ __all__ = [
     "prepare_fitting_objective_context",
     "prepare_bound_mechanism",
     "prepare_simulation_worker_run",
+    "clear_symbolic_jacobian_structure_cache",
     "symbolic_jacobian_identity_for_execution_text",
+    "symbolic_jacobian_structure_cache_stats",
     "symbolic_wegscheider_identity_for_execution_text",
 ]
 
@@ -630,6 +638,21 @@ def _mechanism_has_dynamic_rate_bindings(mechanism: Any) -> bool:
     return False
 
 
+def _mechanism_has_dynamic_keq_input_binding(mechanism: Any) -> bool:
+    for equilibrium in getattr(mechanism, "equilibria", []) or []:
+        meta = getattr(equilibrium, "metadata", {}) or {}
+        if not isinstance(meta, Mapping):
+            continue
+        keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+        if isinstance(keq_input, RateBinding) or callable(keq_input):
+            return True
+    return False
+
+
+def _mechanism_supports_dynamic_symbolic_snapshot(mechanism: Any) -> bool:
+    return not _mechanism_has_dynamic_keq_input_binding(mechanism)
+
+
 def _prepare_preparation_failure(stage: str, message: object) -> SimulationPreparationError:
     return SimulationPreparationError(str(stage or "unknown"), str(message or ""))
 
@@ -984,6 +1007,7 @@ def prepared_simulation_run_for_execution_request(
     rebuild_rhs = bool(override_application.rebuild_rhs)
     rhs = prepared.request.rhs
     jacobian_func = prepared.request.jacobian_func
+    jac_sparsity = prepared.request.jac_sparsity
     temperature_schedule = prepared.request.temperature_schedule
     if request_payload.has_intervention_schedule_authority:
         intervention_schedule = _execution_request_intervention_schedule(request_payload)
@@ -1028,8 +1052,10 @@ def prepared_simulation_run_for_execution_request(
                 solver_config=solver_config,
                 temperature_schedule_override=prepared.request.temperature_schedule,
                 jacobian_func_override=None,
+                allow_dynamic_binding_symbolic_snapshot=True,
             )
             jacobian_func = prepared_context.jacobian_func
+            jac_sparsity = prepared_context.jac_sparsity
             temperature_schedule = prepared_context.temperature_schedule
             warnings = list(prepared_context.warnings)
         except Exception as exc:
@@ -1052,6 +1078,7 @@ def prepared_simulation_run_for_execution_request(
         t_span=(float(request_payload.t_span[0]), float(request_payload.t_span[1])),
         y0=np.asarray(y0, dtype=float).reshape(-1),
         jacobian_func=jacobian_func,
+        jac_sparsity=jac_sparsity,
         temperature_schedule=temperature_schedule,
         intervention_schedule=intervention_schedule,
         species_names=tuple(prepared.species_names),
@@ -1076,6 +1103,7 @@ def _build_prepared_run_context(
     solver_config: _PreparedSolverConfig,
     temperature_schedule_override: object = _MISSING,
     jacobian_func_override: Any = None,
+    allow_dynamic_binding_symbolic_snapshot: bool = False,
 ) -> _PreparedRunContext:
     mech_meta = _metadata_view_for_mechanism(
         mechanism,
@@ -1119,6 +1147,10 @@ def _build_prepared_run_context(
         and implicit_jacobian_solver
         and temperature_schedule is None
         and _mechanism_has_dynamic_rate_bindings(mechanism)
+        and (
+            not bool(allow_dynamic_binding_symbolic_snapshot)
+            or not _mechanism_supports_dynamic_symbolic_snapshot(mechanism)
+        )
     ):
         message = (
             "Symbolic Jacobian disabled for dynamic rate bindings; "
@@ -1131,11 +1163,11 @@ def _build_prepared_run_context(
         jac_sparsity = None
     elif analytical_jacobian_requested:
         try:
-            from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
-
-            symbolic_artifact = build_symbolic_jacobian_artifact(mechanism)
-            jacobian_func = symbolic_artifact.jacobian_func
-            symbolic_jacobian_identity = symbolic_artifact.identity.to_payload()
+            jacobian_func, symbolic_jacobian_identity = _bind_symbolic_jacobian_for_current_mechanism(
+                mechanism=mechanism,
+                prepared_solver_config=solver_config,
+                temperature_K=float(mech_meta.temperature_K),
+            )
         except UnsupportedSymbolicExpressionError as exc:
             symbolic_message = f"Symbolic Jacobian unsupported; using solver default Jacobian handling: {exc}"
             logger.warning("%s", symbolic_message, exc_info=True)
@@ -1223,6 +1255,7 @@ def symbolic_jacobian_identity_for_execution_text(
     *,
     mechanism_text: str,
     solver_config: Mapping[str, Any] | None,
+    parameter_overrides: Mapping[str, Any] | None = None,
 ) -> Optional[Dict[str, Any]]:
     solver_cfg = dict(solver_config or {})
     prepared_solver_config = _build_solver_config(
@@ -1244,11 +1277,37 @@ def symbolic_jacobian_identity_for_execution_text(
         return None
     if str(prepared_solver_config.solver or "").upper() not in {"BDF", "RADAU"}:
         return None
+    temperature_K = float(solver_cfg.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+    structure = _symbolic_jacobian_structure_cache_get(
+        mechanism_text=str(mechanism_text or ""),
+        prepared_solver_config=prepared_solver_config,
+        temperature_K=temperature_K,
+    )
+    if structure is None:
+        return None
+    try:
+        snapshot_values = _symbolic_jacobian_snapshot_values_for_execution_text(
+            mechanism_text=str(mechanism_text or ""),
+            prepared_solver_config=prepared_solver_config,
+            temperature_K=temperature_K,
+            parameter_overrides=parameter_overrides,
+            parameter_symbols=tuple(getattr(structure, "parameter_symbols", ()) or ()),
+        )
+        return dict(structure.bind(snapshot_values).identity.to_payload())
+    except UnsupportedSymbolicExpressionError:
+        return None
 
+
+def _parse_symbolic_execution_mechanism(
+    *,
+    mechanism_text: str,
+    prepared_solver_config: _PreparedSolverConfig,
+    temperature_K: float,
+):
     from kindred.core.simulator.dsl import parse_dsl_to_mechanism
     from kindred.core.units import UnitsModel
 
-    units = UnitsModel(temperature_K=float(solver_cfg.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15)))
+    units = UnitsModel(temperature_K=float(temperature_K))
     mechanism = parse_dsl_to_mechanism(str(mechanism_text or ""), initials={}, units=units)
     meta = getattr(mechanism, "metadata", None)
     if isinstance(meta, dict):
@@ -1259,14 +1318,154 @@ def symbolic_jacobian_identity_for_execution_text(
         mechanism=mechanism,
         mechanism_text=str(mechanism_text or ""),
         structured_prepared_request=False,
-        prepared_solver_config=prepared_solver_config,
+        prepared_solver_config=_build_solver_config(
+            solver_input=str(prepared_solver_config.solver),
+            rtol=1e-6,
+            atol=1e-12,
+            grid={"N": 100},
+            use_sparse_jacobian=True,
+            wegscheider_cyclicity_enabled=bool(prepared_solver_config.wegscheider_cyclicity_enabled),
+        ),
         require_mutable=False,
     )
-    context = _build_prepared_run_context(
-        mechanism=mechanism,
-        solver_config=prepared_solver_config,
+    return mechanism
+
+
+def _symbolic_jacobian_structure_for_mechanism(
+    *,
+    mechanism: Any,
+    prepared_solver_config: _PreparedSolverConfig,
+    temperature_K: float,
+):
+    from kindred.core.symbolic.jacobian import (
+        build_symbolic_jacobian_structure,
+        symbolic_jacobian_structure_fingerprint_for_mechanism,
     )
-    return dict(context.symbolic_jacobian_identity or {}) or None
+
+    if _metadata_view_for_mechanism(mechanism).temperature_schedule is not None:
+        return None
+    try:
+        structure_fingerprint = symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism)
+    except UnsupportedSymbolicExpressionError:
+        return None
+    key = symbolic_jacobian_structure_cache_key(
+        structure_fingerprint=structure_fingerprint,
+        solver=str(prepared_solver_config.solver),
+        temperature_K=float(temperature_K),
+        wegscheider_cyclicity_enabled=bool(prepared_solver_config.wegscheider_cyclicity_enabled),
+    )
+
+    def _build_structure() -> Any:
+        return build_symbolic_jacobian_structure(mechanism)
+
+    try:
+        return get_or_build_symbolic_jacobian_structure(key, _build_structure)
+    except UnsupportedSymbolicExpressionError:
+        return None
+
+
+def _symbolic_jacobian_structure_cache_get(
+    *,
+    mechanism_text: str,
+    prepared_solver_config: _PreparedSolverConfig,
+    temperature_K: float,
+):
+    mechanism = _parse_symbolic_execution_mechanism(
+        mechanism_text=mechanism_text,
+        prepared_solver_config=prepared_solver_config,
+        temperature_K=temperature_K,
+    )
+    return _symbolic_jacobian_structure_for_mechanism(
+        mechanism=mechanism,
+        prepared_solver_config=prepared_solver_config,
+        temperature_K=float(temperature_K),
+    )
+
+
+def _bind_symbolic_jacobian_for_current_mechanism(
+    *,
+    mechanism: Any,
+    prepared_solver_config: _PreparedSolverConfig,
+    temperature_K: float,
+) -> tuple[Any, Dict[str, Any]]:
+    structure = _symbolic_jacobian_structure_for_mechanism(
+        mechanism=mechanism,
+        prepared_solver_config=prepared_solver_config,
+        temperature_K=float(temperature_K),
+    )
+    if structure is None:
+        raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
+    snapshot_values = _symbolic_jacobian_parameter_values_from_mechanism(
+        mechanism,
+        parameter_symbols=tuple(getattr(structure, "parameter_symbols", ()) or ()),
+    )
+    symbolic_artifact = structure.bind(snapshot_values)
+    return symbolic_artifact.jacobian_func, symbolic_artifact.identity.to_payload()
+
+
+def _symbolic_jacobian_snapshot_values_for_execution_text(
+    *,
+    mechanism_text: str,
+    prepared_solver_config: _PreparedSolverConfig,
+    temperature_K: float,
+    parameter_overrides: Mapping[str, Any] | None,
+    parameter_symbols: tuple[str, ...],
+) -> Dict[str, float]:
+    mechanism = _parse_symbolic_execution_mechanism(
+        mechanism_text=mechanism_text,
+        prepared_solver_config=prepared_solver_config,
+        temperature_K=temperature_K,
+    )
+    if parameter_overrides:
+        override_names = sorted(str(name) for name in parameter_overrides.keys())
+        internal_names = _internal_parameter_algebra_binding_names(
+            mechanism,
+            requested_names=override_names,
+        )
+        _bind_parameters_to_mechanism(
+            mechanism,
+            sorted(set(override_names) | set(internal_names)),
+        )
+        apply_parameter_overrides_to_prepared_mechanism(
+            mechanism,
+            parameter_overrides,
+        )
+    return _symbolic_jacobian_parameter_values_from_mechanism(
+        mechanism,
+        parameter_symbols=parameter_symbols,
+    )
+
+
+def _symbolic_jacobian_parameter_values_from_mechanism(
+    mechanism: Any,
+    *,
+    parameter_symbols: tuple[str, ...],
+) -> Dict[str, float]:
+    from kindred.core.simulator.step_indexing import lookup_step_param_target
+    from kindred.core.validation import try_parse_callable_finite_float
+
+    values: Dict[str, float] = {}
+    for name in parameter_symbols:
+        target = lookup_step_param_target(mechanism, str(name))
+        candidate = None
+        if target is not None:
+            kind, idx, role, _entry = target
+            if kind == "reaction" and role == "k":
+                candidate = getattr(mechanism.reactions[int(idx)], "rate", None)
+            elif kind == "equilibrium" and role in {"kf", "kr"}:
+                candidate = getattr(mechanism.equilibria[int(idx)], str(role), None)
+            elif kind == "equilibrium" and role == "Keq":
+                eq = mechanism.equilibria[int(idx)]
+                meta = getattr(eq, "metadata", {}) or {}
+                if isinstance(meta, Mapping):
+                    candidate = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+                if candidate is None:
+                    candidate = getattr(eq, "Keq", None)
+        parsed, ok = try_parse_callable_finite_float(candidate)
+        if not ok:
+            raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
+        values[str(name)] = float(parsed)
+    return values
 
 
 def symbolic_wegscheider_identity_for_execution_text(
@@ -1499,6 +1698,9 @@ def prepare_simulation_worker_run(
             solver_config=prepared_solver_config,
             temperature_schedule_override=temperature_schedule_override,
             jacobian_func_override=jacobian_func_override,
+            allow_dynamic_binding_symbolic_snapshot=bool(
+                request_payload is not None and request_payload.parameter_overrides
+            ),
         )
     except Exception as exc:
         raise SimulationPreparationError("temperature_schedule", str(exc)) from exc
@@ -2204,6 +2406,7 @@ def prepare_fitting_objective_context(
         prepared_run_context = _build_prepared_run_context(
             mechanism=bound.mechanism,
             solver_config=prepared_solver_config,
+            allow_dynamic_binding_symbolic_snapshot=_mechanism_supports_dynamic_symbolic_snapshot(bound.mechanism),
         )
     except Exception as exc:
         if isinstance(exc, SimulationPreparationError):
@@ -2392,6 +2595,7 @@ def build_prepared_simulation_func(
             mechanism=bound.mechanism,
             solver_config=prepared_solver_config,
             jacobian_func_override=jacobian_func,
+            allow_dynamic_binding_symbolic_snapshot=_mechanism_supports_dynamic_symbolic_snapshot(bound.mechanism),
         )
         temperature_schedule = prepared_context.temperature_schedule
         jacobian_func = prepared_context.jacobian_func
@@ -2436,7 +2640,7 @@ def build_prepared_simulation_func(
                 )
 
     def simulation_func(params: Dict[str, float]) -> SimulationSeriesPayload:
-        nonlocal last_shared_fp
+        nonlocal last_shared_fp, prepared_meta
         _ensure_prepared()
         assert bound is not None
 
@@ -2488,6 +2692,30 @@ def build_prepared_simulation_func(
                 continue
             y0[idx] = float(value)
 
+        current_jacobian_func = jacobian_func
+        current_jac_sparsity = jac_sparsity
+        if (
+            bool(prepared_solver_config.use_sparse_jacobian)
+            and str(prepared_solver_config.solver).upper() in {"RADAU", "BDF"}
+            and temperature_schedule is None
+            and _mechanism_supports_dynamic_symbolic_snapshot(bound.mechanism)
+        ):
+            try:
+                current_jacobian_func, symbolic_jacobian_identity = _bind_symbolic_jacobian_for_current_mechanism(
+                    mechanism=bound.mechanism,
+                    prepared_solver_config=prepared_solver_config,
+                    temperature_K=float(temperature_K),
+                )
+                current_jac_sparsity = None
+                prepared_meta = replace(
+                    prepared_meta,
+                    symbolic_jacobian_identity=dict(symbolic_jacobian_identity),
+                )
+                simulation_func._kindred_prepared_simulation_meta = prepared_meta  # type: ignore[attr-defined]
+            except UnsupportedSymbolicExpressionError:
+                current_jacobian_func = None
+                current_jac_sparsity = None
+
         request = SimulationRequest(
             rhs=bound.rhs,
             t_span=(0.0, float(t_end)),
@@ -2496,8 +2724,8 @@ def build_prepared_simulation_func(
             rtol=float(prepared_solver_config.rtol),
             atol=float(prepared_solver_config.atol),
             grid={"N": grid_n},
-            jacobian_func=jacobian_func,
-            jac_sparsity=jac_sparsity,
+            jacobian_func=current_jacobian_func,
+            jac_sparsity=current_jac_sparsity,
             temperature_schedule=temperature_schedule,
             intervention_schedule=intervention_schedule,
             species_names=tuple(bound.species_names),

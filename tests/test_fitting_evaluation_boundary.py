@@ -200,6 +200,60 @@ def test_serial_fitting_process_payload_includes_actual_symbolic_jacobian_identi
     assert identity["artifact_fingerprint"]
 
 
+def test_serial_fitting_evaluator_rebinds_symbolic_jacobian_per_candidate(monkeypatch) -> None:
+    import kindred.core.fitting_evaluation as fitting_evaluation
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+    from kindred.core.simulator.solvers import SimulationOutput
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=True,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    identities: list[dict] = []
+    jacobian_values: list[np.ndarray] = []
+
+    def _capture_request(request):
+        identity = getattr(request.jacobian_func, "_kindred_symbolic_jacobian_identity", None)
+        identities.append(dict(identity or {}))
+        assert callable(request.jacobian_func)
+        jacobian_values.append(
+            np.asarray(request.jacobian_func(0.0, np.asarray([2.0, 0.0], dtype=float)), dtype=float)
+        )
+        t = np.asarray(request.t_eval, dtype=float)
+        y0 = np.asarray(request.y0, dtype=float).reshape(-1)
+        return SimulationOutput(
+            t=t,
+            Y=np.vstack([np.full_like(t, value) for value in y0]),
+            provenance={},
+        )
+
+    monkeypatch.setattr(fitting_evaluation, "_solve_request", _capture_request)
+
+    evaluator({"k1": 0.2})
+    evaluator({"k1": 0.7})
+
+    assert identities[0]["parameter_symbols"] == ["k1"]
+    assert identities[0]["structure_fingerprint"] == identities[1]["structure_fingerprint"]
+    assert identities[0]["evaluation_snapshot_fingerprint"] != identities[1]["evaluation_snapshot_fingerprint"]
+    np.testing.assert_allclose(jacobian_values[0], [[-0.2, 0.0], [0.2, 0.0]])
+    np.testing.assert_allclose(jacobian_values[1], [[-0.7, 0.0], [0.7, 0.0]])
+
+
 def test_serial_fitting_solver_request_carries_symbolic_wegscheider_identity(monkeypatch) -> None:
     import kindred.core.fitting_evaluation as fitting_evaluation
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context

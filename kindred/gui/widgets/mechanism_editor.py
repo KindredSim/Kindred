@@ -9,7 +9,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
-from kindred.gui.ui_helpers import make_scroll_area
+from kindred.gui.ui_helpers import make_bounded_label, make_scroll_area, set_bounded_label_text
 
 # Direct imports required to avoid circular dependency with widgets/__init__.py
 from kindred.gui.widgets.state_network_editor import StateNetworkEditor
@@ -183,7 +183,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_visibility_menu.aboutToShow.connect(self._rebuild_slider_visibility_menu)
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
-        self._slider_edit_targets_label = QtWidgets.QLabel("Slider edit targets: none")
+        self._slider_edit_targets_label = make_bounded_label(
+            "Slider edit targets: none",
+            max_width=360,
+        )
         self._slider_edit_targets_label.setToolTip("The set whose initial conditions are controlled by concentration sliders")
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
@@ -403,7 +406,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         return self._species_sliders
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
-        self._slider_edit_targets_label.setText(str(text or "Slider edit targets: none"))
+        set_bounded_label_text(
+            self._slider_edit_targets_label,
+            str(text or "Slider edit targets: none"),
+            max_width=360,
+        )
 
     def detach_slider_pane_for_dock(self) -> QtWidgets.QWidget:
         if bool(self._slider_workspace_detached):
@@ -503,13 +510,13 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._species_sliders.set_species_visible(str(item_name), bool(visible))
 
     def _on_text_changed(self):
-        """Handle text change event - trigger debounced validation."""
+        """Handle text change event."""
         if bool(getattr(self, "_reactions_read_only", self._reactions_text.isReadOnly())):
             self._validation_timer.stop()
             self._validate_dsl()
             return
-        self._validation_timer.start()
-        self._set_validation_state("validating")
+        self._validation_timer.stop()
+        self._set_validation_state("draft")
 
     def _validate_dsl(self):
         """Validate DSL text and update validation indicator."""
@@ -568,7 +575,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         Parameters
         ----------
         state : str
-            One of: "idle", "validating", "valid", "invalid"
+            One of: "idle", "draft", "validating", "valid", "invalid"
         message : str
             Status message to display
         """
@@ -581,26 +588,44 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
 
         if state == "idle":
-            self._validation_label.setText("")
+            self._set_validation_label_text("")
             self._validation_label.setStyleSheet("QLabel { padding: 4px; }")
 
         elif state == "validating":
-            self._validation_label.setText("\u23f3 Validating...")
+            self._set_validation_label_text("\u23f3 Validating...")
+            self._validation_label.setStyleSheet(
+                "QLabel { padding: 4px; border-radius: 3px; }"
+            )
+
+        elif state == "draft":
+            self._set_validation_label_text("Editing draft")
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
 
         elif state == "valid":
-            self._validation_label.setText(message)
+            self._set_validation_label_text(message)
             self._validation_label.setStyleSheet(
                 "QLabel { padding: 4px; border-radius: 3px; }"
             )
 
         elif state == "invalid":
-            self._validation_label.setText(message)
+            self._set_validation_label_text(message)
             self._validation_label.setStyleSheet(
                 "QLabel { font-weight: bold; padding: 4px; border-radius: 3px; }"
             )
+
+    def _set_validation_label_text(self, text: str) -> None:
+        full_text = str(text or "")
+        self._validation_label.setMaximumWidth(520)
+        self._validation_label.setMaximumHeight(96)
+        self._validation_label.setWordWrap(True)
+        self._validation_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        self._validation_label.setText(full_text)
+        self._validation_label.setToolTip(full_text if full_text else "")
 
     def slider_points_value(self) -> int:
         """Get the current slider simulation points setting."""

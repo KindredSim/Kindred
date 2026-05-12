@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import suppress
 from typing import Callable, Optional
 
+from kindred.gui.ui_helpers import set_bounded_label_text
+
 
 class SimulationRunUiOwner:
     """Owns the simulation run controls' UI state and runtime-ready gate."""
@@ -71,7 +73,7 @@ class SimulationRunUiOwner:
 
     def set_status_text(self, text: str) -> None:
         if self._status_label is not None:
-            self._status_label.setText(str(text))
+            set_bounded_label_text(self._status_label, str(text), max_width=420)
 
     def set_sim_progress_value(self, value: int) -> None:
         if self._progress is not None:
@@ -87,9 +89,10 @@ class SimulationRunUiOwner:
             with suppress(RuntimeError, AttributeError):
                 table.viewport().update()
 
-    def set_algebra_status_text(self, text: str) -> None:
+    def set_algebra_status_text(self, text: str, *, details: str | None = None) -> None:
         if self._algebra_status_label is not None:
-            self._algebra_status_label.setText(str(text))
+            set_bounded_label_text(self._algebra_status_label, str(text), max_width=420)
+            self._algebra_status_label.setToolTip(str(details or ""))
 
     def _apply_run_button_state(self) -> None:
         button = self._run_button
