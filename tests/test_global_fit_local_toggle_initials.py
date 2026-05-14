@@ -29,6 +29,7 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

@@ -663,6 +663,10 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
         def __init__(self) -> None:
             self.ready = False
 
+        @property
+        def ledger(self):
+            return None
+
         def is_ready(self, *, lane_count=None) -> bool:
             return bool(self.ready)
 

@@ -357,6 +357,10 @@ def test_fit_global_wraps_exact_serial_evaluator_with_runtime_session_by_default
         def __init__(self, evaluator):
             self._evaluator = evaluator
 
+        @property
+        def ledger(self):
+            return None
+
         def begin_run(self) -> None:
             return None
 
@@ -451,6 +455,10 @@ def test_fit_global_candidate_timeout_uses_penalty_and_final_replay_keeps_other_
             return lane.evaluate_series_with_parameter_origins(params)
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def begin_run(self):
             return 1
 

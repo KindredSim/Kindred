@@ -30,9 +30,9 @@ def default_batch_lane_pool_factory(max_lanes: int, limit_blas_threads: bool) ->
 
 
 class ParallelBatchExecutor:
-    """Temporary controller adapter over the non-GUI batch runtime session."""
+    """Controller adapter over the non-GUI batch runtime session."""
 
-    __slots__ = ("_runtime_session", "_active_callback_identity_by_set_id")
+    __slots__ = ("_runtime_session",)
 
     def __init__(
         self,
@@ -51,46 +51,38 @@ class ParallelBatchExecutor:
             lane_pool=lane_pool,
         )
         self._runtime_session = BatchRuntimeSession(runtime_owner)
-        self._active_callback_identity_by_set_id: Dict[str, Any] = {}
-
-    @property
-    def _runtime_owner(self) -> BatchRuntimeLaneOwner:
-        return self._runtime_session.lane_owner
 
     @property
     def lane_pool_factory(self) -> Callable[[int, bool], Any]:
-        return self._runtime_owner.lane_pool_factory
+        return self._runtime_session.lane_pool_factory
 
     @lane_pool_factory.setter
     def lane_pool_factory(self, value: Callable[[int, bool], Any]) -> None:
-        previous = self._runtime_owner.lane_pool_factory
-        self._runtime_owner.lane_pool_factory = value
-        if value is not previous and self._runtime_session.has_lane_pool():
-            self._runtime_owner.mark_pool_stale()
+        self._runtime_session.lane_pool_factory = value
 
     @property
     def max_parallel_workers(self) -> int:
-        return int(self._runtime_owner.max_parallel_workers)
+        return int(self._runtime_session.max_parallel_workers)
 
     @max_parallel_workers.setter
     def max_parallel_workers(self, value: int) -> None:
-        self._runtime_owner.max_parallel_workers = int(value)
+        self._runtime_session.max_parallel_workers = int(value)
 
     @property
     def limit_blas_threads_per_worker(self) -> bool:
-        return bool(self._runtime_owner.limit_blas_threads_per_worker)
+        return bool(self._runtime_session.limit_blas_threads_per_worker)
 
     @limit_blas_threads_per_worker.setter
     def limit_blas_threads_per_worker(self, value: bool) -> None:
-        self._runtime_owner.limit_blas_threads_per_worker = bool(value)
+        self._runtime_session.limit_blas_threads_per_worker = bool(value)
 
     @property
     def record_nonfatal_exception(self) -> Callable[[str, BaseException], None]:
-        return self._runtime_owner.record_nonfatal_exception
+        return self._runtime_session.record_nonfatal_exception
 
     @record_nonfatal_exception.setter
     def record_nonfatal_exception(self, value: Callable[[str, BaseException], None]) -> None:
-        self._runtime_owner.record_nonfatal_exception = value
+        self._runtime_session.record_nonfatal_exception = value
 
     @property
     def current_max_workers(self) -> Optional[int]:
@@ -109,7 +101,6 @@ class ParallelBatchExecutor:
         active_timeout_s: float = 60.0,
         cache_key: str = "",
     ) -> None:
-        self._active_callback_identity_by_set_id.clear()
         self._runtime_session.begin(
             BatchRuntimeSessionRequest(
                 run_id=int(run_id),
@@ -154,24 +145,17 @@ class ParallelBatchExecutor:
 
     def active_request_metadata(self, set_id: str) -> Dict[str, Any]:
         sid = str(set_id or "")
-        metadata = self._runtime_session.active_request_metadata(sid)
-        callback_identity = self._active_callback_identity_by_set_id.get(sid)
-        if callback_identity is not None:
-            metadata["callback_identity"] = callback_identity
-        return metadata
+        return self._runtime_session.active_request_metadata(sid)
 
     def discard_request(self, set_id: str) -> None:
         sid = str(set_id or "")
-        self._active_callback_identity_by_set_id.pop(sid, None)
         self._runtime_session.discard_request(sid)
 
     def reset_active_run_state(self) -> None:
-        self._active_callback_identity_by_set_id.clear()
-        self._runtime_owner.reset_active_run_state()
+        self._runtime_session.reset_active_run_state()
 
     def reset_run_state(self) -> None:
-        self._active_callback_identity_by_set_id.clear()
-        self._runtime_owner.reset_run_state()
+        self._runtime_session.reset_run_state()
 
     def drain_completion_queue(self) -> None:
         self._runtime_session.drain_completion_queue()
@@ -190,14 +174,14 @@ class ParallelBatchExecutor:
             int(MAX_PARALLEL_WORKERS_CEILING),
             max(1, int(max_lanes)),
         )
-        return self._runtime_owner.ensure_lane_pool(max_lanes=requested_lanes)
+        return self._runtime_session.ensure_lane_pool(max_lanes=requested_lanes)
 
     def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True) -> Any:
         requested_lanes = min(
             int(MAX_PARALLEL_WORKERS_CEILING),
             max(1, int(max_lanes)),
         )
-        return self._runtime_owner.ensure_warm_lane_pool(
+        return self._runtime_session.ensure_warm_lane_pool(
             max_lanes=requested_lanes,
             wait=bool(wait),
         )
@@ -209,23 +193,19 @@ class ParallelBatchExecutor:
         set_id: str,
         set_name: str,
         expected_owner_epoch: object = None,
-        callback_identity: object = None,
+        callback_identity: object,
     ) -> BatchRequestHandle:
         expected_lane_owner_epoch = None if expected_owner_epoch is None else int(expected_owner_epoch)
         sid = str(set_id or "")
-        if callback_identity is not None:
-            self._active_callback_identity_by_set_id[sid] = callback_identity
-        try:
-            handle = self._runtime_session.submit_task(
-                task,
-                set_id=sid,
-                set_name=str(set_name or set_id or ""),
-                expected_owner_epoch=expected_lane_owner_epoch,
-            )
-        except Exception:
-            self._active_callback_identity_by_set_id.pop(sid, None)
-            raise
-        return handle
+        if callback_identity is None:
+            raise ValueError("Parallel batch task submission requires callback_identity.")
+        return self._runtime_session.submit_task(
+            task,
+            set_id=sid,
+            set_name=str(set_name or set_id or ""),
+            expected_owner_epoch=expected_lane_owner_epoch,
+            callback_identity=callback_identity,
+        )
 
     def shutdown(
         self,
@@ -233,7 +213,6 @@ class ParallelBatchExecutor:
         force_terminate: bool,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None:
-        self._active_callback_identity_by_set_id.clear()
         self._runtime_session.shutdown(
             force_terminate=bool(force_terminate),
             record_nonfatal_exception=record_nonfatal_exception,
@@ -255,7 +234,7 @@ class ParallelBatchExecutor:
 
     @property
     def is_pool_stale(self) -> bool:
-        return bool(self._runtime_owner.is_pool_stale)
+        return bool(self._runtime_session.is_pool_stale)
 
     def mark_pool_stale(self) -> None:
-        self._runtime_owner.mark_pool_stale()
+        self._runtime_session.mark_pool_stale()

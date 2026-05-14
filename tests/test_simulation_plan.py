@@ -81,6 +81,32 @@ def test_cache_identity_and_scope_helpers_return_defensive_payload_views() -> No
     assert plan.scope_identity_payload() == {"schema_id": "scope", "queue_fingerprint": "queue"}
 
 
+def test_cache_identity_schedule_fingerprint_requires_execution_schedule_authority() -> None:
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.0},
+        t_span=(0.0, 2.0),
+        solver_config={"solver": "BDF"},
+        mechanism_text="reaction: A -> B; k=1",
+        simulation_identity={"schema_id": "schema"},
+    )
+
+    with pytest.raises(ValueError, match="intervention_schedule_fingerprint"):
+        SimulationPlan.from_execution_request(
+            request,
+            execution_mode="explicit",
+            algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+            cache_identity_payload={
+                "simulation_identity": {
+                    "schema_id": "schema",
+                    "intervention_schedule_fingerprint": "missing-schedule-authority",
+                }
+            },
+        )
+
+
 def test_prepared_request_round_trip_preserves_payload_and_copies_arrays_defensively() -> None:
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 

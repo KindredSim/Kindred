@@ -204,6 +204,10 @@ def test_global_fit_worker_passes_runtime_session_to_fit_boundary(qt_app):
     events: list[str] = []
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def warm(self, *, cancellation_check=None, lane_count=None):
             raise AssertionError("runtime readiness must be established before worker execution")
 
@@ -402,6 +406,10 @@ def test_global_fit_worker_cancel_notifies_runtime_session(qt_app):
     events: list[str] = []
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def cancel_run(self):
             events.append("runtime:cancel")
 
@@ -429,6 +437,10 @@ def test_global_fit_worker_best_payload_uses_runtime_session_evaluator_when_avai
             return {"t": t, "species": {"A": np.asarray([2.0, 3.0], dtype=float)}}
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def evaluator(self, *, cancellation_check=None):
             assert cancellation_check is not None
             return _RuntimeEvaluator()
@@ -577,6 +589,10 @@ def test_parametric_x_best_payload_and_final_replay_use_ready_runtime_evaluator(
             }
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def begin_run(self) -> None:
             calls.append({"begin_run": 1.0})
 

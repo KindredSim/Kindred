@@ -80,7 +80,12 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
         dataset_specs = tuple(coerce_fit_dataset_specs(dataset_payloads))
         config = {
             "parameters": {"k": 1.0},
+            "bounds": {},
+            "log10_params": {},
+            "method": "trf",
             "max_nfev": 5,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
         }
         identity = FittingRuntimeIdentity(
             datasets=dataset_specs,
@@ -102,7 +107,9 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
             lane_count=1,
             readiness_required=False,
         )
-        window.fit_worker_launch_owner.start_worker(FittingRuntimeAcceptedLaunch(identity=identity, session=None))
+        window.fit_worker_launch_owner.start_runtime_launch(
+            FittingRuntimeAcceptedLaunch(identity=identity, session=None)
+        )
     finally:
         window.close()
 

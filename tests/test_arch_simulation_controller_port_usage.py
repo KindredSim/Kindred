@@ -93,6 +93,7 @@ RUN_UI_ENTRY_PROGRESS_TARGET_METHODS_BY_METHOD = {
     "_submit_parallel_batch_tasks": {
         "set_run_button_enabled",
         "set_stop_button_enabled",
+        "set_status_text",
     },
     "_finish_parallel_batch_with_no_active_requests": {
         "set_run_button_enabled",
@@ -438,8 +439,6 @@ def test_parallel_batch_runtime_snapshot_status_is_owned_by_readiness_owner() ->
     forbidden = {
         ("self", "_batch_parallel", "has_ready_lane_pool"),
         ("self", "_batch_parallel", "runtime_snapshot"),
-        ("self", "_parallel_batch_runtime_readiness_owner", "mark_ready"),
-        ("self", "_parallel_batch_runtime_readiness_owner", "mark_not_ready"),
     }
     assert chains.isdisjoint(forbidden), (
         "`SimulationController._parallel_batch_runtime_snapshot` must not reconstruct batch readiness from "
@@ -769,7 +768,7 @@ def test_removed_controller_scaffolding_methods_do_not_reappear() -> None:
         "_slider_launch_run_simulation_internal",
         "_parallel_outcome_record_nonfatal_exception",
         "_slider_launch_supersede_parallel_batch_run_soft",
-        "_slider_launch_ensure_parallel_batch_pool_eagerly_created",
+        "_slider_launch_ensure_parallel_batch_runtime_ready",
         "_slider_launch_ensure_interactive_simulation_runtime_available_for_mode",
         "_contained_serial_acquire_ready_owner_for_plan",
         "_contained_serial_release_owner",
@@ -2161,7 +2160,7 @@ def test_simulation_complete_results_cluster_uses_explicit_results_port() -> Non
     )
 
 
-def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
+def test_simulation_complete_solver_cluster_does_not_rediscover_publication_state() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     controller_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
     owner_target = repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py"
@@ -2174,12 +2173,19 @@ def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
     owner_tree = ast.parse(owner_source, filename=str(owner_target))
     materialization_source = materialization_target.read_text(encoding="utf-8")
     materialization_tree = ast.parse(materialization_source, filename=str(materialization_target))
+    materialization_fn = _class_method_node(
+        materialization_tree,
+        "SimulationResultMaterializationOwner",
+        "resolve_completion_mechanism",
+    )
+    publication_fn = _completion_publication_method_node(owner_tree, "publish_annotations_and_provenance")
     method_specs = (
-        (materialization_target, materialization_source.splitlines(), _class_method_node(materialization_tree, "SimulationResultMaterializationOwner", "resolve_completion_mechanism")),
-        (owner_target, owner_source.splitlines(), _completion_publication_method_node(owner_tree, "publish_annotations_and_provenance")),
+        (materialization_target, materialization_source.splitlines(), materialization_fn),
+        (owner_target, owner_source.splitlines(), publication_fn),
     )
     flattened_hits: list[_CallHit] = []
-    explicit_methods: set[str] = set()
+    publication_rediscovery_hits: list[_CallHit] = []
+    materialization_methods: set[str] = set()
     for _target, lines, fn in method_specs:
         for node in ast.walk(fn):
             if not isinstance(node, ast.Call):
@@ -2205,12 +2211,29 @@ def test_simulation_complete_solver_cluster_uses_explicit_solver_port() -> None:
                 and chain[:3] in {("self", "ui", "solver"), ("self", "_ui", "solver")}
                 and chain[3] in COMPLETION_SOLVER_TARGET_METHODS
             ):
-                explicit_methods.add(chain[3])
+                if fn is publication_fn:
+                    publication_rediscovery_hits.append(
+                        _CallHit(
+                            method=chain[3],
+                            lineno=node.lineno,
+                            line=lines[node.lineno - 1].strip(),
+                        )
+                    )
+                elif fn is materialization_fn:
+                    materialization_methods.add(chain[3])
 
-    assert explicit_methods == COMPLETION_SOLVER_TARGET_METHODS, (
-        "Guardrail expectation changed: `SimulationController._on_simulation_complete` must route the audited "
-        "solver completion cluster through `self.ui.solver`, but only found "
-        f"{sorted(explicit_methods)}."
+    assert materialization_methods == set(), (
+        "Guardrail expectation changed: completion mechanism materialization must not rediscover live solver "
+        "UI state, but found "
+        f"{sorted(materialization_methods)}."
+    )
+    assert publication_rediscovery_hits == [], (
+        "Guardrail violated: completion publication must use captured result/launch provenance instead of "
+        "rediscovering live solver UI state.\n"
+        + "\n".join(
+            f"{owner_target.relative_to(repo_root)}:{hit.lineno}: `{hit.line}`"
+            for hit in sorted(publication_rediscovery_hits, key=lambda hit: (hit.lineno, hit.method))
+        )
     )
 
     assert flattened_hits == [], (

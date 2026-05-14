@@ -42,6 +42,7 @@ class _FakeLanePool:
     def __init__(self) -> None:
         self.submissions: List[_Submission] = []
         self.close_calls: List[Dict[str, Any]] = []
+        self.ready_lane_count = 999
 
     def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
         _ = run_id, request_id, set_id, active_timeout_s
@@ -57,6 +58,10 @@ class _FakeLanePool:
             success=not (isinstance(payload, dict) and payload.get("success") is False),
             payload=payload if isinstance(payload, dict) else {"payload": payload},
         )
+
+    def warm_lanes(self, required: int, *, wait: bool = True) -> None:
+        _ = wait
+        self.ready_lane_count = max(int(self.ready_lane_count), int(required))
 
     def submit(self, fn, *args, **kwargs):
         sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs))
@@ -178,7 +183,9 @@ def test_parallel_completion_consumes_completed_lane_records_in_completion_order
     monkeypatch.setattr(
         main_window.simulation_controller._completion_callback_owner,
         "handle_completion",
-        lambda _result, **kwargs: processed.append(str(kwargs.get("batch_set_id") or "")),
+        lambda _result, **kwargs: processed.append(
+            str(getattr(kwargs.get("callback_identity"), "batch_set_id", "") or "")
+        ),
         raising=True,
     )
 
@@ -245,6 +252,8 @@ def test_slider_parallel_plot_updates_are_coalesced_per_ui_tick(main_window, mon
         batch_set_id="set2",
         cache_key="coalesce-key",
         callback_context=callback_context,
+        simulation_identity={},
+        preview_batch_cache_token="",
     )
     set3_identity = main_window.simulation_controller._capture_simulation_callback_identity(
         run_id=77,
@@ -255,6 +264,8 @@ def test_slider_parallel_plot_updates_are_coalesced_per_ui_tick(main_window, mon
         batch_set_id="set3",
         cache_key="coalesce-key",
         callback_context=callback_context,
+        simulation_identity={},
+        preview_batch_cache_token="",
     )
 
     main_window.simulation_controller.on_simulation_complete(

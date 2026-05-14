@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from queue import Empty, Queue, SimpleQueue
 from time import perf_counter
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from kindred.core.containment_kernel import (
     ContainmentKernelAcceptTimeout,
@@ -85,9 +85,11 @@ class BatchCompletionRecord:
     metadata: BatchRequestMetadata
     outcome: BatchLaneOutcome
     completed_ts: float
+    request_metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "completed_ts", float(self.completed_ts))
+        object.__setattr__(self, "request_metadata", dict(self.request_metadata or {}))
 
     @property
     def set_id(self) -> str:
@@ -129,6 +131,26 @@ class BatchPolledCompletion:
         object.__setattr__(self, "set_id", str(self.set_id or ""))
         object.__setattr__(self, "source", str(self.source or ""))
         object.__setattr__(self, "completed_ts", float(self.completed_ts))
+
+
+@runtime_checkable
+class BatchLanePoolProtocol(Protocol):
+    @property
+    def ready_lane_count(self) -> int: ...
+
+    def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None: ...
+
+    def run(
+        self,
+        task: Mapping[str, Any],
+        *,
+        run_id: int,
+        request_id: int,
+        set_id: str,
+        active_timeout_s: float,
+    ) -> BatchLaneOutcome: ...
+
+    def close(self, *, kill: bool = False) -> None: ...
 
 
 class _BatchSimulationHandler:
@@ -544,9 +566,7 @@ class BatchLanePool:
     def _next_lane(self) -> WarmBatchSimulationLane:
         lane, reserved = self._reserve_next_lane()
         if reserved:
-            release = getattr(lane, "release_reservation", None)
-            if callable(release):
-                release()
+            lane.release_reservation()
         return lane
 
     def _reserve_next_lane(self) -> tuple[WarmBatchSimulationLane, bool]:
@@ -583,27 +603,14 @@ class BatchLanePool:
 
     @staticmethod
     def _try_reserve_lane(lane: WarmBatchSimulationLane) -> bool:
-        reserve = getattr(lane, "reserve", None)
-        if not callable(reserve):
-            return False
         try:
-            return bool(reserve())
+            return bool(lane.reserve())
         except Exception:
             return False
 
     @staticmethod
     def _lane_is_available(lane: WarmBatchSimulationLane) -> bool:
-        is_busy = getattr(lane, "is_busy", None)
-        if is_busy is not None:
-            return not bool(is_busy() if callable(is_busy) else is_busy)
-        lock = getattr(lane, "_lock", None)
-        locked = getattr(lock, "locked", None)
-        if callable(locked):
-            return not bool(locked())
-        is_running = getattr(lane, "is_running", None)
-        if is_running is not None:
-            return not bool(is_running() if callable(is_running) else is_running)
-        return False
+        return not bool(lane.is_busy)
 
 
 class BatchRequestHandle:
@@ -638,16 +645,18 @@ class BatchRuntimeLaneOwner:
     def __init__(
         self,
         *,
-        lane_pool_factory: Callable[[int, bool], Any],
+        lane_pool_factory: Callable[[int, bool], BatchLanePoolProtocol],
         max_parallel_workers: int,
         limit_blas_threads_per_worker: bool,
         record_nonfatal_exception: Callable[[str, BaseException], None],
-        lane_pool: Any = None,
+        lane_pool: BatchLanePoolProtocol | None = None,
     ) -> None:
         self.lane_pool_factory = lane_pool_factory
         self.max_parallel_workers = int(max_parallel_workers)
         self.limit_blas_threads_per_worker = bool(limit_blas_threads_per_worker)
         self.record_nonfatal_exception = record_nonfatal_exception
+        if lane_pool is not None and not isinstance(lane_pool, BatchLanePoolProtocol):
+            raise TypeError("Batch runtime lane pool must implement BatchLanePoolProtocol.")
         self.lane_pool = lane_pool
         self.active_request_map: dict[str, BatchRequestHandle] = {}
         self.active_request_meta: dict[str, dict[str, Any]] = {}
@@ -662,6 +671,7 @@ class BatchRuntimeLaneOwner:
         self._retired_worker_threads: list[threading.Thread] = []
         self._warm_thread: threading.Thread | None = None
         self._warm_requested_max_lanes = 0
+        self._warm_pending_max_lanes = 0
         self._generation = 0
         self._warm_failure: str | None = None
         self._shutdown_requested = False
@@ -716,9 +726,7 @@ class BatchRuntimeLaneOwner:
                 (self.superseded_request_map or {}).values()
             )
         for handle in handles:
-            join = getattr(handle, "join", None)
-            if callable(join):
-                join(timeout=max(0.0, float(timeout_s)))
+            handle.join(timeout=max(0.0, float(timeout_s)))
 
     def has_lane_pool(self) -> bool:
         return self.lane_pool is not None
@@ -729,13 +737,8 @@ class BatchRuntimeLaneOwner:
             return False
         if self._current_max_workers is None or int(self._current_max_workers) < int(max_lanes):
             return False
-        ready_lane_count = getattr(pool, "ready_lane_count", None)
-        if ready_lane_count is None:
-            warm_lanes = getattr(pool, "warm_lanes", None)
-            return not callable(warm_lanes)
         try:
-            value = ready_lane_count() if callable(ready_lane_count) else ready_lane_count
-            return int(value) >= max(1, int(max_lanes))
+            return int(pool.ready_lane_count) >= max(1, int(max_lanes))
         except Exception:
             return False
 
@@ -813,7 +816,7 @@ class BatchRuntimeLaneOwner:
             return
         self.completed_queue.put((sid, float(perf_counter())))
 
-    def ensure_lane_pool(self, *, max_lanes: int) -> Any:
+    def ensure_lane_pool(self, *, max_lanes: int) -> BatchLanePoolProtocol:
         requested_lanes = max(1, int(max_lanes))
         pool = self.lane_pool
         if pool is not None and self._pool_stale:
@@ -838,16 +841,19 @@ class BatchRuntimeLaneOwner:
         self.shutdown(force_terminate=True, record_nonfatal_exception=self.record_nonfatal_exception)
         return self._create_lane_pool(max_lanes=requested_lanes)
 
-    def _create_lane_pool(self, *, max_lanes: int) -> Any:
+    def _create_lane_pool(self, *, max_lanes: int) -> BatchLanePoolProtocol:
         try:
             with self._lock:
                 self._shutdown_requested = False
                 self._warm_failure = None
             pool = self.lane_pool_factory(int(max_lanes), bool(self.limit_blas_threads_per_worker))
+            if not isinstance(pool, BatchLanePoolProtocol):
+                raise TypeError("Batch lane pool factory must return BatchLanePoolProtocol.")
             self.lane_pool = pool
             self._current_max_workers = int(max_lanes)
             self._pool_stale = False
             self._warm_requested_max_lanes = 0
+            self._warm_pending_max_lanes = 0
             self._ensure_worker_threads(max_workers=int(max_lanes))
         except Exception as exc:
             with self._lock:
@@ -862,22 +868,20 @@ class BatchRuntimeLaneOwner:
             raise
         return self.lane_pool
 
-    def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True) -> Any:
+    def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True) -> BatchLanePoolProtocol:
         pool = self.ensure_lane_pool(max_lanes=int(max_lanes))
         if self._pool_stale and self.has_active_requests():
             return pool
         try:
-            warm_lanes = getattr(pool, "warm_lanes", None)
-            if callable(warm_lanes):
-                with self._lock:
-                    self._warm_failure = None
-                warm_lanes(max(1, int(max_lanes)), wait=bool(wait))
-                self._warm_requested_max_lanes = max(
-                    int(self._warm_requested_max_lanes),
-                    max(1, int(max_lanes)),
-                )
-                if not bool(wait):
-                    self._start_background_ready_wait(pool=pool, max_lanes=max(1, int(max_lanes)))
+            with self._lock:
+                self._warm_failure = None
+            pool.warm_lanes(max(1, int(max_lanes)), wait=bool(wait))
+            self._warm_requested_max_lanes = max(
+                int(self._warm_requested_max_lanes),
+                max(1, int(max_lanes)),
+            )
+            if not bool(wait):
+                self._start_background_ready_wait(pool=pool, max_lanes=max(1, int(max_lanes)))
         except Exception as exc:
             if self._suppress_warm_failure_for_pool(pool):
                 return pool
@@ -896,16 +900,19 @@ class BatchRuntimeLaneOwner:
         with self._lock:
             return bool(self._shutdown_requested or self.lane_pool is not pool)
 
-    def _start_background_ready_wait(self, *, pool: Any, max_lanes: int) -> None:
+    def _start_background_ready_wait(self, *, pool: BatchLanePoolProtocol, max_lanes: int) -> None:
         existing = self._warm_thread
         if existing is not None and existing.is_alive():
+            with self._lock:
+                self._warm_pending_max_lanes = max(
+                    int(self._warm_pending_max_lanes),
+                    max(1, int(max_lanes)),
+                )
             return
 
         def _wait_until_ready() -> None:
             try:
-                warm_lanes = getattr(pool, "warm_lanes", None)
-                if callable(warm_lanes):
-                    warm_lanes(max(1, int(max_lanes)), wait=True)
+                pool.warm_lanes(max(1, int(max_lanes)), wait=True)
             except Exception as exc:
                 if not self._suppress_warm_failure_for_pool(pool):
                     with self._lock:
@@ -916,6 +923,20 @@ class BatchRuntimeLaneOwner:
                         record_nonfatal_exception=self.record_nonfatal_exception,
                         clear_warm_failure=False,
                     )
+            finally:
+                pending_lanes = 0
+                with self._lock:
+                    if self._warm_thread is threading.current_thread():
+                        self._warm_thread = None
+                    if (
+                        not self._shutdown_requested
+                        and self.lane_pool is pool
+                        and int(self._warm_pending_max_lanes) > max(1, int(max_lanes))
+                    ):
+                        pending_lanes = int(self._warm_pending_max_lanes)
+                    self._warm_pending_max_lanes = 0
+                if pending_lanes:
+                    self._start_background_ready_wait(pool=pool, max_lanes=pending_lanes)
 
         thread = threading.Thread(
             target=_wait_until_ready,
@@ -1045,6 +1066,7 @@ class BatchRuntimeLaneOwner:
         preview_owner_epoch: int | None,
         active_timeout_s: float,
         expected_owner_epoch: int | None = None,
+        request_metadata: Mapping[str, Any] | None = None,
     ) -> BatchRequestHandle:
         pool = self.lane_pool
         if pool is None:
@@ -1060,14 +1082,17 @@ class BatchRuntimeLaneOwner:
             expected_owner_epoch=None if expected_owner_epoch is None else int(expected_owner_epoch),
         )
         handle = BatchRequestHandle(metadata)
+        stored_metadata = {
+            "set_name": metadata.set_name,
+            "preview_owner_epoch": metadata.preview_owner_epoch,
+            "owner_epoch": metadata.expected_owner_epoch,
+            "generation": metadata.generation,
+        }
+        if isinstance(request_metadata, Mapping):
+            stored_metadata.update(dict(request_metadata))
         with self._lock:
             self.active_request_map[sid] = handle
-            self.active_request_meta[sid] = {
-                "set_name": metadata.set_name,
-                "preview_owner_epoch": metadata.preview_owner_epoch,
-                "owner_epoch": metadata.expected_owner_epoch,
-                "generation": metadata.generation,
-            }
+            self.active_request_meta[sid] = stored_metadata
 
         def _target() -> BatchLaneOutcome:
             return pool.run(
@@ -1143,18 +1168,27 @@ class BatchRuntimeLaneOwner:
         return polled
 
     @staticmethod
-    def _handle_is_done(handle: Any) -> bool:
-        is_done = getattr(handle, "is_done", None)
-        if callable(is_done):
-            return bool(is_done())
-        return False
+    def _handle_is_done(handle: BatchRequestHandle) -> bool:
+        return bool(handle.is_done())
 
     def pop_completed_record(self, set_id: str) -> BatchCompletionRecord | None:
         sid = str(set_id or "")
         with self._lock:
-            self.active_request_map.pop(sid, None)
-            self.active_request_meta.pop(sid, None)
             record_or_outcome = self.completed_outcome_map.pop(sid, None)
+            if isinstance(record_or_outcome, BatchCompletionRecord):
+                handle = (self.active_request_map or {}).get(sid)
+                handle_metadata = handle.metadata if isinstance(handle, BatchRequestHandle) else None
+                if (
+                    handle_metadata is not None
+                    and int(handle_metadata.generation) == int(record_or_outcome.generation)
+                    and (
+                        handle_metadata.expected_owner_epoch is None
+                        or record_or_outcome.expected_owner_epoch is None
+                        or int(handle_metadata.expected_owner_epoch) == int(record_or_outcome.expected_owner_epoch)
+                    )
+                ):
+                    self.active_request_map.pop(sid, None)
+                    self.active_request_meta.pop(sid, None)
         if isinstance(record_or_outcome, BatchCompletionRecord):
             return record_or_outcome
         return None
@@ -1168,6 +1202,7 @@ class BatchRuntimeLaneOwner:
     ) -> None:
         with self._lock:
             self._shutdown_requested = True
+            self._warm_pending_max_lanes = 0
             if bool(clear_warm_failure):
                 self._warm_failure = None
             active_handles = list((self.active_request_map or {}).values())
@@ -1181,9 +1216,7 @@ class BatchRuntimeLaneOwner:
         self._pool_stale = False
         if pool is not None:
             try:
-                close = getattr(pool, "close", None)
-                if callable(close):
-                    close(kill=bool(force_terminate))
+                pool.close(kill=bool(force_terminate))
             except Exception as exc:
                 record_nonfatal_exception("Failed batch lane pool shutdown", exc)
         self.reset_run_state()
@@ -1214,14 +1247,15 @@ class BatchRuntimeLaneOwner:
             return
         if not isinstance(handle.outcome, BatchLaneOutcome):
             return
-        metadata = handle.metadata
-        record = BatchCompletionRecord(
-            metadata=metadata,
-            outcome=handle.outcome,
-            completed_ts=float(handle.completed_ts if handle.completed_ts is not None else perf_counter()),
-        )
         with self._lock:
             if self.active_request_map.get(sid) is not handle:
                 return
+            request_metadata = dict((self.active_request_meta or {}).get(sid) or {})
+            record = BatchCompletionRecord(
+                metadata=handle.metadata,
+                outcome=handle.outcome,
+                completed_ts=float(handle.completed_ts if handle.completed_ts is not None else perf_counter()),
+                request_metadata=request_metadata,
+            )
             self.completed_outcome_map[sid] = record
         self.completed_queue.put((sid, record.completed_ts))

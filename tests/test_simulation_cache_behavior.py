@@ -12,6 +12,7 @@ from kindred.core.batch_simulation_cache import BatchSimulationCache
 from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
 from kindred.gui.controllers.simulation_cache_admin import SimulationCacheAdmin
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from tests.batch_context_test_helpers import seed_batch_context
 
@@ -29,6 +30,31 @@ def _fake_sim_result(*, marker: float = 1.0) -> dict:
         "fallback_occurred": False,
         "fallback_message": None,
     }
+
+
+def _callback_identity(
+    controller,
+    *,
+    run_id=0,
+    fast_mode=False,
+    request_id=0,
+    owner_epoch=None,
+    batch_set=None,
+    batch_set_id=None,
+    cache_key="",
+) -> SimulationCallbackIdentity:
+    return SimulationCallbackIdentity.capture(
+        run_id=run_id,
+        fast_mode=fast_mode,
+        request_id=request_id,
+        owner_epoch=owner_epoch,
+        batch_set=batch_set,
+        batch_set_id=batch_set_id,
+        cache_key=cache_key,
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
+    )
 
 
 def test_simulation_cache_admin_publishes_completion_cache_entry_and_preview_identity() -> None:
@@ -193,6 +219,11 @@ class _FakeLanePoolSubmission:
 class _FakeLanePool:
     def __init__(self) -> None:
         self.submissions: list[_FakeLanePoolSubmission] = []
+        self.ready_lane_count = 999
+
+    def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None:
+        _ = wait
+        self.ready_lane_count = max(1, int(max_lanes))
 
     def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
         _ = run_id, request_id, set_id, active_timeout_s
@@ -204,7 +235,7 @@ class _FakeLanePool:
             run_id=int(run_id),
             request_id=int(request_id),
             set_id=str(set_id),
-            owner_epoch=1,
+            owner_epoch=int(payload.get("owner_epoch", 1)) if isinstance(payload, dict) else 1,
             success=not (isinstance(payload, dict) and payload.get("success") is False),
             payload=payload if isinstance(payload, dict) else {"payload": payload},
         )
@@ -246,7 +277,7 @@ def _join_batch_request(main_window, task: dict[str, object]) -> None:
     main_window.simulation_controller.parallel_batch.join_active_requests(timeout_s=1.0)
 
 
-def _clear_eager_parallel_pool(main_window) -> None:
+def _clear_parallel_runtime_pool(main_window) -> None:
     controller = main_window.simulation_controller
     if controller.parallel_batch.has_lane_pool():
         controller.shutdown_batch_lane_pool(force_terminate=True)
@@ -307,12 +338,15 @@ def test_preview_results_go_to_preview_cache_and_are_bounded(main_window, qt_app
 
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=1.0),
-        run_id=1,
-        fast_mode=True,
-        request_id=1,
-        batch_set="set1",
-        batch_set_id="set1",
-        cache_key="preview-k1",
+        callback_identity=_callback_identity(
+            main_window.simulation_controller,
+            run_id=1,
+            fast_mode=True,
+            request_id=1,
+            batch_set="set1",
+            batch_set_id="set1",
+            cache_key="preview-k1",
+        ),
     )
     qt_app.processEvents()
 
@@ -325,12 +359,15 @@ def test_preview_results_go_to_preview_cache_and_are_bounded(main_window, qt_app
     )
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=2.0),
-        run_id=2,
-        fast_mode=True,
-        request_id=2,
-        batch_set="set1",
-        batch_set_id="set1",
-        cache_key="preview-k2",
+        callback_identity=_callback_identity(
+            main_window.simulation_controller,
+            run_id=2,
+            fast_mode=True,
+            request_id=2,
+            batch_set="set1",
+            batch_set_id="set1",
+            cache_key="preview-k2",
+        ),
     )
     qt_app.processEvents()
 
@@ -351,12 +388,15 @@ def test_result_cache_is_bounded_separately_from_preview(main_window, qt_app):
     main_window.simulation_controller.run_state.active_run_id = 10
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=1.0),
-        run_id=10,
-        fast_mode=False,
-        request_id=10,
-        batch_set="set1",
-        batch_set_id="set1",
-        cache_key="result-k1",
+        callback_identity=_callback_identity(
+            main_window.simulation_controller,
+            run_id=10,
+            fast_mode=False,
+            request_id=10,
+            batch_set="set1",
+            batch_set_id="set1",
+            cache_key="result-k1",
+        ),
     )
     qt_app.processEvents()
 
@@ -364,12 +404,15 @@ def test_result_cache_is_bounded_separately_from_preview(main_window, qt_app):
     main_window.simulation_controller.run_state.active_run_id = 11
     main_window.simulation_controller.on_simulation_complete(
         _fake_sim_result(marker=2.0),
-        run_id=11,
-        fast_mode=False,
-        request_id=11,
-        batch_set="set1",
-        batch_set_id="set1",
-        cache_key="result-k2",
+        callback_identity=_callback_identity(
+            main_window.simulation_controller,
+            run_id=11,
+            fast_mode=False,
+            request_id=11,
+            batch_set="set1",
+            batch_set_id="set1",
+            cache_key="result-k2",
+        ),
     )
     qt_app.processEvents()
 
@@ -1882,7 +1925,7 @@ def test_live_multiset_preview_completion_keeps_schema_stable_and_workspace_prev
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
-    _clear_eager_parallel_pool(main_window)
+    _clear_parallel_runtime_pool(main_window)
     main_window._batch_model.set_species(["A"])
 
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -2007,7 +2050,7 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
         "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0"
     )
     main_window._extract_and_populate_variables()
-    _clear_eager_parallel_pool(main_window)
+    _clear_parallel_runtime_pool(main_window)
     main_window._batch_model.set_species(["A"])
 
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -2076,13 +2119,14 @@ def test_live_multiset_parameter_preview_replays_after_partial_stale_completion(
     replay_metadata = main_window.simulation_controller.parallel_batch.active_request_metadata(primary_id)
     replay_identity = replay_metadata.get("callback_identity")
     assert replay_metadata["preview_owner_epoch"] == replay_identity.owner_epoch
-    assert replay_metadata["owner_epoch"] is None
+    assert replay_metadata["owner_epoch"] == replay_identity.owner_epoch
     replay_submission.complete(
         {
             "run_id": int(replay_task.get("run_id") or 0),
-            "set_id": str(replay_task.get("set_id") or ""),
-            "set_name": str(replay_task.get("set_name") or ""),
-            "t": np.asarray(preview_t, dtype=float),
+                "set_id": str(replay_task.get("set_id") or ""),
+                "set_name": str(replay_task.get("set_name") or ""),
+                "owner_epoch": int(replay_identity.owner_epoch or 0),
+                "t": np.asarray(preview_t, dtype=float),
             "Y": np.asarray([preview_series], dtype=float),
             "species_names": ["A"],
             "algebra_scalars": {},
@@ -2230,6 +2274,9 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
         batch_set=str(main_window.batch_set_name_for_id(newer_id) or newer_id),
         batch_set_id=newer_id,
         cache_key=cache_key,
+        callback_context=main_window.simulation_controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
     )
 
     main_window.simulation_controller.on_simulation_complete(

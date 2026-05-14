@@ -14,7 +14,7 @@ from kindred.core.analysis.dataset_parameter_overrides import FitDatasetParamete
 from kindred.core.exceptions import FittingCancelled
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
 from kindred.core.fitting_runtime_session import FittingRuntimeSession
-from kindred.core.simulation_preparation import coerce_prepared_simulation_metadata
+from kindred.gui.fitting.evaluator_state import FittingEvaluatorStateOwner
 from kindred.gui.fitting.run_stamp import (
     finalize_global_fit_run_stamp_prepared_simulation,
     hash_global_fit_run_stamp,
@@ -235,10 +235,9 @@ class FittingRuntimePreparationWorker:
         self._cancelled.set()
         with self._lock:
             session = self._session
-        cancel_run = getattr(session, "cancel_run", None)
-        if callable(cancel_run):
+        if session is not None:
             try:
-                cancel_run()
+                session.cancel_run()
             except Exception as exc:
                 logger.debug("Failed to cancel fitting runtime preparation: %s", exc, exc_info=True)
 
@@ -393,29 +392,6 @@ class FittingRuntimeReadinessController:
                 self._state = FittingRuntimeReadinessState.PREPARING
                 return
         self._start_preparation(identity)
-
-    def ready_identity_for(self, stamp_hash: str) -> Optional[FittingRuntimeIdentity]:
-        if self._ready_identity is None:
-            return None
-        requested = str(stamp_hash or "")
-        return (
-            self._ready_identity
-            if requested in {
-                str(self._ready_identity.stamp_hash or ""),
-                str(self._ready_identity.launch_request_hash or ""),
-            }
-            else None
-        )
-
-    def ready_session_for(self, stamp_hash: str) -> Optional[FittingRuntimeSession]:
-        identity = self.ready_identity_for(stamp_hash)
-        if identity is None:
-            return None
-        if not identity.readiness_required:
-            return None
-        if not self._session_ready(self._ready_session, lane_count=identity.lane_count):
-            return None
-        return self._ready_session
 
     def is_ready_for(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
         if identity is None:
@@ -590,14 +566,12 @@ class FittingRuntimeReadinessController:
             self._close_session(session, kill=kill)
 
     def _close_session(self, session: FittingRuntimeSession, *, kill: bool) -> None:
-        close = getattr(session, "close", None)
-        if callable(close):
-            try:
-                close(kill=bool(kill))
-            except Exception as exc:
-                logger.debug("Failed to close fitting runtime session: %s", exc, exc_info=True)
-            else:
-                self._ledger.session_closes += 1
+        try:
+            session.close(kill=bool(kill))
+        except Exception as exc:
+            logger.debug("Failed to close fitting runtime session: %s", exc, exc_info=True)
+        else:
+            self._ledger.session_closes += 1
 
     @staticmethod
     def _worker_running(worker: FittingRuntimePreparationWorker) -> bool:
@@ -631,20 +605,7 @@ class FittingRuntimeReadinessController:
 
     @staticmethod
     def _prepared_simulation_meta(fit_evaluator: Any):
-        if fit_evaluator is None:
-            return None
-        try:
-            prepared = getattr(fit_evaluator, "prepared_metadata", None)
-        except Exception:
-            prepared = None
-        meta = coerce_prepared_simulation_metadata(prepared)
-        if meta is not None:
-            return meta
-        try:
-            prepared = getattr(fit_evaluator, "_kindred_prepared_simulation_meta", None)
-        except Exception:
-            return None
-        return coerce_prepared_simulation_metadata(prepared)
+        return FittingEvaluatorStateOwner.prepared_simulation_meta_for(fit_evaluator)
 
     def _finalize_identity_for_accepted_launch(self, identity: FittingRuntimeIdentity) -> FittingRuntimeIdentity:
         if identity is None:
@@ -683,11 +644,8 @@ class FittingRuntimeReadinessController:
     def _session_ready(session: Optional[FittingRuntimeSession], *, lane_count: int) -> bool:
         if session is None:
             return False
-        is_ready = getattr(session, "is_ready", None)
-        if callable(is_ready):
-            try:
-                return bool(is_ready(lane_count=max(1, int(lane_count))))
-            except Exception as exc:
-                logger.debug("Failed to inspect fitting runtime readiness: %s", exc, exc_info=True)
-                return False
-        return False
+        try:
+            return bool(session.is_ready(lane_count=max(1, int(lane_count))))
+        except Exception as exc:
+            logger.debug("Failed to inspect fitting runtime readiness: %s", exc, exc_info=True)
+            return False

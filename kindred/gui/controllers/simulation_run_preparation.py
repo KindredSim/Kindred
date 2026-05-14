@@ -581,21 +581,51 @@ class SimulationRunDispatchPreparationOwner:
             if not bool(fast_mode):
                 self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
 
+        def _submitted_intervention_schedule_from_text(text: str):
+            from kindred.core.intervention_schedule import (
+                coerce_intervention_schedule,
+                normalized_intervention_schedule_payload,
+                parse_intervention_schedule_from_dsl,
+            )
+
+            intervention_schedule = parse_intervention_schedule_from_dsl(str(text or ""))
+            if intervention_schedule is None:
+                return None
+            from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+            from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+            mechanism = parse_dsl_to_mechanism(str(text or ""), initials={})
+            namespace = build_namespace_from_mechanism(mechanism)
+            payload = normalized_intervention_schedule_payload(
+                intervention_schedule,
+                mechanism_namespace=namespace,
+            )
+            return coerce_intervention_schedule(payload)
+
         for index, set_id in enumerate(mechanism_context.queue_ids):
             set_id_s = str(set_id)
             if index >= len(mechanism_context.batch_rows):
                 try:
+                    intervention_schedule = _submitted_intervention_schedule_from_text(
+                        str(mechanism_context.owner_full_dsl or "")
+                    )
                     identity = self._deps.simulation_identity_for_set(
                         set_id=set_id_s,
                         solver_config=solver_context.solver_config,
                         t_end=float(solver_context.t_end),
                         preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
+                        intervention_schedule_fingerprint=(
+                            "" if intervention_schedule is None else str(intervention_schedule.fingerprint or "")
+                        ),
                         fast_mode=bool(fast_mode),
                     )
                 except Exception as exc:
                     _abort_invalid_intervention_schedule(set_id_s, exc)
                     return None
-                simulation_identity_by_set_id[set_id_s] = identity.to_payload()
+                identity_payload = identity.to_payload()
+                if intervention_schedule is not None:
+                    intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
+                simulation_identity_by_set_id[set_id_s] = identity_payload
                 continue
             row = int(mechanism_context.batch_rows[index])
             set_name = (
@@ -609,9 +639,7 @@ class SimulationRunDispatchPreparationOwner:
             )
             mechanism_text_by_set_id[set_id_s] = str(request_mechanism_text)
             try:
-                from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
-
-                intervention_schedule = parse_intervention_schedule_from_dsl(str(request_mechanism_text))
+                intervention_schedule = _submitted_intervention_schedule_from_text(str(request_mechanism_text))
             except Exception as exc:
                 _abort_invalid_intervention_schedule(set_id_s, exc)
                 return None
@@ -656,12 +684,16 @@ class SimulationRunDispatchPreparationOwner:
                     t_end=float(solver_context.t_end),
                     canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
                     preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
+                    intervention_schedule_fingerprint=(
+                        "" if intervention_schedule is None else str(intervention_schedule.fingerprint or "")
+                    ),
                     fast_mode=bool(fast_mode),
                 )
             except Exception as exc:
                 _abort_invalid_intervention_schedule(set_id_s, exc)
                 return None
-            simulation_identity_by_set_id[set_id_s] = identity.to_payload()
+            identity_payload = identity.to_payload()
+            simulation_identity_by_set_id[set_id_s] = identity_payload
             initials_by_set_id[set_id_s] = dict(initials_dict)
             if bool(fast_mode):
                 parameter_overrides_by_set_id[set_id_s] = self._deps.slider_execution_parameter_values(

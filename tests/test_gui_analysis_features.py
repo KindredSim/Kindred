@@ -114,6 +114,7 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

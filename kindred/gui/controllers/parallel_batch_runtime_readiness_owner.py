@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import threading
 from typing import Callable, Optional
 
+from kindred.core.batch_runtime_session import BatchRuntimeSessionSnapshot
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 
 
@@ -34,7 +35,7 @@ def _runtime_snapshot(
 @dataclass(frozen=True)
 class ParallelBatchRunStartAvailability:
     ready: bool
-    lane_pool: object | None
+    lane_pool_token: int | None
     snapshot: RuntimeReadinessSnapshot
     error: BaseException | None = None
 
@@ -50,45 +51,26 @@ class ParallelBatchRuntimeReadinessOwner:
     ) -> None:
         self._batch_parallel = batch_parallel
         self._capacity_getter = capacity_getter
-        self._eagerly_created = False
-        self._eager_creation_thread: Optional[threading.Thread] = None
-        self._eager_creation_lock = threading.RLock()
+        self._warm_thread: Optional[threading.Thread] = None
+        self._warm_required_lanes: int | None = None
+        self._warm_lock = threading.RLock()
 
-    @property
-    def batch_parallel(self) -> object:
-        return self._batch_parallel
+    def wait_for_background_warm(self, *, timeout_s: float = 1.0) -> bool:
+        with self._warm_lock:
+            thread = self._warm_thread
+        if thread is None:
+            return False
+        thread.join(timeout=max(0.0, float(timeout_s)))
+        return not thread.is_alive()
 
-    @batch_parallel.setter
-    def batch_parallel(self, value: object) -> None:
-        self._batch_parallel = value
-
-    @property
-    def eagerly_created(self) -> bool:
-        return bool(self._eagerly_created)
-
-    @eagerly_created.setter
-    def eagerly_created(self, value: bool) -> None:
-        self._eagerly_created = bool(value)
-
-    @property
-    def eager_creation_thread(self) -> Optional[threading.Thread]:
-        return self._eager_creation_thread
-
-    def mark_ready(self) -> None:
-        self._eagerly_created = True
-
-    def mark_not_ready(self) -> None:
-        self._eagerly_created = False
-
-    def ready(self) -> bool:
-        effective_workers = self._effective_workers()
+    def ready(self, *, required_lanes: int | None = None) -> bool:
+        effective_workers = self._effective_workers(required_lanes=required_lanes)
         try:
             ready = bool(
                 self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers)))
             )
         except Exception:
             ready = False
-        self._eagerly_created = bool(ready)
         return bool(ready)
 
     def runtime_snapshot_for_selection(
@@ -114,7 +96,6 @@ class ParallelBatchRuntimeReadinessOwner:
             ready = bool(self._batch_parallel.has_ready_lane_pool(max_lanes=required))
             snapshot = self._batch_parallel.runtime_snapshot()
         except Exception as exc:
-            self._eagerly_created = False
             return _runtime_snapshot(
                 status="failed",
                 ready=False,
@@ -122,17 +103,15 @@ class ParallelBatchRuntimeReadinessOwner:
                 message=f"Batch runtime readiness check failed: {exc}",
                 polling=False,
             )
-        generation = int(getattr(snapshot, "current_generation", 0) or 0)
+        generation = int(snapshot.current_generation)
         if ready:
-            self._eagerly_created = True
             return _runtime_snapshot(
                 status="ready",
                 ready=True,
                 generation=generation,
                 polling=False,
             )
-        self._eagerly_created = False
-        failure = getattr(snapshot, "warm_failure", None)
+        failure = snapshot.warm_failure
         if failure:
             return _runtime_snapshot(
                 status="failed",
@@ -146,38 +125,40 @@ class ParallelBatchRuntimeReadinessOwner:
 
     def ensure(self, *, wait: bool = False, required_lanes: int | None = None) -> None:
         effective_workers = self._effective_workers(required_lanes=required_lanes)
+        required = max(1, int(effective_workers))
         try:
-            if self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers))):
-                self._eagerly_created = True
+            if self._batch_parallel.has_ready_lane_pool(max_lanes=required):
                 return
         except Exception:
-            self._eagerly_created = False
-        self._eagerly_created = False
+            pass
         if not bool(wait):
-            with self._eager_creation_lock:
-                existing = self._eager_creation_thread
-                if existing is not None and existing.is_alive():
+            with self._warm_lock:
+                existing = self._warm_thread
+                existing_required = self._warm_required_lanes
+                if (
+                    existing is not None
+                    and existing.is_alive()
+                    and existing_required is not None
+                    and int(existing_required) >= int(required)
+                ):
                     return
                 thread = threading.Thread(
                     target=self.ensure,
-                    kwargs={"wait": True, "required_lanes": max(1, int(effective_workers))},
+                    kwargs={"wait": True, "required_lanes": required},
                     name="kindred-batch-runtime-readiness",
                     daemon=True,
                 )
-                self._eager_creation_thread = thread
+                self._warm_thread = thread
+                self._warm_required_lanes = required
                 thread.start()
             return
         try:
             self._batch_parallel.ensure_warm_lane_pool(
-                max_lanes=max(1, int(effective_workers)),
+                max_lanes=required,
                 wait=bool(wait),
             )
         except Exception:
-            self._eagerly_created = False
             return
-        self._eagerly_created = bool(
-            self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers)))
-        )
 
     def run_start_availability(self, *, required_lanes: int) -> ParallelBatchRunStartAvailability:
         required = max(1, int(required_lanes))
@@ -191,25 +172,23 @@ class ParallelBatchRuntimeReadinessOwner:
                 and self._batch_parallel.has_ready_lane_pool(max_lanes=int(required))
             )
             if pool_ready:
-                lane_pool = self._batch_parallel.ensure_lane_pool(max_lanes=int(required))
+                lane_pool_token = self._batch_parallel.lane_pool_token()
                 snapshot = self._batch_parallel.runtime_snapshot()
-                self._eagerly_created = True
                 return ParallelBatchRunStartAvailability(
                     ready=True,
-                    lane_pool=lane_pool,
+                    lane_pool_token=None if lane_pool_token is None else int(lane_pool_token),
                     snapshot=_runtime_snapshot(
                         status="ready",
                         ready=True,
-                        generation=int(getattr(snapshot, "current_generation", 0) or 0),
+                        generation=int(snapshot.current_generation),
                         polling=False,
                     ),
                 )
             snapshot = self._batch_parallel.runtime_snapshot()
         except Exception as exc:
-            self._eagerly_created = False
             return ParallelBatchRunStartAvailability(
                 ready=False,
-                lane_pool=None,
+                lane_pool_token=None,
                 snapshot=_runtime_snapshot(
                     status="failed",
                     ready=False,
@@ -220,18 +199,17 @@ class ParallelBatchRuntimeReadinessOwner:
                 error=exc,
             )
 
-        self._eagerly_created = False
         return ParallelBatchRunStartAvailability(
             ready=False,
-            lane_pool=None,
+            lane_pool_token=None,
             snapshot=self._waiting_runtime_snapshot(snapshot),
         )
 
-    def _waiting_runtime_snapshot(self, snapshot: object) -> RuntimeReadinessSnapshot:
-        if bool(getattr(snapshot, "pool_stale", False)):
+    def _waiting_runtime_snapshot(self, snapshot: BatchRuntimeSessionSnapshot) -> RuntimeReadinessSnapshot:
+        if bool(snapshot.pool_stale):
             status = "stale"
             message = "Rebuilding batch runtime..."
-        elif bool(getattr(snapshot, "has_lane_pool", False)):
+        elif bool(snapshot.has_lane_pool):
             status = "warming"
             message = "Preparing batch runtime..."
         else:
@@ -240,7 +218,7 @@ class ParallelBatchRuntimeReadinessOwner:
         return _runtime_snapshot(
             status=status,
             ready=False,
-            generation=int(getattr(snapshot, "current_generation", 0) or 0),
+            generation=int(snapshot.current_generation),
             message=message,
             polling=True,
         )

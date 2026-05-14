@@ -92,9 +92,6 @@ class SimulationCompletionPublicationOwner:
         result: Mapping[str, Any],
         state: CompletionCallbackState,
         *,
-        run_id: Optional[int],
-        request_id: Optional[int],
-        batch_set_id: Optional[str],
         debug_batch_parallel: bool,
     ) -> None:
         try:
@@ -102,15 +99,13 @@ class SimulationCompletionPublicationOwner:
             if bool(debug_batch_parallel):
                 logger.info(
                     "BATCH_PAR completion handler run_id=%s request_id=%s set_id=%s slider=%s ts=%.6f",
-                    int(run_id or 0),
-                    int(request_id or 0),
-                    str(batch_set_id or ""),
+                    int(state.run_id or 0),
+                    int(state.request_id or 0),
+                    str(state.batch_set_id or ""),
                     bool(state.slider_triggered),
                     float(perf_counter()),
                 )
-            result_for_completion = dict(result)
-            result_for_completion.setdefault("mechanism_text", self._ui.mechanism.get_mechanism_text())
-            completion = self.build_result_state(result_for_completion)
+            completion = self.build_result_state(dict(result))
             self.resolve_cache_key(state)
             self.resolve_result_ownership(completion, state)
             self.apply_materialization_contract(completion, state)
@@ -154,6 +149,8 @@ class SimulationCompletionPublicationOwner:
         algebra_scalars = result.get("algebra_scalars") or {}
         algebra_errors = result.get("algebra_errors") or []
         solver_provenance = result.get("provenance") if isinstance(result.get("provenance"), Mapping) else {}
+        if not solver_provenance and isinstance(result.get("solver_provenance"), Mapping):
+            solver_provenance = result.get("solver_provenance")
         mechanism = result.get("mechanism")
         base_species_count = self._base_species_count(result, mechanism=mechanism)
         mechanism_text = str(result.get("mechanism_text", ""))
@@ -219,10 +216,6 @@ class SimulationCompletionPublicationOwner:
         )
 
     def resolve_cache_key(self, state: CompletionCallbackState) -> None:
-        state.cache_key = self._batch_context_owner.completion_publication_cache_key(
-            callback_cache_key=state.cache_key,
-            callback_context=state.ctx if isinstance(state.ctx, Mapping) else None,
-        )
         state.cache_key = str(state.cache_key) if state.cache_key else None
 
     def publish_cache_truth(self, state: CompletionCallbackState) -> None:
@@ -241,8 +234,11 @@ class SimulationCompletionPublicationOwner:
                 preview_scope_set_ids=preview_scope_ids,
             )
             return
+        context = self._explicit_cache_policy_context(state)
+        if context is None:
+            return
         cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
-            context=self._explicit_cache_policy_context(state),
+            context=context,
             cache_state=self._completion_policy_cache_state(),
             cache_key=state.cache_key,
         )
@@ -288,11 +284,13 @@ class SimulationCompletionPublicationOwner:
                     state.ctx,
                     state.policy_context,
                 )
+                completion.redraw_valid_set_ids, completion.has_redraw_subset = self._redraw_scope(state)
                 return
             state.ctx = self._batch_context_owner.serialize_completion_policy_context(
                 state.policy_context,
                 base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
             )
+            completion.redraw_valid_set_ids, completion.has_redraw_subset = self._redraw_scope(state)
 
     def publish_cache_entry(
         self,
@@ -435,7 +433,13 @@ class SimulationCompletionPublicationOwner:
 
         if not completion.is_primary:
             return
-        temperature_used = float(self._ui.solver.temperature_spinbox_value())
+        launch_provenance = (
+            completion.solver_provenance.get("launch_provenance")
+            if isinstance(completion.solver_provenance, Mapping)
+            else None
+        )
+        launch_provenance = launch_provenance if isinstance(launch_provenance, Mapping) else {}
+        temperature_used = None
         energy_unit_used = None
         if completion.mechanism is not None:
             try:
@@ -449,17 +453,25 @@ class SimulationCompletionPublicationOwner:
                     "Failed to read mechanism metadata for simulation provenance",
                     exc,
                 )
+        if launch_provenance.get("temperature_K") is not None:
+            temperature_used = float(launch_provenance["temperature_K"])
+        if temperature_used is None:
+            raise ValueError("Completion provenance requires captured temperature_K.")
 
-        sim_time_prov: float | str = str(self._ui.solver.sim_time_spinbox_text()).strip()
-        try:
-            sim_time_prov = float(self._ui.solver.parse_sim_time_seconds())
-        except Exception as exc:
-            self._deps.record_nonfatal_exception("Failed to parse simulation time for provenance; keeping text value", exc)
+        if launch_provenance.get("simulation_time") is not None:
+            sim_time_prov: float | str = float(launch_provenance["simulation_time"])
+        else:
+            try:
+                sim_time_prov = float(completion.t[-1])
+            except Exception as exc:
+                raise ValueError("Completion provenance requires captured simulation_time.") from exc
 
         from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, normalize_solver_name
 
         solver_label = str(
-            completion.solver_config.get("solver_label") or self._ui.solver.initial_solver_name() or DEFAULT_SOLVER_NAME
+            completion.solver_config.get("solver_label")
+            or completion.solver_config.get("solver")
+            or DEFAULT_SOLVER_NAME
         ).strip() or DEFAULT_SOLVER_NAME
         solver_method, solver_warning = normalize_solver_name(
             str(completion.solver_config.get("solver") or solver_label)
@@ -472,17 +484,23 @@ class SimulationCompletionPublicationOwner:
             solver_label=str(solver_label),
             solver_warning=(str(solver_warning) if solver_warning else None),
             solver_config={
-                "rtol": completion.solver_config.get("rtol", self._ui.solver.initial_rtol() or 1e-6),
-                "atol": completion.solver_config.get("atol", self._ui.solver.initial_atol() or 1e-12),
+                "rtol": completion.solver_config.get("rtol", 1e-6),
+                "atol": completion.solver_config.get("atol", 1e-12),
             },
             temperature_K=float(temperature_used),
             temperature_source=(
-                "dsl" if self._ui.solver.dsl_global_temperature_K(completion.mechanism_text) is not None else "ui"
+                str(launch_provenance.get("temperature_source"))
+                if launch_provenance.get("temperature_source") is not None
+                else "result"
             ),
             energy_unit=energy_unit_used,
             energy_mode=bool(completion.energy_mode),
             simulation_time=sim_time_prov,
-            num_points_requested=int(self._ui.solver.num_points_spinbox_value()),
+            num_points_requested=(
+                int(launch_provenance["num_points_requested"])
+                if launch_provenance.get("num_points_requested") is not None
+                else int((completion.solver_config.get("grid") or {}).get("N") or len(completion.t))
+            ),
             species_names=list(completion.species_names),
             t=completion.t,
             series=completion.series,
@@ -656,8 +674,11 @@ class SimulationCompletionPublicationOwner:
     def _redraw_scope(self, state: CompletionCallbackState) -> tuple[object | None, bool]:
         if state.is_preview or state.policy_context is None:
             return None, False
+        context = self._explicit_cache_policy_context(state)
+        if context is None:
+            return None, False
         cache_reconciliation = self._completion_policy.build_explicit_cache_reconciliation(
-            context=self._explicit_cache_policy_context(state),
+            context=context,
             cache_state=self._completion_policy_cache_state(),
             cache_key=state.cache_key,
         )
@@ -672,20 +693,11 @@ class SimulationCompletionPublicationOwner:
             active_cache_invalidated_set_ids=self._batch_cache.active_cache_invalidated_set_ids,
         )
 
-    def _explicit_cache_policy_context(self, state: CompletionCallbackState) -> CompletionPolicyContext:
+    def _explicit_cache_policy_context(self, state: CompletionCallbackState) -> CompletionPolicyContext | None:
         context = self._batch_context_owner.completion_publication_policy_context(
             callback_context=state.ctx if isinstance(state.ctx, Mapping) else None,
             policy_context=state.policy_context,
         )
-        if context is None:
-            return CompletionPolicyContext(
-                active=False,
-                request_id=state.request_id,
-                run_id=state.run_id,
-                fast_mode=bool(state.is_preview),
-                parallel=False,
-                keep_lane_pool_alive=False,
-            )
         return context
 
     def _is_primary(self, state: CompletionCallbackState) -> bool:

@@ -187,10 +187,10 @@ def _patch_main_window_test_environment(
                 polling=False,
             ),
         )
-    monkeypatch.setattr(
-        "kindred.gui.controllers.simulation_controller.SimulationController.ensure_parallel_batch_pool_eagerly_created",
-        lambda self, *, wait=False: None,
-    )
+        monkeypatch.setattr(
+            "kindred.gui.controllers.simulation_controller.SimulationController.ensure_parallel_batch_runtime_ready",
+            lambda self, *, wait=False: None,
+        )
 
     def _quiet_dialog(*_args, **_kwargs):
         return QtWidgets.QMessageBox.StandardButton.Ok

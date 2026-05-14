@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.batch_initial_conditions import BatchInitialConditionsStore
 from kindred.core.simulation_identity import canonical_initials_fingerprint
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_controller import SimulationRuntimeInputsChangeOutcome
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
@@ -73,6 +74,29 @@ def _completion_payload() -> dict[str, object]:
         "fallback_occurred": False,
         "fallback_message": None,
     }
+
+
+def _callback_identity(
+    controller,
+    *,
+    run_id=0,
+    fast_mode=False,
+    request_id=0,
+    batch_set_id=None,
+    cache_key="",
+) -> SimulationCallbackIdentity:
+    return SimulationCallbackIdentity.capture(
+        run_id=run_id,
+        fast_mode=fast_mode,
+        request_id=request_id,
+        owner_epoch=None,
+        batch_set=None,
+        batch_set_id=batch_set_id,
+        cache_key=cache_key,
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
+    )
 
 
 def _load_project_via_file_dialog(main_window, tmp_path, monkeypatch, payload) -> None:
@@ -1126,7 +1150,7 @@ def test_bootstrap_window_state_schedules_runtime_warm_without_blocking_hidden_s
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_prewarm_calls.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -1173,7 +1197,7 @@ def test_project_apply_schedules_runtime_warm_without_blocking_visible_load(main
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(
@@ -1213,7 +1237,7 @@ def test_startup_runtime_availability_callback_ignores_close_started_window(main
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: calls.append("batch"),
     )
 
@@ -1236,7 +1260,7 @@ def test_runtime_availability_refresh_delegates_current_workflow_need_without_ba
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: direct_batch_waits.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -1304,7 +1328,7 @@ def test_draft_reactions_typing_does_not_schedule_runtime_warm(main_window, monk
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_warms.append(bool(wait)),
     )
 
@@ -1402,7 +1426,7 @@ def test_solver_settings_runtime_change_truthfully_gates_visible_runtime_control
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_warms.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -1563,7 +1587,7 @@ def test_solver_settings_debounce_only_change_does_not_refresh_runtime(
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_warms.append(bool(wait)),
     )
 
@@ -1666,7 +1690,7 @@ def test_authoritative_mechanism_commit_schedules_runtime_rewarm_after_invalidat
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_warms.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -1745,7 +1769,7 @@ def test_authoritative_mechanism_commit_invalidates_display_before_scheduling_re
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(
@@ -1804,7 +1828,7 @@ def test_programmatic_mechanism_load_invalidates_display_before_scheduling_rewar
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(
@@ -1881,7 +1905,7 @@ def test_programmatic_mechanism_load_supersedes_in_flight_work_without_active_di
     )
     monkeypatch.setattr(
         controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
 
@@ -1921,9 +1945,12 @@ def test_direct_authoritative_editor_rewrite_supersedes_no_display_explicit_comp
     )
     controller.on_simulation_complete(
         _completion_payload(),
-        run_id=old_run_id,
-        fast_mode=False,
-        request_id=old_request_id,
+        callback_identity=_callback_identity(
+            controller,
+            run_id=old_run_id,
+            fast_mode=False,
+            request_id=old_request_id,
+        ),
     )
 
     assert worker.cancel_calls == 1
@@ -1955,11 +1982,14 @@ def test_authoritative_transition_rejects_old_preview_completion_without_active_
     )
     controller.on_simulation_complete(
         _completion_payload(),
-        run_id=old_run_id,
-        fast_mode=True,
-        request_id=old_request_id,
-        batch_set_id=set_id,
-        cache_key="project-apply-pending-preview-cache",
+        callback_identity=_callback_identity(
+            controller,
+            run_id=old_run_id,
+            fast_mode=True,
+            request_id=old_request_id,
+            batch_set_id=set_id,
+            cache_key="project-apply-pending-preview-cache",
+        ),
     )
 
     assert controller.run_state.latest_sim_request_id > old_request_id
@@ -1994,9 +2024,12 @@ def test_template_load_supersedes_no_display_explicit_completion(
     main_window._load_template_from_manager("reaction: A -> C; k=3.0")
     controller.on_simulation_complete(
         _completion_payload(),
-        run_id=old_run_id,
-        fast_mode=False,
-        request_id=old_request_id,
+        callback_identity=_callback_identity(
+            controller,
+            run_id=old_run_id,
+            fast_mode=False,
+            request_id=old_request_id,
+        ),
     )
 
     assert worker.cancel_calls == 1
@@ -2047,9 +2080,12 @@ def test_slider_materialization_supersedes_no_display_explicit_completion(
     main_window._sync_after_authoritative_slider_materialization()
     controller.on_simulation_complete(
         _completion_payload(),
-        run_id=old_run_id,
-        fast_mode=False,
-        request_id=old_request_id,
+        callback_identity=_callback_identity(
+            controller,
+            run_id=old_run_id,
+            fast_mode=False,
+            request_id=old_request_id,
+        ),
     )
 
     assert worker.cancel_calls == 1
@@ -2163,7 +2199,7 @@ def test_project_apply_defers_authoritative_rewarm_until_payload_finishes(
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(
@@ -2262,7 +2298,7 @@ def test_runtime_readiness_poll_enables_single_set_run_without_batch_runtime(mai
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_waits.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -2332,7 +2368,7 @@ def test_show_event_keeps_single_set_run_ready_after_hidden_serial_warm_without_
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_waits.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -2375,7 +2411,7 @@ def test_multiset_selection_gates_run_and_schedules_runtime_readiness(main_windo
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: direct_batch_waits.append(bool(wait)),
     )
     monkeypatch.setattr(

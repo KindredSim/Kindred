@@ -37,6 +37,7 @@ def _callback_identity(
     batch_set_id: str,
     cache_key: str,
     callback_context=None,
+    launch_provenance=None,
 ) -> SimulationCallbackIdentity:
     return main_window.simulation_controller._capture_simulation_callback_identity(
         run_id=run_id,
@@ -47,6 +48,9 @@ def _callback_identity(
         batch_set_id=batch_set_id,
         cache_key=cache_key,
         callback_context=callback_context,
+        simulation_identity={},
+        preview_batch_cache_token="",
+        launch_provenance=launch_provenance or {"temperature_K": 298.15},
     )
 
 
@@ -265,6 +269,7 @@ def test_parallel_callback_completion_main_window_uses_shared_slim_context_and_p
             callback_context=callback_context,
             simulation_identity=identity_payload_by_set_id[set_id],
             preview_batch_cache_token=f"callback-token-{set_id}",
+            launch_provenance={"temperature_K": 298.15},
         )
         for set_id, set_name in (("id1", "set1"), ("id2", "set2"))
     ]

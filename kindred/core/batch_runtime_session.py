@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
-from kindred.core.batch_containment import BatchPolledCompletion, BatchRequestHandle
+from kindred.core.batch_containment import BatchCompletionRecord, BatchPolledCompletion, BatchRequestHandle
 
 
 class BatchRuntimeSessionState(Enum):
@@ -91,16 +91,62 @@ class BatchRuntimeSessionSnapshot:
         )
 
 
+class BatchRuntimeLaneOwnerProtocol(Protocol):
+    current_generation: int
+    current_max_workers: int | None
+    is_pool_stale: bool
+    lane_pool_factory: Callable[[int, bool], Any]
+    limit_blas_threads_per_worker: bool
+    max_parallel_workers: int
+    record_nonfatal_exception: Callable[[str, BaseException], None]
+    warm_failure: str | None
+
+    def active_request_count(self) -> int: ...
+    def active_request_metadata(self, set_id: str) -> dict[str, Any]: ...
+    def clear_stale_requests(self) -> None: ...
+    def discard_request(self, set_id: str) -> None: ...
+    def drain_completion_queue(self) -> None: ...
+    def enqueue_completion(self, set_id: str) -> None: ...
+    def ensure_lane_pool(self, *, max_lanes: int) -> Any: ...
+    def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True) -> Any: ...
+    def has_lane_pool(self) -> bool: ...
+    def has_ready_lane_pool(self, *, max_lanes: int) -> bool: ...
+    def has_active_requests(self) -> bool: ...
+    def join_active_requests(self, *, timeout_s: float = 2.0) -> None: ...
+    def lane_pool_token(self) -> int | None: ...
+    def mark_pool_stale(self) -> None: ...
+    def poll_completed_records(self) -> list[BatchPolledCompletion]: ...
+    def request_worker_count(self) -> int: ...
+    def reset_active_run_state(self) -> None: ...
+    def reset_run_state(self) -> None: ...
+    def shutdown(
+        self,
+        *,
+        force_terminate: bool,
+        record_nonfatal_exception: Callable[[str, BaseException], None],
+    ) -> None: ...
+    def soft_supersede(self) -> tuple[int, int]: ...
+    def submit_task(
+        self,
+        task: Mapping[str, Any],
+        *,
+        run_id: int,
+        request_id: int,
+        set_id: str,
+        set_name: str,
+        preview_owner_epoch: int | None,
+        active_timeout_s: float,
+        expected_owner_epoch: int | None = None,
+        request_metadata: Mapping[str, Any] | None = None,
+    ) -> BatchRequestHandle: ...
+
+
 class BatchRuntimeSession:
-    def __init__(self, lane_owner: Any) -> None:
+    def __init__(self, lane_owner: BatchRuntimeLaneOwnerProtocol) -> None:
         self._lane_owner = lane_owner
         self._state = BatchRuntimeSessionState.IDLE
         self._request: BatchRuntimeSessionRequest | None = None
         self._completed_set_ids: list[str] = []
-
-    @property
-    def lane_owner(self) -> Any:
-        return self._lane_owner
 
     @property
     def state(self) -> BatchRuntimeSessionState:
@@ -112,27 +158,58 @@ class BatchRuntimeSession:
 
     @property
     def is_pool_stale(self) -> bool:
-        return bool(getattr(self._lane_owner, "is_pool_stale", False))
+        return bool(self._lane_owner.is_pool_stale)
 
     @property
     def current_max_workers(self) -> int | None:
-        value = getattr(self._lane_owner, "current_max_workers", None)
+        value = self._lane_owner.current_max_workers
         return None if value is None else int(value)
 
     @property
     def warm_failure(self) -> str | None:
-        value = getattr(self._lane_owner, "warm_failure", None)
-        if callable(value):
-            value = value()
+        value = self._lane_owner.warm_failure
         return None if value is None else str(value)
+
+    @property
+    def lane_pool_factory(self) -> Callable[[int, bool], Any]:
+        return self._lane_owner.lane_pool_factory
+
+    @lane_pool_factory.setter
+    def lane_pool_factory(self, value: Callable[[int, bool], Any]) -> None:
+        previous = self._lane_owner.lane_pool_factory
+        self._lane_owner.lane_pool_factory = value
+        if value is not previous and self.has_lane_pool():
+            self.mark_pool_stale()
+
+    @property
+    def max_parallel_workers(self) -> int:
+        return int(self._lane_owner.max_parallel_workers)
+
+    @max_parallel_workers.setter
+    def max_parallel_workers(self, value: int) -> None:
+        self._lane_owner.max_parallel_workers = int(value)
+
+    @property
+    def limit_blas_threads_per_worker(self) -> bool:
+        return bool(self._lane_owner.limit_blas_threads_per_worker)
+
+    @limit_blas_threads_per_worker.setter
+    def limit_blas_threads_per_worker(self, value: bool) -> None:
+        self._lane_owner.limit_blas_threads_per_worker = bool(value)
+
+    @property
+    def record_nonfatal_exception(self) -> Callable[[str, BaseException], None]:
+        return self._lane_owner.record_nonfatal_exception
+
+    @record_nonfatal_exception.setter
+    def record_nonfatal_exception(self, value: Callable[[str, BaseException], None]) -> None:
+        self._lane_owner.record_nonfatal_exception = value
 
     def begin(self, request: BatchRuntimeSessionRequest) -> None:
         self._request = request
         self._completed_set_ids = []
         self._state = BatchRuntimeSessionState.RUNNING
-        reset = getattr(self._lane_owner, "reset_active_run_state", None)
-        if callable(reset):
-            reset()
+        self._lane_owner.reset_active_run_state()
 
     def snapshot(self) -> BatchRuntimeSessionSnapshot:
         request = self._request
@@ -148,7 +225,7 @@ class BatchRuntimeSession:
             keep_lane_pool_alive=False if request is None else request.keep_lane_pool_alive,
             active_request_count=self.active_request_count(),
             request_worker_count=self.request_worker_count(),
-            current_generation=int(getattr(self._lane_owner, "current_generation", 0) or 0),
+            current_generation=int(self._lane_owner.current_generation or 0),
             current_max_workers=self.current_max_workers,
             pool_stale=self.is_pool_stale,
             has_lane_pool=self.has_lane_pool(),
@@ -170,8 +247,12 @@ class BatchRuntimeSession:
         set_name: str,
         expected_owner_epoch: int | None = None,
         active_timeout_s: float | None = None,
+        callback_identity: Any,
     ) -> BatchRequestHandle:
         request = self._require_running_request()
+        if callback_identity is None:
+            raise ValueError("Batch runtime session task submission requires callback_identity.")
+        request_metadata = {"callback_identity": callback_identity}
         return self._lane_owner.submit_task(
             dict(task or {}),
             run_id=int(request.run_id),
@@ -181,6 +262,7 @@ class BatchRuntimeSession:
             preview_owner_epoch=request.preview_owner_epoch,
             active_timeout_s=float(request.active_timeout_s if active_timeout_s is None else active_timeout_s),
             expected_owner_epoch=None if expected_owner_epoch is None else int(expected_owner_epoch),
+            request_metadata=request_metadata,
         )
 
     def poll_completed_records(self) -> list[BatchPolledCompletion]:
@@ -191,10 +273,44 @@ class BatchRuntimeSession:
         accepted: list[BatchPolledCompletion] = []
         for item in polled:
             record = item.record
-            if int(record.run_id) != int(request.run_id) or int(record.request_id) != int(request.request_id):
-                continue
             sid = str(item.set_id or record.set_id or "")
             if not sid:
+                continue
+            is_current_session_record = (
+                int(record.run_id) == int(request.run_id)
+                and int(record.request_id) == int(request.request_id)
+                and (
+                    request.preview_owner_epoch is None
+                    or (
+                        record.expected_owner_epoch is not None
+                        and int(record.expected_owner_epoch) == int(request.preview_owner_epoch)
+                    )
+                )
+            )
+            if not is_current_session_record:
+                stale_metadata = dict(record.request_metadata or {})
+                stale_metadata["runtime_session_stale"] = {
+                    "expected_run_id": int(request.run_id),
+                    "expected_request_id": int(request.request_id),
+                    "expected_owner_epoch": request.preview_owner_epoch,
+                    "actual_run_id": int(record.run_id),
+                    "actual_request_id": int(record.request_id),
+                    "actual_owner_epoch": record.expected_owner_epoch,
+                }
+                record = BatchCompletionRecord(
+                    metadata=record.metadata,
+                    outcome=record.outcome,
+                    completed_ts=record.completed_ts,
+                    request_metadata=stale_metadata,
+                )
+                accepted.append(
+                    BatchPolledCompletion(
+                        set_id=sid,
+                        record=record,
+                        source=item.source,
+                        completed_ts=item.completed_ts,
+                    )
+                )
                 continue
             if sid not in self._completed_set_ids:
                 self._completed_set_ids.append(sid)
@@ -223,6 +339,14 @@ class BatchRuntimeSession:
     def mark_pool_stale(self) -> None:
         self._lane_owner.mark_pool_stale()
 
+    def reset_active_run_state(self) -> None:
+        self._lane_owner.reset_active_run_state()
+
+    def reset_run_state(self) -> None:
+        self._lane_owner.reset_run_state()
+        self._completed_set_ids = []
+        self._state = BatchRuntimeSessionState.IDLE
+
     def shutdown(
         self,
         *,
@@ -237,60 +361,41 @@ class BatchRuntimeSession:
         self._completed_set_ids = []
 
     def has_lane_pool(self) -> bool:
-        has_lane_pool = getattr(self._lane_owner, "has_lane_pool", None)
-        return bool(has_lane_pool()) if callable(has_lane_pool) else False
+        return bool(self._lane_owner.has_lane_pool())
 
     def has_ready_lane_pool(self, *, max_lanes: int) -> bool:
-        has_ready_lane_pool = getattr(self._lane_owner, "has_ready_lane_pool", None)
-        return bool(has_ready_lane_pool(max_lanes=int(max_lanes))) if callable(has_ready_lane_pool) else False
+        return bool(self._lane_owner.has_ready_lane_pool(max_lanes=int(max_lanes)))
 
     def active_request_count(self) -> int:
-        active_request_count = getattr(self._lane_owner, "active_request_count", None)
-        return int(active_request_count()) if callable(active_request_count) else 0
+        return int(self._lane_owner.active_request_count())
 
     def has_active_requests(self) -> bool:
-        has_active_requests = getattr(self._lane_owner, "has_active_requests", None)
-        return bool(has_active_requests()) if callable(has_active_requests) else bool(self.active_request_count())
+        return bool(self._lane_owner.has_active_requests())
 
     def request_worker_count(self) -> int:
-        request_worker_count = getattr(self._lane_owner, "request_worker_count", None)
-        return int(request_worker_count()) if callable(request_worker_count) else 0
+        return int(self._lane_owner.request_worker_count())
 
     def join_active_requests(self, *, timeout_s: float = 2.0) -> None:
-        join = getattr(self._lane_owner, "join_active_requests", None)
-        if callable(join):
-            join(timeout_s=float(timeout_s))
+        self._lane_owner.join_active_requests(timeout_s=float(timeout_s))
 
     def lane_pool_token(self) -> int | None:
-        lane_pool_token = getattr(self._lane_owner, "lane_pool_token", None)
-        if callable(lane_pool_token):
-            value = lane_pool_token()
-            return None if value is None else int(value)
-        return None
+        value = self._lane_owner.lane_pool_token()
+        return None if value is None else int(value)
 
     def drain_completion_queue(self) -> None:
-        drain = getattr(self._lane_owner, "drain_completion_queue", None)
-        if callable(drain):
-            drain()
+        self._lane_owner.drain_completion_queue()
 
     def enqueue_completion(self, set_id: str) -> None:
-        enqueue = getattr(self._lane_owner, "enqueue_completion", None)
-        if callable(enqueue):
-            enqueue(str(set_id or ""))
+        self._lane_owner.enqueue_completion(str(set_id or ""))
 
     def clear_stale_requests(self) -> None:
-        clear = getattr(self._lane_owner, "clear_stale_requests", None)
-        if callable(clear):
-            clear()
+        self._lane_owner.clear_stale_requests()
 
     def active_request_metadata(self, set_id: str) -> dict[str, Any]:
-        metadata = getattr(self._lane_owner, "active_request_metadata", None)
-        return dict(metadata(str(set_id or ""))) if callable(metadata) else {}
+        return dict(self._lane_owner.active_request_metadata(str(set_id or "")))
 
     def discard_request(self, set_id: str) -> None:
-        discard = getattr(self._lane_owner, "discard_request", None)
-        if callable(discard):
-            discard(str(set_id or ""))
+        self._lane_owner.discard_request(str(set_id or ""))
 
     def _require_running_request(self) -> BatchRuntimeSessionRequest:
         request = self._request

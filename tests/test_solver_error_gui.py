@@ -4,6 +4,7 @@ import pytest
 from PySide6 import QtWidgets
 
 from kindred.core.exceptions import create_solver_error
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
 
@@ -37,7 +38,21 @@ def test_main_window_shows_solver_error(main_window, monkeypatch):
         "forced failure; attempted methods: BDF, Radau",
     )
 
-    main_window.simulation_controller.on_simulation_error(str(error))
+    main_window.simulation_controller.on_simulation_error(
+        str(error),
+        callback_identity=SimulationCallbackIdentity.capture(
+            run_id=main_window.simulation_controller._active_run_id,
+            fast_mode=False,
+            request_id=main_window.simulation_controller._latest_sim_request_id,
+            owner_epoch=None,
+            batch_set=None,
+            batch_set_id=None,
+            cache_key="",
+            callback_context=main_window.simulation_controller.batch_context_owner.callback_context_snapshot(),
+            simulation_identity={},
+            preview_batch_cache_token="",
+        ),
+    )
 
     assert mock_critical.called
     error_text = mock_critical.call_args[0][2]

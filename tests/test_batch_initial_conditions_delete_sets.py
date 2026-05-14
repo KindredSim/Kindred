@@ -325,6 +325,8 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _StubWorker)
 
     class _ReadyLanePool:
+        ready_lane_count = 999
+
         def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
             _ = active_timeout_s
             task_map = dict(task or {})
@@ -351,6 +353,10 @@ def test_run_all_twice_does_not_accumulate_worker_objects_or_plot_curves(main_wi
                 success=True,
                 payload=payload,
             )
+
+        def warm_lanes(self, required: int, *, wait: bool = True) -> None:
+            _ = wait
+            self.ready_lane_count = max(int(self.ready_lane_count), int(required))
 
         def close(self, *, kill: bool = False) -> None:
             _ = kill

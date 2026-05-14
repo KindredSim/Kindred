@@ -115,6 +115,7 @@ def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

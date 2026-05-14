@@ -52,6 +52,23 @@ def _assert_aoh_same_side_step(mechanism: object) -> None:
     assert aoh_step.net_stoich == {"Ycross": -1.0, "W": 1.0, "PO": 1.0}
 
 
+class _ReadyBatchPool:
+    def __init__(self, max_lanes: int, warm_calls: list[dict[str, object]]) -> None:
+        self.ready_lane_count = 0
+        self.max_lanes = int(max_lanes)
+        self._warm_calls = warm_calls
+
+    def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None:
+        self._warm_calls.append({"max_lanes": int(max_lanes), "wait": bool(wait)})
+        self.ready_lane_count = max(self.ready_lane_count, int(max_lanes))
+
+    def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+        raise AssertionError("readiness workflow test must not submit batch work")
+
+    def close(self, *, kill: bool = False) -> None:
+        return None
+
+
 def test_pasted_mechanism_runs_through_real_gui_containment(main_window, qtbot, monkeypatch):
     pasted_mechanism = "\n".join(
         [
@@ -215,7 +232,7 @@ def test_initial_condition_add_select_reselect_is_passive_runtime_work(
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: batch_warms.append(bool(wait)),
     )
     monkeypatch.setattr(
@@ -252,6 +269,76 @@ def test_initial_condition_add_select_reselect_is_passive_runtime_work(
     assert batch_warms == []
     assert scheduled == []
     assert recomputes == []
+
+
+def test_real_runtime_readiness_fixture_uses_parallel_batch_readiness_owner(main_window):
+    controller = main_window.simulation_controller
+    warm_calls: list[dict[str, object]] = []
+
+    controller.shutdown_batch_lane_pool(force_terminate=True)
+    controller._batch_parallel.lane_pool_factory = (
+        lambda max_lanes, _limit_blas_threads: _ReadyBatchPool(int(max_lanes), warm_calls)
+    )
+
+    controller.ensure_parallel_batch_runtime_ready(wait=True, required_lanes=2)
+
+    assert warm_calls == [{"max_lanes": 2, "wait": True}]
+    assert controller.parallel_batch_runtime_ready(required_lanes=2) is True
+    availability = controller.parallel_batch_runtime_readiness_owner.run_start_availability(
+        required_lanes=2,
+    )
+    assert availability.ready is True
+    assert availability.lane_pool_token is not None
+
+
+def test_multirow_run_click_uses_ready_parallel_batch_runtime_owner(
+    main_window,
+    qtbot,
+    qt_app,
+    monkeypatch,
+):
+    controller = main_window.simulation_controller
+    warm_calls: list[dict[str, object]] = []
+    run_calls: list[dict[str, object]] = []
+
+    controller.shutdown_batch_lane_pool(force_terminate=True)
+    controller._batch_parallel.max_parallel_workers = 2
+    controller.batch_runtime_lane_budget = 2
+    controller._batch_parallel.lane_pool_factory = (
+        lambda max_lanes, _limit_blas_threads: _ReadyBatchPool(int(max_lanes), warm_calls)
+    )
+
+    main_window.show()
+    qtbot.waitUntil(lambda: main_window.isVisible(), timeout=1000)
+    main_window._load_preset_mechanism("M1")
+    qt_app.processEvents()
+    main_window._add_batch_set()
+    qt_app.processEvents()
+    _select_batch_rows(main_window, [0, 1])
+    qt_app.processEvents()
+
+    controller.ensure_parallel_batch_runtime_ready(wait=True, required_lanes=2)
+    assert controller.selected_run_uses_parallel_batch_runtime() is True
+    assert controller.selected_run_runtime_snapshot().ready is True
+    assert warm_calls == [{"max_lanes": 2, "wait": True}]
+    warm_calls.clear()
+
+    def _record_run(**kwargs):
+        run_calls.append(dict(kwargs))
+
+    monkeypatch.setattr(controller, "run_simulation_internal", _record_run)
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
+    main_window._simulation_run_ui_owner.set_run_button_enabled(True)
+    qtbot.waitUntil(lambda: main_window._run_btn.isEnabled(), timeout=1000)
+
+    qtbot.mouseClick(main_window._run_btn, QtCore.Qt.LeftButton)
+    qt_app.processEvents()
+
+    assert len(run_calls) == 1
+    assert run_calls[0]["fast_mode"] is False
+    assert run_calls[0]["batch_rows"] == [0, 1]
+    assert run_calls[0]["reuse_parallel_lane_pool"] is True
+    assert warm_calls == []
 
 
 class _RecordingOwner:
@@ -301,7 +388,7 @@ def test_schedule_bearing_runtime_readiness_reuses_and_invalidates_by_schedule_i
 
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(
@@ -499,7 +586,7 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingContainedWorker)
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(
@@ -829,7 +916,7 @@ def test_run_clicked_while_selected_runtime_is_warming_replays_without_second_cl
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _InstantContainedWorker)
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_parallel_batch_pool_eagerly_created",
+        "ensure_parallel_batch_runtime_ready",
         lambda *, wait=False: None,
     )
     monkeypatch.setattr(

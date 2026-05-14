@@ -11,7 +11,6 @@ class ContainedSerialWorkerLaunchRequest:
     plan_payload: Mapping[str, Any] | None
     callback_identity: SimulationCallbackIdentity
     include_mechanism_in_result_payload: bool
-    worker_signature: str | None
     parent: Any
 
 
@@ -57,8 +56,6 @@ class ContainedSerialWorkerLaunchOwner:
         self._stamp_worker_identity(
             worker,
             identity=identity,
-            plan_payload=dict(request.plan_payload),
-            worker_signature=request.worker_signature,
         )
         return worker
 
@@ -98,15 +95,8 @@ class ContainedSerialWorkerLaunchOwner:
         worker: Any,
         *,
         identity: SimulationCallbackIdentity,
-        plan_payload: Mapping[str, Any],
-        worker_signature: str | None,
     ) -> None:
-        worker._run_id = int(identity.run_id or 0)
-        worker._request_id = int(identity.request_id or 0)
+        worker._run_id = int(identity.run_id)
+        worker._request_id = int(identity.request_id)
         worker._fast_mode = bool(identity.fast_mode)
-        worker._batch_set_name = str(identity.batch_set or "")
         worker._batch_set_id = str(identity.batch_set_id or "")
-        worker._batch_cache_key = str(identity.cache_key or "")
-        if worker_signature:
-            worker._batch_mechanism_signature = str(worker_signature)
-        worker._simulation_plan = dict(plan_payload)

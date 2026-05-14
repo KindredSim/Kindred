@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import SimulationExecutionRequest
 
@@ -50,7 +51,6 @@ class SerialBatchDispatchInput:
 class SerialBatchDispatchPlan:
     plan_payload: Dict[str, Any] | None
     cache_key: str
-    worker_signature: str
     cache_key_rewritten: bool = False
 
 
@@ -170,6 +170,12 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             )
 
     simulation_identity = dict(dispatch_input.simulation_identity or {})
+    intervention_schedule_payload: dict[str, Any] | None = None
+    if isinstance(dispatch_input.intervention_schedule, Mapping):
+        schedule = coerce_intervention_schedule(dispatch_input.intervention_schedule)
+        if schedule is not None:
+            intervention_schedule_payload = schedule.to_payload()
+            simulation_identity["intervention_schedule_fingerprint"] = str(schedule.fingerprint or "")
 
     if plan_payload is None:
         if isinstance(execution_request, dict):
@@ -192,8 +198,8 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
                     else None
                 ),
             )
-            if isinstance(dispatch_input.intervention_schedule, Mapping):
-                request_kwargs["intervention_schedule"] = dict(dispatch_input.intervention_schedule)
+            if intervention_schedule_payload is not None:
+                request_kwargs["intervention_schedule"] = dict(intervention_schedule_payload)
             plan_request = SimulationExecutionRequest(**request_kwargs).to_payload()
         cache_identity_payload = _cache_identity_payload(
             dispatch_input,
@@ -219,11 +225,19 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             if isinstance(execution_request, dict)
             else _execution_request_payload_from_plan(plan_payload)
         )
+        if isinstance(plan_execution_request, dict) and intervention_schedule_payload is not None:
+            plan_execution_request = dict(plan_execution_request)
+            plan_execution_request["intervention_schedule"] = dict(intervention_schedule_payload)
         if isinstance(plan_execution_request, dict):
             plan = SimulationPlan.from_payload(plan_payload)
             plan_identity = plan.simulation_identity_payload()
             if plan_identity:
+                schedule_fingerprint = str(
+                    simulation_identity.get("intervention_schedule_fingerprint") or ""
+                )
                 simulation_identity = dict(plan_identity)
+                if schedule_fingerprint:
+                    simulation_identity["intervention_schedule_fingerprint"] = schedule_fingerprint
             cache_identity_payload = _cache_identity_payload(
                 dispatch_input,
                 simulation_identity=simulation_identity,
@@ -272,7 +286,6 @@ def build_serial_batch_dispatch_plan(
     execution_request: Optional[Dict[str, Any]] = None
     simulation_plan_by_set_id = dict(payload.simulation_plan_by_set_id)
     mechanism_text_by_set_id = dict(payload.mechanism_text_by_set_id)
-    mechanism_signature_by_set_id = dict(payload.mechanism_signature_by_set_id)
     simulation_identity_by_set_id = dict(payload.simulation_identity_by_set_id)
     prepared_payloads = dict(payload.prepared_by_set_id)
 
@@ -317,7 +330,6 @@ def build_serial_batch_dispatch_plan(
     else:
         mechanism_text_for_worker = mechanism_text_by_set_id.get(set_id, full_dsl)
 
-    worker_signature = str(mechanism_signature_by_set_id.get(set_id) or "")
     cache_key_rewritten = False
 
     dispatch_plan = build_batch_set_dispatch_plan(
@@ -350,7 +362,6 @@ def build_serial_batch_dispatch_plan(
     return SerialBatchDispatchPlan(
         plan_payload=plan_payload if isinstance(plan_payload, dict) else None,
         cache_key=str(cache_key),
-        worker_signature=worker_signature,
         cache_key_rewritten=bool(cache_key_rewritten),
     )
 
@@ -380,11 +391,9 @@ def build_parallel_batch_task_plan(dispatch_input: ParallelBatchTaskInput) -> Pa
             algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
         )
     )
-    simulation_identity = (
-        dict(dispatch_plan.simulation_identity)
-        if dispatch_plan.simulation_identity
-        else dict(simulation_identity_by_set_id.get(set_id) or {})
-    )
+    simulation_identity = dict(dispatch_plan.simulation_identity)
+    if not simulation_identity:
+        raise ValueError(f"Missing submitted simulation identity for set {set_id!r}.")
     task: Dict[str, Any] = {
         "run_id": int(payload.run_id),
         "request_id": int(payload.request_id),

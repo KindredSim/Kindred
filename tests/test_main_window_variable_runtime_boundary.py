@@ -38,7 +38,7 @@ class _FakeRuntimeHost:
         self._best_effort_failures: list[tuple[str, str]] = []
         self._sim_controller = SimpleNamespace(
             run_state=SimpleNamespace(),
-            ensure_parallel_batch_pool_eagerly_created=lambda *, wait=False: None,
+            ensure_parallel_batch_runtime_ready=lambda *, wait=False: None,
         )
         self._slider_runtime_dirty = False
         self._slider_overrides: Dict[str, float] = {}
@@ -182,7 +182,7 @@ def test_runtime_extract_does_not_warm_parallel_pool_during_variable_refresh() -
             self.calls = 0
             self.run_state = SimpleNamespace()
 
-        def ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
+        def ensure_parallel_batch_runtime_ready(self, *, wait: bool = False) -> None:
             _ = wait
             self.calls += 1
 

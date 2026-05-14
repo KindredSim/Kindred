@@ -329,125 +329,117 @@ def test_warm_simulation_owner_sets_blas_env_for_runtime_child():
         owner.close(kill=True)
 
 
-def test_warm_simulation_owner_custom_child_target_applies_handler_env():
-    from kindred.core.simulation_containment import WarmSimulationOwner
-
-    owner = WarmSimulationOwner(
-        {},
-        child_target=_warm_owner_test_child,
-        handler_env={"KINDRED_TEST_CHILD_ENV": "applied"},
-        mp_context=_require_spawn_queue_support(),
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=1.0,
+def test_warm_simulation_owner_adapter_maps_runtime_warm_failures(monkeypatch):
+    import kindred.core.simulation_containment as containment
+    from kindred.core.containment_kernel import (
+        ContainmentKernelCancelled,
+        ContainmentKernelChildFailure,
+        ContainmentKernelProtocolError,
+        ContainmentKernelStartupTimeout,
     )
-    try:
-        result = owner.solve(
-            {
-                "behavior": "env_echo",
-                "env_names": ["KINDRED_TEST_CHILD_ENV"],
-            }
-        )
-        assert result["env"] == {"KINDRED_TEST_CHILD_ENV": "applied"}
-    finally:
-        owner.close(kill=True)
+    from kindred.core.exceptions import SimulationCancelled
+
+    class _FakeRuntimeOwner:
+        warm_exception: BaseException | None = None
+
+        def __init__(self, **_kwargs):
+            self.owner_epoch = 7
+            self.is_running = False
+            self.is_ready = False
+            self.close_calls: list[bool] = []
+
+        def warm(self, **_kwargs):
+            if self.warm_exception is not None:
+                raise self.warm_exception
+
+        def solve(self, *_args, **_kwargs):
+            return {"success": True}
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    monkeypatch.setattr(containment, "SimulationRuntimeOwner", _FakeRuntimeOwner)
+    cases = [
+        (
+            ContainmentKernelStartupTimeout(0.25),
+            containment.SimulationContainmentStartupTimeout,
+        ),
+        (
+            ContainmentKernelChildFailure({"kind": "boom", "message": "child failed"}),
+            containment.SimulationContainmentChildFailure,
+        ),
+        (
+            ContainmentKernelProtocolError("bad protocol"),
+            containment.SimulationContainmentProtocolError,
+        ),
+        (ContainmentKernelCancelled(), SimulationCancelled),
+    ]
+
+    for runtime_exc, expected_exc in cases:
+        _FakeRuntimeOwner.warm_exception = runtime_exc
+        owner = containment.WarmSimulationOwner({})
+        with pytest.raises(expected_exc):
+            owner.start(wait=True)
 
 
-def test_warm_simulation_owner_delayed_ready_is_startup_timeout_not_active_timeout():
-    from kindred.core.simulation_containment import (
-        SimulationContainmentStartupTimeout,
-        SimulationContainmentTimeout,
-        WarmSimulationOwner,
-    )
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {"ready_delay_s": 0.25},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=0.05,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.05,
-    )
-
-    try:
-        with pytest.raises(SimulationContainmentStartupTimeout):
-            owner.solve({"behavior": "echo"})
-    except SimulationContainmentTimeout as exc:  # pragma: no cover - documents the red/green distinction
-        pytest.fail(f"delayed READY used active timeout path: {exc!r}")
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_active_timeout_starts_after_accept_and_kills_child():
-    from kindred.core.simulation_containment import SimulationContainmentTimeout, WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.05,
-    )
-
-    try:
-        with pytest.raises(SimulationContainmentTimeout) as exc:
-            owner.solve({"behavior": "hang_after_accept"})
-        assert exc.value.failure["kind"] == "timeout"
-        assert owner.owner_epoch == 1
-        assert owner.is_running is False
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_accept_timeout_kills_child():
-    from kindred.core.simulation_containment import SimulationContainmentAcceptTimeout, WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=0.05,
-        active_timeout_s=5.0,
+def test_warm_simulation_owner_adapter_maps_runtime_solve_failures(monkeypatch):
+    import kindred.core.simulation_containment as containment
+    from kindred.core.containment_kernel import (
+        ContainmentKernelAcceptTimeout,
+        ContainmentKernelActiveTimeout,
+        ContainmentKernelChildFailure,
+        ContainmentKernelProtocolError,
+        ContainmentKernelStartupTimeout,
     )
 
-    try:
-        with pytest.raises(SimulationContainmentAcceptTimeout):
-            owner.solve({"behavior": "fatal_before_accept", "fatal_delay_s": 0.2})
-        assert owner.is_running is False
-    finally:
-        owner.close(kill=True)
+    class _FakeRuntimeOwner:
+        solve_exception: BaseException | None = None
 
+        def __init__(self, **_kwargs):
+            self.owner_epoch = 7
+            self.is_running = False
+            self.is_ready = True
 
-def test_warm_simulation_owner_reconstruction_failure_before_accept_is_not_active_timeout():
-    from kindred.core.simulation_containment import (
-        SimulationContainmentChildFailure,
-        SimulationContainmentTimeout,
-        WarmSimulationOwner,
-    )
+        def warm(self, **_kwargs):
+            return None
 
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.01,
-    )
+        def solve(self, *_args, **_kwargs):
+            if self.solve_exception is not None:
+                raise self.solve_exception
+            return {"success": True}
 
-    try:
-        with pytest.raises(SimulationContainmentChildFailure) as exc:
-            owner.solve({"behavior": "fatal_before_accept", "fatal_delay_s": 0.05})
-        assert exc.value.failure["kind"] == "simulation_containment_reconstruction"
-    except SimulationContainmentTimeout as exc:  # pragma: no cover - documents the red/green distinction
-        pytest.fail(f"pre-accept reconstruction failure used active timeout path: {exc!r}")
-    finally:
-        owner.close(kill=True)
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
+
+    monkeypatch.setattr(containment, "SimulationRuntimeOwner", _FakeRuntimeOwner)
+    cases = [
+        (
+            ContainmentKernelStartupTimeout(0.25),
+            containment.SimulationContainmentStartupTimeout,
+        ),
+        (
+            ContainmentKernelAcceptTimeout(0.5),
+            containment.SimulationContainmentAcceptTimeout,
+        ),
+        (
+            ContainmentKernelActiveTimeout(0.75),
+            containment.SimulationContainmentTimeout,
+        ),
+        (
+            ContainmentKernelChildFailure({"kind": "boom", "message": "child failed"}),
+            containment.SimulationContainmentChildFailure,
+        ),
+        (
+            ContainmentKernelProtocolError("bad protocol"),
+            containment.SimulationContainmentProtocolError,
+        ),
+    ]
+
+    for runtime_exc, expected_exc in cases:
+        _FakeRuntimeOwner.solve_exception = runtime_exc
+        owner = containment.WarmSimulationOwner({})
+        with pytest.raises(expected_exc):
+            owner.solve({})
 
 
 def test_warm_simulation_owner_request_reconstruction_failure_includes_child_traceback():
@@ -512,121 +504,6 @@ def test_warm_simulation_owner_startup_failure_includes_child_traceback():
         assert "ValueError" in stack_trace
         assert "SimulationPlan execution_request must be a mapping" in stack_trace
         assert "create_simulation_child_handler" in stack_trace
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_cancellation_kills_child_and_reply_gate_ignores_stale_replies():
-    from kindred.core.exceptions import SimulationCancelled
-    from kindred.core.simulation_containment import SimulationReplyGate, WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=5.0,
-    )
-    started = time.monotonic()
-
-    def _cancel_after_accept() -> bool:
-        return (time.monotonic() - started) >= 0.05
-
-    try:
-        with pytest.raises(SimulationCancelled):
-            owner.solve({"behavior": "hang_after_accept"}, cancellation_check=_cancel_after_accept)
-        assert owner.is_running is False
-
-        gate = SimulationReplyGate(owner_epoch=3, request_id=9)
-        assert gate.is_current({"owner_epoch": 2, "request_id": 9}) is False
-        assert gate.is_current({"owner_epoch": 3, "request_id": 8}) is False
-        assert gate.is_current({"owner_epoch": 3, "request_id": 9}) is True
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_restart_after_timeout_is_lazy_and_increments_epoch():
-    from kindred.core.simulation_containment import SimulationContainmentTimeout, WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.05,
-    )
-
-    try:
-        with pytest.raises(SimulationContainmentTimeout):
-            owner.solve({"behavior": "hang_after_accept"})
-        assert owner.owner_epoch == 1
-        assert owner.is_running is False
-
-        result = owner.solve({"behavior": "echo"})
-
-        assert result["success"] is True
-        assert result["owner_epoch"] == 2
-        assert owner.owner_epoch == 2
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_cancel_restart_is_lazy_and_increments_epoch():
-    from kindred.core.exceptions import SimulationCancelled
-    from kindred.core.simulation_containment import WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=5.0,
-    )
-    started = time.monotonic()
-
-    try:
-        with pytest.raises(SimulationCancelled):
-            owner.solve(
-                {"behavior": "hang_after_accept"},
-                cancellation_check=lambda: (time.monotonic() - started) >= 0.05,
-            )
-        assert owner.owner_epoch == 1
-        assert owner.is_running is False
-
-        result = owner.solve({"behavior": "echo"})
-
-        assert result["owner_epoch"] == 2
-        assert owner.owner_epoch == 2
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_reuses_ready_owner_for_two_requests(tmp_path):
-    from kindred.core.simulation_containment import WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    startup_count_path = tmp_path / "startup-count.txt"
-    owner = WarmSimulationOwner(
-        {"startup_count_path": str(startup_count_path)},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.5,
-    )
-
-    try:
-        first = owner.solve({"value": 1})
-        second = owner.solve({"value": 2})
-
-        assert first["owner_epoch"] == second["owner_epoch"] == 1
-        assert startup_count_path.read_text(encoding="utf-8").splitlines() == ["1"]
     finally:
         owner.close(kill=True)
 
@@ -755,28 +632,5 @@ def test_warm_simulation_owner_preview_sparse_dynamic_override_omits_jacobian_hi
         assert np.asarray(payload["Y"]).shape == (2, 6)
         assert payload["provenance"]["symbolic_jacobian"] is True
         assert payload["provenance"]["jacobian_sparsity_hint"] is False
-    finally:
-        owner.close(kill=True)
-
-
-def test_warm_simulation_owner_ignores_stale_result_before_current_acceptance():
-    from kindred.core.simulation_containment import WarmSimulationOwner
-
-    mp_context = _require_spawn_primitive_support()
-    owner = WarmSimulationOwner(
-        {},
-        mp_context=mp_context,
-        child_target=_warm_owner_test_child,
-        ready_timeout_s=_OWNER_TEST_READY_TIMEOUT_S,
-        accept_timeout_s=_OWNER_TEST_ACCEPT_TIMEOUT_S,
-        active_timeout_s=0.5,
-    )
-
-    try:
-        result = owner.solve({"behavior": "stale_then_result"})
-
-        assert result["success"] is True
-        assert "stale" not in result
-        assert result["owner_epoch"] == 1
     finally:
         owner.close(kill=True)

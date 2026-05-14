@@ -30,6 +30,7 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

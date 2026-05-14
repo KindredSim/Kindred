@@ -22,13 +22,38 @@ class _FakeLaneOwner:
         self.current_max_workers = 2
         self.active_count = 0
         self.worker_count = 0
+        self.lane_pool_factory = lambda _max_lanes, _limit_blas: object()
+        self.max_parallel_workers = 2
+        self.limit_blas_threads_per_worker = True
+        self.record_nonfatal_exception = lambda _msg, _exc: None
+        self.metadata_by_set_id: dict[str, dict[str, Any]] = {}
+        self.discarded: list[str] = []
+        self.enqueued: list[str] = []
+        self.drained = 0
+        self.cleared = 0
+        self.join_calls: list[float] = []
+        self.lane_pool_token_value: int | None = 123
 
     @property
     def is_pool_stale(self) -> bool:
         return bool(self.pool_stale)
 
+    @property
+    def warm_failure(self) -> str | None:
+        return None
+
+    def ensure_lane_pool(self, *, max_lanes: int):
+        return {"max_lanes": int(max_lanes)}
+
+    def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool = True):
+        return {"max_lanes": int(max_lanes), "wait": bool(wait)}
+
     def has_lane_pool(self) -> bool:
         return bool(self.has_pool)
+
+    def has_ready_lane_pool(self, *, max_lanes: int) -> bool:
+        _ = max_lanes
+        return bool(self.has_pool and not self.pool_stale)
 
     def active_request_count(self) -> int:
         return int(self.active_count)
@@ -38,6 +63,27 @@ class _FakeLaneOwner:
 
     def request_worker_count(self) -> int:
         return int(self.worker_count)
+
+    def join_active_requests(self, *, timeout_s: float = 2.0) -> None:
+        self.join_calls.append(float(timeout_s))
+
+    def lane_pool_token(self) -> int | None:
+        return self.lane_pool_token_value
+
+    def active_request_metadata(self, set_id: str) -> dict[str, Any]:
+        return dict(self.metadata_by_set_id.get(str(set_id), {}))
+
+    def discard_request(self, set_id: str) -> None:
+        self.discarded.append(str(set_id))
+
+    def clear_stale_requests(self) -> None:
+        self.cleared += 1
+
+    def drain_completion_queue(self) -> None:
+        self.drained += 1
+
+    def enqueue_completion(self, set_id: str) -> None:
+        self.enqueued.append(str(set_id))
 
     def submit_task(self, task, **kwargs):
         call = {"task": dict(task or {}), **dict(kwargs)}
@@ -60,6 +106,12 @@ class _FakeLaneOwner:
     def reset_active_run_state(self) -> None:
         self.reset_calls += 1
         self.active_count = 0
+
+    def reset_run_state(self) -> None:
+        self.reset_calls += 1
+        self.active_count = 0
+        self.polled = []
+        self.drained += 1
 
     def mark_pool_stale(self) -> None:
         self.pool_stale = True
@@ -94,14 +146,14 @@ def _completion_record(
         request_id=request_id,
         generation=generation,
         preview_owner_epoch=9,
-        expected_owner_epoch=4,
+        expected_owner_epoch=9,
     )
     outcome = BatchLaneOutcome(
         lane_id="lane-a",
         run_id=run_id,
         request_id=request_id,
         set_id=set_id,
-        owner_epoch=4,
+        owner_epoch=9,
         success=True,
         payload={"set_id": set_id},
     )
@@ -158,7 +210,15 @@ def test_session_submit_uses_run_identity_without_controller_repeating_it() -> N
         )
     )
 
-    session.submit_task({"payload": 1}, set_id="a", set_name="Set A")
+    identity = object()
+
+    session.submit_task(
+        {"payload": 1},
+        set_id="a",
+        set_name="Set A",
+        expected_owner_epoch=9,
+        callback_identity=identity,
+    )
 
     assert owner.submitted == [
         {
@@ -169,9 +229,54 @@ def test_session_submit_uses_run_identity_without_controller_repeating_it() -> N
             "set_name": "Set A",
             "preview_owner_epoch": 9,
             "active_timeout_s": 2.5,
-            "expected_owner_epoch": None,
+            "expected_owner_epoch": 9,
+            "request_metadata": {"callback_identity": identity},
         }
     ]
+
+
+def test_session_submit_rejects_missing_callback_identity() -> None:
+    from kindred.core.batch_runtime_session import BatchRuntimeSession, BatchRuntimeSessionRequest
+
+    owner = _FakeLaneOwner()
+    session = BatchRuntimeSession(owner)
+    session.begin(
+        BatchRuntimeSessionRequest(
+            run_id=10,
+            request_id=20,
+            fast_mode=False,
+            queue_ids=("a",),
+            queue_names=("Set A",),
+            keep_lane_pool_alive=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="callback_identity"):
+        session.submit_task({"payload": 1}, set_id="a", set_name="Set A", callback_identity=None)
+
+
+def test_session_submit_stores_callback_identity_in_request_metadata() -> None:
+    from kindred.core.batch_runtime_session import BatchRuntimeSession, BatchRuntimeSessionRequest
+
+    owner = _FakeLaneOwner()
+    session = BatchRuntimeSession(owner)
+    session.begin(
+        BatchRuntimeSessionRequest(
+            run_id=10,
+            request_id=20,
+            fast_mode=False,
+            queue_ids=("a",),
+            queue_names=("Set A",),
+            keep_lane_pool_alive=False,
+            preview_owner_epoch=9,
+            active_timeout_s=2.5,
+        )
+    )
+    identity = object()
+
+    session.submit_task({"payload": 1}, set_id="a", set_name="Set A", callback_identity=identity)
+
+    assert owner.submitted[-1]["request_metadata"] == {"callback_identity": identity}
 
 
 def test_session_poll_consumes_records_and_completes_current_run() -> None:
@@ -202,7 +307,7 @@ def test_session_poll_consumes_records_and_completes_current_run() -> None:
     assert snapshot.state is BatchRuntimeSessionState.COMPLETED
 
 
-def test_session_rejects_stale_polled_records_without_marking_complete() -> None:
+def test_session_returns_stale_polled_records_without_marking_complete() -> None:
     from kindred.core.batch_runtime_session import BatchRuntimeSession, BatchRuntimeSessionRequest, BatchRuntimeSessionState
 
     owner = _FakeLaneOwner()
@@ -221,7 +326,11 @@ def test_session_rejects_stale_polled_records_without_marking_complete() -> None
         )
     )
 
-    assert session.poll_completed_records() == []
+    returned = session.poll_completed_records()
+    assert [item.set_id for item in returned] == ["a"]
+    stale = returned[0].record.request_metadata["runtime_session_stale"]
+    assert stale["expected_run_id"] == 10
+    assert stale["actual_run_id"] == 99
     snapshot = session.snapshot()
     assert snapshot.completed_set_ids == ()
     assert snapshot.active is True

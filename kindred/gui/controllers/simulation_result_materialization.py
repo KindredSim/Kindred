@@ -36,9 +36,10 @@ class SimulationResultMaterializationOwner:
             from kindred.core.simulator.dsl import parse_dsl_to_mechanism
             from kindred.core.units import UnitsModel
 
-            temp_for_parse = float(
-                (solver_config or {}).get("temperature_K") or self._ui.solver.temperature_spinbox_value()
-            )
+            temperature_value = (solver_config or {}).get("temperature_K")
+            if temperature_value is None:
+                return None
+            temp_for_parse = float(temperature_value)
             return parse_dsl_to_mechanism(
                 mechanism_text_s,
                 initials={},
@@ -143,4 +144,3 @@ class SimulationResultMaterializationOwner:
             return
         self._ui.slider.set_slider_triggered_simulation(False)
         logger.debug("Skipped variable extraction (slider-triggered simulation)")
-

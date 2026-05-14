@@ -36,7 +36,7 @@ class SimulationSliderPreviewLaunchDependencies:
     slider_preview_uses_parallel_batch_runtime: Callable[..., bool]
     slider_preview_runtime_snapshot: Callable[..., Any]
     parallel_batch_required_lanes_for_rows: Callable[..., int]
-    ensure_parallel_batch_pool_eagerly_created: Callable[..., None]
+    ensure_parallel_batch_runtime_ready: Callable[..., None]
     ensure_interactive_simulation_runtime_available_for_mode: Callable[..., None]
     mark_request_started: Callable[[int], int]
     retry_slider_preview_launch: Callable[[], None]
@@ -224,7 +224,7 @@ class SimulationSliderPreviewLaunchOwner:
         preview_snapshot = self._deps.slider_preview_runtime_snapshot(selected_rows)
         if bool(preview_snapshot.required) and not bool(preview_snapshot.ready):
             if uses_parallel_batch_runtime:
-                self._deps.ensure_parallel_batch_pool_eagerly_created(
+                self._deps.ensure_parallel_batch_runtime_ready(
                     wait=False,
                     required_lanes=self._deps.parallel_batch_required_lanes_for_rows(selected_rows),
                 )

@@ -7,6 +7,22 @@ from PySide6 import QtWidgets
 
 from kindred.core.constants import R
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
+
+
+def _callback_identity(controller, *, fast_mode: bool | None = None) -> SimulationCallbackIdentity:
+    return SimulationCallbackIdentity.capture(
+        run_id=0,
+        fast_mode=bool(fast_mode),
+        request_id=0,
+        owner_epoch=None,
+        batch_set=None,
+        batch_set_id=None,
+        cache_key="",
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
+    )
 
 
 def _state_network_dsl(*, energy_directive: str | None, T: float, energies: dict[str, float]) -> str:
@@ -121,7 +137,10 @@ def test_gui_energy_mode_temperature_comes_from_dsl(main_window, monkeypatch):
         "mechanism_text": dsl,
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
-    main_window.simulation_controller.on_simulation_complete(payload)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller),
+    )
 
     indicator = main_window._temperature_mode_indicator.text()
     assert "200.00" in indicator
@@ -165,7 +184,10 @@ def _prime_energy_mode_sliders(main_window, monkeypatch, *, T: float = 200.0) ->
         "mechanism_text": dsl,
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
-    main_window.simulation_controller.on_simulation_complete(payload)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller),
+    )
     return dsl
 
 
@@ -209,7 +231,10 @@ def _prime_energy_mode_sliders_in_reaction_editor(main_window, monkeypatch, *, T
         "mechanism_text": dsl,
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
-    main_window.simulation_controller.on_simulation_complete(payload)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller),
+    )
     return dsl
 
 
@@ -236,7 +261,7 @@ def test_gui_energy_slider_updates_worker_mechanism_text_and_commits_state_netwo
 
     main_window.simulation_controller.launch_pending_slider_preview_replay()
     worker = main_window.simulation_controller.run_state.simulation_worker
-    worker_plan = getattr(worker, "_simulation_plan", getattr(worker, "_simulation_plan_payload", {}))
+    worker_plan = getattr(worker, "_simulation_plan_payload", {})
     worker_text = SimulationPlan.from_payload(worker_plan).to_execution_request().mechanism_text
     assert re.search(r"^state:\s*B,.*\benergy=-5\b", worker_text, flags=re.MULTILINE)
 
@@ -332,7 +357,7 @@ def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(m
 
     main_window.simulation_controller.launch_pending_slider_preview_replay()
     worker = main_window.simulation_controller.run_state.simulation_worker
-    worker_plan = getattr(worker, "_simulation_plan", getattr(worker, "_simulation_plan_payload", {}))
+    worker_plan = getattr(worker, "_simulation_plan_payload", {})
     worker_text = SimulationPlan.from_payload(worker_plan).to_execution_request().mechanism_text
     m = re.search(
         rf"^state:.*\bname\s*=\s*{re.escape(product)}\b.*\benergy\s*=\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
@@ -379,7 +404,10 @@ def test_gui_energy_slider_updates_reaction_dsl_and_worker_and_persists_on_run(m
     }
     # Manual "Run Simulation" paths clear the slider-triggered flag before completion refresh.
     preview._slider_triggered_simulation = False
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     current_vars = main_window._mechanism_editor._variable_sliders.get_variables()
     assert float(current_vars[var_eq]) == pytest.approx(new_val, rel=1e-12)
 

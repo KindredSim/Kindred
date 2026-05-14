@@ -8,11 +8,67 @@ import pytest
 from kindred.core.batch_containment import BatchLaneOutcome, WarmBatchSimulationLane
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.gui.controllers.parallel_batch_executor import ParallelBatchExecutor
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
+
+
+def _callback_identity(
+    *,
+    run_id: int = 1,
+    request_id: int = 2,
+    fast_mode: bool = False,
+    cache_key: str = "cache",
+) -> SimulationCallbackIdentity:
+    return SimulationCallbackIdentity.capture(
+        run_id=run_id,
+        fast_mode=fast_mode,
+        request_id=request_id,
+        owner_epoch=None,
+        batch_set=None,
+        batch_set_id=None,
+        cache_key=cache_key,
+        callback_context={
+            "active": True,
+            "run_id": int(run_id),
+            "request_id": int(request_id),
+            "cache_key": str(cache_key),
+            "fast_mode": bool(fast_mode),
+            "parallel": True,
+        },
+        simulation_identity={},
+        preview_batch_cache_token="",
+    )
+
+
+class _MinimalLanePool:
+    ready_lane_count = 0
+
+    def __init__(self) -> None:
+        self.ready_lane_count = 0
+        self.close_calls: list[bool] = []
+
+    def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None:
+        _ = wait
+        self.ready_lane_count = max(1, int(max_lanes))
+
+    def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+        _ = active_timeout_s
+        return BatchLaneOutcome(
+            lane_id="minimal-lane",
+            run_id=int(run_id),
+            request_id=int(request_id),
+            set_id=str(set_id),
+            owner_epoch=1,
+            success=True,
+            payload={"task": dict(task or {})},
+        )
+
+    def close(self, *, kill: bool = False) -> None:
+        self.close_calls.append(bool(kill))
 
 
 @pytest.mark.unit
 def test_lane_pool_factory_change_marks_existing_pool_stale() -> None:
-    class _FakeLanePool:
+    class _FakeLanePool(_MinimalLanePool):
         def __init__(self, label: str) -> None:
             self.label = str(label)
             self.close_calls: list[bool] = []
@@ -47,7 +103,7 @@ def test_lane_pool_factory_change_marks_existing_pool_stale() -> None:
 
 @pytest.mark.unit
 def test_submit_task_uses_lane_request_handle_not_future_facade() -> None:
-    class _FakeLanePool:
+    class _FakeLanePool(_MinimalLanePool):
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
@@ -100,6 +156,8 @@ def test_submit_task_uses_lane_request_handle_not_future_facade() -> None:
         {"value": 1},
         set_id="set-a",
         set_name="Set A",
+        expected_owner_epoch=5,
+        callback_identity=_callback_identity(run_id=11, request_id=22),
     )
     handle.join(timeout=2.0)
 
@@ -125,10 +183,35 @@ def test_submit_task_uses_lane_request_handle_not_future_facade() -> None:
 
 
 @pytest.mark.unit
+def test_parallel_batch_executor_rejects_missing_callback_identity() -> None:
+    class _UnusedLanePool:
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
+
+    batch = ParallelBatchExecutor(lane_pool_factory=lambda _max_workers, _limit_blas_threads: _UnusedLanePool())
+    batch.begin_run(
+        run_id=11,
+        request_id=22,
+        fast_mode=False,
+        queue_ids=["set-a"],
+        queue_names=["Set A"],
+        keep_lane_pool_alive=False,
+    )
+
+    with pytest.raises(ValueError, match="callback_identity"):
+        batch.submit_task(
+            {"value": 1},
+            set_id="set-a",
+            set_name="Set A",
+            callback_identity=None,
+        )
+
+
+@pytest.mark.unit
 def test_soft_supersede_invalidates_lane_requests_without_retained_superseded_bookkeeping() -> None:
     release = threading.Event()
 
-    class _SlowLanePool:
+    class _SlowLanePool(_MinimalLanePool):
         def __init__(self) -> None:
             self.close_calls: list[bool] = []
 
@@ -165,6 +248,7 @@ def test_soft_supersede_invalidates_lane_requests_without_retained_superseded_bo
         {"value": 1},
         set_id="set-a",
         set_name="Set A",
+        callback_identity=_callback_identity(run_id=1, request_id=2, fast_mode=True),
     )
 
     cancelled, running = batch.soft_supersede()
@@ -185,7 +269,7 @@ def test_request_workers_remain_tracked_across_soft_supersede() -> None:
     two_started = threading.Event()
     release = threading.Event()
 
-    class _BlockingLanePool:
+    class _BlockingLanePool(_MinimalLanePool):
         def __init__(self) -> None:
             self.close_calls: list[bool] = []
 
@@ -229,6 +313,7 @@ def test_request_workers_remain_tracked_across_soft_supersede() -> None:
             {"value": index},
             set_id=f"set-{index}",
             set_name=f"Set {index}",
+            callback_identity=_callback_identity(run_id=1, request_id=2, fast_mode=True),
         )
         for index in range(5)
     ]
@@ -265,7 +350,7 @@ def test_nonblocking_warm_growth_is_waited_by_existing_background_warm_thread() 
     release_wait = threading.Event()
     warm_calls: list[tuple[int, bool]] = []
 
-    class _WarmLanePool:
+    class _WarmLanePool(_MinimalLanePool):
         def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None:
             warm_calls.append((int(max_lanes), bool(wait)))
             if bool(wait):
@@ -301,7 +386,7 @@ def test_repeated_soft_supersede_tracks_same_set_inflight_requests_independently
     second_started = threading.Event()
     release = threading.Event()
 
-    class _BlockingLanePool:
+    class _BlockingLanePool(_MinimalLanePool):
         def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
             nonlocal started
             with started_lock:
@@ -338,7 +423,12 @@ def test_repeated_soft_supersede_tracks_same_set_inflight_requests_independently
         preview_owner_epoch=None,
         active_timeout_s=5.0,
     )
-    first = batch.submit_task({"value": 1}, set_id="set-a", set_name="Set A")
+    first = batch.submit_task(
+        {"value": 1},
+        set_id="set-a",
+        set_name="Set A",
+        callback_identity=_callback_identity(run_id=1, request_id=2, fast_mode=True),
+    )
     assert first_started.wait(timeout=1.0)
     batch.soft_supersede()
 
@@ -352,7 +442,12 @@ def test_repeated_soft_supersede_tracks_same_set_inflight_requests_independently
         preview_owner_epoch=None,
         active_timeout_s=5.0,
     )
-    second = batch.submit_task({"value": 2}, set_id="set-a", set_name="Set A")
+    second = batch.submit_task(
+        {"value": 2},
+        set_id="set-a",
+        set_name="Set A",
+        callback_identity=_callback_identity(run_id=2, request_id=20, fast_mode=True),
+    )
     assert second_started.wait(timeout=1.0)
 
     batch.soft_supersede()
@@ -372,7 +467,7 @@ def test_repeated_soft_supersede_tracks_same_set_inflight_requests_independently
 def test_ensure_lane_pool_recreates_pool_when_worker_count_increases() -> None:
     created: list[tuple[int, bool, Any]] = []
 
-    class _FakeLanePool:
+    class _FakeLanePool(_MinimalLanePool):
         def __init__(self, max_lanes: int) -> None:
             self.max_lanes = int(max_lanes)
             self.close_calls: list[bool] = []
@@ -400,9 +495,9 @@ def test_ensure_lane_pool_recreates_pool_when_worker_count_increases() -> None:
 def test_ensure_lane_pool_does_not_resize_downward() -> None:
     created: list[tuple[int, bool]] = []
 
-    def _factory(max_lanes: int, limit_blas_threads: bool) -> object:
+    def _factory(max_lanes: int, limit_blas_threads: bool) -> _MinimalLanePool:
         created.append((int(max_lanes), bool(limit_blas_threads)))
-        return object()
+        return _MinimalLanePool()
 
     batch = ParallelBatchExecutor(lane_pool_factory=_factory)
 
@@ -417,9 +512,9 @@ def test_ensure_lane_pool_does_not_resize_downward() -> None:
 def test_ensure_lane_pool_does_not_resize_when_worker_count_matches() -> None:
     created: list[tuple[int, bool]] = []
 
-    def _factory(max_lanes: int, limit_blas_threads: bool) -> object:
+    def _factory(max_lanes: int, limit_blas_threads: bool) -> _MinimalLanePool:
         created.append((int(max_lanes), bool(limit_blas_threads)))
-        return object()
+        return _MinimalLanePool()
 
     batch = ParallelBatchExecutor(lane_pool_factory=_factory)
 
@@ -434,7 +529,7 @@ def test_ensure_lane_pool_does_not_resize_when_worker_count_matches() -> None:
 def test_ensure_lane_pool_recreates_stale_pool_even_when_worker_count_matches() -> None:
     created: list[Any] = []
 
-    class _FakeLanePool:
+    class _FakeLanePool(_MinimalLanePool):
         def __init__(self, label: str) -> None:
             self.label = str(label)
             self.close_calls: list[bool] = []
@@ -463,7 +558,7 @@ def test_ensure_lane_pool_recreates_stale_pool_even_when_worker_count_matches() 
 def test_ensure_lane_pool_keeps_stale_pool_draining_with_active_requests() -> None:
     release = threading.Event()
 
-    class _BlockingLanePool:
+    class _BlockingLanePool(_MinimalLanePool):
         def __init__(self, label: str) -> None:
             self.label = str(label)
             self.close_calls: list[bool] = []
@@ -504,7 +599,12 @@ def test_ensure_lane_pool_keeps_stale_pool_draining_with_active_requests() -> No
         preview_owner_epoch=None,
         active_timeout_s=5.0,
     )
-    handle = batch.submit_task({"value": 1}, set_id="set-a", set_name="Set A")
+    handle = batch.submit_task(
+        {"value": 1},
+        set_id="set-a",
+        set_name="Set A",
+        callback_identity=_callback_identity(run_id=1, request_id=2, fast_mode=True),
+    )
     batch.mark_pool_stale()
 
     second_pool = batch.ensure_lane_pool(max_lanes=2)
@@ -526,7 +626,7 @@ def test_shutdown_recreate_keeps_unjoined_old_request_workers_counted() -> None:
     release = threading.Event()
     first_started = threading.Event()
 
-    class _BlockingLanePool:
+    class _BlockingLanePool(_MinimalLanePool):
         def __init__(self, label: str) -> None:
             self.label = str(label)
             self.close_calls: list[bool] = []
@@ -566,7 +666,12 @@ def test_shutdown_recreate_keeps_unjoined_old_request_workers_counted() -> None:
         preview_owner_epoch=None,
         active_timeout_s=5.0,
     )
-    handle = batch.submit_task({"value": 1}, set_id="set-a", set_name="Set A")
+    handle = batch.submit_task(
+        {"value": 1},
+        set_id="set-a",
+        set_name="Set A",
+        callback_identity=_callback_identity(run_id=1, request_id=2, fast_mode=True),
+    )
     assert first_started.wait(timeout=1.0)
 
     batch.shutdown(force_terminate=False, record_nonfatal_exception=lambda _msg, _exc: None)
@@ -582,7 +687,7 @@ def test_shutdown_recreate_keeps_unjoined_old_request_workers_counted() -> None:
 
 @pytest.mark.unit
 def test_parallel_batch_adapter_does_not_expose_executor_or_future_compatibility_aliases() -> None:
-    batch = ParallelBatchExecutor(lane_pool_factory=lambda _max_lanes, _limit_blas_threads: object())
+    batch = ParallelBatchExecutor(lane_pool_factory=lambda _max_lanes, _limit_blas_threads: _MinimalLanePool())
 
     assert not hasattr(batch, "executor")
     assert not hasattr(batch, "executor_factory")
@@ -592,19 +697,19 @@ def test_parallel_batch_adapter_does_not_expose_executor_or_future_compatibility
 
 @pytest.mark.unit
 def test_batch_runtime_owner_does_not_expose_legacy_future_outcome_bridge() -> None:
-    batch = ParallelBatchExecutor(lane_pool_factory=lambda _max_lanes, _limit_blas_threads: object())
+    batch = ParallelBatchExecutor(lane_pool_factory=lambda _max_lanes, _limit_blas_threads: _MinimalLanePool())
 
-    assert not hasattr(batch._runtime_owner, "pop_completed_outcome")
-    assert not hasattr(batch._runtime_owner, "_record_from_legacy_outcome")
+    assert not hasattr(batch, "_runtime_owner")
+    assert not hasattr(batch, "_active_callback_identity_by_set_id")
 
 
 @pytest.mark.unit
 def test_ensure_lane_pool_tracks_current_max_workers_without_pool_introspection() -> None:
     created: list[tuple[int, bool]] = []
 
-    def _factory(max_lanes: int, limit_blas_threads: bool) -> object:
+    def _factory(max_lanes: int, limit_blas_threads: bool) -> _MinimalLanePool:
         created.append((int(max_lanes), bool(limit_blas_threads)))
-        return object()
+        return _MinimalLanePool()
 
     batch = ParallelBatchExecutor(lane_pool_factory=_factory)
 
@@ -620,9 +725,9 @@ def test_ensure_lane_pool_tracks_current_max_workers_without_pool_introspection(
 def test_ensure_lane_pool_caps_worker_count_at_shared_ceiling() -> None:
     created: list[tuple[int, bool]] = []
 
-    def _factory(max_lanes: int, limit_blas_threads: bool) -> object:
+    def _factory(max_lanes: int, limit_blas_threads: bool) -> _MinimalLanePool:
         created.append((int(max_lanes), bool(limit_blas_threads)))
-        return object()
+        return _MinimalLanePool()
 
     batch = ParallelBatchExecutor(lane_pool_factory=_factory)
 
@@ -634,10 +739,20 @@ def test_ensure_lane_pool_caps_worker_count_at_shared_ceiling() -> None:
 
 
 @pytest.mark.unit
+def test_lane_pool_factory_rejects_unowned_pool_object() -> None:
+    batch = ParallelBatchExecutor(lane_pool_factory=lambda _max_lanes, _limit_blas_threads: object())
+
+    with pytest.raises(TypeError, match="Batch lane pool factory"):
+        batch.ensure_lane_pool(max_lanes=2)
+
+    assert not batch.has_lane_pool()
+
+
+@pytest.mark.unit
 def test_ensure_lane_pool_resize_factory_failure_leaves_wrapper_consistent() -> None:
     created: list[Any] = []
 
-    class _FakeLanePool:
+    class _FakeLanePool(_MinimalLanePool):
         def __init__(self) -> None:
             self.close_calls: list[bool] = []
 
@@ -690,7 +805,7 @@ def test_create_lane_pool_factory_failure_clears_pool_and_records_failure() -> N
 def test_ensure_warm_lane_pool_failure_is_retained_after_shutdown() -> None:
     recorded: list[tuple[str, str]] = []
 
-    class _FailingWarmPool:
+    class _FailingWarmPool(_MinimalLanePool):
         def __init__(self) -> None:
             self.close_calls: list[bool] = []
 
@@ -750,7 +865,7 @@ def test_busy_warm_batch_lane_close_kills_owner_instead_of_skipping(monkeypatch)
 
 @pytest.mark.unit
 def test_shutdown_force_terminate_closes_lane_pool_with_kill() -> None:
-    class _FakeLanePool:
+    class _FakeLanePool(_MinimalLanePool):
         def __init__(self) -> None:
             self.close_calls: list[bool] = []
 

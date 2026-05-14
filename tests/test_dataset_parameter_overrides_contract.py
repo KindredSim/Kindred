@@ -140,6 +140,7 @@ def test_fitting_window_passes_typed_dataset_overrides_to_worker(qt_app, monkeyp
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

@@ -34,7 +34,13 @@ def test_explicit_batch_dispatch_plan_drops_prepared_payload_and_uses_batch_alge
         _request_payload(prepared_payload={"version": 1, "prepared_for": "id1"}, initials={"A": 3.0}),
         execution_mode="explicit",
         algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
-        cache_identity_payload={"cache_key": "explicit-cache"},
+        cache_identity_payload={
+            "cache_key": "explicit-cache",
+            "simulation_identity": {
+                "schema_id": "schema",
+                "param_fingerprint": "fingerprint",
+            },
+        },
         metadata={"set_id": "id1", "set_name": "set1"},
     ).to_payload()
 
@@ -159,6 +165,77 @@ def test_batch_dispatch_plan_preserves_explicit_intervention_schedule_carrier():
 
     assert plan.execution_request is not None
     assert plan.execution_request["intervention_schedule"]["instant_events"] == schedule_payload["instant_events"]
+    assert plan.simulation_identity["intervention_schedule_fingerprint"]
+
+
+def test_batch_dispatch_plan_adds_explicit_schedule_carrier_to_existing_plan():
+    schedule_payload = {
+        "instant_events": [{"op": "set", "species": "A", "time": 0.0, "value": 2.0}]
+    }
+    gui_plan = SimulationPlan.from_execution_request(
+        _request_payload(prepared_payload={"version": 1, "prepared_for": "id1"}, initials={"A": 3.0}),
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload={
+            "cache_key": "explicit-cache",
+            "simulation_identity": {
+                "schema_id": "schema",
+                "param_fingerprint": "fingerprint",
+                "intervention_schedule_fingerprint": "",
+            },
+        },
+        metadata={"set_id": "id1", "set_name": "set1"},
+    ).to_payload()
+
+    plan = build_batch_set_dispatch_plan(
+        BatchSetDispatchInput(
+            set_id="id1",
+            set_name="set1",
+            fast_mode=False,
+            t_end=10.0,
+            solver_config={"solver": "BDF"},
+            cache_key="explicit-cache",
+            scope_identity={"scope": "selected"},
+            queue_ids=("id1",),
+            initials={"A": 1.0},
+            mechanism_text="reaction: A -> B; k=1",
+            simulation_identity={"schema_id": "schema", "param_fingerprint": "fingerprint"},
+            plan_payload=gui_plan,
+            preview_batch_cache_token="",
+            intervention_schedule=schedule_payload,
+        )
+    )
+
+    submitted_plan = SimulationPlan.from_payload(plan.plan_payload)
+    request = submitted_plan.to_execution_request().to_payload()
+    assert request["intervention_schedule"]["instant_events"] == schedule_payload["instant_events"]
+    assert submitted_plan.simulation_identity_payload()["intervention_schedule_fingerprint"]
+    assert submitted_plan.simulation_identity_payload()["schema_id"] == "schema"
+
+
+def test_batch_dispatch_plan_tolerates_noop_intervention_schedule_carrier():
+    plan = build_batch_set_dispatch_plan(
+        BatchSetDispatchInput(
+            set_id="id1",
+            set_name="set1",
+            fast_mode=False,
+            t_end=5.0,
+            solver_config={"solver": "BDF"},
+            cache_key="cache",
+            scope_identity={"scope": "selected"},
+            queue_ids=("id1",),
+            initials={"A": 1.0},
+            mechanism_text="reaction: A -> B; k=1",
+            simulation_identity={"schema_id": "schema"},
+            plan_payload=None,
+            preview_batch_cache_token="",
+            intervention_schedule={},
+        )
+    )
+
+    assert plan.execution_request is not None
+    assert plan.execution_request.get("intervention_schedule") is None
+    assert plan.simulation_identity == {"schema_id": "schema"}
 
 
 def _payload_without_plan_by_set():

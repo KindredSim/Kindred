@@ -57,15 +57,6 @@ def _batch_run_start_request(**overrides):
     return BatchRunStartRequest(**values)
 
 
-def test_current_queue_item_returns_name_and_id_at_owned_position():
-    owner = BatchRunContextOwner()
-    seed_batch_context(owner, active=True, queue_ids=["id1", "id2"], queue_names=["set1", "set2"], pos=1)
-
-    item = owner.current_queue_item()
-
-    assert item == ("set2", "id2")
-
-
 def test_inactive_context_has_no_active_batch_state():
     owner = BatchRunContextOwner()
     seed_batch_context(owner, active=False, parallel=True, queue_ids=["id1"])
@@ -73,7 +64,7 @@ def test_inactive_context_has_no_active_batch_state():
     assert owner.active_batch_state() is None
 
 
-def test_completion_publication_policy_context_refreshes_current_truth_for_matching_callback_context():
+def test_completion_publication_policy_context_keeps_matching_callback_context_authoritative():
     owner = BatchRunContextOwner()
     seed_batch_context(
         owner,
@@ -106,137 +97,9 @@ def test_completion_publication_policy_context_refreshes_current_truth_for_match
         policy_context=captured_policy_context,
     )
 
-    assert context is not None
-    assert context.explicit_cache_valid_set_ids == ("ok",)
-    assert context.explicit_cache_invalidated_set_ids == ("bad",)
-
-
-def test_completion_publication_policy_context_refreshes_same_cardinality_cache_truth():
-    owner = BatchRunContextOwner()
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["id1", "id2"],
-        completed_set_ids=["id1"],
-        explicit_cache_valid_set_ids=("id2",),
-        explicit_cache_invalidated_set_ids=("id1",),
-    )
-    callback_context = owner.callback_context_snapshot()
-    captured_policy_context = owner.completion_policy_context(callback_context)
-    assert captured_policy_context is not None
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["id1", "id2"],
-        completed_set_ids=["id2"],
-        explicit_cache_valid_set_ids=("id1",),
-        explicit_cache_invalidated_set_ids=("id2",),
-    )
-
-    context = owner.completion_publication_policy_context(
-        callback_context=callback_context,
-        policy_context=captured_policy_context,
-    )
-
-    assert context is not None
-    assert context.completed_set_ids == ("id2",)
-    assert context.explicit_cache_valid_set_ids == ("id1",)
-    assert context.explicit_cache_invalidated_set_ids == ("id2",)
-
-
-def test_completion_publication_policy_context_refreshes_valid_set_only_cache_truth():
-    owner = BatchRunContextOwner()
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["id1", "id2"],
-        completed_set_ids=["id1"],
-        explicit_cache_valid_set_ids=("id1",),
-        explicit_cache_invalidated_set_ids=("bad",),
-    )
-    callback_context = owner.callback_context_snapshot()
-    captured_policy_context = owner.completion_policy_context(callback_context)
-    assert captured_policy_context is not None
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["id1", "id2"],
-        completed_set_ids=["id1"],
-        explicit_cache_valid_set_ids=("id2",),
-        explicit_cache_invalidated_set_ids=("bad",),
-    )
-
-    context = owner.completion_publication_policy_context(
-        callback_context=callback_context,
-        policy_context=captured_policy_context,
-    )
-
-    assert context is not None
-    assert context.completed_set_ids == ("id1",)
-    assert context.explicit_cache_valid_set_ids == ("id2",)
-    assert context.explicit_cache_invalidated_set_ids == ("bad",)
-
-
-def test_completion_publication_policy_context_refreshes_unstamped_token_mismatch():
-    owner = BatchRunContextOwner()
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["id1", "id2"],
-        completed_set_ids=["id1"],
-        explicit_cache_preview_token="old-token",
-        explicit_cache_preview_scope_set_ids=("id1",),
-        explicit_cache_valid_set_ids=("id1",),
-        explicit_cache_invalidated_set_ids=("bad",),
-    )
-    callback_context = owner.callback_context_snapshot()
-    captured_policy_context = owner.completion_policy_context(callback_context)
-    assert captured_policy_context is not None
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["id1", "id2"],
-        completed_set_ids=["id1"],
-        explicit_cache_preview_token="new-token",
-        explicit_cache_preview_scope_set_ids=("id1",),
-        explicit_cache_valid_set_ids=("id1",),
-        explicit_cache_invalidated_set_ids=("bad",),
-    )
-
-    context = owner.completion_publication_policy_context(
-        callback_context=callback_context,
-        policy_context=captured_policy_context,
-    )
-
-    assert context is not None
-    assert context.explicit_cache_preview_token == "new-token"
-    assert context.explicit_cache_preview_scope_set_ids == ("id1",)
-    assert context.explicit_cache_valid_set_ids == ("id1",)
-    assert context.explicit_cache_invalidated_set_ids == ("bad",)
+    assert context is captured_policy_context
+    assert context.explicit_cache_valid_set_ids == ("bad", "ok")
+    assert context.explicit_cache_invalidated_set_ids is None
 
 
 def test_completion_publication_policy_context_preserves_callback_owned_cache_truth():
@@ -289,28 +152,6 @@ def test_completion_publication_policy_context_preserves_callback_owned_cache_tr
     assert context.explicit_cache_preview_scope_set_ids == ("id2",)
     assert context.explicit_cache_valid_set_ids == ("id2",)
     assert context.explicit_cache_invalidated_set_ids == ("id1",)
-
-
-def test_current_run_identity_match_requires_full_current_identity():
-    owner = BatchRunContextOwner()
-    seed_batch_context(
-        owner,
-        active=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-    )
-
-    assert owner.current_run_identity_matches_callback(run_id=1) is False
-    assert owner.current_run_identity_matches_callback(run_id=1, request_id=2) is False
-    assert (
-        owner.current_run_identity_matches_callback(
-            run_id=1,
-            request_id=2,
-            cache_key="ck",
-        )
-        is True
-    )
 
 
 def test_completion_publication_policy_context_keeps_stale_callback_context_out_of_current_truth():
@@ -423,6 +264,10 @@ def test_active_parallel_error_dispatch_context_exposes_failure_metadata_without
     assert dispatch.fast_mode is True
     assert dispatch.owner_epoch == 13
     assert dispatch.cache_key == "cache-1"
+    assert dispatch.callback_context.run_id == 7
+    assert dispatch.callback_context.request_id == 11
+    assert dispatch.callback_context.cache_key == "cache-1"
+    assert dispatch.simulation_identity == {}
 
     seed_batch_context(owner, active=True, parallel=False, run_id=7)
 
@@ -537,6 +382,7 @@ def test_callback_identity_reuses_shared_callback_context_without_deepcopying():
         batch_set_id="id1",
         cache_key="cache-1",
         callback_context=callback_context,
+        simulation_identity={},
     )
 
     assert identity.callback_context is callback_context
@@ -756,39 +602,6 @@ def test_context_matches_current_run_identity_ignores_progress_but_rejects_cache
         "request_id": 7,
         "cache_key": "other",
     })
-
-
-def test_completion_publication_cache_key_uses_callback_key_before_context_fallback():
-    owner = BatchRunContextOwner()
-    seed_batch_context(owner, active=True, run_id=1, request_id=2, cache_key="context-cache")
-    callback_context = owner.callback_context_snapshot()
-
-    assert owner.completion_publication_cache_key(
-        callback_cache_key="callback-cache",
-        callback_context=callback_context,
-    ) == "callback-cache"
-
-
-def test_completion_publication_cache_key_uses_callback_context_as_named_fallback():
-    owner = BatchRunContextOwner()
-    seed_batch_context(owner, active=True, run_id=1, request_id=2, cache_key="context-cache")
-    callback_context = owner.callback_context_snapshot()
-    seed_batch_context(owner, active=True, run_id=99, request_id=100, cache_key="current-cache")
-
-    assert owner.completion_publication_cache_key(
-        callback_cache_key=None,
-        callback_context=callback_context,
-    ) == "context-cache"
-
-
-def test_completion_publication_cache_key_does_not_fall_back_to_current_context_without_callback_context():
-    owner = BatchRunContextOwner()
-    seed_batch_context(owner, active=True, run_id=1, request_id=2, cache_key="current-cache")
-
-    assert owner.completion_publication_cache_key(
-        callback_cache_key=None,
-        callback_context=None,
-    ) == ""
 
 
 def test_simulation_controller_tests_do_not_read_pending_reset_raw_context_fields():
@@ -1233,15 +1046,17 @@ def test_runtime_waiting_transition_deactivates_and_then_restores_context_flag()
     owner = BatchRunContextOwner()
     seed_batch_context(owner, active=True, parallel=True, runtime_waiting=False)
 
-    waiting = owner.mark_runtime_waiting()
+    waiting = owner.mark_runtime_waiting(required_lanes=3)
 
     assert waiting["active"] is False
     assert waiting["runtime_waiting"] is True
+    assert waiting["runtime_waiting_required_lanes"] == 3
 
     ready = owner.clear_runtime_waiting()
 
     assert ready["active"] is False
     assert "runtime_waiting" not in ready
+    assert "runtime_waiting_required_lanes" not in ready
 
 
 def test_completion_policy_context_conversion_is_owned_by_batch_context_owner():

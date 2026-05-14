@@ -35,9 +35,9 @@ class FittingAcceptedLaunchWorkerOwner:
             run_stamp_short,
         )
         window._results_summary_button.setEnabled(True)
-        self.start_worker(accepted_launch)
+        self._start_worker(accepted_launch)
 
-    def start_worker(
+    def _start_worker(
         self,
         accepted_launch: FittingRuntimeAcceptedLaunch,
     ) -> None:
@@ -52,19 +52,19 @@ class FittingAcceptedLaunchWorkerOwner:
         stamp_hash = accepted_launch.stamp_hash
         stamp_short = accepted_launch.stamp_short
         window.fit_run_state_owner.set_active_run_stamp_hash(str(stamp_hash or ""))
-        fit_runtime_ledger = getattr(runtime_session, "ledger", None)
+        fit_runtime_ledger = runtime_session.ledger if runtime_session is not None else None
         worker = GlobalFitWorker(
             datasets,
             dict(config["parameters"]),
             dataset_overrides=list(dataset_overrides),
             bounds=config.get("bounds"),
             weights=weights,
-            method=config.get("method", "trf"),
-            max_nfev=config.get("max_nfev", 1000),
-            ftol=config.get("ftol", 1e-10),
-            xtol=config.get("xtol", 1e-10),
+            method=config["method"],
+            max_nfev=config["max_nfev"],
+            ftol=config["ftol"],
+            xtol=config["xtol"],
             seed=config.get("seed"),
-            log10_params=config.get("log10_params"),
+            log10_params=config["log10_params"],
             fit_evaluator=fit_evaluator,
             fit_runtime_session=runtime_session,
             fit_runtime_max_lanes=int(accepted_launch.lane_count),
@@ -73,8 +73,6 @@ class FittingAcceptedLaunchWorkerOwner:
             solver=str(accepted_launch.identity.requested_solver),
             rtol=float(accepted_launch.identity.requested_rtol),
             atol=float(accepted_launch.identity.requested_atol),
-            best_update_interval_s=0.25,
-            plot_update_interval_s=2.0,
             run_stamp=dict(stamp),
             run_stamp_hash=str(stamp_hash),
             run_stamp_short=str(stamp_short),
@@ -82,14 +80,10 @@ class FittingAcceptedLaunchWorkerOwner:
         )
         window._worker = worker
         worker.progress.connect(window._dispatch_fit_worker_progress)
-        if hasattr(worker, "bestUpdated"):
-            try:
-                worker.bestUpdated.connect(
-                    window._dispatch_fit_worker_best_update,
-                    QtCore.Qt.ConnectionType.QueuedConnection,
-                )
-            except Exception:
-                worker.bestUpdated.connect(window._dispatch_fit_worker_best_update)
+        worker.bestUpdated.connect(
+            window._dispatch_fit_worker_best_update,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
         worker.finished.connect(window._dispatch_fit_worker_finished)
         worker.error.connect(window._dispatch_fit_worker_error)
         worker.start()

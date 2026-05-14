@@ -48,6 +48,7 @@ class _FakeLanePool:
         self.value_marker = float(value_marker)
         self.submissions: List[_Submission] = []
         self.close_calls: List[Dict[str, Any]] = []
+        self.ready_lane_count = 999
 
     def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
         _ = active_timeout_s
@@ -79,6 +80,10 @@ class _FakeLanePool:
             success=True,
             payload=payload,
         )
+
+    def warm_lanes(self, required: int, *, wait: bool = True) -> None:
+        _ = wait
+        self.ready_lane_count = max(int(self.ready_lane_count), int(required))
 
     def _close_requests(self, *, kill: bool = False):
         self.close_calls.append(

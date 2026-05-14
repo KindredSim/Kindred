@@ -394,6 +394,8 @@ class BatchErrorDispatchContext:
     fast_mode: bool
     owner_epoch: int | None
     cache_key: str
+    callback_context: BatchCallbackContext
+    simulation_identity: Dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -600,50 +602,8 @@ class BatchRunContextOwner:
                     return False
         return True
 
-    def current_run_identity_matches_callback(
-        self,
-        *,
-        run_id: Any = None,
-        request_id: Any = None,
-        cache_key: Any = None,
-    ) -> bool:
-        current = self._context
-        if not isinstance(current, Mapping) or not self._coerce_bool(current.get("active")):
-            return True
-        checks = (
-            ("run_id", run_id),
-            ("request_id", request_id),
-            ("cache_key", cache_key),
-        )
-        has_identity = False
-        for key, value in checks:
-            current_value = current.get(key)
-            if current_value is None:
-                continue
-            has_identity = True
-            if value is None or str(value or "") != str(current_value or ""):
-                return False
-        return bool(has_identity)
-
     def load_context(self, seed: BatchContextSeed) -> None:
         self._context = seed.to_context()
-
-    def current_queue_item(
-        self,
-        context: Mapping[str, Any] | None = None,
-    ) -> tuple[str | None, str | None]:
-        ctx = context if isinstance(context, Mapping) else self._context
-        if not isinstance(ctx, Mapping) or not ctx.get("active"):
-            return None, None
-        queue_names = list(ctx.get("queue_names") or [])
-        queue_ids = list(ctx.get("queue_ids") or [])
-        try:
-            pos = int(ctx.get("pos", 0) or 0)
-        except Exception:
-            pos = 0
-        batch_set = str(queue_names[pos]) if 0 <= pos < len(queue_names) else None
-        batch_set_id = str(queue_ids[pos]) if 0 <= pos < len(queue_ids) else None
-        return batch_set, batch_set_id
 
     def active_batch_state(
         self,
@@ -697,6 +657,8 @@ class BatchRunContextOwner:
             fast_mode=bool(state.fast_mode),
             owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
             cache_key=str(ctx.get("cache_key") or ""),
+            callback_context=self.callback_context_snapshot(ctx),
+            simulation_identity=deepcopy(dict(ctx.get("scope_identity") or {})),
         )
 
     def parallel_start_payload(
@@ -995,18 +957,6 @@ class BatchRunContextOwner:
         ctx = context if isinstance(context, Mapping) else self._context
         return str(ctx.get("cache_key") or "")
 
-    def completion_publication_cache_key(
-        self,
-        *,
-        callback_cache_key: str | None,
-        callback_context: Mapping[str, Any] | None,
-    ) -> str:
-        if callback_cache_key:
-            return str(callback_cache_key)
-        if isinstance(callback_context, Mapping):
-            return self.completion_cache_key(callback_context)
-        return ""
-
     def primary_set_id(
         self,
         context: Mapping[str, Any] | None = None,
@@ -1189,16 +1139,21 @@ class BatchRunContextOwner:
     def record_cache_key(self, cache_key: str) -> Dict[str, Any]:
         return self._update(cache_key=str(cache_key))
 
-    def mark_runtime_waiting(self) -> Dict[str, Any]:
+    def mark_runtime_waiting(self, *, required_lanes: int | None = None) -> Dict[str, Any]:
         context = dict(self._context)
         context["runtime_waiting"] = True
         context["active"] = False
+        if required_lanes is None:
+            context.pop("runtime_waiting_required_lanes", None)
+        else:
+            context["runtime_waiting_required_lanes"] = max(1, int(required_lanes))
         self._context = context
         return self._current_context()
 
     def clear_runtime_waiting(self) -> Dict[str, Any]:
         context = dict(self._context)
         context.pop("runtime_waiting", None)
+        context.pop("runtime_waiting_required_lanes", None)
         self._context = context
         return self._current_context()
 
@@ -1244,74 +1199,6 @@ class BatchRunContextOwner:
         context = policy_context
         if context is None and isinstance(callback_context, Mapping):
             context = self.completion_policy_context(callback_context)
-        if context is None:
-            return None
-        if isinstance(callback_context, Mapping):
-            current = self.completion_policy_context(self._context)
-            current_completed = set(current.completed_set_ids) if current is not None else set()
-            context_completed = set(context.completed_set_ids)
-            current_invalidated = (
-                set(current.explicit_cache_invalidated_set_ids or ())
-                if current is not None
-                else set()
-            )
-            context_invalidated = set(context.explicit_cache_invalidated_set_ids or ())
-            current_valid = (
-                set(current.explicit_cache_valid_set_ids or ())
-                if current is not None
-                else set()
-            )
-            context_valid = set(context.explicit_cache_valid_set_ids or ())
-            current_preview_scope = (
-                set(current.explicit_cache_preview_scope_set_ids or ())
-                if current is not None
-                else set()
-            )
-            context_preview_scope = set(context.explicit_cache_preview_scope_set_ids or ())
-            callback_context_has_cache_truth = bool(
-                self._optional_int(callback_context.get("explicit_cache_truth_generation")) is not None
-            )
-            equal_completion_failure_truth = bool(
-                current_completed == context_completed
-                and current_invalidated == context_invalidated
-            )
-            current_has_newer_publication_truth = bool(
-                current is not None
-                and not callback_context_has_cache_truth
-                and (
-                    bool(current_completed - context_completed)
-                    or bool(current_invalidated - context_invalidated)
-                    or (
-                        equal_completion_failure_truth
-                        and (
-                            bool(current_valid != context_valid)
-                            or bool(current_preview_scope != context_preview_scope)
-                        )
-                    )
-                    or (
-                        equal_completion_failure_truth
-                        and
-                        current.explicit_cache_preview_token != context.explicit_cache_preview_token
-                        and current.explicit_cache_preview_token is not None
-                    )
-                )
-            )
-            if (
-                current is not None
-                and current_has_newer_publication_truth
-                and self.context_matches_current_run_identity(callback_context)
-            ):
-                return context.evolve(
-                    completed_set_ids=current.completed_set_ids,
-                    pending_workspace_reset_set_ids=current.pending_workspace_reset_set_ids,
-                    pending_dirty_reset_generation_by_set_id=dict(
-                        current.pending_dirty_reset_generation_by_set_id
-                    ),
-                    explicit_cache_preview_token=current.explicit_cache_preview_token,
-                    explicit_cache_preview_scope_set_ids=current.explicit_cache_preview_scope_set_ids,
-                    explicit_cache_valid_set_ids=current.explicit_cache_valid_set_ids,
-                    explicit_cache_invalidated_set_ids=current.explicit_cache_invalidated_set_ids,
-                )
         return context
 
     def callback_context_with_cache_truth(

@@ -7,7 +7,6 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
-from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +19,7 @@ class ParallelBatchOutcomeResolution:
     owner_epoch: object | None
     expected_owner_epoch: object | None
     stale: bool
+    owner_epoch_mismatch: bool
     failed: bool
     payload: Dict[str, Any] | None
     error_payload: Dict[str, Any] | None
@@ -44,17 +44,18 @@ def resolve_parallel_batch_outcome(
     *,
     set_id: str,
     outcome: BatchLaneOutcome,
-    run_id: int,
-    request_id: int,
     metadata: Mapping[str, Any],
     completion_record: Optional[BatchCompletionRecord] = None,
 ) -> ParallelBatchOutcomeResolution:
     sid = str(set_id or "")
     meta = dict(metadata or {})
     if completion_record is not None:
+        meta.update(dict(completion_record.request_metadata or {}))
         meta.update(
             {
                 "set_name": completion_record.set_name,
+                "run_id": completion_record.run_id,
+                "request_id": completion_record.request_id,
                 "preview_owner_epoch": completion_record.preview_owner_epoch,
                 "owner_epoch": completion_record.expected_owner_epoch,
                 "generation": completion_record.generation,
@@ -72,35 +73,56 @@ def resolve_parallel_batch_outcome(
             owner_epoch_mismatch = int(outcome.owner_epoch) != int(expected_owner_epoch)
         except Exception:
             owner_epoch_mismatch = True
+    missing_identity_metadata: list[str] = []
+    if meta.get("run_id") is None:
+        missing_identity_metadata.append("run_id")
+        expected_run_id = -1
+    else:
+        expected_run_id = int(meta["run_id"])
+    if meta.get("request_id") is None:
+        missing_identity_metadata.append("request_id")
+        expected_request_id = -1
+    else:
+        expected_request_id = int(meta["request_id"])
+    runtime_session_stale = meta.get("runtime_session_stale")
+    runtime_session_stale = runtime_session_stale if isinstance(runtime_session_stale, Mapping) else None
 
     stale = (
-        int(outcome.run_id) != int(run_id)
-        or int(outcome.request_id) != int(request_id)
+        bool(missing_identity_metadata)
+        or runtime_session_stale is not None
+        or int(outcome.run_id) != int(expected_run_id)
+        or int(outcome.request_id) != int(expected_request_id)
         or str(outcome.set_id or "") != sid
         or owner_epoch_mismatch
     )
     if stale:
+        details = {
+            "expected_run_id": int(expected_run_id),
+            "expected_request_id": int(expected_request_id),
+            "expected_set_id": sid,
+            "expected_owner_epoch": expected_owner_epoch,
+            "actual_run_id": int(outcome.run_id),
+            "actual_request_id": int(outcome.request_id),
+            "actual_set_id": str(outcome.set_id or ""),
+            "actual_owner_epoch": int(outcome.owner_epoch),
+        }
+        if runtime_session_stale is not None:
+            details["runtime_session_stale"] = dict(runtime_session_stale)
+        if missing_identity_metadata:
+            details["missing_identity_metadata"] = tuple(missing_identity_metadata)
         return ParallelBatchOutcomeResolution(
             set_id=sid,
             set_name=set_name,
             owner_epoch=owner_epoch,
             expected_owner_epoch=expected_owner_epoch,
             stale=True,
+            owner_epoch_mismatch=bool(owner_epoch_mismatch),
             failed=True,
             payload=None,
             error_payload=build_simulation_failure(
                 "stale_batch_lane_outcome",
                 "Rejected stale batch lane outcome.",
-                details={
-                    "expected_run_id": int(run_id),
-                    "expected_request_id": int(request_id),
-                    "expected_set_id": sid,
-                    "expected_owner_epoch": expected_owner_epoch,
-                    "actual_run_id": int(outcome.run_id),
-                    "actual_request_id": int(outcome.request_id),
-                    "actual_set_id": str(outcome.set_id or ""),
-                    "actual_owner_epoch": int(outcome.owner_epoch),
-                },
+                details=details,
             ),
         )
 
@@ -123,6 +145,7 @@ def resolve_parallel_batch_outcome(
         owner_epoch=owner_epoch,
         expected_owner_epoch=expected_owner_epoch,
         stale=False,
+        owner_epoch_mismatch=False,
         failed=bool(failed),
         payload=payload,
         error_payload=error_payload,
@@ -148,14 +171,6 @@ class ParallelBatchOutcomeOwner:
         self._completion_callback_owner = completion_callback_owner
         self._error_handling_owner = error_handling_owner
         self._deps = dependencies
-
-    @property
-    def batch_parallel(self) -> Any:
-        return self._batch_parallel
-
-    @batch_parallel.setter
-    def batch_parallel(self, value: Any) -> None:
-        self._batch_parallel = value
 
     def handle_scoped_failure(
         self,
@@ -222,47 +237,55 @@ class ParallelBatchOutcomeOwner:
         *,
         set_id: str,
         outcome: BatchLaneOutcome,
-        run_id: int,
-        request_id: int,
-        fast_mode: bool,
-        cache_key: str,
         source: str,
         completed_ts: Optional[float] = None,
         completion_record: Optional[BatchCompletionRecord] = None,
         debug_batch_parallel: bool = False,
     ) -> bool:
         sid = str(set_id or "")
-        meta = self._batch_parallel.active_request_metadata(sid)
+        meta: Dict[str, Any] = {}
+        if completion_record is not None:
+            meta.update(dict(completion_record.request_metadata or {}))
         resolution = resolve_parallel_batch_outcome(
             set_id=sid,
             outcome=outcome,
-            run_id=int(run_id),
-            request_id=int(request_id),
             metadata=meta,
             completion_record=completion_record,
         )
         set_name = resolution.set_name
-        owner_epoch = resolution.owner_epoch
         callback_identity = meta.get("callback_identity")
         callback_context = getattr(callback_identity, "callback_context", None)
         callback_context = callback_context if isinstance(callback_context, Mapping) else None
-        self._batch_parallel.discard_request(sid)
 
         if resolution.stale:
+            runtime_session_stale = meta.get("runtime_session_stale")
+            expected_run_id = meta.get("run_id") if meta.get("run_id") is not None else getattr(completion_record, "run_id", None)
+            expected_request_id = (
+                meta.get("request_id")
+                if meta.get("request_id") is not None
+                else getattr(completion_record, "request_id", None)
+            )
             self._deps.record_nonfatal_exception(
                 (
                     "Rejected stale batch lane outcome "
-                    f"(expected run_id={int(run_id)} request_id={int(request_id)} set_id={sid} owner_epoch={resolution.expected_owner_epoch}; "
+                    f"(expected run_id={expected_run_id if expected_run_id is not None else 'missing'} "
+                    f"request_id={expected_request_id if expected_request_id is not None else 'missing'} "
+                    f"set_id={sid} owner_epoch={resolution.expected_owner_epoch}; "
                     f"got run_id={int(outcome.run_id)} request_id={int(outcome.request_id)} "
                     f"set_id={str(outcome.set_id or '')} owner_epoch={int(outcome.owner_epoch)})"
                 ),
                 RuntimeError("stale batch lane outcome"),
             )
-            if self.handle_scoped_failure(
-                set_id=sid,
-                set_name=set_name,
-                error_payload=resolution.error_payload or {},
-            ):
+            if isinstance(runtime_session_stale, Mapping):
+                return True
+            run_request_set_match = bool(
+                expected_run_id is not None
+                and expected_request_id is not None
+                and int(outcome.run_id) == int(expected_run_id)
+                and int(outcome.request_id) == int(expected_request_id)
+                and str(outcome.set_id or "") == sid
+            )
+            if bool(getattr(callback_identity, "fast_mode", False)) and resolution.owner_epoch_mismatch and run_request_set_match:
                 return True
             self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
             self._deps.set_simulation_running(False)
@@ -272,11 +295,15 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_stop_button_enabled(False)
             return False
 
+        self._batch_parallel.discard_request(sid)
+
         if callback_identity is None or callback_context is None:
             self._deps.record_nonfatal_exception(
                 (
                     "Missing callback identity for active parallel batch outcome "
-                    f"(run_id={int(run_id)} request_id={int(request_id)} set_id={sid} source={str(source)})"
+                    f"(run_id={int(getattr(completion_record, 'run_id', outcome.run_id))} "
+                    f"request_id={int(getattr(completion_record, 'request_id', outcome.request_id))} "
+                    f"set_id={sid} source={str(source)})"
                 ),
                 RuntimeError("missing parallel batch callback identity"),
             )
@@ -309,13 +336,6 @@ class ParallelBatchOutcomeOwner:
                 return True
             self._error_handling_owner.handle_error(
                 error_payload,
-                run_id=run_id,
-                fast_mode=fast_mode,
-                request_id=request_id,
-                owner_epoch=owner_epoch,
-                batch_set=set_name,
-                batch_set_id=sid,
-                cache_key=cache_key,
                 callback_identity=callback_identity,
             )
             self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
@@ -324,25 +344,20 @@ class ParallelBatchOutcomeOwner:
         if bool(debug_batch_parallel):
             logger.info(
                 "BATCH_PAR completion received run_id=%s request_id=%s set_id=%s source=%s completed_at=%.6f received_at=%.6f",
-                int(run_id),
-                int(request_id),
+                int(getattr(callback_identity, "run_id", outcome.run_id)),
+                int(getattr(callback_identity, "request_id", outcome.request_id)),
                 sid,
                 str(source),
                 float(completed_ts if completed_ts is not None else -1.0),
                 float(perf_counter()),
             )
+        completion_policy_context = self._batch_context_owner.completion_policy_context(callback_context)
         try:
             self._completion_callback_owner.handle_completion(
                 resolution.payload,
-                run_id=run_id,
-                fast_mode=fast_mode,
-                request_id=request_id,
-                owner_epoch=owner_epoch,
-                batch_set=set_name,
-                batch_set_id=sid,
-                cache_key=cache_key,
                 debug_batch_parallel=bool(debug_batch_parallel),
                 callback_identity=callback_identity,
+                policy_context=completion_policy_context,
             )
         except Exception as exc:
             self._deps.record_nonfatal_exception(
@@ -352,24 +367,7 @@ class ParallelBatchOutcomeOwner:
             try:
                 self._error_handling_owner.handle_error(
                     f"Simulation failed:\n\n{exc}",
-                    run_id=run_id if callback_identity is not None else None,
-                    fast_mode=fast_mode if callback_identity is not None else None,
-                    request_id=request_id if callback_identity is not None else None,
-                    owner_epoch=owner_epoch if callback_identity is not None else None,
-                    batch_set=set_name if callback_identity is not None else None,
-                    batch_set_id=sid if callback_identity is not None else None,
-                    cache_key=cache_key if callback_identity is not None else None,
-                    callback_identity=callback_identity
-                    or SimulationCallbackIdentity.capture(
-                        run_id=run_id,
-                        fast_mode=fast_mode,
-                        request_id=request_id,
-                        owner_epoch=owner_epoch,
-                        batch_set=set_name,
-                        batch_set_id=sid,
-                        cache_key=cache_key,
-                        callback_context=callback_context,
-                    ),
+                    callback_identity=callback_identity,
                 )
             except Exception as ui_exc:
                 self._deps.record_nonfatal_exception(

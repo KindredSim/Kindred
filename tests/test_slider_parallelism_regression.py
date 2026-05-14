@@ -40,6 +40,7 @@ class _FakeLanePool:
     def __init__(self) -> None:
         self.submissions: List[_Submission] = []
         self.close_calls: List[Dict[str, Any]] = []
+        self.ready_lane_count = 999
 
     def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
         _ = run_id, request_id, set_id, active_timeout_s
@@ -55,6 +56,10 @@ class _FakeLanePool:
             success=not (isinstance(payload, dict) and payload.get("success") is False),
             payload=payload if isinstance(payload, dict) else {"payload": payload},
         )
+
+    def warm_lanes(self, required: int, *, wait: bool = True) -> None:
+        _ = wait
+        self.ready_lane_count = max(int(self.ready_lane_count), int(required))
 
     def submit(self, fn, *args, **kwargs):
         sub = _Submission(fn=fn, args=args, kwargs=dict(kwargs))
@@ -131,7 +136,7 @@ def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_
         time.sleep(0.005)
 
 
-def _clear_eager_parallel_pool(main_window) -> None:
+def _clear_parallel_runtime_pool(main_window) -> None:
     controller = main_window.simulation_controller
     if controller.parallel_batch.has_lane_pool():
         controller.shutdown_batch_lane_pool(force_terminate=True)
@@ -186,7 +191,7 @@ def test_slider_parallel_path_submits_all_selected_sets(main_window, monkeypatch
 def test_slider_parallel_path_uses_per_set_local_mechanism_workspaces(main_window, monkeypatch):
     _prime_three_batch_sets(main_window)
     main_window._extract_and_populate_variables()
-    _clear_eager_parallel_pool(main_window)
+    _clear_parallel_runtime_pool(main_window)
     _select_rows(main_window, [0, 1, 2])
     monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
 

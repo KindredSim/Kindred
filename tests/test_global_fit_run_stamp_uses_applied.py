@@ -114,6 +114,7 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 
@@ -172,6 +173,7 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

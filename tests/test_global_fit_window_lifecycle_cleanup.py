@@ -321,7 +321,16 @@ def _start_worker_from_accepted_launch(
         readiness_required = False
     identity = FittingRuntimeIdentity(
         datasets=dataset_specs,
-        config=dict(config or {}),
+        config={
+            "parameters": {},
+            "bounds": {},
+            "log10_params": {},
+            "method": "trf",
+            "max_nfev": 1000,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
+            **dict(config or {}),
+        },
         dataset_overrides=overrides,
         weights=dict(weights) if isinstance(weights, dict) else None,
         requested_solver=str(requested_solver),
@@ -334,7 +343,7 @@ def _start_worker_from_accepted_launch(
         lane_count=window._fit_runtime_lane_budget(len(dataset_specs)),
         readiness_required=bool(readiness_required),
     )
-    window.fit_worker_launch_owner.start_worker(FittingRuntimeAcceptedLaunch(identity=identity, session=runtime_session))
+    window.fit_worker_launch_owner.start_runtime_launch(FittingRuntimeAcceptedLaunch(identity=identity, session=runtime_session))
 
 
 def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
@@ -345,6 +354,10 @@ def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
     class _ReadyRuntimeSession:
         def __init__(self) -> None:
             self.warm_calls: list[int | None] = []
+
+        @property
+        def ledger(self):
+            return None
 
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             self.warm_calls.append(lane_count)
@@ -413,6 +426,7 @@ def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
         window._on_targets_applied()
         window.show()
         qtbot.waitUntil(lambda: bool(sessions) and sessions[-1].is_ready(), timeout=3000)
+        qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=3000)
 
         assert builder_calls
         assert window._run_button.isEnabled() is True
@@ -447,7 +461,10 @@ def test_fit_runtime_readiness_finalizes_existing_stamp_with_actual_symbolic_ide
     from dataclasses import replace
 
     from kindred.core.simulation_preparation import PreparedSimulationMetadata
-    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, FittingRuntimeReadinessController
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+    )
     from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
 
     evaluator = _basic_serial_fitting_evaluator()
@@ -503,7 +520,11 @@ def test_fit_runtime_readiness_finalizes_existing_stamp_with_actual_symbolic_ide
 def test_fit_runtime_readiness_rejects_launch_hash_after_prepared_symbolic_identity_changes(qt_app):
     from dataclasses import replace
 
-    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, FittingRuntimeReadinessController
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
     from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
 
     evaluator = _basic_serial_fitting_evaluator()
@@ -549,15 +570,26 @@ def test_fit_runtime_readiness_rejects_launch_hash_after_prepared_symbolic_ident
     stale_request = replace(identity, fit_evaluator=None)
 
     assert controller._same_ready_identity(finalized, stale_request) is False
+    ready_session = type(
+        "_ReadyFittingSession",
+        (),
+        {"is_ready": lambda self, *, lane_count=None: True},
+    )()
     controller._ready_identity = finalized
-    assert controller.ready_identity_for(stale_hash) is None
-    assert controller.ready_identity_for(finalized.stamp_hash) is finalized
+    controller._ready_session = ready_session
+    controller._state = FittingRuntimeReadinessState.READY
+    assert controller.is_ready_for(stale_request) is False
+    assert controller.is_ready_for(finalized) is True
 
 
 def test_fit_runtime_readiness_rejects_launch_hash_after_prepared_wegscheider_identity_changes(qt_app):
     from dataclasses import replace
 
-    from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, FittingRuntimeReadinessController
+    from kindred.gui.fitting.runtime_readiness import (
+        FittingRuntimeIdentity,
+        FittingRuntimeReadinessController,
+        FittingRuntimeReadinessState,
+    )
     from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
 
     evaluator = _basic_serial_fitting_evaluator()
@@ -606,9 +638,17 @@ def test_fit_runtime_readiness_rejects_launch_hash_after_prepared_wegscheider_id
 
     assert finalized.stamp["prepared_simulation"]["symbolic_wegscheider_identity"]["fingerprint"] == "actual"
     assert finalized.launch_request_hash == finalized.stamp_hash
+    ready_session = type(
+        "_ReadyFittingSession",
+        (),
+        {"is_ready": lambda self, *, lane_count=None: True},
+    )()
     controller._ready_identity = finalized
-    assert controller.ready_identity_for(stale_hash) is None
-    assert controller.ready_identity_for(finalized.stamp_hash) is finalized
+    controller._ready_session = ready_session
+    controller._state = FittingRuntimeReadinessState.READY
+    stale_request = replace(identity, fit_evaluator=None)
+    assert controller.is_ready_for(stale_request) is False
+    assert controller.is_ready_for(finalized) is True
 
 
 def test_fit_runtime_readiness_still_blocks_de_infinite_bounds(qt_app):
@@ -839,6 +879,10 @@ def test_passive_fit_runtime_preparation_builds_evaluator_off_gui_thread(
     class _ReadyRuntimeSession:
         def __init__(self) -> None:
             self.ready = False
+
+        @property
+        def ledger(self):
+            return None
 
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             self.ready = True
@@ -1073,6 +1117,10 @@ def test_fit_runtime_poll_retries_completion_when_worker_is_still_unwinding(qt_a
     )
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def is_ready(self, *, lane_count=None) -> bool:
             return True
 
@@ -1142,6 +1190,10 @@ def test_close_retries_fit_runtime_completion_when_worker_is_still_unwinding(qt_
     class _RuntimeSession:
         def __init__(self) -> None:
             self.close_calls: list[bool] = []
+
+        @property
+        def ledger(self):
+            return None
 
         def is_ready(self, *, lane_count=None) -> bool:
             return True
@@ -1254,6 +1306,10 @@ def test_superseded_same_hash_different_lane_preparation_does_not_publish_ready(
         def __init__(self, lane_count: int) -> None:
             self.lane_count = int(lane_count)
             self.closed: list[bool] = []
+
+        @property
+        def ledger(self):
+            return None
 
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             return None
@@ -1387,6 +1443,10 @@ def test_cancelled_fit_runtime_preparation_returns_readiness_to_empty(qt_app, qt
     class _RuntimeSession:
         def __init__(self) -> None:
             self.closed: list[bool] = []
+
+        @property
+        def ledger(self):
+            return None
 
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             while not release_warm.wait(0.01):
@@ -1553,6 +1613,10 @@ def test_close_kills_prepared_fit_runtime_session_after_deferred_drain(qt_app, q
     close_calls: list[bool] = []
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             return None
 
@@ -1781,6 +1845,8 @@ def test_stale_finished_from_older_fit_worker_does_not_clear_newer_worker(qt_app
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
             "seed": None,
             "log10_params": {},
         }
@@ -1843,6 +1909,10 @@ def test_serial_fit_worker_start_requires_accepted_launch_even_with_ready_snapsh
             workers.append(self)
 
     class _RuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def is_ready(self, *, lane_count=None) -> bool:
             return True
 
@@ -1901,6 +1971,8 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
             "seed": None,
             "log10_params": {},
         }
@@ -1988,6 +2060,8 @@ def test_stale_terminal_payload_after_newer_completion_is_rejected_by_run_stamp(
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
             "seed": None,
             "log10_params": {},
         }
@@ -2084,6 +2158,8 @@ def test_runtime_input_change_supersedes_active_fit_worker_outputs(qt_app, monke
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
             "seed": None,
             "log10_params": {},
         }
@@ -2194,6 +2270,10 @@ def test_passive_fit_runtime_preparation_keeps_inputs_editable(qt_app, qtbot, mo
     class _RuntimeSession:
         def __init__(self) -> None:
             self.ready = False
+
+        @property
+        def ledger(self):
+            return None
 
         def is_ready(self, *, lane_count=None) -> bool:
             return bool(self.ready)
@@ -2317,7 +2397,7 @@ def test_accepted_fixed_param_launch_does_not_poison_base_evaluator(qt_app, qtbo
         assert getattr(fixed_identity.fit_evaluator, "_fixed_params", {}).get("k1") == pytest.approx(1.23)
         window.fit_runtime_readiness.set_desired_identity(fixed_identity)
         qtbot.waitUntil(lambda: window.fit_runtime_readiness.is_ready_for(fixed_identity), timeout=2000)
-        monkeypatch.setattr(window.fit_worker_launch_owner, "start_worker", lambda _accepted_launch: None)
+        monkeypatch.setattr(window.fit_worker_launch_owner, "start_runtime_launch", lambda _accepted_launch: None)
 
         window.run_fit()
 
@@ -2421,7 +2501,7 @@ def test_passive_readiness_and_run_fit_share_collector_but_run_fit_revalidates(q
         )
         monkeypatch.setattr(
             window.fit_worker_launch_owner,
-            "start_worker",
+            "start_runtime_launch",
             lambda accepted_launch: started.append(accepted_launch),
         )
 
@@ -3016,7 +3096,7 @@ def test_deferred_fit_runtime_identity_remains_ready_after_acceptance(qt_app, qt
         identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
         assert identity is not None
         assert window.fit_runtime_readiness.is_ready_for(identity)
-        monkeypatch.setattr(window.fit_worker_launch_owner, "start_worker", lambda accepted_launch: started.append(accepted_launch))
+        monkeypatch.setattr(window.fit_worker_launch_owner, "start_runtime_launch", lambda accepted_launch: started.append(accepted_launch))
 
         window.run_fit()
         window._refresh_run_button_enabled_state()
@@ -3040,6 +3120,10 @@ def test_fit_runtime_input_change_restarts_preparation_after_old_worker_exits(qt
         class _RuntimeSession:
             def __init__(self) -> None:
                 self.ready = False
+
+            @property
+            def ledger(self):
+                return None
 
             def warm(self, *, cancellation_check=None, lane_count=None):
                 warm_hashes.append(window.fit_runtime_readiness.snapshot().active_hash)
@@ -3142,6 +3226,10 @@ def test_close_waits_for_active_fit_runtime_preparation_before_deleting(qt_app, 
             def __init__(self) -> None:
                 self.cancelled = False
 
+            @property
+            def ledger(self):
+                return None
+
             def warm(self, *, cancellation_check=None, lane_count=None):
                 warm_started.set()
                 while not release_warm.wait(0.01):
@@ -3198,6 +3286,10 @@ def test_close_waits_for_failed_fit_runtime_preparation_before_deleting(qt_app, 
         class _RuntimeSession:
             def __init__(self) -> None:
                 self.cancelled = False
+
+            @property
+            def ledger(self):
+                return None
 
             def warm(self, *, cancellation_check=None, lane_count=None):
                 warm_started.set()
@@ -3471,6 +3563,10 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
         runtime_close_calls: list[bool] = []
 
         class _BadCloseRuntimeSession:
+            @property
+            def ledger(self):
+                return None
+
             def warm(self, *, cancellation_check=None, lane_count=None):
                 return None
 
@@ -3488,6 +3584,8 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
+            "ftol": 1e-10,
+            "xtol": 1e-10,
             "seed": None,
             "log10_params": {},
         }
@@ -3527,7 +3625,7 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
         assert accepted_launch is not None
 
         window._set_running_state(True)
-        window.fit_worker_launch_owner.start_worker(accepted_launch)
+        window.fit_worker_launch_owner.start_runtime_launch(accepted_launch)
         worker = worker_ref["worker"]
 
         window._cancel_fit()
@@ -3617,6 +3715,10 @@ def test_stop_fit_runtime_preparation_does_not_schedule_refresh(qt_app, monkeypa
     release_warm = threading.Event()
 
     class _BlockingRuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             while not release_warm.wait(0.01):
                 if cancellation_check is not None and cancellation_check():
@@ -3665,6 +3767,10 @@ def test_visible_stop_button_cancels_run_initiated_fit_runtime_preparation(qt_ap
         def __init__(self) -> None:
             self.cancelled = False
             self.ready = False
+
+        @property
+        def ledger(self):
+            return None
 
         def warm(self, *, cancellation_check=None, lane_count=None) -> None:
             while not release_warm.wait(0.01):
@@ -4861,7 +4967,7 @@ def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_pa
         )
         monkeypatch.setattr(
             window.fit_worker_launch_owner,
-            "start_worker",
+            "start_runtime_launch",
             lambda _accepted_launch: (_ for _ in ()).throw(RuntimeError("launch boom")),
         )
 

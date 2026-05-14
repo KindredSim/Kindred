@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping
 
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
+from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
 from kindred.gui.controllers.simulation_completion_publication import CompletionCallbackState
 
 logger = logging.getLogger(__name__)
@@ -49,27 +50,20 @@ class SimulationCompletionCallbackOwner:
         self,
         result: Mapping[str, Any],
         *,
-        run_id: Optional[int],
-        fast_mode: Optional[bool],
-        request_id: Optional[int],
-        owner_epoch: Optional[int],
-        batch_set: Optional[str],
-        batch_set_id: Optional[str],
-        cache_key: Optional[str],
         debug_batch_parallel: bool,
-        callback_identity: SimulationCallbackIdentity | None = None,
+        callback_identity: SimulationCallbackIdentity,
+        policy_context: CompletionPolicyContext | None = None,
     ) -> None:
-        if callback_identity is not None:
-            run_id = callback_identity.run_id
-            fast_mode = callback_identity.fast_mode
-            request_id = callback_identity.request_id
-            owner_epoch = callback_identity.owner_epoch
-            batch_set = callback_identity.batch_set
-            batch_set_id = callback_identity.batch_set_id
-            cache_key = callback_identity.cache_key
+        run_id = callback_identity.run_id
+        fast_mode = callback_identity.fast_mode
+        request_id = callback_identity.request_id
+        owner_epoch = callback_identity.owner_epoch
+        batch_set = callback_identity.batch_set
+        batch_set_id = callback_identity.batch_set_id
+        cache_key = callback_identity.cache_key
         active_run_id = int(self._deps.active_run_id())
         shutdown_requested = bool(self._deps.shutdown_requested())
-        if run_id is not None and int(run_id) != active_run_id:
+        if int(run_id) != active_run_id:
             logger.debug(
                 "Ignoring stale simulation completion (run_id=%s, active=%s)",
                 run_id,
@@ -79,43 +73,11 @@ class SimulationCompletionCallbackOwner:
 
         ctx: Mapping[str, Any] | None = (
             callback_identity.callback_context
-            if callback_identity is not None and isinstance(callback_identity.callback_context, Mapping)
+            if isinstance(callback_identity.callback_context, Mapping)
             else None
         )
-        if not isinstance(ctx, Mapping) and self._active_current_context():
-            if not self._batch_context_owner.current_run_identity_matches_callback(
-                run_id=run_id,
-                request_id=request_id,
-                cache_key=cache_key,
-            ):
-                logger.debug(
-                    "Ignoring missing-context simulation completion for non-current callback identity "
-                    "(run_id=%s request_id=%s cache_key=%s)",
-                    run_id,
-                    request_id,
-                    cache_key,
-                )
-                return
-            ctx = self._batch_context_owner.deactivate()
-            self._deps.apply_lifecycle_effects(
-                self._lifecycle_effect_owner.terminal_error_effects(
-                    cancelled=False,
-                    error_text="Missing simulation callback context.",
-                    error_detail_text="",
-                    fast_mode=bool(fast_mode),
-                    has_deferred_preview_replay=False,
-                ),
-                failed_run_context=ctx if isinstance(ctx, Mapping) else None,
-            )
-            return
-        if (batch_set is None or batch_set_id is None) and isinstance(ctx, Mapping):
-            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(ctx)
-            if batch_set is None:
-                batch_set = hinted_set
-            if batch_set_id is None:
-                batch_set_id = hinted_set_id
-        if batch_set_id is None and isinstance(batch_set, str):
-            batch_set_id = self._ui.batch.batch_set_id_for_name(batch_set)
+        if not isinstance(ctx, Mapping):
+            raise ValueError("simulation completion requires callback_identity.callback_context.")
         if isinstance(ctx, Mapping) and self._deps.active_batch_context_runtime_input_stale_for_set(
             batch_set_id=batch_set_id,
             context=ctx,
@@ -131,15 +93,15 @@ class SimulationCompletionCallbackOwner:
             )
             return
 
-        policy_context = (
-            self._batch_context_owner.completion_policy_context(ctx)
-            if isinstance(ctx, Mapping)
-            else None
-        )
+        if policy_context is None:
+            policy_context = (
+                self._batch_context_owner.completion_policy_context(ctx)
+                if isinstance(ctx, Mapping)
+                else None
+            )
         latest_request_id = int(self._deps.latest_request_id())
         callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
-            context=policy_context,
         )
         missing_owner_epoch = self._deps.missing_preview_owner_epoch_for_current_fast_owner(
             fast_mode=fast_mode,
@@ -161,21 +123,27 @@ class SimulationCompletionCallbackOwner:
             explicit_batch_coalescing=False,
             simulation_identity=(
                 callback_identity.simulation_identity
-                if callback_identity is not None and isinstance(callback_identity.simulation_identity, Mapping)
+                if isinstance(callback_identity.simulation_identity, Mapping)
                 else None
             ),
-            preview_batch_cache_token=(
-                callback_identity.preview_batch_cache_token if callback_identity is not None else None
-            ),
+            preview_batch_cache_token=callback_identity.preview_batch_cache_token,
         )
+        if isinstance(callback_identity.launch_provenance, Mapping):
+            solver_provenance = dict(result.get("provenance") or {})
+            launch_provenance = dict(callback_identity.launch_provenance)
+            solver_provenance["launch_provenance"] = launch_provenance
+            result = dict(result)
+            result["provenance"] = solver_provenance
+            if "mechanism_text" not in result and launch_provenance.get("mechanism_text") is not None:
+                result["mechanism_text"] = str(launch_provenance["mechanism_text"])
         is_superseded_fast_request = bool(
             fast_mode
-            and request_id is not None
             and (
                 bool(missing_owner_epoch)
                 or (not self._deps.preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
             )
         )
+
         if not is_superseded_fast_request:
             state.explicit_batch_coalescing = self._batch_context_owner.explicit_batch_coalescing_for_completion(
                 slider_triggered=bool(state.slider_triggered),
@@ -184,9 +152,6 @@ class SimulationCompletionCallbackOwner:
             self._publication_owner.publish_success(
                 result,
                 state,
-                run_id=run_id,
-                request_id=request_id,
-                batch_set_id=batch_set_id,
                 debug_batch_parallel=bool(debug_batch_parallel),
             )
             return
@@ -224,9 +189,6 @@ class SimulationCompletionCallbackOwner:
             self._publication_owner.publish_success(
                 result,
                 state,
-                run_id=run_id,
-                request_id=request_id,
-                batch_set_id=batch_set_id,
                 debug_batch_parallel=bool(debug_batch_parallel),
             )
             return
@@ -253,7 +215,7 @@ class SimulationCompletionCallbackOwner:
             )
         )
 
-    def _active_current_context(self) -> bool:
+    def _has_active_context(self) -> bool:
         try:
             state = self._batch_context_owner.completion_state()
         except Exception:

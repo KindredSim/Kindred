@@ -93,6 +93,7 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

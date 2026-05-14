@@ -11,6 +11,7 @@ import kindred.core.simulator.dsl as dsl
 import kindred.core.simulator.dsl_build as dsl_build
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 from kindred.core.simulation_preparation import BoundMechanism
+from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
 from tests.worker_stubs import make_contained_simulation_worker_stub
@@ -89,6 +90,21 @@ def _worker_payload(prepared, mechanism_text):
         "mechanism_text": mechanism_text,
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
+
+
+def _callback_identity(controller, *, run_id=0, fast_mode=False, request_id=0, batch_set_id=None, cache_key=""):
+    return SimulationCallbackIdentity.capture(
+        run_id=run_id,
+        fast_mode=fast_mode,
+        request_id=request_id,
+        owner_epoch=None,
+        batch_set=None,
+        batch_set_id=batch_set_id,
+        cache_key=cache_key,
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
+    )
 
 
 class _SliderCommitTransitionWorker(QtCore.QObject):
@@ -1025,7 +1041,10 @@ def test_hidden_mechanism_slider_does_not_leak_into_later_load_with_reused_name(
     }
 
     main_window._preview_session._slider_triggered_simulation = False
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     QtWidgets.QApplication.processEvents()
 
     assert sliders.has_variable("k1")
@@ -1073,7 +1092,10 @@ def test_hidden_mechanism_slider_persists_across_same_universe_dsl_text_edit_com
     }
 
     main_window._preview_session._slider_triggered_simulation = False
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     QtWidgets.QApplication.processEvents()
 
     assert sliders.has_variable("k1")
@@ -1139,7 +1161,10 @@ def test_hidden_mechanism_slider_persists_across_same_universe_scalar_reorder_co
     }
 
     main_window._preview_session._slider_triggered_simulation = False
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     QtWidgets.QApplication.processEvents()
 
     assert sliders.has_variable("a")
@@ -1184,7 +1209,10 @@ def test_hidden_mechanism_slider_persists_across_primary_explicit_completion_rep
     }
 
     main_window._preview_session._slider_triggered_simulation = False
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     QtWidgets.QApplication.processEvents()
 
     assert sliders.has_variable("k1")
@@ -1229,7 +1257,10 @@ def test_hidden_mechanism_slider_persists_across_energy_mode_refresh_repopulatio
         "solver_config": {"solver": "BDF", "rtol": 1e-6, "atol": 1e-12},
     }
 
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     QtWidgets.QApplication.processEvents()
 
     qtbot.addWidget(main_window)
@@ -1245,7 +1276,10 @@ def test_hidden_mechanism_slider_persists_across_energy_mode_refresh_repopulatio
     assert first_slider.isVisible() is False
 
     main_window._preview_session._slider_triggered_simulation = False
-    main_window.simulation_controller.on_simulation_complete(payload, fast_mode=False)
+    main_window.simulation_controller.on_simulation_complete(
+        payload,
+        callback_identity=_callback_identity(main_window.simulation_controller, fast_mode=False),
+    )
     QtWidgets.QApplication.processEvents()
 
     assert sliders.has_variable(variable_name)
@@ -1468,7 +1502,8 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
     seen_cache_keys: list[object] = []
 
     def _spy_complete(_result, *_args, **kwargs) -> None:
-        seen_cache_keys.append(kwargs.get("cache_key"))
+        callback_identity = kwargs.get("callback_identity")
+        seen_cache_keys.append(getattr(callback_identity, "cache_key", None))
 
     monkeypatch.setattr(main_window.simulation_controller, "_on_simulation_complete", _spy_complete)
 
@@ -3305,11 +3340,14 @@ def test_species_only_commit_preserves_matching_dirty_preview_and_rejects_old_ex
 
     controller.on_simulation_complete(
         _completion_payload_with_a_series([42.0, 43.0]),
-        run_id=old_run_id,
-        fast_mode=False,
-        request_id=old_request_id,
-        batch_set_id=set_id,
-        cache_key=explicit_key,
+        callback_identity=_callback_identity(
+            controller,
+            run_id=old_run_id,
+            fast_mode=False,
+            request_id=old_request_id,
+            batch_set_id=set_id,
+            cache_key=explicit_key,
+        ),
     )
 
     assert np.allclose(np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float), preview_series)
@@ -3386,6 +3424,9 @@ def test_direct_species_cell_edit_clears_visible_multiset_without_invalidating_u
         batch_set=None,
         batch_set_id=edited_set_id,
         cache_key=explicit_key,
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
     )
 
     assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "3.0")
@@ -5181,6 +5222,9 @@ def test_run_selected_success_refreshes_focused_species_sliders_after_clearing_s
         batch_set=str(main_window.batch_set_name_for_id(set_id) or ""),
         batch_set_id=set_id,
         cache_key=str(flush_context.cache_key or ""),
+        callback_context=batch_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
     )
 
     result = {
@@ -5257,6 +5301,9 @@ def test_run_selected_completion_preserves_surviving_pending_slider_replay_after
         batch_set=str(main_window.batch_set_name_for_id(set0_id) or ""),
         batch_set_id=set0_id,
         cache_key=str(flush_context.cache_key or ""),
+        callback_context=batch_owner.callback_context_snapshot(),
+        simulation_identity={},
+        preview_batch_cache_token="",
     )
     result = {
         "t": np.linspace(0.0, 1.0, 3),

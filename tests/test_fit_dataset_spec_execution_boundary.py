@@ -8,6 +8,10 @@ class _ReadyRuntimeSession:
     def __init__(self) -> None:
         self.ready = False
 
+    @property
+    def ledger(self):
+        return None
+
     def is_ready(self, *, lane_count=None) -> bool:
         return bool(self.ready)
 
@@ -168,6 +172,7 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

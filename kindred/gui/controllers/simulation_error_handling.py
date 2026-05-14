@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping
 
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.core.simulation_failure import (
@@ -53,30 +53,19 @@ class SimulationErrorHandlingOwner:
         self,
         error_msg: object,
         *,
-        run_id: Optional[int],
-        fast_mode: Optional[bool],
-        request_id: Optional[int],
-        owner_epoch: Optional[int],
-        batch_set: Optional[str],
-        batch_set_id: Optional[str],
-        cache_key: Optional[str] = None,
-        callback_identity: SimulationCallbackIdentity | None = None,
+        callback_identity: SimulationCallbackIdentity,
     ) -> None:
-        _ = cache_key
-        if callback_identity is not None:
-            run_id = callback_identity.run_id
-            fast_mode = callback_identity.fast_mode
-            request_id = callback_identity.request_id
-            owner_epoch = callback_identity.owner_epoch
-            batch_set = callback_identity.batch_set
-            batch_set_id = callback_identity.batch_set_id
-            cache_key = callback_identity.cache_key
+        run_id = callback_identity.run_id
+        fast_mode = callback_identity.fast_mode
+        request_id = callback_identity.request_id
+        owner_epoch = callback_identity.owner_epoch
+        batch_set_id = callback_identity.batch_set_id
         error_payload = coerce_simulation_failure(error_msg)
         error_text = simulation_failure_user_message(error_payload)
         error_detail_text = simulation_failure_detail_text(error_payload)
         cancelled = is_cancelled_failure(error_payload)
         active_run_id = int(self._deps.active_run_id())
-        if run_id is not None and int(run_id) != active_run_id:
+        if int(run_id) != active_run_id:
             logger.debug(
                 "Ignoring stale simulation error (run_id=%s, active=%s): %s",
                 run_id,
@@ -87,47 +76,11 @@ class SimulationErrorHandlingOwner:
         latest_request_id = int(self._deps.latest_request_id())
         ctx = (
             callback_identity.callback_context
-            if callback_identity is not None and isinstance(callback_identity.callback_context, Mapping)
+            if isinstance(callback_identity.callback_context, Mapping)
             else None
         )
-        if not isinstance(ctx, Mapping) and self._active_current_context():
-            if not self._batch_context_owner.current_run_identity_matches_callback(
-                run_id=run_id,
-                request_id=request_id,
-                cache_key=cache_key,
-            ):
-                logger.debug(
-                    "Ignoring missing-context simulation error for non-current callback identity "
-                    "(run_id=%s request_id=%s cache_key=%s): %s",
-                    run_id,
-                    request_id,
-                    cache_key,
-                    error_text,
-                )
-                return
-            ctx = self._batch_context_owner.deactivate()
-            logger.warning("Simulation error surfaced to UI: %s", error_text)
-            if not cancelled and error_detail_text:
-                logger.warning("%s", error_detail_text)
-            self._deps.apply_lifecycle_effects(
-                self._lifecycle_effect_owner.terminal_error_effects(
-                    cancelled=bool(cancelled),
-                    error_text=str(error_text),
-                    error_detail_text=str(error_detail_text or ""),
-                    fast_mode=bool(fast_mode),
-                    has_deferred_preview_replay=bool(self._deps.has_deferred_preview_replay_intent()),
-                ),
-                failed_run_context=ctx if isinstance(ctx, Mapping) else None,
-            )
-            return
-        if (batch_set is None or batch_set_id is None) and isinstance(ctx, Mapping):
-            hinted_set, hinted_set_id = self._batch_context_owner.current_queue_item(ctx)
-            if batch_set is None:
-                batch_set = hinted_set
-            if batch_set_id is None:
-                batch_set_id = hinted_set_id
-        if batch_set_id is None and isinstance(batch_set, str):
-            batch_set_id = self._ui.batch.batch_set_id_for_name(batch_set)
+        if not isinstance(ctx, Mapping):
+            raise ValueError("simulation error requires callback_identity.callback_context.")
         if isinstance(ctx, Mapping) and self._deps.active_batch_context_runtime_input_stale_for_set(
             batch_set_id=batch_set_id,
             context=ctx,
@@ -150,7 +103,6 @@ class SimulationErrorHandlingOwner:
         )
         callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
             owner_epoch=owner_epoch,
-            context=policy_context,
         )
         missing_owner_epoch = self._deps.missing_preview_owner_epoch_for_current_fast_owner(
             fast_mode=fast_mode,
@@ -160,7 +112,6 @@ class SimulationErrorHandlingOwner:
         )
         is_superseded_fast_request = bool(
             fast_mode
-            and request_id is not None
             and (
                 bool(missing_owner_epoch)
                 or (not self._deps.preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
@@ -258,7 +209,7 @@ class SimulationErrorHandlingOwner:
             failed_run_context=ctx if isinstance(ctx, Mapping) else None,
         )
 
-    def _active_current_context(self) -> bool:
+    def _has_active_context(self) -> bool:
         try:
             state = self._batch_context_owner.completion_state()
         except Exception:

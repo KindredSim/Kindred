@@ -164,6 +164,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 
@@ -225,6 +226,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
 
     class _FakeWorker(QtCore.QObject):
         progress = QtCore.Signal(int, str)
+        bestUpdated = QtCore.Signal(dict)
         finished = QtCore.Signal(dict)
         error = QtCore.Signal(str)
 

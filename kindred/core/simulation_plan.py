@@ -7,6 +7,7 @@ from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
+from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_preparation import SimulationExecutionRequest, SimulationPreparationError
 
 __all__ = [
@@ -117,6 +118,7 @@ class SimulationPlan:
         if not isinstance(self.metadata, Mapping):
             raise TypeError("metadata must be a mapping.")
         object.__setattr__(self, "metadata", _copy_payload_value(self.metadata))
+        self._validate_cache_identity_schedule()
 
     @classmethod
     def from_execution_request(
@@ -219,6 +221,26 @@ class SimulationPlan:
         if not isinstance(queue_ids, (list, tuple)):
             return ()
         return tuple(str(item) for item in queue_ids if str(item))
+
+    def _validate_cache_identity_schedule(self) -> None:
+        identity = self.simulation_identity_payload()
+        if not identity:
+            return
+        actual_fingerprint = str(identity.get("intervention_schedule_fingerprint") or "")
+        if actual_fingerprint and not self.execution_request.has_intervention_schedule_authority:
+            raise ValueError(
+                "SimulationPlan cache_identity_payload simulation_identity "
+                "intervention_schedule_fingerprint requires execution_request intervention_schedule authority."
+            )
+        if not self.execution_request.has_intervention_schedule_authority:
+            return
+        schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
+        expected_fingerprint = "" if schedule is None else str(schedule.fingerprint or "")
+        if actual_fingerprint != expected_fingerprint:
+            raise ValueError(
+                "SimulationPlan cache_identity_payload simulation_identity "
+                "intervention_schedule_fingerprint conflicts with execution_request."
+            )
 
 
 _RESULT_KNOWN_FIELDS = {
