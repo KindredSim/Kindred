@@ -650,7 +650,7 @@ def test_warm_simulation_owner_preserves_gui_algebra_outputs_in_result_payload()
             "initial: B=0.0",
             "# Algebra",
             "param scale = 2.0",
-            "total = [A] + [B]",
+            "let total = [A] + [B]",
         ]
     )
     bound = prepare_bound_mechanism(

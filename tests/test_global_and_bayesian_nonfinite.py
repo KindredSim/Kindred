@@ -464,7 +464,7 @@ def test_fit_global_shared_serial_evaluator_fails_on_nonfinite_dataset_override(
 
 
 @pytest.mark.unit
-def test_fit_global_shared_serial_evaluator_ignores_nonfinite_unconsumed_dataset_overrides(monkeypatch):
+def test_fit_global_shared_serial_evaluator_rejects_unknown_dataset_overrides(monkeypatch):
     evaluator, _payload, _layout, dataset = _build_serial_fit_components()
 
     def fake_least_squares(fun, x0, **_kwargs):
@@ -503,10 +503,10 @@ def test_fit_global_shared_serial_evaluator_ignores_nonfinite_unconsumed_dataset
         max_nfev=5,
     )
 
-    assert result.completion.status == "ok"
-    assert result.message == "ok"
+    assert result.completion.status == "fail"
+    assert "Unknown request parameter" in result.message
     assert result.objective_residuals is not None
-    assert np.all(np.isfinite(result.objective_residuals))
+    assert result.objective_residuals.size == 0
 
 
 @pytest.mark.unit

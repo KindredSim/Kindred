@@ -1,30 +1,15 @@
 import pytest
 
 from kindred.core.simulator.dsl import _parse_dsl_ir, extract_parameter_names_from_dsl, parse_dsl_to_mechanism
-from kindred.core.simulator.dsl_parameter_scan import _parameter_family, _scan_mechanism_param_names
+from kindred.core.simulator.dsl_parameter_scan import _scan_mechanism_param_names
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
+from kindred.core.simulator.parameter_namespace import build_namespace_from_canonical_names
 from kindred.core.simulator.parameter_algebra import mechanism_parameter_names
 from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
 
 pytestmark = pytest.mark.unit
 
-
-
-@pytest.mark.parametrize(
-    ("name", "family"),
-    [
-        ("Keq", "Keq"),
-        ("Keq1", "Keq"),
-        ("Keq2", "Keq"),
-        ("Keq10", "Keq"),
-    ],
-)
-def test_parameter_family_recognizes_keq_suffixes(name, family):
-    assert _parameter_family(name) == family
-
-
-def test_scan_public_path_accepts_k_alias_for_irreversible_step():
+def test_scan_public_path_accepts_indexed_k_direct_spelling_for_irreversible_step():
     dsl = "\n".join(
         [
             "reaction: A -> B; k=1.0",
@@ -33,12 +18,10 @@ def test_scan_public_path_accepts_k_alias_for_irreversible_step():
         ]
     )
 
-    names = extract_parameter_names_from_dsl(dsl)
-
-    assert "k1" in names
+    assert "k1" in extract_parameter_names_from_dsl(dsl)
 
 
-def test_scan_public_path_rejects_k_alias_for_equilibrium_step():
+def test_scan_public_path_rejects_indexed_k_for_equilibrium_step():
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; Keq=3.0; kf=6.0",
@@ -47,8 +30,50 @@ def test_scan_public_path_rejects_k_alias_for_equilibrium_step():
         ]
     )
 
-    with pytest.raises(DSLError, match="Keq1"):
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier"):
         extract_parameter_names_from_dsl(dsl)
+
+
+def test_scan_public_path_canonicalizes_observable_rhs_direct_spelling_for_irreversible_step():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "# Algebra",
+            "let signal = K1",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(dsl)
+
+    assert "k1" in names
+    assert "signal" in names
+
+
+def test_scan_public_path_rejects_observable_rhs_indexed_k_for_equilibrium_step():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; Keq=3.0; kf=6.0",
+            "# Algebra",
+            "let signal = K1",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier"):
+        extract_parameter_names_from_dsl(dsl)
+
+
+def test_scan_public_path_preserves_longer_observable_rhs_names_as_ordinary():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; Keq=3.0; kf=6.0",
+            "# Algebra",
+            "let signal = K1_test",
+        ]
+    )
+
+    names = extract_parameter_names_from_dsl(dsl)
+
+    assert "signal" in names
 
 
 def test_scan_namespace_matches_global_step_indexing():
@@ -94,14 +119,13 @@ def test_scan_namespace_matches_executable_namespace_for_audit_cases(dsl, expect
     assert mechanism_parameter_names(mech) == expected
 
 
-def test_scan_private_validation_reversible_step_uses_kf_namespace():
-    spec = parse_parameter_algebra_spec_from_dsl_text(
-        "\n".join(
-            [
-                "param K2 = 5",
-            ]
-        ),
-        mechanism_namespace=build_flat_compat_namespace({"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"}),
-    )
-
-    assert [assignment.name for assignment in spec.param_statements] == ["kf2"]
+def test_scan_private_validation_reversible_step_rejects_unresolved_indexed_k():
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier"):
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(
+                [
+                    "param K2 = 5",
+                ]
+            ),
+            mechanism_namespace=build_namespace_from_canonical_names({"k1", "kf2", "kr2", "kf3", "kr3", "Keq3"}),
+        )

@@ -68,7 +68,7 @@ def test_scientific_notation_numeric_literals_translate_without_identifier_rewri
     assert translated.normalized_source == "1/(Keq1*Keq2)"
 
 
-def test_case_insensitive_aliases_translate_to_canonical_names():
+def test_case_insensitive_direct_spellings_translate_to_canonical_names():
     from kindred.core.symbolic.parameter_expression import translate_parameter_expression
 
     translated = translate_parameter_expression(
@@ -78,6 +78,23 @@ def test_case_insensitive_aliases_translate_to_canonical_names():
 
     assert translated.canonical_identifiers == ("Keq1", "Keq2")
     assert translated.normalized_source == "1/(Keq1*Keq2)"
+
+
+def test_symbolic_translation_rejects_indexed_k_for_reversible_parameters():
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.parameter_expression import translate_parameter_expression
+
+    spec = _spec(
+        "\n".join(
+            [
+                "equilibrium: A <-> B ; kf=1 ; kr=0.5",
+                "init: A=1, B=0",
+            ]
+        )
+    )
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="Protected indexed mechanism parameter 'K1'"):
+        translate_parameter_expression(_assignment("K1", name="derived"), spec=spec)
 
 
 @pytest.mark.parametrize(

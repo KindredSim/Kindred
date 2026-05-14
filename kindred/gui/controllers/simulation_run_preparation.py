@@ -93,7 +93,6 @@ class SimulationRunPreparationPorts:
 class SimulationRunPreparationDependencies:
     claim_preview_ownership: Callable[..., Any]
     clear_preview_ownership: Callable[[], None]
-    apply_parameter_override_fallback_to_dsl: Callable[..., str]
     invalidate_preserved_pending_init_results_after_failed_run: Callable[..., None]
     clear_failed_fast_preview_ownership: Callable[[], None]
     clear_slider_triggered_preflight_state: Callable[..., None]
@@ -362,8 +361,6 @@ class SimulationRunMechanismPreparationOwner:
         full_dsl = reactions_text
         if state_network_dsl.strip():
             full_dsl += "\n\n# State Network\n" + state_network_dsl
-        if has_slider_overrides:
-            full_dsl = self._deps.apply_parameter_override_fallback_to_dsl(full_dsl, set_id=primary_set_id)
         owner_reactions_text = strip_reaction_dsl_initial_concentrations(owner_reactions_text_raw)
         owner_full_dsl = owner_reactions_text
         if owner_state_network_dsl_raw.strip():
@@ -560,18 +557,45 @@ class SimulationRunDispatchPreparationOwner:
         simulation_identity_by_set_id: Dict[str, Dict[str, Any]] = {}
         initials_by_set_id: Dict[str, Dict[str, Any]] = {}
         parameter_overrides_by_set_id: Dict[str, Dict[str, Any]] = {}
+        intervention_schedule_by_set_id: Dict[str, Dict[str, Any]] = {}
         contained_owner_identity_by_set_id: Dict[str, Dict[str, Any]] = {}
+
+        def _abort_invalid_intervention_schedule(set_id_s: str, exc: BaseException) -> None:
+            if bool(runtime_readiness_only):
+                raise ValueError(f"Invalid intervention schedule for set {set_id_s!r}: {exc}") from exc
+            self._deps.invalidate_preserved_pending_init_results_after_failed_run(
+                pending_init_applied=bool(mechanism_context.pending_init_applied)
+            )
+            self._deps.record_nonfatal_exception("Failed to parse intervention schedule for run plan", exc)
+            self._ports.dialogs.message_box_warning(
+                "Invalid Intervention Schedule",
+                f"Fix intervention schedule directives before running:\n\n{exc}",
+            )
+            if bool(fast_mode):
+                self._deps.clear_failed_fast_preview_ownership()
+            self._deps.set_simulation_running(False)
+            self._ports.run_ui.set_run_button_enabled(True)
+            self._ports.run_ui.set_stop_button_enabled(False)
+            self._deps.set_slider_simulation_active(False)
+            self._deps.clear_slider_triggered_preflight_state(fast_mode=bool(fast_mode))
+            if not bool(fast_mode):
+                self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
+
         for index, set_id in enumerate(mechanism_context.queue_ids):
             set_id_s = str(set_id)
-            identity = self._deps.simulation_identity_for_set(
-                set_id=set_id_s,
-                solver_config=solver_context.solver_config,
-                t_end=float(solver_context.t_end),
-                preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
-                fast_mode=bool(fast_mode),
-            )
-            simulation_identity_by_set_id[set_id_s] = identity.to_payload()
             if index >= len(mechanism_context.batch_rows):
+                try:
+                    identity = self._deps.simulation_identity_for_set(
+                        set_id=set_id_s,
+                        solver_config=solver_context.solver_config,
+                        t_end=float(solver_context.t_end),
+                        preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
+                        fast_mode=bool(fast_mode),
+                    )
+                except Exception as exc:
+                    _abort_invalid_intervention_schedule(set_id_s, exc)
+                    return None
+                simulation_identity_by_set_id[set_id_s] = identity.to_payload()
                 continue
             row = int(mechanism_context.batch_rows[index])
             set_name = (
@@ -584,6 +608,15 @@ class SimulationRunDispatchPreparationOwner:
                 has_slider_overrides=mechanism_context.has_slider_overrides,
             )
             mechanism_text_by_set_id[set_id_s] = str(request_mechanism_text)
+            try:
+                from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
+
+                intervention_schedule = parse_intervention_schedule_from_dsl(str(request_mechanism_text))
+            except Exception as exc:
+                _abort_invalid_intervention_schedule(set_id_s, exc)
+                return None
+            if intervention_schedule is not None:
+                intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
             prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
             try:
                 initials_dict = self._deps.resolved_initials_for_batch_row(
@@ -616,14 +649,18 @@ class SimulationRunDispatchPreparationOwner:
                     self._deps.requeue_preserved_pending_slider_replay_after_preflight_abort()
                 return None
 
-            identity = self._deps.simulation_identity_for_set(
-                set_id=set_id_s,
-                solver_config=solver_context.solver_config,
-                t_end=float(solver_context.t_end),
-                canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
-                preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
-                fast_mode=bool(fast_mode),
-            )
+            try:
+                identity = self._deps.simulation_identity_for_set(
+                    set_id=set_id_s,
+                    solver_config=solver_context.solver_config,
+                    t_end=float(solver_context.t_end),
+                    canonical_initials_fingerprint=canonical_initials_fingerprint(initials_dict),
+                    preview_batch_cache_token=preview_batch_cache_token_by_set_id.get(set_id_s, ""),
+                    fast_mode=bool(fast_mode),
+                )
+            except Exception as exc:
+                _abort_invalid_intervention_schedule(set_id_s, exc)
+                return None
             simulation_identity_by_set_id[set_id_s] = identity.to_payload()
             initials_by_set_id[set_id_s] = dict(initials_dict)
             if bool(fast_mode):
@@ -718,6 +755,7 @@ class SimulationRunDispatchPreparationOwner:
                         if bool(fast_mode)
                         else None
                     ),
+                    intervention_schedule=intervention_schedule_by_set_id.get(set_id_s),
                     contained_owner_identity=contained_owner_identity_by_set_id.get(set_id_s),
                     algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
                 )

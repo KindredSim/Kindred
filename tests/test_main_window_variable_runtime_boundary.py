@@ -63,8 +63,7 @@ class _FakeRuntimeHost:
             return dict(self._slider_overrides_by_set[str(set_id)])
         return dict(self._slider_overrides)
 
-    def _parameter_algebra_spec_for_ui(self, *, mechanism_param_names: set[str]):
-        _ = mechanism_param_names
+    def _parameter_algebra_spec_for_ui(self):
         return None
 
     def _get_mechanism_text(self) -> str:

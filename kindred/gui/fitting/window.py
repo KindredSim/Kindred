@@ -531,10 +531,16 @@ class FittingWindow(QtWidgets.QDialog):
             try:
                 from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
                 from kindred.core.simulator.algebra_section import extract_algebra_section_text
+                from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+                from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
                 reactions_text = str(self._reactions_text_getter() or "")
                 algebra_text = extract_algebra_section_text(reactions_text)
-                observables = extract_observables_from_algebra_text(algebra_text)
+                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(reactions_text, initials={}))
+                observables = extract_observables_from_algebra_text(
+                    algebra_text,
+                    mechanism_namespace=mechanism_namespace,
+                )
                 if isinstance(observables, dict):
                     modeled |= {str(k) for k in observables.keys() if str(k).strip()}
             except Exception:
@@ -1530,10 +1536,12 @@ class FittingWindow(QtWidgets.QDialog):
             extract_observables_from_algebra_text,
         )
         from kindred.core.algebra.symbols import SymbolTable
+        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
         from kindred.core.simulator.algebra_section import (
             extract_algebra_section_text,
             upsert_lines_into_algebra_section,
         )
+        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
         from kindred.core.validation import validate_name
 
         if not self._observable_dsl_edit_available():
@@ -1550,7 +1558,15 @@ class FittingWindow(QtWidgets.QDialog):
 
         reactions_text = str(self._reactions_text_getter() or "")
         algebra_text = extract_algebra_section_text(reactions_text)
-        existing_obs_map = extract_observables_from_algebra_text(algebra_text)
+        try:
+            mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(reactions_text, initials={}))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Mechanism Reactions text is invalid:\n\n{exc}")
+            return
+        existing_obs_map = extract_observables_from_algebra_text(
+            algebra_text,
+            mechanism_namespace=mechanism_namespace,
+        )
         existing_observables = {str(x) for x in (existing_obs_map or {}).keys() if str(x).strip()}
         if not self._validate_observable_existence(obs_name, existing_observables=existing_observables, persist_observable=persist_observable):
             return
@@ -1573,14 +1589,19 @@ class FittingWindow(QtWidgets.QDialog):
             return
         known_identifiers |= {obs_name}
 
-        missing_scalars = sorted(
-            detect_unknown_scalar_identifiers(
-                obs_expr,
-                observable_name=obs_name,
-                known_identifiers=known_identifiers,
-                mechanism_species=mechanism_species,
+        try:
+            missing_scalars = sorted(
+                detect_unknown_scalar_identifiers(
+                    obs_expr,
+                    observable_name=obs_name,
+                    known_identifiers=known_identifiers,
+                    mechanism_species=mechanism_species,
+                    mechanism_namespace=mechanism_namespace,
+                )
             )
-        )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Add Observable", f"Invalid expression:\n\n{exc}")
+            return
         updated_reactions_text = self._persist_observable_updates(
             reactions_text=reactions_text,
             obs_name=obs_name,
@@ -1651,8 +1672,6 @@ class FittingWindow(QtWidgets.QDialog):
         mechanism_species: set[str],
         symbol_table,
     ) -> bool:
-        import re
-
         if obs_name in symbol_table.protected_names() or obs_name in symbol_table.functions().keys():
             QtWidgets.QMessageBox.warning(
                 self,
@@ -1667,7 +1686,19 @@ class FittingWindow(QtWidgets.QDialog):
                 f"Observable name '{obs_name}' conflicts with a mechanism species name.",
             )
             return False
-        if re.fullmatch(r"(?i:(?:k|kf|kr|keq)\d+)", obs_name):
+        from kindred.core.simulator.parameter_algebra_spec import (
+            is_protected_indexed_parameter_identifier,
+            is_protected_step_key_identifier,
+        )
+
+        if is_protected_step_key_identifier(obs_name):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Add Observable",
+                f"'{obs_name}' is a step-local DSL key. Choose a different observable name.",
+            )
+            return False
+        if is_protected_indexed_parameter_identifier(obs_name):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Add Observable",

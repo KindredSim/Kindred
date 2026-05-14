@@ -7,7 +7,7 @@ import pytest
 from kindred.core.simulator.dsl import _parse_dsl_ir, parse_dsl_to_mechanism
 from kindred.core.simulator.parameter_namespace import (
     _namespace_policy_from_step,
-    build_flat_compat_namespace,
+    build_namespace_from_canonical_names,
     build_namespace_from_ir_steps,
     build_namespace_from_mechanism,
 )
@@ -111,12 +111,51 @@ def test_shared_step_policy_matches_builder_step_index_metadata(dsl, expected_ki
         assert "has_Keq_param" not in entry
 
 
-def test_flat_compat_namespace_rejects_noncanonical_inputs():
+def test_canonical_name_namespace_rejects_noncanonical_inputs():
     with pytest.raises(ValueError, match="already-canonical"):
-        build_flat_compat_namespace({"K1"})
+        build_namespace_from_canonical_names({"K1"})
 
     with pytest.raises(ValueError, match="already-canonical"):
-        build_flat_compat_namespace({"k01"})
+        build_namespace_from_canonical_names({"k01"})
+
+
+def test_namespace_resolver_accepts_only_direct_case_insensitive_canonical_spellings():
+    namespace = build_namespace_from_canonical_names({"k1", "kf2", "kr2", "Keq2"})
+
+    assert namespace.resolve("k1").canonical_name == "k1"
+    assert namespace.resolve("KF2").canonical_name == "kf2"
+    assert namespace.resolve("KR2").canonical_name == "kr2"
+    assert namespace.resolve("KEQ2").canonical_name == "Keq2"
+    assert namespace.resolve("keq2").canonical_name == "Keq2"
+
+
+def test_namespace_resolver_treats_K1_as_case_insensitive_k1_spelling():
+    namespace = build_namespace_from_canonical_names({"k1", "kf1", "kr1"})
+
+    resolution = namespace.resolve("K1")
+
+    assert resolution.canonical_name == "k1"
+
+
+def test_namespace_resolver_does_not_map_K1_to_Keq1():
+    namespace = build_namespace_from_canonical_names({"Keq1"})
+
+    resolution = namespace.resolve("K1")
+
+    assert resolution.canonical_name is None
+    assert namespace.resolve("KEQ1").canonical_name == "Keq1"
+
+
+def test_namespace_resolver_rejects_K1_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names():
+    namespace = build_namespace_from_canonical_names({"kf1", "kr1", "Keq1"})
+
+    resolution = namespace.resolve("K1")
+
+    assert resolution.canonical_name is None
+    invalid = namespace.invalid_protected_indexed_identifier("K1")
+    assert invalid is not None
+    assert invalid.raw_name == "K1"
+    assert invalid.suggested_names == ("kf1", "kr1", "Keq1")
 
 
 def test_ir_namespace_builder_rejects_malformed_steps():

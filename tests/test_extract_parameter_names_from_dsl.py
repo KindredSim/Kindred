@@ -26,17 +26,45 @@ def test_extract_parameter_names_from_dsl_extracts_algebra_param_and_observable_
             "reaction: B -> C; k=2.0",
             "param k1 = 4*k2",
             "let obs = 3.0",
-            "x = 1.0",
+            "let x = 1.0",
         ]
     )
     names = extract_parameter_names_from_dsl(dsl)
-    assert "k" in names
     assert "k1" in names
+    assert "k2" in names
+    assert "k" not in names
     assert "obs" in names
     assert "x" in names
 
 
-def test_extract_parameter_names_from_dsl_rejects_duplicate_equilibrium_aliases():
+def test_extract_parameter_names_from_dsl_rejects_bare_assignment():
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "# Algebra",
+            "x = 1.0",
+        ]
+    )
+
+    with pytest.raises(DSLError, match="Use 'let name = expr' or 'param name = expr'"):
+        extract_parameter_names_from_dsl(dsl)
+
+
+@pytest.mark.parametrize("line", ["param K = 1.0", "let Keq = 1.0"])
+def test_extract_parameter_names_from_dsl_rejects_bare_step_local_declaration_names(line):
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "# Algebra",
+            line,
+        ]
+    )
+
+    with pytest.raises(DSLError, match="step-local DSL key"):
+        extract_parameter_names_from_dsl(dsl)
+
+
+def test_extract_parameter_names_from_dsl_rejects_duplicate_equilibrium_source_tokens():
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; kf=1.0; Keq=2.0; K_eq=3.0",
@@ -47,7 +75,7 @@ def test_extract_parameter_names_from_dsl_rejects_duplicate_equilibrium_aliases(
         extract_parameter_names_from_dsl(dsl)
 
 
-def test_extract_parameter_names_from_dsl_accepts_k_alias_on_irreversible_step():
+def test_extract_parameter_names_from_dsl_accepts_indexed_k_direct_spelling_on_irreversible_step():
     dsl = "\n".join(
         [
             "reaction: A -> B; k=1.0",
@@ -56,12 +84,10 @@ def test_extract_parameter_names_from_dsl_accepts_k_alias_on_irreversible_step()
         ]
     )
 
-    names = extract_parameter_names_from_dsl(dsl)
-
-    assert "k1" in names
+    assert "k1" in extract_parameter_names_from_dsl(dsl)
 
 
-def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_step():
+def test_extract_parameter_names_from_dsl_rejects_indexed_k_on_equilibrium_step():
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; Keq=3.0; kf=6.0",
@@ -70,11 +96,11 @@ def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_step():
         ]
     )
 
-    with pytest.raises(DSLError, match="Keq1"):
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier"):
         extract_parameter_names_from_dsl(dsl)
 
 
-def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_without_explicit_keq():
+def test_extract_parameter_names_from_dsl_rejects_indexed_k_on_equilibrium_without_explicit_keq():
     dsl = "\n".join(
         [
             "equilibrium: A <-> B; kf=6.0; kr=2.0",
@@ -83,7 +109,7 @@ def test_extract_parameter_names_from_dsl_rejects_k_alias_on_equilibrium_without
         ]
     )
 
-    with pytest.raises(DSLError, match="Keq1"):
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier"):
         extract_parameter_names_from_dsl(dsl)
 
 

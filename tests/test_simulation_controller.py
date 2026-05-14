@@ -7,14 +7,13 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 import warnings
 from typing import Any, Callable, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_containment import BatchLaneOutcome
-from kindred.core.simulator.dsl_text_update import format_authoritative_parameter_value
 from kindred.core.simulation_failure import build_simulation_failure
 from kindred.core.simulation_identity import SimulationIdentity, SimulationScopeIdentity
 from kindred.gui.controllers.simulation_controller import (
@@ -77,6 +76,39 @@ def test_simulation_run_ui_owner_clears_algebra_status_tooltip(qt_app) -> None:
 
 def _join_active_batch_requests(controller: SimulationController) -> None:
     controller.parallel_batch.join_active_requests(timeout_s=2.0)
+
+
+def _test_simulation_plan_payload(
+    *,
+    set_id: str = "id1",
+    set_name: str = "set1",
+    mechanism_text: str = "reaction: A -> B; k=1",
+    initials: dict[str, float] | None = None,
+    fast_mode: bool = False,
+    cache_key: str = "cache",
+    simulation_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    identity = dict(simulation_identity or {"schema_id": "schema", "param_fingerprint": f"fingerprint-{set_id}"})
+    return SimulationPlan.from_execution_request(
+        {
+            "prepared_payload": None,
+            "initials": dict(initials or {"A": 1.0}),
+            "t_span": (0.0, 10.0),
+            "solver_config": {"solver": "BDF"},
+            "mechanism_text": str(mechanism_text),
+            "simulation_identity": identity,
+        },
+        execution_mode="preview" if bool(fast_mode) else "explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload={
+            "cache_key": str(cache_key),
+            "simulation_identity": identity,
+        },
+        cache_scope_payload={"scope_identity": {"schema_id": "scope"}, "queue_ids": [str(set_id)]},
+        metadata={"set_id": str(set_id), "set_name": str(set_name), "fast_mode": bool(fast_mode)},
+    ).to_payload()
 
 
 def _batch_policy_context(controller: SimulationController):
@@ -1025,9 +1057,6 @@ class _FakeMainWindow(QtCore.QObject):
         _ = set_id
         return str(self._apply_overrides_to_state_network_dsl(str(base_text)))
 
-    def apply_parameter_overrides_to_dsl(self, mechanism_text: str, parameters: dict[str, float]) -> str:
-        return str(self._apply_parameter_overrides_to_dsl(str(mechanism_text), dict(parameters)))
-
     def get_mechanism_text(self) -> str:
         return str(self._get_mechanism_text() or "")
 
@@ -1291,7 +1320,6 @@ def mw(qt_app) -> _FakeMainWindow:
     window._apply_slider_overrides_to_bindings = MagicMock(return_value=False)
     window._apply_overrides_to_text = MagicMock(side_effect=lambda text: str(text))
     window._apply_overrides_to_state_network_dsl = MagicMock(side_effect=lambda text: str(text))
-    window._apply_parameter_overrides_to_dsl = MagicMock(side_effect=lambda mechanism_text, parameters: str(mechanism_text))
     window.reset_mechanism_workspaces = MagicMock(return_value=False)
     window.discard_concentration_overlays_for_set_ids = MagicMock(return_value=False)
     window.discard_concentration_overlays_for_rows = MagicMock(return_value=False)
@@ -1571,12 +1599,6 @@ def test_fast_preview_identity_includes_symbolic_snapshot_for_slider_parameter_o
     _install_mechanism_editor_text(mw, mechanism_text)
     mw._slider_overrides = {"k1": 0.4}
     mw._simulation_param_fingerprints = {"set1": "slider-k1"}
-    mw._apply_parameter_overrides_to_dsl = MagicMock(
-        side_effect=lambda text, parameters: str(text).replace(
-            "k=0.2",
-            f"k={float(parameters['k1'])}",
-        )
-    )
 
     identity = controller._simulation_identity_for_set(
         set_id="set1",
@@ -1616,6 +1638,37 @@ def test_fast_preview_identity_includes_symbolic_snapshot_for_slider_parameter_o
         symbolic_identity["evaluation_snapshot_fingerprint"]
         != updated_symbolic_identity["evaluation_snapshot_fingerprint"]
     )
+
+
+@pytest.mark.unit
+def test_symbolic_jacobian_identity_normalizes_indexed_k_direct_spelling_for_irreversible_parameter(
+    controller: SimulationController,
+    mw: _FakeMainWindow,
+) -> None:
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    _install_mechanism_editor_text(mw, mechanism_text)
+    mw._slider_overrides = {"K1": 0.4}
+
+    identity = controller._symbolic_jacobian_identity_for_set(
+        set_id="set1",
+        solver_config={
+            "solver": "BDF",
+            "grid": {"N": 12},
+            "temperature_K": 298.15,
+            "use_sparse_jacobian": True,
+            "wegscheider_cyclicity_enabled": False,
+        },
+        fast_mode=True,
+    )
+
+    assert identity["parameter_symbols"] == ["k1"]
+    assert identity["evaluation_snapshot_fingerprint"]
 
 
 @pytest.mark.unit
@@ -5327,7 +5380,7 @@ def test_stale_lane_request_bookkeeping_does_not_abort_active_run(controller: Si
     controller._poll_parallel_batch_completions()
     controller._completion_callback_owner.handle_completion.assert_called_once()
 
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=12, request_id=23, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=12, request_id=23, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={"fresh": _test_simulation_plan_payload(set_id="fresh", set_name="fresh-set", initials={"A": 1.0}, cache_key="current-cache")})
     controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
 
     controller._start_parallel_batch_simulations()
@@ -6915,7 +6968,7 @@ def test_consume_parallel_batch_outcome_exception_tears_down_pool_and_next_paral
 
     controller.parallel_batch.lane_pool_factory = _factory
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["fresh"], queue_names=["fresh-set"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={"fresh": _test_simulation_plan_payload(set_id="fresh", set_name="fresh-set", initials={"A": 1.0}, cache_key="ck")})
     controller.ui.batch.batch_initials_for_row = MagicMock(return_value={"A": 1.0})
 
     controller._start_parallel_batch_simulations()
@@ -7411,6 +7464,38 @@ def test_run_simulation_from_slider_uses_snapshotted_target_rows(
 
 
 @pytest.mark.unit
+def test_selected_run_runtime_snapshot_uses_batch_runtime_for_parallel_run(controller: SimulationController):
+    from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
+
+    batch_snapshot = RuntimeReadinessSnapshot(
+        mode="batch",
+        status="warming",
+        ready=False,
+        generation=4,
+        required=True,
+        controls_ready=False,
+        polling=True,
+    )
+    serial_snapshot = RuntimeReadinessSnapshot(
+        mode="ordinary",
+        status="ready",
+        ready=True,
+        generation=5,
+        required=True,
+        controls_ready=True,
+        polling=False,
+    )
+    controller._interactive_runtime_rows = MagicMock(return_value=[0, 1])
+    controller._effective_batch_worker_count = MagicMock(return_value=2)
+    controller._parallel_batch_runtime_snapshot = MagicMock(return_value=batch_snapshot)
+    controller._interactive_simulation_runtime_snapshot = MagicMock(return_value=serial_snapshot)
+
+    assert controller.selected_run_runtime_snapshot() is batch_snapshot
+    controller._parallel_batch_runtime_snapshot.assert_called_once()
+    controller._interactive_simulation_runtime_snapshot.assert_not_called()
+
+
+@pytest.mark.unit
 def test_slider_preview_runtime_snapshot_uses_batch_runtime_for_parallel_preview(controller: SimulationController):
     from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 
@@ -7440,6 +7525,41 @@ def test_slider_preview_runtime_snapshot_uses_batch_runtime_for_parallel_preview
     assert controller.slider_preview_runtime_snapshot() is batch_snapshot
     controller._parallel_batch_runtime_snapshot.assert_called_once()
     controller._interactive_simulation_runtime_snapshot.assert_not_called()
+
+
+@pytest.mark.unit
+def test_current_interactive_runtime_warm_skips_batch_for_single_row_serial_workflows(
+    controller: SimulationController,
+):
+    controller._interactive_runtime_rows = MagicMock(return_value=[0])
+    controller._effective_batch_worker_count = MagicMock(return_value=1)
+    controller._ensure_interactive_simulation_runtime_available_for_mode = MagicMock()
+    controller._parallel_batch_runtime_readiness_owner.ensure = MagicMock()
+
+    controller.ensure_current_interactive_simulation_runtimes_available(wait=False)
+
+    assert controller._ensure_interactive_simulation_runtime_available_for_mode.call_args_list == [
+        call(fast_mode=False, wait=False),
+        call(fast_mode=True, wait=False),
+    ]
+    controller._parallel_batch_runtime_readiness_owner.ensure.assert_not_called()
+
+
+@pytest.mark.unit
+def test_current_interactive_runtime_warm_uses_required_lanes_for_parallel_run_and_preview(
+    controller: SimulationController,
+):
+    controller._interactive_runtime_rows = MagicMock(return_value=[0, 1, 2])
+    controller._effective_batch_worker_count = MagicMock(return_value=2)
+    controller._ensure_interactive_simulation_runtime_available_for_mode = MagicMock()
+    controller._parallel_batch_runtime_readiness_owner.ensure = MagicMock()
+
+    controller.ensure_current_interactive_simulation_runtimes_available(wait=False)
+
+    controller._parallel_batch_runtime_readiness_owner.ensure.assert_called_once_with(
+        wait=False,
+        required_lanes=2,
+    )
 
 
 @pytest.mark.unit
@@ -7809,7 +7929,7 @@ def test_start_parallel_batch_simulations_maps_submit_failure_to_affected_set(
         )
 
     monkeypatch.setattr(type(controller._batch_parallel), "submit_task", _submit_task)
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], run_id=1, request_id=2, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["bad", "ok"], queue_names=["Bad Set", "OK Set"], run_id=1, request_id=2, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={"bad": _test_simulation_plan_payload(set_id="bad", set_name="Bad Set", initials={"A": 1.0}), "ok": _test_simulation_plan_payload(set_id="ok", set_name="OK Set", initials={"A": 1.0})})
 
     controller._start_parallel_batch_simulations()
 
@@ -7883,6 +8003,7 @@ def test_start_parallel_batch_submit_failure_preserves_captured_callback_identit
         pending_init_seed={},
         pending_init_applied=True,
         simulation_identity_by_set_id={"id1": {"fingerprint": "fp-1"}},
+        simulation_plan_by_set_id={"id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", initials={"A": 1.0}, fast_mode=True, cache_key="batch-cache", simulation_identity={"fingerprint": "fp-1"})},
         preview_batch_cache_token_by_set_id={"id1": "preview-token"},
     )
 
@@ -7949,6 +8070,7 @@ def test_start_parallel_batch_identity_capture_failure_surfaces_original_failure
         fast_mode=True,
         pending_init_seed={},
         pending_init_applied=True,
+        simulation_plan_by_set_id={"id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", initials={"A": 1.0}, fast_mode=True, cache_key="batch-cache")},
     )
 
     controller._start_parallel_batch_simulations()
@@ -7985,6 +8107,7 @@ def test_start_parallel_batch_simulations_records_preview_owner_epoch_in_submitt
         fast_mode=True,
         pending_init_seed={},
         pending_init_applied=True,
+        simulation_plan_by_set_id={"id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", initials={"A": 1.0}, fast_mode=True, cache_key="cache")},
     )
 
     controller._start_parallel_batch_simulations()
@@ -8034,6 +8157,10 @@ def test_start_parallel_batch_simulations_reuses_one_callback_context_for_submit
         simulation_identity_by_set_id={
             "id1": {"fingerprint": "fp-1"},
             "id2": {"fingerprint": "fp-2"},
+        },
+        simulation_plan_by_set_id={
+            "id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", mechanism_text="reaction: A -> B; k=1", initials={"A": 1.0}, cache_key="batch-cache", simulation_identity={"fingerprint": "fp-1"}),
+            "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", mechanism_text="reaction: A -> C; k=2", initials={"A": 1.0}, cache_key="batch-cache", simulation_identity={"fingerprint": "fp-2"}),
         },
         preview_batch_cache_token_by_set_id={"id1": "preview-1", "id2": "preview-2"},
     )
@@ -8277,7 +8404,7 @@ def test_start_parallel_batch_simulations_resizes_retained_pool_before_submit(
     controller._batch_parallel.ensure_lane_pool(max_lanes=2)
     controller._batch_parallel.lane_pool_factory = lambda _max_lanes, _limit_blas_threads: new_pool
     controller._batch_parallel.ensure_lane_pool(max_lanes=4)
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1, 2, 3], queue_ids=["id1", "id2", "id3", "id4"], queue_names=["set1", "set2", "set3", "set4"], run_id=1, request_id=2, effective_workers=4, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1, 2, 3], queue_ids=["id1", "id2", "id3", "id4"], queue_names=["set1", "set2", "set3", "set4"], run_id=1, request_id=2, effective_workers=4, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={set_id: _test_simulation_plan_payload(set_id=set_id, set_name=f"set{idx}", initials={"A": 1.0}) for idx, set_id in enumerate(("id1", "id2", "id3", "id4"), start=1)})
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -8345,9 +8472,6 @@ def test_run_simulation_internal_builds_context_and_calls_start_next(monkeypatch
         "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
         lambda **_kwargs: 1,
     )
-    controller._apply_parameter_override_fallback_to_dsl = MagicMock(
-        side_effect=lambda text, *, set_id=None: str(text).replace("PRIMARY", str(set_id))
-    )
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
     mw.discard_concentration_overlays_for_rows.return_value = True
@@ -8373,7 +8497,7 @@ def test_simulation_identity_for_set_records_intervention_schedule_fingerprint(
     mw: _FakeMainWindow,
     controller: SimulationController,
 ):
-    from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+    from kindred.core.intervention_schedule import normalized_intervention_schedule_fingerprint_from_dsl_text
 
     first_dsl = "\n".join(
         [
@@ -8410,9 +8534,56 @@ def test_simulation_identity_for_set_records_intervention_schedule_fingerprint(
         fast_mode=False,
     )
 
-    assert first_identity.intervention_schedule_fingerprint == intervention_schedule_fingerprint_from_dsl_text(first_dsl)
-    assert second_identity.intervention_schedule_fingerprint == intervention_schedule_fingerprint_from_dsl_text(second_dsl)
+    assert first_identity.intervention_schedule_fingerprint == normalized_intervention_schedule_fingerprint_from_dsl_text(first_dsl)
+    assert second_identity.intervention_schedule_fingerprint == normalized_intervention_schedule_fingerprint_from_dsl_text(second_dsl)
     assert first_identity.cache_key() != second_identity.cache_key()
+
+
+@pytest.mark.unit
+def test_simulation_identity_for_set_normalizes_schedule_param_direct_spelling(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    k1_dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1",
+            "initial: A=1.0",
+            "intervention: time=1.0; species=A; op=add; amount_param=k1",
+        ]
+    )
+    K1_dsl = "\n".join(
+        [
+            "reaction: A -> B; k=1",
+            "initial: A=1.0",
+            "intervention: time=1.0; species=A; op=add; amount_param=K1",
+        ]
+    )
+    solver_config = {
+        "solver": "BDF",
+        "rtol": 1e-6,
+        "atol": 1e-12,
+        "grid_n": 100,
+        "temperature_K": 298.15,
+    }
+
+    mw._get_mechanism_text.return_value = k1_dsl
+    first_identity = controller._simulation_identity_for_set(
+        set_id="id1",
+        solver_config=solver_config,
+        t_end=10.0,
+        fast_mode=False,
+    )
+    mw._get_mechanism_text.return_value = K1_dsl
+    second_identity = controller._simulation_identity_for_set(
+        set_id="id1",
+        solver_config=solver_config,
+        t_end=10.0,
+        fast_mode=False,
+    )
+
+    assert first_identity.intervention_schedule_fingerprint
+    assert first_identity.intervention_schedule_fingerprint == second_identity.intervention_schedule_fingerprint
+    assert first_identity.cache_key() == second_identity.cache_key()
 
 
 @pytest.mark.unit
@@ -9110,6 +9281,28 @@ def test_interactive_runtime_availability_does_not_apply_pending_init_migration(
 
     assert created
     apply_pending_init_migration.assert_not_called()
+
+
+@pytest.mark.unit
+def test_interactive_runtime_snapshot_surfaces_payload_build_failure(monkeypatch, controller: SimulationController):
+    def _raise_payload_error(*, fast_mode: bool):
+        _ = fast_mode
+        raise ValueError("invalid intervention schedule")
+
+    monkeypatch.setattr(
+        controller,
+        "_interactive_runtime_plan_payloads_for_mode",
+        _raise_payload_error,
+    )
+
+    snapshot = controller.interactive_simulation_runtime_snapshot(fast_mode=False)
+
+    assert snapshot.status == "failed"
+    assert snapshot.ready is False
+    assert snapshot.required is True
+    assert snapshot.controls_ready is False
+    assert snapshot.should_poll is False
+    assert "invalid intervention schedule" in str(snapshot.failure)
 
 
 @pytest.mark.unit
@@ -9901,9 +10094,6 @@ def test_run_simulation_internal_merges_empty_default_named_block_with_legacy_in
         "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
         lambda **_kwargs: 1,
     )
-    controller._apply_parameter_override_fallback_to_dsl = MagicMock(
-        side_effect=lambda text, *, set_id=None: str(text).replace("PRIMARY", str(set_id))
-    )
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
 
@@ -9944,7 +10134,14 @@ def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
 
     class _MechanismEditor:
         def __init__(self):
-            self._reactions_text = _Text("reaction: A -> B; k=1")
+            self._reactions_text = _Text(
+                "\n".join(
+                    [
+                        "reaction: A -> B; k=1",
+                        "intervention: op=set; species=A; time=0.0; value=2.0",
+                    ]
+                )
+            )
             self._state_network_editor = _StateNetworkEditor()
 
     class _FakeRuntime:
@@ -10006,9 +10203,6 @@ def test_run_simulation_internal_fast_mode_isolates_prepared_payloads_per_set(
         "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
         lambda **_kwargs: 1,
     )
-    controller._apply_parameter_override_fallback_to_dsl = MagicMock(
-        side_effect=lambda text, *, set_id=None: str(text).replace("PRIMARY", str(set_id))
-    )
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
 
@@ -10053,7 +10247,14 @@ def test_run_simulation_internal_fast_mode_refreshes_runtime_after_multi_set_pre
 
     class _MechanismEditor:
         def __init__(self):
-            self._reactions_text = _Text("reaction: A -> B; k=1")
+            self._reactions_text = _Text(
+                "\n".join(
+                    [
+                        "reaction: A -> B; k=1",
+                        "intervention: op=set; species=A; time=0.0; value=2.0",
+                    ]
+                )
+            )
             self._state_network_editor = _StateNetworkEditor()
 
     class _FakeRuntime:
@@ -10112,9 +10313,6 @@ def test_run_simulation_internal_fast_mode_refreshes_runtime_after_multi_set_pre
     monkeypatch.setattr(
         "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
         lambda **_kwargs: 1,
-    )
-    controller._apply_parameter_override_fallback_to_dsl = MagicMock(
-        side_effect=lambda text, *, set_id=None: str(text).replace("PRIMARY", str(set_id))
     )
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
@@ -10629,9 +10827,11 @@ def test_fast_mode_preview_owner_identity_uses_set_specific_staged_request_dsl(
 
 
 @pytest.mark.unit
-def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_when_bindings_cannot_apply(
+def test_run_simulation_internal_fast_mode_passes_scalar_override_as_request_parameter_when_bindings_cannot_apply(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
+    from kindred.core.simulation_plan import SimulationPlan
+
     class _Text:
         def __init__(self, text: str) -> None:
             self._text = text
@@ -10658,12 +10858,6 @@ def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_w
     mw._slider_overrides = {"a": 2.0}
     mw._apply_overrides_to_text = MagicMock(side_effect=lambda text: str(text))
     mw._apply_overrides_to_state_network_dsl = MagicMock(side_effect=lambda text: str(text))
-    mw._apply_parameter_overrides_to_dsl = MagicMock(
-        side_effect=lambda text, parameters: str(text).replace(
-            "param a = 5",
-            f"param a = {format_authoritative_parameter_value(parameters['a'])}",
-        )
-    )
     mw._prepare_slider_runtime = MagicMock(return_value=object())
     mw._apply_slider_overrides_to_bindings = MagicMock(return_value=False)
     mw._parse_sim_time_seconds.return_value = 10.0
@@ -10681,8 +10875,11 @@ def test_run_simulation_internal_fast_mode_keeps_scalar_override_in_worker_dsl_w
 
     controller._run_simulation_internal(fast_mode=True, request_id=8, batch_rows=[0], reuse_parallel_lane_pool=False)
 
-    assert "param a = 2" in controller.batch_context_owner.execution_payload_state().mechanism_text_by_set_id["id1"]
-    mw._apply_parameter_overrides_to_dsl.assert_called()
+    execution_state = controller.batch_context_owner.execution_payload_state()
+    assert "param a = 5" in execution_state.mechanism_text_by_set_id["id1"]
+    plan = SimulationPlan.from_payload(execution_state.simulation_plan_by_set_id["id1"])
+    request_payload = plan.to_execution_request().to_payload()
+    assert request_payload["parameter_overrides"] == {"a": pytest.approx(2.0)}
 
 @pytest.mark.unit
 def test_run_simulation_internal_explicit_run_uses_overlay_cache_token(
@@ -10942,7 +11139,7 @@ def test_start_parallel_batch_simulations_marks_only_primary_explicit_result_for
     )
     controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1", "id2": "sig-2"}, solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], primary_set_id="id1", run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1", "id2": "sig-2"}, solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={"id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", initials={"A": 1.0}), "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", initials={"A": 2.0})})
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -11067,7 +11264,10 @@ def test_start_next_batch_simulation_fast_mode_does_not_borrow_batch_global_prep
             "id2": "sig-3",
         }, prepared={"prepared_for": "id1"}, prepared_by_set_id={
             "id1": {"prepared_for": "id1"},
-        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=11, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
+        }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=11, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={
+            "id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", mechanism_text="reaction: A -> B; k=2", initials={"A": 1.0}, fast_mode=True, cache_key="slider-cache"),
+            "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", mechanism_text="reaction: A -> B; k=3", initials={"A": 4.0}, fast_mode=True, cache_key="slider-cache"),
+        })
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -11118,7 +11318,10 @@ def test_start_next_batch_simulation_fast_mode_uses_target_queue_preview_inputs(
         }, mechanism_signature="sig", mechanism_signature_by_set_id={
             "id1": "sig-2",
             "id2": "sig-3",
-        }, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=12, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
+        }, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=12, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={
+            "id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", mechanism_text="reaction: A -> B; k=2", initials={"A": 1.0}, fast_mode=True, cache_key="slider-cache"),
+            "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", mechanism_text="reaction: A -> B; k=3", initials={"A": 4.0}, fast_mode=True, cache_key="slider-cache"),
+        })
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -11130,131 +11333,6 @@ def test_start_next_batch_simulation_fast_mode_uses_target_queue_preview_inputs(
     assert created["solver_config"] == {"solver": "BDF"}
     assert created["started"] is True
     assert getattr(controller._simulation_worker, "_execution_request", None) is None
-
-@pytest.mark.unit
-def test_start_next_batch_simulation_fast_mode_reapplies_parameter_override_fallback_when_prepared_missing(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    created: dict[str, object] = {}
-
-    class _RecordingWorker:
-        def __init__(
-            self,
-            *,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent,
-            prepared,
-            include_mechanism_in_result_payload=None,
-        ):
-            created["mechanism_text"] = str(mechanism_text)
-            created["prepared"] = prepared
-            created["include_mechanism_in_result_payload"] = include_mechanism_in_result_payload
-            self.progress = _FakeSignal()
-            self.result_ready = _FakeSignal()
-            self.error = _FakeSignal()
-
-        def start(self) -> None:
-            created["started"] = True
-
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
-    mw._slider_overrides = {"a": 2.0}
-    mw._apply_parameter_overrides_to_dsl = MagicMock(
-        side_effect=lambda mechanism_text, parameters: str(mechanism_text).replace(
-            "param a = 5",
-            f"param a = {format_authoritative_parameter_value(parameters['a'])}",
-        )
-    )
-    controller._release_current_simulation_worker = MagicMock()
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1\n# Algebra\nparam a = 5\n", mechanism_text_by_set_id={
-            "id1": "reaction: A -> B; k=1\n# Algebra\nparam a = 5\n",
-        }, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=9, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
-
-    _install_recording_contained_worker(monkeypatch, created, controller)
-
-    controller._start_next_batch_simulation()
-
-    assert created["prepared"] is None
-    assert "param a = 2" in str(created["mechanism_text"])
-    mw._apply_parameter_overrides_to_dsl.assert_called_once()
-    assert created["started"] is True
-
-@pytest.mark.unit
-def test_start_next_batch_simulation_fast_mode_fallback_cache_key_ignores_rewritten_worker_dsl_witness(
-    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
-):
-    created: dict[str, object] = {}
-
-    class _RecordingWorker:
-        def __init__(
-            self,
-            *,
-            mechanism_text,
-            initials,
-            t_span,
-            solver_config,
-            parent,
-            prepared,
-            include_mechanism_in_result_payload=None,
-        ):
-            _ = include_mechanism_in_result_payload
-            self.progress = _FakeSignal()
-            self.result_ready = _FakeSignal()
-            self.error = _FakeSignal()
-
-        def start(self) -> None:
-            return
-
-    mw._batch_initials_for_row.return_value = {"A": 1.0}
-    mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
-    mw._slider_overrides = {"a": 2.0}
-    mw._simulation_schema_id = "schema-preview"
-    mw._simulation_param_fingerprints = {"id1": "params-id1"}
-    controller._release_current_simulation_worker = MagicMock()
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1\n# Algebra\nparam a = 5\n", mechanism_text_by_set_id={
-            "id1": "reaction: A -> B; k=1\n# Algebra\nparam a = 5\n",
-        }, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, prepared=None, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=9, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True, simulation_identity_by_set_id={
-            "id1": {
-                "version": 1,
-                "schema_id": "schema-preview",
-                "param_fingerprint": "params-id1",
-                "solver": {
-                    "solver": "BDF",
-                    "rtol": 1e-6,
-                    "atol": 1e-12,
-                    "grid_n": 100,
-                    "temperature_K": 298.15,
-                    "use_sparse_jacobian": False,
-                    "wegscheider_cyclicity_enabled": False,
-                },
-                "t_end": 10.0,
-                "preview_batch_cache_token": "",
-                "execution_flags": ("fast_mode",),
-            }
-        })
-
-    rewritten_texts = [
-        "reaction: A -> B; k=1\n# Algebra\nparam a = 2\n# witness one\n",
-        "reaction: A -> B; k=1\n# Algebra\nparam a = 2\n# witness two\n",
-    ]
-    mw._apply_parameter_overrides_to_dsl = MagicMock(side_effect=list(rewritten_texts))
-
-    _install_recording_contained_worker(monkeypatch, created, controller)
-
-    controller._start_next_batch_simulation()
-    first_key = str(controller.batch_context_owner.completion_cache_key())
-
-    controller.batch_context_owner.serialize_completion_policy_context(
-        _batch_policy_context(controller).evolve(pos=0)
-    )
-    controller.batch_context_owner.record_cache_key("slider-cache")
-    controller._start_next_batch_simulation()
-    second_key = str(controller.batch_context_owner.completion_cache_key())
-
-    assert first_key == second_key
 
 @pytest.mark.unit
 def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_seed(
@@ -11286,7 +11364,9 @@ def test_start_next_batch_simulation_explicit_run_uses_canonical_pending_init_se
     mw._batch_initials_for_row.return_value = {"A": 0.25}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
     controller._release_current_simulation_worker = MagicMock()
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["randomname3"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={"randomname3": {"A": 1.0}}, pending_init_applied=False)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["randomname3"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={"randomname3": {"A": 1.0}}, pending_init_applied=False, simulation_plan_by_set_id={
+        "id1": _test_simulation_plan_payload(set_id="id1", set_name="randomname3", initials={"A": 1.0}, cache_key="explicit-cache"),
+    })
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -11312,7 +11392,9 @@ def test_start_parallel_batch_simulations_explicit_run_uses_canonical_pending_in
     )
     controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["randomname3"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={"randomname3": {"A": 1.0}}, pending_init_applied=False)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["randomname3"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={"randomname3": {"A": 1.0}}, pending_init_applied=False, simulation_plan_by_set_id={
+        "id1": _test_simulation_plan_payload(set_id="id1", set_name="randomname3", initials={"A": 1.0}, cache_key="explicit-cache"),
+    })
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -11749,7 +11831,10 @@ def test_start_parallel_batch_uses_prewarmed_lane_pool_without_blocking_warm(
     assert controller.parallel_batch_runtime_readiness_owner.eager_creation_thread is not None
     controller.parallel_batch_runtime_readiness_owner.eager_creation_thread.join(timeout=1.0)
 
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["a", "b"], queue_names=["A", "B"], run_id=10, request_id=20, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=1.0, fast_mode=False, keep_lane_pool_alive=True, cache_key="cache-a", simulation_plan_by_set_id={}, mechanism_text_by_set_id={}, simulation_identity_by_set_id={})
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["a", "b"], queue_names=["A", "B"], run_id=10, request_id=20, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=1.0, fast_mode=False, keep_lane_pool_alive=True, cache_key="cache-a", simulation_plan_by_set_id={
+        "a": _test_simulation_plan_payload(set_id="a", set_name="A", cache_key="cache-a"),
+        "b": _test_simulation_plan_payload(set_id="b", set_name="B", cache_key="cache-a"),
+    }, mechanism_text_by_set_id={}, simulation_identity_by_set_id={})
 
     controller._start_parallel_batch_simulations()
     controller.parallel_batch.join_active_requests(timeout_s=1.0)
@@ -11801,7 +11886,10 @@ def test_start_parallel_batch_does_not_submit_until_lane_pool_is_ready(
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
     assert controller.parallel_batch.has_ready_lane_pool(max_lanes=2) is False
 
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["a", "b"], queue_names=["A", "B"], run_id=10, request_id=20, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=1.0, fast_mode=False, keep_lane_pool_alive=True, cache_key="cache-a", simulation_plan_by_set_id={}, mechanism_text_by_set_id={}, simulation_identity_by_set_id={})
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0, 1], queue_ids=["a", "b"], queue_names=["A", "B"], run_id=10, request_id=20, effective_workers=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=1.0, fast_mode=False, keep_lane_pool_alive=True, cache_key="cache-a", simulation_plan_by_set_id={
+        "a": _test_simulation_plan_payload(set_id="a", set_name="A", cache_key="cache-a"),
+        "b": _test_simulation_plan_payload(set_id="b", set_name="B", cache_key="cache-a"),
+    }, mechanism_text_by_set_id={}, simulation_identity_by_set_id={})
 
     controller._start_parallel_batch_simulations()
     controller.parallel_batch.join_active_requests(timeout_s=1.0)
@@ -13999,7 +14087,10 @@ def test_scoped_runtime_input_supersede_preserves_unaffected_serial_queue_tail(
     controller._simulation_running = True
     controller._slider_simulation_active = False
     mw._batch_initials_for_row.side_effect = lambda row: {0: {"A": 1.0}, 1: {"A": 2.0}}[int(row)]
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, run_id=3, request_id=5, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], rows=[0, 1], pos=0, total=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, completed_set_ids=[], pending_workspace_reset_set_ids=["id1", "id2"], pending_dirty_reset_generation_by_set_id={"id1": 1, "id2": 2}, runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0})
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, fast_mode=False, run_id=3, request_id=5, cache_key="ck", queue_ids=["id1", "id2"], queue_names=["set1", "set2"], rows=[0, 1], pos=0, total=2, full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, completed_set_ids=[], pending_workspace_reset_set_ids=["id1", "id2"], pending_dirty_reset_generation_by_set_id={"id1": 1, "id2": 2}, runtime_input_global_epoch=0, runtime_input_set_epoch_by_set_id={"id1": 1, "id2": 0}, simulation_plan_by_set_id={
+        "id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", initials={"A": 1.0}, cache_key="ck"),
+        "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", initials={"A": 2.0}, cache_key="ck"),
+    })
 
     controller._supersede_active_work_for_authoritative_mechanism_transition(
         epoch=2,
@@ -14174,6 +14265,13 @@ def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
 ):
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+
     class _Text:
         def __init__(self, text: str) -> None:
             self._text = text
@@ -14187,7 +14285,7 @@ def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
 
     class _MechanismEditor:
         def __init__(self):
-            self._reactions_text = _Text("reaction: A -> B; k=1")
+            self._reactions_text = _Text(mechanism_text)
             self._state_network_editor = _StateNetworkEditor()
 
     class _FakeRuntime:
@@ -14254,7 +14352,10 @@ def test_run_simulation_internal_non_fast_mode_builds_simulation_plans(
     assert request["prepared_payload"] is None
     assert request["initials"] == {"A": 1.0}
     assert tuple(request["t_span"]) == (0.0, 10.0)
-    assert request["mechanism_text"] == "reaction: A -> B; k=1"
+    assert request["mechanism_text"] == mechanism_text
+    assert request["intervention_schedule"]["instant_events"] == [
+        {"op": "set", "species": "A", "time": 0.0, "value": 2.0}
+    ]
     assert request["simulation_identity"]["schema_id"] != ""
     assert request["simulation_identity"]["param_fingerprint"] == ""
     mw.preview_initials_for_row.assert_not_called()
@@ -14403,9 +14504,6 @@ def test_run_simulation_internal_non_fast_mode_multiset_plans_do_not_inherit_pri
     )
     controller._start_next_batch_simulation = MagicMock()
     controller._shutdown_batch_lane_pool = MagicMock()
-    controller._apply_parameter_override_fallback_to_dsl = MagicMock(
-        side_effect=lambda text, *, set_id=None: str(text).replace("PRIMARY", str(set_id))
-    )
 
     controller._run_simulation_internal(fast_mode=False, request_id=42, batch_rows=[0, 1], reuse_parallel_lane_pool=False)
 
@@ -14455,7 +14553,7 @@ def test_start_next_batch_simulation_non_fast_mode_ignores_prepared_payload(
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 1.0})
     controller._release_current_simulation_worker = MagicMock()
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"}, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, prepared=None, prepared_by_set_id={
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id1"], queue_names=["set1"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={"id1": "reaction: A -> B; k=1"}, mechanism_signature="sig", mechanism_signature_by_set_id={"id1": "sig-1"}, simulation_plan_by_set_id={"id1": _test_simulation_plan_payload(set_id="id1", set_name="set1", initials={"A": 1.0}, cache_key="explicit-cache")}, prepared=None, prepared_by_set_id={
             "id1": {"prepared_for": "id1", "version": 1},
         }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=42, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
 
@@ -14581,7 +14679,7 @@ def test_start_parallel_batch_simulations_submits_simulation_plan_payload(
 
 
 @pytest.mark.unit
-def test_start_parallel_batch_simulations_fast_fallback_submits_preview_plan_without_execution_request(
+def test_start_parallel_batch_simulations_fast_existing_plan_submits_preview_plan_without_execution_request(
     mw: _FakeMainWindow, controller: SimulationController
 ):
     from kindred.core.simulation_plan import SimulationPlan
@@ -14595,7 +14693,15 @@ def test_start_parallel_batch_simulations_fast_fallback_submits_preview_plan_wit
         _RecordingLanePool(submitted_tasks),
         max_lanes=2,
     )
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["set1"], run_id=101, effective_workers=2, full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={}, mechanism_text_by_set_id={"id1": "reaction: A -> B; k=4"}, mechanism_signature_by_set_id={"id1": "sig"}, simulation_identity_by_set_id={
+    plan_payload = _test_simulation_plan_payload(
+        set_id="id1",
+        set_name="set1",
+        mechanism_text="reaction: A -> B; k=4",
+        initials={"A": 4.0},
+        fast_mode=True,
+        cache_key="preview-cache",
+    )
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id1"], queue_names=["set1"], run_id=101, effective_workers=2, full_dsl="reaction: A -> B; k=1", simulation_plan_by_set_id={"id1": plan_payload}, mechanism_text_by_set_id={"id1": "reaction: A -> B; k=4"}, mechanism_signature_by_set_id={"id1": "sig"}, simulation_identity_by_set_id={
             "id1": {"schema_id": "schema", "param_fingerprint": "fingerprint"}
         }, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=42, pending_init_seed={}, pending_init_applied=True)
 
@@ -14745,7 +14851,7 @@ def test_start_next_batch_simulation_non_primary_explicit_worker_uses_secondary_
 
 
 @pytest.mark.unit
-def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_without_execution_request(
+def test_start_next_batch_simulation_fast_mode_existing_plan_attaches_preview_plan_without_execution_request(
     monkeypatch, mw: _FakeMainWindow, controller: SimulationController
 ):
     from kindred.core.simulation_plan import SimulationPlan
@@ -14776,9 +14882,17 @@ def test_start_next_batch_simulation_fast_mode_fallback_attaches_preview_plan_wi
     mw.preview_initials_for_row = MagicMock(return_value={"A": 4.0})
     mw._slider_overrides = {}
     controller._release_current_simulation_worker = MagicMock()
+    plan_payload = _test_simulation_plan_payload(
+        set_id="id2",
+        set_name="set2",
+        mechanism_text="reaction: A -> B; k=3",
+        initials={"A": 4.0},
+        fast_mode=True,
+        cache_key="slider-cache",
+    )
     seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=1, rows=[0, 1], queue_ids=["id1", "id2"], queue_names=["set1", "set2"], full_dsl="reaction: A -> B; k=1", mechanism_text_by_set_id={"id2": "reaction: A -> B; k=3"}, mechanism_signature_by_set_id={"id2": "sig-3"}, simulation_identity_by_set_id={
             "id2": {"schema_id": "schema-b", "param_fingerprint": "fingerprint-b"}
-        }, simulation_plan_by_set_id={}, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=12, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
+        }, simulation_plan_by_set_id={"id2": plan_payload}, prepared_by_set_id={}, solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=True, request_id=12, cache_key="slider-cache", pending_init_seed={}, pending_init_applied=True)
 
     monkeypatch.setattr("kindred.gui.simulation_worker.ContainedSimulationWorker", _RecordingWorker)
     controller._contained_simulation_owner_factory = lambda *, fast_mode: "preview-owner"
@@ -14929,7 +15043,9 @@ def test_start_next_batch_simulation_explicit_run_ignores_staged_concentration_o
     mw._batch_initials_for_row.return_value = {"A": 1.0}
     mw.preview_initials_for_row = MagicMock(return_value={"A": 2.5})
     controller._release_current_simulation_worker = MagicMock()
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id2"], queue_names=["set2"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=False, pos=0, rows=[0], queue_ids=["id2"], queue_names=["set2"], full_dsl="reaction: A -> B; k=1", solver_config={"solver": "BDF"}, t_end=10.0, fast_mode=False, request_id=7, cache_key="explicit-cache", pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={
+        "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", initials={"A": 1.0}, cache_key="explicit-cache"),
+    })
 
     _install_recording_contained_worker(monkeypatch, created, controller)
 
@@ -14955,7 +15071,9 @@ def test_start_parallel_batch_simulations_explicit_run_ignores_staged_concentrat
     )
     controller.parallel_batch.lane_pool_factory = MagicMock(return_value=pool)
     controller.parallel_batch.ensure_lane_pool(max_lanes=2)
-    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id2"], queue_names=["set2"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True)
+    seed_batch_context(controller.batch_context_owner, active=True, parallel=True, rows=[0], queue_ids=["id2"], queue_names=["set2"], run_id=3, request_id=11, full_dsl="reaction: A -> B; k=1", mechanism_signature="sig", solver_config={"solver": "BDF"}, t_end=10.0, effective_workers=2, fast_mode=False, pending_init_seed={}, pending_init_applied=True, simulation_plan_by_set_id={
+        "id2": _test_simulation_plan_payload(set_id="id2", set_name="set2", initials={"A": 1.0}, cache_key="explicit-cache"),
+    })
 
     controller._start_parallel_batch_simulations()
     _join_active_batch_requests(controller)
@@ -15886,6 +16004,67 @@ def test_run_simulation_internal_invalid_t_end_preserves_targeted_dirty_workspac
 
     assert warned and warned[0][0] == "Invalid t_end"
     mw.reset_mechanism_workspaces.assert_not_called()
+    controller._start_next_batch_simulation.assert_not_called()
+
+
+def test_run_simulation_internal_invalid_schedule_protected_name_uses_run_validation_cleanup(
+    monkeypatch, mw: _FakeMainWindow, controller: SimulationController
+):
+    class _Text:
+        def toPlainText(self) -> str:
+            return "\n".join(
+                [
+                    "equilibrium: A <-> B; kf=1.0; kr=0.5",
+                    "initial: A=1.0",
+                    "intervention: op=add; species=A; time=1.0; amount_param=K1",
+                ]
+            )
+
+    class _StateNetworkEditor:
+        def get_state_network_dsl(self) -> str:
+            return ""
+
+    class _MechanismEditor:
+        def __init__(self):
+            self._reactions_text = _Text()
+            self._state_network_editor = _StateNetworkEditor()
+
+    warned: list[tuple[str, str]] = []
+
+    def _warning(_parent, title, message):
+        warned.append((str(title), str(message)))
+        return QtWidgets.QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", _warning)
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_run_preparation.strip_reaction_dsl_initial_concentrations",
+        lambda text: text,
+    )
+    monkeypatch.setattr(
+        "kindred.gui.controllers.simulation_controller.compute_effective_batch_workers",
+        lambda **_kwargs: 1,
+    )
+
+    mw._mechanism_editor = _MechanismEditor()
+    mw._batch_store.row_count.return_value = 1
+    mw._batch_store.set_names.return_value = ["set1"]
+    mw._batch_rows_for_scope.return_value = [0]
+    mw._batch_set_id_for_row.return_value = "id1"
+    mw._batch_preferred_primary_set_id.return_value = "id1"
+    mw._batch_cache_key.return_value = "ck"
+    mw._batch_initials_for_row.return_value = {"A": 1.0, "B": 0.0}
+
+    controller._start_next_batch_simulation = MagicMock()
+    controller._shutdown_batch_lane_pool = MagicMock()
+
+    controller._run_simulation_internal(fast_mode=False, request_id=1, batch_rows=[0], reuse_parallel_lane_pool=False)
+
+    assert warned and warned[0][0] == "Invalid Intervention Schedule"
+    assert "K1" in warned[0][1]
+    assert "not a valid indexed parameter identifier" in warned[0][1]
+    assert mw.run_button_is_enabled() is True
+    assert controller._slider_simulation_active is False
+    mw._invalidate_pending_init_preserved_results_after_failed_run.assert_called_once_with()
     controller._start_next_batch_simulation.assert_not_called()
 
 

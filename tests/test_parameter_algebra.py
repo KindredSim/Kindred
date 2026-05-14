@@ -8,12 +8,14 @@ from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_to_mechanism,
     evaluate_parameter_algebra,
+    extract_observable_names_from_algebra_lines,
     mechanism_parameter_namespace,
     parse_parameter_algebra_spec_from_dsl_text,
     parameter_algebra_spec_from_mechanism,
+    read_mechanism_parameter_values,
     solver_parameter_units_from_mechanism,
 )
-from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
+from kindred.core.simulator.parameter_namespace import build_namespace_from_canonical_names
 from kindred.core.simulator.parameter_units import rate_constant_unit
 
 pytestmark = pytest.mark.unit
@@ -24,8 +26,8 @@ def _base_mech(dsl_text: str):
     return parse_dsl_to_mechanism(dsl_text, initials={})
 
 
-def _compat_namespace(names: set[str]):
-    return build_flat_compat_namespace(names)
+def _canonical_name_namespace(names: set[str]):
+    return build_namespace_from_canonical_names(names)
 
 
 def _override_warning_messages(dsl_text: str) -> list[str]:
@@ -56,6 +58,23 @@ def test_parameter_algebra_recomputes_on_base_change():
     mech.reactions[1] = replace(mech.reactions[1], rate=2.0)
     apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
     assert float(mech.reactions[0].rate) == pytest.approx(8.0)
+
+
+def test_implicit_keq_parameter_value_tracks_current_forward_reverse_rates():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B ; kf=2.0, kr=0.5",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    mech = _base_mech(dsl)
+
+    assert read_mechanism_parameter_values(mech, names={"Keq1"})["Keq1"] == pytest.approx(4.0)
+
+    mech.equilibria[0] = replace(mech.equilibria[0], kf=4.0)
+
+    assert read_mechanism_parameter_values(mech, names={"Keq1"})["Keq1"] == pytest.approx(8.0)
 
 
 def test_parameter_algebra_cycle_detection():
@@ -109,9 +128,8 @@ def test_ambiguous_let_to_parameter_is_error():
             "",
         ]
     )
-    mech = _base_mech(dsl)
     with pytest.raises(DSLError) as exc:
-        apply_parameter_algebra_to_mechanism(dsl, mechanism=mech, require_mutable=False)
+        _base_mech(dsl)
     msg = str(exc.value)
     assert "param k1" in msg
 
@@ -332,7 +350,7 @@ def test_unused_builtin_shadow_scalar_input_does_not_poison_parameter_algebra_ev
                 "param Keq1 = 5",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
+        mechanism_namespace=_canonical_name_namespace({"kf1", "kr1", "Keq1"}),
         scalar_input_names={"sin"},
     )
 
@@ -352,7 +370,7 @@ def test_referenced_builtin_shadow_scalar_input_is_rejected():
                 "param Keq1 = sin",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
+        mechanism_namespace=_canonical_name_namespace({"kf1", "kr1", "Keq1"}),
         scalar_input_names={"sin"},
     )
 
@@ -371,7 +389,7 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
                 "param Keq2 = a",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1", "kf2", "kr2", "Keq2"}),
+        mechanism_namespace=_canonical_name_namespace({"kf1", "kr1", "Keq1", "kf2", "kr2", "Keq2"}),
         scalar_input_names={"a"},
     )
 
@@ -388,9 +406,6 @@ def test_referenced_nonfinite_scalar_input_is_rejected_with_assignment_context()
 @pytest.mark.parametrize(
     ("line", "mechanism_param_names", "expected_name", "base_values", "expected_value"),
     [
-        ("param K1 = 5", {"k1"}, "k1", {"k1": 1.0}, 5.0),
-        ("param K1 = 5", {"kf1", "kr1"}, "kf1", {"kf1": 2.0, "kr1": 0.5}, 5.0),
-        ("param k1 = 5", {"kf1", "kr1"}, "kf1", {"kf1": 2.0, "kr1": 0.5}, 5.0),
         ("param KF2 = 5", {"kf2", "kr2"}, "kf2", {"kf2": 2.0, "kr2": 0.5}, 5.0),
         ("param KR2 = 5", {"kf2", "kr2"}, "kr2", {"kf2": 2.0, "kr2": 0.5}, 5.0),
         ("param KEQ3 = 5", {"kf3", "kr3", "Keq3"}, "Keq3", {"kf3": 8.0, "Keq3": 4.0}, 5.0),
@@ -406,7 +421,7 @@ def test_param_targets_resolve_case_insensitively_against_mechanism_namespace(
 ):
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(["# Algebra", line]),
-        mechanism_namespace=_compat_namespace(mechanism_param_names),
+        mechanism_namespace=_canonical_name_namespace(mechanism_param_names),
     )
 
     assert [assignment.name for assignment in spec.param_statements] == [expected_name]
@@ -416,8 +431,36 @@ def test_param_targets_resolve_case_insensitively_against_mechanism_namespace(
     assert derived[expected_name] == pytest.approx(expected_value)
 
 
-def test_param_k_target_rejects_equilibrium_constant_shorthand_with_keq_guidance():
-    with pytest.raises(DSLError, match="Keq1") as exc:
+@pytest.mark.parametrize(
+    ("line", "expected_match"),
+    [
+        ("param K2 = 5", "not a valid indexed parameter identifier"),
+        ("param k2 = 5", "not a valid indexed parameter identifier"),
+    ],
+)
+def test_param_targets_reject_unresolved_protected_k_for_reversible_namespace(line, expected_match):
+    with pytest.raises(DSLError, match=expected_match) as exc:
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(["# Algebra", line]),
+            mechanism_namespace=_canonical_name_namespace({"kf2", "kr2"}),
+        )
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == line
+    assert "K2" in str(exc.value) or "k2" in str(exc.value)
+
+
+def test_param_targets_normalize_case_insensitive_direct_spelling_for_irreversible_namespace():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(["# Algebra", "param K1 = 5"]),
+        mechanism_namespace=_canonical_name_namespace({"k1"}),
+    )
+
+    assert [assignment.name for assignment in spec.param_statements] == ["k1"]
+
+
+def test_rejects_K1_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names():
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier") as exc:
         parse_parameter_algebra_spec_from_dsl_text(
             "\n".join(
                 [
@@ -425,23 +468,40 @@ def test_param_k_target_rejects_equilibrium_constant_shorthand_with_keq_guidance
                     "param K1 = 5",
                 ]
             ),
-            mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
+            mechanism_namespace=_canonical_name_namespace({"kf1", "kr1", "Keq1"}),
         )
 
     assert exc.value.line_number == 2
     assert exc.value.line_content == "param K1 = 5"
-    assert "K1" in str(exc.value)
+    message = str(exc.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_param_k_target_rejects_out_of_range_protected_indexed_name():
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier") as exc:
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(["# Algebra", "param K999 = 5"]),
+            mechanism_namespace=_canonical_name_namespace({"kf1", "kr1", "Keq1"}),
+        )
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == "param K999 = 5"
+    assert "K999" in str(exc.value)
 
 
 @pytest.mark.parametrize(
-    ("line", "mechanism_param_names"),
+    ("line", "expected"),
     [
-        ("let K1 = 5", {"k1"}),
-        ("K1 = 5", {"k1"}),
+        ("let K1 = 5", "rate/equilibrium parameter"),
+        ("K1 = 5", "Use 'let name = expr' or 'param name = expr'"),
     ],
 )
-def test_k_like_non_param_assignments_reject_resolved_mechanism_targets(line, mechanism_param_names):
-    with pytest.raises(DSLError, match="use 'param K1 ="):
+def test_k_like_non_param_assignments_reject_resolved_mechanism_targets(line, expected):
+    with pytest.raises(DSLError, match=expected):
         parse_parameter_algebra_spec_from_dsl_text(
             "\n".join(
                 [
@@ -449,30 +509,140 @@ def test_k_like_non_param_assignments_reject_resolved_mechanism_targets(line, me
                     line,
                 ]
             ),
-            mechanism_namespace=_compat_namespace(mechanism_param_names),
+            mechanism_namespace=_canonical_name_namespace({"k1"}),
         )
 
 
-def test_let_k_like_name_without_mechanism_match_remains_observable():
+def test_let_longer_k_like_name_without_mechanism_match_remains_observable():
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(
             [
                 "# Algebra",
-                "let K1 = 5",
+                "let K1_test = 5",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"k2"}),
+        mechanism_namespace=_canonical_name_namespace({"k2"}),
     )
 
     assert spec.param_statements == []
-    assert spec.observable_names == {"K1"}
+    assert spec.observable_names == {"K1_test"}
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "param K1 = 5",
+        "let signal = K1",
+    ],
+)
+def test_public_dsl_parse_accepts_indexed_k_direct_spelling_algebra_paths(line):
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                line,
+            ]
+        ),
+        initials={},
+    )
+
+    assert mechanism is not None
+
+
+def test_public_dsl_parse_rejects_indexed_k_observable_target_even_when_resolved():
+    with pytest.raises(DSLError, match="rate/equilibrium parameter"):
+        parse_dsl_to_mechanism(
+            "\n".join(
+                [
+                    "reaction: A -> B; k=1.0",
+                    "initial: A=1.0",
+                    "initial: B=0.0",
+                    "let K1 = 5",
+                ]
+            ),
+            initials={},
+        )
+
+
+def test_public_dsl_parse_allows_longer_k_like_observable_name():
+    mech = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "let K1_test = [A]",
+            ]
+        ),
+        initials={},
+    )
+
+    assert "let K1_test = [A]" in mech.metadata["algebra_text"]
+
+
+@pytest.mark.parametrize("keyword", ["k", "kf", "kr", "K", "Keq"])
+@pytest.mark.parametrize("declaration", ["param {name} = 5", "let {name} = 5"])
+def test_bare_step_local_keys_reject_as_parameter_algebra_identities(keyword, declaration):
+    with pytest.raises(DSLError, match="step-local DSL key"):
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(["# Algebra", declaration.format(name=keyword)]),
+            mechanism_namespace=_canonical_name_namespace({"k1", "kf2", "kr2", "Keq2"}),
+        )
+
+
+@pytest.mark.parametrize("keyword", ["k", "kf", "kr", "K", "Keq"])
+def test_observable_name_extractor_rejects_bare_step_local_keys(keyword):
+    with pytest.raises(DSLError, match="step-local DSL key"):
+        extract_observable_names_from_algebra_lines([(1, f"let {keyword} = 5")])
+
+
+@pytest.mark.parametrize("line", ["let K1 = 5", "let k1 = 5", "let kf1 = 5", "let kr1 = 5", "let Keq1 = 5"])
+def test_exact_indexed_protected_names_reject_as_observables_even_without_matching_step(line):
+    with pytest.raises(DSLError, match="protected"):
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(["# Algebra", line]),
+            mechanism_namespace=_canonical_name_namespace({"k2"}),
+        )
+
+
+@pytest.mark.parametrize("line", ["let K1 = 5", "let k1 = 5", "let kf1 = 5", "let kr1 = 5", "let Keq1 = 5"])
+def test_observable_name_extractor_rejects_exact_indexed_protected_names(line):
+    with pytest.raises(DSLError, match="protected"):
+        extract_observable_names_from_algebra_lines([(1, line)])
+
+
+@pytest.mark.parametrize("line", ["K1 = 5", "k1 = 5", "kf1 = 5", "kr1 = 5", "Keq1 = 5", "ordinary = 5"])
+def test_bare_assignment_is_not_supported_in_parameter_algebra(line):
+    with pytest.raises(DSLError, match="Use 'let name = expr' or 'param name = expr'"):
+        parse_parameter_algebra_spec_from_dsl_text(
+            "\n".join(["# Algebra", line]),
+            mechanism_namespace=_canonical_name_namespace({"k2"}),
+        )
+
+
+def test_longer_names_containing_indexed_tokens_remain_ordinary_declarations():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param K1_test = 2",
+                "param k1_scale = 3",
+                "let kr2_observed = 5",
+            ]
+        ),
+        mechanism_namespace=_canonical_name_namespace({"k1", "kf2", "kr2", "Keq2"}),
+    )
+
+    assert [assignment.name for assignment in spec.param_statements] == ["K1_test", "k1_scale"]
+    assert spec.observable_names == {"kr2_observed"}
 
 
 @pytest.mark.parametrize(
     ("line", "mechanism_param_names", "base_values", "expected"),
     [
-        ("param a = 2*K1", {"k1"}, {"k1": 3.0}, 6.0),
-        ("param a = K1 + K2", {"k1", "kf2", "kr2"}, {"k1": 3.0, "kf2": 4.0}, 7.0),
+        ("param a = 2*KF1", {"kf1", "kr1"}, {"kf1": 3.0, "kr1": 1.0}, 6.0),
     ],
 )
 def test_rhs_mechanism_identifiers_resolve_case_insensitively(
@@ -488,7 +658,7 @@ def test_rhs_mechanism_identifiers_resolve_case_insensitively(
                 line,
             ]
         ),
-        mechanism_namespace=_compat_namespace(mechanism_param_names),
+        mechanism_namespace=_canonical_name_namespace(mechanism_param_names),
     )
 
     derived = evaluate_parameter_algebra(spec, base_values=dict(base_values))
@@ -496,7 +666,25 @@ def test_rhs_mechanism_identifiers_resolve_case_insensitively(
     assert derived["a"] == pytest.approx(expected)
 
 
-def test_rhs_exact_case_scalar_input_takes_priority_over_mechanism_canonicalization():
+def test_rhs_rejects_noncanonical_indexed_k_for_reversible_namespace():
+    spec = parse_parameter_algebra_spec_from_dsl_text(
+        "\n".join(
+            [
+                "# Algebra",
+                "param a = K2",
+            ]
+        ),
+        mechanism_namespace=_canonical_name_namespace({"kf2", "kr2"}),
+    )
+
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier") as exc:
+        evaluate_parameter_algebra(spec, base_values={"kf2": 4.0, "kr2": 0.5})
+
+    assert exc.value.line_number == 2
+    assert exc.value.line_content == "param a = K2"
+
+
+def test_rhs_indexed_k_direct_spelling_prefers_mechanism_namespace_over_scalar_input():
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(
             [
@@ -504,7 +692,7 @@ def test_rhs_exact_case_scalar_input_takes_priority_over_mechanism_canonicalizat
                 "param k2 = K1",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"k1", "k2"}),
+        mechanism_namespace=_canonical_name_namespace({"k1", "k2"}),
         scalar_input_names={"K1"},
     )
 
@@ -513,10 +701,10 @@ def test_rhs_exact_case_scalar_input_takes_priority_over_mechanism_canonicalizat
         base_values={"k1": 1.0, "k2": 0.0, "K1": 99.0},
     )
 
-    assert derived["k2"] == pytest.approx(99.0)
+    assert derived["k2"] == pytest.approx(1.0)
 
 
-def test_rhs_mechanism_canonicalization_applies_when_exact_case_scalar_input_is_absent():
+def test_rhs_indexed_k_direct_spelling_resolves_when_exact_case_scalar_input_is_absent():
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(
             [
@@ -524,7 +712,7 @@ def test_rhs_mechanism_canonicalization_applies_when_exact_case_scalar_input_is_
                 "param k2 = K1",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"k1", "k2"}),
+        mechanism_namespace=_canonical_name_namespace({"k1", "k2"}),
     )
 
     derived = evaluate_parameter_algebra(
@@ -535,7 +723,7 @@ def test_rhs_mechanism_canonicalization_applies_when_exact_case_scalar_input_is_
     assert derived["k2"] == pytest.approx(1.0)
 
 
-def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_guidance():
+def test_rhs_k_identifier_rejects_reversible_step_without_irreversible_k_and_suggests_existing_canonical_names():
     spec = parse_parameter_algebra_spec_from_dsl_text(
         "\n".join(
             [
@@ -543,10 +731,10 @@ def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_
                 "param a = K1",
             ]
         ),
-        mechanism_namespace=_compat_namespace({"kf1", "kr1", "Keq1"}),
+        mechanism_namespace=_canonical_name_namespace({"kf1", "kr1", "Keq1"}),
     )
 
-    with pytest.raises(DSLError, match="Keq1") as exc:
+    with pytest.raises(DSLError, match="not a valid indexed parameter identifier") as exc:
         evaluate_parameter_algebra(
             spec,
             base_values={"kf1": 6.0, "kr1": 2.0, "Keq1": 3.0},
@@ -554,7 +742,12 @@ def test_rhs_k_identifier_rejects_equilibrium_constant_shorthand_with_raw_token_
 
     assert exc.value.line_number == 2
     assert exc.value.line_content == "param a = K1"
-    assert "K1" in str(exc.value)
+    message = str(exc.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
 
 
 def test_mechanism_parameter_namespace_requires_authoritative_step_index_map():

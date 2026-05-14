@@ -306,7 +306,7 @@ def test_preview_owner_identity_matches_when_only_parameter_value_changes(monkey
     assert prepared_request.plan.to_execution_request().parameter_overrides == {"k1": 2.0}
 
 
-def test_contained_prepared_reuse_clears_removed_intervention_schedule():
+def test_contained_prepared_reuse_preserves_prepared_schedule_without_request_schedule_authority():
     from kindred.core.simulation_containment import (
         _SimulationChildHandler,
         build_contained_simulation_plan_payload,
@@ -319,13 +319,6 @@ def test_contained_prepared_reuse_clears_removed_intervention_schedule():
             "initial: A=1.0",
             "initial: B=0.0",
             "intervention: op=set; species=A; time=0.0; value=2.0",
-        ]
-    )
-    unscheduled_text = "\n".join(
-        [
-            "reaction: A -> B; k=0",
-            "initial: A=1.0",
-            "initial: B=0.0",
         ]
     )
     owner_identity = {
@@ -345,7 +338,16 @@ def test_contained_prepared_reuse_clears_removed_intervention_schedule():
         wegscheider_cyclicity_enabled=False,
     )
 
-    def _plan(mechanism_text: str, *, prepared_payload: dict[str, object] | None) -> dict[str, object]:
+    def _plan(
+        mechanism_text: str,
+        *,
+        prepared_payload: dict[str, object] | None,
+        intervention_schedule: object = None,
+        schedule_authority: bool = False,
+    ) -> dict[str, object]:
+        kwargs: dict[str, object] = {}
+        if schedule_authority:
+            kwargs["intervention_schedule"] = intervention_schedule
         request = SimulationExecutionRequest(
             prepared_payload=prepared_payload,
             initials={"A": 1.0, "B": 0.0},
@@ -353,7 +355,7 @@ def test_contained_prepared_reuse_clears_removed_intervention_schedule():
             solver_config={"solver": "BDF", "grid": {"N": 3}, "use_sparse_jacobian": False},
             mechanism_text=mechanism_text,
             simulation_identity={"schema_id": "schema", "param_fingerprint": "same"},
-            intervention_schedule=None,
+            **kwargs,
         )
         plan = SimulationPlan.from_execution_request(
             request,
@@ -366,14 +368,24 @@ def test_contained_prepared_reuse_clears_removed_intervention_schedule():
     startup_payload = _plan(
         scheduled_text,
         prepared_payload=scheduled_bound.as_serializable_execution_payload(),
+        intervention_schedule=scheduled_bound.as_serializable_execution_payload()["intervention_schedule"],
+        schedule_authority=True,
     )
-    changed_payload = _plan(unscheduled_text, prepared_payload=None)
+    changed_payload = _plan(
+        scheduled_text,
+        prepared_payload=None,
+        schedule_authority=False,
+    )
     handler = _SimulationChildHandler(startup_payload)
 
     prepared_request = handler._prepare_request({"simulation_plan_payload": changed_payload})
 
     assert contained_owner_payloads_match(startup_payload, changed_payload) is True
-    assert prepared_request.prepared.request.intervention_schedule is None
+    assert "intervention_schedule" not in changed_payload["execution_request"]
+    assert prepared_request.prepared.request.intervention_schedule is not None
+    assert prepared_request.prepared.request.intervention_schedule.to_payload()["instant_events"] == [
+        {"time": 0.0, "species": "A", "op": "set", "value": 2.0}
+    ]
 
 
 def test_contained_owner_identity_distinguishes_mechanism_but_not_preview_parameter_value():

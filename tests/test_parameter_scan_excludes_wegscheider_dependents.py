@@ -76,3 +76,27 @@ def test_parameter_scan_excludes_reverse_rate_derived_by_explicit_keq():
     assert "kf1" in names
     assert "Keq1" in names
     assert "kr1" not in names
+
+
+def test_parameter_scan_excludes_implicit_keq_as_fittable_endpoint():
+    dsl = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=6.0; kr=2.0",
+            "init: A=1.0, B=0.0",
+        ]
+    )
+
+    mgr = DatasetManager(
+        plot_tabs=None,
+        dataset_resolver=lambda _name: None,
+        mechanism_getter=None,
+        simulation_runner=None,
+        solver_settings_getter=lambda: {"wegscheider_cyclicity_enabled": False},
+    )
+
+    params = mgr.scan_mechanism_parameters(dsl)
+    names = {p["name"] for p in params}
+
+    assert "kf1" in names
+    assert "kr1" in names
+    assert "Keq1" not in names

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from typing import Any, Dict, Mapping, Optional, Sequence
 
-from kindred.core.simulation_identity import coerce_simulation_identity
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import SimulationExecutionRequest
 
@@ -26,6 +24,7 @@ class BatchSetDispatchInput:
     preview_batch_cache_token: str = ""
     prepared_payload: Mapping[str, Any] | None = None
     parameter_overrides: Mapping[str, Any] | None = None
+    intervention_schedule: Mapping[str, Any] | None = None
     contained_owner_identity: Mapping[str, Any] | None = None
     algebra_policy: SimulationAlgebraPolicy = SimulationAlgebraPolicy.BATCH_BEST_EFFORT
 
@@ -69,30 +68,6 @@ class ParallelBatchTaskInput:
 class ParallelBatchTaskPlan:
     task: Dict[str, Any]
     simulation_identity: Dict[str, Any]
-
-
-def build_fallback_cache_key(
-    mechanism_text: str = "",
-    t_end: float = 0.0,
-    solver_config: dict | None = None,
-    *,
-    simulation_identity: object | None = None,
-) -> str:
-    identity = coerce_simulation_identity(simulation_identity)
-    if identity is not None:
-        return identity.cache_key()
-    solver_config_parts = []
-    for key, value in sorted((solver_config or {}).items(), key=lambda kv: str(kv[0])):
-        solver_config_parts.append(f"{key}={value!r}")
-    solver_config_for_key = "|".join(solver_config_parts)
-    cache_key_material = "\x00".join(
-        [
-            str(mechanism_text),
-            f"{float(t_end)!r}",
-            str(solver_config_for_key),
-        ]
-    )
-    return hashlib.sha256(cache_key_material.encode("utf-8")).hexdigest()
 
 
 def _simulation_plan_payload(value: object) -> Optional[Dict[str, Any]]:
@@ -197,10 +172,10 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
     simulation_identity = dict(dispatch_input.simulation_identity or {})
 
     if plan_payload is None:
-        plan_request = (
-            dict(execution_request)
-            if isinstance(execution_request, dict)
-            else SimulationExecutionRequest(
+        if isinstance(execution_request, dict):
+            plan_request = dict(execution_request)
+        else:
+            request_kwargs: Dict[str, Any] = dict(
                 prepared_payload=(
                     dict(dispatch_input.prepared_payload)
                     if isinstance(dispatch_input.prepared_payload, Mapping)
@@ -216,8 +191,10 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
                     if isinstance(dispatch_input.parameter_overrides, Mapping)
                     else None
                 ),
-            ).to_payload()
-        )
+            )
+            if isinstance(dispatch_input.intervention_schedule, Mapping):
+                request_kwargs["intervention_schedule"] = dict(dispatch_input.intervention_schedule)
+            plan_request = SimulationExecutionRequest(**request_kwargs).to_payload()
         cache_identity_payload = _cache_identity_payload(
             dispatch_input,
             simulation_identity=simulation_identity,
@@ -283,9 +260,6 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
 
 def build_serial_batch_dispatch_plan(
     dispatch_input: SerialBatchDispatchInput,
-    *,
-    apply_parameter_overrides_to_dsl,
-    record_nonfatal_exception,
 ) -> SerialBatchDispatchPlan:
     payload = dispatch_input.payload
     set_id = str(dispatch_input.set_id)
@@ -308,11 +282,9 @@ def build_serial_batch_dispatch_plan(
 
     candidate_plan = simulation_plan_by_set_id.get(set_id)
     plan_payload = simulation_plan_payload(candidate_plan)
+    if plan_payload is None:
+        raise ValueError(f"Missing simulation plan payload for set {set_id!r}.")
     candidate_request = execution_request_payload_from_plan(candidate_plan)
-    if not bool(fast_mode) and candidate_request is None:
-        candidate_plan = payload.simulation_plan
-        plan_payload = simulation_plan_payload(candidate_plan)
-        candidate_request = execution_request_payload_from_plan(candidate_plan)
     if isinstance(candidate_request, dict):
         execution_request = candidate_request
         if not bool(fast_mode):
@@ -347,28 +319,6 @@ def build_serial_batch_dispatch_plan(
 
     worker_signature = str(mechanism_signature_by_set_id.get(set_id) or "")
     cache_key_rewritten = False
-    if bool(fast_mode) and prepared_payload is None:
-        overrides = dict(dispatch_input.slider_overrides or {})
-        if overrides:
-            try:
-                mechanism_text_for_worker = apply_parameter_overrides_to_dsl(
-                    mechanism_text_for_worker,
-                    overrides,
-                )
-            except Exception as exc:
-                record_nonfatal_exception(
-                    "Failed to apply slider overrides to worker DSL; falling back to baseline DSL",
-                    exc,
-                )
-                mechanism_text_for_worker = full_dsl
-        if len(dispatch_input.queue_ids) <= 1:
-            cache_key = build_fallback_cache_key(
-                str(mechanism_text_for_worker),
-                float(t_end),
-                dict(solver_config or {}),
-                simulation_identity=simulation_identity_by_set_id.get(set_id),
-            )
-            cache_key_rewritten = True
 
     dispatch_plan = build_batch_set_dispatch_plan(
         BatchSetDispatchInput(
@@ -409,6 +359,9 @@ def build_parallel_batch_task_plan(dispatch_input: ParallelBatchTaskInput) -> Pa
     payload = dispatch_input.payload
     set_id = str(dispatch_input.set_id)
     simulation_identity_by_set_id = dict(payload.simulation_identity_by_set_id)
+    plan_payload = dict(payload.simulation_plan_by_set_id).get(set_id)
+    if plan_payload is None:
+        raise ValueError(f"Missing simulation plan payload for set {set_id!r}.")
     dispatch_plan = build_batch_set_dispatch_plan(
         BatchSetDispatchInput(
             set_id=set_id,
@@ -422,7 +375,7 @@ def build_parallel_batch_task_plan(dispatch_input: ParallelBatchTaskInput) -> Pa
             initials=dict(dispatch_input.initials),
             mechanism_text=dict(payload.mechanism_text_by_set_id).get(set_id, str(payload.full_dsl)),
             simulation_identity=simulation_identity_by_set_id.get(set_id),
-            plan_payload=dict(payload.simulation_plan_by_set_id).get(set_id),
+            plan_payload=plan_payload,
             preview_batch_cache_token=payload.preview_batch_cache_token_by_set_id.get(set_id, ""),
             algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
         )

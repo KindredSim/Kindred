@@ -12,7 +12,7 @@ def test_simulate_mechanism_includes_algebra_observables(main_window):
             "initial: A=1.0",
             "initial: B=0.0",
             "# Algebra",
-            "total = [A] + [B]",
+            "let total = [A] + [B]",
         ]
     )
 
@@ -21,4 +21,3 @@ def test_simulate_mechanism_includes_algebra_observables(main_window):
     species = result["species"]
     assert "total" in species
     assert species["total"].shape == np.asarray(result["t"]).shape
-

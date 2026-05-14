@@ -11,7 +11,6 @@ import kindred.core.simulator.dsl as dsl
 import kindred.core.simulator.dsl_build as dsl_build
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
 from kindred.core.simulation_preparation import BoundMechanism
-from kindred.gui.controllers.simulation_controller import build_fallback_cache_key
 from kindred.gui.controllers.simulation_run_state import PreviewOwnershipState
 from kindred.gui.ports import SliderReplayIntent
 from tests.worker_stubs import make_contained_simulation_worker_stub
@@ -490,11 +489,11 @@ def test_scalar_param_slider_updates_existing_param_in_reactions_algebra(main_wi
 
     # The effective DSL (built the same way as production) must contain exactly one `param a = ...`.
     full_dsl = main_window._get_mechanism_text()
-    from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
+    from kindred.core.simulator.parameter_namespace import build_namespace_from_canonical_names
 
     spec = parse_parameter_algebra_spec_from_dsl_text(
         full_dsl,
-        mechanism_namespace=build_flat_compat_namespace({"k2", "kf1"}),
+        mechanism_namespace=build_namespace_from_canonical_names({"k2", "kf1"}),
     )
     a_statements = [stmt for stmt in spec.param_statements if stmt.name == "a"]
     assert len(a_statements) == 1
@@ -522,7 +521,7 @@ def test_scalar_param_slider_commit_uses_authoritative_parameter_precision(main_
 
 def test_scalar_param_slider_updates_existing_param_without_header(main_window, monkeypatch):
     from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
-    from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
+    from kindred.core.simulator.parameter_namespace import build_namespace_from_canonical_names
 
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
@@ -548,7 +547,7 @@ def test_scalar_param_slider_updates_existing_param_without_header(main_window, 
 
     spec = parse_parameter_algebra_spec_from_dsl_text(
         main_window._get_mechanism_text(),
-        mechanism_namespace=build_flat_compat_namespace({"k2", "kf1"}),
+        mechanism_namespace=build_namespace_from_canonical_names({"k2", "kf1"}),
     )
     a_statements = [stmt for stmt in spec.param_statements if stmt.name == "a"]
     assert len(a_statements) == 1
@@ -1547,13 +1546,9 @@ def test_missing_binding_forces_reparse_with_updated_value(main_window, qtbot, m
     assert plan_overrides[0]["k1"] == pytest.approx(expected_value)
     assert any("k=2.5" in text for text in mechanism_texts)
     assert isinstance(seen_cache_keys[0], str)
-    assert seen_cache_keys[0] != build_fallback_cache_key(
-        str(mechanism_texts[0]),
-        float(t_ends[0]),
-        dict(solver_configs[0] or {}),
-    )
+    assert seen_cache_keys[0]
 
-def test_equilibrium_slider_does_not_synthesize_K_when_not_explicit(main_window):
+def test_implicit_equilibrium_constant_slider_is_visible_read_only_without_synthesizing_K(main_window):
     main_window._mechanism_editor._reactions_text.setPlainText(
         "\n".join(
             [
@@ -1570,12 +1565,17 @@ def test_equilibrium_slider_does_not_synthesize_K_when_not_explicit(main_window)
     sliders = main_window._mechanism_editor._variable_sliders
     assert sliders.has_variable("kf1")
     assert sliders.has_variable("kr1")
-    assert not sliders.has_variable("Keq1")
+    assert sliders.has_variable("Keq1")
+    assert sliders._sliders["Keq1"].isEnabled() is False
+    assert main_window.variable_metadata()["Keq1"].get("editable") is False
+    assert "Keq1" not in main_window.simulation_controller._slider_execution_parameter_values(set_id=None)
 
     # Changing kf1 should not introduce a K=... token into the DSL.
     main_window._update_variable_in_mechanism("kf1", 1.2)
     updated = main_window._mechanism_editor._reactions_text.toPlainText()
     assert "K=" not in updated
+    assert sliders.get_variables()["Keq1"] == pytest.approx(1.2 / 0.25)
+
 
 def test_reset_slider_overrides_ends_live_drag(main_window, monkeypatch):
     main_window._mechanism_editor._reactions_text.setPlainText(

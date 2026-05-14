@@ -187,7 +187,6 @@ _SIMULATION_PORT_METHODS = {
         "is_mechanism_ready_for_run",
         "mechanism_reactions_text_raw",
         "get_mechanism_text",
-        "apply_parameter_overrides_to_dsl",
         "apply_wegscheider_resolution_source_rewrite",
     ),
     "solver": (

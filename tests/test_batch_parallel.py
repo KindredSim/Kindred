@@ -689,6 +689,7 @@ def test_run_batch_simulation_task_executes_intervention_schedule_from_plan_with
 
 
 def test_run_batch_simulation_task_executes_state_trigger_schedule_from_plan():
+    from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 
     mechanism_text = "\n".join(
@@ -710,6 +711,7 @@ def test_run_batch_simulation_task_executes_state_trigger_schedule_from_plan():
             "solver_config": {"solver": "BDF", "grid": {"N": 5}},
             "mechanism_text": mechanism_text,
             "simulation_identity": {"schema_id": "schema", "param_fingerprint": "fingerprint"},
+            "intervention_schedule": parse_intervention_schedule_from_dsl(mechanism_text),
         },
         execution_mode="explicit",
         algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,

@@ -10,7 +10,12 @@ from kindred.core.fitting_objective import (
     build_fitting_objective,
     build_prepared_fitting_objective,
 )
-from kindred.core.simulation_preparation import BoundMechanism, PreparedFittingObjectiveContext
+from kindred.core.simulation_preparation import (
+    BoundMechanism,
+    PreparedFittingObjectiveContext,
+    SimulationPreparationError,
+    materialize_request_intervention_schedule_for_parameter_values,
+)
 from kindred.core.simulator.solvers import SimulationOutput
 
 
@@ -63,6 +68,159 @@ def test_direct_prepare_fitting_objective_context_preserves_intervention_schedul
 
     assert prepared.request.intervention_schedule is not None
     assert prepared.request.species_names == ("A", "B")
+
+
+@pytest.mark.unit
+def test_direct_fitting_objective_resolves_protected_schedule_name_through_canonical_mechanism_parameter() -> None:
+    seen_amounts: list[float] = []
+
+    def _solve_policy_factory(_prepared):
+        def _solve_request(request: object, _param_values: np.ndarray) -> SimulationOutput:
+            schedule = getattr(request, "intervention_schedule", None)
+            payload = schedule.to_payload() if schedule is not None else {}
+            seen_amounts.append(float(payload["instant_events"][0]["amount"]))
+            return SimulationOutput(
+                t=np.array([0.0, 1.0], dtype=float),
+                Y=np.array([[2.0, 2.0], [0.0, 0.0]], dtype=float),
+                provenance={"solver": "direct-schedule-test"},
+            )
+
+        return _solve_request
+
+    objective = build_fitting_objective(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.0",
+                "initial: A=0.0",
+                "initial: B=0.0",
+                "intervention: op=add; species=A; time=0.0; amount_param=K1",
+            ]
+        ),
+        param_names=["K1"],
+        t_exp=np.array([0.0, 1.0], dtype=float),
+        y_exp=np.array([2.0, 2.0], dtype=float),
+        target_species="A",
+        solver="BDF",
+        solve_policy_factory=_solve_policy_factory,
+        parameter_algebra_policy_factory=lambda _prepared: (lambda _params: None),
+    )
+
+    residuals = objective(np.array([2.0], dtype=float))
+
+    assert np.allclose(residuals, 0.0)
+    assert seen_amounts == [pytest.approx(2.0)]
+
+
+@pytest.mark.unit
+def test_direct_module_parameterized_schedule_preserves_structured_execution_request() -> None:
+    from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
+    from kindred.core.simulation_preparation import SimulationExecutionRequest
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=0.0; amount_param=dose",
+        ]
+    )
+    mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
+    unresolved = parse_intervention_schedule_from_dsl(mechanism_text)
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 0.0, "B": 0.0},
+        t_span=(0.0, 1.0),
+        solver_config={"solver": "BDF"},
+        mechanism_text=mechanism_text,
+    )
+    prepared = PreparedFittingObjectiveContext(
+        bound=BoundMechanism(
+            mechanism=mechanism,
+            rhs=lambda *_args, **_kwargs: np.array([], dtype=float),
+            bindings={},
+            species_names=["A", "B"],
+            y0=np.array([0.0, 0.0], dtype=float),
+            param_names=["dose"],
+            mechanism_text=mechanism_text,
+            unresolved_intervention_schedule=unresolved,
+        ),
+        requested_param_names=["dose"],
+        request=request,
+        target_species="A",
+        target_is_species=True,
+        target_species_index=0,
+        compiled_algebra=None,
+        initials_for_algebra={"A": 0.0, "B": 0.0},
+        temperature_K=298.15,
+        unresolved_intervention_schedule=unresolved,
+    )
+
+    updated = materialize_request_intervention_schedule_for_parameter_values(
+        mechanism=prepared.bound.mechanism,
+        request=prepared.request,
+        unresolved_intervention_schedule=prepared.unresolved_intervention_schedule,
+        parameter_values={"dose": 2.0},
+        species_names=prepared.bound.species_names,
+        runtime_parameter_names=prepared.bound.bindings.keys(),
+    )
+
+    assert isinstance(updated, SimulationExecutionRequest)
+    assert updated.has_intervention_schedule_authority is True
+    assert updated.intervention_schedule is not None
+    payload = updated.intervention_schedule.to_payload()
+    assert payload["instant_events"][0]["amount"] == pytest.approx(2.0)
+
+
+@pytest.mark.unit
+def test_direct_module_parameterized_schedule_rejects_unowned_request_type() -> None:
+    from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=0.0; amount_param=dose",
+        ]
+    )
+    mechanism = parse_dsl_to_mechanism(mechanism_text, initials={})
+    unresolved = parse_intervention_schedule_from_dsl(mechanism_text)
+    prepared = PreparedFittingObjectiveContext(
+        bound=BoundMechanism(
+            mechanism=mechanism,
+            rhs=lambda *_args, **_kwargs: np.array([], dtype=float),
+            bindings={},
+            species_names=["A", "B"],
+            y0=np.array([0.0, 0.0], dtype=float),
+            param_names=["dose"],
+            mechanism_text=mechanism_text,
+            unresolved_intervention_schedule=unresolved,
+        ),
+        requested_param_names=["dose"],
+        request=SimpleNamespace(t_span=(0.0, 1.0)),
+        target_species="A",
+        target_is_species=True,
+        target_species_index=0,
+        compiled_algebra=None,
+        initials_for_algebra={"A": 0.0, "B": 0.0},
+        temperature_K=298.15,
+        unresolved_intervention_schedule=unresolved,
+    )
+
+    with pytest.raises(
+        SimulationPreparationError,
+        match="does not support intervention schedule replacement",
+    ):
+        materialize_request_intervention_schedule_for_parameter_values(
+            mechanism=prepared.bound.mechanism,
+            request=prepared.request,
+            unresolved_intervention_schedule=prepared.unresolved_intervention_schedule,
+            parameter_values={"dose": 2.0},
+            species_names=prepared.bound.species_names,
+            runtime_parameter_names=prepared.bound.bindings.keys(),
+        )
 
 
 @pytest.mark.unit

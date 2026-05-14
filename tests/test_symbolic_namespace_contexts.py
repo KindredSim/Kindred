@@ -14,11 +14,12 @@ from kindred.core.simulator.parameter_namespace import build_namespace_from_mech
 pytestmark = pytest.mark.unit
 
 
-def _spec(text: str):
+def _spec(text: str, *, scalar_input_names=None):
     mechanism = parse_dsl_to_mechanism(text, initials={})
     return parse_parameter_algebra_spec_from_dsl_text(
         text,
         mechanism_namespace=build_namespace_from_mechanism(mechanism),
+        scalar_input_names=set(scalar_input_names or ()),
     )
 
 
@@ -83,6 +84,91 @@ def test_parameter_expression_records_parameter_namespace_and_rejects_state_symb
     assert translated.symbol_context["mechanism_parameters"] == ["Keq1", "Keq2", "Keq3", "kf1", "kf2", "kf3", "kr1", "kr2", "kr3"]
     with pytest.raises(UnsupportedSymbolicExpressionError, match="State concentration symbols"):
         translate_parameter_expression(_assignment("[A]"), namespace=namespace)
+
+
+def test_symbolic_parameter_namespace_uses_direct_casefold_policy_only():
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.namespaces import make_parameter_namespace_context
+
+    spec = _spec(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "equilibrium: B <-> C ; kf=1 ; kr=0.5",
+                "init: A=1, B=0, C=0",
+            ]
+        )
+    )
+    namespace = make_parameter_namespace_context(spec)
+
+    assert namespace.resolve_identifier("k1") == "k1"
+    assert namespace.resolve_identifier("K1") == "k1"
+    assert namespace.resolve_identifier("KF2") == "kf2"
+    assert namespace.resolve_identifier("KR2") == "kr2"
+    assert namespace.resolve_identifier("KEQ2") == "Keq2"
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="Protected indexed mechanism parameter 'K2'"):
+        namespace.resolve_identifier("K2")
+
+
+def test_symbolic_parameter_namespace_resolves_K1_through_mechanism_before_scalar_input():
+    from kindred.core.symbolic.namespaces import make_parameter_namespace_context
+
+    spec = _spec(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1, B=0",
+            ]
+        ),
+        scalar_input_names={"K1"},
+    )
+    namespace = make_parameter_namespace_context(spec)
+
+    assert namespace.resolve_identifier("K1") == "k1"
+
+
+def test_symbolic_jacobian_canonicalizes_explicit_indexed_k_binding_name_for_irreversible_step():
+    from dataclasses import replace
+
+    from kindred.core.rate_binding import RateBinding
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1, B=0",
+            ]
+        ),
+        initials={},
+    )
+    mechanism.reactions[0] = replace(mechanism.reactions[0], rate=RateBinding(name="K1", value=2.0))
+
+    structure = build_symbolic_jacobian_structure(mechanism)
+
+    assert structure.parameter_symbols == ("k1",)
+
+
+def test_symbolic_jacobian_rejects_explicit_indexed_k_binding_name_for_reversible_step():
+    from dataclasses import replace
+
+    from kindred.core.rate_binding import RateBinding
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "equilibrium: A <-> B; kf=1.0; kr=0.5",
+                "init: A=1, B=0",
+            ]
+        ),
+        initials={},
+    )
+    mechanism.equilibria[0] = replace(mechanism.equilibria[0], kf=RateBinding(name="K1", value=1.0))
+
+    with pytest.raises(UnsupportedSymbolicExpressionError, match="K1.*not a valid indexed parameter identifier"):
+        build_symbolic_jacobian_structure(mechanism)
 
 
 def test_wegscheider_proof_records_parameter_only_proof_namespace():

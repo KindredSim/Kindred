@@ -293,7 +293,12 @@ class MainWindowVariableRuntime:
                 return
 
             variables, metadata = enumerate_step_parameters_for_gui(mechanism)
-            if not variables and self.is_energy_mode_mechanism(mechanism):
+            current_metadata = self.variable_metadata()
+            has_current_energy_sliders = any(
+                isinstance(meta, dict) and meta.get("type") == "energy"
+                for meta in dict(current_metadata or {}).values()
+            )
+            if self.is_energy_mode_mechanism(mechanism) and (not variables or has_current_energy_sliders):
                 self.populate_energy_mode_variables_from_mechanism(
                     mechanism,
                     refresh_sliders=True,
@@ -437,14 +442,13 @@ class MainWindowVariableRuntime:
             param_names = list(mw.slider_overrides(set_id=set_id).keys())
         if not param_names:
             return None
-        meta_map = self._variable_metadata or {}
 
         # Ensure constrained mechanism parameters are bound even if the user isn't directly editing them.
         try:
-            mechanism_param_names = {k for k in meta_map.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
-            spec = mw._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
+            spec = mw._parameter_algebra_spec_for_ui()
             if spec is not None and getattr(spec, "param_statements", None):
-                constrained = {p.name for p in spec.param_statements if re.match(r"^(k|kf|kr|Keq)\d+$", str(p.name))}
+                namespace_info = getattr(getattr(spec, "mechanism_namespace", None), "info_by_name", {}) or {}
+                constrained = {p.name for p in spec.param_statements if str(p.name) in namespace_info}
                 if constrained:
                     param_names = sorted(set(param_names) | constrained)
         except Exception as exc:
@@ -588,16 +592,23 @@ class MainWindowVariableRuntime:
         mw = self._mw
 
         def _equilibrium_value(eq_obj: object, role: str) -> float:
+            if role == "Keq":
+                meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("Keq_input")
+                try:
+                    return float(meta_value() if callable(meta_value) else meta_value)
+                except Exception:
+                    try:
+                        kf_value = getattr(eq_obj, "kf", None)
+                        kr_value = getattr(eq_obj, "kr", None)
+                        kf = float(kf_value() if callable(kf_value) else kf_value)
+                        kr = float(kr_value() if callable(kr_value) else kr_value)
+                        return float(kf) / float(kr) if kr != 0.0 else float("nan")
+                    except Exception:
+                        return float("nan")
             raw_value = getattr(eq_obj, role, None)
             try:
                 return float(raw_value() if callable(raw_value) else raw_value)
             except Exception:
-                if role == "Keq":
-                    meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("Keq_input")
-                    try:
-                        return float(meta_value() if callable(meta_value) else meta_value)
-                    except Exception:
-                        return float("nan")
                 return float("nan")
 
         meta = getattr(mechanism, "metadata", {}) or {}

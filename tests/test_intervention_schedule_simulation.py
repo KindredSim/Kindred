@@ -5,7 +5,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
+from kindred.core.simulation_preparation import SimulationExecutionRequest
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
 from kindred.core.simulator.solvers import SimulationRequest, solve_ode
 
@@ -35,6 +37,25 @@ def _request_from_dsl(
             intervention_schedule=mechanism.metadata.get("intervention_schedule"),
         ),
         species_names,
+    )
+
+
+def _execution_request_from_dsl(
+    text: str,
+    *,
+    initials: dict[str, float],
+    t_span: tuple[float, float],
+    solver_config: dict[str, object],
+    parameter_overrides: dict[str, float] | None = None,
+) -> SimulationExecutionRequest:
+    return SimulationExecutionRequest(
+        prepared_payload=None,
+        initials=initials,
+        t_span=t_span,
+        solver_config=solver_config,
+        mechanism_text=text,
+        intervention_schedule=parse_intervention_schedule_from_dsl(text),
+        parameter_overrides=parameter_overrides,
     )
 
 
@@ -204,24 +225,21 @@ def test_repeated_pulses_and_source_sink_intervals_execute_through_shared_solver
 
 
 def test_parameterized_pulse_amount_executes_through_execution_request_overrides() -> None:
-    from kindred.core.simulation_preparation import (
-        SimulationExecutionRequest,
-        prepare_simulation_worker_run,
-    )
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
-    execution_request = SimulationExecutionRequest(
-        prepared_payload=None,
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
         initials={"A": 1.0, "B": 0.0},
         t_span=(0.0, 2.0),
         solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text="\n".join(
-            [
-                "reaction: A -> B; k=0",
-                "initial: A=1.0",
-                "initial: B=0.0",
-                "intervention: op=add; species=A; time=1.0; amount_param=dose",
-            ]
-        ),
         parameter_overrides={"dose": 2.5},
     )
 
@@ -232,25 +250,140 @@ def test_parameterized_pulse_amount_executes_through_execution_request_overrides
     assert float(a[-1]) == pytest.approx(3.5, abs=1e-6)
 
 
-def test_parameterized_event_time_resegments_execution_request_schedule() -> None:
-    from kindred.core.simulation_preparation import (
-        SimulationExecutionRequest,
-        prepare_simulation_worker_run,
-    )
+def test_rejects_K1_schedule_name_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names() -> None:
+    from kindred.core.simulation_preparation import SimulationPreparationError
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
-    execution_request = SimulationExecutionRequest(
-        prepared_payload=None,
+    text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
         initials={"A": 1.0, "B": 0.0},
         t_span=(0.0, 2.0),
         solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text="\n".join(
-            [
-                "reaction: A -> B; k=0",
-                "initial: A=1.0",
-                "initial: B=0.0",
-                "intervention: op=add; species=A; time_param=pulse_time; amount=2.0",
-            ]
-        ),
+        parameter_overrides={"K1": 2.5},
+    )
+
+    with pytest.raises(SimulationPreparationError) as exc_info:
+        prepare_simulation_worker_run(execution_request=execution_request)
+    message = str(exc_info.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_rejects_K1_schedule_name_on_reversible_step_even_without_override_value() -> None:
+    from kindred.core.simulation_preparation import SimulationPreparationError, prepare_simulation_worker_run
+
+    text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config={"solver": "BDF", "grid": {"N": 3}},
+    )
+
+    with pytest.raises(SimulationPreparationError) as exc_info:
+        prepare_simulation_worker_run(execution_request=execution_request)
+    message = str(exc_info.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_schedule_parameter_k_direct_spelling_also_overrides_existing_irreversible_k() -> None:
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
+    from kindred.core.validation import try_parse_callable_finite_float
+
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config={"solver": "BDF", "grid": {"N": 3}},
+        parameter_overrides={"K1": 2.5},
+    )
+
+    prepared = prepare_simulation_worker_run(execution_request=execution_request)
+    schedule_payload = prepared.request.intervention_schedule.to_payload()
+    rate_value, ok = try_parse_callable_finite_float(prepared.mechanism.reactions[0].rate)
+
+    assert schedule_payload["instant_events"][0]["amount"] == pytest.approx(2.5)
+    assert ok is True
+    assert rate_value == pytest.approx(2.5)
+
+
+def test_schedule_scalar_shared_parameter_updates_schedule_and_algebra_rate() -> None:
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
+    from kindred.core.validation import try_parse_callable_finite_float
+
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "param scale = 1.0",
+            "param k1 = scale",
+            "intervention: op=add; species=A; time=1.0; amount_param=scale",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config={"solver": "BDF", "grid": {"N": 3}},
+        parameter_overrides={"scale": 2.5},
+    )
+
+    prepared = prepare_simulation_worker_run(execution_request=execution_request)
+    schedule_payload = prepared.request.intervention_schedule.to_payload()
+    rate_value, ok = try_parse_callable_finite_float(prepared.mechanism.reactions[0].rate)
+
+    assert schedule_payload["instant_events"][0]["amount"] == pytest.approx(2.5)
+    assert ok is True
+    assert rate_value == pytest.approx(2.5)
+
+
+def test_parameterized_event_time_resegments_execution_request_schedule() -> None:
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
+
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time_param=pulse_time; amount=2.0",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config={"solver": "BDF", "grid": {"N": 3}},
         parameter_overrides={"pulse_time": 2.0},
     )
 
@@ -264,24 +397,21 @@ def test_parameterized_event_time_resegments_execution_request_schedule() -> Non
 
 
 def test_parameterized_source_interval_rate_executes_through_execution_request_overrides() -> None:
-    from kindred.core.simulation_preparation import (
-        SimulationExecutionRequest,
-        prepare_simulation_worker_run,
-    )
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
-    execution_request = SimulationExecutionRequest(
-        prepared_payload=None,
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=0.0",
+            "initial: B=0.0",
+            "intervention: op=source; species=A; start=0.0; end=2.0; rate_param=feed",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
         initials={"A": 0.0, "B": 0.0},
         t_span=(0.0, 2.0),
         solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text="\n".join(
-            [
-                "reaction: A -> B; k=0",
-                "initial: A=0.0",
-                "initial: B=0.0",
-                "intervention: op=source; species=A; start=0.0; end=2.0; rate_param=feed",
-            ]
-        ),
         parameter_overrides={"feed": 1.5},
     )
 
@@ -293,24 +423,21 @@ def test_parameterized_source_interval_rate_executes_through_execution_request_o
 
 
 def test_parameterized_repeated_pulse_amount_executes_through_execution_request_overrides() -> None:
-    from kindred.core.simulation_preparation import (
-        SimulationExecutionRequest,
-        prepare_simulation_worker_run,
-    )
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
-    execution_request = SimulationExecutionRequest(
-        prepared_payload=None,
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=pulse; species=A; start=1.0; every=1.0; count=2; amount_param=dose",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
         initials={"A": 1.0, "B": 0.0},
         t_span=(0.0, 3.0),
         solver_config={"solver": "BDF", "grid": {"N": 4}},
-        mechanism_text="\n".join(
-            [
-                "reaction: A -> B; k=0",
-                "initial: A=1.0",
-                "initial: B=0.0",
-                "intervention: op=pulse; species=A; start=1.0; every=1.0; count=2; amount_param=dose",
-            ]
-        ),
         parameter_overrides={"dose": 1.25},
     )
 
@@ -322,24 +449,21 @@ def test_parameterized_repeated_pulse_amount_executes_through_execution_request_
 
 
 def test_parameterized_repeated_pulse_timing_executes_through_execution_request_overrides() -> None:
-    from kindred.core.simulation_preparation import (
-        SimulationExecutionRequest,
-        prepare_simulation_worker_run,
-    )
+    from kindred.core.simulation_preparation import prepare_simulation_worker_run
 
-    execution_request = SimulationExecutionRequest(
-        prepared_payload=None,
+    text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=pulse; species=A; start_param=pulse_start; every_param=pulse_gap; count=2; amount=1.0",
+        ]
+    )
+    execution_request = _execution_request_from_dsl(
+        text,
         initials={"A": 1.0, "B": 0.0},
         t_span=(0.0, 4.0),
         solver_config={"solver": "BDF", "grid": {"N": 5}},
-        mechanism_text="\n".join(
-            [
-                "reaction: A -> B; k=0",
-                "initial: A=1.0",
-                "initial: B=0.0",
-                "intervention: op=pulse; species=A; start_param=pulse_start; every_param=pulse_gap; count=2; amount=1.0",
-            ]
-        ),
         parameter_overrides={"pulse_start": 1.0, "pulse_gap": 2.0},
     )
 

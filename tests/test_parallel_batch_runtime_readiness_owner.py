@@ -20,6 +20,7 @@ class _FakeBatchParallel:
         self.is_pool_stale = bool(stale)
         self.current_max_workers = 4 if has_pool else None
         self.ensure_calls: list[int] = []
+        self.warm_calls: list[dict[str, object]] = []
         self.pool = object()
         self.snapshot = SimpleNamespace(
             current_generation=7,
@@ -35,6 +36,14 @@ class _FakeBatchParallel:
 
     def ensure_lane_pool(self, *, max_lanes: int):
         self.ensure_calls.append(int(max_lanes))
+        return self.pool
+
+    def ensure_warm_lane_pool(self, *, max_lanes: int, wait: bool):
+        self.warm_calls.append({"max_lanes": int(max_lanes), "wait": bool(wait)})
+        self._has_pool = True
+        self.current_max_workers = max(int(self.current_max_workers or 0), int(max_lanes))
+        if bool(wait):
+            self.ready = True
         return self.pool
 
     def runtime_snapshot(self):
@@ -83,3 +92,16 @@ def test_batch_waiting_runtime_status_mapping_has_one_owner() -> None:
 
     assert source.count('getattr(snapshot, "pool_stale", False)') == 1
     assert source.count('getattr(snapshot, "has_lane_pool", False)') == 1
+
+
+def test_ensure_warms_only_required_lanes_for_current_workflow() -> None:
+    batch_parallel = _FakeBatchParallel(ready=False, has_pool=False)
+    owner = ParallelBatchRuntimeReadinessOwner(
+        batch_parallel=batch_parallel,
+        capacity_getter=lambda: 8,
+    )
+
+    owner.ensure(wait=True, required_lanes=3)
+
+    assert batch_parallel.warm_calls == [{"max_lanes": 3, "wait": True}]
+    assert owner.eagerly_created is True

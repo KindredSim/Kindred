@@ -39,7 +39,7 @@ def _basic_context():
                 "initial: B=0.0",
             ]
         ),
-        param_names=["k"],
+        param_names=["k1"],
         t_end=1.0,
         num_points=5,
         solver="BDF",
@@ -145,8 +145,8 @@ def test_spawn_child_reconstructs_serial_evaluator_once_and_reuses_prepared_stat
         args=(
             payload,
             [
-                {"k": 0.2, "init:A": 1.0},
-                {"k": 0.2, "init:A": 2.0},
+                {"k1": 0.2, "init:A": 1.0},
+                {"k1": 0.2, "init:A": 2.0},
             ],
             output_queue,
         ),
@@ -202,9 +202,9 @@ def test_warm_lane_times_out_after_accepted_request_and_kills_child() -> None:
 
     with pytest.raises(FittingLaneTimeout) as exc_info:
         lane.evaluate_series_with_parameter_origins(
-            {"k": 0.2},
-            {"k": "optimizer_shared"},
-            failed_params={"k": 0.2},
+            {"k1": 0.2},
+            {"k1": "optimizer_shared"},
+            failed_params={"k1": 0.2},
         )
 
     assert exc_info.value.details["fatal"] is False
@@ -249,7 +249,7 @@ def test_warm_lane_reconstruction_failure_is_fatal_with_child_diagnostics() -> N
     )
 
     with pytest.raises(FitSimulationError) as exc_info:
-        lane.evaluate_series_with_parameter_origins({"k": 0.2}, {}, failed_params={"k": 0.2})
+        lane.evaluate_series_with_parameter_origins({"k1": 0.2}, {}, failed_params={"k1": 0.2})
 
     err = exc_info.value
     assert err.details["fatal"] is True
@@ -278,9 +278,9 @@ def test_warm_lane_cancellation_kills_in_progress_request_without_penalty_mappin
 
     with pytest.raises(FittingCancelled):
         lane.evaluate_series_with_parameter_origins(
-            {"k": 0.2},
-            {"k": "optimizer_shared"},
-            failed_params={"k": 0.2},
+            {"k1": 0.2},
+            {"k1": "optimizer_shared"},
+            failed_params={"k1": 0.2},
             cancellation_check=_cancel_after_request_is_active,
         )
 
@@ -310,16 +310,16 @@ def test_contained_evaluator_timeout_maps_to_nonfatal_fit_simulation_error() -> 
 
     with pytest.raises(FitSimulationError) as exc_info:
         evaluator.evaluate_series_with_parameter_origins(
-            {"k": 0.2, "init:A": 1.0},
-            {"k": "optimizer_shared", "init:A": "optimizer_dataset"},
-            failed_params={"k": 0.2, "ds::init:A": 1.0},
+            {"k1": 0.2, "init:A": 1.0},
+            {"k1": "optimizer_shared", "init:A": "optimizer_dataset"},
+            failed_params={"k1": 0.2, "ds::init:A": 1.0},
         )
 
     err = exc_info.value
     assert err.details["fatal"] is False
     assert err.details["failure"]["kind"] == "timeout"
     assert err.details["failure"]["details"]["active_solve_timeout_s"] == pytest.approx(0.25)
-    assert err.failed_params == {"k": 0.2, "ds::init:A": 1.0}
+    assert err.failed_params == {"k1": 0.2, "ds::init:A": 1.0}
 
     evaluator.close()
     assert lane.close_calls == 1
@@ -342,7 +342,7 @@ def test_contained_evaluator_lane_protocol_error_is_fatal() -> None:
     )
 
     with pytest.raises(FitSimulationError) as exc_info:
-        evaluator.evaluate_series({"k": 0.2, "init:A": 1.0})
+        evaluator.evaluate_series({"k1": 0.2, "init:A": 1.0})
 
     assert exc_info.value.details["fatal"] is True
     assert exc_info.value.details["failure"]["kind"] == "fitting_containment_protocol"
@@ -381,7 +381,7 @@ def test_fit_global_wraps_exact_serial_evaluator_with_runtime_session_by_default
     result = global_fitting.fit_global(
         _basic_evaluator(),
         datasets=[{"id": "ds1", "t": t, "y": np.zeros_like(t), "species": "B"}],
-        shared_params={"k": 0.2},
+        shared_params={"k1": 0.2},
         method="trf",
         max_nfev=1,
     )
@@ -423,7 +423,7 @@ def test_fit_global_candidate_timeout_uses_penalty_and_final_replay_keeps_other_
             if self.calls in {1, 3}:
                 raise FittingLaneTimeout(0.2)
             t = np.linspace(0.0, 1.0, 4)
-            value = float(dict(params).get("k", 0.0))
+            value = float(dict(params).get("k1", 0.0))
             return {"t": t, "species": {"A": np.full_like(t, value)}}
 
         def close(self) -> None:
@@ -478,7 +478,7 @@ def test_fit_global_candidate_timeout_uses_penalty_and_final_replay_keeps_other_
             {"id": "ds-timeout", "t": t.copy(), "y": np.zeros_like(t), "species": "A"},
             {"id": "ds-ok", "t": t.copy(), "y": np.zeros_like(t), "species": "A"},
         ],
-        shared_params={"k": 0.2},
+        shared_params={"k1": 0.2},
         method="trf",
         max_nfev=1,
     )

@@ -1002,7 +1002,7 @@ def analyze_parameter_updates_to_dsl_text(
             continue
 
         escaped_name = re.escape(name)
-        pattern_toplevel = rf"^\s*{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
+        pattern_toplevel = rf"^\s*param\s+{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
         pattern_inline = rf"(?<=[;,])\s*{escaped_name}\s*=\s*(?P<value>[^,\n#]+)"
 
         matches_toplevel = list(re.finditer(pattern_toplevel, updated_text, re.MULTILINE))
@@ -1092,7 +1092,7 @@ def apply_parameter_updates_to_dsl_text(
             continue
 
         escaped_name = re.escape(name)
-        pattern_toplevel = rf"^\s*{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
+        pattern_toplevel = rf"^\s*param\s+{escaped_name}\s*=\s*(?P<value>[^\n#;]+)"
         pattern_inline = rf"(?<=[;,])\s*{escaped_name}\s*=\s*(?P<value>[^,\n#]+)"
 
         matches_toplevel = list(re.finditer(pattern_toplevel, updated_text, re.MULTILINE))

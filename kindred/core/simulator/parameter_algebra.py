@@ -5,7 +5,7 @@ This adds an explicit, unambiguous syntax in mechanism DSL text:
 
     param k1 = 4*k2
 
-`let` (and bare `name = expr`) remain for observables only.
+`let` declares observables. Bare `name = expr` declarations are not supported.
 """
 
 from __future__ import annotations
@@ -104,7 +104,16 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
                 meta = getattr(eq, "metadata", {}) or {}
                 v = _as_float(meta.get("Keq_input"))
                 if v is None:
-                    v = _as_float(getattr(eq, "Keq", None))
+                    kf = _as_float(getattr(eq, "kf", None))
+                    kr = _as_float(getattr(eq, "kr", None))
+                    if (
+                        kf is not None
+                        and kr is not None
+                        and math.isfinite(kf)
+                        and math.isfinite(kr)
+                        and abs(kr) > 1e-30
+                    ):
+                        v = float(kf) / float(kr)
                 if v is not None:
                     out[name] = v
     return out
@@ -240,8 +249,9 @@ def _apply_equilibrium_Keq_constraints_to_values(
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium Keq-constraint entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
-            continue
+            raise ValueError(
+                f"Invalid equilibrium Keq-constraint step_index={entry.get('step_index')!r}."
+            ) from exc
         derive_rate = str(entry.get("derive_rate") or "kr")
         kf_key = f"kf{n}"
         kr_key = f"kr{n}"
@@ -249,16 +259,20 @@ def _apply_equilibrium_Keq_constraints_to_values(
         if keq_key not in active_keq_names:
             continue
         if keq_key not in base_values:
-            continue
+            raise ValueError(f"Active equilibrium constraint {keq_key!r} has no source value.")
         keq = float(base_values[keq_key])
         if not math.isfinite(keq) or abs(keq) < 1e-30:
-            continue
+            raise ValueError(f"Active equilibrium constraint {keq_key!r} has invalid value {keq!r}.")
         if derive_rate == "kf":
             if kr_key in base_values:
                 base_values[kf_key] = float(base_values[kr_key]) * keq
+            else:
+                raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kf_key!r}.")
         else:
             if kf_key in base_values:
                 base_values[kr_key] = float(base_values[kf_key]) / keq
+            else:
+                raise ValueError(f"Active equilibrium constraint {keq_key!r} cannot derive missing {kr_key!r}.")
 
 
 def _apply_equilibrium_Keq_constraints_to_mechanism(
@@ -281,8 +295,9 @@ def _apply_equilibrium_Keq_constraints_to_mechanism(
         try:
             n = int(entry.get("step_index"))  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
-            logger.debug("Skipping equilibrium Keq-constraint (mechanism) entry with invalid step_index=%r: %s", entry.get("step_index"), exc)
-            continue
+            raise ValueError(
+                f"Invalid equilibrium Keq-constraint step_index={entry.get('step_index')!r}."
+            ) from exc
         derive_rate = str(entry.get("derive_rate") or "kr")
         if f"Keq{n}" not in active_keq_names:
             continue
@@ -291,7 +306,7 @@ def _apply_equilibrium_Keq_constraints_to_mechanism(
         else:
             nm = f"kr{n}"
         if nm not in values:
-            continue
+            raise ValueError(f"Active equilibrium constraint for step {n} cannot derive missing {nm!r}.")
         v = float(values[nm])
         _set_mechanism_param(mechanism, nm, v, require_mutable=require_mutable)
         updates[nm] = v

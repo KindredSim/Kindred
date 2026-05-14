@@ -191,6 +191,185 @@ def test_dsl_intervention_directives_preserve_parameterized_schedule_fields() ->
     ]
 
 
+@pytest.mark.parametrize(
+    ("directive", "param_name"),
+    [
+        ("intervention: op=add; species=A; time_param=K1; amount=1.0", "K1"),
+        ("intervention: op=set; species=A; time=1.0; value_param=K1", "K1"),
+        ("intervention: op=pulse; species=A; start_param=K1; every=1.0; count=1; amount=1.0", "K1"),
+        ("intervention: op=pulse; species=A; start=1.0; every_param=K1; count=1; amount=1.0", "K1"),
+        ("intervention: op=source; species=A; start_param=K1; end=2.0; rate=1.0", "K1"),
+        ("intervention: op=source; species=A; start=0.0; end_param=K1; rate=1.0", "K1"),
+        ("intervention: op=source; species=A; start=0.0; end=2.0; rate_param=K1", "K1"),
+        ("intervention: op=reservoir; species=A; start=0.0; end=2.0; value_param=K1", "K1"),
+        (
+            "intervention: op=trigger; trigger_species=A; direction=falling; threshold_param=K1; species=B; action=add; amount=1.0; max_count=1; min_interval=0.0",
+            "K1",
+        ),
+    ],
+)
+def test_schedule_param_fields_reject_indexed_k_on_reversible_only_step(directive: str, param_name: str) -> None:
+    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.simulation_preparation import partition_simulation_parameter_values
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "equilibrium: A <-> B; kf=1.0; kr=0.5",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                directive,
+            ]
+        ),
+        initials={},
+    )
+    schedule = mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
+
+    partition = partition_simulation_parameter_values(
+        mechanism=mechanism,
+        parameter_overrides={param_name: 2.0},
+        unresolved_intervention_schedule=schedule,
+    )
+
+    message = partition.invalid_parameter_identifier_messages[param_name]
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_schedule_longer_non_exact_indexed_like_name_remains_ordinary_parameter() -> None:
+    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.simulation_preparation import partition_simulation_parameter_values
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "equilibrium: A <-> B; kf=1.0; kr=0.5",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=add; species=A; time=1.0; amount_param=dose_K1",
+            ]
+        ),
+        initials={},
+    )
+    schedule = mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
+
+    partition = partition_simulation_parameter_values(
+        mechanism=mechanism,
+        parameter_overrides={"dose_K1": 2.0},
+        unresolved_intervention_schedule=schedule,
+    )
+
+    assert partition.invalid_parameter_identifier_messages == {}
+    assert partition.schedule_only_parameter_names == frozenset({"dose_K1"})
+
+
+def test_schedule_scalar_shared_parameter_is_additive_not_schedule_only() -> None:
+    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.simulation_preparation import prepare_bound_mechanism, partition_simulation_parameter_values
+
+    bound = prepare_bound_mechanism(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "param scale = 1.0",
+                "param k1 = scale",
+                "intervention: op=add; species=A; time=1.0; amount_param=scale",
+            ]
+        ),
+        param_names=["scale"],
+        temperature_K=298.15,
+        initials={},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+    schedule = bound.mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
+
+    partition = partition_simulation_parameter_values(
+        mechanism=bound.mechanism,
+        parameter_overrides={"scale": 2.0},
+        unresolved_intervention_schedule=schedule,
+    )
+
+    assert partition.invalid_parameter_identifier_messages == {}
+    assert partition.schedule_parameter_names == frozenset({"scale"})
+    assert partition.scalar_parameter_names == frozenset({"scale"})
+    assert partition.schedule_only_parameter_names == frozenset()
+    assert partition.mechanism_binding_values["scale"] == pytest.approx(2.0)
+    assert partition.schedule_resolution_values["scale"] == pytest.approx(2.0)
+
+
+def test_schedule_declared_scalar_shared_parameter_is_additive_not_schedule_only() -> None:
+    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.simulation_preparation import partition_simulation_parameter_values
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=add; species=A; time=1.0; amount_param=scale",
+            ]
+        ),
+        initials={},
+    )
+    schedule = mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
+
+    partition = partition_simulation_parameter_values(
+        mechanism=mechanism,
+        parameter_overrides={"scale": 2.0},
+        unresolved_intervention_schedule=schedule,
+        scalar_parameter_names={"scale"},
+    )
+
+    assert partition.invalid_parameter_identifier_messages == {}
+    assert partition.schedule_parameter_names == frozenset({"scale"})
+    assert partition.scalar_parameter_names == frozenset({"scale"})
+    assert partition.schedule_only_parameter_names == frozenset()
+    assert partition.mechanism_binding_values["scale"] == pytest.approx(2.0)
+    assert partition.schedule_resolution_values["scale"] == pytest.approx(2.0)
+
+
+def test_schedule_runtime_shared_parameter_is_additive_not_schedule_only() -> None:
+    from kindred.core.mechanism_metadata import MechanismMetadataKeys
+    from kindred.core.simulation_preparation import partition_simulation_parameter_values
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=add; species=A; time=1.0; amount_param=runtime_scale",
+            ]
+        ),
+        initials={},
+    )
+    schedule = mechanism.metadata[MechanismMetadataKeys.INTERVENTION_SCHEDULE]
+
+    partition = partition_simulation_parameter_values(
+        mechanism=mechanism,
+        parameter_overrides={"runtime_scale": 2.0},
+        unresolved_intervention_schedule=schedule,
+        runtime_parameter_names={"runtime_scale"},
+    )
+
+    assert partition.invalid_parameter_identifier_messages == {}
+    assert partition.schedule_parameter_names == frozenset({"runtime_scale"})
+    assert partition.runtime_parameter_names == frozenset({"runtime_scale"})
+    assert partition.schedule_only_parameter_names == frozenset()
+    assert partition.mechanism_binding_values["runtime_scale"] == pytest.approx(2.0)
+    assert partition.schedule_resolution_values["runtime_scale"] == pytest.approx(2.0)
+
+
 def test_parameterized_intervention_schedule_requires_request_parameter_values_before_solve() -> None:
     from kindred.core.simulation_preparation import (
         SimulationExecutionRequest,
@@ -211,6 +390,11 @@ def test_parameterized_intervention_schedule_requires_request_parameter_values_b
                 "intervention: op=add; species=A; time=1.0; amount_param=dose",
             ]
         ),
+        intervention_schedule={
+            "instant_events": [
+                {"time": 1.0, "species": "A", "op": "add", "amount_param": "dose"}
+            ]
+        },
     )
 
     with pytest.raises(SimulationPreparationError, match="Missing intervention schedule parameter: dose"):
@@ -324,7 +508,97 @@ def test_prepared_runtime_reuse_clears_removed_intervention_schedule() -> None:
     assert reused.request.intervention_schedule is None
 
 
-def test_execution_request_payload_makes_schedule_presence_explicit() -> None:
+def test_prepared_runtime_reuse_preserves_schedule_when_request_has_absent_schedule_authority() -> None:
+    from kindred.core.simulation_preparation import (
+        SimulationExecutionRequest,
+        prepare_simulation_worker_run,
+        prepared_simulation_run_for_execution_request,
+    )
+
+    scheduled_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    solver_config = {"solver": "BDF", "grid": {"N": 3}}
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=scheduled_text,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config=solver_config,
+    )
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 0.5, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config=solver_config,
+        mechanism_text=scheduled_text,
+    )
+
+    reused = prepared_simulation_run_for_execution_request(prepared, request)
+
+    assert request.has_intervention_schedule_authority is False
+    assert "intervention_schedule" not in request.to_payload()
+    assert prepared.request.intervention_schedule is not None
+    assert reused.unresolved_intervention_schedule is not None
+    assert reused.unresolved_intervention_schedule.to_payload() == prepared.request.intervention_schedule.to_payload()
+    assert reused.request.intervention_schedule is not None
+    assert reused.request.intervention_schedule.to_payload() == prepared.request.intervention_schedule.to_payload()
+    assert reused.request.y0[0] == pytest.approx(0.5)
+
+
+def test_prepared_runtime_reuse_replaces_schedule_before_parameter_resolution() -> None:
+    from kindred.core.simulation_preparation import (
+        SimulationExecutionRequest,
+        prepare_simulation_worker_run,
+        prepared_simulation_run_for_execution_request,
+    )
+
+    scheduled_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    solver_config = {"solver": "BDF", "grid": {"N": 3}}
+    prepared = prepare_simulation_worker_run(
+        mechanism_text=scheduled_text,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config=solver_config,
+    )
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config=solver_config,
+        mechanism_text=scheduled_text,
+        parameter_overrides={"dose": 4.0},
+        intervention_schedule={
+            "instant_events": [
+                {"time": 1.0, "species": "A", "op": "add", "amount_param": "dose"}
+            ]
+        },
+    )
+
+    reused = prepared_simulation_run_for_execution_request(prepared, request)
+
+    assert request.has_intervention_schedule_authority is True
+    assert reused.unresolved_intervention_schedule is not prepared.unresolved_intervention_schedule
+    assert reused.unresolved_intervention_schedule.to_payload()["instant_events"] == [
+        {"time": 1.0, "species": "A", "op": "add", "amount_param": "dose"}
+    ]
+    assert reused.request.intervention_schedule.to_payload()["instant_events"] == [
+        {"time": 1.0, "species": "A", "op": "add", "amount": 4.0}
+    ]
+
+
+def test_execution_request_payload_does_not_derive_schedule_authority_from_mechanism_text() -> None:
     from kindred.core.simulation_preparation import SimulationExecutionRequest
 
     scheduled_text = "\n".join(
@@ -358,7 +632,7 @@ def test_execution_request_payload_makes_schedule_presence_explicit() -> None:
         mechanism_text=unscheduled_text,
     ).to_payload()
 
-    assert scheduled_payload["intervention_schedule"]["instant_events"][0]["value"] == 2.0
+    assert "intervention_schedule" not in scheduled_payload
     assert "intervention_schedule" not in unscheduled_payload
 
 
@@ -386,7 +660,7 @@ def test_execution_request_explicit_none_schedule_overrides_scheduled_mechanism_
     assert payload["intervention_schedule"] is None
 
 
-def test_prepared_payload_schedule_is_preserved_when_request_has_no_schedule_authority() -> None:
+def test_unscheduled_execution_request_does_not_inherit_prepared_payload_schedule() -> None:
     from kindred.core.simulation_preparation import (
         prepare_bound_mechanism,
         prepare_simulation_worker_run,
@@ -428,8 +702,7 @@ def test_prepared_payload_schedule_is_preserved_when_request_has_no_schedule_aut
 
     assert request_payload["prepared_payload"]["intervention_schedule"] is not None
     assert "intervention_schedule" not in request_payload
-    assert prepared.request.intervention_schedule is not None
-    assert prepared.request.intervention_schedule.to_payload()["instant_events"][0]["value"] == 2.0
+    assert prepared.request.intervention_schedule is None
 
 
 def test_simulation_plan_round_trip_preserves_absent_schedule_authority() -> None:

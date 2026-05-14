@@ -12,7 +12,15 @@ from kindred.core.algebra.parser import (
     UnaryNode,
     parse_algebra,
 )
+from kindred.core.algebra.identifier_canonicalization import canonicalize_observable_rhs_source
 from kindred.core.algebra.symbols import SymbolTable
+from kindred.core.simulator.parameter_algebra_spec import (
+    classify_parameter_algebra_declaration,
+    invalid_parameter_algebra_identifier_reference_message,
+    is_protected_indexed_parameter_identifier,
+    is_protected_step_key_identifier,
+)
+from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
 __all__ = [
     "ObservableExpressionAnalysis",
@@ -88,13 +96,33 @@ def analyze_observable_expression(expr_src: str) -> ObservableExpressionAnalysis
         has_time_ref=bool(expr.has_time_ref()),
     )
 
-def extract_observables_from_algebra_text(algebra_text: str) -> dict[str, str]:
+
+def _reject_invalid_identifier_references(
+    identifiers: Set[str],
+    *,
+    mechanism_namespace: MechanismParameterNamespace | None = None,
+    reject_unresolved_protected_indexed: bool = False,
+) -> None:
+    for name in sorted(str(identifier) for identifier in (identifiers or set()) if str(identifier).strip()):
+        message = invalid_parameter_algebra_identifier_reference_message(
+            name,
+            mechanism_namespace=mechanism_namespace,
+            reject_unresolved_protected_indexed=bool(reject_unresolved_protected_indexed),
+        )
+        if message is not None:
+            raise ValueError(message)
+
+
+def extract_observables_from_algebra_text(
+    algebra_text: str,
+    *,
+    mechanism_namespace: MechanismParameterNamespace | None = None,
+) -> dict[str, str]:
     """
     Extract observable definitions from the persisted Algebra editor text.
 
-    Supports both:
+    Supports:
       - `let name = expr`
-      - `name = expr` (GUI-style; later normalized by compiler)
 
     Excludes:
       - `param name = expr` (scalar params / parameter algebra)
@@ -106,6 +134,7 @@ def extract_observables_from_algebra_text(algebra_text: str) -> dict[str, str]:
         Mapping of observable_name -> expression_source (RHS text).
     """
     out: dict[str, str] = {}
+
     for raw in str(algebra_text or "").splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -126,14 +155,38 @@ def extract_observables_from_algebra_text(algebra_text: str) -> dict[str, str]:
         code = code.strip()
         if not code or code.startswith("#"):
             continue
-        lower = code.lower()
-        if lower.startswith("param "):
+        classification = classify_parameter_algebra_declaration(
+            code,
+            mechanism_namespace=mechanism_namespace,
+            allow_non_algebra_bare_assignment=False,
+        )
+        if classification.kind == "param":
             continue
 
-        if lower.startswith("let "):
+        if classification.kind == "let":
+            if is_protected_indexed_parameter_identifier(classification.raw_name):
+                raise ValueError(
+                    f"{classification.raw_name!r} is a protected indexed parameter identifier "
+                    "and cannot be declared as an observable."
+                )
+            if is_protected_step_key_identifier(classification.raw_name):
+                raise ValueError(
+                    f"{classification.raw_name!r} is a step-local DSL key "
+                    "and cannot be declared as an observable."
+                )
             rest = code[4:].strip()
+        elif classification.kind == "invalid_step_key_identifier":
+            raise ValueError(
+                f"{classification.raw_name!r} is a step-local DSL key "
+                "and cannot be declared as an observable."
+            )
+        elif classification.kind == "unsupported_bare_assignment":
+            raise ValueError(
+                f"Bare algebra assignment {classification.raw_name!r} is not supported. "
+                "Use 'let name = expr' or 'param name = expr'."
+            )
         else:
-            rest = code
+            continue
 
         if "=" not in rest:
             continue
@@ -142,6 +195,14 @@ def extract_observables_from_algebra_text(algebra_text: str) -> dict[str, str]:
         expr = rhs.strip()
         if not name or not expr:
             continue
+        analysis = analyze_observable_expression(expr)
+        _reject_invalid_identifier_references(
+            analysis.identifiers,
+            mechanism_namespace=mechanism_namespace,
+            reject_unresolved_protected_indexed=mechanism_namespace is None,
+        )
+        if mechanism_namespace is not None:
+            expr = canonicalize_observable_rhs_source(expr, mechanism_namespace=mechanism_namespace)
         out[str(name)] = str(expr)
     return out
 
@@ -152,6 +213,7 @@ def detect_unknown_scalar_identifiers(
     observable_name: str,
     known_identifiers: Set[str],
     mechanism_species: Set[str],
+    mechanism_namespace: MechanismParameterNamespace | None = None,
 ) -> Set[str]:
     """
     Return bare identifier names that likely represent missing scalar parameters.
@@ -170,4 +232,25 @@ def detect_unknown_scalar_identifiers(
     blocked.add(str(observable_name))
     blocked |= set(symtab.protected_names())
     blocked |= set(symtab.functions().keys())
-    return {nm for nm in (analysis.identifiers or set()) if nm and nm not in blocked}
+    _reject_invalid_identifier_references(
+        analysis.identifiers,
+        mechanism_namespace=mechanism_namespace,
+    )
+    identifier_names: set[str] = set()
+    for raw_name in analysis.identifiers or set():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if mechanism_namespace is not None:
+            resolution = mechanism_namespace.resolve(name)
+            if resolution.canonical_name is not None:
+                identifier_names.add(str(resolution.canonical_name))
+                continue
+        identifier_names.add(name)
+    candidates = {nm for nm in identifier_names if nm and nm not in blocked}
+    _reject_invalid_identifier_references(
+        candidates,
+        mechanism_namespace=mechanism_namespace,
+        reject_unresolved_protected_indexed=mechanism_namespace is None,
+    )
+    return candidates

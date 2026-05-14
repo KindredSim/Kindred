@@ -33,7 +33,7 @@ def test_prepared_simulation_returns_typed_series_payload() -> None:
 
 
 def test_prepared_simulation_executes_intervention_schedule_direct_path() -> None:
-    from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+    from kindred.core.intervention_schedule import normalized_intervention_schedule_fingerprint_from_dsl_text
     from kindred.core.simulation_preparation import build_prepared_simulation_func
 
     mechanism_text = "\n".join(
@@ -55,10 +55,32 @@ def test_prepared_simulation_executes_intervention_schedule_direct_path() -> Non
 
     result = prepared({"k1": 0.0})
 
-    assert prepared_meta.intervention_schedule_fingerprint == intervention_schedule_fingerprint_from_dsl_text(
+    assert prepared_meta.intervention_schedule_fingerprint == normalized_intervention_schedule_fingerprint_from_dsl_text(
         mechanism_text
     )
     assert float(np.asarray(result["species"]["A"], dtype=float)[0]) == pytest.approx(3.0)
+
+
+def test_prepared_simulation_metadata_canonicalizes_direct_indexed_request_names_before_execution() -> None:
+    from kindred.core.simulation_preparation import build_prepared_simulation_func
+
+    prepared = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.5",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["K1"],
+        t_end=1.0,
+        num_points=5,
+        solver="BDF",
+    )
+
+    prepared_meta = prepared._kindred_prepared_simulation_meta  # type: ignore[attr-defined]
+
+    assert prepared_meta.param_names == ["k1"]
 
 
 def test_global_fit_accepts_typed_simulation_series_payload() -> None:

@@ -295,7 +295,7 @@ class _PlanStepHost(_PlanHost):
 def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_step_warning_present(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 1.0\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
@@ -319,7 +319,7 @@ def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_step_war
     assert isinstance(result, str)
     assert "kf2" in result
     assert "skipped" in result
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 2\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 2\nreaction: A -> B; k=0.2"
     assert host._batch_store.get_value(0, "A") == "2.5"
     assert host._batch_store.get_value(1, "A") == "1.7"
     assert host._fitting_ports.dataset_manager.get_fit_settings("ds1").initial_conditions["A"] == pytest.approx(2.5)
@@ -511,7 +511,7 @@ def test_build_fit_project_apply_plan_preserves_plain_k_current_text_step_constr
 def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_current_text_step_block_present(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4",
+        mechanism_text="param alpha = 1.0\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4",
         authoritative_params={"alpha": 1.0, "Keq1": 4.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
@@ -536,7 +536,7 @@ def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_current_
     assert "Keq1" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == (
-        "alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4"
+        "param alpha = 2\nequilibrium: A <-> B ; kf=6, K=3\n\n# Algebra\nparam Keq1 = 4"
     )
     assert host._batch_store.get_value(0, "A") == "2.5"
     assert host._batch_store.get_value(1, "A") == "1.7"
@@ -547,7 +547,7 @@ def test_apply_fit_results_to_project_allows_scalar_and_ic_updates_when_current_
 def test_apply_fit_results_to_project_keeps_plain_k_block_when_current_text_constraint_present(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nreaction: A -> B ; k=3\n\n# Algebra\nparam k1 = 4",
+        mechanism_text="param alpha = 1.0\nreaction: A -> B ; k=3\n\n# Algebra\nparam k1 = 4",
         authoritative_params={"alpha": 1.0, "k1": 4.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -566,7 +566,7 @@ def test_apply_fit_results_to_project_keeps_plain_k_block_when_current_text_cons
     assert "k1" in result
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == (
-        "alpha = 2\nreaction: A -> B ; k=3\n\n# Algebra\nparam k1 = 4"
+        "param alpha = 2\nreaction: A -> B ; k=3\n\n# Algebra\nparam k1 = 4"
     )
 
 
@@ -577,8 +577,7 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     host = _PlanHost(
         mechanism_text="\n".join(
             [
-                "alpha = 1.0",
-                "sin = 2",
+                "param alpha = 1.0",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
@@ -609,8 +608,7 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
-            "alpha = 2",
-            "sin = 2",
+            "param alpha = 2",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -627,8 +625,7 @@ def test_apply_fit_results_to_project_allows_same_step_constrained_K_when_other_
     host = _PlanHost(
         mechanism_text="\n".join(
             [
-                "alpha = 1.0",
-                "sin = 2",
+                "param alpha = 1.0",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
@@ -660,8 +657,7 @@ def test_apply_fit_results_to_project_allows_same_step_constrained_K_when_other_
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
-            "alpha = 2",
-            "sin = 2",
+            "param alpha = 2",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -679,8 +675,7 @@ def test_apply_fit_results_to_project_keeps_target_step_analysis_failure_block(q
     host = _PlanHost(
         mechanism_text="\n".join(
             [
-                "alpha = 1.0",
-                "sin = 2",
+                "param alpha = 1.0",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
@@ -710,8 +705,7 @@ def test_apply_fit_results_to_project_keeps_target_step_analysis_failure_block(q
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
-            "alpha = 2",
-            "sin = 2",
+            "param alpha = 2",
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
@@ -725,7 +719,7 @@ def test_apply_fit_results_to_project_keeps_target_step_analysis_failure_block(q
 def test_apply_fit_results_to_project_requires_real_mechanism_rewrite_before_reporting_success(qt_app):
     _ = qt_app
     host = _NoRewritePlanHost(
-        mechanism_text="alpha = 1.0\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 1.0\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -741,13 +735,13 @@ def test_apply_fit_results_to_project_requires_real_mechanism_rewrite_before_rep
         host.close()
 
     assert result is False
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 1.0\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 1.0\nreaction: A -> B; k=0.2"
 
 
 def test_write_fit_results_to_mechanism_reports_already_current_when_dsl_needs_no_rewrite(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 2\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 2\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -759,13 +753,13 @@ def test_write_fit_results_to_mechanism_reports_already_current_when_dsl_needs_n
         host.close()
 
     assert result == "already_current"
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 2\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 2\nreaction: A -> B; k=0.2"
 
 
 def test_apply_fit_results_to_project_treats_already_current_parameter_state_as_success(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 2\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 2\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -781,13 +775,13 @@ def test_apply_fit_results_to_project_treats_already_current_parameter_state_as_
         host.close()
 
     assert result is True
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 2\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 2\nreaction: A -> B; k=0.2"
 
 
 def test_apply_fit_results_to_project_skips_guard_for_stale_authority_already_current_parameter_state(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 2\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 2\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -808,13 +802,13 @@ def test_apply_fit_results_to_project_skips_guard_for_stale_authority_already_cu
 
     assert result is True
     assert guard_calls == []
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 2\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 2\nreaction: A -> B; k=0.2"
 
 
 def test_apply_fit_results_to_project_warns_when_requested_scalar_parameter_is_missing_from_current_text(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 1.0\nreaction: A -> B; k=0.2",
         authoritative_params={"beta": 1.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -832,13 +826,13 @@ def test_apply_fit_results_to_project_warns_when_requested_scalar_parameter_is_m
     assert isinstance(result, str)
     assert "beta" in result
     assert "current mechanism text" in result
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 1.0\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 1.0\nreaction: A -> B; k=0.2"
 
 
 def test_apply_fit_results_to_project_warns_with_invalid_value_diagnosis_for_nonfinite_scalar_fit_result(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 1.0\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -858,13 +852,13 @@ def test_apply_fit_results_to_project_warns_with_invalid_value_diagnosis_for_non
     assert "could not be applied" in result
     assert "non-finite" in result
     assert "no longer exists in the current mechanism text" not in result
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 1.0\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 1.0\nreaction: A -> B; k=0.2"
 
 
 def test_apply_fit_results_to_project_keeps_mixed_apply_success_when_parameter_dsl_is_already_current(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 2\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 2\nreaction: A -> B; k=0.2",
         authoritative_params={"alpha": 1.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
@@ -884,7 +878,7 @@ def test_apply_fit_results_to_project_keeps_mixed_apply_success_when_parameter_d
         host.close()
 
     assert result is True
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 2\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 2\nreaction: A -> B; k=0.2"
     assert host._batch_store.get_value(0, "A") == "2.5"
     assert host._fitting_ports.dataset_manager.get_fit_settings("ds1").initial_conditions["A"] == pytest.approx(2.5)
 
@@ -894,7 +888,7 @@ def test_apply_fit_results_to_project_keeps_partial_success_when_missing_scalar_
 ):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1.0\nreaction: A -> B; k=0.2",
+        mechanism_text="param alpha = 1.0\nreaction: A -> B; k=0.2",
         authoritative_params={"beta": 1.0},
         batch_rows=[
             {"set_id": "set-ds1", "set_name": "Set ds1", "values": {"A": "1.0"}},
@@ -916,7 +910,7 @@ def test_apply_fit_results_to_project_keeps_partial_success_when_missing_scalar_
     assert isinstance(result, str)
     assert "Applied remaining valid project updates" in result
     assert "beta" in result
-    assert host._fitting_ports.mechanism_editor.reactions_text() == "alpha = 1.0\nreaction: A -> B; k=0.2"
+    assert host._fitting_ports.mechanism_editor.reactions_text() == "param alpha = 1.0\nreaction: A -> B; k=0.2"
     assert host._batch_store.get_value(0, "A") == "2.5"
     assert host._fitting_ports.dataset_manager.get_fit_settings("ds1").initial_conditions["A"] == pytest.approx(2.5)
 
@@ -928,7 +922,7 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     host = _PlanHost(
         mechanism_text="\n".join(
             [
-                "alpha = 1.0",
+                "param alpha = 1.0",
                 "param a = nan",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "equilibrium: B <-> C ; kf=4, K=5",
@@ -960,7 +954,7 @@ def test_apply_fit_results_to_project_best_effort_applies_unrelated_step_scalar_
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
-            "alpha = 2",
+            "param alpha = 2",
             "param a = nan",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
@@ -977,7 +971,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_scalar_name_matches_
     _ = qt_app
     mechanism_text = "\n".join(
         [
-            "alpha = 1.0",
+            "param alpha = 1.0",
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
@@ -1006,7 +1000,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_scalar_name_matches_
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
-            "alpha = 2",
+            "param alpha = 2",
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
@@ -1016,11 +1010,11 @@ def test_apply_fit_results_to_project_keeps_step_block_when_scalar_name_matches_
     )
 
 
-def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shadow_scalar_input_present(qt_app):
+def test_apply_fit_results_to_project_keeps_constrained_step_block_when_updating_unrelated_scalar(qt_app):
     _ = qt_app
     mechanism_text = "\n".join(
         [
-            "sin = 1.0",
+            "param scale = 1.0",
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
@@ -1029,7 +1023,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shado
     )
     host = _PlanHost(
         mechanism_text=mechanism_text,
-        authoritative_params={"sin": 1.0, "Keq1": 4.0},
+        authoritative_params={"scale": 1.0, "Keq1": 4.0},
         batch_rows=[],
         settings_by_dataset={},
     )
@@ -1037,7 +1031,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shado
     try:
         result = host._apply_fit_results_to_project(
             "parameters",
-            {"sin": 2.0, "Keq1": 8.0},
+            {"scale": 2.0, "Keq1": 8.0},
             {},
         )
     finally:
@@ -1048,7 +1042,7 @@ def test_apply_fit_results_to_project_keeps_step_block_when_unused_builtin_shado
     assert "skipped" in result
     assert host._fitting_ports.mechanism_editor.reactions_text() == "\n".join(
         [
-            "sin = 2",
+            "param scale = 2",
             "equilibrium: A <-> B ; kf=6, K=3",
             "",
             "# Algebra",
@@ -1092,7 +1086,7 @@ def test_build_fit_project_apply_plan_treats_numeric_parameter_noop_with_text_fo
 ):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 0.200000\nreaction: A -> B; k=1.0",
+        mechanism_text="param alpha = 0.200000\nreaction: A -> B; k=1.0",
         authoritative_params={"alpha": 0.2},
         batch_rows=[],
         settings_by_dataset={},
@@ -1114,7 +1108,7 @@ def test_build_fit_project_apply_plan_treats_numeric_parameter_noop_with_text_fo
 def test_build_fit_project_apply_plan_uses_authoritative_parameter_precision_for_real_change(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 1000000.1234567\nreaction: A -> B; k=1.0",
+        mechanism_text="param alpha = 1000000.1234567\nreaction: A -> B; k=1.0",
         authoritative_params={"alpha": 1000000.1234567},
         batch_rows=[],
         settings_by_dataset={},
@@ -1126,7 +1120,7 @@ def test_build_fit_project_apply_plan_uses_authoritative_parameter_precision_for
         host.close()
 
     assert plan.parameter_delta is not None
-    assert plan.parameter_delta.updated_text == "alpha = 1000000.1234568\nreaction: A -> B; k=1.0"
+    assert plan.parameter_delta.updated_text == "param alpha = 1000000.1234568\nreaction: A -> B; k=1.0"
     assert plan.parameter_delta.has_real_change is True
     assert plan.parameter_delta.needs_dsl_rewrite is True
     assert plan.needs_slider_guard is True
@@ -1136,7 +1130,7 @@ def test_build_fit_project_apply_plan_uses_authoritative_parameter_precision_for
 def test_build_fit_project_apply_plan_treats_signed_zero_parameter_difference_as_true_noop(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 0\nreaction: A -> B; k=1.0",
+        mechanism_text="param alpha = 0\nreaction: A -> B; k=1.0",
         authoritative_params={"alpha": 0.0},
         batch_rows=[],
         settings_by_dataset={},
@@ -1148,7 +1142,7 @@ def test_build_fit_project_apply_plan_treats_signed_zero_parameter_difference_as
         host.close()
 
     assert plan.parameter_delta is not None
-    assert plan.parameter_delta.updated_text == "alpha = 0\nreaction: A -> B; k=1.0"
+    assert plan.parameter_delta.updated_text == "param alpha = 0\nreaction: A -> B; k=1.0"
     assert plan.parameter_delta.has_real_change is False
     assert plan.parameter_delta.needs_dsl_rewrite is False
     assert plan.needs_slider_guard is False
@@ -1182,7 +1176,7 @@ def test_build_fit_project_apply_plan_treats_step_parameter_signed_zero_floor_as
 def test_build_fit_project_apply_plan_marks_real_parameter_change_separately_from_dsl_rewrite(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 0.2\nreaction: A -> B; k=1.0",
+        mechanism_text="param alpha = 0.2\nreaction: A -> B; k=1.0",
         authoritative_params={"alpha": 0.2},
         batch_rows=[],
         settings_by_dataset={},
@@ -1239,7 +1233,7 @@ def test_build_fit_project_apply_plan_separates_dataset_settings_sync_from_canon
 def test_build_fit_project_apply_plan_marks_canonical_ic_change_and_both_scope_matrix(qt_app):
     _ = qt_app
     host = _PlanHost(
-        mechanism_text="alpha = 0.2\nreaction: A -> B; k=1.0",
+        mechanism_text="param alpha = 0.2\nreaction: A -> B; k=1.0",
         authoritative_params={"alpha": 0.2},
         batch_rows=[
             {

@@ -25,27 +25,37 @@ from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
-from kindred.core.intervention_schedule import InterventionScheduleError, coerce_intervention_schedule
+from kindred.core.intervention_schedule import (
+    coerce_intervention_schedule,
+    normalized_intervention_schedule_fingerprint,
+)
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
     SimulationExecutionRequest,
     _bind_symbolic_jacobian_for_current_mechanism,
     _build_solver_config,
     _fit_simulation_error_from_preparation_error,
+    _prepare_preparation_failure,
+    _raise_unowned_request_parameter_values,
     _mechanism_supports_dynamic_symbolic_snapshot,
     _prepared_metadata_with_symbolic_jacobian,
     _reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     _solve_request,
     _symbolic_jacobian_for_bind_failure,
+    assert_simulation_execution_request_schedule_identity,
+    build_simulation_request_from_prepared_run,
+    canonicalize_request_parameter_names,
     coerce_prepared_simulation_metadata,
     metadata_view_for_mechanism,
+    partition_simulation_parameter_values,
     prepare_bound_mechanism,
     prepare_simulation_worker_run,
+    resolve_prepared_run_intervention_schedule,
     SimulationPreparationError,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_series_payload import SimulationSeriesPayload, coerce_simulation_series_payload
-from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME, SimulationRequest
+from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
@@ -90,28 +100,6 @@ def _prepared_metadata_from_evaluator(value) -> Optional[PreparedSimulationMetad
 def _parameter_origin_for(name: str, origins: Optional[Mapping[str, str]]) -> str:
     origin = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR) or "").strip()
     return origin or FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-
-
-def _intervention_schedule_parameter_names(schedule: object) -> set[str]:
-    try:
-        payload = schedule.to_payload()  # type: ignore[attr-defined]
-    except Exception:
-        return set()
-    names: set[str] = set()
-
-    def _walk(value: object) -> None:
-        if isinstance(value, Mapping):
-            for key, item in value.items():
-                if str(key).endswith("_param") and str(item or "").strip():
-                    names.add(str(item))
-                else:
-                    _walk(item)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                _walk(item)
-
-    _walk(payload)
-    return names
 
 
 def _coerce_consumed_parameter_value(
@@ -544,22 +532,44 @@ def prepare_fitting_execution_context(
         use_advanced_dsl=True,
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
     )
+    requested_partition = partition_simulation_parameter_values(
+        mechanism=bound.mechanism,
+        parameter_overrides=None,
+        unresolved_intervention_schedule=bound.unresolved_intervention_schedule,
+        requested_parameter_names=param_names or [],
+        runtime_parameter_names=bound.bindings.keys(),
+    )
     try:
+        _raise_unowned_request_parameter_values(requested_partition)
+        canonical_requested_param_names = canonicalize_request_parameter_names(
+            requested_partition,
+            param_names or [],
+        )
         _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
             bound.mechanism,
-            param_names,
+            requested_partition.bindable_mechanism_parameter_names,
         )
     except SimulationPreparationError as exc:
         raise _fit_simulation_error_from_preparation_error(exc) from exc
+    except ValueError as exc:
+        raise _fit_simulation_error_from_preparation_error(
+            _prepare_preparation_failure("parameter_binding", exc)
+        ) from exc
     prepared_payload = dict(bound.as_serializable_execution_payload())
     prepared_payload["bindings"] = dict(bound.bindings)
     intervention_schedule = coerce_intervention_schedule(prepared_payload.get("intervention_schedule"))
+    from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+    intervention_schedule_fingerprint = normalized_intervention_schedule_fingerprint(
+        intervention_schedule,
+        mechanism_namespace=build_namespace_from_mechanism(bound.mechanism),
+    )
 
     prepared_meta = PreparedSimulationMetadata(
         version=1,
         mechanism_text_sha256=hashlib.sha256((mechanism_text or "").encode("utf-8")).hexdigest(),
         mechanism_text_len=len(mechanism_text or ""),
-        param_names=sorted({str(x) for x in (param_names or []) if str(x).strip()}),
+        param_names=sorted({str(x) for x in canonical_requested_param_names if str(x).strip()}),
         t_end=float(t_end),
         num_points=int(grid_n),
         temperature_K=float(temperature_K),
@@ -575,9 +585,7 @@ def prepare_fitting_execution_context(
         use_sparse_jacobian=bool(prepared_solver_config.use_sparse_jacobian),
         wegscheider_cyclicity_enabled=bool(wegscheider_cyclicity_enabled),
         initial_prefix=str(initial_prefix),
-        intervention_schedule_fingerprint=(
-            intervention_schedule.fingerprint if intervention_schedule is not None else ""
-        ),
+        intervention_schedule_fingerprint=str(intervention_schedule_fingerprint),
     )
 
     execution_request = SimulationExecutionRequest(
@@ -600,7 +608,7 @@ def prepare_fitting_execution_context(
     )
     return PreparedFittingExecutionContext(
         execution_request=execution_request,
-        requested_param_names=sorted({str(x) for x in (param_names or []) if str(x).strip()}),
+        requested_param_names=sorted({str(x) for x in canonical_requested_param_names if str(x).strip()}),
         prepared_metadata=prepared_meta,
         temperature_K=float(temperature_K),
         initial_prefix=str(initial_prefix),
@@ -722,12 +730,15 @@ class SerialFittingEvaluator:
             raise ValueError("Process payload prepared_metadata.temperature_K conflicts with simulation_plan.")
         if str(payload["initial_prefix"] or "init:") != str(prepared_metadata.initial_prefix or "init:"):
             raise ValueError("Process payload initial_prefix conflicts with prepared_metadata.")
-        request_schedule = coerce_intervention_schedule(request.to_payload().get("intervention_schedule"))
-        request_schedule_fingerprint = "" if request_schedule is None else str(request_schedule.fingerprint or "")
-        if str(prepared_metadata.intervention_schedule_fingerprint or "") != request_schedule_fingerprint:
-            raise ValueError(
-                "Process payload prepared_metadata.intervention_schedule_fingerprint conflicts with simulation_plan."
+        try:
+            assert_simulation_execution_request_schedule_identity(
+                request,
+                expected_fingerprint=str(prepared_metadata.intervention_schedule_fingerprint or ""),
             )
+        except SimulationPreparationError as exc:
+            raise ValueError(
+                f"Process payload intervention_schedule conflicts with simulation_plan: {exc}"
+            ) from exc
         return cls(
             PreparedFittingExecutionContext(
                 simulation_plan=plan_payload,
@@ -789,9 +800,30 @@ class SerialFittingEvaluator:
 
         initial_overrides: Dict[str, float] = {}
         shared_values: Dict[str, float] = {}
-        schedule_param_names = _intervention_schedule_parameter_names(
-            prepared_run.request.intervention_schedule
-        )
+        from kindred.core.simulation_preparation import partition_simulation_parameter_values
+
+        non_initial_parameters = {
+            str(name): value
+            for name, value in param_map.items()
+            if not str(name).startswith(self._context.initial_prefix)
+        }
+        try:
+            parameter_partition = partition_simulation_parameter_values(
+                mechanism=prepared_run.mechanism,
+                parameter_overrides=non_initial_parameters,
+                unresolved_intervention_schedule=prepared_run.unresolved_intervention_schedule,
+                runtime_parameter_names=self._bindings.keys(),
+                validate_values=False,
+            )
+            _raise_unowned_request_parameter_values(parameter_partition)
+        except SimulationPreparationError as exc:
+            raise _fit_simulation_error_from_preparation_error(exc) from exc
+        except ValueError as exc:
+            raise FitSimulationError(
+                str(exc),
+                failed_params=failed_params,
+                details={"fatal": True, "stage": "parameter_binding"},
+            ) from exc
         for key, raw_val in param_map.items():
             name = str(key)
             if name.startswith(self._context.initial_prefix):
@@ -805,9 +837,21 @@ class SerialFittingEvaluator:
                     failed_params=failed_params,
                 )
             else:
-                if name not in self._bindings:
-                    if name in schedule_param_names:
+                binding_name = parameter_partition.mechanism_parameter_name_by_raw.get(name, name)
+                if binding_name not in self._bindings:
+                    if name in parameter_partition.schedule_only_parameter_names:
+                        _coerce_consumed_parameter_value(
+                            name=name,
+                            raw_value=raw_val,
+                            origins=origin_map,
+                            failed_params=failed_params,
+                        )
                         continue
+                    if name in parameter_partition.invalid_parameter_identifier_messages:
+                        raise FitSimulationError(
+                            parameter_partition.invalid_parameter_identifier_messages[name],
+                            details={"fatal": True, "stage": "parameter_binding"},
+                        )
                     if name in set(self._context.requested_param_names or ()):
                         raise FitSimulationError(
                             (
@@ -817,7 +861,7 @@ class SerialFittingEvaluator:
                             details={"fatal": True, "stage": "parameter_binding"},
                         )
                     continue
-                shared_values[name] = _coerce_consumed_parameter_value(
+                shared_values[binding_name] = _coerce_consumed_parameter_value(
                     name=name,
                     raw_value=raw_val,
                     origins=origin_map,
@@ -841,15 +885,16 @@ class SerialFittingEvaluator:
         if cancellation_event is not None:
             events.append(cancellation_event)
 
-        intervention_schedule = prepared_run.request.intervention_schedule
-        if intervention_schedule is not None:
-            try:
-                intervention_schedule = intervention_schedule.resolve_parameters(param_map)
-            except InterventionScheduleError as exc:
-                raise FitSimulationError(
-                    f"Fitting intervention schedule failed: {exc}",
-                    details={"fatal": False, "stage": "intervention_schedule"},
-                ) from exc
+        try:
+            intervention_schedule = resolve_prepared_run_intervention_schedule(
+                prepared_run,
+                parameter_partition,
+            )
+        except SimulationPreparationError as exc:
+            raise FitSimulationError(
+                f"Fitting intervention schedule failed: {exc}",
+                details={"fatal": False, "stage": "intervention_schedule"},
+            ) from exc
 
         symbolic_jacobian = SymbolicJacobianExecution.from_request_fields(
             jacobian_func=prepared_run.request.jacobian_func,
@@ -891,20 +936,12 @@ class SerialFittingEvaluator:
                 )
                 self._kindred_fitting_execution_context = self._context
 
-        request = SimulationRequest(
-            rhs=prepared_run.request.rhs,
-            t_span=tuple(map(float, prepared_run.request.t_span)),
+        request = build_simulation_request_from_prepared_run(
+            prepared_run,
             y0=y0,
-            solver=str(prepared_run.request.solver),
-            rtol=float(prepared_run.request.rtol),
-            atol=float(prepared_run.request.atol),
-            grid=dict(prepared_run.request.grid or {}),
-            **symbolic_jacobian.to_request_kwargs(),
-            temperature_schedule=prepared_run.request.temperature_schedule,
             intervention_schedule=intervention_schedule,
-            species_names=tuple(prepared_run.species_names),
-            events=tuple(events) if events else None,
-            symbolic_wegscheider_identity=prepared_run.request.symbolic_wegscheider_identity,
+            symbolic_jacobian=symbolic_jacobian,
+            events=events,
         )
         try:
             result = _solve_request(request)
@@ -1043,6 +1080,7 @@ class SerialFittingEvaluator:
             fitting_strict_time_ref_error,
         )
         from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
+        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
         ensure_fitting_strict_algebra_policy(self._context.simulation_plan.algebra_policy)
         self._parameter_algebra_spec = parameter_algebra_spec_from_mechanism(prepared_run.mechanism)
@@ -1052,7 +1090,10 @@ class SerialFittingEvaluator:
         algebra_text = metadata_view_for_mechanism(prepared_run.mechanism).algebra_text
         if algebra_text:
             try:
-                compiled_algebra = compile_algebra_observables(str(algebra_text))
+                compiled_algebra = compile_algebra_observables(
+                    str(algebra_text),
+                    mechanism_namespace=build_namespace_from_mechanism(prepared_run.mechanism),
+                )
             except Exception as exc:
                 raise fitting_strict_parse_error(
                     exc,

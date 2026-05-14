@@ -28,9 +28,6 @@ def test_global_fit_simulation_func_parses_once_per_session(main_window, monkeyp
         )
     )
 
-    # Avoid relying on slider variable metadata during this unit-style regression.
-    monkeypatch.setattr(main_window, "_apply_parameter_overrides_to_dsl", lambda mech, _params: mech)
-
     # Avoid any setup-time parsing that is unrelated to evaluation.
     monkeypatch.setattr(
         main_window._dataset_manager,

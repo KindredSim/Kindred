@@ -19,7 +19,6 @@ class SimulationMechanismOwner:
         try_lock_mechanism_editor: Callable[[], bool],
         apply_overrides_to_text: Callable[..., str],
         apply_overrides_to_state_network_dsl: Callable[..., str],
-        apply_parameter_overrides_to_dsl: Callable[[str, Dict[str, float]], str],
         apply_wegscheider_resolution_source_rewrite: Callable[[str], None] | None = None,
     ) -> None:
         self._mechanism_session_owner_getter = mechanism_session_owner_getter
@@ -30,7 +29,6 @@ class SimulationMechanismOwner:
         self._try_lock_mechanism_editor = try_lock_mechanism_editor
         self._apply_overrides_to_text = apply_overrides_to_text
         self._apply_overrides_to_state_network_dsl = apply_overrides_to_state_network_dsl
-        self._apply_parameter_overrides_to_dsl = apply_parameter_overrides_to_dsl
         self._apply_wegscheider_resolution_source_rewrite = apply_wegscheider_resolution_source_rewrite
 
     def auto_lock_for_run(self) -> bool:
@@ -124,9 +122,6 @@ class SimulationMechanismOwner:
 
     def apply_overrides_to_state_network_dsl(self, base_text: str, *, set_id: Optional[str] = None) -> str:
         return str(self._apply_overrides_to_state_network_dsl(str(base_text), set_id=set_id))
-
-    def apply_parameter_overrides_to_dsl(self, mechanism_text: str, parameters: Dict[str, float]) -> str:
-        return str(self._apply_parameter_overrides_to_dsl(str(mechanism_text), dict(parameters)))
 
     def get_mechanism_text(self) -> str:
         return self._simulation_schema_text()

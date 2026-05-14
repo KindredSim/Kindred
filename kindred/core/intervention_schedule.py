@@ -14,7 +14,10 @@ __all__ = [
     "InterventionScheduleError",
     "InterventionTriggerEvent",
     "coerce_intervention_schedule",
-    "intervention_schedule_fingerprint_from_dsl_text",
+    "intervention_schedule_parameter_names",
+    "normalized_intervention_schedule_fingerprint",
+    "normalized_intervention_schedule_fingerprint_from_dsl_text",
+    "normalized_intervention_schedule_payload",
     "parse_intervention_schedule_from_dsl",
 ]
 
@@ -120,6 +123,27 @@ def _write_scalar_payload(
         payload[f"{field}_param"] = str(parameter)
     else:
         payload[field] = float(value if value is not None else 0.0)
+
+
+def intervention_schedule_parameter_names(schedule: "InterventionSchedule | None") -> set[str]:
+    if schedule is None:
+        return set()
+    payload = schedule.to_payload()
+    names: set[str] = set()
+
+    def _walk(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if str(key).endswith("_param") and str(item or "").strip():
+                    names.add(str(item))
+                else:
+                    _walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _walk(item)
+
+    _walk(payload)
+    return names
 
 
 def _species_name(value: object) -> str:
@@ -746,9 +770,73 @@ def parse_intervention_schedule_from_dsl(text: str) -> InterventionSchedule | No
     return None if schedule.is_empty() else schedule
 
 
-def intervention_schedule_fingerprint_from_dsl_text(text: str) -> str:
+def _canonicalize_schedule_parameter_names(value: object, *, mechanism_namespace: object) -> object:
+    if isinstance(value, Mapping):
+        out: dict[str, object] = {}
+        for key, item in value.items():
+            key_s = str(key)
+            if key_s.endswith("_param") and str(item or "").strip():
+                raw_name = str(item)
+                resolution = mechanism_namespace.resolve(raw_name)  # type: ignore[attr-defined]
+                if resolution.canonical_name is not None:
+                    out[key_s] = str(resolution.canonical_name)
+                    continue
+                invalid_message = mechanism_namespace.invalid_protected_indexed_identifier_message(raw_name)  # type: ignore[attr-defined]
+                if invalid_message is not None:
+                    raise InterventionScheduleError(invalid_message)
+                out[key_s] = raw_name
+                continue
+            out[key_s] = _canonicalize_schedule_parameter_names(item, mechanism_namespace=mechanism_namespace)
+        return out
+    if isinstance(value, list):
+        return [_canonicalize_schedule_parameter_names(item, mechanism_namespace=mechanism_namespace) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_canonicalize_schedule_parameter_names(item, mechanism_namespace=mechanism_namespace) for item in value)
+    return value
+
+
+def normalized_intervention_schedule_payload(
+    schedule: "InterventionSchedule | Mapping[str, Any] | None",
+    *,
+    mechanism_namespace: object,
+) -> dict[str, Any] | None:
+    schedule_obj = coerce_intervention_schedule(schedule)
+    if schedule_obj is None:
+        return None
+    payload = _canonicalize_schedule_parameter_names(
+        schedule_obj.to_payload(),
+        mechanism_namespace=mechanism_namespace,
+    )
+    return InterventionSchedule.from_payload(payload).to_payload()
+
+
+def normalized_intervention_schedule_fingerprint(
+    schedule: "InterventionSchedule | Mapping[str, Any] | None",
+    *,
+    mechanism_namespace: object,
+) -> str:
+    payload = normalized_intervention_schedule_payload(
+        schedule,
+        mechanism_namespace=mechanism_namespace,
+    )
+    if payload is None:
+        return ""
+    return InterventionSchedule.from_payload(payload).fingerprint
+
+
+def normalized_intervention_schedule_fingerprint_from_dsl_text(text: str) -> str:
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+    from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
     schedule = parse_intervention_schedule_from_dsl(text)
-    return "" if schedule is None else schedule.fingerprint
+    if schedule is None:
+        return ""
+    mechanism = parse_dsl_to_mechanism(str(text or ""), initials={})
+    namespace = build_namespace_from_mechanism(mechanism)
+    return normalized_intervention_schedule_fingerprint(
+        schedule,
+        mechanism_namespace=namespace,
+    )
 
 
 def _parse_directive_fields(rest: str, *, line_no: int) -> dict[str, Any]:

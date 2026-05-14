@@ -236,7 +236,6 @@ class MainWindow(
             try_lock_mechanism_editor=self._try_lock_mechanism_editor,
             apply_overrides_to_text=self._apply_overrides_to_text,
             apply_overrides_to_state_network_dsl=self._apply_overrides_to_state_network_dsl,
-            apply_parameter_overrides_to_dsl=self._apply_parameter_overrides_to_dsl,
             apply_wegscheider_resolution_source_rewrite=(
                 self._apply_wegscheider_resolution_source_rewrite
             ),
@@ -1357,9 +1356,7 @@ class MainWindow(
         if bool(getattr(self, "_simulation_runtime_availability_shutdown_started", False)):
             return
         try:
-            self._sim_controller.ensure_interactive_simulation_runtimes_available(wait=bool(wait))
-            if self.isVisible():
-                self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=bool(wait))
+            self._sim_controller.ensure_current_interactive_simulation_runtimes_available(wait=bool(wait))
             self._poll_interactive_runtime_readiness_after_refresh()
         except Exception as exc:
             record_gui_best_effort_failure(
@@ -1428,14 +1425,10 @@ class MainWindow(
                 self._runtime_snapshot_should_poll(snapshot)
                 for snapshot in (ordinary_snapshot, preview_snapshot, run_snapshot)
             ):
-                self._sim_controller.ensure_interactive_simulation_runtimes_available(wait=False)
-                if self.isVisible():
-                    self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
+                self._sim_controller.ensure_current_interactive_simulation_runtimes_available(wait=False)
                 ordinary_snapshot = self._sim_controller.interactive_simulation_runtime_snapshot(fast_mode=False)
                 preview_snapshot = self._sim_controller.slider_preview_runtime_snapshot()
                 run_snapshot = self._sim_controller.selected_run_runtime_snapshot()
-            elif self.isVisible():
-                self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
             self._set_runtime_backed_run_controls_ready(
                 self._runtime_snapshot_controls_ready(run_snapshot)
             )
@@ -4773,12 +4766,6 @@ class MainWindow(
             set_id=set_id,
         )
 
-    def apply_parameter_overrides_to_dsl(self, mechanism_text: str, parameters: Dict[str, float]) -> str:
-        return self._simulation_mechanism_owner.apply_parameter_overrides_to_dsl(
-            str(mechanism_text),
-            dict(parameters),
-        )
-
     def get_mechanism_text(self) -> str:
         return self._simulation_mechanism_owner.get_mechanism_text()
 
@@ -4936,58 +4923,6 @@ class MainWindow(
         if not (has_active_cache or has_displayed_selection or self.main_plot_has_data()):
             return
         self._invalidate_active_results_for_global_authoritative_change()
-
-    def _apply_parameter_overrides_to_dsl(
-        self,
-        mechanism_text: str,
-        parameters: Dict[str, float],
-    ) -> str:
-        """Return DSL text with parameter values replaced."""
-        updated_text = mechanism_text
-        step_analysis_context = None
-        step_constraint_context = {
-            "temperature_K": float(self._temperature_spinbox.value()),
-            "wegscheider_cyclicity_enabled": bool(self._simulation_solver_owner.wegscheider_cyclicity_enabled()),
-        }
-        for name, value in parameters.items():
-            name_str = str(name)
-            if re.match(r"^(kf|kr|Keq|k)\d+$", name_str) and hasattr(self, "_update_variable_in_mechanism"):
-                if re.match(r"^(kf|kr|Keq)\d+$", name_str) and (
-                    step_analysis_context is None or step_analysis_context.source_text != updated_text
-                ):
-                    step_analysis_context = build_current_text_step_analysis_context(
-                        updated_text,
-                        step_constraint_context=step_constraint_context,
-                    )
-                previous_text = updated_text
-                updated_text = self._update_variable_in_mechanism(
-                    name_str,
-                    float(value),
-                    source_text=updated_text,
-                    commit=False,
-                    step_analysis_context=step_analysis_context,
-                )
-                if updated_text != previous_text:
-                    step_analysis_context = None
-                continue
-
-            escaped_name = re.escape(name_str)
-            pattern_assignment = rf"(?<![\w]){escaped_name}\s*=\s*(?P<value>[^\n#;,]+)"
-
-            def _replace(match: re.Match) -> str:
-                old_value = match.group("value").strip()
-                return match.group(0).replace(old_value, f"{float(value):.6g}", 1)
-
-            updated_text, replacements = re.subn(
-                pattern_assignment,
-                _replace,
-                updated_text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-            if replacements == 0:
-                logger.debug("Parameter '%s' not found while applying overrides", name)
-        return updated_text
 
     def _simulate_mechanism(
         self,
@@ -6465,7 +6400,7 @@ class MainWindow(
             if isinstance(meta, dict) and meta.get("type") == "energy":
                 has_energy_overrides = True
                 continue
-            if re.match(r"^(kf|kr|Keq)\d+$", str(var_name)):
+            if isinstance(meta, dict) and meta.get("type") == "equilibrium" and meta.get("role") in {"kf", "kr", "Keq"}:
                 if step_analysis_context is None or step_analysis_context.source_text != text:
                     step_analysis_context = build_current_text_step_analysis_context(
                         text,
@@ -7163,16 +7098,20 @@ class MainWindow(
         else:
             reactions_widget.setPlainText(new_text)
 
-    def _parameter_algebra_spec_for_ui(self, *, mechanism_param_names: set[str]):
+    def _parameter_algebra_spec_for_ui(self):
         from kindred.core.simulator.algebra_section import extract_algebra_section_text
-        from kindred.core.simulator.parameter_namespace import build_flat_compat_namespace
 
         reactions_text = self._mechanism_editor._reactions_text.toPlainText()
         if not extract_algebra_section_text(reactions_text).strip():
             return None
-        from kindred.core.simulator.parameter_algebra import parse_parameter_algebra_spec_from_dsl_text
+        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+        from kindred.core.simulator.parameter_algebra import (
+            mechanism_parameter_namespace,
+            parse_parameter_algebra_spec_from_dsl_text,
+        )
 
-        mechanism_namespace = build_flat_compat_namespace(mechanism_param_names)
+        mechanism = parse_dsl_to_mechanism(str(reactions_text or ""), initials={})
+        mechanism_namespace = mechanism_parameter_namespace(mechanism)
         return parse_parameter_algebra_spec_from_dsl_text(
             str(reactions_text or ""),
             mechanism_namespace=mechanism_namespace,
@@ -7183,10 +7122,9 @@ class MainWindow(
         current = sliders.get_variables()
         if not current:
             return
-        mechanism_param_names = {k for k in current.keys() if re.match(r"^(k|kf|kr|Keq)\d+$", str(k))}
         spec = None
         try:
-            spec = self._parameter_algebra_spec_for_ui(mechanism_param_names=mechanism_param_names)
+            spec = self._parameter_algebra_spec_for_ui()
         except Exception as exc:
             logger.debug("Parameter algebra not applied to sliders: %s", exc)
             spec = None
@@ -7223,8 +7161,6 @@ class MainWindow(
                     continue
                 if str(entry.get("kind") or "") != "equilibrium":
                     continue
-                if not bool(entry.get("has_Keq_param")):
-                    continue
                 try:
                     n = int(entry.get("step_index"))  # type: ignore[arg-type]
                 except Exception as exc:
@@ -7237,6 +7173,31 @@ class MainWindow(
                 K_key = f"Keq{n}"
                 kf_key = f"kf{n}"
                 kr_key = f"kr{n}"
+                if not bool(entry.get("has_Keq_param")):
+                    if kf_key not in current or kr_key not in current:
+                        continue
+                    try:
+                        kf_val = float(current[kf_key])
+                        kr_val = float(current[kr_key])
+                    except Exception as exc:
+                        self._record_best_effort_failure(
+                            "main_window.derived_Keq_readout.live_rate_values",
+                            message=f"Invalid kf/kr value while deriving {K_key}",
+                            exc=exc,
+                        )
+                        continue
+                    if not (math.isfinite(kf_val) and math.isfinite(kr_val) and abs(kr_val) > 1e-30):
+                        continue
+                    K_val = float(kf_val) / float(kr_val)
+                    current[K_key] = K_val
+                    sliders.update_variable_readout(K_key, float(K_val))
+                    meta_map = self._mutable_variable_metadata()
+                    meta = dict(meta_map.get(K_key) or {})
+                    meta["editable"] = False
+                    meta["derived"] = True
+                    meta_map[K_key] = meta
+                    sliders.update_metadata(K_key, meta)
+                    continue
                 if K_key not in current:
                     continue
                 try:
@@ -7648,10 +7609,6 @@ class MainWindow(
             reactions_text = self._apply_overrides_to_text(
                 reactions_text,
                 overrides=non_scalar_values,
-            )
-            reactions_text = self._apply_parameter_overrides_to_dsl(
-                reactions_text,
-                non_scalar_values,
             )
         if scalar_values:
             reactions_text = self._apply_scalar_param_overrides_to_reactions_text(
@@ -8135,6 +8092,7 @@ class MainWindow(
         *,
         source_text: Optional[str] = None,
         commit: bool = True,
+        strict: bool = False,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         step_analysis_context: object | None = None,
     ) -> str:
@@ -8178,11 +8136,17 @@ class MainWindow(
                 step_constraint_context=step_constraint_context,
                 step_analysis_context=step_analysis_context,
             )
-        except ValueError:
+        except ValueError as exc:
+            if strict:
+                raise ValueError(f"Invalid request parameter override {name!r}: {exc}") from exc
             logger.warning("Ignoring invalid step parameter update for %r", name)
             return mechanism_text
 
-        if not outcome.found_target or not outcome.writable or not outcome.would_change_text:
+        if not outcome.found_target or not outcome.writable:
+            if strict:
+                raise ValueError(f"Invalid request parameter override {name!r}.")
+            return mechanism_text
+        if not outcome.would_change_text:
             return mechanism_text
 
         family = str(outcome.parameter_family)
@@ -8336,6 +8300,32 @@ class MainWindow(
             }
             if commit:
                 slider_updates.append((name, float(f"{resolved_values[name]:.6g}"), metadata[name]))
+
+        if commit and family in {"kf", "kr"} and f"Keq{step_index}" not in resolved_values:
+            try:
+                kf_current = float(resolved_values[f"kf{step_index}"])
+                kr_current = float(resolved_values[f"kr{step_index}"])
+            except Exception:
+                kf_current = float("nan")
+                kr_current = float("nan")
+            if math.isfinite(kf_current) and math.isfinite(kr_current) and abs(kr_current) > 1e-30:
+                K_name = f"Keq{step_index}"
+                K_meta = dict(metadata.get(K_name) or {})
+                if K_meta or (sliders is not None and sliders.has_variable(K_name)):
+                    label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
+                    K_meta.update(
+                        {
+                            "type": "equilibrium",
+                            "index": step_index,
+                            "label": K_meta.get("label") or label_text,
+                            "line": line_index,
+                            "role": "Keq",
+                            "editable": False,
+                            "derived": True,
+                        }
+                    )
+                    metadata[K_name] = K_meta
+                    slider_updates.append((K_name, float(f"{(kf_current / kr_current):.6g}"), K_meta))
 
         if not commit:
             return new_text
@@ -8933,10 +8923,6 @@ class MainWindow(
         if not serial_ready:
             self._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
             return
-        try:
-            self._sim_controller.ensure_parallel_batch_pool_eagerly_created(wait=False)
-        except Exception:
-            logger.debug("Failed to schedule visible batch runtime readiness during show event", exc_info=True)
         self._poll_interactive_runtime_readiness_after_refresh()
 
     def _prepare_fit_window_shutdown_for_close(self) -> bool:

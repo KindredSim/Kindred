@@ -15,6 +15,15 @@ from kindred.core.simulator.dsl_text_update import (
 pytestmark = pytest.mark.unit
 
 
+def test_step_constraint_authority_reports_bare_assignment_as_parse_error():
+    context = dsl_text_update.build_current_text_step_analysis_context("foo = 1.0")
+
+    assert context.constraint_analysis_error is not None
+    assert context.constraint_analysis_error.stage == "parse_parameter_algebra_spec"
+    assert "Bare algebra assignment 'foo' is not supported" in context.constraint_analysis_error.message
+    assert context.step_constraint_analysis.scalar_input_names == frozenset()
+
+
 
 def test_apply_parameter_updates_to_dsl_text_reports_canonical_updater_errors():
     source = "reaction: A -> B; k=1.0"
@@ -57,14 +66,14 @@ def test_apply_parameter_updates_to_dsl_text_treats_lookuperror_as_missing():
 
 
 def test_apply_parameter_updates_to_dsl_text_uses_authoritative_parameter_precision():
-    source = "alpha = 1.0\nreaction: A -> B; k=1.0\n"
+    source = "param alpha = 1.0\nreaction: A -> B; k=1.0\n"
 
     updated_text, missing, update_errors = apply_parameter_updates_to_dsl_text(
         source,
         {"alpha": 1000000.1234567},
     )
 
-    assert updated_text == "alpha = 1000000.1234567\nreaction: A -> B; k=1.0\n"
+    assert updated_text == "param alpha = 1000000.1234567\nreaction: A -> B; k=1.0\n"
     assert missing == []
     assert update_errors == []
 
@@ -82,12 +91,12 @@ def test_authoritative_parameter_values_match_treats_signed_zero_as_equal():
 
 def test_authoritative_parameter_formatting_normalizes_signed_zero():
     updated_text, missing, update_errors = apply_parameter_updates_to_dsl_text(
-        "alpha = 1.0\nreaction: A -> B; k=1.0\n",
+        "param alpha = 1.0\nreaction: A -> B; k=1.0\n",
         {"alpha": -0.0},
     )
 
     assert format_authoritative_parameter_value(-0.0) == "0"
-    assert updated_text == "alpha = 0\nreaction: A -> B; k=1.0\n"
+    assert updated_text == "param alpha = 0\nreaction: A -> B; k=1.0\n"
     assert missing == []
     assert update_errors == []
 
@@ -97,7 +106,7 @@ def test_authoritative_parameter_change_name_aware_keeps_scalar_signed_zero_as_n
         "alpha",
         0.0,
         -0.0,
-        source_text="alpha = 0\nreaction: A -> B; k=1.0\n",
+        source_text="param alpha = 0\nreaction: A -> B; k=1.0\n",
     ) is False
 
 
@@ -390,7 +399,6 @@ def test_analyze_step_parameter_update_allows_K_edit_when_constrained_explicit_k
 def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_other_step_algebra_fails():
     source_text = "\n".join(
         [
-            "sin = 2",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -416,7 +424,6 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
     assert outcome.canonicalization_only_change is False
     assert outcome.updated_text == "\n".join(
         [
-            "sin = 2",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -469,17 +476,17 @@ def test_analyze_step_parameter_update_allows_same_step_constrained_K_edit_when_
     assert outcome.warning_reason is None
 
 
-def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when_scalar_name_matches_observable():
+def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when_scalar_and_observable_present():
     from kindred.core.simulator.step_constraint_authority import build_step_constraint_reasons_from_text
 
     reasons = build_step_constraint_reasons_from_text(
         "\n".join(
             [
-                "alpha = 2",
+                "param alpha = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "let alpha = [A]",
+                "let alpha_obs = [A]",
                 "param Keq1 = 5",
             ]
         )
@@ -488,15 +495,15 @@ def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when
     assert reasons["Keq1"] == "algebra"
 
 
-def test_analyze_step_parameter_update_keeps_explicit_k_block_when_scalar_name_matches_observable():
+def test_analyze_step_parameter_update_keeps_explicit_k_block_when_scalar_and_observable_present():
     outcome = analyze_step_parameter_update(
         "\n".join(
             [
-                "alpha = 2",
+                "param alpha = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
-                "let alpha = [A]",
+                "let alpha_obs = [A]",
                 "param Keq1 = 5",
             ]
         ),
@@ -515,13 +522,13 @@ def test_analyze_step_parameter_update_keeps_explicit_k_block_when_scalar_name_m
     assert outcome.warning_reason == "target_unwritable"
 
 
-def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when_unused_builtin_shadow_scalar_input_present():
+def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when_scalar_input_present():
     from kindred.core.simulator.step_constraint_authority import build_step_constraint_reasons_from_text
 
     reasons = build_step_constraint_reasons_from_text(
         "\n".join(
             [
-                "sin = 2",
+                "param scale = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
@@ -533,11 +540,11 @@ def test_build_step_constraint_reasons_from_text_keeps_unrelated_constraint_when
     assert reasons["Keq1"] == "algebra"
 
 
-def test_analyze_step_parameter_update_keeps_explicit_k_block_when_unused_builtin_shadow_scalar_input_present():
+def test_analyze_step_parameter_update_keeps_explicit_k_block_when_scalar_input_present():
     outcome = analyze_step_parameter_update(
         "\n".join(
             [
-                "sin = 2",
+                "param scale = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
@@ -563,7 +570,6 @@ def test_build_current_text_step_analysis_context_records_constraint_analysis_fa
     context = dsl_text_update.build_current_text_step_analysis_context(
         "\n".join(
             [
-                "sin = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
@@ -582,7 +588,6 @@ def test_analyze_step_parameter_update_blocks_when_current_text_constraint_analy
     outcome = analyze_step_parameter_update(
         "\n".join(
             [
-                "sin = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "",
                 "# Algebra",
@@ -608,7 +613,6 @@ def test_build_current_text_step_analysis_context_scopes_constraint_analysis_fai
     context = dsl_text_update.build_current_text_step_analysis_context(
         "\n".join(
             [
-                "sin = 2",
                 "equilibrium: A <-> B ; kf=6, K=3",
                 "equilibrium: B <-> C ; kf=4, K=5",
                 "",
@@ -628,7 +632,6 @@ def test_build_current_text_step_analysis_context_scopes_constraint_analysis_fai
 def test_analyze_step_parameter_update_scopes_current_text_constraint_analysis_failure_per_step():
     source_text = "\n".join(
         [
-            "sin = 2",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -656,7 +659,6 @@ def test_analyze_step_parameter_update_scopes_current_text_constraint_analysis_f
     assert unaffected.warning_reason is None
     assert unaffected.updated_text == "\n".join(
         [
-            "sin = 2",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -893,12 +895,12 @@ def test_analyze_parameter_updates_to_dsl_text_reports_step_floor_as_real_semant
 
 def test_analyze_parameter_updates_to_dsl_text_reports_nonfinite_scalar_input_as_update_error():
     analysis = analyze_parameter_updates_to_dsl_text(
-        "alpha = 1.0\nreaction: A -> B; k=0.2",
+        "param alpha = 1.0\nreaction: A -> B; k=0.2",
         {"alpha": float("nan")},
         authoritative_values={"alpha": 1.0},
     )
 
-    assert analysis.updated_text == "alpha = 1.0\nreaction: A -> B; k=0.2"
+    assert analysis.updated_text == "param alpha = 1.0\nreaction: A -> B; k=0.2"
     assert analysis.missing == ()
     assert analysis.update_errors == (
         {
@@ -943,8 +945,7 @@ def test_analyze_parameter_updates_to_dsl_text_reuses_shared_step_analysis_conte
 def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_step_and_scalar_when_other_step_analysis_fails():
     source_text = "\n".join(
         [
-            "alpha = 1.0",
-            "sin = 2",
+            "param alpha = 1.0",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -961,8 +962,7 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
 
     assert analysis.updated_text == "\n".join(
         [
-            "alpha = 2",
-            "sin = 2",
+            "param alpha = 2",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",
             "",
@@ -982,7 +982,7 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
 def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_step_and_scalar_when_other_step_uses_nonfinite_scalar_input():
     source_text = "\n".join(
         [
-            "alpha = 1.0",
+            "param alpha = 1.0",
             "param a = nan",
             "equilibrium: A <-> B ; kf=6, K=3",
             "equilibrium: B <-> C ; kf=4, K=5",
@@ -1000,7 +1000,7 @@ def test_analyze_parameter_updates_to_dsl_text_best_effort_applies_unrelated_ste
 
     assert analysis.updated_text == "\n".join(
         [
-            "alpha = 2",
+            "param alpha = 2",
             "param a = nan",
             "equilibrium: A <-> B ; kf=6, Keq=8",
             "equilibrium: B <-> C ; kf=4, K=5",

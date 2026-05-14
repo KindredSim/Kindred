@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, ParameterAssignment
+from kindred.core.simulator.parameter_namespace import is_protected_indexed_identifier
 
 from .errors import UnsupportedSymbolicExpressionError
 
@@ -88,11 +89,15 @@ class SymbolicParameterNamespaceContext:
         name_s = str(name)
         if name_s in _PROTECTED_RUNTIME_SYMBOLS:
             raise UnsupportedSymbolicExpressionError(f"Protected runtime symbol {name_s!r} is not supported in symbolic proof.")
-        if name_s in self.scalar_input_names:
-            return name_s
         direct = self.canonical_by_lower.get(name_s.lower())
         if direct is not None:
             return direct
+        if is_protected_indexed_identifier(name_s):
+            raise UnsupportedSymbolicExpressionError(
+                f"Protected indexed mechanism parameter {name_s!r} is not present in the mechanism namespace."
+            )
+        if name_s in self.scalar_input_names:
+            return name_s
         if name_s in self.assignment_names:
             return name_s
         raise UnsupportedSymbolicExpressionError(f"Unknown symbolic identifier {name_s!r}.")

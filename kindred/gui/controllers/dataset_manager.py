@@ -291,149 +291,23 @@ class DatasetManager:
 
         params: List[Dict[str, Any]] = []
 
-        def _as_float(x: object) -> Optional[float]:
-            try:
-                return float(x()) if callable(x) else float(x)
-            except (TypeError, ValueError, OverflowError):
-                return None
-
-        def _as_int(x: object) -> Optional[int]:
-            try:
-                return int(x)
-            except (TypeError, ValueError, OverflowError):
-                return None
-
-        # Canonical step-index parameters from the mechanism step map.
-        step_map = (getattr(mech, "metadata", {}) or {}).get("step_index_map") or []
-        if isinstance(step_map, list) and step_map:
-            rxns = list(getattr(mech, "reactions", []) or [])
-            eqs = list(getattr(mech, "equilibria", []) or [])
-            for entry in step_map:
-                if not isinstance(entry, dict):
-                    continue
-                kind = str(entry.get("kind") or "")
-                n = _as_int(entry.get("step_index"))
-                if n is None:
-                    continue
-                context = str(entry.get("context") or "")
-                has_Keq_param = bool(entry.get("has_Keq_param"))
-                raw_derive_rate = str(entry.get("derive_rate") or "")
-                derive_rate = raw_derive_rate if raw_derive_rate in {"kf", "kr"} else ("kr" if has_Keq_param else "")
-
-                if kind == "reaction":
-                    name = f"k{n}"
-                    if name in constrained:
-                        continue
-                    idx = _as_int(entry.get("reaction_index", -1))
-                    if idx is None:
-                        continue
-                    if not (0 <= idx < len(rxns)):
-                        continue
-                    value = _as_float(getattr(rxns[idx], "rate", None))
-                    if value is None:
-                        continue
-                    min_bound, max_bound = self._suggest_parameter_bounds(name, value)
-                    params.append(
-                        {
-                            "name": name,
-                            "value": value,
-                            "min": min_bound,
-                            "max": max_bound,
-                            "context": context,
-                            "source": "Rate constant",
-                        }
-                    )
-                elif kind == "equilibrium":
-                    idx = _as_int(entry.get("equilibrium_index", -1))
-                    if idx is None:
-                        continue
-                    if not (0 <= idx < len(eqs)):
-                        continue
-                    eq = eqs[idx]
-
-                    # kfN
-                    kf_name = f"kf{n}"
-                    if kf_name not in constrained and derive_rate != "kf":
-                        val = _as_float(getattr(eq, "kf", None))
-                        if val is not None:
-                            mn, mx = self._suggest_parameter_bounds(kf_name, val)
-                            params.append(
-                                {
-                                    "name": kf_name,
-                                    "value": val,
-                                    "min": mn,
-                                    "max": mx,
-                                    "context": context,
-                                    "source": "Forward rate",
-                                }
-                            )
-
-                    # krN
-                    kr_name = f"kr{n}"
-                    if kr_name not in constrained and derive_rate != "kr":
-                        val = _as_float(getattr(eq, "kr", None))
-                        if val is not None:
-                            mn, mx = self._suggest_parameter_bounds(kr_name, val)
-                            params.append(
-                                {
-                                    "name": kr_name,
-                                    "value": val,
-                                    "min": mn,
-                                    "max": mx,
-                                    "context": context,
-                                    "source": "Reverse rate",
-                                }
-                            )
-
-                    # Show KeqN only when the source explicitly represents it or algebra uses it.
-                    if has_Keq_param:
-                        Keq_name = f"Keq{n}"
-                        if Keq_name not in constrained:
-                            meta = getattr(eq, "metadata", {}) or {}
-                            val = _as_float(meta.get("Keq_input"))
-                            if val is not None:
-                                mn, mx = self._suggest_parameter_bounds(Keq_name, val)
-                                params.append(
-                                    {
-                                        "name": Keq_name,
-                                        "value": val,
-                                        "min": mn,
-                                        "max": mx,
-                                        "context": context,
-                                        "source": "Equilibrium constant",
-                                    }
-                                )
-        else:
-            # Fallback: use DSL extraction when structured parameter metadata is unavailable.
-            parameter_defs = extract_parameters_from_dsl(cleaned)
-            for definition in parameter_defs:
-                name = definition.name
-                step_index = getattr(definition, "step_index", None)
-                match = re.match(r"^(kf|kr|Keq|k)\d*$", str(name))
-                if match and step_index is not None:
-                    family = match.group(1)
-                    context_str = str(definition.context)
-                    is_equilibrium = "<->" in context_str or "<=>" in context_str
-                    if family == "k" and is_equilibrium:
-                        family = "kf"
-                    elif family == "kf" and not is_equilibrium:
-                        family = "k"
-                    elif family in {"kr", "Keq"} and not is_equilibrium:
-                        family = "k"
-                    name = f"{family}{int(step_index)}"
-                if str(name) in constrained:
-                    continue
-                min_bound, max_bound = self._suggest_parameter_bounds(name, definition.value)
-                params.append(
-                    {
-                        "name": name,
-                        "value": definition.value,
-                        "min": min_bound,
-                        "max": max_bound,
-                        "context": definition.context,
-                        "source": definition.source,
-                    }
-                )
+        for definition in extract_parameters_from_dsl(cleaned):
+            if getattr(definition, "editable", True) is False:
+                continue
+            name = definition.name
+            if str(name) in constrained:
+                continue
+            min_bound, max_bound = self._suggest_parameter_bounds(name, definition.value)
+            params.append(
+                {
+                    "name": name,
+                    "value": definition.value,
+                    "min": min_bound,
+                    "max": max_bound,
+                    "context": definition.context,
+                    "source": definition.source,
+                }
+            )
 
         # Add scalar base parameters (editable, dimensionless by default).
         for name, value in scalar_params.items():

@@ -11,7 +11,10 @@ import numpy as np
 from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.rate_binding import RateBinding
-from kindred.core.simulator.parameter_namespace import canonical_name_for_mechanism_step_parameter
+from kindred.core.simulator.parameter_namespace import (
+    build_namespace_from_mechanism,
+    canonical_name_for_mechanism_step_parameter,
+)
 
 from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
 from .backend import get_symbolic_backend_metadata, require_sympy
@@ -105,7 +108,7 @@ class _ParameterRegistry:
         self._values: dict[str, float] = {}
 
     def parameter(self, value: object, *, label: str, default_name: str) -> Any:
-        name = str(getattr(value, "name", None) or default_name or label).strip()
+        name = str(default_name or getattr(value, "name", None) or label).strip()
         if not name:
             name = str(default_name or label)
         scalar = _finite_scalar(value, label=label)
@@ -136,19 +139,32 @@ def _canonical_step_parameter_name(
     kind: str,
     item_index: int,
     role: str,
-    fallback_name: str,
+    expected_name: str,
     value: object = None,
 ) -> str:
-    explicit_name = str(getattr(value, "name", None) or "").strip()
-    if explicit_name:
-        return explicit_name
-    return canonical_name_for_mechanism_step_parameter(
+    canonical_name = canonical_name_for_mechanism_step_parameter(
         mechanism,
         kind=kind,
         item_index=int(item_index),
         role=role,
-        fallback_name=str(fallback_name),
+        expected_name=str(expected_name),
     )
+    explicit_name = str(getattr(value, "name", None) or "").strip()
+    if explicit_name:
+        namespace = build_namespace_from_mechanism(mechanism)
+        resolution = namespace.resolve(explicit_name)
+        if resolution.canonical_name is not None:
+            resolved = str(resolution.canonical_name)
+            if resolved != canonical_name:
+                raise UnsupportedSymbolicExpressionError(
+                    f"Symbolic Jacobian binding name {explicit_name!r} resolves to {resolved!r}, "
+                    f"but this step parameter is {canonical_name!r}."
+                )
+            return resolved
+        invalid_message = namespace.invalid_protected_indexed_identifier_message(explicit_name)
+        if invalid_message is not None:
+            raise UnsupportedSymbolicExpressionError(invalid_message)
+    return canonical_name
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -235,11 +251,18 @@ def _reaction_rate_expr(
             kind="reaction",
             item_index=int(reaction_index),
             role="k",
-            fallback_name=f"k{int(reaction_index) + 1}",
+            expected_name=f"k{int(reaction_index) + 1}",
             value=rate_value,
         ),
     )
     return rate * _power_product(sympy, symbols, getattr(rxn, "rate_orders", {}) or {})
+
+
+def _explicit_keq_source(eq: Equilibrium) -> object | None:
+    meta = getattr(eq, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
+        return meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+    return None
 
 
 def _equilibrium_rates(
@@ -251,13 +274,13 @@ def _equilibrium_rates(
 ) -> tuple[Any, Any]:
     kf = getattr(eq, "kf", None)
     kr = getattr(eq, "kr", None)
-    keq = getattr(eq, "Keq", None)
+    keq = _explicit_keq_source(eq)
     kf_name = _canonical_step_parameter_name(
         mechanism,
         kind="equilibrium",
         item_index=int(equilibrium_index),
         role="kf",
-        fallback_name=f"kf{int(equilibrium_index) + 1}",
+        expected_name=f"kf{int(equilibrium_index) + 1}",
         value=kf,
     )
     kr_name = _canonical_step_parameter_name(
@@ -265,7 +288,7 @@ def _equilibrium_rates(
         kind="equilibrium",
         item_index=int(equilibrium_index),
         role="kr",
-        fallback_name=f"kr{int(equilibrium_index) + 1}",
+        expected_name=f"kr{int(equilibrium_index) + 1}",
         value=kr,
     )
     keq_name = _canonical_step_parameter_name(
@@ -273,7 +296,7 @@ def _equilibrium_rates(
         kind="equilibrium",
         item_index=int(equilibrium_index),
         role="Keq",
-        fallback_name=f"Keq{int(equilibrium_index) + 1}",
+        expected_name=f"Keq{int(equilibrium_index) + 1}",
         value=keq,
     )
     if kf is None and kr is not None and keq is not None:
@@ -378,7 +401,7 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
         meta = dict(getattr(eq, "metadata", {}) or {})
         kf = getattr(eq, "kf", None)
         kr = getattr(eq, "kr", None)
-        keq = getattr(eq, "Keq", None)
+        keq = _explicit_keq_source(eq)
         keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
         kf_kind = _symbolic_snapshot_value_kind(kf) if kf is not None else "missing"
         kr_kind = _symbolic_snapshot_value_kind(kr) if kr is not None else "missing"
@@ -422,7 +445,9 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
             supported_pair = kr_kind == "snapshot_scalar" and keq_kind == "snapshot_scalar"
         if not supported_pair:
             unsupported_code = "unsupported-equilibrium-parameters"
-            unsupported_reason = f"Symbolic Jacobian is missing finite equilibrium parameters for equilibrium {idx}."
+            unsupported_reason = (
+                f"Symbolic Jacobian is missing finite equilibrium parameters, including Keq, for equilibrium {idx}."
+            )
             continue
         if keq is not None and keq_kind == "snapshot_scalar":
             keq_scalar = _symbolic_snapshot_scalar_value(keq)
@@ -464,7 +489,7 @@ def _structure_identity_payload(
                     kind="reaction",
                     item_index=idx - 1,
                     role="k",
-                    fallback_name=f"k{idx}",
+                    expected_name=f"k{idx}",
                     value=rate,
                 ),
             }
@@ -481,7 +506,7 @@ def _structure_identity_payload(
                     kind="equilibrium",
                     item_index=idx - 1,
                     role="kf",
-                    fallback_name=f"kf{idx}",
+                    expected_name=f"kf{idx}",
                     value=getattr(eq, "kf", None),
                 ) if getattr(eq, "kf", None) is not None else None,
                 "kr_parameter": _canonical_step_parameter_name(
@@ -489,7 +514,7 @@ def _structure_identity_payload(
                     kind="equilibrium",
                     item_index=idx - 1,
                     role="kr",
-                    fallback_name=f"kr{idx}",
+                    expected_name=f"kr{idx}",
                     value=getattr(eq, "kr", None),
                 ) if getattr(eq, "kr", None) is not None else None,
                 "keq_parameter": _canonical_step_parameter_name(
@@ -497,9 +522,9 @@ def _structure_identity_payload(
                     kind="equilibrium",
                     item_index=idx - 1,
                     role="Keq",
-                    fallback_name=f"Keq{idx}",
-                    value=getattr(eq, "Keq", None),
-                ) if getattr(eq, "Keq", None) is not None else None,
+                    expected_name=f"Keq{idx}",
+                    value=_explicit_keq_source(eq),
+                ) if _explicit_keq_source(eq) is not None else None,
             }
         )
     return {
@@ -521,20 +546,20 @@ def _structure_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
                 kind="reaction",
                 item_index=int(reaction_index),
                 role="k",
-                fallback_name=f"k{int(reaction_index) + 1}",
+                expected_name=f"k{int(reaction_index) + 1}",
                 value=rate,
             )
         )
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         kf = getattr(eq, "kf", None)
         kr = getattr(eq, "kr", None)
-        keq = getattr(eq, "Keq", None)
+        keq = _explicit_keq_source(eq)
         kf_name = _canonical_step_parameter_name(
             mechanism,
             kind="equilibrium",
             item_index=int(equilibrium_index),
             role="kf",
-            fallback_name=f"kf{int(equilibrium_index) + 1}",
+            expected_name=f"kf{int(equilibrium_index) + 1}",
             value=kf,
         )
         kr_name = _canonical_step_parameter_name(
@@ -542,7 +567,7 @@ def _structure_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
             kind="equilibrium",
             item_index=int(equilibrium_index),
             role="kr",
-            fallback_name=f"kr{int(equilibrium_index) + 1}",
+            expected_name=f"kr{int(equilibrium_index) + 1}",
             value=kr,
         )
         keq_name = _canonical_step_parameter_name(
@@ -550,7 +575,7 @@ def _structure_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
             kind="equilibrium",
             item_index=int(equilibrium_index),
             role="Keq",
-            fallback_name=f"Keq{int(equilibrium_index) + 1}",
+            expected_name=f"Keq{int(equilibrium_index) + 1}",
             value=keq,
         )
         if kf is None and kr is not None and keq is not None:
@@ -577,20 +602,20 @@ def _parameter_values_for_mechanism(
             kind="reaction",
             item_index=int(reaction_index),
             role="k",
-            fallback_name=f"k{int(reaction_index) + 1}",
+            expected_name=f"k{int(reaction_index) + 1}",
             value=rate,
         )
         values[name] = _finite_scalar(rate, label=f"symbolic parameter {name}")
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         kf = getattr(eq, "kf", None)
         kr = getattr(eq, "kr", None)
-        keq = getattr(eq, "Keq", None)
+        keq = _explicit_keq_source(eq)
         kf_name = _canonical_step_parameter_name(
             mechanism,
             kind="equilibrium",
             item_index=int(equilibrium_index),
             role="kf",
-            fallback_name=f"kf{int(equilibrium_index) + 1}",
+            expected_name=f"kf{int(equilibrium_index) + 1}",
             value=kf,
         )
         kr_name = _canonical_step_parameter_name(
@@ -598,7 +623,7 @@ def _parameter_values_for_mechanism(
             kind="equilibrium",
             item_index=int(equilibrium_index),
             role="kr",
-            fallback_name=f"kr{int(equilibrium_index) + 1}",
+            expected_name=f"kr{int(equilibrium_index) + 1}",
             value=kr,
         )
         keq_name = _canonical_step_parameter_name(
@@ -606,7 +631,7 @@ def _parameter_values_for_mechanism(
             kind="equilibrium",
             item_index=int(equilibrium_index),
             role="Keq",
-            fallback_name=f"Keq{int(equilibrium_index) + 1}",
+            expected_name=f"Keq{int(equilibrium_index) + 1}",
             value=keq,
         )
         if kf is None and kr is not None and keq is not None:

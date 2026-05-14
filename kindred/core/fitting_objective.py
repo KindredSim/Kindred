@@ -20,6 +20,8 @@ from kindred.core.objective import ObjectiveContext, ObjectiveWrapper
 from kindred.core.runtime_defaults import WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT
 from kindred.core.simulation_preparation import (
     PreparedFittingObjectiveContext,
+    SimulationPreparationError,
+    materialize_request_intervention_schedule_for_parameter_values,
     prepare_fitting_objective_context,
 )
 from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
@@ -141,9 +143,25 @@ def build_prepared_fitting_objective(
         try:
             _update_parameter_bindings(prepared, param_values, param_state)
             parameter_algebra_policy(param_state)
-            result = solve_request(prepared.request, param_values)
+            request = materialize_request_intervention_schedule_for_parameter_values(
+                mechanism=prepared.bound.mechanism,
+                request=prepared.request,
+                unresolved_intervention_schedule=prepared.unresolved_intervention_schedule,
+                parameter_values=param_state,
+                species_names=prepared.bound.species_names,
+                runtime_parameter_names=prepared.bound.bindings.keys(),
+            )
+            result = solve_request(request, param_values)
         except (FittingCancelled, SimulationCancelled) as exc:
             raise FittingCancelled() from exc
+        except SimulationPreparationError as exc:
+            err = FitSimulationError(
+                str(exc),
+                failed_params=param_state,
+                details={"fatal": True, "stage": exc.stage},
+            )
+            _record_error(err)
+            raise err from exc
         except FitSimulationError as exc:
             _record_error(exc)
             raise

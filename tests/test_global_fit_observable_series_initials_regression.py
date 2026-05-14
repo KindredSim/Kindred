@@ -41,8 +41,6 @@ def test_global_fit_does_not_require_initials_for_derived_series(main_window, mo
         )
     )
 
-    # Keep setup deterministic and avoid reliance on slider variable metadata.
-    monkeypatch.setattr(main_window, "_apply_parameter_overrides_to_dsl", lambda mech, _params: mech)
     monkeypatch.setattr(
         type(main_window),
         "_extract_mechanism_initials",

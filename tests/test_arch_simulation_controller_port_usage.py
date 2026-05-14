@@ -211,7 +211,6 @@ REMAINING_SOLVER_TARGET_METHODS = {
 MECHANISM_TARGET_METHODS = {
     "slider_overrides",
     "variable_slider_values",
-    "apply_parameter_overrides_to_dsl",
     "auto_lock_for_run",
     "is_mechanism_ready_for_run",
     "mechanism_reactions_text_raw",
@@ -1096,7 +1095,6 @@ def test_simulation_run_preparation_owners_use_explicit_ports(
             "_serial_batch_dispatch_state",
             {
                 "slider_overrides",
-                "apply_parameter_overrides_to_dsl",
             },
         ),
         ("_start_next_batch_simulation", set()),

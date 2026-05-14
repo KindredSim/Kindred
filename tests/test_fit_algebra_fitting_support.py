@@ -32,7 +32,7 @@ def test_prepared_simulation_emits_algebra_observables(monkeypatch):
             "initial: A=1.0",
             "initial: B=0.0",
             "# Algebra",
-            "total = [A] + [B]",
+            "let total = [A] + [B]",
         ]
     )
     prepared = build_prepared_simulation_func(
@@ -53,6 +53,35 @@ def test_prepared_simulation_emits_algebra_observables(monkeypatch):
     assert sim["species"]["total"].shape == np.asarray(sim["t"]).shape
 
 
+def test_prepared_simulation_rejects_unowned_shared_parameter(monkeypatch):
+    monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve_constant)
+
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.simulation_preparation import build_prepared_simulation_func
+
+    prepared = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        use_sparse_jacobian=False,
+        initial_prefix="init:",
+    )
+
+    with pytest.raises(FitSimulationError, match="ghost"):
+        prepared({"k1": 0.2, "ghost": 1.0})
+
+
 def test_prepared_simulation_algebra_initial_reflects_init_override(monkeypatch):
     monkeypatch.setattr("kindred.core.simulator.solvers.solve_ode", _fake_solve_constant)
 
@@ -64,7 +93,7 @@ def test_prepared_simulation_algebra_initial_reflects_init_override(monkeypatch)
             "initial: A=2.0",
             "initial: B=0.0",
             "# Algebra",
-            "A0 = [A]_0 + 0*[A]",
+            "let A0 = [A]_0 + 0*[A]",
         ]
     )
     prepared = build_prepared_simulation_func(
@@ -96,7 +125,7 @@ def test_prepared_simulation_algebra_sees_scalar_param(monkeypatch):
             "initial: B=0.0",
             "# Algebra",
             "param a = 2",
-            "obs = a * [A]",
+            "let obs = a * [A]",
         ]
     )
     prepared = build_prepared_simulation_func(
@@ -118,6 +147,71 @@ def test_prepared_simulation_algebra_sees_scalar_param(monkeypatch):
     assert np.allclose(sim3["species"]["obs"], 3.0)
 
 
+def test_prepared_simulation_resolves_ordinary_schedule_parameter_per_candidate(monkeypatch):
+    seen_amounts: list[float] = []
+
+    def _recording_solve(request):
+        schedule = getattr(request, "intervention_schedule", None)
+        seen_amounts.append(float(schedule.to_payload()["instant_events"][0]["amount"]))
+        return _fake_solve_constant(request)
+
+    monkeypatch.setattr("kindred.core.simulation_preparation._solve_request", _recording_solve)
+
+    from kindred.core.simulation_preparation import build_prepared_simulation_func
+
+    dsl = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose",
+        ]
+    )
+    prepared = build_prepared_simulation_func(
+        mechanism_text=dsl,
+        param_names=["dose"],
+        t_end=2.0,
+        num_points=3,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    prepared({"dose": 1.0})
+    prepared({"dose": 3.0})
+
+    assert seen_amounts == pytest.approx([1.0, 3.0])
+
+
+@pytest.mark.parametrize("name", ["K999", "kf999", "kr999", "Keq999"])
+def test_prepared_simulation_rejects_unknown_protected_indexed_parameter(name):
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.simulation_preparation import build_prepared_simulation_func
+
+    prepared = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.2",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        param_names=[],
+        t_end=1.0,
+        num_points=3,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    with pytest.raises(FitSimulationError, match=name):
+        prepared({name: 1.0})
+
+
 def test_prepared_simulation_uses_patched_solver_after_module_import(monkeypatch):
     import kindred.core.simulation_preparation as simulation_preparation
 
@@ -131,7 +225,7 @@ def test_prepared_simulation_uses_patched_solver_after_module_import(monkeypatch
                 "initial: B=0.0",
                 "# Algebra",
                 "param a = 2",
-                "obs = a * [A]",
+                "let obs = a * [A]",
             ]
         ),
         param_names=["k1"],
@@ -161,7 +255,7 @@ def test_prepared_simulation_rejects_baseline_time_refs_for_fitting(monkeypatch)
             "initial: A=1.0",
             "initial: B=0.0",
             "# Algebra",
-            "bad = [A](T0)",
+            "let bad = [A](T0)",
         ]
     )
     prepared = build_prepared_simulation_func(
@@ -201,7 +295,7 @@ def test_prepared_simulation_parses_dsl_once_even_with_algebra(monkeypatch):
             "initial: A=1.0",
             "initial: B=0.0",
             "# Algebra",
-            "total = [A] + [B]",
+            "let total = [A] + [B]",
         ]
     )
     prepared = build_prepared_simulation_func(
@@ -235,7 +329,7 @@ def test_local_fitting_objective_accepts_algebra_target(monkeypatch):
             "initial: A=1.0",
             "initial: B=0.0",
             "# Algebra",
-            "total = [A] + [B]",
+            "let total = [A] + [B]",
         ]
     )
     t_exp = np.linspace(0.0, 1.0, 6)

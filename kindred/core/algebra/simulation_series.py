@@ -15,8 +15,27 @@ from kindred.core.algebra.evaluator import (
     evaluate_block,
     evaluate_block_partial,
 )
-from kindred.core.algebra.parser import AlgebraBlock, LetStatement, parse_algebra
+from kindred.core.algebra.parser import (
+    AlgebraBlock,
+    BinaryNode,
+    CallNode,
+    ExprNode,
+    IdentNode,
+    LetStatement,
+    SpeciesRefNode,
+    UnaryNode,
+    parse_algebra,
+)
+from kindred.core.algebra.identifier_canonicalization import canonicalize_algebra_block
+from kindred.core.algebra.printer import algebra_block_to_source
 from kindred.core.algebra.symbol_table import build_algebra_symbol_table
+from kindred.core.simulator.parameter_algebra_spec import (
+    classify_parameter_algebra_declaration,
+    invalid_parameter_algebra_identifier_reference_message,
+    is_protected_indexed_parameter_identifier,
+    is_protected_step_key_identifier,
+)
+from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +48,41 @@ __all__ = [
 ]
 
 
+def _iter_identifiers(expr: ExprNode):
+    if isinstance(expr, IdentNode):
+        yield str(expr.name)
+        return
+    if isinstance(expr, SpeciesRefNode):
+        return
+    if isinstance(expr, UnaryNode):
+        yield from _iter_identifiers(expr.rhs)
+        return
+    if isinstance(expr, BinaryNode):
+        yield from _iter_identifiers(expr.lhs)
+        yield from _iter_identifiers(expr.rhs)
+        return
+    if isinstance(expr, CallNode):
+        for arg in expr.args:
+            yield from _iter_identifiers(arg)
+        return
+
+
+def _reject_invalid_identifier_references(
+    block: AlgebraBlock,
+    *,
+    mechanism_namespace: MechanismParameterNamespace | None = None,
+) -> None:
+    for stmt in block.lines:
+        for name in sorted(set(_iter_identifiers(stmt.expr))):
+            message = invalid_parameter_algebra_identifier_reference_message(
+                name,
+                mechanism_namespace=mechanism_namespace,
+                reject_unresolved_protected_indexed=mechanism_namespace is None,
+            )
+            if message is not None:
+                raise ValueError(message)
+
+
 @dataclass(frozen=True)
 class CompiledAlgebraSeries:
     """Pre-parsed algebra observables for repeated evaluation."""
@@ -39,7 +93,11 @@ class CompiledAlgebraSeries:
     time_ref_statements: Tuple[LetStatement, ...]
 
 
-def _preprocess_algebra_text(algebra_text: str) -> str:
+def _preprocess_algebra_text(
+    algebra_text: str,
+    *,
+    mechanism_namespace: MechanismParameterNamespace | None = None,
+) -> str:
     algebra_lines_raw = str(algebra_text).strip().split("\n")
     algebra_lines_processed = ["# Algebra"]
     for line in algebra_lines_raw:
@@ -58,18 +116,47 @@ def _preprocess_algebra_text(algebra_text: str) -> str:
                         break
             if not code_part:
                 continue
-            if code_part.lower().startswith("param "):
+            classification = classify_parameter_algebra_declaration(
+                code_part,
+                mechanism_namespace=mechanism_namespace,
+                allow_non_algebra_bare_assignment=False,
+            )
+            if classification.kind == "param":
                 continue
-            if code_part.startswith("let "):
+            if classification.kind == "let":
+                if is_protected_indexed_parameter_identifier(classification.raw_name):
+                    raise ValueError(
+                        f"{classification.raw_name!r} is a protected indexed parameter identifier "
+                        "and cannot be declared as an observable."
+                    )
+                if is_protected_step_key_identifier(classification.raw_name):
+                    raise ValueError(
+                        f"{classification.raw_name!r} is a step-local DSL key "
+                        "and cannot be declared as an observable."
+                    )
                 algebra_lines_processed.append(code_part)
-            else:
-                algebra_lines_processed.append(f"let {code_part}")
+                continue
+            if classification.kind == "invalid_step_key_identifier":
+                raise ValueError(
+                    f"{classification.raw_name!r} is a step-local DSL key "
+                    "and cannot be declared as an observable."
+                )
+            if classification.kind == "unsupported_bare_assignment":
+                raise ValueError(
+                    f"Bare algebra assignment {classification.raw_name!r} is not supported. "
+                    "Use 'let name = expr' or 'param name = expr'."
+                )
+            algebra_lines_processed.append(code_part)
         elif stripped:
             algebra_lines_processed.append(stripped)
     return "\n".join(algebra_lines_processed) + "\n"
 
 
-def compile_algebra_observables(algebra_text: str) -> CompiledAlgebraSeries:
+def compile_algebra_observables(
+    algebra_text: str,
+    *,
+    mechanism_namespace: MechanismParameterNamespace | None = None,
+) -> CompiledAlgebraSeries:
     """
     Compile the Algebra observables block once for repeated evaluation.
 
@@ -79,8 +166,12 @@ def compile_algebra_observables(algebra_text: str) -> CompiledAlgebraSeries:
     - Baseline time references ([A](T0)) are *not* rejected here; fitting callers
       should enforce any additional constraints.
     """
-    processed = _preprocess_algebra_text(str(algebra_text))
+    processed = _preprocess_algebra_text(str(algebra_text), mechanism_namespace=mechanism_namespace)
     algebra_block = parse_algebra(processed)
+    if mechanism_namespace is not None:
+        algebra_block = canonicalize_algebra_block(algebra_block, mechanism_namespace=mechanism_namespace)
+        processed = algebra_block_to_source(algebra_block)
+    _reject_invalid_identifier_references(algebra_block, mechanism_namespace=mechanism_namespace)
     observable_names = tuple(str(stmt.name) for stmt in (algebra_block.lines or []))
     time_ref_stmts = tuple(stmt for stmt in (algebra_block.lines or []) if stmt.expr.has_time_ref())
     return CompiledAlgebraSeries(
@@ -238,7 +329,12 @@ def evaluate_algebra_series_for_simulation_with_errors(
         return {}, {}, []
 
     try:
-        compiled = compile_algebra_observables(str(algebra_text))
+        from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+        compiled = compile_algebra_observables(
+            str(algebra_text),
+            mechanism_namespace=build_namespace_from_mechanism(mechanism),
+        )
     except Exception as exc:
         return {}, {}, [_error_from_exception("__parse__", exc)]
 

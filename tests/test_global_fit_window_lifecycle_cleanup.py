@@ -88,7 +88,7 @@ def _make_detail_section(*, dataset_id: str | None = None, message: str, stack_t
     )
 
 
-def _build_success_result(*, dataset_id: str = "ds1", param_name: str = "k", value: float = 1.0) -> GlobalFitResult:
+def _build_success_result(*, dataset_id: str = "ds1", param_name: str = "k1", value: float = 1.0) -> GlobalFitResult:
     model = np.asarray([1.0, 0.8, 0.6], dtype=float)
     return GlobalFitResult(
         shared_params={str(param_name): float(value)},
@@ -123,7 +123,7 @@ def _build_completion_result(
     status: str,
     optimizer_converged: bool | None = None,
     dataset_id: str = "ds1",
-    param_name: str = "k",
+    param_name: str = "k1",
     value: float = 1.0,
     message: str | None = None,
 ) -> GlobalFitResult:
@@ -170,7 +170,7 @@ def _build_window(
             return {"t": np.asarray([0.0, 1.0, 2.0]), "species": {"A": np.asarray([1.0, 0.8, 0.6])}}
     return FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=list(dataset_entries),
         dataset_payloads=list(dataset_payloads),
         mechanism_species=["A"],
@@ -181,7 +181,7 @@ def _build_window(
 def _build_dataset_variable_window(*, simulation_func=None) -> FittingWindow:
     return FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_variable_params={
             "ds1": {
                 "init:A": {
@@ -227,7 +227,7 @@ def _basic_serial_fitting_evaluator(*, solver: str = "BDF", rtol: float = 1e-6, 
 
     context = prepare_fitting_execution_context(
         mechanism_text=_basic_mechanism_text(),
-        param_names=["k"],
+        param_names=["k1"],
         t_end=2.0,
         num_points=3,
         solver=str(solver),
@@ -381,7 +381,7 @@ def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
     )
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -437,7 +437,7 @@ def test_fit_runtime_readiness_accepts_infinite_bounds_for_non_de_methods(qt_app
         identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
 
         assert identity is not None
-        assert identity.config["bounds"]["k"] == (float("-inf"), float("inf"))
+        assert identity.config["bounds"]["k1"] == (float("-inf"), float("inf"))
     finally:
         window.close()
         qt_app.processEvents()
@@ -681,7 +681,7 @@ def test_explicit_parameter_collection_rejects_nonfinite_initial_value(qt_app, m
         table.item(0, 5).setText("inf")
 
         assert window._params_ics_tab.collect_parameter_config() is None
-        assert warnings == [("Invalid Parameter", "Parameter 'k' initial value must be finite.")]
+        assert warnings == [("Invalid Parameter", "Parameter 'k1' initial value must be finite.")]
     finally:
         window.close()
         qt_app.processEvents()
@@ -727,7 +727,7 @@ def test_fit_runtime_readiness_ignores_de_infinite_dataset_bounds_for_excluded_d
     ]
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_variable_params={
             "ds1": {
                 "init:A": {"initial": 1.0, "min": 0.1, "max": 10.0, "log10": False},
@@ -776,11 +776,11 @@ def test_passive_mechanism_refresh_does_not_reenter_identity_build(qt_app, monke
         def scan_mechanism_parameters(mechanism_text: str) -> list[dict[str, object]]:
             if "A -> C" in str(mechanism_text):
                 return [{"name": "k2", "value": 0.4, "min": 0.0, "max": 1.0}]
-            return [{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}]
+            return [{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}]
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -900,7 +900,7 @@ def test_passive_fit_runtime_preparation_builds_evaluator_off_gui_thread(
     )
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -1213,7 +1213,7 @@ def test_close_retries_fit_runtime_completion_when_worker_is_still_unwinding(qt_
 def test_fit_runtime_identity_defensively_copies_mutable_inputs():
     from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
 
-    config = {"parameters": {"k": 1.0}}
+    config = {"parameters": {"k1": 1.0}}
     weights = {"ds1": 1.0}
     stamp = {"algorithm": {"method": "trf"}}
 
@@ -1232,11 +1232,11 @@ def test_fit_runtime_identity_defensively_copies_mutable_inputs():
         lane_count=1,
     )
 
-    config["parameters"]["k"] = 2.0
+    config["parameters"]["k1"] = 2.0
     weights["ds1"] = 3.0
     stamp["algorithm"]["method"] = "lm"
 
-    assert identity.config["parameters"]["k"] == 1.0
+    assert identity.config["parameters"]["k1"] == 1.0
     assert identity.weights == {"ds1": 1.0}
     assert identity.stamp["algorithm"]["method"] == "trf"
 
@@ -1312,7 +1312,7 @@ def test_fit_runtime_preparation_failure_is_visible_in_window(qt_app, qtbot):
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -1364,7 +1364,7 @@ def test_worker_rejects_missing_required_fit_runtime_session(qt_app):
         window.close()
     worker = GlobalFitWorker(
         [dataset],
-        {"k": 1.0},
+        {"k1": 1.0},
         fit_evaluator=_basic_serial_fitting_evaluator(),
         fit_runtime_session=None,
         fit_runtime_max_lanes=1,
@@ -1681,7 +1681,7 @@ def test_global_fit_window_deletes_worker_after_run(qt_app, qtbot):
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=dataset_entries,
         dataset_payloads=dataset_payloads,
         mechanism_species=["A"],
@@ -1776,8 +1776,8 @@ def test_stale_finished_from_older_fit_worker_does_not_clear_newer_worker(qt_app
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -1856,7 +1856,7 @@ def test_serial_fit_worker_start_requires_accepted_launch_even_with_ready_snapsh
         evaluator = _basic_serial_fitting_evaluator()
         identity = FittingRuntimeIdentity(
             datasets=(),
-            config={"parameters": {"k": 1.0}},
+            config={"parameters": {"k1": 1.0}},
             dataset_overrides=(),
             weights=None,
             requested_solver="BDF",
@@ -1896,8 +1896,8 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -1939,14 +1939,14 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
             stamp_short="new",
         )
         new_worker = workers[-1]
-        window._params_ics_tab.set_last_fit_params({"k": 77.0})
+        window._params_ics_tab.set_last_fit_params({"k1": 77.0})
         window._best_cost = 123.0
         window._status_label.setText("Running newer fit")
 
         old_worker.bestUpdated.emit(
             {
                 "cost": 9.0,
-                "shared_params": {"k": 0.1},
+                "shared_params": {"k1": 0.1},
                 "dataset_params": {"ds1": {}},
                 "model_series": {},
                 "dataset_stats": {},
@@ -1955,7 +1955,7 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
         window._apply_pending_best_update()
 
         assert window._worker is new_worker
-        assert window._params_ics_tab.get_last_fit_params() == {"k": 77.0}
+        assert window._params_ics_tab.get_last_fit_params() == {"k1": 77.0}
         assert window._best_cost == 123.0
         assert window._status_label.text() == "Running newer fit"
 
@@ -1983,8 +1983,8 @@ def test_stale_terminal_payload_after_newer_completion_is_rejected_by_run_stamp(
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -2035,7 +2035,7 @@ def test_stale_terminal_payload_after_newer_completion_is_rejected_by_run_stamp(
             }
         )
         assert window._worker is None
-        assert window._last_result.shared_params == {"k": 2.0}
+        assert window._last_result.shared_params == {"k1": 2.0}
 
         old_worker.finished.emit(
             {
@@ -2044,7 +2044,7 @@ def test_stale_terminal_payload_after_newer_completion_is_rejected_by_run_stamp(
             }
         )
 
-        assert window._last_result.shared_params == {"k": 2.0}
+        assert window._last_result.shared_params == {"k1": 2.0}
     finally:
         window.close()
 
@@ -2079,8 +2079,8 @@ def test_runtime_input_change_supersedes_active_fit_worker_outputs(qt_app, monke
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -2114,7 +2114,7 @@ def test_runtime_input_change_supersedes_active_fit_worker_outputs(qt_app, monke
         assert window.fit_run_state_owner.active_run_stamp_hash == ""
         assert window._run_button.isEnabled() is False
 
-        worker.bestUpdated.emit({"cost": 99.0, "shared_params": {"k": 99.0}, "dataset_params": {"ds1": {}}})
+        worker.bestUpdated.emit({"cost": 99.0, "shared_params": {"k1": 99.0}, "dataset_params": {"ds1": {}}})
         worker.finished.emit({"result": _build_success_result(value=99.0), "run_stamp_hash": "active"})
         QtCore.QCoreApplication.processEvents()
 
@@ -2142,8 +2142,8 @@ def test_runtime_input_change_supersedes_stopped_worker_pending_terminal_signal(
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -2177,7 +2177,7 @@ def test_runtime_input_change_supersedes_stopped_worker_pending_terminal_signal(
         assert window.fit_run_state_owner.active_run_superseded is True
         assert window.fit_run_state_owner.active_run_stamp_hash == ""
 
-        worker.bestUpdated.emit({"cost": 99.0, "shared_params": {"k": 99.0}, "dataset_params": {"ds1": {}}})
+        worker.bestUpdated.emit({"cost": 99.0, "shared_params": {"k1": 99.0}, "dataset_params": {"ds1": {}}})
         worker.finished.emit({"result": _build_success_result(value=99.0), "run_stamp_hash": "active"})
         QtCore.QCoreApplication.processEvents()
 
@@ -2314,7 +2314,7 @@ def test_accepted_fixed_param_launch_does_not_poison_base_evaluator(qt_app, qtbo
 
         fixed_identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
         assert fixed_identity is not None
-        assert getattr(fixed_identity.fit_evaluator, "_fixed_params", {}).get("k") == pytest.approx(1.23)
+        assert getattr(fixed_identity.fit_evaluator, "_fixed_params", {}).get("k1") == pytest.approx(1.23)
         window.fit_runtime_readiness.set_desired_identity(fixed_identity)
         qtbot.waitUntil(lambda: window.fit_runtime_readiness.is_ready_for(fixed_identity), timeout=2000)
         monkeypatch.setattr(window.fit_worker_launch_owner, "start_worker", lambda _accepted_launch: None)
@@ -2594,7 +2594,7 @@ def test_run_fit_button_rejects_stale_ready_identity_after_runtime_setting_chang
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -2718,7 +2718,7 @@ def test_runtime_request_identity_matches_false_runtime_settings(qt_app):
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -2779,7 +2779,7 @@ def test_runtime_settings_getter_failure_blocks_fitting_readiness(qt_app, qtbot,
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -2983,7 +2983,7 @@ def test_deferred_fit_runtime_identity_remains_ready_after_acceptance(qt_app, qt
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -3321,8 +3321,8 @@ def test_detached_fit_worker_late_emissions_do_not_reenter_deleted_dialog(qt_app
     window._schedule_worker_cleanup = lambda worker: callbacks.append(("cleanup", worker))  # type: ignore[method-assign]
 
     config = {
-        "parameters": {"k": 1.0},
-        "bounds": {"k": (0.0, 2.0)},
+        "parameters": {"k1": 1.0},
+        "bounds": {"k1": (0.0, 2.0)},
         "fixed_params": {},
         "method": "trf",
         "max_nfev": 2,
@@ -3393,8 +3393,8 @@ def test_consecutive_fit_dispatch_cycles_leave_clean_state(qt_app, monkeypatch):
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -3483,8 +3483,8 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
                 raise RuntimeError("runtime close failed")
 
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -3575,8 +3575,8 @@ def test_stop_fit_schedules_runtime_preparation_refresh(qt_app, monkeypatch):
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -3859,7 +3859,7 @@ def test_deferred_fit_launch_captures_failed_restore_baseline(qt_app, qtbot, mon
         qtbot.waitUntil(lambda: bool(workers), timeout=2000)
         worker = workers[-1]
 
-        window._params_ics_tab.push_best_update({"k": 0.9}, {})
+        window._params_ics_tab.push_best_update({"k1": 0.9}, {})
         assert window._params_ics_tab._param_table.item(0, 3).text() == "0.9"
 
         result = _build_completion_result(
@@ -3896,7 +3896,7 @@ def test_deferred_generic_evaluator_prepares_without_runtime_session_requirement
 
     window = FittingWindow(
         mode="global",
-        parameter_defs=[{"name": "k", "value": 1.0, "min": 0.0, "max": 2.0}],
+        parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
         dataset_entries=[
             {
                 "id": "ds1",
@@ -3967,7 +3967,7 @@ def test_successful_fit_result_parameter_mutation_reprepares_next_run_identity(q
         qtbot.waitUntil(lambda: len(created) == 1 and window._run_button.isEnabled(), timeout=2000)
         old_session = created[-1]
 
-        window._handle_global_fit_complete({"result": _build_success_result(param_name="k", value=1.5)})
+        window._handle_global_fit_complete({"result": _build_success_result(param_name="k1", value=1.5)})
 
         qtbot.waitUntil(lambda: len(created) >= 2, timeout=2000)
         assert old_session.closed == [False]
@@ -4067,8 +4067,8 @@ def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeyp
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -4505,7 +4505,7 @@ def test_warning_completion_surfaces_optimizer_diagnostic_message_in_dialog_body
                 "text": (
                     "Final Chi-Squared (\u03c7\u00b2): 1\n\n"
                     "Fitted Parameters:\n"
-                    "  k = 1\n\n"
+                    "  k1 = 1\n\n"
                     "Warnings:\n"
                     "- Optimizer did not report convergence; results may be suboptimal.\n"
                     "- optimizer step rejected"
@@ -4665,7 +4665,7 @@ def test_failed_completion_keeps_user_edited_value_cells_after_clearing_fit_auth
     try:
         window.show()
         qt_app.processEvents()
-        window._params_ics_tab.set_last_fit_params({"k": 0.5})
+        window._params_ics_tab.set_last_fit_params({"k1": 0.5})
         parameter_state = window._params_ics_tab.get_parameter_state()
         parameter_state[0]["value"] = 1.7
         parameter_state[0]["last_fit"] = 0.5
@@ -4702,7 +4702,7 @@ def test_failed_completion_restores_pre_run_value_cells_after_live_best_update(q
         window.show()
         qt_app.processEvents()
         window._pre_run_parameter_state = window._params_ics_tab.get_parameter_state()
-        window._params_ics_tab.push_best_update({"k": 0.9}, {})
+        window._params_ics_tab.push_best_update({"k1": 0.9}, {})
         assert window._params_ics_tab._param_table.item(0, 3).text() == "0.9"
 
         monkeypatch.setattr(
@@ -4737,7 +4737,7 @@ def test_failed_completion_restores_pre_run_staged_dataset_params(qt_app, monkey
         window._params_ics_tab.set_staged_dataset_params({"ds1": {"init:A": 2.5}})
         window._pre_run_parameter_state = window._params_ics_tab.get_parameter_state()
         window._pre_run_staged_dataset_params = window._params_ics_tab.get_staged_dataset_params()
-        window._params_ics_tab.push_best_update({"k": 0.9}, {"ds1": {"init:A": 0.4}})
+        window._params_ics_tab.push_best_update({"k1": 0.9}, {"ds1": {"init:A": 0.4}})
 
         monkeypatch.setattr(
             QtWidgets.QMessageBox,
@@ -5093,8 +5093,8 @@ def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, m
             window._params_ics_tab,
             "collect_parameter_config",
             lambda: {
-                "parameters": {"k": 1.0},
-                "bounds": {"k": (0.0, 2.0)},
+                "parameters": {"k1": 1.0},
+                "bounds": {"k1": (0.0, 2.0)},
                 "fixed_params": {},
                 "method": "trf",
                 "max_nfev": 2,
@@ -5356,7 +5356,7 @@ def test_worker_error_clears_active_run_fit_state_after_prior_success(qt_app, mo
             lambda self: int(QtWidgets.QMessageBox.StandardButton.Ok),
         )
         window._handle_global_fit_complete({"result": _build_success_result()})
-        window._params_ics_tab.set_last_fit_params({"k": 0.5})
+        window._params_ics_tab.set_last_fit_params({"k1": 0.5})
         window.fit_run_state_owner.set_active_dataset_ids(["ds1"])
 
         worker = _SignalWorker()
@@ -5723,8 +5723,8 @@ def test_close_teardown_disconnects_worker_signals(qt_app, monkeypatch):
     window = _build_window()
     try:
         config = {
-            "parameters": {"k": 1.0},
-            "bounds": {"k": (0.0, 2.0)},
+            "parameters": {"k1": 1.0},
+            "bounds": {"k1": (0.0, 2.0)},
             "fixed_params": {},
             "method": "trf",
             "max_nfev": 2,
@@ -5803,8 +5803,8 @@ def test_start_fit_clears_cached_state_before_launch(monkeypatch):
             window._params_ics_tab,
             "collect_parameter_config",
             lambda: {
-                "parameters": {"k": 1.0},
-                "bounds": {"k": (0.0, 2.0)},
+                "parameters": {"k1": 1.0},
+                "bounds": {"k1": (0.0, 2.0)},
                 "fixed_params": {},
                 "method": "trf",
                 "max_nfev": 2,

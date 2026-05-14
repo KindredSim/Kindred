@@ -27,7 +27,8 @@ from kindred.core.simulator.parameter_algebra_spec import (
     ParameterAlgebraNamespace,
     ParameterAlgebraSpec,
     ParameterAssignment,
-    _raise_equilibrium_constant_alias_error,
+    _raise_invalid_protected_indexed_identifier_error,
+    is_protected_indexed_parameter_identifier,
     mechanism_parameter_name_pattern,
 )
 
@@ -145,18 +146,30 @@ def _canonicalize_mechanism_param_identifiers(
     if isinstance(expr, SpeciesRefNode):
         return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
     if isinstance(expr, IdentNode):
-        # Exact-case scalar names keep their original binding.
-        if expr.name in scalar_input_names:
-            return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
         resolution = mechanism_namespace.resolve(expr.name)
-        if resolution.equilibrium_conflict_name is not None:
-            _raise_equilibrium_constant_alias_error(
+        invalid_protected = (
+            mechanism_namespace.invalid_protected_indexed_identifier(expr.name)
+            if resolution.canonical_name is None
+            else None
+        )
+        if invalid_protected is not None:
+            _raise_invalid_protected_indexed_identifier_error(
                 expr.name,
-                equilibrium_name=resolution.equilibrium_conflict_name,
+                suggested_names=invalid_protected.suggested_names,
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
         if resolution.canonical_name is None:
+            if is_protected_indexed_parameter_identifier(expr.name):
+                _raise_invalid_protected_indexed_identifier_error(
+                    expr.name,
+                    suggested_names=[],
+                    line_number=assignment.line_number,
+                    line_content=assignment.line_content,
+                )
+            # Non-protected exact-case scalar names keep their original binding.
+            if expr.name in scalar_input_names:
+                return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
             return _CanonicalizedExpr(expr=expr, raw_to_canonical_identifiers={})
         return _CanonicalizedExpr(
             expr=IdentNode(resolution.canonical_name),

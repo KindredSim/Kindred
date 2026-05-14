@@ -191,6 +191,94 @@ def test_prepare_bound_mechanism_stops_before_binding_on_namespace_prepass_failu
     assert "parameter_algebra" in str(exc.value)
 
 
+def test_partition_simulation_parameter_values_propagates_namespace_failure(monkeypatch) -> None:
+    from kindred.core.simulation_preparation import partition_simulation_parameter_values
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0\n",
+        initials={},
+    )
+    monkeypatch.setattr(
+        "kindred.core.simulator.parameter_namespace.build_namespace_from_mechanism",
+        lambda _mechanism: (_ for _ in ()).throw(ValueError("namespace sentinel")),
+    )
+
+    with pytest.raises(ValueError, match="namespace sentinel"):
+        partition_simulation_parameter_values(
+            mechanism=mechanism,
+            parameter_overrides={"K1": 2.0},
+            unresolved_intervention_schedule=None,
+        )
+
+
+def test_partition_routes_protected_indexed_k_through_mechanism_before_stale_scalar_metadata() -> None:
+    from kindred.core.simulation_preparation import partition_simulation_parameter_values
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0\n",
+        initials={},
+    )
+    mechanism.metadata.setdefault("scalar_params", {})["K1"] = 7.0
+
+    partition = partition_simulation_parameter_values(
+        mechanism=mechanism,
+        parameter_overrides={"K1": 2.0},
+        unresolved_intervention_schedule=None,
+    )
+
+    assert "K1" not in partition.scalar_parameter_names
+    assert partition.unbound_mechanism_parameter_name_by_raw["K1"] == "k1"
+    assert "k1" in partition.unbound_mechanism_parameter_names
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_prepare_simulation_worker_run_rejects_nonfinite_parameter_override(value: float) -> None:
+    from kindred.core.simulation_preparation import (
+        SimulationExecutionRequest,
+        SimulationPreparationError,
+        prepare_simulation_worker_run,
+    )
+
+    with pytest.raises(SimulationPreparationError) as excinfo:
+        prepare_simulation_worker_run(
+            execution_request=SimulationExecutionRequest(
+                prepared_payload=None,
+                mechanism_text="reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0\n",
+                initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 1.0),
+                solver_config={"solver": "BDF", "grid": {"N": 5}},
+                parameter_overrides={"K1": value},
+            ),
+        )
+
+    assert excinfo.value.stage == "parameter_overrides"
+    assert "K1" in str(excinfo.value)
+
+
+def test_internal_parameter_algebra_binding_names_propagates_spec_failure(monkeypatch) -> None:
+    from kindred.core.simulation_preparation import (
+        SimulationPreparationError,
+        _internal_parameter_algebra_binding_names,
+    )
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "reaction: A -> B; k=1.0\ninitial: A=1.0\ninitial: B=0.0\n",
+        initials={},
+    )
+    monkeypatch.setattr(
+        "kindred.core.simulator.parameter_algebra.parameter_algebra_spec_from_mechanism",
+        lambda _mechanism: (_ for _ in ()).throw(ValueError("spec sentinel")),
+    )
+
+    with pytest.raises(SimulationPreparationError, match="spec sentinel") as excinfo:
+        _internal_parameter_algebra_binding_names(mechanism)
+
+    assert excinfo.value.stage == "parameter_algebra"
+
+
 def test_prepare_simulation_worker_run_accepts_structured_execution_request_without_text(monkeypatch) -> None:
     from kindred.core.simulation_preparation import (
         SimulationExecutionRequest,

@@ -144,9 +144,6 @@ _STRUCTURAL_SEMICOLON_DIRECTIVES = {
 }
 _MUTABLE_REACTION_RATE_DIRECTIVES = {"k", "kf", "kr"}
 _MUTABLE_EQUILIBRIUM_DIRECTIVES = {"Keq"}
-_MECHANISM_PARAMETER_NAME_RE = re.compile(r"^(?:k|kf|kr|keq|K)[1-9][0-9]*$", re.IGNORECASE)
-
-
 def _mutable_preview_parameter_names(parameter_names: Sequence[str] | object) -> set[str]:
     return {str(name) for name in (parameter_names or ()) if str(name)}
 
@@ -156,10 +153,6 @@ def _canonical_semicolon_directive_key(name: str) -> str:
     if name_s == "K":
         return "Keq"
     return _DSL_SEMICOLON_KEY_ALIASES.get(name_s.lower(), name_s)
-
-
-def _is_mechanism_parameter_name(name: str) -> bool:
-    return _MECHANISM_PARAMETER_NAME_RE.fullmatch(str(name or "").strip()) is not None
 
 
 def _mutable_preview_assignment_token(

@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import math
 import numbers
-import re
 from typing import Dict, List, Optional
 
 from ..mechanism import Mechanism
@@ -259,6 +258,7 @@ def build_mechanism_from_ir(
                 rate=rxn.rate,
                 rate_orders=rxn.rate_orders,
                 overrides=rxn.overrides,
+                record_step_index=False,
             )
 
         for eq in state_mechanism.equilibria:
@@ -270,10 +270,11 @@ def build_mechanism_from_ir(
                 kr=eq.kr,
                 fast=eq.fast,
                 metadata=getattr(eq, "metadata", None) or None,
+                record_step_index=False,
             )
 
         # Safety guard: state-network generated steps do not participate in canonical step indexing
-        _CANON = re.compile(r"^(k|kf|kr|Keq)\d+$")
+        from kindred.core.simulator.parameter_namespace import is_protected_indexed_identifier
 
         def _fail(reason: str) -> None:
             raise DSLError(
@@ -287,7 +288,7 @@ def build_mechanism_from_ir(
             if val is None:
                 return
             nm = getattr(val, "name", None)
-            if nm is not None and _CANON.match(str(nm)):
+            if nm is not None and is_protected_indexed_identifier(str(nm)):
                 _fail(f"{where} introduced a canonical-looking parameter name {nm!r}.")
             if callable(val):
                 _fail(f"{where} introduced a non-numeric binding/callable ({type(val).__name__}).")
@@ -315,7 +316,23 @@ def build_mechanism_from_ir(
         )
 
     if algebra_lines:
-        mechanism.metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = "\n".join(algebra_lines)
+        algebra_text = "\n".join(algebra_lines)
+        from kindred.core.algebra.simulation_series import compile_algebra_observables
+        from kindred.core.simulator.parameter_algebra import (
+            mechanism_parameter_namespace,
+            parse_parameter_algebra_spec_from_dsl_text,
+        )
+
+        mechanism_namespace = mechanism_parameter_namespace(mechanism)
+        parse_parameter_algebra_spec_from_dsl_text(
+            algebra_text,
+            mechanism_namespace=mechanism_namespace,
+        )
+        try:
+            compile_algebra_observables(algebra_text, mechanism_namespace=mechanism_namespace)
+        except ValueError as exc:
+            raise DSLError(str(exc)) from exc
+        mechanism.metadata[MechanismMetadataKeys.ALGEBRA_TEXT] = algebra_text
 
     if temperature_schedule is not None:
         mechanism.metadata[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule

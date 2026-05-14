@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 import re
 
+from kindred.core.simulator.parameter_algebra_spec import classify_parameter_algebra_declaration
+
 __all__ = [
     "extract_algebra_section_text",
     "is_algebra_line",
-    "is_bare_assignment_algebra_line",
     "is_let_algebra_line",
     "is_param_algebra_line",
     "upsert_lines_into_algebra_section",
@@ -20,66 +21,38 @@ _PARAM_LINE_RE = re.compile(
     r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$",
     re.IGNORECASE,
 )
-_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
-_ARROW_RE = re.compile(r"<->|<=>|->|=>")
-_NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
-    "comp",
-    "edge",
-    "energy",
-    "equilibrium",
-    "init",
-    "initial",
-    "kappa",
-    "reaction",
-    "state",
-    "t",
-    "temp_const",
-    "temp_response",
-    "temp_step",
-    "time",
-    "c0",
-}
-
 
 def _code_without_inline_comment(line: str) -> str:
     return str(line or "").split("#", 1)[0].rstrip()
 
 
 def is_let_algebra_line(line: str) -> bool:
-    match = _LET_LINE_RE.match(_code_without_inline_comment(line))
-    if match is None:
-        return False
-    return not str(match.group(2) or "").lstrip().startswith("{")
+    classification = classify_parameter_algebra_declaration(line)
+    if classification.kind == "let":
+        return True
+    return bool(
+        classification.kind == "invalid_step_key_identifier"
+        and _LET_LINE_RE.match(_code_without_inline_comment(line))
+    )
 
 
 def is_param_algebra_line(line: str) -> bool:
-    match = _PARAM_LINE_RE.match(_code_without_inline_comment(line))
-    if match is None:
-        return False
-    return not str(match.group(2) or "").lstrip().startswith("{")
-
-
-def is_bare_assignment_algebra_line(line: str) -> bool:
-    code = _code_without_inline_comment(line).strip()
-    if not code or _ARROW_RE.search(code):
-        return False
-    if re.match(r"^(let|param)\b", code, flags=re.IGNORECASE):
-        return False
-    match = _ASSIGN_RE.match(code)
-    if match is None:
-        return False
-    rhs = code[match.end():].lstrip()
-    if rhs.startswith("{"):
-        return False
-    return str(match.group(1) or "").lower() not in _NON_ALGEBRA_ASSIGNMENT_PREFIXES
+    classification = classify_parameter_algebra_declaration(line)
+    if classification.kind == "param":
+        return True
+    return bool(
+        classification.kind == "invalid_step_key_identifier"
+        and _PARAM_LINE_RE.match(_code_without_inline_comment(line))
+    )
 
 
 def is_algebra_line(line: str) -> bool:
-    return (
-        is_let_algebra_line(line)
-        or is_param_algebra_line(line)
-        or is_bare_assignment_algebra_line(line)
-    )
+    return classify_parameter_algebra_declaration(line).kind in {
+        "param",
+        "let",
+        "invalid_step_key_identifier",
+        "unsupported_bare_assignment",
+    }
 
 
 def extract_algebra_section_text(dsl_text: str) -> str:

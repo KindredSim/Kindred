@@ -1222,31 +1222,40 @@ def test_startup_runtime_availability_callback_ignores_close_started_window(main
     assert calls == []
 
 
-def test_runtime_availability_refresh_schedules_exact_runtimes_without_blocking(main_window, monkeypatch):
+def test_runtime_availability_refresh_delegates_current_workflow_need_without_batch_proxy(main_window, monkeypatch):
     scheduled: list[tuple[int, object]] = []
-    interactive_waits: list[bool] = []
-    batch_waits: list[bool] = []
+    current_workflow_waits: list[bool] = []
+    direct_batch_waits: list[bool] = []
 
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "ensure_interactive_simulation_runtimes_available",
-        lambda *, wait=False: interactive_waits.append(bool(wait)),
+        "ensure_current_interactive_simulation_runtimes_available",
+        lambda *, wait=False: current_workflow_waits.append(bool(wait)),
+        raising=False,
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
         "ensure_parallel_batch_pool_eagerly_created",
-        lambda *, wait=False: batch_waits.append(bool(wait)),
+        lambda *, wait=False: direct_batch_waits.append(bool(wait)),
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "interactive_simulation_runtime_ready",
-        lambda *, fast_mode: True,
+        "interactive_simulation_runtime_snapshot",
+        lambda *, fast_mode: _runtime_snapshot(
+            mode="preview" if bool(fast_mode) else "ordinary",
+            ready=True,
+        ),
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "parallel_batch_runtime_ready",
-        lambda: True,
+        "slider_preview_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="preview", ready=True),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "selected_run_runtime_snapshot",
+        lambda: _runtime_snapshot(mode="ordinary", ready=True),
     )
 
     main_window.show()
@@ -1254,10 +1263,8 @@ def test_runtime_availability_refresh_schedules_exact_runtimes_without_blocking(
     main_window._schedule_simulation_runtime_availability_refresh(wait=False)
 
     assert scheduled == []
-    assert interactive_waits
-    assert all(wait is False for wait in interactive_waits)
-    assert batch_waits
-    assert all(wait is False for wait in batch_waits)
+    assert current_workflow_waits == [False]
+    assert direct_batch_waits == []
     assert main_window._run_btn.isEnabled()
     assert main_window._mechanism_editor._variable_sliders.isEnabled()
 
@@ -1428,8 +1435,7 @@ def test_solver_settings_runtime_change_truthfully_gates_visible_runtime_control
     ]
     assert interactive_warms
     assert all(wait is False for wait in interactive_warms)
-    assert batch_warms
-    assert all(wait is False for wait in batch_warms)
+    assert batch_warms == []
     assert not main_window._run_btn.isEnabled()
     assert not main_window._mechanism_editor._variable_sliders.isEnabled()
     assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
@@ -1692,8 +1698,7 @@ def test_authoritative_mechanism_commit_schedules_runtime_rewarm_after_invalidat
     assert not main_window._mechanism_editor._variable_sliders.isEnabled()
     assert interactive_warms
     assert all(wait is False for wait in interactive_warms)
-    assert batch_warms
-    assert all(wait is False for wait in batch_warms)
+    assert batch_warms == []
     assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
 
     readiness_by_mode[False] = True
@@ -2244,7 +2249,6 @@ def test_runtime_readiness_poll_enables_run_before_preview_sliders(main_window, 
 
 def test_runtime_readiness_poll_enables_single_set_run_without_batch_runtime(main_window, monkeypatch):
     scheduled: list[tuple[int, object]] = []
-    batch_ready = {"value": False}
     interactive_waits: list[bool] = []
     batch_waits: list[bool] = []
 
@@ -2279,23 +2283,16 @@ def test_runtime_readiness_poll_enables_single_set_run_without_batch_runtime(mai
         "selected_run_runtime_snapshot",
         lambda: _runtime_snapshot(mode="ordinary", ready=True),
     )
-    monkeypatch.setattr(
-        main_window.simulation_controller,
-        "parallel_batch_runtime_ready",
-        lambda: bool(batch_ready["value"]),
-    )
 
     main_window._poll_interactive_runtime_readiness_after_refresh()
 
     assert main_window._run_btn.isEnabled()
     assert main_window._mechanism_editor._variable_sliders.isEnabled()
     assert interactive_waits == []
-    assert batch_waits
-    assert all(wait is False for wait in batch_waits)
+    assert batch_waits == []
     assert scheduled == []
 
     scheduled.clear()
-    batch_ready["value"] = True
     main_window._poll_interactive_runtime_readiness_after_refresh()
 
     assert main_window._run_btn.isEnabled()
@@ -2307,7 +2304,7 @@ def test_show_event_keeps_single_set_run_ready_after_hidden_serial_warm_without_
     scheduled: list[tuple[int, object]] = []
     interactive_waits: list[bool] = []
     batch_waits: list[bool] = []
-    batch_ready = {"value": False}
+    current_workflow_waits: list[bool] = []
 
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda delay_ms, fn: scheduled.append((int(delay_ms), fn)))
     monkeypatch.setattr(
@@ -2340,22 +2337,23 @@ def test_show_event_keeps_single_set_run_ready_after_hidden_serial_warm_without_
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
-        "parallel_batch_runtime_ready",
-        lambda: bool(batch_ready["value"]),
+        "ensure_current_interactive_simulation_runtimes_available",
+        lambda *, wait=False: current_workflow_waits.append(bool(wait)),
+        raising=False,
     )
 
     main_window._schedule_simulation_runtime_availability_refresh(wait=False, force_when_hidden=True)
 
-    assert interactive_waits
-    assert all(wait is False for wait in interactive_waits)
+    assert interactive_waits == []
+    assert current_workflow_waits == [False]
     assert batch_waits == []
     assert main_window._run_btn.isEnabled()
 
     main_window.show()
     qtbot.waitUntil(lambda: main_window.isVisible(), timeout=1000)
 
-    assert batch_waits
-    assert all(wait is False for wait in batch_waits)
+    assert current_workflow_waits == [False]
+    assert batch_waits == []
     assert main_window._run_btn.isEnabled()
     assert scheduled == []
 
@@ -2364,7 +2362,8 @@ def test_multiset_selection_gates_run_and_schedules_runtime_readiness(main_windo
     scheduled: list[tuple[int, object]] = []
     batch_ready = {"value": False}
     interactive_waits: list[bool] = []
-    batch_waits: list[bool] = []
+    current_workflow_waits: list[bool] = []
+    direct_batch_waits: list[bool] = []
 
     main_window.show()
     main_window._set_runtime_backed_controls_ready(True)
@@ -2377,7 +2376,13 @@ def test_multiset_selection_gates_run_and_schedules_runtime_readiness(main_windo
     monkeypatch.setattr(
         main_window.simulation_controller,
         "ensure_parallel_batch_pool_eagerly_created",
-        lambda *, wait=False: batch_waits.append(bool(wait)),
+        lambda *, wait=False: direct_batch_waits.append(bool(wait)),
+    )
+    monkeypatch.setattr(
+        main_window.simulation_controller,
+        "ensure_current_interactive_simulation_runtimes_available",
+        lambda *, wait=False: current_workflow_waits.append(bool(wait)),
+        raising=False,
     )
     monkeypatch.setattr(
         main_window.simulation_controller,
@@ -2410,10 +2415,10 @@ def test_multiset_selection_gates_run_and_schedules_runtime_readiness(main_windo
     main_window._simulation_run_ui_owner.set_run_button_enabled(True)
     assert not main_window._run_btn.isEnabled()
     assert not main_window._mechanism_editor._variable_sliders.isEnabled()
-    assert interactive_waits
-    assert batch_waits
-    assert all(wait is False for wait in interactive_waits)
-    assert all(wait is False for wait in batch_waits)
+    assert interactive_waits == []
+    assert current_workflow_waits
+    assert all(wait is False for wait in current_workflow_waits)
+    assert direct_batch_waits == []
     assert scheduled == [(50, main_window._poll_interactive_runtime_readiness_after_refresh)]
 
     scheduled.clear()

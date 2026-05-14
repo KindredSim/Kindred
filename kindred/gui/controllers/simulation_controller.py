@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from contextlib import suppress
-import hashlib
 import json
 import logging
 import os
@@ -28,7 +27,6 @@ from kindred.gui.controllers.batch_run_context_owner import BatchRunContextOwner
 from kindred.gui.controllers.batch_dispatch_plan import (
     ParallelBatchTaskInput,
     SerialBatchDispatchInput,
-    build_fallback_cache_key as _build_fallback_cache_key,
     build_parallel_batch_task_plan,
     build_serial_batch_dispatch_plan,
     simulation_plan_from_payloadish,
@@ -162,21 +160,6 @@ def _runtime_readiness_snapshot(
     )
 
 
-def build_fallback_cache_key(
-    mechanism_text: str = "",
-    t_end: float = 0.0,
-    solver_config: dict | None = None,
-    *,
-    simulation_identity: object | None = None,
-) -> str:
-    return _build_fallback_cache_key(
-        mechanism_text,
-        t_end,
-        solver_config,
-        simulation_identity=simulation_identity,
-    )
-
-
 class SimulationController(QtCore.QObject):
     """
     Simulation execution + batch orchestration controller.
@@ -218,7 +201,6 @@ class SimulationController(QtCore.QObject):
             dependencies=SimulationRunPreparationDependencies(
                 claim_preview_ownership=self._claim_preview_ownership,
                 clear_preview_ownership=self._clear_preview_ownership,
-                apply_parameter_override_fallback_to_dsl=self._apply_parameter_override_fallback_to_dsl,
                 invalidate_preserved_pending_init_results_after_failed_run=(
                     self._invalidate_preserved_pending_init_results_after_failed_run
                 ),
@@ -401,6 +383,7 @@ class SimulationController(QtCore.QObject):
                 slider_target_rows_for_dispatch=self._slider_target_rows_for_dispatch,
                 slider_preview_uses_parallel_batch_runtime=self._slider_preview_uses_parallel_batch_runtime,
                 slider_preview_runtime_snapshot=self._slider_preview_runtime_snapshot,
+                parallel_batch_required_lanes_for_rows=self._parallel_batch_required_lanes_for_rows,
                 ensure_parallel_batch_pool_eagerly_created=(
                     self._parallel_batch_runtime_readiness_owner.ensure
                 ),
@@ -660,7 +643,10 @@ class SimulationController(QtCore.QObject):
 
     def _ensure_selected_run_runtime_warming(self) -> None:
         if self._selected_run_uses_parallel_batch_runtime():
-            self._ensure_parallel_batch_pool_eagerly_created(wait=False)
+            self._ensure_parallel_batch_pool_eagerly_created(
+                wait=False,
+                required_lanes=self._current_parallel_batch_runtime_required_lanes(),
+            )
         else:
             self._ensure_interactive_simulation_runtime_available_for_mode(fast_mode=False, wait=False)
 
@@ -1334,6 +1320,15 @@ class SimulationController(QtCore.QObject):
                     f"Failed to make {mode_label} contained simulation runtime available",
                     exc,
                 )
+
+    def ensure_current_interactive_simulation_runtimes_available(self, *, wait: bool = False) -> None:
+        self.ensure_interactive_simulation_runtimes_available(wait=bool(wait))
+        required_lanes = self._current_parallel_batch_runtime_required_lanes()
+        if int(required_lanes) > 1:
+            self._ensure_parallel_batch_pool_eagerly_created(
+                wait=bool(wait),
+                required_lanes=int(required_lanes),
+            )
 
     def invalidate_interactive_simulation_runtimes(self, *, kill: bool = False) -> None:
         self._runtime_application.close(kill=bool(kill))
@@ -2052,7 +2047,21 @@ class SimulationController(QtCore.QObject):
 
     def _interactive_simulation_runtime_snapshot(self, *, fast_mode: bool) -> RuntimeReadinessSnapshot:
         mode = self._contained_owner_mode(fast_mode=bool(fast_mode))
-        payloads = self._interactive_runtime_plan_payloads_for_mode(fast_mode=bool(fast_mode))
+        try:
+            payloads = self._interactive_runtime_plan_payloads_for_mode(fast_mode=bool(fast_mode))
+        except Exception as exc:
+            message = f"Failed to build {'preview' if bool(fast_mode) else 'simulation'} runtime payload."
+            logger.warning("%s %s", message, exc, exc_info=True)
+            return _runtime_readiness_snapshot(
+                mode=mode,
+                status="failed",
+                ready=False,
+                failure=str(exc),
+                message=f"{message} {exc}",
+                required=True,
+                controls_ready=False,
+                polling=False,
+            )
         if not payloads:
             return _runtime_readiness_snapshot(
                 mode=mode,
@@ -2114,38 +2123,35 @@ class SimulationController(QtCore.QObject):
         fast_mode: bool,
         batch_rows: Sequence[int],
     ) -> list[dict[str, Any]]:
-        try:
-            rows = self._run_rows_or_abort(
-                batch_rows=batch_rows,
-                fast_mode=bool(fast_mode),
-                runtime_readiness_only=True,
-            )
-            if rows is None:
-                return []
-            mechanism_context = self._run_mechanism_context_or_abort(
-                fast_mode=bool(fast_mode),
-                request_id=0,
-                batch_rows=rows,
-                runtime_readiness_only=True,
-            )
-            if mechanism_context is None:
-                return []
-            solver_context = self._run_solver_context_or_abort(
-                fast_mode=bool(fast_mode),
-                runtime_readiness_only=True,
-                mechanism_context=mechanism_context,
-            )
-            if solver_context is None:
-                return []
-            dispatch_context = self._build_run_dispatch_context_or_abort(
-                fast_mode=bool(fast_mode),
-                runtime_readiness_only=True,
-                mechanism_context=mechanism_context,
-                solver_context=solver_context,
-            )
-            if dispatch_context is None:
-                return []
-        except Exception:
+        rows = self._run_rows_or_abort(
+            batch_rows=batch_rows,
+            fast_mode=bool(fast_mode),
+            runtime_readiness_only=True,
+        )
+        if rows is None:
+            return []
+        mechanism_context = self._run_mechanism_context_or_abort(
+            fast_mode=bool(fast_mode),
+            request_id=0,
+            batch_rows=rows,
+            runtime_readiness_only=True,
+        )
+        if mechanism_context is None:
+            return []
+        solver_context = self._run_solver_context_or_abort(
+            fast_mode=bool(fast_mode),
+            runtime_readiness_only=True,
+            mechanism_context=mechanism_context,
+        )
+        if solver_context is None:
+            return []
+        dispatch_context = self._build_run_dispatch_context_or_abort(
+            fast_mode=bool(fast_mode),
+            runtime_readiness_only=True,
+            mechanism_context=mechanism_context,
+            solver_context=solver_context,
+        )
+        if dispatch_context is None:
             return []
 
         from kindred.core.simulation_containment import build_contained_simulation_plan_payload
@@ -2324,10 +2330,26 @@ class SimulationController(QtCore.QObject):
         row_count = len(list(rows or ()))
         return bool(row_count > 1 and self._effective_batch_worker_count(row_count) > 1)
 
+    def _parallel_batch_required_lanes_for_rows(self, rows: Sequence[int]) -> int:
+        row_count = len(list(rows or ()))
+        return max(1, int(self._effective_batch_worker_count(row_count)))
+
     def _slider_preview_runtime_snapshot(self, rows: Optional[Sequence[int]] = None) -> RuntimeReadinessSnapshot:
         if self._slider_preview_uses_parallel_batch_runtime(rows):
             return self._parallel_batch_runtime_snapshot(rows=rows)
         return self._interactive_simulation_runtime_snapshot(fast_mode=True)
+
+    def _current_parallel_batch_runtime_required_lanes(self) -> int:
+        rows = self._interactive_runtime_rows()
+        row_count = len(rows)
+        if row_count <= 1:
+            return 1
+        required_lanes = self._parallel_batch_required_lanes_for_rows(rows)
+        if required_lanes <= 1:
+            return 1
+        if self._selected_run_uses_parallel_batch_runtime() or self._slider_preview_uses_parallel_batch_runtime(rows):
+            return int(required_lanes)
+        return 1
 
     def _parallel_batch_runtime_snapshot(self, rows: Optional[Sequence[int]] = None) -> RuntimeReadinessSnapshot:
         if rows is None:
@@ -2335,7 +2357,7 @@ class SimulationController(QtCore.QObject):
         rows = list(rows or ())
         return self._parallel_batch_runtime_readiness_owner.runtime_snapshot_for_selection(
             row_count=len(rows),
-            required_lanes=max(1, int(self._effective_batch_worker_count(len(rows)))),
+            required_lanes=self._parallel_batch_required_lanes_for_rows(rows),
         )
 
     def _shutdown_batch_lane_pool(self, *, force_terminate: bool) -> None:
@@ -2380,15 +2402,23 @@ class SimulationController(QtCore.QObject):
             batch_outcome = self._parallel_batch_pool_settings_changed()
         else:
             batch_outcome = "unchanged"
-        self.ensure_interactive_simulation_runtimes_available(wait=False)
+        self.ensure_current_interactive_simulation_runtimes_available(wait=False)
         return SimulationRuntimeInputsChangeOutcome(
             interactive_runtime_refresh_requested=True,
             batch_pool_shut_down=batch_outcome == "shut_down",
             batch_pool_marked_stale_draining=batch_outcome == "marked_stale_draining",
         )
 
-    def _ensure_parallel_batch_pool_eagerly_created(self, *, wait: bool = False) -> None:
-        self._parallel_batch_runtime_readiness_owner.ensure(wait=bool(wait))
+    def _ensure_parallel_batch_pool_eagerly_created(
+        self,
+        *,
+        wait: bool = False,
+        required_lanes: int | None = None,
+    ) -> None:
+        self._parallel_batch_runtime_readiness_owner.ensure(
+            wait=bool(wait),
+            required_lanes=required_lanes,
+        )
 
     def _interactive_batch_runtime_capacity(self) -> int:
         max_workers = max(1, int(getattr(self._batch_parallel, "max_parallel_workers", 1) or 1))
@@ -3321,44 +3351,17 @@ class SimulationController(QtCore.QObject):
             resolved_rows.append(int(row))
         return resolved_rows
 
-    def _apply_parameter_override_fallback_to_dsl(self, dsl_text: str, *, set_id: Optional[str]) -> str:
-        mechanism_text = str(dsl_text or "")
-        overrides = self.ui.mechanism.slider_overrides(set_id=set_id)
-        if not overrides:
-            return mechanism_text
-        try:
-            return self.ui.mechanism.apply_parameter_overrides_to_dsl(mechanism_text, overrides)
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                f"Failed to apply parameter override fallback to slider DSL for set_id={str(set_id or '')}",
-                exc,
-            )
-            return mechanism_text
-
     def _execution_identity_flags(self, *, fast_mode: bool) -> tuple[str, ...]:
         return ("fast_mode",) if bool(fast_mode) else ()
 
     def _intervention_schedule_fingerprint_for_set(self, *, set_id: str, fast_mode: bool) -> str:
-        try:
-            mechanism_text = self._request_mechanism_text_for_set(
-                set_id=str(set_id),
-                has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
-            )
-        except Exception as exc:
-            self._record_nonfatal_exception(
-                f"Failed to resolve intervention schedule identity text for set_id={str(set_id or '')}",
-                exc,
-            )
-            try:
-                mechanism_text = self.ui.mechanism.get_mechanism_text()
-            except Exception:
-                mechanism_text = ""
-        try:
-            from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+        mechanism_text = self._request_mechanism_text_for_set(
+            set_id=str(set_id),
+            has_slider_overrides=bool(fast_mode) and self.ui.mechanism.has_slider_overrides(),
+        )
+        from kindred.core.intervention_schedule import normalized_intervention_schedule_fingerprint_from_dsl_text
 
-            return str(intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or "")
-        except Exception:
-            return hashlib.sha256(str(mechanism_text or "").encode("utf-8", "surrogatepass")).hexdigest()
+        return str(normalized_intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or "")
 
     def _symbolic_jacobian_identity_for_set(
         self,
@@ -3395,7 +3398,14 @@ class SimulationController(QtCore.QObject):
             if not payload:
                 return {}
             return dict(payload)
-        except Exception:
+        except (ValueError, TypeError):
+            raise
+        except Exception as exc:
+            if (
+                exc.__class__.__name__ == "SimulationPreparationError"
+                and str(getattr(exc, "stage", "")) == "parameter_overrides"
+            ):
+                raise
             return {}
 
     def _symbolic_wegscheider_identity_for_set(
@@ -3552,30 +3562,45 @@ class SimulationController(QtCore.QObject):
         request_mechanism_text = set_reactions_text
         if set_state_network_dsl.strip():
             request_mechanism_text += "\n\n# State Network\n" + set_state_network_dsl
-        if has_slider_overrides and bool(apply_parameter_overrides):
-            request_mechanism_text = self._apply_parameter_override_fallback_to_dsl(
-                request_mechanism_text,
-                set_id=str(set_id),
-            )
         return str(request_mechanism_text)
 
     def _slider_runtime_parameter_names(self, *, set_id: Optional[str]) -> list[str]:
         names: set[str] = set()
         try:
-            names.update(str(name) for name in self.ui.mechanism.slider_overrides(set_id=set_id).keys())
+            metadata = dict(self.ui.mechanism.variable_metadata() or {})
+        except Exception:
+            metadata = {}
+        try:
+            names.update(
+                str(name)
+                for name in self.ui.mechanism.slider_overrides(set_id=set_id).keys()
+                if self._slider_parameter_is_editable(name, metadata)
+            )
         except Exception:
             pass
         try:
-            names.update(str(name) for name in self.ui.mechanism.variable_slider_values().keys())
+            names.update(
+                str(name)
+                for name in self.ui.mechanism.variable_slider_values().keys()
+                if self._slider_parameter_is_editable(name, metadata)
+            )
         except Exception:
             pass
-        try:
-            names.update(str(name) for name in self.ui.mechanism.variable_metadata().keys())
-        except Exception:
-            pass
+        names.update(
+            str(name)
+            for name in metadata.keys()
+            if self._slider_parameter_is_editable(name, metadata)
+        )
         if not names:
             names.update(self._slider_parameter_names_from_current_mechanism())
         return sorted(name for name in names if name)
+
+    @staticmethod
+    def _slider_parameter_is_editable(name: object, metadata: Mapping[str, Any]) -> bool:
+        entry = metadata.get(str(name))
+        if isinstance(entry, Mapping) and entry.get("editable") is False:
+            return False
+        return True
 
     def _slider_parameter_names_from_current_mechanism(self) -> list[str]:
         try:
@@ -3632,11 +3657,24 @@ class SimulationController(QtCore.QObject):
                 mechanism = structure_snapshot.mechanism
             else:
                 mechanism = _build_structure_snapshot(full_dsl)
-            variables, _metadata = enumerate_step_parameters_for_gui(mechanism)
-            names = {str(name) for name in dict(variables or {}).keys() if str(name)}
+            variables, metadata = enumerate_step_parameters_for_gui(mechanism)
+            metadata_map = dict(metadata or {})
+            names = {
+                str(name)
+                for name in dict(variables or {}).keys()
+                if str(name) and self._slider_parameter_is_editable(name, metadata_map)
+            }
             scalar_params = (getattr(mechanism, "metadata", {}) or {}).get("scalar_params") or {}
+            scalar_info = (getattr(mechanism, "metadata", {}) or {}).get("scalar_param_info") or {}
             if isinstance(scalar_params, Mapping):
-                names.update(str(name) for name in scalar_params.keys() if str(name))
+                for name in scalar_params.keys():
+                    name_s = str(name)
+                    if not name_s:
+                        continue
+                    info = scalar_info.get(name_s) if isinstance(scalar_info, Mapping) else None
+                    if isinstance(info, Mapping) and info.get("derived") is True:
+                        continue
+                    names.add(name_s)
             return sorted(names)
         except Exception:
             return []
@@ -3644,10 +3682,15 @@ class SimulationController(QtCore.QObject):
     def _slider_execution_parameter_values(self, *, set_id: Optional[str]) -> Dict[str, float]:
         values: Dict[str, float] = {}
         try:
+            metadata = dict(self.ui.mechanism.variable_metadata() or {})
+        except Exception:
+            metadata = {}
+        try:
             values.update(
                 {
                     str(name): float(value)
                     for name, value in self.ui.mechanism.variable_slider_values().items()
+                    if self._slider_parameter_is_editable(name, metadata)
                 }
             )
         except Exception:
@@ -3657,6 +3700,7 @@ class SimulationController(QtCore.QObject):
                 {
                     str(name): float(value)
                     for name, value in self.ui.mechanism.slider_overrides(set_id=set_id).items()
+                    if self._slider_parameter_is_editable(name, metadata)
                 }
             )
         except Exception:
@@ -4308,9 +4352,7 @@ class SimulationController(QtCore.QObject):
                 set_name=str(set_name),
                 initials=dict(initials_dict),
                 slider_overrides=self.ui.mechanism.slider_overrides(set_id=str(set_id)),
-            ),
-            apply_parameter_overrides_to_dsl=self.ui.mechanism.apply_parameter_overrides_to_dsl,
-            record_nonfatal_exception=self._record_nonfatal_exception,
+            )
         )
         if dispatch_plan.cache_key_rewritten and isinstance(context, dict):
             context = self._batch_context_owner.record_cache_key(str(dispatch_plan.cache_key))

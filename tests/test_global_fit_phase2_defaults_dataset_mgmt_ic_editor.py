@@ -1515,8 +1515,10 @@ def test_global_fit_rebuild_preserves_shared_initial_rows_after_mechanism_edit(m
         mechanism_b = "\n".join(
             [
                 "reaction: A -> C; k=0.4",
+                "reaction: C -> D; k=0.4",
                 "initial: A=1.0",
                 "initial: C=0.0",
+                "initial: D=0.0",
             ]
         )
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
@@ -1876,8 +1878,10 @@ def test_global_fit_rebuild_refreshes_live_window_parameter_table_after_mechanis
         mechanism_b = "\n".join(
             [
                 "reaction: A -> C; k=0.4",
+                "reaction: C -> D; k=0.4",
                 "initial: A=1.0",
                 "initial: C=0.0",
+                "initial: D=0.0",
             ]
         )
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)
@@ -1935,8 +1939,10 @@ def test_global_fit_refreshes_no_prepared_window_before_readiness_after_mechanis
         mechanism_b = "\n".join(
             [
                 "reaction: A -> C; k=0.4",
+                "reaction: C -> D; k=0.4",
                 "initial: A=1.0",
                 "initial: C=0.0",
+                "initial: D=0.0",
             ]
         )
         main_window._mechanism_editor._reactions_text.setPlainText(mechanism_b)

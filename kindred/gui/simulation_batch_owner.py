@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
@@ -633,16 +632,11 @@ class SimulationBatchOwner:
             set_id=str(set_id),
             mechanism_text=mechanism_text,
         )
-        try:
-            from kindred.core.intervention_schedule import intervention_schedule_fingerprint_from_dsl_text
+        from kindred.core.intervention_schedule import normalized_intervention_schedule_fingerprint_from_dsl_text
 
-            intervention_schedule_fingerprint = str(
-                intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or ""
-            )
-        except Exception:
-            intervention_schedule_fingerprint = hashlib.sha256(
-                str(mechanism_text or "").encode("utf-8", "surrogatepass")
-            ).hexdigest()
+        intervention_schedule_fingerprint = str(
+            normalized_intervention_schedule_fingerprint_from_dsl_text(str(mechanism_text or "")) or ""
+        )
         initials_fingerprint = ""
         row = self._batch_row_for_set_id(str(set_id))
         if row is not None:
@@ -1029,11 +1023,6 @@ class SimulationBatchOwner:
         full_dsl = reactions_text
         if state_network_dsl.strip():
             full_dsl += "\n\n# State Network\n" + state_network_dsl
-        if self._mechanism_owner.has_slider_overrides() and bool(apply_parameter_overrides):
-            full_dsl = self._mechanism_owner.apply_parameter_overrides_to_dsl(
-                full_dsl,
-                self._normalized_slider_overrides(set_id=str(set_id)),
-            )
         return str(full_dsl)
 
     def _current_workspace_preview_context(

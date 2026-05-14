@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import pickle
 
 import numpy as np
@@ -363,6 +364,149 @@ def test_serial_fitting_evaluator_runs_from_structured_context() -> None:
     assert np.asarray(result.species["A"], dtype=float).shape == (6,)
 
 
+def test_prepare_fitting_execution_context_accepts_case_insensitive_canonical_rate_name() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.2; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["KF1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    result = SerialFittingEvaluator(context)({"KF1": 0.4})
+
+    assert np.asarray(result.t, dtype=float).size == 6
+    assert set(result.species) == {"A", "B"}
+
+
+def test_serial_fitting_evaluator_accepts_indexed_k_direct_spelling_for_irreversible_name() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+
+    changed = evaluator({"K1": 2.0})
+    unchanged = SerialFittingEvaluator(context)({"k1": 0.1})
+
+    assert float(np.asarray(changed.species["A"], dtype=float)[-1]) < float(
+        np.asarray(unchanged.species["A"], dtype=float)[-1]
+    )
+
+
+def test_serial_fitting_evaluator_fixed_params_apply_case_insensitive_canonical_name() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    unchanged = SerialFittingEvaluator(context)({"k1": 0.1})
+    changed = SerialFittingEvaluator(context).with_fixed_params({"K1": 2.0})({})
+    assert float(np.asarray(changed.species["A"], dtype=float)[-1]) < float(
+        np.asarray(unchanged.species["A"], dtype=float)[-1]
+    )
+
+
+@pytest.mark.parametrize("name", ["K1", "k1"])
+def test_prepare_fitting_execution_context_rejects_indexed_k_for_reversible_parameter(name: str) -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.2; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+
+    with pytest.raises(FitSimulationError, match=rf"{name}.*Keq1"):
+        prepare_fitting_execution_context(
+            mechanism_text=mechanism_text,
+            param_names=[name],
+            t_end=1.0,
+            num_points=6,
+            solver="BDF",
+            rtol=1e-6,
+            atol=1e-12,
+            initial_prefix="init:",
+        )
+
+
+def test_serial_fitting_evaluator_rejects_fixed_indexed_k_for_reversible_parameter() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.2; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context).with_fixed_params({"K1": 2.0})
+
+    with pytest.raises(FitSimulationError) as exc_info:
+        evaluator({})
+    message = str(exc_info.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
 def test_serial_fitting_evaluator_applies_parameterized_schedule_amount_per_candidate() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 
@@ -391,6 +535,102 @@ def test_serial_fitting_evaluator_applies_parameterized_schedule_amount_per_cand
 
     assert float(np.asarray(low.species["A"], dtype=float)[-1]) == pytest.approx(2.0, abs=1e-6)
     assert float(np.asarray(high.species["A"], dtype=float)[-1]) == pytest.approx(4.0, abs=1e-6)
+
+
+def test_serial_fitting_evaluator_classifies_nonfinite_schedule_parameter_by_origin() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["dose"],
+        t_end=2.0,
+        num_points=3,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    evaluator = SerialFittingEvaluator(context)
+    failed_params = {"dose": float("nan")}
+
+    with pytest.raises(FitSimulationError, match="Non-finite parameter value for 'dose'") as exc_info:
+        evaluator.evaluate_series_with_parameter_origins(
+            {"dose": float("nan")},
+            {"dose": "optimizer_shared"},
+            failed_params=failed_params,
+        )
+
+    assert exc_info.value.details["fatal"] is False
+    assert exc_info.value.details["parameter_origin"] == "optimizer_shared"
+    assert exc_info.value.failed_params == failed_params
+
+
+def test_fitting_rejects_K1_schedule_name_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    with pytest.raises(FitSimulationError) as exc_info:
+        prepare_fitting_execution_context(
+            mechanism_text=mechanism_text,
+            param_names=["K1"],
+            t_end=2.0,
+            num_points=3,
+            solver="BDF",
+            rtol=1e-6,
+            atol=1e-12,
+            initial_prefix="init:",
+        )
+    message = str(exc_info.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_fitting_rejects_algebra_owned_canonical_mechanism_parameter_even_if_schedule_references_it() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=1.0; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=kr1",
+            "# Algebra",
+            "param scale = 1.0",
+            "param kr1 = 0.1 * scale",
+        ]
+    )
+    with pytest.raises(FitSimulationError, match="algebra-owned mechanism parameter"):
+        prepare_fitting_execution_context(
+            mechanism_text=mechanism_text,
+            param_names=["kr1"],
+            t_end=2.0,
+            num_points=3,
+            solver="BDF",
+            rtol=1e-6,
+            atol=1e-12,
+            initial_prefix="init:",
+        )
 
 
 def test_serial_fitting_evaluator_applies_parameterized_state_trigger_per_candidate() -> None:
@@ -859,9 +1099,113 @@ def test_serial_fitting_process_payload_rejects_schedule_fingerprint_conflict() 
         SerialFittingEvaluator.from_process_payload(payload)
 
 
+def test_serial_fitting_process_payload_rejects_tampered_structured_schedule() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        temperature_K=310.0,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    schedule_payload = copy.deepcopy(
+        payload["simulation_plan"]["execution_request"]["intervention_schedule"]
+    )
+    schedule_payload["instant_events"][0]["value"] = 9.0
+    payload["simulation_plan"]["execution_request"]["intervention_schedule"] = schedule_payload
+
+    with pytest.raises(ValueError, match="intervention_schedule"):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
+def test_serial_fitting_process_payload_rejects_prepared_schedule_carrier_conflict() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        temperature_K=310.0,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    prepared_schedule_payload = copy.deepcopy(
+        payload["simulation_plan"]["execution_request"]["prepared_payload"]["intervention_schedule"]
+    )
+    prepared_schedule_payload["instant_events"][0]["value"] = 9.0
+    payload["simulation_plan"]["execution_request"]["prepared_payload"]["intervention_schedule"] = (
+        prepared_schedule_payload
+    )
+
+    with pytest.raises(ValueError, match="prepared_payload.intervention_schedule"):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
+def test_serial_fitting_process_payload_rejects_missing_authoritative_schedule_carrier() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=set; species=A; time=0.0; value=2.0",
+        ]
+    )
+    context = prepare_fitting_execution_context(
+        mechanism_text=mechanism_text,
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        temperature_K=310.0,
+        initial_prefix="init:",
+    )
+    payload = SerialFittingEvaluator(context).to_process_payload()
+    plan_request = payload["simulation_plan"]["execution_request"]
+    assert plan_request["intervention_schedule"] is not None
+    assert plan_request["prepared_payload"]["intervention_schedule"] is not None
+    del plan_request["intervention_schedule"]
+
+    with pytest.raises(ValueError, match="intervention_schedule"):
+        SerialFittingEvaluator.from_process_payload(payload)
+
+
 def test_serial_fitting_process_payload_preserves_and_executes_intervention_schedule() -> None:
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-    from kindred.core.intervention_schedule import coerce_intervention_schedule
+    from kindred.core.intervention_schedule import (
+        coerce_intervention_schedule,
+        normalized_intervention_schedule_fingerprint,
+    )
+    from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
     mechanism_text = "\n".join(
         [
@@ -884,18 +1228,70 @@ def test_serial_fitting_process_payload_preserves_and_executes_intervention_sche
 
     schedule = coerce_intervention_schedule(context.execution_request.intervention_schedule)
     assert schedule is not None
-    assert context.prepared_metadata.intervention_schedule_fingerprint == schedule.fingerprint
+    mechanism = context.execution_request.prepared_payload["mechanism"]
+    expected_fingerprint = normalized_intervention_schedule_fingerprint(
+        schedule,
+        mechanism_namespace=build_namespace_from_mechanism(mechanism),
+    )
+    assert context.prepared_metadata.intervention_schedule_fingerprint == expected_fingerprint
 
     payload = SerialFittingEvaluator(context).to_process_payload()
     plan_request = payload["simulation_plan"]["execution_request"]
     assert plan_request["intervention_schedule"] == schedule.to_payload()
     assert plan_request["prepared_payload"]["intervention_schedule"] == schedule.to_payload()
-    assert payload["prepared_metadata"]["intervention_schedule_fingerprint"] == schedule.fingerprint
+    assert payload["prepared_metadata"]["intervention_schedule_fingerprint"] == expected_fingerprint
 
     restored = SerialFittingEvaluator.from_process_payload(payload)
     result = restored({"init:A": 1.0, "k1": 0.0})
 
     assert float(np.asarray(result.species["A"], dtype=float)[0]) == pytest.approx(3.0)
+
+
+def test_serial_fitting_metadata_normalizes_schedule_parameter_direct_spelling() -> None:
+    from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
+
+    base_lines = [
+        "reaction: A -> B; k=1.0",
+        "initial: A=1.0",
+        "initial: B=0.0",
+    ]
+    lower_context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [*base_lines, "intervention: op=add; species=A; time=0.0; amount_param=k1"]
+        ),
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=4,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+    direct_context = prepare_fitting_execution_context(
+        mechanism_text="\n".join(
+            [*base_lines, "intervention: op=add; species=A; time=0.0; amount_param=K1"]
+        ),
+        param_names=["K1"],
+        t_end=1.0,
+        num_points=4,
+        solver="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        initial_prefix="init:",
+    )
+
+    assert lower_context.prepared_metadata.intervention_schedule_fingerprint
+    assert (
+        lower_context.prepared_metadata.intervention_schedule_fingerprint
+        == direct_context.prepared_metadata.intervention_schedule_fingerprint
+    )
+
+    lower_payload = SerialFittingEvaluator(lower_context).to_process_payload()
+    direct_payload = SerialFittingEvaluator(direct_context).to_process_payload()
+    assert (
+        lower_payload["prepared_metadata"]["intervention_schedule_fingerprint"]
+        == direct_payload["prepared_metadata"]["intervention_schedule_fingerprint"]
+    )
 
 
 def test_serial_fitting_evaluator_process_payload_is_picklable_without_prepared_rhs() -> None:
@@ -1097,7 +1493,7 @@ def test_serial_fitting_evaluator_from_process_payload_requires_all_fields() -> 
                 "initial: B=0.0",
             ]
         ),
-        param_names=["k"],
+        param_names=["k1"],
         t_end=1.0,
         num_points=3,
         solver="BDF",
@@ -1145,13 +1541,14 @@ def test_serial_fitting_evaluator_rejects_nonfinite_consumed_parameter_values() 
     )
     evaluator = SerialFittingEvaluator(context)
 
-    with pytest.raises(FitSimulationError, match="Non-finite parameter value") as exc_info:
+    with pytest.raises(FitSimulationError, match="Non-finite parameter value for 'k1'") as exc_info:
         evaluator({"k1": float("nan"), "init:A": 1.0})
 
     assert exc_info.value.details["fatal"] is True
 
 
-def test_serial_fitting_evaluator_ignores_nonfinite_unconsumed_parameter_values() -> None:
+def test_serial_fitting_evaluator_rejects_unowned_parameter_values_fatally() -> None:
+    from kindred.core.exceptions import FitSimulationError
     from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
 
     mechanism_text = "\n".join(
@@ -1173,21 +1570,42 @@ def test_serial_fitting_evaluator_ignores_nonfinite_unconsumed_parameter_values(
     )
     evaluator = SerialFittingEvaluator(context)
 
-    expected = evaluator({"k1": 0.2, "init:A": 1.0})
-    actual = evaluator(
-        {
-            "k1": 0.2,
-            "init:A": 1.0,
-            "init:Removed": float("nan"),
-            "unused_rate": float("inf"),
-            "arbitrary_extra": float("-inf"),
-        }
+    with pytest.raises(FitSimulationError, match="unused_rate") as exc_info:
+        evaluator(
+            {
+                "k1": 0.2,
+                "init:A": 1.0,
+                "init:Removed": float("nan"),
+                "unused_rate": 1.0,
+            }
+        )
+
+    assert exc_info.value.details["fatal"] is True
+
+
+def test_prepare_fitting_execution_context_rejects_unowned_requested_parameter_name() -> None:
+    from kindred.core.exceptions import FitSimulationError
+    from kindred.core.fitting_evaluation import prepare_fitting_execution_context
+
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.2",
+            "initial: A=1.0",
+            "initial: B=0.0",
+        ]
     )
 
-    assert np.allclose(
-        np.asarray(actual.species["B"], dtype=float),
-        np.asarray(expected.species["B"], dtype=float),
-    )
+    with pytest.raises(FitSimulationError, match="ghost"):
+        prepare_fitting_execution_context(
+            mechanism_text=mechanism_text,
+            param_names=["ghost"],
+            t_end=1.0,
+            num_points=6,
+            solver="BDF",
+            rtol=1e-6,
+            atol=1e-12,
+            initial_prefix="init:",
+        )
 
 
 def test_serial_fitting_evaluator_rejects_non_numeric_parameter_values_fatally() -> None:
@@ -1213,7 +1631,7 @@ def test_serial_fitting_evaluator_rejects_non_numeric_parameter_values_fatally()
     )
     evaluator = SerialFittingEvaluator(context)
 
-    with pytest.raises(FitSimulationError, match="Invalid parameter value") as exc_info:
+    with pytest.raises(FitSimulationError, match="Parameter override 'k1' must be numeric") as exc_info:
         evaluator({"k1": "not-a-number", "init:A": 1.0})
 
     assert exc_info.value.details["fatal"] is True
@@ -1242,7 +1660,7 @@ def test_serial_fitting_evaluator_rejects_nonfinite_fixed_params_fatally() -> No
     )
     evaluator = SerialFittingEvaluator(context).with_fixed_params({"k1": float("nan")})
 
-    with pytest.raises(FitSimulationError, match="Non-finite parameter value") as exc_info:
+    with pytest.raises(FitSimulationError, match="Non-finite parameter value for 'k1'") as exc_info:
         evaluator({"init:A": 1.0})
 
     assert exc_info.value.details["fatal"] is True

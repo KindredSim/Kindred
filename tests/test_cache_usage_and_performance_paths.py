@@ -54,7 +54,7 @@ def test_fitting_objective_compiles_once(monkeypatch):
     dsl_text, _, _, _ = _simple_mechanism()
     objective = build_fitting_objective(
         dsl_text,
-        ["k"],
+        ["k1"],
         np.array([0.0, 1.0, 2.0]),
         np.array([1.0, 0.5, 0.25]),
         "B",

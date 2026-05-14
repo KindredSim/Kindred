@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from kindred.core.algebra.symbol_table import build_algebra_symbol_table
 from kindred.core.batch_parallel import run_batch_simulation_task
 from kindred.core.exceptions import FitSimulationError
 from kindred.core.fitting_evaluation import (
@@ -10,9 +11,11 @@ from kindred.core.fitting_evaluation import (
     evaluate_fitting_series,
     prepare_fitting_execution_context,
 )
+from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
+    SimulationPreparationError,
     build_prepared_simulation_func,
     prepared_simulation_run_for_execution_request,
     prepare_bound_mechanism,
@@ -112,6 +115,34 @@ def _solve_batch_explicit_series(mechanism_text: str) -> tuple[list[str], np.nda
     return list(payload["species_names"]), np.asarray(payload["Y"], dtype=float)
 
 
+def _run_batch_explicit_payload(mechanism_text: str, *, parameter_overrides: dict[str, float]) -> dict:
+    execution_request = {
+        "prepared_payload": None,
+        "initials": dict(_INITIALS),
+        "t_span": (0.0, 20.0),
+        "solver_config": dict(_SOLVER_CONFIG),
+        "mechanism_text": mechanism_text,
+        "parameter_overrides": dict(parameter_overrides),
+        "simulation_identity": {
+            "schema_id": "override-runtime-regression",
+            "param_fingerprint": mechanism_text,
+        },
+    }
+    return run_batch_simulation_task(
+        {
+            "run_id": 1,
+            "set_id": "id1",
+            "set_name": "set1",
+            "simulation_plan": SimulationPlan.from_execution_request(
+                execution_request,
+                execution_mode="explicit",
+                algebra_policy=SimulationAlgebraPolicy.BATCH_BEST_EFFORT,
+                metadata={"set_id": "id1", "set_name": "set1"},
+            ).to_payload(),
+        }
+    )
+
+
 def _solve_fitting_series(mechanism_text: str, params: dict[str, float]) -> dict[str, np.ndarray]:
     context = prepare_fitting_execution_context(
         mechanism_text=mechanism_text,
@@ -153,6 +184,48 @@ def test_batch_parallel_explicit_run_uses_algebra_derived_equilibrium_rate_overr
     control_names, control_y = _solve_batch_explicit_series(_CONTROL_MECHANISM_TEXT)
 
     _assert_final_state_matches_control(actual_names, actual_y, control_names, control_y)
+
+
+def test_batch_parallel_rejects_indexed_k_override_for_reversible_step() -> None:
+    payload = _run_batch_explicit_payload(
+        "A <-> B ; kf=1.0, kr=0.5\nB -> C ; k=0.2",
+        parameter_overrides={"K1": 8.0},
+    )
+
+    assert payload["success"] is False
+    assert payload["error"]["details"]["stage"] == "parameter_overrides"
+    assert "K1" in payload["error"]["message"]
+    assert "Keq1" in payload["error"]["message"]
+
+
+@pytest.mark.parametrize("name", ["k1", "kf2", "kr2", "Keq2", "K999", "kf999", "kr999", "Keq999"])
+def test_runtime_rejects_invalid_exact_indexed_protected_override_names(name: str) -> None:
+    with pytest.raises(SimulationPreparationError, match=name):
+        prepare_simulation_worker_run(
+            execution_request=SimulationExecutionRequest(
+                prepared_payload=None,
+                initials=dict(_INITIALS),
+                t_span=(0.0, 20.0),
+                solver_config=dict(_SOLVER_CONFIG),
+                mechanism_text="A <-> B ; kf=1.0, kr=0.5\nB -> C ; k=0.2",
+                parameter_overrides={name: 8.0},
+            ),
+        )
+
+
+@pytest.mark.parametrize("name", ["k", "kf", "kr", "K", "Keq"])
+def test_runtime_rejects_bare_step_key_override_names(name: str) -> None:
+    with pytest.raises(SimulationPreparationError, match="Bare step-local DSL keys"):
+        prepare_simulation_worker_run(
+            execution_request=SimulationExecutionRequest(
+                prepared_payload=None,
+                initials=dict(_INITIALS),
+                t_span=(0.0, 20.0),
+                solver_config=dict(_SOLVER_CONFIG),
+                mechanism_text="A -> B ; k=1.0\nB <-> C ; kf=1.0, kr=0.5",
+                parameter_overrides={name: 8.0},
+            ),
+        )
 
 
 def test_canonical_and_preview_paths_match_for_equilibrium_rate_override() -> None:
@@ -520,6 +593,89 @@ def test_reused_prepared_preview_applies_keq_override_to_rebuilt_rhs() -> None:
         )
 
 
+def test_reused_prepared_preview_keq_symbol_table_uses_mutable_override() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 80}
+    startup = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 20.0),
+        solver_config=solver_config,
+        mechanism_text="A <-> B ; kf=1.0; Keq=2.0",
+        parameter_overrides={"Keq1": 2.0},
+    )
+    prepared = prepare_simulation_worker_run(execution_request=startup)
+
+    changed = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 20.0),
+            solver_config=solver_config,
+            mechanism_text=startup.mechanism_text,
+            parameter_overrides={"keq1": 8.0},
+        ),
+    )
+    symtab = build_algebra_symbol_table(changed.mechanism)
+
+    assert symtab.get("Keq1") == pytest.approx(8.0)
+    with pytest.raises(KeyError):
+        symtab.get("K1")
+
+
+def test_reused_prepared_preview_implicit_keq_symbol_table_uses_current_rates() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 80}
+    startup = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 20.0),
+        solver_config=solver_config,
+        mechanism_text="A <-> B ; kf=1.0; kr=0.5",
+        parameter_overrides={"kf1": 1.0},
+    )
+    prepared = prepare_simulation_worker_run(execution_request=startup)
+
+    changed = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 20.0),
+            solver_config=solver_config,
+            mechanism_text=startup.mechanism_text,
+            parameter_overrides={"kf1": 2.0},
+        ),
+    )
+    symtab = build_algebra_symbol_table(changed.mechanism)
+
+    assert symtab.get("kf1") == pytest.approx(2.0)
+    assert symtab.get("kr1") == pytest.approx(0.5)
+    assert symtab.get("Keq1") == pytest.approx(4.0)
+    with pytest.raises(KeyError):
+        symtab.get("K1")
+
+
+def test_algebra_symbol_table_rejects_protected_indexed_scalar_metadata_names() -> None:
+    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ]
+        ),
+        initials={},
+    )
+    mechanism.metadata.setdefault("scalar_params", {})["K1"] = 3.0
+
+    with pytest.raises(ValueError, match="K1.*protected indexed"):
+        build_algebra_symbol_table(mechanism)
+
+
 def test_reused_prepared_preview_accepts_case_insensitive_step_override_names() -> None:
     solver_config = dict(_SOLVER_CONFIG)
     solver_config["grid"] = {"N": 80}
@@ -596,6 +752,235 @@ def test_reused_prepared_preview_accepts_case_insensitive_step_override_names() 
         rtol=1e-6,
         atol=1e-8,
     )
+
+
+def test_reused_prepared_preview_rejects_K1_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 80}
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 20.0),
+            solver_config=solver_config,
+            mechanism_text="A <-> B ; kf=1.0; kr=0.5",
+        )
+    )
+
+    with pytest.raises(SimulationPreparationError) as exc_info:
+        prepared_simulation_run_for_execution_request(
+            prepared,
+            SimulationExecutionRequest(
+                prepared_payload=None,
+                initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 20.0),
+                solver_config=solver_config,
+                mechanism_text="A <-> B ; kf=1.0; kr=0.5",
+                parameter_overrides={"K1": 8.0},
+            ),
+        )
+    message = str(exc_info.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_reused_prepared_preview_rejects_K1_schedule_name_on_reversible_step_without_irreversible_k1_and_suggests_existing_canonical_names() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 5}
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    with pytest.raises(SimulationPreparationError) as exc_info:
+        prepare_simulation_worker_run(
+            execution_request=SimulationExecutionRequest(
+                prepared_payload=None,
+                initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 2.0),
+                solver_config=solver_config,
+                mechanism_text=mechanism_text,
+                intervention_schedule=parse_intervention_schedule_from_dsl(mechanism_text),
+                parameter_overrides={"K1": 1.0},
+            )
+        )
+    message = str(exc_info.value)
+    assert "K1" in message
+    assert "not a valid indexed parameter identifier" in message
+    assert "kf1" in message
+    assert "kr1" in message
+    assert "Keq1" in message
+
+
+def test_reused_prepared_preview_routes_protected_schedule_name_through_canonical_mechanism_parameter() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 5}
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 2.0),
+                solver_config=solver_config,
+                mechanism_text=mechanism_text,
+                intervention_schedule=parse_intervention_schedule_from_dsl(mechanism_text),
+                parameter_overrides={"K1": 3.0},
+            )
+        )
+
+    assert prepared.request.intervention_schedule.to_payload()["instant_events"][0]["amount"] == pytest.approx(3.0)
+    assert (
+        prepared.unresolved_intervention_schedule.to_payload()["instant_events"][0]["amount_param"]
+        == "K1"
+    )
+
+
+def test_chained_prepared_preview_preserves_request_local_unresolved_schedule_source() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 5}
+    startup_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose1",
+        ]
+    )
+    request_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose2",
+        ]
+    )
+    prepared = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 2.0),
+                solver_config=solver_config,
+                mechanism_text=startup_text,
+                intervention_schedule=parse_intervention_schedule_from_dsl(startup_text),
+                parameter_overrides={"dose1": 1.0},
+            )
+        )
+
+    changed = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 2.0),
+            solver_config=solver_config,
+            mechanism_text=request_text,
+            intervention_schedule=parse_intervention_schedule_from_dsl(request_text),
+            parameter_overrides={"dose2": 3.0},
+        ),
+    )
+    chained = prepared_simulation_run_for_execution_request(
+        changed,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 2.0),
+            solver_config=solver_config,
+            mechanism_text="",
+            intervention_schedule=changed.unresolved_intervention_schedule,
+            parameter_overrides={"dose2": 5.0},
+        ),
+    )
+
+    assert changed.unresolved_intervention_schedule.to_payload()["instant_events"][0]["amount_param"] == "dose2"
+    assert chained.request.intervention_schedule.to_payload()["instant_events"][0]["amount"] == pytest.approx(5.0)
+
+
+def test_structured_prepared_payload_uses_explicit_request_schedule_for_ordinary_schedule_name() -> None:
+    solver_config = dict(_SOLVER_CONFIG)
+    solver_config["grid"] = {"N": 5}
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose",
+        ]
+    )
+    bound = prepare_bound_mechanism(
+        mechanism_text,
+        [],
+        temperature_K=298.15,
+        initials={"A": 1.0, "B": 0.0},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    prepared = prepare_simulation_worker_run(
+        prepared_payload=bound.as_serializable_execution_payload(),
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 2.0),
+                solver_config=solver_config,
+                mechanism_text="",
+                intervention_schedule=bound.unresolved_intervention_schedule,
+                parameter_overrides={"dose": 4.0},
+            ),
+        )
+
+    assert prepared.request.intervention_schedule.to_payload()["instant_events"][0]["amount"] == pytest.approx(4.0)
+
+
+def test_symbolic_snapshot_binds_only_partitioned_mechanism_override_names(monkeypatch) -> None:
+    import kindred.core.simulation_preparation as simulation_preparation
+
+    solver_config = simulation_preparation._build_solver_config(
+        solver_input="BDF",
+        rtol=1e-6,
+        atol=1e-12,
+        grid={"N": 5},
+        use_sparse_jacobian=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+    mechanism_text = "\n".join(
+        [
+            "equilibrium: A <-> B; kf=0.1; kr=0.1",
+            "intervention: op=add; species=A; time=1.0; amount_param=dose",
+        ]
+    )
+    original_bind = simulation_preparation._bind_parameters_to_mechanism
+    seen_names: list[list[str]] = []
+
+    def _recording_bind(mechanism, names):
+        seen_names.append(list(names))
+        return original_bind(mechanism, names)
+
+    monkeypatch.setattr(simulation_preparation, "_bind_parameters_to_mechanism", _recording_bind)
+
+    simulation_preparation._symbolic_jacobian_snapshot_values_for_execution_text(
+        mechanism_text=mechanism_text,
+        prepared_solver_config=solver_config,
+        temperature_K=298.15,
+        parameter_overrides={"dose": 4.0, "kf1": 0.2},
+        parameter_symbols=("kf1", "kr1"),
+    )
+
+    assert seen_names
+    assert all("dose" not in names for names in seen_names)
+    assert any("kf1" in names for names in seen_names)
 
 
 def test_reused_prepared_preview_recomputes_algebra_after_step_override() -> None:
@@ -782,6 +1167,102 @@ def test_prepare_fitting_execution_context_rejects_algebra_owned_rate_as_request
         )
 
 
+def test_reused_prepared_preview_applies_shared_schedule_scalar_parameter_override() -> None:
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "param scale = 1.0",
+            "param k1 = scale",
+            "intervention: op=add; species=A; time=1.0; amount_param=scale",
+        ]
+    )
+    solver_config = {
+        "solver": "BDF",
+        "rtol": 1e-8,
+        "atol": 1e-10,
+        "grid": {"N": 40},
+        "use_sparse_jacobian": False,
+    }
+    startup = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
+        solver_config=dict(solver_config),
+        mechanism_text=mechanism_text,
+        parameter_overrides={"scale": 1.0},
+        intervention_schedule=parse_intervention_schedule_from_dsl(mechanism_text),
+    )
+    prepared = prepare_simulation_worker_run(execution_request=startup)
+
+    changed = prepared_simulation_run_for_execution_request(
+        prepared,
+        SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 2.0),
+            solver_config=dict(solver_config),
+            mechanism_text=mechanism_text,
+            parameter_overrides={"scale": 2.0},
+            intervention_schedule=parse_intervention_schedule_from_dsl(mechanism_text),
+        ),
+    )
+    result = solve_ode(changed.request)
+    fresh_control_text = "\n".join(
+        [
+            "reaction: A -> B; k=2.0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount=2.0",
+        ]
+    )
+    stale_control_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount=2.0",
+        ]
+    )
+    fresh_control = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 2.0),
+            solver_config=dict(solver_config),
+            mechanism_text=fresh_control_text,
+            intervention_schedule=parse_intervention_schedule_from_dsl(fresh_control_text),
+        )
+    )
+    stale_control = prepare_simulation_worker_run(
+        execution_request=SimulationExecutionRequest(
+            prepared_payload=None,
+            initials={"A": 1.0, "B": 0.0},
+            t_span=(0.0, 2.0),
+            solver_config=dict(solver_config),
+            mechanism_text=stale_control_text,
+            intervention_schedule=parse_intervention_schedule_from_dsl(stale_control_text),
+        )
+    )
+    fresh_result = solve_ode(fresh_control.request)
+    stale_result = solve_ode(stale_control.request)
+
+    np.testing.assert_allclose(
+        np.asarray(result.Y, dtype=float)[:, -1],
+        np.asarray(fresh_result.Y, dtype=float)[:, -1],
+        rtol=1e-6,
+        atol=1e-8,
+    )
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(result.Y, dtype=float)[:, -1],
+            np.asarray(stale_result.Y, dtype=float)[:, -1],
+            rtol=1e-6,
+            atol=1e-8,
+        )
+
+
 def test_build_prepared_simulation_func_rejects_algebra_owned_rate_as_fit_parameter() -> None:
     simulation_func = build_prepared_simulation_func(
         mechanism_text="\n".join(
@@ -806,6 +1287,109 @@ def test_build_prepared_simulation_func_rejects_algebra_owned_rate_as_fit_parame
 
     with pytest.raises(FitSimulationError, match="algebra-owned mechanism parameter"):
         simulation_func({"k1": 2.0})
+
+
+def test_build_prepared_simulation_func_accepts_indexed_k_direct_spelling_for_irreversible_name() -> None:
+    simulation_func = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=0.1",
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        param_names=["k1"],
+        t_end=1.0,
+        num_points=6,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-8,
+        atol=1e-10,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )
+
+    payload = simulation_func({"K1": 2.0})
+
+    assert np.asarray(payload.species["A"], dtype=float)[-1] < 0.5
+
+
+def test_build_prepared_simulation_func_applies_shared_schedule_scalar_parameter_to_rate() -> None:
+    simulation_func = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+                "param scale = 1.0",
+                "param k1 = scale",
+                "intervention: op=add; species=A; time=1.0; amount_param=scale",
+            ]
+        ),
+        param_names=["scale"],
+        t_end=2.0,
+        num_points=20,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-8,
+        atol=1e-10,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )
+    stale_control = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+                "intervention: op=add; species=A; time=1.0; amount=2.0",
+            ]
+        ),
+        param_names=[],
+        t_end=2.0,
+        num_points=20,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-8,
+        atol=1e-10,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )({})
+    fresh_control = build_prepared_simulation_func(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=2.0",
+                "init: A=1.0, B=0.0",
+                "intervention: op=add; species=A; time=1.0; amount=2.0",
+            ]
+        ),
+        param_names=[],
+        t_end=2.0,
+        num_points=20,
+        temperature_K=298.15,
+        solver="BDF",
+        rtol=1e-8,
+        atol=1e-10,
+        use_sparse_jacobian=False,
+        wegscheider_cyclicity_enabled=False,
+        initial_prefix="init:",
+    )({})
+
+    result = simulation_func({"scale": 2.0})
+
+    np.testing.assert_allclose(
+        np.asarray(result.species["A"], dtype=float)[-1],
+        np.asarray(fresh_control.species["A"], dtype=float)[-1],
+        rtol=1e-6,
+        atol=1e-8,
+    )
+    with pytest.raises(AssertionError):
+        np.testing.assert_allclose(
+            np.asarray(result.species["A"], dtype=float)[-1],
+            np.asarray(stale_control.species["A"], dtype=float)[-1],
+            rtol=1e-6,
+            atol=1e-8,
+        )
 
 
 def test_prepare_bound_mechanism_keeps_internal_algebra_owned_rate_binding_for_scalar_fit_dimension() -> None:
@@ -844,3 +1428,58 @@ def test_prepare_bound_mechanism_keeps_internal_algebra_owned_rate_binding_for_s
     assert "scale" in bound.bindings
     assert "k1" in bound.bindings
     assert bound.bindings["k1"]() == pytest.approx(2.0)
+
+
+def test_prepare_bound_mechanism_accepts_indexed_k_direct_spelling_for_irreversible_name() -> None:
+    bound = prepare_bound_mechanism(
+        mechanism_text="\n".join(
+            [
+                "reaction: A -> B; k=1.0",
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        param_names=["K1"],
+        temperature_K=298.15,
+        initials={},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+
+    assert "k1" in bound.bindings
+    assert "K1" not in bound.bindings
+
+
+def test_prepare_bound_mechanism_rejects_implicit_keq_as_fit_parameter() -> None:
+    with pytest.raises(FitSimulationError, match="Keq1.*not writable"):
+        prepare_bound_mechanism(
+            mechanism_text="\n".join(
+                [
+                    "equilibrium: A <-> B; kf=6.0; kr=2.0",
+                    "init: A=1.0, B=0.0",
+                ]
+            ),
+            param_names=["Keq1"],
+            temperature_K=298.15,
+            initials={},
+            use_advanced_dsl=True,
+            wegscheider_cyclicity_enabled=False,
+        )
+
+
+def test_prepare_simulation_worker_run_rejects_implicit_keq_runtime_override() -> None:
+    with pytest.raises(SimulationPreparationError, match="Keq1.*not writable"):
+        prepare_simulation_worker_run(
+            execution_request=SimulationExecutionRequest(
+                prepared_payload=None,
+                mechanism_text="\n".join(
+                    [
+                        "equilibrium: A <-> B; kf=6.0; kr=2.0",
+                        "init: A=1.0, B=0.0",
+                    ]
+                ),
+                initials={"A": 1.0, "B": 0.0},
+                t_span=(0.0, 1.0),
+                solver_config={"solver": "BDF", "grid": {"N": 4}},
+                parameter_overrides={"Keq1": 4.0},
+            )
+        )

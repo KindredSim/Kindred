@@ -3,9 +3,9 @@ from __future__ import annotations
 from kindred.core.algebra.observable_introspection import extract_observables_from_algebra_text
 from kindred.core.simulator.algebra_section import (
     extract_algebra_section_text,
-    is_bare_assignment_algebra_line,
     upsert_lines_into_algebra_section,
 )
+from kindred.core.simulator.parameter_algebra_spec import classify_parameter_algebra_declaration
 from kindred.core.simulator.step_constraint_authority import build_step_constraint_reasons_from_text
 import pytest
 
@@ -19,7 +19,7 @@ def test_extract_algebra_section_text_collects_interleaved_algebra_lines_only():
             "reaction: A -> B ; k=1.0",
             "let total = [A] + [B]",
             "B -> C ; k=2.0",
-            "conversion = 1 - [A]/[A]_0",
+            "let conversion = 1 - [A]/[A]_0",
             "param scale = 2.0",
         ]
     )
@@ -27,7 +27,7 @@ def test_extract_algebra_section_text_collects_interleaved_algebra_lines_only():
     assert extract_algebra_section_text(text) == "\n".join(
         [
             "let total = [A] + [B]",
-            "conversion = 1 - [A]/[A]_0",
+            "let conversion = 1 - [A]/[A]_0",
             "param scale = 2.0",
         ]
     )
@@ -114,6 +114,25 @@ def test_interleaved_observable_discovery_reads_extracted_algebra_text():
     assert observables["signal"] == "[A] + [B]"
 
 
+def test_extract_algebra_section_text_preserves_unsupported_bare_assignment_for_policy_rejection():
+    text = "\n".join(
+        [
+            "reaction: A -> B ; k=1.0",
+            "signal = [A] + [B]",
+            "param scale = 2.0",
+        ]
+    )
+
+    extracted = extract_algebra_section_text(text)
+
+    assert extracted.splitlines() == [
+        "signal = [A] + [B]",
+        "param scale = 2.0",
+    ]
+    with pytest.raises(ValueError, match="Bare algebra assignment"):
+        extract_observables_from_algebra_text(extracted)
+
+
 def test_step_constraint_reasons_detect_interleaved_constraint_without_header():
     text = "\n".join(
         [
@@ -128,17 +147,17 @@ def test_step_constraint_reasons_detect_interleaved_constraint_without_header():
     assert reasons["k1"] == "algebra"
 
 
-def test_bare_assignment_classifier_rejects_prefixed_dsl_assignments():
-    assert is_bare_assignment_algebra_line("reaction = nope") is False
-    assert is_bare_assignment_algebra_line("equilibrium = nope") is False
-    assert is_bare_assignment_algebra_line("state = nope") is False
-    assert is_bare_assignment_algebra_line("conversion = 1 - [A]/[A]_0") is True
+def test_unsupported_bare_assignment_classifier_rejects_prefixed_dsl_assignments():
+    assert classify_parameter_algebra_declaration("reaction = nope").kind == "non_algebra"
+    assert classify_parameter_algebra_declaration("equilibrium = nope").kind == "non_algebra"
+    assert classify_parameter_algebra_declaration("state = nope").kind == "non_algebra"
 
 
-def test_bare_assignment_classifier_rejects_brace_block_rhs():
-    assert is_bare_assignment_algebra_line("config = {") is False
-    assert is_bare_assignment_algebra_line("result = { [A] = 1.0 }") is False
+def test_unsupported_bare_assignment_classifier_rejects_brace_block_rhs():
+    assert classify_parameter_algebra_declaration("config = {").kind == "non_algebra"
+    assert classify_parameter_algebra_declaration("result = { [A] = 1.0 }").kind == "non_algebra"
 
 
-def test_bare_assignment_classifier_accepts_non_brace_rhs():
-    assert is_bare_assignment_algebra_line("config = 1.0") is True
+def test_unsupported_bare_assignment_classifier_detects_non_brace_rhs():
+    assert classify_parameter_algebra_declaration("config = 1.0").kind == "unsupported_bare_assignment"
+    assert classify_parameter_algebra_declaration("conversion = 1 - [A]/[A]_0").kind == "unsupported_bare_assignment"

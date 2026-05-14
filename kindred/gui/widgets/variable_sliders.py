@@ -33,7 +33,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     Features:
     - Sliders for rate constants (k1, k2, ...)
-    - Sliders for equilibrium constants (K1, kf1, kr1, ...)
+    - Sliders for equilibrium constants (Keq1, kf1, kr1, ...)
     - Sliders for scalar parameters defined in mechanism
     - Logarithmic scale for wide range of values
     - Real-time value display
@@ -144,7 +144,7 @@ class VariableSliders(QtWidgets.QWidget):
         ----------
         variables : dict
             Dictionary of {variable_name: value}
-            Examples: {'k1': 0.5, 'k2': 1.0, 'K1': 10.0, 'kf1': 2.0, 'kr1': 0.2}
+            Examples: {'k1': 0.5, 'k2': 1.0, 'Keq1': 10.0, 'kf1': 2.0, 'kr1': 0.2}
         """
         logger.info(f"Setting {len(variables)} variables")
 
@@ -215,7 +215,7 @@ class VariableSliders(QtWidgets.QWidget):
         Parameters
         ----------
         name : str
-            Variable name (e.g., 'k1', 'K1', 'kf1')
+            Variable name (e.g., 'k1', 'Keq1', 'kf1')
         value : float
             Current value
         """

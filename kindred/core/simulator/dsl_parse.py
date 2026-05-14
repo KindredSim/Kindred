@@ -36,11 +36,6 @@ from typing import Dict, List, Optional, Tuple, cast, TYPE_CHECKING
 import re
 
 from ..units import UnitsModel
-from .algebra_section import (
-    is_bare_assignment_algebra_line,
-    is_let_algebra_line,
-    is_param_algebra_line,
-)
 from .dsl_types import StepPreview
 from .errors import (
     DSLError,
@@ -51,6 +46,7 @@ from .errors import (
     invalid_keyvalue_pair_error,
     invalid_boolean_error,
 )
+from .parameter_algebra_spec import classify_parameter_algebra_declaration
 
 if TYPE_CHECKING:
     from ..mechanism import Mechanism
@@ -561,13 +557,35 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 raise DSLError(str(exc), line_number=line_no, line_content=raw) from exc
             continue
 
-        if is_let_algebra_line(raw):
+        classification = classify_parameter_algebra_declaration(raw, line_number=line_no)
+        if classification.kind == "let":
             algebra_lines.append(raw)
             continue
 
-        if is_param_algebra_line(raw):
+        if classification.kind == "param":
             algebra_lines.append(raw)
             continue
+
+        if classification.kind == "invalid_step_key_identifier":
+            target = classification.raw_name or raw.strip()
+            raise DSLError(
+                f"{target!r} is a step-local DSL key and cannot be declared as a parameter or observable.",
+                suggestion=(
+                    "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
+                    "or choose a longer ordinary name."
+                ),
+                line_number=line_no,
+                line_content=raw,
+            )
+
+        if classification.kind == "unsupported_bare_assignment":
+            target = classification.raw_name or raw.strip()
+            raise DSLError(
+                f"Bare algebra assignment {target!r} is not supported.",
+                suggestion="Use 'let name = expr' or 'param name = expr'.",
+                line_number=line_no,
+                line_content=raw,
+            )
 
         # reaction: line
         if lower.startswith("reaction:"):
@@ -614,10 +632,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     line_content=raw,
                 )
             )
-            continue
-
-        if is_bare_assignment_algebra_line(raw):
-            algebra_lines.append(raw)
             continue
 
         raise DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)

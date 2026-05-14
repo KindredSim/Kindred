@@ -355,7 +355,9 @@ class TestParameterExtraction:
 
         assert len(params) >= 2
         param_names = [p.name for p in params]
-        assert "k" in param_names or any("k" in name for name in param_names)
+        assert "k1" in param_names
+        assert "k2" in param_names
+        assert "k" not in param_names
 
     def test_extract_thermodynamic_params(self):
         """Test extracting thermodynamic parameters."""
@@ -365,8 +367,17 @@ class TestParameterExtraction:
         """
         params = extract_parameters_from_dsl(dsl)
 
-        # Should extract dG_act parameter
-        assert len(params) > 0
+        # dG_act is step-local input syntax; the public parameter identity is canonical k1.
+        assert [p.name for p in params] == ["k1"]
+
+    def test_extract_parameters_from_dsl_returns_canonical_equilibrium_names(self):
+        dsl = """
+        equilibrium: A <-> B; kf=1.0; kr=0.25
+        """
+        params = extract_parameters_from_dsl(dsl)
+
+        assert [p.name for p in params] == ["kf1", "kr1", "Keq1"]
+        assert [p.editable for p in params] == [True, True, False]
 
     def test_extract_parameters_from_dsl_rejects_duplicate_equilibrium_aliases(self):
         dsl = """

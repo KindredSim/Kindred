@@ -61,7 +61,7 @@ def test_global_fit_worker_emits_best_updated_only_on_improvement(qt_app):
 
     worker = GlobalFitWorker(
         datasets,
-        {"k": 1.0},
+        {"k1": 1.0},
         fit_evaluator=simulation,
         fit_func=fake_fit_global,
         best_update_interval_s=0.0,
@@ -256,7 +256,7 @@ def test_global_fit_worker_rejects_exact_serial_evaluator_without_runtime_sessio
                 "initial: B=0.0",
             ]
         ),
-        param_names=["k"],
+        param_names=["k1"],
         t_end=1.0,
         num_points=2,
         solver="BDF",
@@ -273,7 +273,7 @@ def test_global_fit_worker_rejects_exact_serial_evaluator_without_runtime_sessio
 
     worker = GlobalFitWorker(
         [{"id": "ds", "t": np.asarray([0.0]), "y": np.asarray([0.0]), "species": "A"}],
-        {"k": 1.0},
+        {"k1": 1.0},
         fit_evaluator=evaluator,
         fit_runtime_session=None,
         fit_func=fake_fit_global,
@@ -300,7 +300,7 @@ def test_global_fit_worker_rejects_exact_serial_evaluator_with_unready_runtime_s
                 "initial: B=0.0",
             ]
         ),
-        param_names=["k"],
+        param_names=["k1"],
         t_end=1.0,
         num_points=2,
         solver="BDF",
@@ -317,7 +317,7 @@ def test_global_fit_worker_rejects_exact_serial_evaluator_with_unready_runtime_s
 
     worker = GlobalFitWorker(
         [{"id": "ds", "t": np.asarray([0.0]), "y": np.asarray([0.0]), "species": "A"}],
-        {"k": 1.0},
+        {"k1": 1.0},
         fit_evaluator=evaluator,
         fit_runtime_session=_UnreadySession(),
         fit_func=fake_fit_global,
@@ -348,7 +348,7 @@ def test_global_fit_worker_accepts_ready_runtime_session_with_default_lane_count
                 "initial: B=0.0",
             ]
         ),
-        param_names=["k"],
+        param_names=["k1"],
         t_end=1.0,
         num_points=2,
         solver="BDF",
@@ -364,7 +364,7 @@ def test_global_fit_worker_accepts_ready_runtime_session_with_default_lane_count
         captured["runtime_session"] = kwargs.get("runtime_session")
         captured["max_runtime_lanes"] = kwargs.get("max_runtime_lanes")
         return GlobalFitResult(
-            shared_params={"k": 1.0},
+            shared_params={"k1": 1.0},
             dataset_params={"ds": {}},
             uncertainties=None,
             global_chi_squared=0.0,

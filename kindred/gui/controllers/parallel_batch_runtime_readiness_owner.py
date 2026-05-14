@@ -144,8 +144,8 @@ class ParallelBatchRuntimeReadinessOwner:
             )
         return self._waiting_runtime_snapshot(snapshot)
 
-    def ensure(self, *, wait: bool = False) -> None:
-        effective_workers = self._effective_workers()
+    def ensure(self, *, wait: bool = False, required_lanes: int | None = None) -> None:
+        effective_workers = self._effective_workers(required_lanes=required_lanes)
         try:
             if self._batch_parallel.has_ready_lane_pool(max_lanes=max(1, int(effective_workers))):
                 self._eagerly_created = True
@@ -160,7 +160,7 @@ class ParallelBatchRuntimeReadinessOwner:
                     return
                 thread = threading.Thread(
                     target=self.ensure,
-                    kwargs={"wait": True},
+                    kwargs={"wait": True, "required_lanes": max(1, int(effective_workers))},
                     name="kindred-batch-runtime-readiness",
                     daemon=True,
                 )
@@ -245,7 +245,9 @@ class ParallelBatchRuntimeReadinessOwner:
             polling=True,
         )
 
-    def _effective_workers(self) -> int:
+    def _effective_workers(self, *, required_lanes: int | None = None) -> int:
+        if required_lanes is not None:
+            return max(1, int(required_lanes))
         try:
             return max(1, int(self._capacity_getter()))
         except Exception:

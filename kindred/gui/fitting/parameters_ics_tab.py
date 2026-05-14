@@ -10,6 +10,7 @@ from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.gui.ui_helpers import safe_float_parse, setup_scientific_validator
@@ -802,7 +803,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
                 reactions_text = str(self._reactions_text_getter() or "")
                 algebra_text = extract_algebra_section_text(reactions_text)
-                available_observables = extract_observables_from_algebra_text(algebra_text)
+                mechanism_namespace = build_namespace_from_mechanism(parse_dsl_to_mechanism(reactions_text, initials={}))
+                available_observables = extract_observables_from_algebra_text(
+                    algebra_text,
+                    mechanism_namespace=mechanism_namespace,
+                )
             except Exception:
                 available_observables = {}
         dialog = _AddFittableParameterDialog(
