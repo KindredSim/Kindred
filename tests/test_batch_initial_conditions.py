@@ -3,7 +3,7 @@ import pytest
 
 @pytest.mark.unit
 def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
-    from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
+    from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 
     reaction_text = "\n".join(
         [
@@ -17,9 +17,12 @@ def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
         ]
     )
 
-    seed, rewritten = migrate_reaction_dsl_initial_concentrations(reaction_text, set_name="set1")
+    seeds, rewritten = migrate_reaction_dsl_initial_concentration_sets(
+        reaction_text,
+        default_set_name="set1",
+    )
 
-    assert seed == {"A": pytest.approx(1.0), "B": pytest.approx(0.0)}
+    assert seeds == {"set1": {"A": pytest.approx(1.0), "B": pytest.approx(0.0)}}
     assert "[A]" not in rewritten
     assert "[B]" not in rewritten
     assert "let x = 3" in rewritten
@@ -27,7 +30,7 @@ def test_migrate_initial_concentrations_block_rewrites_stub_and_returns_seed():
 
 @pytest.mark.unit
 def test_migrate_initial_concentrations_is_one_time_seed_if_stub_present():
-    from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
+    from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 
     stubbed = "\n".join(
         [
@@ -36,9 +39,19 @@ def test_migrate_initial_concentrations_is_one_time_seed_if_stub_present():
         ]
     )
 
-    seed, rewritten = migrate_reaction_dsl_initial_concentrations(stubbed, set_name="set1")
-    assert seed == {}
+    seeds, rewritten = migrate_reaction_dsl_initial_concentration_sets(
+        stubbed,
+        default_set_name="set1",
+    )
+    assert seeds == {}
     assert rewritten == stubbed
+
+
+@pytest.mark.unit
+def test_single_set_initial_concentration_migration_wrapper_is_removed():
+    import kindred.core.batch_initial_conditions as batch_initial_conditions
+
+    assert not hasattr(batch_initial_conditions, "migrate_reaction_dsl_initial_concentrations")
 
 @pytest.mark.unit
 def test_migrate_named_initial_concentration_sets_preserves_imported_names_and_rewrites_each_block():
@@ -840,7 +853,7 @@ def test_move_reorders_cached_main_plot_popup_labels_for_duplicate_names(main_wi
     cache.active_batch_set = "dup"
     cache.last_display_selection = [first_id, second_id]
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([1.0, 2.0], dtype=float)},
         label="dup",
@@ -906,7 +919,7 @@ def test_batch_set_rename_resyncs_cached_main_plot_popup_labels(main_window, qt_
     cache.active_batch_set = "dup"
     cache.last_display_selection = [first_id, second_id]
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([1.0, 2.0], dtype=float)},
         label="dup",
@@ -957,7 +970,7 @@ def test_batch_table_paste_rename_resyncs_cached_main_plot_popup_labels(main_win
     cache.active_batch_set = "dup"
     cache.last_display_selection = [first_id, second_id]
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([1.0, 2.0], dtype=float)},
         label="dup",

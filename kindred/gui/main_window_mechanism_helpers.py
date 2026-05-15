@@ -19,21 +19,15 @@ class MainWindowMechanismHelpers:
         self._set_temperature_override_state: Callable[..., None] = main_window.set_temperature_override_state
         self._set_temperature_mode_indicator_text: Callable[[str], None] = main_window.set_temperature_mode_indicator_text
         self._update_temperature_mode_indicator: Callable[[], None] = main_window.update_temperature_mode_indicator
-        self._sync_mechanism_controls_to_focused_batch_set: Callable[..., None] = getattr(
-            main_window,
-            "_sync_mechanism_controls_to_focused_batch_set",
-            lambda **_kwargs: None,
+        self._sync_mechanism_controls_to_focused_batch_set: Callable[..., None] = (
+            main_window._sync_mechanism_controls_to_focused_batch_set
         )
         self._apply_pending_init_migration: Callable[..., bool] = main_window.apply_pending_init_migration
-        self._arm_pending_init_result_invalidation_guard: Callable[..., None] = getattr(
-            main_window,
-            "arm_pending_init_result_invalidation_guard",
-            lambda *, rewrite=None: None,
+        self._arm_pending_init_result_invalidation_guard: Callable[..., None] = (
+            main_window.arm_pending_init_result_invalidation_guard
         )
-        self._invalidate_pending_init_preserved_results_after_failed_run: Callable[[], None] = getattr(
-            main_window,
-            "invalidate_pending_init_preserved_results_after_failed_run",
-            lambda: None,
+        self._invalidate_pending_init_preserved_results_after_failed_run: Callable[[], None] = (
+            main_window.invalidate_pending_init_preserved_results_after_failed_run
         )
         self._last_mechanism: object | None = None
         self._last_mechanism_context: dict[str, Any] = {}
@@ -88,22 +82,13 @@ class MainWindowMechanismHelpers:
         self,
         *,
         seed_sets: dict[str, dict[str, float]] | None = None,
-        seed: dict[str, float] | None = None,
         rewrite: str,
     ) -> bool:
-        if seed_sets is None and seed is not None:
-            seed_sets = {"set1": dict(seed)}
         normalized = {
-            str(set_name): {str(species): float(value) for species, value in dict(seed).items()}
-            for set_name, seed in dict(seed_sets or {}).items()
+            str(set_name): {str(species): float(value) for species, value in dict(values).items()}
+            for set_name, values in dict(seed_sets or {}).items()
         }
-        try:
-            return bool(self._apply_pending_init_migration(seed_sets=normalized, rewrite=str(rewrite)))
-        except TypeError:
-            legacy_seed = normalized.get("set1")
-            if legacy_seed is None:
-                raise
-            return bool(self._apply_pending_init_migration(seed=legacy_seed, rewrite=str(rewrite)))
+        return bool(self._apply_pending_init_migration(seed_sets=normalized, rewrite=str(rewrite)))
 
     def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
         self._arm_pending_init_result_invalidation_guard(rewrite=rewrite)

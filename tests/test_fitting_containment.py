@@ -12,6 +12,12 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+def test_contained_serial_fitting_evaluator_wrapper_is_removed() -> None:
+    import kindred.core.fitting_containment as fitting_containment
+
+    assert not hasattr(fitting_containment, "ContainedSerialFittingEvaluator")
+
+
 def _process_context() -> multiprocessing.context.BaseContext:
     return multiprocessing.get_context("spawn")
 
@@ -289,8 +295,8 @@ def test_warm_lane_cancellation_kills_in_progress_request_without_penalty_mappin
 
 
 def test_contained_evaluator_timeout_maps_to_nonfatal_fit_simulation_error() -> None:
-    from kindred.core.exceptions import FitSimulationError
-    from kindred.core.fitting_containment import ContainedSerialFittingEvaluator, FittingLaneTimeout
+    from kindred.core.fitting_containment import FittingLaneTimeout
+    from kindred.core.fitting_runtime_session import FittingRuntimeSession
 
     class _TimeoutLane:
         close_calls = 0
@@ -298,17 +304,22 @@ def test_contained_evaluator_timeout_maps_to_nonfatal_fit_simulation_error() -> 
         def evaluate_series_with_parameter_origins(self, *_args, **_kwargs):
             raise FittingLaneTimeout(0.25)
 
-        def close(self) -> None:
+        def warm(self, *, cancellation_check=None) -> None:
+            return None
+
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
             self.close_calls += 1
 
     lane = _TimeoutLane()
-    evaluator = ContainedSerialFittingEvaluator(
-        _basic_evaluator(),
+    session = FittingRuntimeSession(
+        process_payload=_basic_evaluator().to_process_payload(),
+        max_lanes=1,
         lane_factory=lambda _payload, **_kwargs: lane,
-        request_timeout_s=0.25,
     )
+    evaluator = session.evaluator()
 
-    with pytest.raises(FitSimulationError) as exc_info:
+    with pytest.raises(FittingLaneTimeout) as exc_info:
         evaluator.evaluate_series_with_parameter_origins(
             {"k1": 0.2, "init:A": 1.0},
             {"k1": "optimizer_shared", "init:A": "optimizer_dataset"},
@@ -316,30 +327,34 @@ def test_contained_evaluator_timeout_maps_to_nonfatal_fit_simulation_error() -> 
         )
 
     err = exc_info.value
-    assert err.details["fatal"] is False
-    assert err.details["failure"]["kind"] == "timeout"
-    assert err.details["failure"]["details"]["active_solve_timeout_s"] == pytest.approx(0.25)
-    assert err.failed_params == {"k1": 0.2, "ds::init:A": 1.0}
+    assert err.timeout_s == pytest.approx(0.25)
 
-    evaluator.close()
+    session.close()
     assert lane.close_calls == 1
 
 
 def test_contained_evaluator_lane_protocol_error_is_fatal() -> None:
     from kindred.core.exceptions import FitSimulationError
-    from kindred.core.fitting_containment import ContainedSerialFittingEvaluator, FittingLaneProtocolError
+    from kindred.core.fitting_containment import FittingLaneProtocolError
+    from kindred.core.fitting_runtime_session import FittingRuntimeSession
 
     class _ProtocolFailureLane:
+        def warm(self, *, cancellation_check=None) -> None:
+            return None
+
         def evaluate_series_with_parameter_origins(self, *_args, **_kwargs):
             raise FittingLaneProtocolError("bad reply")
 
-        def close(self) -> None:
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
             return None
 
-    evaluator = ContainedSerialFittingEvaluator(
-        _basic_evaluator(),
+    session = FittingRuntimeSession(
+        process_payload=_basic_evaluator().to_process_payload(),
+        max_lanes=1,
         lane_factory=lambda _payload, **_kwargs: _ProtocolFailureLane(),
     )
+    evaluator = session.evaluator()
 
     with pytest.raises(FitSimulationError) as exc_info:
         evaluator.evaluate_series({"k1": 0.2, "init:A": 1.0})

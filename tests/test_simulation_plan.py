@@ -146,6 +146,37 @@ def test_prepared_request_round_trip_preserves_payload_and_copies_arrays_defensi
     assert round_tripped["prepared_payload"]["y0"] is not y0
 
 
+def test_plan_payload_copy_does_not_invoke_arbitrary_leaf_deepcopy_hooks() -> None:
+    from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
+
+    class ThreadUnsafeLeaf:
+        deepcopy_called = False
+
+        def __deepcopy__(self, _memo):
+            type(self).deepcopy_called = True
+            return self
+
+    leaf = ThreadUnsafeLeaf()
+    request = SimulationExecutionRequest(
+        prepared_payload=None,
+        initials={},
+        t_span=(0.0, 1.0),
+        solver_config={"solver": "BDF"},
+        mechanism_text="reaction: A -> B; k=1",
+    )
+    plan = SimulationPlan.from_execution_request(
+        request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        metadata={"opaque_leaf": leaf},
+    )
+
+    payload = plan.to_payload()
+
+    assert payload["metadata"]["opaque_leaf"] is leaf
+    assert ThreadUnsafeLeaf.deepcopy_called is False
+
+
 def test_malformed_plan_payload_fails_clearly() -> None:
     from kindred.core.simulation_plan import SimulationPlan
 

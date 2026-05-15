@@ -27,12 +27,13 @@ from kindred.core.api.simulation import (
 )
 from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetPayloadResult,
-    FitDatasetSpec,
     coerce_fit_dataset_payload_result,
+    coerce_fit_dataset_specs,
     read_fit_dataset_payload,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
-    FitDatasetParameterOverrides,
+    coerce_fit_dataset_parameter_overrides,
+    split_fit_dataset_parameter_overrides,
 )
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
@@ -40,13 +41,19 @@ from kindred.core.fitting_evaluation import (
     coerce_fitting_series_evaluator,
     evaluate_fitting_series,
 )
-from kindred.core.batch_parallel import compute_effective_batch_workers
 from kindred.core.fitting_runtime_session import FittingRuntimeLedger, FittingRuntimeSession
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulation_preparation import PreparedSimulationMetadata
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
-from kindred.gui.fitting.launch import FittingLaunchIdentityOwner, validate_de_bounds
+from kindred.gui.fitting.launch import (
+    FittingLaunchDatasetSelection,
+    FittingLaunchPurpose,
+    FittingLaunchRejection,
+    FittingLaunchResult,
+    FittingLaunchSnapshot,
+    validate_de_bounds,
+)
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
     simulation_failure_detail_text,
@@ -57,8 +64,11 @@ from kindred.gui.fitting.run_stamp import (
     hash_global_fit_run_stamp,
 )
 from kindred.gui.fitting.runtime_readiness import (
+    FittingRuntimeAcceptedLaunch,
     FittingRuntimeIdentity,
+    PreparedFitEvaluator,
     FittingRuntimeReadinessController,
+    FittingRuntimeLaunchDecisionState,
     FittingRuntimeReadinessState,
 )
 from kindred.gui.fitting.data_tab import DataTab
@@ -66,12 +76,10 @@ from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.evaluator_state import FittingEvaluatorStateOwner
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
-from kindred.gui.fitting.run_command import FittingRunCommandOwner
 from kindred.gui.fitting.run_state import FittingRunStateOwner
 from kindred.gui.fitting.runtime_preparation import FittingRuntimePreparationOwner
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.worker_lifecycle import FitWorkerStopPolicy
-from kindred.gui.fitting.worker_launch import FittingAcceptedLaunchWorkerOwner
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices, compute_windowed_indices
 from kindred.gui.fitting.constants import INITIAL_PREFIX, _SAMPLING_ALL_POINTS_SENTINEL, DEFAULT_PARALLEL_STARTS
@@ -274,6 +282,7 @@ class FittingWindow(QtWidgets.QDialog):
         reactions_text_setter: Optional[Callable[[str], None]] = None,
         simulation_builder: Optional[SimulationBuilder] = None,
         runtime_settings_getter: Optional[Callable[[], Mapping[str, Any]]] = None,
+        runtime_lane_budget: Optional[Callable[[int], int]] = None,
         dataset_params: Optional[Dict[str, Dict[str, float]]] = None,
         dataset_variable_params: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
         dataset_payloads: Optional[Sequence[Dict[str, Any]]] = None,
@@ -303,14 +312,16 @@ class FittingWindow(QtWidgets.QDialog):
             if callable(simulation_builder)
             else None
         )
+        if runtime_lane_budget is None:
+            raise ValueError("FittingWindow requires an explicit runtime_lane_budget provider.")
+
         self._fit_evaluator_state = FittingEvaluatorStateOwner(
             base_evaluator=simulation_func,
             simulation_builder=self._simulation_builder,
         )
-        self._fit_launch_identity_owner = FittingLaunchIdentityOwner(self)
-        self._fit_run_command_owner = FittingRunCommandOwner(self)
-        self._fit_worker_launch_owner = FittingAcceptedLaunchWorkerOwner(self)
+        self._last_launch_result: Optional[FittingLaunchResult] = None
         self._runtime_settings_getter = runtime_settings_getter
+        self._runtime_lane_budget = runtime_lane_budget
         self._apply_callback = apply_callback
         self._project_apply_callback = project_apply_callback
         self._dataset_settings_updater = dataset_settings_updater
@@ -473,12 +484,11 @@ class FittingWindow(QtWidgets.QDialog):
         return bool(self._worker and hasattr(self._worker, "isRunning") and self._worker.isRunning())
 
     @property
-    def fit_launch_identity_owner(self) -> FittingLaunchIdentityOwner:
-        return self._fit_launch_identity_owner
+    def is_closing(self) -> bool:
+        return bool(self._closing)
 
-    @property
-    def fit_run_command_owner(self) -> FittingRunCommandOwner:
-        return self._fit_run_command_owner
+    def is_fit_running(self) -> bool:
+        return self._is_fit_running
 
     @property
     def fit_run_state_owner(self) -> FittingRunStateOwner:
@@ -492,9 +502,358 @@ class FittingWindow(QtWidgets.QDialog):
     def fit_runtime_readiness(self) -> FittingRuntimeReadinessController:
         return self._fit_runtime_readiness
 
-    @property
-    def fit_worker_launch_owner(self) -> FittingAcceptedLaunchWorkerOwner:
-        return self._fit_worker_launch_owner
+    def _runtime_lane_budget_for_dataset_count(self, dataset_count: int) -> int:
+        provider = self._runtime_lane_budget
+        value = int(provider(max(1, int(dataset_count))))
+        return max(1, int(value))
+
+    def collect_dataset_selection(self) -> FittingLaunchDatasetSelection:
+        rows = []
+        included_ids: List[str] = []
+        for entry in list(self._dataset_entries):
+            dataset_id = str(entry.get("id") or "").strip()
+            include = bool(entry.get("include", True))
+            label = str(entry.get("label") or dataset_id)
+            species = ", ".join(entry.get("selected_species", []))
+            weight = self._dataset_weight_for_id(dataset_id)
+            entry["weight"] = weight
+            entry["include"] = include
+            rows.append(
+                {
+                    "id": dataset_id,
+                    "label": label,
+                    "species": species,
+                    "include": include,
+                    "weight": weight,
+                }
+            )
+            if include:
+                included_ids.append(dataset_id)
+        return FittingLaunchDatasetSelection(rows=tuple(rows), ids=tuple(included_ids))
+
+    def build_current_launch_snapshot(
+        self,
+        *,
+        integration_settings: Optional[tuple[str, float, float]] = None,
+        purpose: Optional[FittingLaunchPurpose] = None,
+        refresh_current_mechanism: bool = True,
+    ) -> Optional[FittingLaunchSnapshot]:
+        launch_purpose = purpose or FittingLaunchPurpose.PASSIVE_READINESS
+        explicit = launch_purpose is FittingLaunchPurpose.EXPLICIT_RUN
+        if self._fit_window_state_refreshing:
+            return None
+        if refresh_current_mechanism and not self._refresh_fit_window_state_for_current_mechanism(
+            show_errors=explicit
+        ):
+            return None
+        collected_config_bundle = self._params_ics_tab.collect_parameter_config_bundle(show_errors=explicit)
+        if collected_config_bundle is None:
+            return None
+        config, global_dataset_params, global_dataset_variable_params = collected_config_bundle
+        dataset_selection = self.collect_dataset_selection()
+        if explicit:
+            self._fit_run_state_owner.set_active_dataset_ids(list(dataset_selection.ids))
+        if not dataset_selection.ids:
+            if explicit:
+                QtWidgets.QMessageBox.warning(self, "No Datasets", "Select at least one dataset to include.")
+            return None
+        invalid = self._invalid_applied_used_dataset_ids_for_run()
+        if invalid:
+            if explicit:
+                labels = [self._dataset_label_for_id(ds_id) for ds_id in invalid]
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Global Fit",
+                    "Run Fit is disabled due to invalid applied settings for: "
+                    + ", ".join(labels)
+                    + ".",
+                )
+            else:
+                self._set_fit_status("Fitting runtime not ready: invalid applied settings")
+            return None
+        if integration_settings is not None:
+            integration = integration_settings
+        elif explicit:
+            integration = self._params_ics_tab.collect_integration_settings()
+        else:
+            collect_integration_settings = getattr(
+                self._params_ics_tab,
+                "collect_integration_settings_silent",
+                self._params_ics_tab.collect_integration_settings,
+            )
+            integration = collect_integration_settings()
+        if integration is None:
+            return None
+        return FittingLaunchSnapshot(
+            config=dict(config or {}),
+            global_dataset_params=dict(global_dataset_params or {}),
+            global_dataset_variable_params=dict(global_dataset_variable_params or {}),
+            dataset_selection=dataset_selection,
+            integration=integration,
+        )
+
+    def build_current_launch_result(
+        self,
+        *,
+        purpose: FittingLaunchPurpose,
+        integration_settings: Optional[tuple[str, float, float]] = None,
+        refresh_current_mechanism: bool = True,
+    ) -> FittingLaunchResult:
+        identity, rejection = self._build_current_fit_runtime_identity(
+            purpose=purpose,
+            integration_settings=integration_settings,
+            refresh_current_mechanism=refresh_current_mechanism,
+        )
+        result = FittingLaunchResult(identity=identity, rejection=rejection)
+        self._last_launch_result = result
+        return result
+
+    def current_launch_result(self) -> Optional[FittingLaunchResult]:
+        return self._last_launch_result
+
+    def payloads_available_for_identity(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
+        if identity is None:
+            return False
+        for spec in identity.datasets:
+            dataset_id = str(getattr(spec, "dataset_id", "") or "")
+            result = self._global_payload_results.get(dataset_id)
+            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
+                return False
+            if dataset_id not in self._global_payload_lookup:
+                return False
+        return True
+
+    def build_current_fit_runtime_identity(
+        self,
+        *,
+        integration_settings: Optional[tuple[str, float, float]] = None,
+        refresh_current_mechanism: bool = True,
+    ) -> Optional[FittingRuntimeIdentity]:
+        result = self.build_current_launch_result(
+            purpose=FittingLaunchPurpose.PASSIVE_READINESS,
+            integration_settings=integration_settings,
+            refresh_current_mechanism=refresh_current_mechanism,
+        )
+        return result.identity
+
+    def render_launch_rejection(
+        self,
+        result: FittingLaunchResult,
+        *,
+        purpose: FittingLaunchPurpose,
+    ) -> None:
+        rejection = result.rejection
+        if rejection is None:
+            return
+        if purpose is FittingLaunchPurpose.EXPLICIT_RUN and rejection.title:
+            QtWidgets.QMessageBox.warning(self, rejection.title, rejection.message)
+        elif rejection.passive_status:
+            self._set_fit_status(rejection.passive_status)
+
+    def _build_current_fit_runtime_identity(
+        self,
+        *,
+        purpose: FittingLaunchPurpose,
+        integration_settings: Optional[tuple[str, float, float]] = None,
+        refresh_current_mechanism: bool = True,
+    ) -> tuple[Optional[FittingRuntimeIdentity], Optional[FittingLaunchRejection]]:
+        launch_snapshot = self.build_current_launch_snapshot(
+            integration_settings=integration_settings,
+            purpose=purpose,
+            refresh_current_mechanism=refresh_current_mechanism,
+        )
+        if launch_snapshot is None:
+            if purpose is FittingLaunchPurpose.EXPLICIT_RUN:
+                return None, None
+            if self._invalid_applied_used_dataset_ids_for_run():
+                return None, FittingLaunchRejection(
+                    title="",
+                    message="Fitting launch inputs have invalid applied settings.",
+                    passive_status="Fitting runtime not ready: invalid applied settings",
+                )
+            return None, FittingLaunchRejection(
+                title="",
+                message="Fitting launch inputs are not valid.",
+                passive_status="Fitting runtime not ready",
+            )
+        config = launch_snapshot.config
+        global_dataset_params = launch_snapshot.global_dataset_params
+        global_dataset_variable_params = launch_snapshot.global_dataset_variable_params
+        dataset_selection = launch_snapshot.dataset_selection
+        solver, rtol, atol = launch_snapshot.integration
+        requested_solver, _solver_warning = normalize_solver_name(str(solver or FITTING_DEFAULT_SOLVER))
+        mechanism_text = self._safe_text_from_getter(self._mechanism_text_getter)
+        evaluator_components = self._fitting_evaluator_components_for_runtime_identity(
+            mechanism_text=mechanism_text,
+            config=config,
+            requested_solver=str(requested_solver),
+            requested_rtol=float(rtol),
+            requested_atol=float(atol),
+        )
+        if evaluator_components is None:
+            return None, FittingLaunchRejection(
+                title="Global Fit" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
+                message="Failed to build fitting evaluator.",
+                passive_status="Fitting runtime not ready",
+            )
+        simulation_func = evaluator_components.base_evaluator
+        simulation_factory = evaluator_components.evaluator_factory
+        prepared_simulation = evaluator_components.prepared_simulation
+        readiness_required = evaluator_components.readiness_required
+
+        datasets, rejection = self._dataset_payloads_for_launch(dataset_selection.ids)
+        if datasets is None:
+            return None, rejection
+        try:
+            dataset_specs = coerce_fit_dataset_specs(datasets)
+        except Exception as exc:
+            return None, FittingLaunchRejection(
+                title="Global Fit" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
+                message=str(exc) or "Dataset payloads are invalid.",
+                passive_status="Fitting runtime not ready: invalid dataset payloads",
+            )
+
+        weights = self._weights_for_run(dataset_selection.as_mapping())
+        staged_params = self._params_ics_tab.get_staged_dataset_params() or {}
+        shared_param_keys = self._shared_param_keys_for_run(config)
+        dataset_params_for_run = self._dataset_params_for_run(
+            list(dataset_selection.ids),
+            shared_param_keys,
+            staged_params,
+            global_dataset_params=global_dataset_params,
+            evaluator=simulation_func,
+        )
+        variable_params = self._variable_params_for_run(
+            list(dataset_selection.ids),
+            shared_param_keys,
+            staged_params,
+            global_dataset_variable_params=global_dataset_variable_params,
+            evaluator=simulation_func,
+        )
+        ok, errors = validate_de_bounds(config, dataset_variable_params=variable_params)
+        if not ok:
+            return None, FittingLaunchRejection(
+                title="Invalid Bounds" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
+                message="\n".join(errors),
+                passive_status="Fitting runtime not ready: invalid bounds",
+            )
+        dataset_overrides = coerce_fit_dataset_parameter_overrides(
+            dataset_ids=list(dataset_selection.ids),
+            dataset_params=dataset_params_for_run,
+            dataset_variable_params=variable_params,
+        )
+        reactions_text = self._safe_text_from_getter(self._reactions_text_getter)
+        applied_targets = {
+            str(ds_id): list(values or [])
+            for ds_id, values in (self._species_table.fit_targets_selection_applied or {}).items()
+        }
+        applied_target_weights = {
+            str(ds_id): self._species_table.applied_target_weights_for_dataset(str(ds_id))
+            for ds_id in applied_targets.keys()
+        }
+        stamp = build_global_fit_run_stamp(
+            dataset_rows=list(dataset_selection.rows),
+            included_ids=list(dataset_selection.ids),
+            applied_fit_targets=applied_targets,
+            applied_target_weights=applied_target_weights,
+            weights_used=(dict(weights) if isinstance(weights, dict) else None),
+            weight_mode=("equal" if weights is None else "custom"),
+            fit_config=dict(config or {}),
+            mechanism_text=mechanism_text,
+            reactions_text=reactions_text,
+            prepared_simulation=prepared_simulation,
+            dataset_specs=list(dataset_specs),
+            dataset_overrides=list(dataset_overrides),
+        )
+        if prepared_simulation is None:
+            stamp["runtime_request"] = {
+                "solver": str(requested_solver),
+                "rtol": f"{float(rtol):.12g}",
+                "atol": f"{float(atol):.12g}",
+                "param_names": self._param_names_for_readiness_identity(
+                    config=config,
+                    prepared_simulation=None,
+                    mechanism_text=mechanism_text,
+                ),
+            }
+            stamp["runtime_request"].update(self._runtime_settings_for_identity())
+        stamp_hash = hash_global_fit_run_stamp(stamp)
+        stamp_short = str(stamp_hash)[:12]
+        fixed_params = self._fixed_params_for_run(config)
+        fit_evaluator = self._simulation_with_fixed_params(simulation_func, fixed_params) if simulation_func is not None else None
+        fit_evaluator_factory = None
+        if callable(simulation_factory):
+            fixed_snapshot = dict(fixed_params)
+
+            def fit_evaluator_factory():
+                base_evaluator = simulation_factory()
+                return PreparedFitEvaluator(
+                    base_evaluator=base_evaluator,
+                    fit_evaluator=self._simulation_with_fixed_params(base_evaluator, fixed_snapshot),
+                )
+
+        lane_budget = self._runtime_lane_budget_for_dataset_count(len(dataset_specs))
+        return FittingRuntimeIdentity(
+            datasets=tuple(dataset_specs),
+            config=config,
+            dataset_overrides=tuple(dataset_overrides),
+            weights=dict(weights) if weights is not None else None,
+            requested_solver=str(requested_solver),
+            requested_rtol=float(rtol),
+            requested_atol=float(atol),
+            fit_evaluator=fit_evaluator,
+            stamp=stamp,
+            stamp_hash=str(stamp_hash),
+            stamp_short=str(stamp_short),
+            lane_count=int(lane_budget),
+            readiness_required=bool(readiness_required),
+            fit_evaluator_factory=fit_evaluator_factory,
+            base_evaluator=simulation_func,
+        ), None
+
+    def _dataset_payloads_for_launch(
+        self,
+        selected_ids: Sequence[str],
+    ) -> tuple[Optional[list[dict[str, Any]]], Optional[FittingLaunchRejection]]:
+        datasets: list[dict[str, Any]] = []
+        for dataset_id in selected_ids:
+            ds_id = str(dataset_id)
+            result = self._global_payload_results.get(ds_id)
+            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
+                reason = str(result.error or "Dataset payload is invalid.")
+                return None, FittingLaunchRejection(
+                    title="Global Fit",
+                    message=f"Dataset '{ds_id}' has invalid payload:\n{reason}",
+                    passive_status="Fitting runtime not ready: invalid dataset payloads",
+                )
+            if ds_id not in self._global_payload_lookup:
+                return None, FittingLaunchRejection(
+                    title="Global Fit",
+                    message=f"Dataset '{ds_id}' is missing payloads.",
+                    passive_status="Fitting runtime not ready: missing dataset payloads",
+                )
+            datasets.append(dict(self._global_payload_lookup[ds_id]))
+        return datasets, None
+
+    def _set_fit_status(self, text: str) -> None:
+        if hasattr(self, "_status_label"):
+            self._status_label.setText(str(text))
+
+    def _set_fit_stop_enabled(self, enabled: bool) -> None:
+        if hasattr(self, "_stop_button"):
+            self._stop_button.setEnabled(bool(enabled))
+
+    def set_fit_status(self, text: str) -> None:
+        self._set_fit_status(text)
+
+    def set_fit_stop_enabled(self, enabled: bool) -> None:
+        self._set_fit_stop_enabled(enabled)
+
+    def set_fit_controls_locked(self, locked: bool) -> None:
+        self._set_fit_controls_locked(locked)
+
+    def refresh_run_button_enabled_state(self) -> None:
+        self._refresh_run_button_enabled_state()
 
     def _request_rebuild_subtabs(self) -> None:
         if self._is_fit_running:
@@ -1142,9 +1501,9 @@ class FittingWindow(QtWidgets.QDialog):
     def _fit_runtime_identity_matches_current_noncollecting_inputs(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
         if identity is None:
             return False
-        if not self._fit_launch_identity_owner.payloads_available_for_identity(identity):
+        if not self.payloads_available_for_identity(identity):
             return False
-        current_selection = self._fit_launch_identity_owner.collect_dataset_selection()
+        current_selection = self.collect_dataset_selection()
         current_dataset_ids = tuple(str(ds_id) for ds_id in current_selection.ids)
         identity_dataset_ids = tuple(str(getattr(spec, "dataset_id", "") or "") for spec in identity.datasets)
         if current_dataset_ids != identity_dataset_ids:
@@ -1161,7 +1520,7 @@ class FittingWindow(QtWidgets.QDialog):
         if not math.isclose(float(atol), float(identity.requested_atol), rel_tol=1e-9, abs_tol=1e-12):
             return False
         try:
-            current_lane_count = self._fit_runtime_lane_budget(len(identity.datasets))
+            current_lane_count = self._runtime_lane_budget_for_dataset_count(len(identity.datasets))
         except Exception:
             return False
         if int(current_lane_count) != int(identity.lane_count):
@@ -1518,7 +1877,7 @@ class FittingWindow(QtWidgets.QDialog):
     # Actions
     # ------------------------------------------------------------------
     def _selected_dataset_ids(self) -> List[str]:
-        selection = self._fit_launch_identity_owner.collect_dataset_selection()
+        selection = self.collect_dataset_selection()
         return list(selection.ids)
 
     def _add_algebraic_observable(
@@ -1916,7 +2275,118 @@ class FittingWindow(QtWidgets.QDialog):
         return True
 
     def run_fit(self) -> None:
-        self._fit_run_command_owner.run_fit()
+        if self._is_fit_running:
+            QtWidgets.QMessageBox.information(self, "Fit Running", "A fit is already in progress.")
+            return
+        self._reset_fit_run_cached_state()
+        self._species_table.flush_visible_weight_edits()
+        self._species_table.flush_dataset_weight_editor()
+        try:
+            launch_result = self.build_current_launch_result(
+                purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+            )
+        except RuntimeError as exc:
+            self._fit_runtime_readiness.set_blocked(exc)
+            self._set_fit_status(f"Fitting runtime not ready: {exc}")
+            self._refresh_run_button_enabled_state()
+            return
+        identity = launch_result.identity
+        if identity is None:
+            self._fit_runtime_readiness.set_blocked()
+            self.render_launch_rejection(
+                launch_result,
+                purpose=FittingLaunchPurpose.EXPLICIT_RUN,
+            )
+            self._clear_failed_run_visual_state()
+            self._refresh_run_button_enabled_state()
+            return
+        self._capture_failed_fit_restore_baseline()
+        launch_decision = self._fit_runtime_readiness.prepare_or_accept_launch(identity)
+        if launch_decision.state is not FittingRuntimeLaunchDecisionState.ACCEPTED:
+            snapshot = launch_decision.snapshot or self._fit_runtime_readiness.snapshot()
+            if snapshot.state is FittingRuntimeReadinessState.PREPARING:
+                self._set_fit_status("Preparing fitting runtime...")
+                self._set_fit_stop_enabled(True)
+            else:
+                self._set_fit_status("Fitting runtime is not ready")
+            self._refresh_run_button_enabled_state()
+            return
+        accepted_launch = launch_decision.accepted_launch
+        if accepted_launch is None:
+            self._refresh_run_button_enabled_state()
+            return
+        self._start_accepted_fit_runtime_launch(accepted_launch)
+
+    def _start_accepted_fit_runtime_launch(self, accepted_launch: FittingRuntimeAcceptedLaunch) -> None:
+        ready_identity = accepted_launch.identity
+        self._fit_run_state_owner.set_active_dataset_ids(
+            [spec.dataset_id for spec in ready_identity.datasets]
+        )
+        _dataset_params_map, variable_params_map = split_fit_dataset_parameter_overrides(ready_identity.dataset_overrides)
+        self._active_variable_specs = {
+            str(ds_id): {str(name): dict(spec) for name, spec in spec_map.items()}
+            for ds_id, spec_map in dict(variable_params_map or {}).items()
+            if isinstance(spec_map, Mapping)
+        }
+        self._run_results_tab.set_run_stamp(
+            dict(accepted_launch.stamp),
+            str(accepted_launch.stamp_hash),
+            str(accepted_launch.stamp_short),
+        )
+        self._results_summary_button.setEnabled(True)
+        self._start_fit_worker_from_accepted_launch(accepted_launch)
+
+    def _start_fit_worker_from_accepted_launch(self, accepted_launch: FittingRuntimeAcceptedLaunch) -> None:
+        datasets = list(accepted_launch.datasets)
+        config = accepted_launch.config
+        dataset_overrides = list(accepted_launch.dataset_overrides)
+        weights = accepted_launch.weights
+        fit_evaluator = accepted_launch.fit_evaluator
+        runtime_session = accepted_launch.session
+        stamp = accepted_launch.stamp
+        stamp_hash = accepted_launch.stamp_hash
+        stamp_short = accepted_launch.stamp_short
+        self._fit_run_state_owner.set_active_run_stamp_hash(str(stamp_hash or ""))
+        fit_runtime_ledger = runtime_session.ledger if runtime_session is not None else None
+        worker = GlobalFitWorker(
+            datasets,
+            dict(config["parameters"]),
+            dataset_overrides=list(dataset_overrides),
+            bounds=config.get("bounds"),
+            weights=weights,
+            method=config["method"],
+            max_nfev=config["max_nfev"],
+            ftol=config["ftol"],
+            xtol=config["xtol"],
+            seed=config.get("seed"),
+            log10_params=config["log10_params"],
+            fit_evaluator=fit_evaluator,
+            fit_runtime_session=runtime_session,
+            fit_runtime_max_lanes=int(accepted_launch.lane_count),
+            fit_runtime_ledger=fit_runtime_ledger,
+            fit_func=self._fit_func,
+            solver=str(accepted_launch.identity.requested_solver),
+            rtol=float(accepted_launch.identity.requested_rtol),
+            atol=float(accepted_launch.identity.requested_atol),
+            run_stamp=dict(stamp),
+            run_stamp_hash=str(stamp_hash),
+            run_stamp_short=str(stamp_short),
+            parent=None,
+        )
+        self._worker = worker
+        worker.progress.connect(self._dispatch_fit_worker_progress)
+        worker.bestUpdated.connect(
+            self._dispatch_fit_worker_best_update,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+        worker.finished.connect(self._dispatch_fit_worker_finished)
+        worker.error.connect(self._dispatch_fit_worker_error)
+        worker.start()
+        if self._worker_is_running(worker):
+            self._set_running_state(True)
+        self._paused = False
+        self._pause_button.setEnabled(True)
+        self._resume_button.setEnabled(False)
 
     @staticmethod
     def _shared_param_keys_for_run(config: Dict[str, Any]) -> set[str]:
@@ -2241,45 +2711,6 @@ class FittingWindow(QtWidgets.QDialog):
 
         return True, prepared_simulation
 
-    def _store_run_stamp_and_update_ui(
-        self,
-        *,
-        dataset_selection: Dict[str, Any],
-        included_ids: Sequence[str],
-        weights: Optional[dict[str, float]],
-        config: Dict[str, Any],
-        mechanism_text: str,
-        reactions_text: str,
-        prepared_simulation: Optional[PreparedSimulationMetadata],
-        dataset_overrides: Sequence[FitDatasetParameterOverrides],
-        dataset_specs: Optional[Sequence[FitDatasetSpec]] = None,
-    ) -> tuple[dict[str, Any], str, str]:
-        weight_mode = "equal" if weights is None else "custom"
-        applied_targets = dict(self._species_table.fit_targets_selection_applied or {})
-        applied_target_weights = {
-            str(ds_id): self._species_table.applied_target_weights_for_dataset(str(ds_id))
-            for ds_id in applied_targets.keys()
-        }
-        stamp = build_global_fit_run_stamp(
-            dataset_rows=list(dataset_selection.get("rows") or []),
-            included_ids=list(included_ids),
-            applied_fit_targets=applied_targets,
-            applied_target_weights=applied_target_weights,
-            weights_used=(dict(weights) if isinstance(weights, dict) else None),
-            weight_mode=weight_mode,
-            fit_config=dict(config or {}),
-            mechanism_text=mechanism_text,
-            reactions_text=reactions_text,
-            prepared_simulation=prepared_simulation,
-            dataset_specs=list(dataset_specs) if dataset_specs is not None else None,
-            dataset_overrides=list(dataset_overrides),
-        )
-        stamp_hash = hash_global_fit_run_stamp(stamp)
-        stamp_short = str(stamp_hash)[:12]
-        self._run_results_tab.set_run_stamp(dict(stamp), str(stamp_hash), str(stamp_short))
-        self._results_summary_button.setEnabled(True)
-        return stamp, str(stamp_hash), str(stamp_short)
-
     @staticmethod
     def _fixed_params_for_run(config: Dict[str, Any]) -> dict[str, float]:
         fixed_params = config.get("fixed_params") or {}
@@ -2294,31 +2725,6 @@ class FittingWindow(QtWidgets.QDialog):
             except (TypeError, ValueError, OverflowError):
                 continue
         return out
-
-    def _fit_runtime_lane_budget(self, dataset_count: int) -> int:
-        budget = None
-        parent = self.parent()
-        simulation_controller = None
-        for owner in (parent, getattr(parent, "_sim_controller", None), getattr(parent, "simulation_controller", None)):
-            if owner is None:
-                continue
-            if hasattr(owner, "batch_runtime_lane_budget"):
-                simulation_controller = owner
-                break
-        if simulation_controller is not None:
-            try:
-                budget = int(getattr(simulation_controller, "batch_runtime_lane_budget"))
-            except Exception:
-                budget = None
-        if budget is None:
-            try:
-                budget = int(PROJECT_DEFAULTS["batch_runtime_lane_budget"])
-            except Exception:
-                budget = 1
-        return compute_effective_batch_workers(
-            num_sets=max(1, int(dataset_count)),
-            max_parallel_workers=max(1, int(budget)),
-        )
 
     def _discard_fit_runtime_session(self, *, kill: bool = False) -> None:
         self._fit_runtime_readiness.cancel(kill=bool(kill))

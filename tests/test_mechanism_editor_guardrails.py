@@ -1360,7 +1360,7 @@ def test_pending_init_migration_rewrites_reactions_while_locked(main_window, qt_
     )
 
     applied = main_window.apply_pending_init_migration(
-        seed={"A": 1.0},
+        seed_sets={"set1": {"A": 1.0}},
         rewrite=rewrite,
     )
     qt_app.processEvents()
@@ -1387,7 +1387,7 @@ def test_pending_init_migration_while_unlocked_force_locks_without_validation_ga
     )
 
     applied = main_window.apply_pending_init_migration(
-        seed={"A": 1.0},
+        seed_sets={"set1": {"A": 1.0}},
         rewrite=rewrite,
     )
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
@@ -1410,7 +1410,7 @@ def test_pending_init_migration_while_unlocked_dispatches_consumers_and_refreshe
     main_window._temperature_spinbox.setValue(298.15)
 
     applied = main_window.apply_pending_init_migration(
-        seed={"A": 1.0},
+        seed_sets={"set1": {"A": 1.0}},
         rewrite="T=400\nthis line does not parse",
     )
     _wait_for_mechanism_validity(main_window, qt_app, expected_valid=False)
@@ -1442,7 +1442,7 @@ def test_pending_init_migration_dispatches_consumers_after_force_lock(main_windo
     )
 
     applied = main_window.apply_pending_init_migration(
-        seed={"A": 1.0},
+        seed_sets={"set1": {"A": 1.0}},
         rewrite="reaction: A -> B; k=2.0",
     )
     qt_app.processEvents()

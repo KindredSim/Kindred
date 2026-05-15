@@ -175,10 +175,15 @@ def _build_window(
         dataset_payloads=list(dataset_payloads),
         mechanism_species=["A"],
         simulation_func=simulation_func,
+        runtime_lane_budget=_runtime_lane_budget,
     )
 
 
 def _build_dataset_variable_window(*, simulation_func=None) -> FittingWindow:
+    if simulation_func is None:
+        def simulation_func(_params):
+            return {"t": np.asarray([0.0, 1.0, 2.0]), "species": {"A": np.asarray([1.0, 0.8, 0.6])}}
+
     return FittingWindow(
         mode="global",
         parameter_defs=[{"name": "k1", "value": 1.0, "min": 0.0, "max": 2.0}],
@@ -208,8 +213,13 @@ def _build_dataset_variable_window(*, simulation_func=None) -> FittingWindow:
         ],
         mechanism_species=["A", "B"],
         mechanism_text_getter=_basic_mechanism_text,
-        simulation_func=simulation_func or _basic_serial_fitting_evaluator(),
+        simulation_func=simulation_func,
+        runtime_lane_budget=_runtime_lane_budget,
     )
+
+
+def _runtime_lane_budget(dataset_count: int) -> int:
+    return max(1, int(dataset_count))
 
 
 def _basic_mechanism_text() -> str:
@@ -340,10 +350,10 @@ def _start_worker_from_accepted_launch(
         stamp=dict(stamp or {}),
         stamp_hash=str(stamp_hash or ""),
         stamp_short=str(stamp_short or stamp_hash or "")[:12],
-        lane_count=window._fit_runtime_lane_budget(len(dataset_specs)),
+        lane_count=window._runtime_lane_budget_for_dataset_count(len(dataset_specs)),
         readiness_required=bool(readiness_required),
     )
-    window.fit_worker_launch_owner.start_runtime_launch(FittingRuntimeAcceptedLaunch(identity=identity, session=runtime_session))
+    window._start_accepted_fit_runtime_launch(FittingRuntimeAcceptedLaunch(identity=identity, session=runtime_session))
 
 
 def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
@@ -420,7 +430,8 @@ def test_passive_fit_runtime_preparation_builds_deferred_evaluator_before_run(
         reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
         simulation_func=None,
         simulation_builder=_simulation_builder,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window._on_targets_applied()
@@ -448,7 +459,7 @@ def test_fit_runtime_readiness_accepts_infinite_bounds_for_non_de_methods(qt_app
         table.item(0, 5).setText("inf")
         window._params_ics_tab._method_combo.setCurrentText("trf")
 
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
 
         assert identity is not None
         assert identity.config["bounds"]["k1"] == (float("-inf"), float("inf"))
@@ -659,7 +670,7 @@ def test_fit_runtime_readiness_still_blocks_de_infinite_bounds(qt_app):
         table.item(0, 5).setText("inf")
         window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
 
-        assert window.fit_launch_identity_owner.build_current_fit_runtime_identity() is None
+        assert window.build_current_fit_runtime_identity() is None
     finally:
         window.close()
         qt_app.processEvents()
@@ -699,7 +710,7 @@ def test_fit_runtime_readiness_rejects_nonfinite_initial_value(qt_app):
         table.item(0, 5).setText("inf")
         window._params_ics_tab._method_combo.setCurrentText("trf")
 
-        assert window.fit_launch_identity_owner.build_current_fit_runtime_identity() is None
+        assert window.build_current_fit_runtime_identity() is None
     finally:
         window.close()
         qt_app.processEvents()
@@ -738,7 +749,7 @@ def test_fit_runtime_readiness_still_blocks_de_infinite_dataset_bounds(qt_app):
         table.item(dataset_row, 5).setText("inf")
         window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
 
-        assert window.fit_launch_identity_owner.build_current_fit_runtime_identity() is None
+        assert window.build_current_fit_runtime_identity() is None
     finally:
         window.close()
         qt_app.processEvents()
@@ -784,7 +795,8 @@ def test_fit_runtime_readiness_ignores_de_infinite_dataset_bounds_for_excluded_d
         mechanism_species=["A"],
         mechanism_text_getter=_basic_mechanism_text,
         simulation_func=_basic_serial_fitting_evaluator(),
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window._species_table._fit_targets_selection_applied["ds2"] = ["A"]
@@ -792,7 +804,7 @@ def test_fit_runtime_readiness_ignores_de_infinite_dataset_bounds_for_excluded_d
         table.item(0, 0).setCheckState(QtCore.Qt.Unchecked)
         window._params_ics_tab._method_combo.setCurrentText("differential_evolution")
 
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
 
         assert identity is not None
         assert [override.dataset_id for override in identity.dataset_overrides] == ["ds1"]
@@ -840,6 +852,7 @@ def test_passive_mechanism_refresh_does_not_reenter_identity_build(qt_app, monke
         simulation_func=_basic_serial_fitting_evaluator(),
         simulation_builder=lambda *_args, **_kwargs: _basic_serial_fitting_evaluator(),
         mechanism_text_getter=lambda: refreshed_mechanism,
+        runtime_lane_budget=_runtime_lane_budget,
     )
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
@@ -857,7 +870,7 @@ def test_passive_mechanism_refresh_does_not_reenter_identity_build(qt_app, monke
 
         monkeypatch.setattr(window._params_ics_tab, "rebuild_for_mechanism", _rebuild_for_mechanism)
 
-        assert window.fit_launch_identity_owner.build_current_fit_runtime_identity() is not None
+        assert window.build_current_fit_runtime_identity() is not None
         assert rebuild_calls == 1
     finally:
         window.close()
@@ -965,7 +978,8 @@ def test_passive_fit_runtime_preparation_builds_evaluator_off_gui_thread(
         simulation_func=None,
         simulation_builder=_simulation_builder,
         runtime_settings_getter=_runtime_settings_getter,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window.fit_runtime_preparation_owner.prepare_current_state()
@@ -1388,7 +1402,8 @@ def test_fit_runtime_preparation_failure_is_visible_in_window(qt_app, qtbot):
         reactions_text_getter=lambda: "reaction: A -> B; k=0.2",
         simulation_func=None,
         simulation_builder=_simulation_builder,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window.fit_runtime_preparation_owner.prepare_current_state()
@@ -1682,7 +1697,8 @@ def test_global_fit_window_close_deletes_dialog(qt_app, qtbot):
         dataset_payloads=[],
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": np.asarray([0.0]), "species": {"A": np.asarray([0.0])}},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     destroyed = {"fired": False}
     window.destroyed.connect(lambda *_args: destroyed.__setitem__("fired", True))
 
@@ -1751,7 +1767,8 @@ def test_global_fit_window_deletes_worker_after_run(qt_app, qtbot):
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": t_axis, "species": {"A": y_axis}},
         fit_func=fake_fit_global,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     qtbot.addWidget(window)
 
     window.run_fit()
@@ -1782,7 +1799,8 @@ def test_global_fit_window_close_hard_terminates_stuck_worker(qt_app, qtbot):
         dataset_payloads=[],
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": np.asarray([0.0]), "species": {"A": np.asarray([0.0])}},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     qtbot.addWidget(window)
 
     class _StuckWorker:
@@ -1834,7 +1852,7 @@ def test_stale_finished_from_older_fit_worker_does_not_clear_newer_worker(qt_app
             super().__init__(*args, **kwargs)
             workers.append(self)
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: fn())
 
     window = _build_window()
@@ -1919,7 +1937,7 @@ def test_serial_fit_worker_start_requires_accepted_launch_even_with_ready_snapsh
         def close(self, *, kill: bool = False) -> None:
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
 
     window = _build_window()
     try:
@@ -1955,7 +1973,7 @@ def test_stale_error_and_best_update_from_older_fit_worker_do_not_clobber_newer_
             super().__init__(*args, **kwargs)
             workers.append(self)
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
     warning_calls = []
     monkeypatch.setattr(
         "PySide6.QtWidgets.QMessageBox.warning",
@@ -2049,7 +2067,7 @@ def test_stale_terminal_payload_after_newer_completion_is_rejected_by_run_stamp(
             super().__init__(*args, **kwargs)
             workers.append(self)
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
     monkeypatch.setattr(QtCore.QTimer, "singleShot", lambda _ms, fn: fn())
 
     window = _build_window()
@@ -2143,7 +2161,7 @@ def test_runtime_input_change_supersedes_active_fit_worker_outputs(qt_app, monke
         def deleteLater(self) -> None:
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _CancelableWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
     monkeypatch.setattr(
         QtWidgets.QMessageBox,
         "exec",
@@ -2208,7 +2226,7 @@ def test_runtime_input_change_supersedes_stopped_worker_pending_terminal_signal(
             super().__init__(*args, **kwargs)
             workers.append(self)
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
     monkeypatch.setattr(
         QtWidgets.QMessageBox,
         "exec",
@@ -2296,7 +2314,7 @@ def test_passive_fit_runtime_preparation_keeps_inputs_editable(qt_app, qtbot, mo
             events.append("worker:start")
 
     monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
 
     window = _build_window(simulation_func=_basic_serial_fitting_evaluator())
     try:
@@ -2380,7 +2398,7 @@ def test_accepted_fixed_param_launch_does_not_poison_base_evaluator(qt_app, qtbo
         lambda _evaluator, *, max_lanes, ledger=None: _ReadySession(),
     )
 
-    window = _build_dataset_variable_window()
+    window = _build_dataset_variable_window(simulation_func=_basic_serial_fitting_evaluator())
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         table = window._params_ics_tab._param_table
@@ -2392,12 +2410,12 @@ def test_accepted_fixed_param_launch_does_not_poison_base_evaluator(qt_app, qtbo
         shared_fit_item.setCheckState(QtCore.Qt.Unchecked)
         qt_app.processEvents()
 
-        fixed_identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        fixed_identity = window.build_current_fit_runtime_identity()
         assert fixed_identity is not None
         assert getattr(fixed_identity.fit_evaluator, "_fixed_params", {}).get("k1") == pytest.approx(1.23)
         window.fit_runtime_readiness.set_desired_identity(fixed_identity)
         qtbot.waitUntil(lambda: window.fit_runtime_readiness.is_ready_for(fixed_identity), timeout=2000)
-        monkeypatch.setattr(window.fit_worker_launch_owner, "start_runtime_launch", lambda _accepted_launch: None)
+        monkeypatch.setattr(window, "_start_accepted_fit_runtime_launch", lambda _accepted_launch: None)
 
         window.run_fit()
 
@@ -2405,7 +2423,7 @@ def test_accepted_fixed_param_launch_does_not_poison_base_evaluator(qt_app, qtbo
 
         shared_fit_item.setCheckState(QtCore.Qt.Checked)
         qt_app.processEvents()
-        next_identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        next_identity = window.build_current_fit_runtime_identity()
 
         assert next_identity is not None
         assert getattr(next_identity.fit_evaluator, "_fixed_params", {}) == {}
@@ -2426,7 +2444,7 @@ def test_dataset_scoped_readiness_uses_live_checked_fit_flag(qt_app):
         assert table.item(dataset_row, 0).checkState() == QtCore.Qt.Checked
         window._params_ics_tab._parameter_state[dataset_row]["fit"] = False
 
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
 
         assert identity is not None
         assert "init:A" in identity.dataset_overrides[0].variable_params
@@ -2434,7 +2452,27 @@ def test_dataset_scoped_readiness_uses_live_checked_fit_flag(qt_app):
         window.close()
 
 
-def test_dataset_scoped_readiness_rejects_live_unchecked_fit_flag(qt_app):
+def test_dataset_scoped_readiness_rejects_live_unchecked_fit_flag(qt_app, monkeypatch):
+    session_creations: list[int] = []
+
+    class _NoRuntimeSession:
+        @property
+        def ledger(self):
+            return None
+
+        def warm(self, *, cancellation_check=None, lane_count=None):
+            session_creations.append(int(lane_count or 0))
+
+        def is_ready(self, *, lane_count=None) -> bool:
+            return True
+
+        def close(self, *, kill: bool = False):
+            return None
+
+    monkeypatch.setattr(
+        "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
+        lambda _evaluator, *, max_lanes, ledger=None: _NoRuntimeSession(),
+    )
     window = _build_dataset_variable_window()
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
@@ -2453,9 +2491,10 @@ def test_dataset_scoped_readiness_rejects_live_unchecked_fit_flag(qt_app):
             table.blockSignals(False)
         window._params_ics_tab._parameter_state[dataset_row]["fit"] = True
 
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
 
         assert identity is None
+        assert session_creations == []
     finally:
         window.close()
 
@@ -2500,8 +2539,8 @@ def test_passive_readiness_and_run_fit_share_collector_but_run_fit_revalidates(q
             _old_collector_called,
         )
         monkeypatch.setattr(
-            window.fit_worker_launch_owner,
-            "start_runtime_launch",
+            window,
+            "_start_accepted_fit_runtime_launch",
             lambda accepted_launch: started.append(accepted_launch),
         )
 
@@ -2596,7 +2635,7 @@ def test_run_fit_button_rejects_stale_ready_identity_with_current_lane_budget(qt
 
     window = _build_window(simulation_func=_basic_serial_fitting_evaluator())
     try:
-        monkeypatch.setattr(window, "_fit_runtime_lane_budget", lambda _dataset_count: int(budget["value"]))
+        monkeypatch.setattr(window, "_runtime_lane_budget_for_dataset_count", lambda _dataset_count: int(budget["value"]))
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window._mechanism_text_getter = _basic_mechanism_text
         window._on_targets_applied()
@@ -2695,7 +2734,8 @@ def test_run_fit_button_rejects_stale_ready_identity_after_runtime_setting_chang
         simulation_func=None,
         simulation_builder=_simulation_builder,
         runtime_settings_getter=_runtime_settings_getter,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window.fit_runtime_preparation_owner.prepare_current_state()
@@ -2819,6 +2859,7 @@ def test_runtime_request_identity_matches_false_runtime_settings(qt_app):
         simulation_func=None,
         simulation_builder=lambda *_args, **_kwargs: _basic_serial_fitting_evaluator(),
         runtime_settings_getter=_runtime_settings_getter,
+        runtime_lane_budget=_runtime_lane_budget,
     )
     try:
         identity = SimpleNamespace(
@@ -2880,6 +2921,7 @@ def test_runtime_settings_getter_failure_blocks_fitting_readiness(qt_app, qtbot,
         simulation_func=None,
         simulation_builder=lambda *_args, **_kwargs: _basic_serial_fitting_evaluator(),
         runtime_settings_getter=_runtime_settings_getter,
+        runtime_lane_budget=_runtime_lane_budget,
     )
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
@@ -3088,19 +3130,20 @@ def test_deferred_fit_runtime_identity_remains_ready_after_acceptance(qt_app, qt
             "use_sparse_jacobian": False,
             "wegscheider_cyclicity_enabled": False,
         },
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window.fit_runtime_preparation_owner.prepare_current_state()
         qtbot.waitUntil(lambda: window._run_button.isEnabled(), timeout=2000)
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
         assert identity is not None
         assert window.fit_runtime_readiness.is_ready_for(identity)
-        monkeypatch.setattr(window.fit_worker_launch_owner, "start_runtime_launch", lambda accepted_launch: started.append(accepted_launch))
+        monkeypatch.setattr(window, "_start_accepted_fit_runtime_launch", lambda accepted_launch: started.append(accepted_launch))
 
         window.run_fit()
         window._refresh_run_button_enabled_state()
-        current_identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        current_identity = window.build_current_fit_runtime_identity()
 
         assert started
         assert current_identity is not None
@@ -3396,7 +3439,7 @@ def test_detached_fit_worker_late_emissions_do_not_reenter_deleted_dialog(qt_app
         def terminate(self) -> None:
             self.terminate_called = True
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _LateSignalWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _LateSignalWorker)
 
     window = _build_window()
     callbacks: list[tuple[str, object]] = []
@@ -3475,7 +3518,7 @@ def test_consecutive_fit_dispatch_cycles_leave_clean_state(qt_app, monkeypatch):
         def deleteLater(self) -> None:
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
     monkeypatch.setattr(
         QtWidgets.QMessageBox,
         "exec",
@@ -3556,7 +3599,7 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
         def deleteLater(self) -> None:
             self.deleted = True
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _CancelableWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
 
     window = _build_window()
     try:
@@ -3625,7 +3668,7 @@ def test_cancelled_fit_hard_teardown_returns_dialog_to_rerunnable_idle_state(qt_
         assert accepted_launch is not None
 
         window._set_running_state(True)
-        window.fit_worker_launch_owner.start_runtime_launch(accepted_launch)
+        window._start_accepted_fit_runtime_launch(accepted_launch)
         worker = worker_ref["worker"]
 
         window._cancel_fit()
@@ -3668,7 +3711,7 @@ def test_stop_fit_schedules_runtime_preparation_refresh(qt_app, monkeypatch):
         def deleteLater(self) -> None:
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _CancelableWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CancelableWorker)
 
     window = _build_window()
     try:
@@ -3737,7 +3780,7 @@ def test_stop_fit_runtime_preparation_does_not_schedule_refresh(qt_app, monkeypa
     FittingRuntimeSession.from_serial_evaluator = staticmethod(
         lambda _fit_evaluator, *, max_lanes, ledger=None: _BlockingRuntimeSession()
     )
-    window = _build_dataset_variable_window()
+    window = _build_dataset_variable_window(simulation_func=_basic_serial_fitting_evaluator())
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window.fit_runtime_preparation_owner.prepare_current_state()
@@ -3877,7 +3920,7 @@ def test_run_fit_starts_accepted_launch_after_runtime_ready(qt_app, qtbot, monke
         return _ReadyAfterReleaseRuntimeSession()
 
     monkeypatch.setattr("kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator", _fake_from_serial)
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _CaptureWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CaptureWorker)
 
     window = _build_window(simulation_func=_basic_serial_fitting_evaluator())
     try:
@@ -3941,7 +3984,7 @@ def test_deferred_fit_launch_captures_failed_restore_baseline(qt_app, qtbot, mon
         "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
         lambda *_args, **_kwargs: _ReadyAfterReleaseRuntimeSession(),
     )
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _CaptureWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _CaptureWorker)
     monkeypatch.setattr(
         QtWidgets.QMessageBox,
         "exec",
@@ -4022,7 +4065,8 @@ def test_deferred_generic_evaluator_prepares_without_runtime_session_requirement
         reactions_text_getter=lambda: "reaction: A -> B; k=0",
         simulation_func=None,
         simulation_builder=_generic_builder,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window.fit_runtime_preparation_owner.prepare_current_state()
@@ -4113,7 +4157,7 @@ def test_fit_runtime_session_cache_invalidates_when_lane_budget_changes(qt_app, 
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window._mechanism_text_getter = _basic_mechanism_text
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
         assert identity is not None
         first_identity = replace(identity, lane_count=2)
         second_identity = replace(identity, lane_count=2)
@@ -4163,7 +4207,7 @@ def test_old_worker_best_update_is_disconnected_after_completion(qt_app, monkeyp
         def deleteLater(self) -> None:
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FactoryWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FactoryWorker)
     monkeypatch.setattr(
         QtWidgets.QMessageBox,
         "exec",
@@ -4954,7 +4998,8 @@ def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_pa
         ),
         mechanism_text_getter=lambda: refreshed_mechanism,
         reactions_text_getter=lambda: refreshed_mechanism,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window.show()
         qt_app.processEvents()
@@ -4966,8 +5011,8 @@ def test_start_fit_launch_failure_after_mechanism_refresh_preserves_refreshed_pa
             lambda *_args, **_kwargs: int(QtWidgets.QMessageBox.StandardButton.Ok),
         )
         monkeypatch.setattr(
-            window.fit_worker_launch_owner,
-            "start_runtime_launch",
+            window,
+            "_start_accepted_fit_runtime_launch",
             lambda _accepted_launch: (_ for _ in ()).throw(RuntimeError("launch boom")),
         )
 
@@ -5209,7 +5254,7 @@ def test_start_fit_failure_clears_prior_fit_state_before_worker_launch(qt_app, m
             },
         )
         monkeypatch.setattr(
-            window.fit_launch_identity_owner,
+            window,
             "collect_dataset_selection",
             lambda: FittingLaunchDatasetSelection(
                 rows=({"id": "ds1", "label": "Dataset 1", "species": "A", "include": True, "weight": 1.0},),
@@ -5824,7 +5869,7 @@ def test_close_teardown_disconnects_worker_signals(qt_app, monkeypatch):
         def deleteLater(self) -> None:
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _TeardownWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _TeardownWorker)
 
     window = _build_window()
     try:
@@ -5919,7 +5964,7 @@ def test_start_fit_clears_cached_state_before_launch(monkeypatch):
             },
         )
         monkeypatch.setattr(
-            window.fit_launch_identity_owner,
+            window,
             "collect_dataset_selection",
             lambda: FittingLaunchDatasetSelection(
                 rows=({"id": "ds1", "label": "Dataset 1", "species": "A", "include": True, "weight": 1.0},),

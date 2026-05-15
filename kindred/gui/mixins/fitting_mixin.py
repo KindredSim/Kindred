@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.batch_parallel import compute_effective_batch_workers
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.simulator.dsl_text_update import (
     StepParameterUpdateOutcome,
@@ -104,12 +105,6 @@ class _FitProjectApplyPlan:
 
 if TYPE_CHECKING:
     from kindred.gui.fitting.launch import GlobalFitLaunchContext
-
-
-def launch_global_fit_session(context):
-    from kindred.gui.fitting.launch import launch_global_fit_session as _impl
-
-    return _impl(context)
 
 
 class FittingMixin:
@@ -705,6 +700,13 @@ class FittingMixin:
                 return
             reactions_widget.setPlainText(str(new_text or ""))
 
+        def _runtime_lane_budget(dataset_count: int) -> int:
+            raw_budget = int(self.simulation_controller.batch_runtime_lane_budget)
+            return compute_effective_batch_workers(
+                num_sets=max(1, int(dataset_count)),
+                max_parallel_workers=max(1, int(raw_budget)),
+            )
+
         return GlobalFitLaunchContext(
             parent=self,
             dataset_manager=ports.dataset_manager,
@@ -725,6 +727,7 @@ class FittingMixin:
             apply_fit_results_to_project=self._apply_fit_results_to_project,
             apply_dataset_initial_updates=self._apply_dataset_initial_updates,
             load_fitting_defaults=self._get_fitting_session_defaults,
+            runtime_lane_budget=_runtime_lane_budget,
             batch_store=getattr(self, "_batch_store", None),
             batch_model=getattr(self, "_batch_model", None),
             batch_table=getattr(self, "_batch_table", None),
@@ -732,6 +735,8 @@ class FittingMixin:
 
     def _run_global_fit(self):
         """Delegate global-fit launch ownership to the fitting package."""
+        from kindred.gui.fitting.launch import launch_global_fit_session
+
         return launch_global_fit_session(self._build_global_fit_launch_context())
 
     @staticmethod

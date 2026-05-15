@@ -14,8 +14,9 @@ class _FakeMechanismHost:
     temperature_override_calls: list[tuple[bool, str]] = field(default_factory=list)
     temperature_mode_indicator_texts: list[str] = field(default_factory=list)
     temperature_mode_indicator_updates: int = 0
-    pending_init_calls: list[tuple[dict[str, float], str]] = field(default_factory=list)
+    pending_init_calls: list[tuple[dict[str, dict[str, float]], str]] = field(default_factory=list)
     pending_init_failure_invalidations: int = 0
+    pending_init_guard_rewrites: list[str | None] = field(default_factory=list)
     focused_control_sync_calls: list[bool] = field(default_factory=list)
 
     def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None:
@@ -27,12 +28,15 @@ class _FakeMechanismHost:
     def update_temperature_mode_indicator(self) -> None:
         self.temperature_mode_indicator_updates += 1
 
-    def apply_pending_init_migration(self, *, seed: dict[str, float], rewrite: str) -> bool:
-        self.pending_init_calls.append((dict(seed), str(rewrite)))
+    def apply_pending_init_migration(self, *, seed_sets: dict[str, dict[str, float]], rewrite: str) -> bool:
+        self.pending_init_calls.append(({name: dict(seed) for name, seed in seed_sets.items()}, str(rewrite)))
         return True
 
     def invalidate_pending_init_preserved_results_after_failed_run(self) -> None:
         self.pending_init_failure_invalidations += 1
+
+    def arm_pending_init_result_invalidation_guard(self, *, rewrite: str | None = None) -> None:
+        self.pending_init_guard_rewrites.append(rewrite)
 
     def _sync_mechanism_controls_to_focused_batch_set(self, *, use_workspace: bool = True) -> None:
         self.focused_control_sync_calls.append(bool(use_workspace))
@@ -93,7 +97,7 @@ def test_mechanism_helpers_own_mechanism_state_and_do_not_forward_variable_runti
 
     assert (
         helper.apply_pending_init_migration(
-            seed={"A": 1.0},
+            seed_sets={"set1": {"A": 1.0}},
             rewrite="reaction: A -> B; k=1.0",
         )
         is True
@@ -103,27 +107,35 @@ def test_mechanism_helpers_own_mechanism_state_and_do_not_forward_variable_runti
     assert host.temperature_override_calls == [(False, "Overridden by energy-mode DSL (T=...).")]
     assert host.temperature_mode_indicator_texts == ["Temperature: 200.00 K (from DSL)"]
     assert host.temperature_mode_indicator_updates == 1
-    assert host.pending_init_calls == [({"A": 1.0}, "reaction: A -> B; k=1.0")]
+    assert host.pending_init_calls == [({"set1": {"A": 1.0}}, "reaction: A -> B; k=1.0")]
     assert host.pending_init_failure_invalidations == 1
     assert host.focused_control_sync_calls == [True]
 
 
-def test_mechanism_helpers_pending_init_guard_fallback_accepts_rewrite_keyword() -> None:
-    @dataclass
-    class _PartialHost:
-        def set_temperature_override_state(self, *, enabled: bool, tooltip: str) -> None:
-            _ = (enabled, tooltip)
-
-        def set_temperature_mode_indicator_text(self, text: str) -> None:
-            _ = text
-
-        def update_temperature_mode_indicator(self) -> None:
-            return
-
-        def apply_pending_init_migration(self, *, seed: dict[str, float], rewrite: str) -> bool:
-            _ = (seed, rewrite)
-            return True
-
-    helper = MainWindowMechanismHelpers(_PartialHost())
+def test_mechanism_helpers_pending_init_guard_uses_host_contract() -> None:
+    host = _FakeMechanismHost()
+    helper = MainWindowMechanismHelpers(host)
 
     helper.arm_pending_init_result_invalidation_guard(rewrite="reaction: A -> B; k=1.0")
+
+    assert host.pending_init_guard_rewrites == ["reaction: A -> B; k=1.0"]
+
+
+def test_mechanism_helpers_do_not_preserve_legacy_seed_pending_init_contract() -> None:
+    from pathlib import Path
+
+    source = Path("kindred/gui/main_window_mechanism_helpers.py").read_text(encoding="utf-8")
+
+    assert "seed:" not in source
+    assert "except TypeError" not in source
+
+
+def test_mechanism_helpers_do_not_silently_fallback_missing_host_methods() -> None:
+    from pathlib import Path
+
+    source = Path("kindred/gui/main_window_mechanism_helpers.py").read_text(encoding="utf-8")
+
+    assert "getattr(" not in source
+    assert "lambda **_kwargs: None" not in source
+    assert "lambda *, rewrite=None: None" not in source
+    assert "lambda: None" not in source

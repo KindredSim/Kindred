@@ -58,7 +58,8 @@ def test_fitting_window_small_multiples_grid(qapp):
         parameter_defs=parameter_defs,
         dataset_entries=dataset_entries,
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
     assert set(window._run_results_tab._dataset_plot_views.keys()) == {"ds1", "ds2", "ds3"}
     assert {ds["name"] for ds in getattr(window._run_results_tab._all_datasets_plot_view, "_datasets", [])} == {"ds1", "ds2", "ds3"}
@@ -146,7 +147,7 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -158,7 +159,8 @@ def test_fitting_window_uses_pending_dataset_weight_on_immediate_run(qapp, monke
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0, "ds2": 0.5},
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     top_tabs = window.findChild(QtWidgets.QTabBar, "global_fit_top_tabs")
     assert top_tabs is not None
     assert window._tabs is top_tabs
@@ -252,7 +254,8 @@ def test_fitting_window_applies_dataset_initial_updates(qapp):
         dataset_weights={"ds1": 1.0, "ds2": 1.0},
         apply_callback=lambda params: None,
         dataset_settings_updater=_updater,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
     result = GlobalFitResult(
         shared_params={"k": 0.25},
@@ -337,7 +340,8 @@ def test_global_fit_parameter_toggles_persist_across_best_updates_and_affect_con
         dataset_payloads=[{"id": "demo", "t": t_axis, "y": np.vstack([np.exp(-0.2 * t_axis)]), "species": ["A"]}],
         dataset_weights={"demo": 1.0},
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         # Toggle: k1 uses log10; k2 excluded from fitting.
         window._params_ics_tab._param_table.item(0, 1).setCheckState(QtCore.Qt.Checked)   # Log10
@@ -394,7 +398,7 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         def cancel(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -417,7 +421,8 @@ def test_global_fit_fixed_params_are_passed_to_simulation_even_when_not_fitted(q
         dataset_payloads=[{"id": "demo", "t": t_axis, "y": np.vstack([np.exp(-0.2 * t_axis)]), "species": ["A"]}],
         dataset_weights={"demo": 1.0},
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         # Exclude k2 from fitting but set its fixed value.
         window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
@@ -477,7 +482,7 @@ def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, m
         def cancel(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -500,7 +505,8 @@ def test_global_fit_fixed_params_accept_evaluate_series_only_evaluator(qt_app, m
         dataset_payloads=[{"id": "demo", "t": t_axis, "y": np.vstack([np.exp(-0.2 * t_axis)]), "species": ["A"]}],
         dataset_weights={"demo": 1.0},
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._params_ics_tab._param_table.item(1, 0).setCheckState(QtCore.Qt.Unchecked)
         window._params_ics_tab._param_table.item(1, 3).setText("9.87")
@@ -614,7 +620,8 @@ def test_global_fit_run_prep_prunes_stale_and_unknown_dataset_params(qt_app):
         mechanism_species=["A"],
         dataset_payloads=[{"id": "ds1", "t": t_axis, "y": np.vstack([np.ones_like(t_axis)]), "species": ["A"]}],
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         fixed = window._dataset_params_for_run(["ds1"], {"k1"}, {})
         variable = window._variable_params_for_run(["ds1"], {"k1"}, {})
@@ -684,7 +691,8 @@ def test_global_fit_run_prep_uses_prepared_metadata_for_dataset_param_pruning(qt
         },
         dataset_payloads=[{"id": "ds1", "t": t_axis, "y": np.vstack([np.ones_like(t_axis)]), "species": ["A"]}],
         apply_callback=lambda params: None,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         fixed = window._dataset_params_for_run(["ds1"], {"shared_only"}, {})
         variable = window._variable_params_for_run(["ds1"], {"shared_only"}, {})

@@ -28,7 +28,6 @@ def test_main_window_shows_solver_error(main_window, monkeypatch):
     mock_table.viewport.return_value = mock_viewport
     mock_plot.stats_table.return_value = mock_table
 
-    main_window.set_data = lambda *args, **kwargs: None
     main_window._plot_tabs = MagicMock()
     main_window._plot_tabs._main_plot = mock_plot
 

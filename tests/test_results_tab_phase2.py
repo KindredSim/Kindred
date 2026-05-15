@@ -135,7 +135,8 @@ def _make_window(entries: list[dict]) -> FittingWindow:
             for entry in entries
         ],
         dataset_weights={str(entry["id"]): float(entry.get("weight", 1.0)) for entry in entries},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _make_best_update_worker(

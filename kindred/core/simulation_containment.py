@@ -473,8 +473,6 @@ class WarmSimulationOwner:
     def prepare_runtime_payload(
         self,
         simulation_plan_payload: Mapping[str, Any],
-        *,
-        wait: bool = True,
     ) -> None:
         plan_payload = validate_contained_simulation_payload(dict(simulation_plan_payload or {}))
         with self._lock:
@@ -496,6 +494,7 @@ class WarmSimulationOwner:
                 raise SimulationContainmentChildFailure(exc.failure) from exc
             except ContainmentKernelProtocolError as exc:
                 raise SimulationContainmentProtocolError(str(exc)) from exc
+            self._runtime_owner.update_startup_payload(dict(plan_payload))
             self._simulation_plan_payload = dict(plan_payload)
 
     def solve(

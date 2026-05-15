@@ -192,6 +192,26 @@ def test_session_begin_owns_explicit_lifecycle_state() -> None:
     assert snapshot.has_lane_pool is True
 
 
+def test_session_reconfiguration_marks_existing_pool_stale() -> None:
+    from kindred.core.batch_runtime_session import BatchRuntimeSession
+
+    owner = _FakeLaneOwner()
+    owner.has_pool = True
+    owner.pool_stale = False
+    session = BatchRuntimeSession(owner)
+
+    session.reconfigure_runtime_pool(
+        max_parallel_workers=4,
+        limit_blas_threads_per_worker=False,
+        lane_pool_factory=owner.lane_pool_factory,
+        record_nonfatal_exception=owner.record_nonfatal_exception,
+    )
+
+    assert owner.max_parallel_workers == 4
+    assert owner.limit_blas_threads_per_worker is False
+    assert owner.pool_stale is True
+
+
 def test_session_submit_uses_run_identity_without_controller_repeating_it() -> None:
     from kindred.core.batch_runtime_session import BatchRuntimeSession, BatchRuntimeSessionRequest
 

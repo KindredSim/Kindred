@@ -590,7 +590,7 @@ def test_apply_project_payload_clears_dirty_session_state(main_window, qt_app):
     data_panel._on_csv_loaded("dirty.csv", dataset_payload)
     qt_app.processEvents()
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([2.0, 1.0], dtype=float)},
         label="dirty-run",
@@ -1934,7 +1934,7 @@ def test_direct_authoritative_editor_rewrite_supersedes_no_display_explicit_comp
     controller._slider_simulation_active = False
     controller._simulation_worker = worker
 
-    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window.results_controller, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
     monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
     monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
 
@@ -1972,7 +1972,7 @@ def test_authoritative_transition_rejects_old_preview_completion_without_active_
     controller._simulation_running = True
     controller._slider_simulation_active = True
 
-    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window.results_controller, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
     monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
     monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
 
@@ -2017,7 +2017,7 @@ def test_template_load_supersedes_no_display_explicit_completion(
     controller._slider_simulation_active = False
     controller._simulation_worker = worker
 
-    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window.results_controller, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
     monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
     monkeypatch.setattr(main_window, "_schedule_simulation_runtime_availability_refresh", lambda *, wait=False: None)
 
@@ -2060,7 +2060,7 @@ def test_slider_materialization_supersedes_no_display_explicit_completion(
     controller._slider_simulation_active = False
     controller._simulation_worker = worker
 
-    monkeypatch.setattr(main_window, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
+    monkeypatch.setattr(main_window.results_controller, "set_data", lambda *args, **kwargs: published.append((args, kwargs)))
     monkeypatch.setattr(main_window, "_authoritative_mechanism_has_active_display", lambda: False)
     monkeypatch.setattr(
         controller,

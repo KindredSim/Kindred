@@ -8,10 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from kindred.core.exceptions import FitSimulationError, FittingCancelled, SimulationCancelled
-from kindred.core.fitting_evaluation import (
-    FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR,
-    SerialFittingEvaluator,
-)
+from kindred.core.fitting_evaluation import SerialFittingEvaluator
 from kindred.core.simulation_failure import (
     build_simulation_failure,
     coerce_simulation_failure,
@@ -450,82 +447,3 @@ class WarmFittingEvaluatorLane:
             return False
         check = getattr(cancellation_check, "_kindred_nonblocking_cancelled", cancellation_check)
         return bool(check())
-
-
-class ContainedSerialFittingEvaluator:
-    def __init__(
-        self,
-        evaluator: SerialFittingEvaluator,
-        *,
-        lane_factory: Optional[Callable[..., Any]] = None,
-        request_timeout_s: float = _DEFAULT_FITTING_SOLVE_TIMEOUT_S,
-        cancellation_check: Optional[Callable[[], bool]] = None,
-    ) -> None:
-        self._base_evaluator = evaluator
-        self._cancellation_check = cancellation_check
-        try:
-            process_payload = evaluator.to_process_payload()
-        except Exception as exc:
-            raise _fatal_fit_simulation_error(
-                "fitting_containment_payload",
-                f"Failed to build fitting containment payload: {exc}",
-                exc=exc,
-            ) from exc
-        factory = lane_factory or WarmFittingEvaluatorLane
-        self._lane = factory(
-            process_payload,
-            request_timeout_s=request_timeout_s,
-        )
-
-    @property
-    def prepared_metadata(self):
-        return self._base_evaluator.prepared_metadata
-
-    @property
-    def context(self):
-        return self._base_evaluator.context
-
-    def __call__(self, params: Mapping[str, float]):
-        return self.evaluate_series(params)
-
-    def evaluate_series(self, params: Mapping[str, float]):
-        configured_origins = {
-            str(name): FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-            for name in dict(params or {})
-            if str(name).strip()
-        }
-        return self.evaluate_series_with_parameter_origins(
-            params,
-            configured_origins,
-            failed_params=None,
-        )
-
-    def evaluate_series_with_parameter_origins(
-        self,
-        params: Mapping[str, float],
-        origins: Optional[Mapping[str, str]] = None,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
-    ):
-        try:
-            return self._lane.evaluate_series_with_parameter_origins(
-                dict(params or {}),
-                dict(origins or {}),
-                failed_params=dict(failed_params or {}),
-                cancellation_check=self._cancellation_check,
-            )
-        except FittingLaneTimeout as exc:
-            if exc.failed_params:
-                raise
-            raise FittingLaneTimeout(exc.timeout_s, failed_params=failed_params) from exc
-        except FittingLaneProtocolError as exc:
-            raise _fatal_fit_simulation_error(
-                "fitting_containment_protocol",
-                str(exc),
-                exc=exc,
-            ) from exc
-
-    def close(self) -> None:
-        close = getattr(self._lane, "close", None)
-        if callable(close):
-            close()

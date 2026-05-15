@@ -4819,11 +4819,8 @@ class MainWindow(
         self,
         *,
         seed_sets: Mapping[str, Mapping[str, object]] | None = None,
-        seed: Mapping[str, object] | None = None,
         rewrite: str,
     ) -> bool:
-        if seed_sets is None and seed is not None:
-            seed_sets = {"set1": dict(seed)}
         if not seed_sets or not rewrite:
             return False
         try:
@@ -8407,8 +8404,6 @@ class MainWindow(
             preserve_visibility=bool(preserve_visibility),
         )
 
-    # ===== Public API for setting data (compatibility) =====
-
     def _open_docs(self):
         """
         Open documentation in browser or show guidance if not yet published.
@@ -8956,14 +8951,3 @@ class MainWindow(
     # ========================================================================
     # PROFILE MANAGEMENT
     # ========================================================================
-
-    def set_data(
-        self,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
-        *,
-        label: Optional[str] = None,
-        overlays: Optional[Sequence[Dict[str, object]]] = None,
-        owned_species: Optional[Sequence[str]] = None,
-    ) -> None:
-        self.results_controller.set_data(t, series, label=label, overlays=overlays, owned_species=owned_species)

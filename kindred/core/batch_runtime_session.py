@@ -205,6 +205,29 @@ class BatchRuntimeSession:
     def record_nonfatal_exception(self, value: Callable[[str, BaseException], None]) -> None:
         self._lane_owner.record_nonfatal_exception = value
 
+    def reconfigure_runtime_pool(
+        self,
+        *,
+        max_parallel_workers: int,
+        limit_blas_threads_per_worker: bool,
+        lane_pool_factory: Callable[[int, bool], Any],
+        record_nonfatal_exception: Callable[[str, BaseException], None],
+    ) -> None:
+        changed = False
+        if int(self._lane_owner.max_parallel_workers) != int(max_parallel_workers):
+            self._lane_owner.max_parallel_workers = int(max_parallel_workers)
+            changed = True
+        if bool(self._lane_owner.limit_blas_threads_per_worker) != bool(limit_blas_threads_per_worker):
+            self._lane_owner.limit_blas_threads_per_worker = bool(limit_blas_threads_per_worker)
+            changed = True
+        if self._lane_owner.lane_pool_factory is not lane_pool_factory:
+            self._lane_owner.lane_pool_factory = lane_pool_factory
+            changed = True
+        if self._lane_owner.record_nonfatal_exception is not record_nonfatal_exception:
+            self._lane_owner.record_nonfatal_exception = record_nonfatal_exception
+        if changed and self.has_lane_pool():
+            self.mark_pool_stale()
+
     def begin(self, request: BatchRuntimeSessionRequest) -> None:
         self._request = request
         self._completed_set_ids = []

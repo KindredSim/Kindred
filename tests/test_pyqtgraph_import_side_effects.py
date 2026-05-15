@@ -19,7 +19,6 @@ LEGACY_LOG_STRINGS = (
 PLOTTING_MODULES_WITH_PREVIOUS_IMPORT_SIDE_EFFECTS = (
     "kindred.gui.plot_config",
     "kindred.gui.widgets.grid_plot_view",
-    "kindred.gui.widgets.pyqtgraph_plot_panel",
 )
 
 
@@ -62,3 +61,13 @@ def test_pyqtgraph_availability_helper_reports_true_when_importable():
 
     plot_config = _fresh_import("kindred.gui.plot_config")
     assert plot_config.is_pyqtgraph_available() is True
+
+
+def test_plot_panel_class_loads_through_plot_config_not_compatibility_wrapper():
+    sys.modules.pop("kindred.gui.widgets.pyqtgraph_plot_panel", None)
+    plot_config = _fresh_import("kindred.gui.plot_config")
+
+    panel_class = plot_config.get_plot_panel_class()
+
+    assert panel_class.__module__ == "kindred.gui.widgets.pyqtgraph_plot_panel_impl"
+    assert "kindred.gui.widgets.pyqtgraph_plot_panel" not in sys.modules

@@ -48,7 +48,7 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -58,7 +58,8 @@ def test_local_initial_fit_toggle_controls_solver_payload(qt_app, monkeypatch):
         dataset_variable_params={"ds1": {"init:A": {"initial": 1.0, "min": 0.1, "max": 2.0, "log10": False}}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         ds_rows = [
             idx

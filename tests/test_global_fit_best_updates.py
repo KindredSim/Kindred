@@ -593,9 +593,6 @@ def test_parametric_x_best_payload_and_final_replay_use_ready_runtime_evaluator(
         def ledger(self):
             return None
 
-        def begin_run(self) -> None:
-            calls.append({"begin_run": 1.0})
-
         def evaluator(self, *, cancellation_check=None):
             assert cancellation_check is not None
             return _RuntimeEvaluator()
@@ -646,5 +643,4 @@ def test_parametric_x_best_payload_and_final_replay_use_ready_runtime_evaluator(
     assert set(dataset_stats) == {"ds1"}
     assert set(result.model_series) == {"ds1"}
     assert set(result.plot_model_x) == {"ds1"}
-    assert any("begin_run" in call for call in calls)
     assert sum(1 for call in calls if "a" in call) >= 2

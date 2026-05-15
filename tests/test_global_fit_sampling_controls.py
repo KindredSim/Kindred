@@ -48,7 +48,8 @@ def _make_window(*, t1: np.ndarray, t2: np.ndarray):
         dataset_entries=dataset_entries,
         simulation_func=simulation_func,
         mechanism_species=["A", "X"],
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _select_dataset_row(window, *, row: int, qt_app) -> None:

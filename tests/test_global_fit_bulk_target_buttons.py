@@ -42,7 +42,8 @@ def _make_window(*, selected_species: list[str]):
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": y_a.copy(), "B": y_b.copy(), "C": y_c.copy()}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _set_fit_targets_dataset(widget, *, dataset_id: str) -> None:

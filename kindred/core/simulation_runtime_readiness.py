@@ -494,7 +494,7 @@ class SimulationRuntimeApplication:
         try:
             prepare = getattr(owner, "prepare_runtime_payload", None)
             if callable(prepare):
-                prepare(dict(payload), wait=True)
+                prepare(dict(payload))
             else:
                 start = getattr(owner, "start", None)
                 if callable(start):

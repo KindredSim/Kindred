@@ -33,7 +33,8 @@ def _make_window():
         dataset_entries=dataset_entries,
         simulation_func=simulation_func,
         mechanism_species=["A"],
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def test_completion_dialog_spec_warns_when_alignment_has_approximations(qt_app):

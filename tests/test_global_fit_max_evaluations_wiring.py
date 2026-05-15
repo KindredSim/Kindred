@@ -28,7 +28,8 @@ def test_global_fit_window_default_max_evaluations_is_1000(qt_app):
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.ones_like(t)}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         assert window._params_ics_tab._max_eval_spin.value() == 1000
         config = window._params_ics_tab.collect_parameter_config()
@@ -110,7 +111,7 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -119,7 +120,8 @@ def test_max_evaluations_spinbox_is_passed_to_worker(qt_app, monkeypatch):
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.ones_like(t)}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._params_ics_tab._max_eval_spin.setValue(123)
         config = window._params_ics_tab.collect_parameter_config()

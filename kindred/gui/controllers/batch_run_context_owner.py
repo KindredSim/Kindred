@@ -5,7 +5,11 @@ from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, Iterator, Mapping, Sequence
 
-from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
+from kindred.gui.controllers.simulation_completion_policy import (
+    CompletionPolicyContext,
+    cache_truth_generation_value,
+    next_cache_truth_generation,
+)
 
 
 @dataclass(frozen=True)
@@ -1096,6 +1100,7 @@ class BatchRunContextOwner:
             "explicit_cache_preview_scope_set_ids": request.explicit_cache_preview_scope_set_ids,
             "explicit_cache_valid_set_ids": request.explicit_cache_valid_set_ids,
             "explicit_cache_invalidated_set_ids": request.explicit_cache_invalidated_set_ids,
+            "explicit_cache_truth_generation": 0,
             "preview_scope_set_ids": request.preview_scope_set_ids,
             "preview_owner_epoch": request.preview_owner_epoch,
             "preview_batch_cache_token_by_set_id": {
@@ -1186,6 +1191,7 @@ class BatchRunContextOwner:
             explicit_cache_preview_scope_set_ids=ctx.get("explicit_cache_preview_scope_set_ids"),
             explicit_cache_valid_set_ids=ctx.get("explicit_cache_valid_set_ids"),
             explicit_cache_invalidated_set_ids=ctx.get("explicit_cache_invalidated_set_ids"),
+            explicit_cache_truth_generation=ctx.get("explicit_cache_truth_generation"),
             preview_scope_set_ids=ctx.get("preview_scope_set_ids"),
             preview_owner_epoch=ctx.get("preview_owner_epoch"),
         )
@@ -1199,6 +1205,23 @@ class BatchRunContextOwner:
         context = policy_context
         if context is None and isinstance(callback_context, Mapping):
             context = self.completion_policy_context(callback_context)
+        if (
+            context is not None
+            and isinstance(callback_context, Mapping)
+            and isinstance(self._context, Mapping)
+            and self.context_matches_current_run_identity(callback_context)
+        ):
+            current_context = self.completion_policy_context()
+            if current_context is not None and cache_truth_generation_value(
+                current_context.explicit_cache_truth_generation
+            ) > cache_truth_generation_value(context.explicit_cache_truth_generation):
+                context = context.evolve(
+                    explicit_cache_preview_token=current_context.explicit_cache_preview_token,
+                    explicit_cache_preview_scope_set_ids=current_context.explicit_cache_preview_scope_set_ids,
+                    explicit_cache_valid_set_ids=current_context.explicit_cache_valid_set_ids,
+                    explicit_cache_invalidated_set_ids=current_context.explicit_cache_invalidated_set_ids,
+                    explicit_cache_truth_generation=current_context.explicit_cache_truth_generation,
+                )
         return context
 
     def callback_context_with_cache_truth(
@@ -1213,11 +1236,9 @@ class BatchRunContextOwner:
                 "explicit_cache_preview_scope_set_ids": cache_truth_context.explicit_cache_preview_scope_set_ids,
                 "explicit_cache_valid_set_ids": cache_truth_context.explicit_cache_valid_set_ids,
                 "explicit_cache_invalidated_set_ids": cache_truth_context.explicit_cache_invalidated_set_ids,
-                "explicit_cache_truth_generation": self._int_value(
-                    base.get("explicit_cache_truth_generation"),
-                    default=0,
-                )
-                + 1,
+                    "explicit_cache_truth_generation": cache_truth_context.explicit_cache_truth_generation
+                    if cache_truth_context.explicit_cache_truth_generation is not None
+                    else next_cache_truth_generation(base.get("explicit_cache_truth_generation")),
             }
         )
         return self.callback_context_snapshot(base)
@@ -1260,8 +1281,7 @@ class BatchRunContextOwner:
         raw["explicit_cache_preview_scope_set_ids"] = context.explicit_cache_preview_scope_set_ids
         raw["explicit_cache_valid_set_ids"] = context.explicit_cache_valid_set_ids
         raw["explicit_cache_invalidated_set_ids"] = context.explicit_cache_invalidated_set_ids
-        if "explicit_cache_truth_generation" in raw:
-            raw["explicit_cache_truth_generation"] = raw.get("explicit_cache_truth_generation")
+        raw["explicit_cache_truth_generation"] = context.explicit_cache_truth_generation
         raw["preview_scope_set_ids"] = context.preview_scope_set_ids
         raw["preview_owner_epoch"] = context.preview_owner_epoch
         if base_context is None or self._matches_current_identity(raw):
@@ -1597,6 +1617,9 @@ class BatchRunContextOwner:
         ) + tuple(sorted(item for item in invalidated_seen if item not in queued_seen))
         context["explicit_cache_valid_set_ids"] = valid_set_ids
         context["explicit_cache_invalidated_set_ids"] = invalidated_set_ids
+        context["explicit_cache_truth_generation"] = next_cache_truth_generation(
+            context.get("explicit_cache_truth_generation")
+        )
 
     @staticmethod
     def _remove_pending_dirty_reset_set_ids(context: Dict[str, Any], set_ids: Sequence[str]) -> None:

@@ -52,7 +52,7 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
         def cancel(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     dataset_payloads = [
         {"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]},
@@ -74,7 +74,8 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
         simulation_func=_sim,
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         assert not hasattr(window, "_parallel_fit_runtime_settings_for_run")
         dataset_specs = tuple(coerce_fit_dataset_specs(dataset_payloads))
@@ -107,7 +108,7 @@ def test_serial_only_gui_worker_contract(qt_app, monkeypatch) -> None:
             lane_count=1,
             readiness_required=False,
         )
-        window.fit_worker_launch_owner.start_runtime_launch(
+        window._start_accepted_fit_runtime_launch(
             FittingRuntimeAcceptedLaunch(identity=identity, session=None)
         )
     finally:

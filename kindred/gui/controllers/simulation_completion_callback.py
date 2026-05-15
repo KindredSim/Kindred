@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Mapping
 
+from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
 from kindred.gui.controllers.simulation_completion_publication import CompletionCallbackState
@@ -13,15 +14,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SimulationCompletionCallbackDependencies:
-    active_run_id: Callable[[], int]
-    shutdown_requested: Callable[[], bool]
-    latest_request_id: Callable[[], int]
-    current_global_epoch: Callable[[], int]
-    active_batch_context_runtime_input_stale_for_set: Callable[..., bool]
-    mark_stale_runtime_input_callback_consumed: Callable[..., None]
-    effective_preview_owner_epoch_for_callback: Callable[..., int | None]
-    missing_preview_owner_epoch_for_current_fast_owner: Callable[..., bool]
-    preview_request_matches_current_owner_epoch: Callable[..., bool]
+    freshness: SimulationCallbackFreshnessOwner
     completion_policy_preview_ownership: Callable[[], Any]
     completion_policy_pending_replay_state: Callable[[], Any]
     apply_completion_policy_state_patch: Callable[..., None]
@@ -57,20 +50,9 @@ class SimulationCompletionCallbackOwner:
         run_id = callback_identity.run_id
         fast_mode = callback_identity.fast_mode
         request_id = callback_identity.request_id
-        owner_epoch = callback_identity.owner_epoch
         batch_set = callback_identity.batch_set
         batch_set_id = callback_identity.batch_set_id
         cache_key = callback_identity.cache_key
-        active_run_id = int(self._deps.active_run_id())
-        shutdown_requested = bool(self._deps.shutdown_requested())
-        if int(run_id) != active_run_id:
-            logger.debug(
-                "Ignoring stale simulation completion (run_id=%s, active=%s)",
-                run_id,
-                active_run_id,
-            )
-            return
-
         ctx: Mapping[str, Any] | None = (
             callback_identity.callback_context
             if isinstance(callback_identity.callback_context, Mapping)
@@ -78,16 +60,22 @@ class SimulationCompletionCallbackOwner:
         )
         if not isinstance(ctx, Mapping):
             raise ValueError("simulation completion requires callback_identity.callback_context.")
-        if isinstance(ctx, Mapping) and self._deps.active_batch_context_runtime_input_stale_for_set(
-            batch_set_id=batch_set_id,
-            context=ctx,
-        ):
+        freshness = self._deps.freshness.assess_callback(callback_identity, context=ctx)
+        if freshness.stale_run:
+            logger.debug(
+                "Ignoring stale simulation completion (run_id=%s, active=%s)",
+                run_id,
+                freshness.active_run_id,
+            )
+            return
+
+        if freshness.runtime_input_stale:
             logger.debug(
                 "Ignoring stale simulation completion (batch_set_id=%s, current_global_epoch=%s)",
                 str(batch_set_id or ""),
-                int(self._deps.current_global_epoch()),
+                freshness.current_global_epoch,
             )
-            self._deps.mark_stale_runtime_input_callback_consumed(
+            self._deps.freshness.mark_stale_runtime_input_callback_consumed(
                 batch_set_id=batch_set_id,
                 context=ctx,
             )
@@ -99,16 +87,8 @@ class SimulationCompletionCallbackOwner:
                 if isinstance(ctx, Mapping)
                 else None
             )
-        latest_request_id = int(self._deps.latest_request_id())
-        callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
-            owner_epoch=owner_epoch,
-        )
-        missing_owner_epoch = self._deps.missing_preview_owner_epoch_for_current_fast_owner(
-            fast_mode=fast_mode,
-            request_id=request_id,
-            owner_epoch=callback_owner_epoch,
-            latest_request_id=latest_request_id,
-        )
+        latest_request_id = freshness.latest_request_id
+        callback_owner_epoch = freshness.callback_owner_epoch
         state = CompletionCallbackState(
             run_id=run_id,
             request_id=request_id,
@@ -117,7 +97,7 @@ class SimulationCompletionCallbackOwner:
             cache_key=cache_key,
             policy_context=policy_context,
             ctx=ctx,
-            shutdown_requested=shutdown_requested,
+            shutdown_requested=freshness.shutdown_requested,
             is_preview=bool(fast_mode),
             slider_triggered=bool(self._ui.slider.slider_triggered_simulation()) or bool(fast_mode),
             explicit_batch_coalescing=False,
@@ -136,13 +116,7 @@ class SimulationCompletionCallbackOwner:
             result["provenance"] = solver_provenance
             if "mechanism_text" not in result and launch_provenance.get("mechanism_text") is not None:
                 result["mechanism_text"] = str(launch_provenance["mechanism_text"])
-        is_superseded_fast_request = bool(
-            fast_mode
-            and (
-                bool(missing_owner_epoch)
-                or (not self._deps.preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
-            )
-        )
+        is_superseded_fast_request = freshness.superseded_fast_request
 
         if not is_superseded_fast_request:
             state.explicit_batch_coalescing = self._batch_context_owner.explicit_batch_coalescing_for_completion(
@@ -162,7 +136,7 @@ class SimulationCompletionCallbackOwner:
             request_id=int(request_id),
             preview_owner_epoch=callback_owner_epoch,
             pending_replay=self._deps.completion_policy_pending_replay_state(),
-            shutdown_requested=shutdown_requested,
+            shutdown_requested=freshness.shutdown_requested,
         )
         logger.debug(
             "Active fast completion superseded (request_id=%s, latest=%s, run_id=%s, schedule_pending=%s, display_current_preview=%s, handoff_after_display=%s)",
@@ -214,10 +188,3 @@ class SimulationCompletionCallbackOwner:
                 ),
             )
         )
-
-    def _has_active_context(self) -> bool:
-        try:
-            state = self._batch_context_owner.completion_state()
-        except Exception:
-            return False
-        return bool(state is not None and state.active)

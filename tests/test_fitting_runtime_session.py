@@ -6,6 +6,12 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+def test_fitting_runtime_session_has_no_fake_begin_run_lifecycle() -> None:
+    from kindred.core.fitting_runtime_session import FittingRuntimeSession
+
+    assert not hasattr(FittingRuntimeSession, "begin_run")
+
+
 def test_global_fitting_runtime_session_reuses_warm_lanes_and_records_ledger() -> None:
     from kindred.core.fitting_runtime_session import (
         FittingRuntimeLedger,

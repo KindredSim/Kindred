@@ -58,7 +58,8 @@ def _make_window(
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": y_a.copy(), "B": y_b.copy()}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 def _make_two_dataset_window(*, ds1_selected: list[str], ds2_selected: list[str]):
     from kindred.gui.fitting.window import FittingWindow
@@ -108,6 +109,7 @@ def _make_two_dataset_window(*, ds1_selected: list[str], ds2_selected: list[str]
         simulation_func=lambda _params: {"t": t.copy(), "species": {**ds1_series, **ds2_series}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0, "ds2": 1.0},
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
     )
 
 
@@ -178,7 +180,7 @@ def test_fit_targets_apply_required_to_update_payload(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:
@@ -240,7 +242,7 @@ def test_fit_target_weights_apply_required_to_update_payload(qt_app, monkeypatch
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:

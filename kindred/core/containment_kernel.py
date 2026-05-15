@@ -366,6 +366,10 @@ class ContainmentKernelOwner:
     def startup_payload(self) -> dict[str, Any]:
         return dict(self._startup_payload)
 
+    def update_startup_payload(self, payload: Mapping[str, Any] | None) -> None:
+        with self._lifecycle_lock:
+            self._startup_payload = dict(payload or {})
+
     @property
     def is_running(self) -> bool:
         proc = self._process

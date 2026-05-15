@@ -58,7 +58,12 @@ class ParallelBatchExecutor:
 
     @lane_pool_factory.setter
     def lane_pool_factory(self, value: Callable[[int, bool], Any]) -> None:
-        self._runtime_session.lane_pool_factory = value
+        self._runtime_session.reconfigure_runtime_pool(
+            max_parallel_workers=self.max_parallel_workers,
+            limit_blas_threads_per_worker=self.limit_blas_threads_per_worker,
+            lane_pool_factory=value,
+            record_nonfatal_exception=self.record_nonfatal_exception,
+        )
 
     @property
     def max_parallel_workers(self) -> int:
@@ -66,7 +71,12 @@ class ParallelBatchExecutor:
 
     @max_parallel_workers.setter
     def max_parallel_workers(self, value: int) -> None:
-        self._runtime_session.max_parallel_workers = int(value)
+        self._runtime_session.reconfigure_runtime_pool(
+            max_parallel_workers=int(value),
+            limit_blas_threads_per_worker=self.limit_blas_threads_per_worker,
+            lane_pool_factory=self.lane_pool_factory,
+            record_nonfatal_exception=self.record_nonfatal_exception,
+        )
 
     @property
     def limit_blas_threads_per_worker(self) -> bool:
@@ -74,7 +84,12 @@ class ParallelBatchExecutor:
 
     @limit_blas_threads_per_worker.setter
     def limit_blas_threads_per_worker(self, value: bool) -> None:
-        self._runtime_session.limit_blas_threads_per_worker = bool(value)
+        self._runtime_session.reconfigure_runtime_pool(
+            max_parallel_workers=self.max_parallel_workers,
+            limit_blas_threads_per_worker=bool(value),
+            lane_pool_factory=self.lane_pool_factory,
+            record_nonfatal_exception=self.record_nonfatal_exception,
+        )
 
     @property
     def record_nonfatal_exception(self) -> Callable[[str, BaseException], None]:
@@ -82,7 +97,12 @@ class ParallelBatchExecutor:
 
     @record_nonfatal_exception.setter
     def record_nonfatal_exception(self, value: Callable[[str, BaseException], None]) -> None:
-        self._runtime_session.record_nonfatal_exception = value
+        self._runtime_session.reconfigure_runtime_pool(
+            max_parallel_workers=self.max_parallel_workers,
+            limit_blas_threads_per_worker=self.limit_blas_threads_per_worker,
+            lane_pool_factory=self.lane_pool_factory,
+            record_nonfatal_exception=value,
+        )
 
     @property
     def current_max_workers(self) -> Optional[int]:

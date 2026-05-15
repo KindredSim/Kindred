@@ -56,5 +56,6 @@ def test_main_window_no_longer_exposes_dead_public_runtime_forwarders(main_windo
         "prepare_slider_runtime",
         "apply_slider_overrides_to_bindings",
         "set_slider_runtime_dirty",
+        "set_data",
     ):
         assert name not in type(main_window).__dict__, f"Dead runtime forwarder {name} should be removed from MainWindow."

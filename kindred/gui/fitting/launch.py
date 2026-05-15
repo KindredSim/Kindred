@@ -6,19 +6,16 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 import os
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 from PySide6 import QtWidgets
 
-from kindred.core.analysis.dataset_parameter_overrides import coerce_fit_dataset_parameter_overrides
 from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetPayloadResult,
-    coerce_fit_dataset_specs,
     read_fit_dataset_payload,
 )
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, prepare_fitting_execution_context
-from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.gui.controllers.dataset_manager import DatasetManagerError
 from kindred.gui.fitting.batch_mapping import (
     T0_SEED_TOL_S,
@@ -32,13 +29,11 @@ from kindred.gui.fitting.batch_mapping import (
     unique_batch_set_name,
 )
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
-from kindred.gui.fitting.run_stamp import build_global_fit_run_stamp, hash_global_fit_run_stamp
-from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity, PreparedFitEvaluator
+from kindred.gui.fitting.runtime_readiness import FittingRuntimeIdentity
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 if TYPE_CHECKING:
     from kindred.gui.controllers.dataset_manager import DatasetFitSettings
-    from kindred.gui.fitting.window import FittingWindow
 
 
 logger = logging.getLogger(__name__)
@@ -49,7 +44,6 @@ __all__ = [
     "FittingLaunchRejection",
     "FittingLaunchResult",
     "FittingLaunchSnapshot",
-    "FittingLaunchIdentityOwner",
     "GlobalFitLaunchContext",
     "launch_global_fit_session",
     "validate_de_bounds",
@@ -121,349 +115,6 @@ def validate_de_bounds(
     return is_valid, errors
 
 
-class FittingLaunchIdentityOwner:
-    """Owns fitting launch identity collection for passive readiness and explicit Run Fit."""
-
-    def __init__(self, window: "FittingWindow") -> None:
-        self._window = window
-        self._last_launch_result: Optional[FittingLaunchResult] = None
-
-    def collect_dataset_selection(self) -> "FittingLaunchDatasetSelection":
-        window = self._window
-        rows = []
-        included_ids: List[str] = []
-        for entry in window._dataset_entries:
-            dataset_id = str(entry.get("id") or "").strip()
-            include = bool(entry.get("include", True))
-            label = str(entry.get("label") or dataset_id)
-            species = ", ".join(entry.get("selected_species", []))
-            weight = window._dataset_weight_for_id(dataset_id)
-            entry["weight"] = weight
-            entry["include"] = include
-            rows.append(
-                {
-                    "id": dataset_id,
-                    "label": label,
-                    "species": species,
-                    "include": include,
-                    "weight": weight,
-                }
-            )
-            if include:
-                included_ids.append(dataset_id)
-        return FittingLaunchDatasetSelection(rows=tuple(rows), ids=tuple(included_ids))
-
-    def build_current_launch_snapshot(
-        self,
-        *,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        purpose: "FittingLaunchPurpose" = None,
-        refresh_current_mechanism: bool = True,
-    ) -> Optional["FittingLaunchSnapshot"]:
-        window = self._window
-        launch_purpose = purpose or FittingLaunchPurpose.PASSIVE_READINESS
-        explicit = launch_purpose is FittingLaunchPurpose.EXPLICIT_RUN
-        if getattr(window, "_fit_window_state_refreshing", False):
-            return None
-        if refresh_current_mechanism and not window._refresh_fit_window_state_for_current_mechanism(
-            show_errors=explicit
-        ):
-            return None
-        collected_config_bundle = window._params_ics_tab.collect_parameter_config_bundle(
-            show_errors=explicit
-        )
-        if collected_config_bundle is None:
-            return None
-        config, global_dataset_params, global_dataset_variable_params = collected_config_bundle
-        dataset_selection = self.collect_dataset_selection()
-        if explicit:
-            window.fit_run_state_owner.set_active_dataset_ids(list(dataset_selection.ids))
-        if not dataset_selection.ids:
-            if explicit:
-                QtWidgets.QMessageBox.warning(window, "No Datasets", "Select at least one dataset to include.")
-            return None
-        invalid = window._invalid_applied_used_dataset_ids_for_run()
-        if invalid:
-            if explicit:
-                labels = [window._dataset_label_for_id(ds_id) for ds_id in invalid]
-                QtWidgets.QMessageBox.warning(
-                    window,
-                    "Global Fit",
-                    "Run Fit is disabled due to invalid applied settings for: "
-                    + ", ".join(labels)
-                    + ".",
-                )
-            elif hasattr(window, "_status_label"):
-                window._status_label.setText("Fitting runtime not ready: invalid applied settings")
-            return None
-        if integration_settings is not None:
-            integration = integration_settings
-        elif explicit:
-            integration = window._params_ics_tab.collect_integration_settings()
-        else:
-            collect_integration_settings = getattr(
-                window._params_ics_tab,
-                "collect_integration_settings_silent",
-                window._params_ics_tab.collect_integration_settings,
-            )
-            integration = collect_integration_settings()
-        if integration is None:
-            return None
-        return FittingLaunchSnapshot(
-            config=dict(config or {}),
-            global_dataset_params=dict(global_dataset_params or {}),
-            global_dataset_variable_params=dict(global_dataset_variable_params or {}),
-            dataset_selection=dataset_selection,
-            integration=integration,
-        )
-
-    def build_current_launch_result(
-        self,
-        *,
-        purpose: "FittingLaunchPurpose",
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> "FittingLaunchResult":
-        identity, rejection = self._build_current_fit_runtime_identity(
-            purpose=purpose,
-            integration_settings=integration_settings,
-            refresh_current_mechanism=refresh_current_mechanism,
-        )
-        result = FittingLaunchResult(identity=identity, rejection=rejection)
-        self._last_launch_result = result
-        return result
-
-    def current_launch_result(self) -> Optional["FittingLaunchResult"]:
-        return self._last_launch_result
-
-    def payloads_available_for_identity(self, identity: Optional[FittingRuntimeIdentity]) -> bool:
-        if identity is None:
-            return False
-        for spec in identity.datasets:
-            dataset_id = str(getattr(spec, "dataset_id", "") or "")
-            result = self._window._global_payload_results.get(dataset_id)
-            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
-                return False
-            if dataset_id not in self._window._global_payload_lookup:
-                return False
-        return True
-
-    def build_current_fit_runtime_identity(
-        self,
-        *,
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> Optional[FittingRuntimeIdentity]:
-        result = self.build_current_launch_result(
-            purpose=FittingLaunchPurpose.PASSIVE_READINESS,
-            integration_settings=integration_settings,
-            refresh_current_mechanism=refresh_current_mechanism,
-        )
-        return result.identity
-
-    def render_launch_rejection(
-        self,
-        result: "FittingLaunchResult",
-        *,
-        purpose: "FittingLaunchPurpose",
-    ) -> None:
-        rejection = result.rejection
-        if rejection is None:
-            return
-        window = self._window
-        if purpose is FittingLaunchPurpose.EXPLICIT_RUN and rejection.title:
-            QtWidgets.QMessageBox.warning(window, rejection.title, rejection.message)
-        elif hasattr(window, "_status_label") and rejection.passive_status:
-            window._status_label.setText(rejection.passive_status)
-
-    def _build_current_fit_runtime_identity(
-        self,
-        *,
-        purpose: "FittingLaunchPurpose",
-        integration_settings: Optional[tuple[str, float, float]] = None,
-        refresh_current_mechanism: bool = True,
-    ) -> tuple[Optional[FittingRuntimeIdentity], Optional["FittingLaunchRejection"]]:
-        window = self._window
-        launch_snapshot = self.build_current_launch_snapshot(
-            integration_settings=integration_settings,
-            purpose=purpose,
-            refresh_current_mechanism=refresh_current_mechanism,
-        )
-        if launch_snapshot is None:
-            if purpose is FittingLaunchPurpose.EXPLICIT_RUN:
-                return None, None
-            if window._invalid_applied_used_dataset_ids_for_run():
-                return None, FittingLaunchRejection(
-                    title="",
-                    message="Fitting launch inputs have invalid applied settings.",
-                    passive_status="Fitting runtime not ready: invalid applied settings",
-                )
-            return None, FittingLaunchRejection(
-                title="",
-                message="Fitting launch inputs are not valid.",
-                passive_status="Fitting runtime not ready",
-            )
-        config = launch_snapshot.config
-        global_dataset_params = launch_snapshot.global_dataset_params
-        global_dataset_variable_params = launch_snapshot.global_dataset_variable_params
-        dataset_selection = launch_snapshot.dataset_selection
-        solver, rtol, atol = launch_snapshot.integration
-        requested_solver, _solver_warning = normalize_solver_name(str(solver or FITTING_DEFAULT_SOLVER))
-        mechanism_text = window._safe_text_from_getter(getattr(window, "_mechanism_text_getter", None))
-        evaluator_components = window._fitting_evaluator_components_for_runtime_identity(
-            mechanism_text=mechanism_text,
-            config=config,
-            requested_solver=str(requested_solver),
-            requested_rtol=float(rtol),
-            requested_atol=float(atol),
-        )
-        if evaluator_components is None:
-            return None, FittingLaunchRejection(
-                title="Global Fit" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message="Failed to build fitting evaluator.",
-                passive_status="Fitting runtime not ready",
-            )
-        simulation_func = evaluator_components.base_evaluator
-        simulation_factory = evaluator_components.evaluator_factory
-        prepared_simulation = evaluator_components.prepared_simulation
-        readiness_required = evaluator_components.readiness_required
-
-        datasets, rejection = self._dataset_payloads_for_launch(dataset_selection.ids)
-        if datasets is None:
-            return None, rejection
-        try:
-            dataset_specs = coerce_fit_dataset_specs(datasets)
-        except Exception as exc:
-            return None, FittingLaunchRejection(
-                title="Global Fit" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message=str(exc) or "Dataset payloads are invalid.",
-                passive_status="Fitting runtime not ready: invalid dataset payloads",
-            )
-
-        weights = window._weights_for_run(dataset_selection.as_mapping())
-        staged_params = window._params_ics_tab.get_staged_dataset_params() or {}
-        shared_param_keys = window._shared_param_keys_for_run(config)
-        dataset_params_for_run = window._dataset_params_for_run(
-            list(dataset_selection.ids),
-            shared_param_keys,
-            staged_params,
-            global_dataset_params=global_dataset_params,
-            evaluator=simulation_func,
-        )
-        variable_params = window._variable_params_for_run(
-            list(dataset_selection.ids),
-            shared_param_keys,
-            staged_params,
-            global_dataset_variable_params=global_dataset_variable_params,
-            evaluator=simulation_func,
-        )
-        ok, errors = validate_de_bounds(
-            config,
-            dataset_variable_params=variable_params,
-        )
-        if not ok:
-            return None, FittingLaunchRejection(
-                title="Invalid Bounds" if purpose is FittingLaunchPurpose.EXPLICIT_RUN else "",
-                message="\n".join(errors),
-                passive_status="Fitting runtime not ready: invalid bounds",
-            )
-        dataset_overrides = coerce_fit_dataset_parameter_overrides(
-            dataset_ids=list(dataset_selection.ids),
-            dataset_params=dataset_params_for_run,
-            dataset_variable_params=variable_params,
-        )
-        reactions_text = window._safe_text_from_getter(getattr(window, "_reactions_text_getter", None))
-        applied_targets = dict(window._species_table.fit_targets_selection_applied or {})
-        applied_target_weights = {
-            str(ds_id): window._species_table.applied_target_weights_for_dataset(str(ds_id))
-            for ds_id in applied_targets.keys()
-        }
-        stamp = build_global_fit_run_stamp(
-            dataset_rows=list(dataset_selection.rows),
-            included_ids=list(dataset_selection.ids),
-            applied_fit_targets=applied_targets,
-            applied_target_weights=applied_target_weights,
-            weights_used=(dict(weights) if isinstance(weights, dict) else None),
-            weight_mode=("equal" if weights is None else "custom"),
-            fit_config=dict(config or {}),
-            mechanism_text=mechanism_text,
-            reactions_text=reactions_text,
-            prepared_simulation=prepared_simulation,
-            dataset_specs=list(dataset_specs),
-            dataset_overrides=list(dataset_overrides),
-        )
-        if prepared_simulation is None:
-            stamp["runtime_request"] = {
-                "solver": str(requested_solver),
-                "rtol": f"{float(rtol):.12g}",
-                "atol": f"{float(atol):.12g}",
-                "param_names": window._param_names_for_readiness_identity(
-                    config=config,
-                    prepared_simulation=None,
-                    mechanism_text=mechanism_text,
-                ),
-            }
-            stamp["runtime_request"].update(window._runtime_settings_for_identity())
-        stamp_hash = hash_global_fit_run_stamp(stamp)
-        stamp_short = str(stamp_hash)[:12]
-        fixed_params = window._fixed_params_for_run(config)
-        fit_evaluator = window._simulation_with_fixed_params(simulation_func, fixed_params) if simulation_func is not None else None
-        fit_evaluator_factory = None
-        if callable(simulation_factory):
-            fixed_snapshot = dict(fixed_params)
-
-            def fit_evaluator_factory():
-                base_evaluator = simulation_factory()
-                return PreparedFitEvaluator(
-                    base_evaluator=base_evaluator,
-                    fit_evaluator=window._simulation_with_fixed_params(base_evaluator, fixed_snapshot),
-                )
-
-        lane_budget = window._fit_runtime_lane_budget(len(dataset_specs))
-        return FittingRuntimeIdentity(
-            datasets=tuple(dataset_specs),
-            config=config,
-            dataset_overrides=tuple(dataset_overrides),
-            weights=dict(weights) if weights is not None else None,
-            requested_solver=str(requested_solver),
-            requested_rtol=float(rtol),
-            requested_atol=float(atol),
-            fit_evaluator=fit_evaluator,
-            stamp=stamp,
-            stamp_hash=str(stamp_hash),
-            stamp_short=str(stamp_short),
-            lane_count=int(lane_budget),
-            readiness_required=bool(readiness_required),
-            fit_evaluator_factory=fit_evaluator_factory,
-            base_evaluator=simulation_func,
-        ), None
-
-    def _dataset_payloads_for_launch(
-        self,
-        selected_ids: Sequence[str],
-    ) -> tuple[Optional[list[dict[str, Any]]], Optional["FittingLaunchRejection"]]:
-        window = self._window
-        datasets: list[dict[str, Any]] = []
-        for dataset_id in selected_ids:
-            ds_id = str(dataset_id)
-            result = window._global_payload_results.get(ds_id)
-            if isinstance(result, FitDatasetPayloadResult) and result.state == "invalid":
-                reason = str(result.error or "Dataset payload is invalid.")
-                return None, FittingLaunchRejection(
-                    title="Global Fit",
-                    message=f"Dataset '{ds_id}' has invalid payload:\n{reason}",
-                    passive_status="Fitting runtime not ready: invalid dataset payloads",
-                )
-            if ds_id not in window._global_payload_lookup:
-                return None, FittingLaunchRejection(
-                    title="Global Fit",
-                    message=f"Dataset '{ds_id}' is missing payloads.",
-                    passive_status="Fitting runtime not ready: missing dataset payloads",
-                )
-            datasets.append(dict(window._global_payload_lookup[ds_id]))
-        return datasets, None
-
-
 class FittingLaunchPurpose(Enum):
     PASSIVE_READINESS = "passive_readiness"
     EXPLICIT_RUN = "explicit_run"
@@ -524,6 +175,7 @@ class GlobalFitLaunchContext:
     apply_fit_results_to_project: Callable[[str, Dict[str, float], Dict[str, Dict[str, float]]], None]
     apply_dataset_initial_updates: Callable[[str, Dict[str, float]], None]
     load_fitting_defaults: Callable[[], Dict[str, object]]
+    runtime_lane_budget: Callable[[int], int]
     batch_store: Any = None
     batch_model: Any = None
     batch_table: Any = None
@@ -965,6 +617,7 @@ def launch_global_fit_session(context: GlobalFitLaunchContext) -> Optional[QtWid
         dataset_payloads=dataset_payloads,
         dataset_payload_results=dataset_payload_results,
         dataset_weights=weights,
+        runtime_lane_budget=context.runtime_lane_budget,
         apply_callback=context.write_fit_results_to_mechanism,
         project_apply_callback=context.apply_fit_results_to_project,
         config_defaults=context.load_fitting_defaults(),

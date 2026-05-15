@@ -48,7 +48,7 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
         def cancel(self):
             pass
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -58,7 +58,8 @@ def test_global_fit_restart_uses_staged_dataset_variable_initials(qt_app, monkey
         dataset_variable_params={"ds1": {"init:A": {"initial": 1.0, "min": 0.1, "max": 2.0}}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._params_ics_tab.set_staged_dataset_params({"ds1": {"init:A": 0.6}})
         window.run_fit()

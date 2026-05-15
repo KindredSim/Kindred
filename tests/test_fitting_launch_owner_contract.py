@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 import importlib.resources
 from types import SimpleNamespace
@@ -52,14 +53,15 @@ def _seed_simple_mechanism(main_window) -> None:
     )
 
 
+def _runtime_lane_budget(dataset_count: int) -> int:
+    return max(1, int(dataset_count))
+
+
 @pytest.mark.gui
 def test_fitting_window_base_evaluator_state_is_owned_outside_simulation_func_field(qt_app):
     from kindred.gui.fitting.window import FittingWindow
-    from kindred.gui.fitting.launch import FittingLaunchIdentityOwner
-    from kindred.gui.fitting.run_command import FittingRunCommandOwner
     from kindred.gui.fitting.run_state import FittingRunStateOwner
     from kindred.gui.fitting.runtime_preparation import FittingRuntimePreparationOwner
-    from kindred.gui.fitting.worker_launch import FittingAcceptedLaunchWorkerOwner
 
     t = np.asarray([0.0, 1.0], dtype=float)
 
@@ -85,22 +87,18 @@ def test_fitting_window_base_evaluator_state_is_owned_outside_simulation_func_fi
         ],
         mechanism_species=["A"],
         simulation_func=_base_evaluator,
+        runtime_lane_budget=_runtime_lane_budget,
     )
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
-        assert not hasattr(type(window), "_build_current_fit_runtime_identity")
-        assert not hasattr(type(window), "build_current_fit_runtime_identity")
+        assert hasattr(type(window), "build_current_fit_runtime_identity")
         assert not hasattr(type(window), "_start_fit")
         assert not hasattr(type(window), "_start_accepted_fit_worker")
-        assert not hasattr(type(window), "_start_accepted_fit_runtime_launch")
         assert not hasattr(type(window), "start_accepted_fit_worker")
         assert callable(getattr(window, "run_fit", None))
-        assert getattr(window, "fit_launch_identity_owner", None) is not None
-        assert isinstance(window.fit_launch_identity_owner, FittingLaunchIdentityOwner)
-        assert getattr(window, "fit_run_command_owner", None) is not None
-        assert isinstance(window.fit_run_command_owner, FittingRunCommandOwner)
-        assert getattr(window, "fit_worker_launch_owner", None) is not None
-        assert isinstance(window.fit_worker_launch_owner, FittingAcceptedLaunchWorkerOwner)
+        assert not hasattr(window, "fit_launch_identity_owner")
+        assert not hasattr(window, "fit_run_command_owner")
+        assert not hasattr(window, "fit_worker_launch_owner")
         assert getattr(window, "fit_runtime_readiness", None) is not None
         assert not hasattr(type(window), "_prepare_fit_runtime_for_current_state")
         assert not hasattr(type(window), "_poll_fit_runtime_preparation")
@@ -110,7 +108,7 @@ def test_fitting_window_base_evaluator_state_is_owned_outside_simulation_func_fi
         assert isinstance(window.fit_runtime_preparation_owner, FittingRuntimePreparationOwner)
         assert isinstance(window.fit_runtime_preparation_owner.refresh_pending, bool)
         assert window.fit_runtime_preparation_owner.close_after_prepare is False
-        identity = window.fit_launch_identity_owner.build_current_fit_runtime_identity()
+        identity = window.build_current_fit_runtime_identity()
 
         assert "_simulation_func" not in window.__dict__
         assert "_last_fit_config" not in window.__dict__
@@ -124,20 +122,127 @@ def test_fitting_window_base_evaluator_state_is_owned_outside_simulation_func_fi
         window.close()
 
 
-def test_fitting_sidecar_owners_use_public_owner_dependencies():
+def test_fitting_window_does_not_keep_fake_launch_run_or_worker_sidecar_modules():
     from pathlib import Path
 
     package_root = Path("kindred/gui/fitting")
-    for relative in ("run_command.py", "runtime_preparation.py"):
-        source = (package_root / relative).read_text(encoding="utf-8")
-        assert "._fit_runtime_readiness" not in source
-        assert "._fit_launch_identity_owner" not in source
-        assert "._fit_worker_launch_owner" not in source
-    run_command_source = (package_root / "run_command.py").read_text(encoding="utf-8")
-    assert "._collect_dataset_selection" not in run_command_source
+    assert not (package_root / "run_command.py").exists()
+    assert not (package_root / "worker_launch.py").exists()
     launch_source = (package_root / "launch.py").read_text(encoding="utf-8")
-    assert "._collect_dataset_selection" not in launch_source
-    assert "show_dataset_messages" not in launch_source
+    assert "class FittingLaunchIdentityOwner" not in launch_source
+
+
+def test_fitting_sidecars_do_not_use_broad_window_private_reachthrough():
+    from pathlib import Path
+
+    package_root = Path("kindred/gui/fitting")
+    allowed_private_tokens = {
+        "runtime_preparation.py": {"_refresh_pending", "_close_after_prepare"},
+    }
+    offenders: list[str] = []
+    for relative in ("launch.py", "runtime_preparation.py"):
+        source = (package_root / relative).read_text(encoding="utf-8")
+        for lineno, line in enumerate(source.splitlines(), start=1):
+            if "window._" not in line:
+                continue
+            if any(token in line for token in allowed_private_tokens.get(relative, set())):
+                continue
+            offenders.append(f"{relative}:{lineno}:{line.strip()}")
+
+    assert offenders == []
+
+
+def test_fitting_lane_budget_comes_from_explicit_launch_dependency():
+    from pathlib import Path
+
+    window_source = Path("kindred/gui/fitting/window.py").read_text(encoding="utf-8")
+    launch_source = Path("kindred/gui/fitting/launch.py").read_text(encoding="utf-8")
+
+    assert "def _fit_runtime_lane_budget" not in window_source
+    assert "def _default_runtime_lane_budget" not in window_source
+    assert "runtime_lane_budget or" not in window_source
+    assert "window._fit_runtime_lane_budget" not in launch_source
+    assert "runtime_lane_budget" in launch_source
+
+
+def test_fitting_mixin_calls_real_launch_boundary_without_pass_through_wrapper():
+    from pathlib import Path
+
+    source = Path("kindred/gui/mixins/fitting_mixin.py").read_text(encoding="utf-8")
+
+    assert "def launch_global_fit_session(context)" not in source
+    assert "return _impl(context)" not in source
+    assert "from kindred.gui.fitting.launch import launch_global_fit_session" in source
+
+
+def test_fitting_window_does_not_relocate_fake_sidecars_into_private_port_slabs():
+    from pathlib import Path
+
+    source = Path("kindred/gui/fitting/window.py").read_text(encoding="utf-8")
+
+    assert "_FittingLaunchWindowPort" not in source
+    assert "_FittingRunCommandWindowPort" not in source
+    assert "_FittingAcceptedLaunchWorkerWindowPort" not in source
+    assert "_fit_launch_port" not in source
+    assert "_fit_run_command_port" not in source
+    assert "_fit_worker_launch_port" not in source
+    assert "FittingLaunchIdentityOwner" not in source
+    assert "FittingRunCommandOwner" not in source
+    assert "FittingAcceptedLaunchWorkerOwner" not in source
+
+
+def test_fitting_window_does_not_keep_public_sidecar_pass_through_slab():
+    from pathlib import Path
+
+    source = Path("kindred/gui/fitting/window.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    window_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "FittingWindow"
+    )
+    method_names = {
+        node.name
+        for node in window_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    forbidden = {
+        "fit_dataset_entries_for_launch",
+        "collect_fit_parameter_config_bundle",
+        "fitting_evaluator_components_for_runtime_identity",
+        "dataset_params_for_fitting_run",
+        "variable_params_for_fitting_run",
+        "publish_fit_worker",
+        "set_fit_pause_controls",
+    }
+    assert method_names.isdisjoint(forbidden)
+
+
+def test_fitting_runtime_lane_budget_has_no_hidden_window_default_fallback():
+    from pathlib import Path
+
+    source = Path("kindred/gui/fitting/window.py").read_text(encoding="utf-8")
+    mixin_source = Path("kindred/gui/mixins/fitting_mixin.py").read_text(encoding="utf-8")
+
+    assert "PROJECT_DEFAULTS[\"batch_runtime_lane_budget\"]" not in source
+    assert "PROJECT_DEFAULTS['batch_runtime_lane_budget']" not in source
+    assert "BATCH_RUNTIME_LANE_BUDGET_DEFAULT" not in source
+    assert "PROJECT_DEFAULTS[\"batch_runtime_lane_budget\"]" not in mixin_source
+    assert "PROJECT_DEFAULTS['batch_runtime_lane_budget']" not in mixin_source
+    lane_provider_source = mixin_source.split("def _runtime_lane_budget", 1)[1].split(
+        "return GlobalFitLaunchContext",
+        1,
+    )[0]
+    assert "except Exception" not in lane_provider_source
+
+
+def test_deadcode_allowlist_does_not_keep_deleted_pyqtgraph_compatibility_stub():
+    from pathlib import Path
+
+    source = Path("tools/audit/deadcode_test_only_keep_allowlist.txt").read_text(encoding="utf-8")
+
+    assert "kindred/gui/widgets/pyqtgraph_plot_panel.py" not in source
 
 
 def test_fitting_workflow_tests_use_public_runtime_readiness_owner():
@@ -152,87 +257,8 @@ def test_fitting_workflow_tests_use_public_runtime_readiness_owner():
     assert offenders == []
 
 
-def test_run_fit_revalidates_explicit_launch_even_when_runtime_is_ready():
-    from kindred.gui.fitting.launch import FittingLaunchPurpose, FittingLaunchResult
-    from kindred.gui.fitting.run_command import FittingRunCommandOwner
-    from kindred.gui.fitting.runtime_readiness import (
-        FittingRuntimeLaunchDecisionState,
-        FittingRuntimeReadinessState,
-    )
-
-    stale_identity = SimpleNamespace(name="stale")
-    explicit_identity = SimpleNamespace(name="explicit")
-    accepted_launch = SimpleNamespace(identity=explicit_identity)
-    calls: list[object] = []
-
-    class _Worker:
-        def isRunning(self) -> bool:
-            return False
-
-    class _SpeciesTable:
-        def flush_visible_weight_edits(self) -> None:
-            calls.append("flush_visible")
-
-        def flush_dataset_weight_editor(self) -> None:
-            calls.append("flush_dataset")
-
-    class _Readiness:
-        def snapshot(self):
-            return SimpleNamespace(
-                state=FittingRuntimeReadinessState.READY,
-                identity=stale_identity,
-            )
-
-        def is_ready_for(self, identity):
-            calls.append(("ready_for", identity))
-            return identity is stale_identity or identity is explicit_identity
-
-        def set_blocked(self, *_args, **_kwargs) -> None:
-            calls.append("blocked")
-
-        def prepare_or_accept_launch(self, identity):
-            calls.append(("accept", identity))
-            return SimpleNamespace(
-                state=FittingRuntimeLaunchDecisionState.ACCEPTED,
-                accepted_launch=accepted_launch,
-                snapshot=self.snapshot(),
-            )
-
-    class _LaunchOwner:
-        def build_current_launch_result(self, *, purpose, **_kwargs):
-            calls.append(("build", purpose))
-            return FittingLaunchResult(identity=explicit_identity)
-
-        def render_launch_rejection(self, *_args, **_kwargs) -> None:
-            calls.append("reject")
-
-    class _WorkerLaunchOwner:
-        def start_runtime_launch(self, launch):
-            calls.append(("start", launch))
-
-    window = SimpleNamespace(
-        _worker=_Worker(),
-        _species_table=_SpeciesTable(),
-        fit_runtime_readiness=_Readiness(),
-        fit_launch_identity_owner=_LaunchOwner(),
-        fit_worker_launch_owner=_WorkerLaunchOwner(),
-        _reset_fit_run_cached_state=lambda: calls.append("reset"),
-        _fit_runtime_identity_matches_current_noncollecting_inputs=lambda identity: identity is stale_identity,
-        _capture_failed_fit_restore_baseline=lambda: calls.append("capture_baseline"),
-        _clear_failed_run_visual_state=lambda: calls.append("clear_failed"),
-        _refresh_run_button_enabled_state=lambda: calls.append("refresh_button"),
-    )
-
-    FittingRunCommandOwner(window).run_fit()
-
-    assert ("build", FittingLaunchPurpose.EXPLICIT_RUN) in calls
-    assert ("accept", explicit_identity) in calls
-    assert ("start", accepted_launch) in calls
-    assert ("accept", stale_identity) not in calls
-
-
 @pytest.mark.gui
-def test_fitting_window_routes_passive_and_explicit_launch_identity_through_owner(qt_app, monkeypatch):
+def test_fitting_window_routes_passive_and_explicit_launch_identity_through_single_window_boundary(qt_app, monkeypatch):
     from kindred.gui.fitting.window import FittingWindow
     from kindred.gui.fitting.launch import FittingLaunchPurpose, FittingLaunchResult
 
@@ -256,6 +282,7 @@ def test_fitting_window_routes_passive_and_explicit_launch_identity_through_owne
         ],
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.asarray([1.0, 0.8])}},
+        runtime_lane_budget=_runtime_lane_budget,
     )
     try:
         calls: list[FittingLaunchPurpose] = []
@@ -264,8 +291,7 @@ def test_fitting_window_routes_passive_and_explicit_launch_identity_through_owne
             calls.append(purpose)
             return FittingLaunchResult(identity=None)
 
-        owner = window.fit_launch_identity_owner
-        monkeypatch.setattr(owner, "build_current_launch_result", _capture_result)
+        monkeypatch.setattr(window, "build_current_launch_result", _capture_result)
 
         window.fit_runtime_preparation_owner.prepare_current_state()
         window.run_fit()
@@ -310,17 +336,18 @@ def test_fitting_launch_validation_result_owns_payload_errors_without_window_spl
         ],
         mechanism_species=["A"],
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.asarray([1.0, 0.8])}},
+        runtime_lane_budget=_runtime_lane_budget,
     )
     try:
         assert not hasattr(FittingWindow, "_datasets_payloads_for_run")
         assert not hasattr(FittingWindow, "_datasets_payloads_for_readiness")
         window._global_payload_results["ds1"] = FitDatasetPayloadResult.invalid("invalid payload")
 
-        passive = window.fit_launch_identity_owner.build_current_launch_result(
+        passive = window.build_current_launch_result(
             purpose=FittingLaunchPurpose.PASSIVE_READINESS,
             refresh_current_mechanism=False,
         )
-        explicit = window.fit_launch_identity_owner.build_current_launch_result(
+        explicit = window.build_current_launch_result(
             purpose=FittingLaunchPurpose.EXPLICIT_RUN,
             refresh_current_mechanism=False,
         )
@@ -331,7 +358,7 @@ def test_fitting_launch_validation_result_owns_payload_errors_without_window_spl
         assert explicit.rejection == passive.rejection
         assert captured == []
 
-        window.fit_launch_identity_owner.render_launch_rejection(
+        window.render_launch_rejection(
             explicit,
             purpose=FittingLaunchPurpose.EXPLICIT_RUN,
         )
@@ -693,7 +720,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
         def activateWindow(self):
             return None
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
     monkeypatch.setattr(
         "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
         lambda _evaluator, *, max_lanes, ledger=None: _RuntimeSession(),
@@ -705,7 +732,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
     try:
         config = eager_window._params_ics_tab.collect_parameter_config()
         assert config is not None
-        selection = eager_window.fit_launch_identity_owner.collect_dataset_selection()
+        selection = eager_window.collect_dataset_selection()
         assert list(selection.ids) == ["ds1"]
         assert "_simulation_func" not in eager_window.__dict__
         assert eager_window._fit_evaluator_state.current_base_evaluator() is None
@@ -739,6 +766,7 @@ def test_fitting_package_launch_owner_preserves_serial_evaluator_through_worker_
         assert schedule.to_payload()["instant_events"][0]["value"] == pytest.approx(2.0)
         worker_kwargs = captured.get("worker_kwargs")
         assert isinstance(worker_kwargs, dict)
+        assert worker_kwargs["parent"] is None
         run_stamp = worker_kwargs["run_stamp"]
         assert run_stamp["prepared_simulation"]["intervention_schedule_fingerprint"] == schedule.fingerprint
         assert collect_calls == [True]

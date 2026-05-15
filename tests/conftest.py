@@ -189,7 +189,7 @@ def _patch_main_window_test_environment(
         )
         monkeypatch.setattr(
             "kindred.gui.controllers.simulation_controller.SimulationController.ensure_parallel_batch_runtime_ready",
-            lambda self, *, wait=False: None,
+            lambda self, *, wait=False, required_lanes=None: None,
         )
 
     def _quiet_dialog(*_args, **_kwargs):

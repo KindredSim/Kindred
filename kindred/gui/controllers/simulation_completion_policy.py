@@ -88,6 +88,14 @@ def _normalize_nonnegative_int(value: object, *, default: int = 0) -> int:
     return max(0, int(normalized))
 
 
+def cache_truth_generation_value(value: object) -> int:
+    return _normalize_nonnegative_int(value, default=0)
+
+
+def next_cache_truth_generation(value: object) -> int:
+    return cache_truth_generation_value(value) + 1
+
+
 def pending_initial_seed_for_set(
     pending_init_seed: object,
     *,
@@ -125,6 +133,7 @@ class CompletionPolicyContext:
     explicit_cache_preview_scope_set_ids: Optional[tuple[str, ...]] = None
     explicit_cache_valid_set_ids: Optional[tuple[str, ...]] = None
     explicit_cache_invalidated_set_ids: Optional[tuple[str, ...]] = None
+    explicit_cache_truth_generation: Optional[int] = None
     preview_scope_set_ids: Optional[tuple[str, ...]] = None
     preview_owner_epoch: Optional[int] = None
 
@@ -185,6 +194,11 @@ class CompletionPolicyContext:
             self,
             "explicit_cache_invalidated_set_ids",
             _normalize_optional_set_ids(self.explicit_cache_invalidated_set_ids),
+        )
+        object.__setattr__(
+            self,
+            "explicit_cache_truth_generation",
+            _normalize_optional_int(self.explicit_cache_truth_generation),
         )
         object.__setattr__(self, "preview_scope_set_ids", _normalize_optional_set_ids(self.preview_scope_set_ids))
         object.__setattr__(self, "preview_owner_epoch", _normalize_optional_int(self.preview_owner_epoch))
@@ -677,18 +691,21 @@ class SimulationCompletionPolicy:
         cache_state: CacheAuthorityState,
         cache_key: Optional[str],
     ) -> CompletionPolicyContext:
+        next_generation = next_cache_truth_generation(context.explicit_cache_truth_generation)
         if cache_state.active_cache_key == _normalize_optional_str(cache_key):
             return context.evolve(
                 explicit_cache_preview_token=cache_state.active_cache_preview_token,
                 explicit_cache_preview_scope_set_ids=cache_state.active_cache_preview_scope_set_ids,
                 explicit_cache_valid_set_ids=cache_state.active_cache_valid_set_ids,
                 explicit_cache_invalidated_set_ids=cache_state.active_cache_invalidated_set_ids,
+                explicit_cache_truth_generation=next_generation,
             )
         return context.evolve(
             explicit_cache_preview_token=None,
             explicit_cache_preview_scope_set_ids=(),
             explicit_cache_valid_set_ids=(),
             explicit_cache_invalidated_set_ids=(),
+            explicit_cache_truth_generation=next_generation,
         )
 
     def resolve_pending_init_completion(

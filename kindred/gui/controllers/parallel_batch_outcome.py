@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
+from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
 
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,7 @@ class ParallelBatchOutcomeResolution:
 
 @dataclass(frozen=True)
 class ParallelBatchOutcomeDependencies:
-    active_batch_context_runtime_input_stale_for_set: Callable[..., bool]
-    mark_stale_runtime_input_callback_consumed: Callable[..., None]
+    freshness: SimulationCallbackFreshnessOwner
     record_nonfatal_exception: Callable[..., None]
     invalidate_preserved_pending_init_results_after_failed_run: Callable[..., None]
     finalize_scoped_batch_success_subset: Callable[..., None]
@@ -295,8 +295,6 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_stop_button_enabled(False)
             return False
 
-        self._batch_parallel.discard_request(sid)
-
         if callback_identity is None or callback_context is None:
             self._deps.record_nonfatal_exception(
                 (
@@ -317,15 +315,17 @@ class ParallelBatchOutcomeOwner:
             self._ui.run_ui.set_status_text("Batch simulation failed")
             return False
 
-        if self._deps.active_batch_context_runtime_input_stale_for_set(
-            batch_set_id=sid,
-            context=callback_context,
-        ):
-            self._deps.mark_stale_runtime_input_callback_consumed(
+        freshness = self._deps.freshness.assess_callback(callback_identity, context=callback_context)
+        if freshness.stale_run and int(freshness.active_run_id) > 0:
+            return True
+        if freshness.runtime_input_stale:
+            self._deps.freshness.mark_stale_runtime_input_callback_consumed(
                 batch_set_id=sid,
                 context=callback_context,
             )
             return True
+
+        self._batch_parallel.discard_request(sid)
         if resolution.failed:
             error_payload = dict(resolution.error_payload or {})
             if self.handle_scoped_failure(

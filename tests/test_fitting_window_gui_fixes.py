@@ -136,7 +136,8 @@ def _make_window():
         },
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 # ---- FittingWindow has minimize/maximize buttons ----

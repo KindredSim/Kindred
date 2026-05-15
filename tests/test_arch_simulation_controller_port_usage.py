@@ -674,6 +674,9 @@ def test_parallel_batch_outcome_uses_callback_owners_not_controller_dispatch_dep
 
     assert "dispatch_simulation_complete" not in dependency_fields
     assert "dispatch_simulation_error" not in dependency_fields
+    assert "freshness" in dependency_fields
+    assert "active_batch_context_runtime_input_stale_for_set" not in dependency_fields
+    assert "mark_stale_runtime_input_callback_consumed" not in dependency_fields
     assert "completion_callback_owner" in init_args
     assert "error_handling_owner" in init_args
 
@@ -698,6 +701,109 @@ def test_parallel_batch_outcome_wiring_does_not_wrap_dependencies_in_lambdas() -
         "Parallel batch outcome wiring must not hide dependencies behind controller lambda wrappers; this syntax "
         "guard is not a claim that all remaining callback dependencies are final ownership boundaries."
     )
+
+
+@pytest.mark.parametrize(
+    "dependency_name",
+    [
+        "SimulationCallbackFreshnessDependencies",
+        "SimulationCompletionCallbackDependencies",
+        "SimulationErrorHandlingDependencies",
+    ],
+)
+def test_callback_freshness_wiring_does_not_wrap_dependencies_in_lambdas(dependency_name: str) -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    dependency_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == dependency_name
+    ]
+    assert len(dependency_calls) == 1
+
+    lambda_fields = [
+        keyword.arg
+        for keyword in dependency_calls[0].keywords
+        if isinstance(keyword.value, ast.Lambda)
+    ]
+    assert lambda_fields == [], (
+        f"{dependency_name} must not be wired through controller lambda pass-throughs; "
+        "callback freshness must be owned by a typed freshness boundary."
+    )
+
+
+def test_callback_dependencies_use_typed_freshness_owner_not_callable_bundle() -> None:
+    callback_source = Path("kindred/gui/controllers/simulation_completion_callback.py").read_text(encoding="utf-8")
+    error_source = Path("kindred/gui/controllers/simulation_error_handling.py").read_text(encoding="utf-8")
+    freshness_source = Path("kindred/gui/controllers/simulation_callback_freshness.py").read_text(encoding="utf-8")
+    controller_source = Path("kindred/gui/controllers/simulation_controller.py").read_text(encoding="utf-8")
+
+    for dependency_name, source in (
+        ("SimulationCompletionCallbackDependencies", callback_source),
+        ("SimulationErrorHandlingDependencies", error_source),
+    ):
+        tree = ast.parse(source)
+        node = _class_node(tree, dependency_name)
+        annotations = {
+            stmt.target.id
+            for stmt in node.body
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+        }
+        assert "freshness" in annotations
+        assert annotations.isdisjoint(
+            {
+                "active_run_id",
+                "latest_request_id",
+                "current_global_epoch",
+                "active_batch_context_runtime_input_stale_for_set",
+                "mark_stale_runtime_input_callback_consumed",
+                "effective_preview_owner_epoch_for_callback",
+                "missing_preview_owner_epoch_for_current_fast_owner",
+                "preview_request_matches_current_owner_epoch",
+            }
+        )
+
+    assert "SimulationCallbackFreshnessOwner" in controller_source
+    freshness_tree = ast.parse(freshness_source)
+    freshness_node = _class_node(freshness_tree, "SimulationCallbackFreshnessOwner")
+    freshness_methods = {
+        node.name
+        for node in freshness_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "assess_callback" in freshness_methods
+    assert freshness_methods.isdisjoint(
+        {
+            "active_run_id",
+            "latest_request_id",
+            "current_global_epoch",
+            "callback_owner_epoch",
+        }
+    )
+    assert "_callback_owner_epoch" not in controller_source
+    assert "_callback_active_run_id" not in controller_source
+    assert "_callback_latest_request_id" not in controller_source
+    assert "_callback_current_global_epoch" not in controller_source
+    assert "_fast_callback_missing_owner_epoch_is_stale" not in controller_source
+    assert "_runtime_input_context_stale_for_set" not in controller_source
+    assert "_active_batch_context_runtime_input_stale_for_set" not in controller_source
+    assert "_mark_stale_runtime_input_callback_consumed" not in controller_source
+
+
+def test_simulation_controller_does_not_keep_fake_preview_epoch_normalizers() -> None:
+    _target, _source, tree = _repo_source_tree("kindred/gui/controllers/simulation_controller.py")
+    class_node = _class_node(tree, "SimulationController")
+    method_names = {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert "_effective_preview_owner_epoch_for_callback" not in method_names
+    assert "_missing_preview_owner_epoch_for_current_fast_owner" not in method_names
+    assert "_preview_request_matches_current_owner" not in method_names
+    assert "_preview_request_matches_current_owner_epoch" not in method_names
 
 
 def test_slider_preview_launch_wiring_does_not_wrap_dependencies_in_lambdas() -> None:
@@ -2444,11 +2550,8 @@ def test_simulation_completion_callback_owner_applies_callback_policy_outside_co
 
     hits: list[_CallHit] = []
     expected_owner_calls = {
-        "active_batch_context_runtime_input_stale_for_set",
+        "assess_callback",
         "mark_stale_runtime_input_callback_consumed",
-        "effective_preview_owner_epoch_for_callback",
-        "missing_preview_owner_epoch_for_current_fast_owner",
-        "preview_request_matches_current_owner_epoch",
         "apply_completion_policy_state_patch",
         "apply_lifecycle_effects",
         "publish_success",

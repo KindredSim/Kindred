@@ -440,7 +440,7 @@ def test_cache_miss_on_clean_selection_preserves_plot_and_sets_evicted_message(m
     # Establish a known plot state before the cache-miss selection reconciliation.
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     # A selection change must never trigger a run; hard-fail if it does.
     monkeypatch.setattr(
@@ -471,7 +471,7 @@ def test_lru_evicted_clean_selection_preserves_current_plot_and_reports_cache_mi
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     first_set_id = str(main_window._batch_set_id_for_row(0))
     second_set_id = str(main_window._batch_set_id_for_row(1))
@@ -503,7 +503,7 @@ def test_selection_change_without_active_cache_context_does_not_show_evicted_war
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     main_window._status_label.setText("Ready")
 
     main_window._batch_model.set_species(["A"])
@@ -539,7 +539,7 @@ def test_selection_change_without_active_cache_context_clears_stale_cache_warnin
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     main_window._status_label.setText("Result not cached (evicted). Press Run to compute.")
 
     main_window._batch_model.set_species(["A"])
@@ -828,7 +828,7 @@ def test_selection_change_reuses_current_workspace_preview_from_inactive_preview
 ):
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     monkeypatch.setattr(
@@ -893,7 +893,7 @@ def test_selection_change_reuses_current_workspace_preview_from_same_key_outside
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     monkeypatch.setattr(
@@ -947,7 +947,7 @@ def test_selection_change_rejects_workspace_preview_with_wrong_overlay_token(
 ):
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     monkeypatch.setattr(
         main_window.simulation_controller,
@@ -992,7 +992,7 @@ def test_selection_change_reuses_workspace_preview_with_matching_overlay_token(
 ):
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     monkeypatch.setattr(
@@ -1044,7 +1044,7 @@ def test_selection_change_reuses_workspace_preview_with_matching_structured_iden
 ):
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     monkeypatch.setattr(
@@ -1103,7 +1103,7 @@ def test_selection_change_reuses_workspace_preview_with_slider_override_solver_a
 ):
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     monkeypatch.setattr(
@@ -1157,7 +1157,7 @@ def test_selection_change_rejects_workspace_preview_with_wrong_solver_context(
 ):
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     monkeypatch.setattr(
         main_window.simulation_controller,
@@ -1204,7 +1204,7 @@ def test_selection_change_partial_workspace_preview_keeps_resolved_dirty_preview
 
     baseline_t = np.asarray([0.0, 1.0], dtype=float)
     baseline_series = {"A": np.asarray([1.0, 2.0], dtype=float)}
-    main_window.set_data(baseline_t, baseline_series, label="baseline", overlays=[])
+    main_window.results_controller.set_data(baseline_t, baseline_series, label="baseline", overlays=[])
     preview_t = _current_preview_time_axis(main_window)
     preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
     plot = main_window._plot_tabs._main_plot
@@ -1550,7 +1550,7 @@ def test_selection_change_partial_preview_coverage_within_active_scope_keeps_dir
 
     preview_t = _current_preview_time_axis(main_window)
     preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
-    main_window.set_data(preview_t, preview_series, label="preview", overlays=[])
+    main_window.results_controller.set_data(preview_t, preview_series, label="preview", overlays=[])
 
     cache = main_window.simulation_controller.batch_cache
     explicit_key = "explicit-partial-preview-selection-cache-key"
@@ -1596,7 +1596,7 @@ def test_selection_change_partial_preview_without_explicit_cache_keeps_dirty_pre
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1653,7 +1653,7 @@ def test_selection_change_new_current_row_without_workspace_or_cache_context_cle
 
     preview_t = np.asarray([0.0, 1.0], dtype=float)
     preview_series = {"A": np.asarray([9.0, 18.0], dtype=float)}
-    main_window.set_data(preview_t, preview_series, label="set1", overlays=[])
+    main_window.results_controller.set_data(preview_t, preview_series, label="set1", overlays=[])
 
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1710,7 +1710,7 @@ def test_selection_change_partial_preview_with_invalid_explicit_cache_keeps_dirt
 
     preview_t = _current_preview_time_axis(main_window)
     preview_series = {"A": np.linspace(9.0, 18.0, preview_t.size, dtype=float)}
-    main_window.set_data(preview_t, preview_series, label="preview", overlays=[])
+    main_window.results_controller.set_data(preview_t, preview_series, label="preview", overlays=[])
 
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1771,7 +1771,7 @@ def test_selection_change_invalid_preview_without_usable_explicit_fallback_prese
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -1880,7 +1880,7 @@ def test_invalid_cache_entry_on_selection_change_sets_invalid_message_and_clears
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
 
     main_window._batch_model.set_species(["A"])
     add_btn = main_window.findChild(QtWidgets.QPushButton, "addBatchSetButton")
@@ -2166,7 +2166,7 @@ def test_selection_change_displays_selected_valid_cached_row_outside_latest_vali
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     main_window._batch_model.set_species(["A"])
@@ -2230,7 +2230,7 @@ def test_completion_redraw_keeps_newer_valid_result_authoritative_after_active_s
 
     t0 = np.asarray([0.0, 1.0], dtype=float)
     series0 = {"A": np.asarray([1.0, 0.5], dtype=float)}
-    main_window.set_data(t0, series0, label="baseline", overlays=[])
+    main_window.results_controller.set_data(t0, series0, label="baseline", overlays=[])
     plot = main_window._plot_tabs._main_plot
 
     main_window._batch_model.set_species(["A"])

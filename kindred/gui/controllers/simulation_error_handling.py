@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Mapping
 
+from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.core.simulation_failure import (
     coerce_simulation_failure,
@@ -17,14 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SimulationErrorHandlingDependencies:
-    active_run_id: Callable[[], int]
-    latest_request_id: Callable[[], int]
-    current_global_epoch: Callable[[], int]
-    active_batch_context_runtime_input_stale_for_set: Callable[..., bool]
-    mark_stale_runtime_input_callback_consumed: Callable[..., None]
-    effective_preview_owner_epoch_for_callback: Callable[..., int | None]
-    missing_preview_owner_epoch_for_current_fast_owner: Callable[..., bool]
-    preview_request_matches_current_owner_epoch: Callable[..., bool]
+    freshness: SimulationCallbackFreshnessOwner
     completion_policy_preview_ownership: Callable[[], Any]
     completion_policy_pending_replay_state: Callable[[], Any]
     apply_completion_policy_state_patch: Callable[..., None]
@@ -58,22 +52,11 @@ class SimulationErrorHandlingOwner:
         run_id = callback_identity.run_id
         fast_mode = callback_identity.fast_mode
         request_id = callback_identity.request_id
-        owner_epoch = callback_identity.owner_epoch
         batch_set_id = callback_identity.batch_set_id
         error_payload = coerce_simulation_failure(error_msg)
         error_text = simulation_failure_user_message(error_payload)
         error_detail_text = simulation_failure_detail_text(error_payload)
         cancelled = is_cancelled_failure(error_payload)
-        active_run_id = int(self._deps.active_run_id())
-        if int(run_id) != active_run_id:
-            logger.debug(
-                "Ignoring stale simulation error (run_id=%s, active=%s): %s",
-                run_id,
-                active_run_id,
-                error_text,
-            )
-            return
-        latest_request_id = int(self._deps.latest_request_id())
         ctx = (
             callback_identity.callback_context
             if isinstance(callback_identity.callback_context, Mapping)
@@ -81,17 +64,24 @@ class SimulationErrorHandlingOwner:
         )
         if not isinstance(ctx, Mapping):
             raise ValueError("simulation error requires callback_identity.callback_context.")
-        if isinstance(ctx, Mapping) and self._deps.active_batch_context_runtime_input_stale_for_set(
-            batch_set_id=batch_set_id,
-            context=ctx,
-        ):
+        freshness = self._deps.freshness.assess_callback(callback_identity, context=ctx)
+        if freshness.stale_run:
+            logger.debug(
+                "Ignoring stale simulation error (run_id=%s, active=%s): %s",
+                run_id,
+                freshness.active_run_id,
+                error_text,
+            )
+            return
+        latest_request_id = freshness.latest_request_id
+        if freshness.runtime_input_stale:
             logger.debug(
                 "Ignoring stale simulation error (batch_set_id=%s, current_global_epoch=%s): %s",
                 str(batch_set_id or ""),
-                int(self._deps.current_global_epoch()),
+                freshness.current_global_epoch,
                 error_text,
             )
-            self._deps.mark_stale_runtime_input_callback_consumed(
+            self._deps.freshness.mark_stale_runtime_input_callback_consumed(
                 batch_set_id=batch_set_id,
                 context=ctx,
             )
@@ -99,24 +89,10 @@ class SimulationErrorHandlingOwner:
         policy_context = (
             self._batch_context_owner.completion_policy_context(ctx)
             if isinstance(ctx, Mapping)
-            else None
-        )
-        callback_owner_epoch = self._deps.effective_preview_owner_epoch_for_callback(
-            owner_epoch=owner_epoch,
-        )
-        missing_owner_epoch = self._deps.missing_preview_owner_epoch_for_current_fast_owner(
-            fast_mode=fast_mode,
-            request_id=request_id,
-            owner_epoch=callback_owner_epoch,
-            latest_request_id=latest_request_id,
-        )
-        is_superseded_fast_request = bool(
-            fast_mode
-            and (
-                bool(missing_owner_epoch)
-                or (not self._deps.preview_request_matches_current_owner_epoch(request_id, callback_owner_epoch))
+                else None
             )
-        )
+        callback_owner_epoch = freshness.callback_owner_epoch
+        is_superseded_fast_request = freshness.superseded_fast_request
         if is_superseded_fast_request:
             stale_fast_decision = self._completion_policy.resolve_superseded_fast_error(
                 preview_ownership=self._deps.completion_policy_preview_ownership(),
@@ -208,10 +184,3 @@ class SimulationErrorHandlingOwner:
             ),
             failed_run_context=ctx if isinstance(ctx, Mapping) else None,
         )
-
-    def _has_active_context(self) -> bool:
-        try:
-            state = self._batch_context_owner.completion_state()
-        except Exception:
-            return False
-        return bool(state is not None and state.active)

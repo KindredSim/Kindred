@@ -707,6 +707,7 @@ def test_warm_simulation_owner_reprepares_running_runtime_without_replacing_proc
 
         def __init__(self) -> None:
             self.solve_calls: list[dict[str, object]] = []
+            self.startup_payload: dict[str, object] | None = None
 
         def solve(self, payload, *, active_timeout_s, cancellation_check=None):
             self.solve_calls.append(
@@ -721,13 +722,17 @@ def test_warm_simulation_owner_reprepares_running_runtime_without_replacing_proc
         def close(self, *, kill: bool = False) -> None:
             raise AssertionError("prepare must not replace or close the runtime owner")
 
+        def update_startup_payload(self, payload) -> None:
+            self.startup_payload = dict(payload)
+
     owner = WarmSimulationOwner(first_payload, active_timeout_s=12.0)
     runtime_owner = _RuntimeOwner()
     owner._runtime_owner = runtime_owner
 
-    owner.prepare_runtime_payload(second_payload, wait=True)
+    owner.prepare_runtime_payload(second_payload)
 
     assert owner.simulation_plan_payload == second_payload
+    assert runtime_owner.startup_payload == second_payload
     assert runtime_owner.solve_calls == [
         {
             "payload": {
@@ -738,6 +743,58 @@ def test_warm_simulation_owner_reprepares_running_runtime_without_replacing_proc
             "cancelled": None,
         }
     ]
+
+
+def test_prepare_runtime_payload_updates_restart_startup_payload():
+    from kindred.core.simulation_containment import WarmSimulationOwner
+
+    first_payload = _normal_plan().to_payload()
+    second_payload = _energy_scheduled_plan().to_payload()
+
+    class _RuntimeOwner:
+        owner_epoch = 1
+        is_running = True
+        is_ready = True
+
+        def __init__(self) -> None:
+            self.startup_payload = dict(first_payload)
+            self.prepare_calls: list[dict[str, object]] = []
+            self.close_calls: list[bool] = []
+
+        def solve(self, payload=None, *, active_timeout_s, cancellation_check=None):
+            request = dict(payload or {})
+            if request.get("prepare_only"):
+                self.prepare_calls.append(request)
+                return {"success": True, "prepared": True}
+            return {
+                "success": True,
+                "restart_startup_payload": dict(self.startup_payload),
+                "active_timeout_s": float(active_timeout_s),
+                "cancelled": cancellation_check is not None,
+            }
+
+        def update_startup_payload(self, payload) -> None:
+            self.startup_payload = dict(payload)
+
+        def close(self, *, kill: bool = False) -> None:
+            self.close_calls.append(bool(kill))
+
+    owner = WarmSimulationOwner(first_payload, active_timeout_s=12.0)
+    runtime_owner = _RuntimeOwner()
+    owner._runtime_owner = runtime_owner
+
+    owner.prepare_runtime_payload(second_payload)
+    owner.close(kill=True)
+    result = owner.solve({})
+
+    assert runtime_owner.prepare_calls == [
+        {
+            "simulation_plan_payload": second_payload,
+            "prepare_only": True,
+        }
+    ]
+    assert runtime_owner.close_calls == [True]
+    assert result["restart_startup_payload"] == second_payload
 
 
 def test_contained_worker_sends_exact_plan_even_when_owner_has_matching_startup_payload(qt_app):

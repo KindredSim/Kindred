@@ -78,7 +78,8 @@ def test_global_fit_does_not_persist_dataset_initials_until_apply(qt_app):
         ],
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": model.copy()}},
         dataset_settings_updater=_dataset_settings_updater,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._handle_global_fit_complete({"result": _make_fit_result()})
         assert calls == []
@@ -125,7 +126,8 @@ def test_apply_to_project_uses_selected_scope(qt_app, monkeypatch, scope_label, 
         ],
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": model.copy()}},
         project_apply_callback=_project_apply_callback,
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._handle_global_fit_complete({"result": _make_fit_result()})
         combo = window.findChild(QtWidgets.QComboBox, "global_fit_apply_scope_combo")

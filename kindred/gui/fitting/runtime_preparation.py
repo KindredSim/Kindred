@@ -1,20 +1,31 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from PySide6 import QtCore
 
 from kindred.gui.fitting.launch import FittingLaunchPurpose
 from kindred.gui.fitting.runtime_readiness import FittingRuntimeReadinessState
 
-if TYPE_CHECKING:
-    from kindred.gui.fitting.window import FittingWindow
+class FittingRuntimePreparationWindow(Protocol):
+    @property
+    def is_closing(self) -> bool: ...
+    @property
+    def fit_runtime_readiness(self): ...
+    def is_fit_running(self) -> bool: ...
+    def build_current_launch_result(self, *, purpose, **kwargs): ...
+    def render_launch_rejection(self, result, *, purpose) -> None: ...
+    def refresh_run_button_enabled_state(self) -> None: ...
+    def set_fit_status(self, text: str) -> None: ...
+    def set_fit_stop_enabled(self, enabled: bool) -> None: ...
+    def set_fit_controls_locked(self, locked: bool) -> None: ...
+    def close(self) -> None: ...
 
 
 class FittingRuntimePreparationOwner:
     """Owns passive fitting runtime preparation scheduling and close-after lifecycle."""
 
-    def __init__(self, window: "FittingWindow") -> None:
+    def __init__(self, window: FittingRuntimePreparationWindow) -> None:
         self._window = window
         self._refresh_pending = False
         self._close_after_prepare = False
@@ -37,9 +48,9 @@ class FittingRuntimePreparationOwner:
 
     def schedule_refresh(self) -> None:
         window = self._window
-        if getattr(window, "_closing", False):
+        if window.is_closing:
             return
-        if bool(getattr(window, "_worker", None) and getattr(window._worker, "isRunning", lambda: False)()):
+        if window.is_fit_running():
             return
         if window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING:
             self._refresh_pending = True
@@ -57,50 +68,46 @@ class FittingRuntimePreparationOwner:
 
     def prepare_current_state(self) -> None:
         window = self._window
-        if getattr(window, "_closing", False):
+        if window.is_closing:
             return
         if window.fit_runtime_readiness.snapshot().state is FittingRuntimeReadinessState.PREPARING:
             return
-        if bool(getattr(window, "_worker", None) and getattr(window._worker, "isRunning", lambda: False)()):
+        if window.is_fit_running():
             return
         try:
-            launch_result = window.fit_launch_identity_owner.build_current_launch_result(
+            launch_result = window.build_current_launch_result(
                 purpose=FittingLaunchPurpose.PASSIVE_READINESS,
             )
         except RuntimeError as exc:
             window.fit_runtime_readiness.set_blocked(exc)
-            if hasattr(window, "_status_label"):
-                window._status_label.setText(f"Fitting runtime not ready: {exc}")
-            window._refresh_run_button_enabled_state()
+            window.set_fit_status(f"Fitting runtime not ready: {exc}")
+            window.refresh_run_button_enabled_state()
             return
         identity = launch_result.identity
         if identity is None:
             window.fit_runtime_readiness.set_blocked()
-            window.fit_launch_identity_owner.render_launch_rejection(
+            window.render_launch_rejection(
                 launch_result,
                 purpose=FittingLaunchPurpose.PASSIVE_READINESS,
             )
-            window._refresh_run_button_enabled_state()
+            window.refresh_run_button_enabled_state()
             return
         window.fit_runtime_readiness.set_desired_identity(identity)
-        if hasattr(window, "_status_label"):
-            snapshot = window.fit_runtime_readiness.snapshot()
-            if snapshot.state is FittingRuntimeReadinessState.PREPARING:
-                window._status_label.setText("Preparing fitting runtime...")
-                if hasattr(window, "_stop_button"):
-                    window._stop_button.setEnabled(True)
-            elif snapshot.state is FittingRuntimeReadinessState.READY:
-                window._status_label.setText("Fitting runtime ready")
-                if hasattr(window, "_stop_button"):
-                    window._stop_button.setEnabled(False)
-        window._refresh_run_button_enabled_state()
+        snapshot = window.fit_runtime_readiness.snapshot()
+        if snapshot.state is FittingRuntimeReadinessState.PREPARING:
+            window.set_fit_status("Preparing fitting runtime...")
+            window.set_fit_stop_enabled(True)
+        elif snapshot.state is FittingRuntimeReadinessState.READY:
+            window.set_fit_status("Fitting runtime ready")
+            window.set_fit_stop_enabled(False)
+        window.refresh_run_button_enabled_state()
 
     def cancel_preparation(self, *, kill: bool) -> bool:
         return self._window.fit_runtime_readiness.cancel(kill=bool(kill))
 
     def queue_pending_refresh(self) -> None:
         window = self._window
-        if getattr(window, "_closing", False):
+        if window.is_closing:
             return
         if not self._refresh_pending:
             return
@@ -125,18 +132,16 @@ class FittingRuntimePreparationOwner:
             QtCore.QTimer.singleShot(0, self.poll_preparation)
             return
         snapshot = window.fit_runtime_readiness.snapshot()
-        if hasattr(window, "_status_label"):
-            if snapshot.state is FittingRuntimeReadinessState.READY:
-                window._status_label.setText("Fitting runtime ready")
-            elif snapshot.state is FittingRuntimeReadinessState.FAILED:
-                message = str(snapshot.error or "Unknown fitting runtime preparation failure.")
-                window._status_label.setText(f"Fitting runtime preparation failed: {message}")
-            elif snapshot.state is FittingRuntimeReadinessState.BLOCKED:
-                window._status_label.setText("Fitting runtime not ready")
-        if hasattr(window, "_stop_button"):
-            window._stop_button.setEnabled(False)
-        window._set_fit_controls_locked(False)
-        window._refresh_run_button_enabled_state()
+        if snapshot.state is FittingRuntimeReadinessState.READY:
+            window.set_fit_status("Fitting runtime ready")
+        elif snapshot.state is FittingRuntimeReadinessState.FAILED:
+            message = str(snapshot.error or "Unknown fitting runtime preparation failure.")
+            window.set_fit_status(f"Fitting runtime preparation failed: {message}")
+        elif snapshot.state is FittingRuntimeReadinessState.BLOCKED:
+            window.set_fit_status("Fitting runtime not ready")
+        window.set_fit_stop_enabled(False)
+        window.set_fit_controls_locked(False)
+        window.refresh_run_button_enabled_state()
         if snapshot.state is FittingRuntimeReadinessState.FAILED:
             self._refresh_pending = False
             return

@@ -29,7 +29,8 @@ def test_remove_global_initial_parameter_allows_readd(qt_app, monkeypatch):
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
         dataset_params={"ds1": {"init:A": 1.0}},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._params_ics_tab._add_global_initial_parameter("A", ["ds1"])
         rows = [

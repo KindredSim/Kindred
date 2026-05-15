@@ -1998,7 +1998,6 @@ def fit_global(
 
     try:
         if runtime_session is not None:
-            runtime_session.begin_run()
             fit_evaluator_for_run = runtime_session.evaluator(cancellation_check=cancellation_check)
         elif type(fit_evaluator) is SerialFittingEvaluator:
             lane_count = 1 if max_runtime_lanes is None else max(1, int(max_runtime_lanes))
@@ -2007,7 +2006,6 @@ def fit_global(
                 max_lanes=lane_count,
                 ledger=runtime_ledger,
             )
-            contained_fit_evaluator.begin_run()
             fit_evaluator_for_run = contained_fit_evaluator.evaluator(cancellation_check=cancellation_check)
         else:
             fit_evaluator_for_run = fit_evaluator

@@ -235,6 +235,24 @@ def test_completion_callback_injects_captured_launch_provenance_before_publicati
         def publish_success(self, result, _state, **_kwargs):
             published.append(dict(result))
 
+    class _Freshness:
+        def assess_callback(self, callback_identity, **_kwargs):
+            return SimpleNamespace(
+                active_run_id=7,
+                latest_request_id=11,
+                shutdown_requested=False,
+                current_global_epoch=0,
+                callback_owner_epoch=callback_identity.owner_epoch,
+                stale_run=False,
+                runtime_input_stale=False,
+                missing_owner_epoch=False,
+                preview_owner_matches=True,
+                superseded_fast_request=False,
+            )
+
+        def mark_stale_runtime_input_callback_consumed(self, **_kwargs) -> None:
+            return None
+
     owner = SimulationCompletionCallbackOwner(
         ui=SimpleNamespace(slider=SimpleNamespace(slider_triggered_simulation=lambda: False)),
         batch_context_owner=SimpleNamespace(
@@ -245,15 +263,7 @@ def test_completion_callback_injects_captured_launch_provenance_before_publicati
         lifecycle_effect_owner=SimpleNamespace(),
         publication_owner=_Publication(),
         dependencies=SimulationCompletionCallbackDependencies(
-            active_run_id=lambda: 7,
-            shutdown_requested=lambda: False,
-            latest_request_id=lambda: 11,
-            current_global_epoch=lambda: 0,
-            active_batch_context_runtime_input_stale_for_set=lambda **_kwargs: False,
-            mark_stale_runtime_input_callback_consumed=lambda **_kwargs: None,
-            effective_preview_owner_epoch_for_callback=lambda **kwargs: kwargs.get("owner_epoch"),
-            missing_preview_owner_epoch_for_current_fast_owner=lambda **_kwargs: False,
-            preview_request_matches_current_owner_epoch=lambda *_args, **_kwargs: True,
+            freshness=_Freshness(),
             completion_policy_preview_ownership=lambda: None,
             completion_policy_pending_replay_state=lambda: None,
             apply_completion_policy_state_patch=lambda *_args, **_kwargs: None,
@@ -465,19 +475,22 @@ def test_fitting_readiness_uses_evaluator_state_owner_for_prepared_metadata(monk
     assert FittingRuntimeReadinessController._prepared_simulation_meta(object()) is sentinel
 
 
-def test_fitting_worker_launch_exposes_only_accepted_runtime_launch_entrypoint() -> None:
-    from kindred.gui.fitting.worker_launch import FittingAcceptedLaunchWorkerOwner
-
-    owner = FittingAcceptedLaunchWorkerOwner(SimpleNamespace())
-
-    with pytest.raises(AttributeError):
-        getattr(owner, "start_worker")
-
-
-def test_fitting_worker_launch_does_not_duplicate_worker_update_defaults() -> None:
+def test_fitting_worker_launch_is_owned_by_window_without_fake_sidecar_module() -> None:
     from pathlib import Path
 
-    source = Path("kindred/gui/fitting/worker_launch.py").read_text(encoding="utf-8")
+    assert not Path("kindred/gui/fitting/worker_launch.py").exists()
+    source = Path("kindred/gui/fitting/window.py").read_text(encoding="utf-8")
 
     assert "best_update_interval_s=" not in source
     assert "plot_update_interval_s=" not in source
+
+
+def test_main_window_set_data_compatibility_surface_is_removed_without_test_shim() -> None:
+    from pathlib import Path
+
+    main_window_source = Path("kindred/gui/main_window.py").read_text(encoding="utf-8")
+    solver_error_test = Path("tests/test_solver_error_gui.py").read_text(encoding="utf-8")
+
+    assert "def set_data" not in main_window_source
+    assert "Public API for setting data (compatibility)" not in main_window_source
+    assert "main_window.set_data =" not in solver_error_test

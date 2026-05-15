@@ -499,6 +499,7 @@ class BatchLanePool:
         self._next_lane_index = 0
         self._events: deque[ContainmentKernelEvent] = deque(maxlen=self._event_history_limit)
         self._lock = threading.Lock()
+        self._lane_available = threading.Condition(self._lock)
         self._closed = False
 
     @property
@@ -531,63 +532,65 @@ class BatchLanePool:
     ) -> BatchLaneOutcome:
         lane, reserved = self._reserve_next_lane()
         run_method = lane.run_reserved if reserved else lane.run
-        outcome = run_method(
-            dict(task or {}),
-            run_id=int(run_id),
-            request_id=int(request_id),
-            set_id=str(set_id or ""),
-            active_timeout_s=float(active_timeout_s),
-        )
+        try:
+            outcome = run_method(
+                dict(task or {}),
+                run_id=int(run_id),
+                request_id=int(request_id),
+                set_id=str(set_id or ""),
+                active_timeout_s=float(active_timeout_s),
+            )
+        finally:
+            with self._lane_available:
+                self._lane_available.notify_all()
         for event in outcome.events:
             self._events.append(event)
         return outcome
 
     def warm_lanes(self, max_lanes: int, *, wait: bool = True) -> None:
         requested_lanes = min(self._max_lanes, max(1, int(max_lanes)))
-        with self._lock:
+        with self._lane_available:
             if self._closed:
                 raise RuntimeError("Batch lane pool is closed.")
             while len(self._lanes) < requested_lanes:
                 self._lanes.append(self._create_lane_unlocked())
             lanes = tuple(self._lanes[:requested_lanes])
         for lane in lanes:
-            lane.warm(wait=bool(wait))
-            for event in lane.drain_events():
-                self._events.append(event)
+            try:
+                lane.warm(wait=bool(wait))
+                for event in lane.drain_events():
+                    self._events.append(event)
+            finally:
+                with self._lane_available:
+                    self._lane_available.notify_all()
 
     def close(self, *, kill: bool = False) -> None:
-        with self._lock:
+        with self._lane_available:
             self._closed = True
+            self._lane_available.notify_all()
         for lane in list(self._lanes):
             lane.close(kill=bool(kill))
             for event in lane.drain_events():
                 self._events.append(event)
 
-    def _next_lane(self) -> WarmBatchSimulationLane:
-        lane, reserved = self._reserve_next_lane()
-        if reserved:
-            lane.release_reservation()
-        return lane
-
     def _reserve_next_lane(self) -> tuple[WarmBatchSimulationLane, bool]:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Batch lane pool is closed.")
-            lane_count = len(self._lanes)
-            for offset in range(lane_count):
-                index = (self._next_lane_index + offset) % lane_count
-                candidate = self._lanes[index]
-                reserved = self._try_reserve_lane(candidate)
-                if reserved or self._lane_is_available(candidate):
-                    self._next_lane_index = (index + 1) % lane_count
-                    return candidate, reserved
-            if len(self._lanes) < self._max_lanes:
-                lane = self._create_lane_unlocked()
-                self._lanes.append(lane)
-                return lane, self._try_reserve_lane(lane)
-            lane = self._lanes[self._next_lane_index % lane_count]
-            self._next_lane_index = (self._next_lane_index + 1) % lane_count
-            return lane, False
+        with self._lane_available:
+            while True:
+                if self._closed:
+                    raise RuntimeError("Batch lane pool is closed.")
+                lane_count = len(self._lanes)
+                for offset in range(lane_count):
+                    index = (self._next_lane_index + offset) % lane_count
+                    candidate = self._lanes[index]
+                    reserved = self._try_reserve_lane(candidate)
+                    if reserved or self._lane_is_available(candidate):
+                        self._next_lane_index = (index + 1) % lane_count
+                        return candidate, reserved
+                if len(self._lanes) < self._max_lanes:
+                    lane = self._create_lane_unlocked()
+                    self._lanes.append(lane)
+                    return lane, self._try_reserve_lane(lane)
+                self._lane_available.wait()
 
     def _create_lane_unlocked(self) -> WarmBatchSimulationLane:
         return WarmBatchSimulationLane(

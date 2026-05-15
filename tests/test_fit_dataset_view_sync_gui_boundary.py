@@ -69,7 +69,8 @@ def _make_fitting_window(*, dataset_manager) -> FittingWindow:
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": y_a.copy()}},
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def test_plot_tabs_public_sync_seams_reuse_tab_and_preserve_grid_plot_items(qt_app) -> None:
@@ -190,7 +191,8 @@ def test_fitting_window_targets_dataset_manager_updates_only_for_result_datasets
             {"id": "ds2", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
         ],
         dataset_weights={"ds1": 1.0, "ds2": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         result = SimpleNamespace(
             model_series={"ds1": {"A": np.asarray([1.0, 0.8, 0.6, 0.4, 0.2])}},

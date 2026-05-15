@@ -56,6 +56,10 @@ from kindred.gui.controllers.simulation_completion_policy import (
     RunActivitySnapshot,
     SimulationCompletionPolicy,
 )
+from kindred.gui.controllers.simulation_callback_freshness import (
+    SimulationCallbackFreshnessDependencies,
+    SimulationCallbackFreshnessOwner,
+)
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
 from kindred.gui.controllers.simulation_completion_callback import (
     SimulationCompletionCallbackDependencies,
@@ -290,6 +294,18 @@ class SimulationController(QtCore.QObject):
                 start_next_batch_simulation=self._start_next_batch_simulation,
             ),
         )
+        self._callback_freshness_owner = SimulationCallbackFreshnessOwner(
+            SimulationCallbackFreshnessDependencies(
+                run_state=self._run_state,
+                batch_context_owner=self._batch_context_owner,
+                preview_ownership=self._completion_policy_preview_ownership,
+                shutdown_requested=self._shutdown_requested_for_completion_callbacks,
+                current_global_epoch=self._current_runtime_input_global_epoch,
+                current_epoch=self._current_runtime_input_epoch,
+                current_set_epoch=self._runtime_input_set_epoch,
+                finalize_batch_queue_done_without_result=self._finalize_batch_queue_done_without_result,
+            )
+        )
         self._completion_callback_owner = SimulationCompletionCallbackOwner(
             ui=self.ui,
             batch_context_owner=self._batch_context_owner,
@@ -297,19 +313,7 @@ class SimulationController(QtCore.QObject):
             lifecycle_effect_owner=self._lifecycle_effect_owner,
             publication_owner=self._completion_publication_owner,
             dependencies=SimulationCompletionCallbackDependencies(
-                active_run_id=lambda: int(getattr(self, "_active_run_id", 0)),
-                shutdown_requested=lambda: bool(getattr(self, "_shutdown_requested_for_close", False)),
-                latest_request_id=lambda: int(getattr(self, "_latest_sim_request_id", 0)),
-                current_global_epoch=lambda: int(
-                    getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0
-                ),
-                active_batch_context_runtime_input_stale_for_set=self._active_batch_context_runtime_input_stale_for_set,
-                mark_stale_runtime_input_callback_consumed=self._mark_stale_runtime_input_callback_consumed,
-                effective_preview_owner_epoch_for_callback=self._effective_preview_owner_epoch_for_callback,
-                missing_preview_owner_epoch_for_current_fast_owner=(
-                    self._missing_preview_owner_epoch_for_current_fast_owner
-                ),
-                preview_request_matches_current_owner_epoch=self._preview_request_matches_current_owner_epoch,
+                freshness=self._callback_freshness_owner,
                 completion_policy_preview_ownership=self._completion_policy_preview_ownership,
                 completion_policy_pending_replay_state=self._completion_policy_pending_replay_state,
                 apply_completion_policy_state_patch=self._apply_completion_policy_state_patch,
@@ -322,18 +326,7 @@ class SimulationController(QtCore.QObject):
             completion_policy=self._completion_policy,
             lifecycle_effect_owner=self._lifecycle_effect_owner,
             dependencies=SimulationErrorHandlingDependencies(
-                active_run_id=lambda: int(getattr(self, "_active_run_id", 0)),
-                latest_request_id=lambda: int(getattr(self, "_latest_sim_request_id", 0)),
-                current_global_epoch=lambda: int(
-                    getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0
-                ),
-                active_batch_context_runtime_input_stale_for_set=self._active_batch_context_runtime_input_stale_for_set,
-                mark_stale_runtime_input_callback_consumed=self._mark_stale_runtime_input_callback_consumed,
-                effective_preview_owner_epoch_for_callback=self._effective_preview_owner_epoch_for_callback,
-                missing_preview_owner_epoch_for_current_fast_owner=(
-                    self._missing_preview_owner_epoch_for_current_fast_owner
-                ),
-                preview_request_matches_current_owner_epoch=self._preview_request_matches_current_owner_epoch,
+                freshness=self._callback_freshness_owner,
                 completion_policy_preview_ownership=self._completion_policy_preview_ownership,
                 completion_policy_pending_replay_state=self._completion_policy_pending_replay_state,
                 apply_completion_policy_state_patch=self._apply_completion_policy_state_patch,
@@ -350,8 +343,7 @@ class SimulationController(QtCore.QObject):
             completion_callback_owner=self._completion_callback_owner,
             error_handling_owner=self._error_handling_owner,
             dependencies=ParallelBatchOutcomeDependencies(
-                active_batch_context_runtime_input_stale_for_set=self._active_batch_context_runtime_input_stale_for_set,
-                mark_stale_runtime_input_callback_consumed=self._mark_stale_runtime_input_callback_consumed,
+                freshness=self._callback_freshness_owner,
                 record_nonfatal_exception=self._record_nonfatal_exception,
                 invalidate_preserved_pending_init_results_after_failed_run=(
                     self._invalidate_preserved_pending_init_results_after_failed_run
@@ -946,25 +938,6 @@ class SimulationController(QtCore.QObject):
             self._latest_sim_request_id = request_id_i
         return request_id_i
 
-    def _preview_request_matches_current_owner(self, request_id: Optional[int]) -> bool:
-        if request_id is None:
-            return True
-        owner_request_id = self._preview_ownership.request_id
-        if owner_request_id is None:
-            return False
-        return int(owner_request_id) == int(request_id)
-
-    def _preview_request_matches_current_owner_epoch(
-        self,
-        request_id: Optional[int],
-        owner_epoch: Optional[int],
-    ) -> bool:
-        if not self._preview_request_matches_current_owner(request_id):
-            return False
-        if owner_epoch is None:
-            return True
-        return int(self._preview_ownership.epoch) == int(owner_epoch)
-
     def _queued_preview_update_still_matches_current_owner(
         self,
         *,
@@ -1189,6 +1162,15 @@ class SimulationController(QtCore.QObject):
 
     def _completion_policy_preview_ownership(self) -> PreviewOwnershipState:
         return self._preview_ownership
+
+    def _shutdown_requested_for_completion_callbacks(self) -> bool:
+        return bool(getattr(self, "_shutdown_requested_for_close", False))
+
+    def _current_runtime_input_global_epoch(self) -> int:
+        return int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0)
+
+    def _current_runtime_input_epoch(self) -> int:
+        return int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0)
 
     def _apply_completion_policy_state_patch(
         self,
@@ -1722,33 +1704,6 @@ class SimulationController(QtCore.QObject):
         return self._completion_policy.preview_request_can_display(
             preview_ownership=self._completion_policy_preview_ownership(),
             request_id=request_id,
-        )
-
-    def _effective_preview_owner_epoch_for_callback(
-        self,
-        *,
-        owner_epoch: Optional[int],
-    ) -> Optional[int]:
-        if owner_epoch is not None:
-            return int(owner_epoch)
-        return None
-
-    def _missing_preview_owner_epoch_for_current_fast_owner(
-        self,
-        *,
-        fast_mode: Optional[bool],
-        request_id: Optional[int],
-        owner_epoch: Optional[int],
-        latest_request_id: int,
-    ) -> bool:
-        if (not bool(fast_mode)) or request_id is None or owner_epoch is not None:
-            return False
-        owner_request_id = self._preview_ownership.request_id
-        if owner_request_id is None:
-            return False
-        return (
-            int(owner_request_id) == int(request_id)
-            and int(request_id) != int(latest_request_id)
         )
 
     def _prepare_simulation_shutdown_for_close(self) -> bool:
@@ -2531,52 +2486,6 @@ class SimulationController(QtCore.QObject):
         if worker is None:
             return ""
         return str(getattr(worker, "_batch_set_id", "") or "").strip()
-
-    def _runtime_input_context_stale_for_set(
-        self,
-        context: Mapping[str, Any],
-        *,
-        batch_set_id: Optional[str],
-    ) -> bool:
-        set_id = str(batch_set_id or "").strip()
-        return self._batch_context_owner.runtime_input_stale_for_set(
-            context,
-            batch_set_id=set_id,
-            current_global_epoch=int(getattr(self, "_authoritative_runtime_input_global_epoch", 0) or 0),
-            current_set_epoch=self._runtime_input_set_epoch(set_id),
-            current_epoch=int(getattr(self, "_authoritative_runtime_input_epoch", 0) or 0),
-        )
-
-    def _active_batch_context_runtime_input_stale_for_set(
-        self,
-        *,
-        batch_set_id: Optional[str],
-        context: Optional[Mapping[str, Any]] = None,
-    ) -> bool:
-        if isinstance(context, Mapping):
-            return self._runtime_input_context_stale_for_set(
-                context,
-                batch_set_id=batch_set_id,
-            )
-        return False
-
-    def _mark_stale_runtime_input_callback_consumed(
-        self,
-        *,
-        batch_set_id: Optional[str],
-        context: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        set_id = str(batch_set_id or "").strip()
-        if not set_id:
-            return
-        if isinstance(context, Mapping) and not self._batch_context_owner.context_matches_current_run_identity(context):
-            return
-        transition = self._batch_context_owner.record_parallel_stale_callback_consumed_if_active(set_id=set_id)
-        if transition is None:
-            return
-        if transition.batch_done:
-            context = transition.context
-            self._finalize_batch_queue_done_without_result(context)
 
     def _preview_work_intersects_runtime_input_scope(self, affected_set_ids: Sequence[str]) -> bool:
         affected_scope = set(self._normalize_runtime_input_set_ids(affected_set_ids))

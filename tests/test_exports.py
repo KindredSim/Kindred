@@ -40,7 +40,7 @@ def prepared_window(main_window, monkeypatch):
         lambda *args, **kwargs: (0.5, "mock", True, 1e-6, "tail"),
     )
     series_map = {name: Y[idx] for idx, name in enumerate(species_names)}
-    main_window.set_data(t, series_map, label="Results", overlays=[])
+    main_window.results_controller.set_data(t, series_map, label="Results", overlays=[])
     dataset_panel = main_window._plot_tabs.add_dataset_tab("Dataset 1")
     first_species = species_names[0]
     dataset_panel.set_data(

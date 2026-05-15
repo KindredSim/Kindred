@@ -30,7 +30,8 @@ def test_global_fit_window_applies_ftol_xtol_defaults_to_ui(qt_app):
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
         config_defaults={"ftol": 1e-8, "xtol": 1e-9},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         assert window._params_ics_tab._ftol_edit.text() == "1e-8"
         assert window._params_ics_tab._xtol_edit.text() == "1e-9"

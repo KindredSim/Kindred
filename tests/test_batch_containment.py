@@ -533,6 +533,123 @@ def test_batch_lane_pool_concurrent_runs_grow_instead_of_waiting_on_reserved_lan
     assert pool.retained_lane_count == 2
 
 
+def test_batch_lane_pool_has_no_direct_next_lane_accessor() -> None:
+    from kindred.core.batch_containment import BatchLanePool
+
+    assert not hasattr(BatchLanePool, "_next_lane")
+
+
+def test_batch_lane_pool_full_pool_waits_for_first_available_lane(monkeypatch) -> None:
+    from kindred.core import batch_containment
+    from kindred.core.batch_containment import BatchLaneOutcome
+
+    lane_started: dict[str, threading.Event] = {
+        "batch-lane-1": threading.Event(),
+        "batch-lane-2": threading.Event(),
+    }
+    lane_release: dict[str, threading.Event] = {
+        "batch-lane-1": threading.Event(),
+        "batch-lane-2": threading.Event(),
+    }
+    third_completed = threading.Event()
+    third_lane: list[str] = []
+
+    class _FakeLane:
+        def __init__(self, *, lane_id: str, **_kwargs: object) -> None:
+            self.lane_id = str(lane_id)
+            self._lock = threading.Lock()
+
+        @property
+        def is_busy(self) -> bool:
+            return self._lock.locked()
+
+        def reserve(self) -> bool:
+            return bool(self._lock.acquire(blocking=False))
+
+        def release_reservation(self) -> None:
+            self._lock.release()
+
+        def warm(self, *, wait: bool = True) -> None:
+            _ = wait
+
+        def drain_events(self) -> tuple[object, ...]:
+            return ()
+
+        def close(self, *, kill: bool = False) -> None:
+            _ = kill
+
+        def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+            with self._lock:
+                return self._finish(task, run_id=run_id, request_id=request_id, set_id=set_id)
+
+        def run_reserved(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+            try:
+                return self._finish(task, run_id=run_id, request_id=request_id, set_id=set_id)
+            finally:
+                self.release_reservation()
+
+        def _finish(self, task, *, run_id: int, request_id: int, set_id: str):
+            if set_id in {"first", "second"}:
+                lane_started[self.lane_id].set()
+                assert lane_release[self.lane_id].wait(timeout=1.0)
+            return BatchLaneOutcome(
+                lane_id=self.lane_id,
+                run_id=run_id,
+                request_id=request_id,
+                set_id=set_id,
+                owner_epoch=1,
+                success=True,
+                payload={"task": dict(task or {})},
+            )
+
+    monkeypatch.setattr(batch_containment, "WarmBatchSimulationLane", _FakeLane)
+    pool = batch_containment.BatchLanePool(max_lanes=2)
+    try:
+        pool.warm_lanes(2)
+
+        def _run(set_id: str) -> None:
+            outcome = pool.run(
+                {"set_id": set_id},
+                run_id=41,
+                request_id=1,
+                set_id=set_id,
+                active_timeout_s=1.0,
+            )
+            if set_id == "third":
+                third_lane.append(outcome.lane_id)
+                third_completed.set()
+
+        first = threading.Thread(target=_run, args=("first",))
+        second = threading.Thread(target=_run, args=("second",))
+        third = threading.Thread(target=_run, args=("third",))
+        first.start()
+        second.start()
+        assert lane_started["batch-lane-1"].wait(timeout=1.0)
+        assert lane_started["batch-lane-2"].wait(timeout=1.0)
+
+        third.start()
+        lane_release["batch-lane-2"].set()
+        assert third_completed.wait(timeout=0.5)
+        assert third_lane == ["batch-lane-2"]
+
+        lane_release["batch-lane-1"].set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        third.join(timeout=1.0)
+    finally:
+        lane_release["batch-lane-1"].set()
+        lane_release["batch-lane-2"].set()
+        pool.close(kill=True)
+
+
+def test_batch_lane_pool_reservation_uses_condition_wait_not_fixed_sleep_polling() -> None:
+    source = Path("kindred/core/batch_containment.py").read_text(encoding="utf-8")
+    pool_source = source.split("class BatchLanePool:", 1)[1].split("class BatchRequestHandle:", 1)[0]
+
+    assert "threading.Condition" in pool_source
+    assert "sleep(" not in pool_source
+
+
 def test_warm_batch_lane_force_close_reaches_owner_during_active_run(monkeypatch) -> None:
     from kindred.core import batch_containment
 

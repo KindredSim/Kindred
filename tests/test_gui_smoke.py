@@ -26,7 +26,7 @@ def _run_fake_simulation(window: MainWindow, monkeypatch):
         "integrate_ctc",
         lambda *args, **kwargs: (0.5, "mock", True, 1e-6, "tail"),
     )
-    window.set_data(
+    window.results_controller.set_data(
         t,
         {"A": species_a, "B": species_b},
         label="Results",

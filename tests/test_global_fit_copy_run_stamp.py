@@ -86,7 +86,8 @@ def _make_window():
         },
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def test_copy_buttons_disabled_before_any_run(qt_app):
@@ -129,7 +130,7 @@ def test_copy_short_and_json_stamp_updates_clipboard(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = _make_window()
     try:

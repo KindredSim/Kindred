@@ -114,7 +114,8 @@ def test_active_integration_defaults_reads_from_config_defaults(qt_app):
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
         config_defaults={"solver": "BDF", "rtol": 1e-3, "atol": 1e-9},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         solver, rtol, atol = window._active_integration_defaults_for_ui()
         assert solver == "BDF"
@@ -271,7 +272,8 @@ def test_active_integration_defaults_none_check_not_falsy_or(qt_app):
         ],
         dataset_weights={"ds1": 1.0},
         config_defaults={"solver": "Radau", "rtol": 1e-5, "atol": 1e-11},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         solver, rtol, atol = window._active_integration_defaults_for_ui()
         assert solver == "Radau"
@@ -302,7 +304,8 @@ def test_active_integration_defaults_normalizes_valid_solver_names(qt_app, solve
         ],
         dataset_weights={"ds1": 1.0},
         config_defaults={"solver": solver_value, "rtol": 1e-5, "atol": 1e-11},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         solver, rtol, atol = window._active_integration_defaults_for_ui()
         assert solver == "Radau"

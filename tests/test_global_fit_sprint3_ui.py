@@ -69,7 +69,8 @@ def _make_window():
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": model.copy()}},
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([y.copy()]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def test_fit_completion_shows_success_popup(qt_app, monkeypatch):

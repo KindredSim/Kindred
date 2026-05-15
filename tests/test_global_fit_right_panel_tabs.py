@@ -30,7 +30,8 @@ def _make_window() -> FittingWindow:
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": model.copy()}},
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([y.copy()]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _make_two_dataset_window() -> FittingWindow:
@@ -66,7 +67,8 @@ def _make_two_dataset_window() -> FittingWindow:
             {"id": "ds2", "t": t.copy(), "y": np.vstack([y_b.copy()]), "species": ["B"]},
         ],
         dataset_weights={"ds1": 1.0, "ds2": 0.5},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _tab_index(tab_bar: QtWidgets.QTabBar, title: str) -> int:

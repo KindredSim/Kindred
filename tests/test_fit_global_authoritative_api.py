@@ -18,6 +18,14 @@ def test_fit_global_authoritative_api_module_exports_core_contract() -> None:
 
 
 @pytest.mark.unit
+def test_core_analysis_package_no_longer_reexports_fit_global_lazy_alias() -> None:
+    analysis = importlib.import_module("kindred.core.analysis")
+
+    assert not hasattr(analysis, "__getattr__")
+    assert not hasattr(analysis, "fit_global")
+
+
+@pytest.mark.unit
 def test_fit_global_authoritative_api_signature_matches_current_core_surface() -> None:
     from kindred.core.api.fitting import fit_global
 

@@ -40,7 +40,7 @@ class _PrepareCapableOwner(_Owner):
         super().__init__(payload, ready_event=ready_event)
         self.prepare_calls: list[dict[str, object]] = []
 
-    def prepare_runtime_payload(self, payload: dict[str, object], *, wait: bool = True) -> None:
+    def prepare_runtime_payload(self, payload: dict[str, object]) -> None:
         self.prepare_calls.append(dict(payload))
         self._payload = dict(payload)
         self.ready = True
@@ -132,7 +132,7 @@ def test_readiness_service_does_not_reuse_prepare_capable_owner_while_old_prepar
     owners: list[_PrepareCapableOwner] = []
 
     class _BlockingFirstPrepareOwner(_PrepareCapableOwner):
-        def prepare_runtime_payload(self, payload: dict[str, object], *, wait: bool = True) -> None:
+        def prepare_runtime_payload(self, payload: dict[str, object]) -> None:
             self.prepare_calls.append(dict(payload))
             if dict(payload) == first_payload:
                 first_prepare_started.set()

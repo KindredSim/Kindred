@@ -65,7 +65,8 @@ def test_global_fit_add_observable_appends_to_reactions_algebra_not_notes(monkey
         ),
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._add_algebraic_observable(
             "signal",
@@ -144,7 +145,8 @@ def test_global_fit_add_observable_rejects_unresolved_protected_rhs_before_writi
         ),
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._add_algebraic_observable(
             "signal",

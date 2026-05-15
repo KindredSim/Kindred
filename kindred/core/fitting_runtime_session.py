@@ -120,12 +120,10 @@ class FittingRuntimeSession:
     def ledger(self) -> FittingRuntimeLedger:
         return self._ledger
 
-    def begin_run(self) -> None:
+    def evaluator(self, *, cancellation_check: Optional[Callable[[], bool]] = None) -> "FittingRuntimeEvaluator":
         with self._lock:
             if self._closed:
                 raise RuntimeError("Fitting runtime session is closed.")
-
-    def evaluator(self, *, cancellation_check: Optional[Callable[[], bool]] = None) -> "FittingRuntimeEvaluator":
         return FittingRuntimeEvaluator(self, cancellation_check=cancellation_check)
 
     def is_ready(self, *, lane_count: Optional[int] = None) -> bool:

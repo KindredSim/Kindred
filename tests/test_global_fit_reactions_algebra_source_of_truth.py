@@ -66,7 +66,8 @@ def test_global_fit_observable_dropdown_reads_from_reactions_dsl_declarations(qt
         simulation_builder=lambda _dsl, _names: (lambda _p: {"t": t.copy(), "species": {}}),
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.linspace(0.2, 0.8, t.size)]), "species": ["selectivity"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         monkeypatch.setattr(window, "_selected_dataset_ids", lambda: ["ds1"])
         window._params_ics_tab._add_parameter()

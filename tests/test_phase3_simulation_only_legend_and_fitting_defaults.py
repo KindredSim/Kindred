@@ -190,7 +190,8 @@ def test_fitting_window_solver_combo_defaults_to_bdf_even_with_radau_prepared_me
         }],
         simulation_func=sim_func,
         mechanism_species=["A"],
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         qt_app.processEvents()
         combo = window._params_ics_tab._integration_solver_combo

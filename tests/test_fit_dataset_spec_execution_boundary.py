@@ -189,7 +189,7 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
         def cancel(self):
             return
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = FittingWindow(
         mode="global",
@@ -198,7 +198,8 @@ def test_fitting_window_passes_typed_dataset_specs_to_worker(qt_app, monkeypatch
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.ones_like(t)}},
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         config = window._params_ics_tab.collect_parameter_config()
         assert config is not None
@@ -245,7 +246,8 @@ def test_fitting_window_preserves_invalid_payload_reason_during_rebuild(qt_app, 
         simulation_func=lambda _params: {"t": t.copy(), "species": {"A": np.ones_like(t)}},
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._dataset_entries[0]["x_name"] = "X"
         window._dataset_entries[0]["x_obs"] = object()
@@ -255,13 +257,13 @@ def test_fitting_window_preserves_invalid_payload_reason_during_rebuild(qt_app, 
 
         from kindred.gui.fitting.launch import FittingLaunchPurpose
 
-        result = window.fit_launch_identity_owner.build_current_launch_result(
+        result = window.build_current_launch_result(
             purpose=FittingLaunchPurpose.EXPLICIT_RUN,
             refresh_current_mechanism=False,
         )
         assert result.identity is None
         assert result.rejection is not None
-        window.fit_launch_identity_owner.render_launch_rejection(
+        window.render_launch_rejection(
             result,
             purpose=FittingLaunchPurpose.EXPLICIT_RUN,
         )
@@ -327,7 +329,7 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, qtbo
         )
         return SerialFittingEvaluator(context)
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
     monkeypatch.setattr(
         "kindred.gui.fitting.window.FittingRuntimeSession.from_serial_evaluator",
         lambda _evaluator, *, max_lanes, ledger=None: _ReadyRuntimeSession(),
@@ -359,7 +361,8 @@ def test_fitting_window_rebuilds_fit_evaluator_when_launch_deferred(qt_app, qtbo
         mechanism_text_getter=lambda: mechanism_text,
         dataset_payloads=[{"id": "ds1", "t": t.copy(), "y": np.vstack([np.ones_like(t)]), "species": ["A"]}],
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window._species_table._fit_targets_selection_applied["ds1"] = ["A"]
         window._on_targets_applied()

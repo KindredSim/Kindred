@@ -2916,16 +2916,8 @@ def test_completion_missing_callback_context_does_not_use_current_preview_owner_
         queue_ids=["id2"],
         queue_names=["set2"],
     )
-    owner_epoch_calls: list[dict[str, object]] = []
-
-    def _missing_owner_epoch_spy(**kwargs):
-        owner_epoch_calls.append(dict(kwargs))
-        return False
-
-    object.__setattr__(
-        controller._completion_callback_owner._deps,
-        "missing_preview_owner_epoch_for_current_fast_owner",
-        _missing_owner_epoch_spy,
+    controller._completion_callback_owner._deps.freshness.assess_callback = MagicMock(
+        side_effect=AssertionError("freshness must not be consulted without callback context")
     )
     controller._completion_publication_owner.publish_success = MagicMock()
     controller.ui.dialogs.message_box_critical = MagicMock()
@@ -2944,7 +2936,7 @@ def test_completion_missing_callback_context_does_not_use_current_preview_owner_
             ),
         ),
 
-    assert owner_epoch_calls == []
+    controller._completion_callback_owner._deps.freshness.assess_callback.assert_not_called()
     controller._completion_publication_owner.publish_success.assert_not_called()
 
 
@@ -2976,16 +2968,8 @@ def test_completion_missing_callback_context_does_not_use_current_queue_or_stale
         queue_names=["current-set"],
         pos=0,
     )
-    stale_calls: list[dict[str, object]] = []
-
-    def _stale_runtime_spy(**kwargs):
-        stale_calls.append(dict(kwargs))
-        return False
-
-    object.__setattr__(
-        controller._completion_callback_owner._deps,
-        "active_batch_context_runtime_input_stale_for_set",
-        _stale_runtime_spy,
+    controller._completion_callback_owner._deps.freshness.assess_callback = MagicMock(
+        side_effect=AssertionError("freshness must not be consulted without callback context")
     )
     controller._completion_publication_owner.publish_success = MagicMock()
     controller.ui.dialogs.message_box_critical = MagicMock()
@@ -3004,7 +2988,7 @@ def test_completion_missing_callback_context_does_not_use_current_queue_or_stale
             ),
         ),
 
-    assert stale_calls == []
+    controller._completion_callback_owner._deps.freshness.assess_callback.assert_not_called()
     controller._completion_publication_owner.publish_success.assert_not_called()
 
 
@@ -6651,6 +6635,85 @@ def test_parallel_batch_outcome_missing_callback_context_does_not_use_current_ru
 
 
 @pytest.mark.unit
+def test_parallel_batch_outcome_stale_run_decision_does_not_mutate_scoped_failure_state(
+    mw: _FakeMainWindow,
+    controller: SimulationController,
+):
+    failed = _timeout_failure_outcome("bad")
+    healthy = _lane_outcome("ok", _successful_result_payload())
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        queue_ids=["bad", "ok"],
+        queue_names=["Bad Set", "OK Set"],
+        total=2,
+        explicit_cache_valid_set_ids=("bad", "ok"),
+    )
+    failed_identity = _capture_callback_identity(
+        controller,
+        run_id=1,
+        fast_mode=False,
+        request_id=2,
+        owner_epoch=None,
+        batch_set="Bad Set",
+        batch_set_id="bad",
+        cache_key="ck",
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+    )
+    success_identity = _capture_callback_identity(
+        controller,
+        run_id=1,
+        fast_mode=False,
+        request_id=2,
+        owner_epoch=None,
+        batch_set="OK Set",
+        batch_set_id="ok",
+        cache_key="ck",
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+    )
+    _install_active_lane_outcomes(
+        controller,
+        {"bad": failed, "ok": healthy},
+        set_names={"bad": "Bad Set", "ok": "OK Set"},
+        callback_identities={"bad": failed_identity, "ok": success_identity},
+    )
+    controller._active_run_id = 99
+    controller._simulation_running = True
+    controller._completion_callback_owner.handle_completion = MagicMock()
+    controller._error_handling_owner.handle_error = MagicMock()
+    controller._parallel_batch_outcome_owner.handle_scoped_failure = MagicMock(return_value=True)
+    mw.message_box_critical = MagicMock()
+
+    ok = _consume_parallel_batch_outcome_for_test(
+        controller,
+        set_id="bad",
+        outcome=failed,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        source="callback",
+    )
+
+    assert ok is True
+    controller._parallel_batch_outcome_owner.handle_scoped_failure.assert_not_called()
+    controller._completion_callback_owner.handle_completion.assert_not_called()
+    controller._error_handling_owner.handle_error.assert_not_called()
+    state = controller.batch_context_owner.completion_state()
+    summary = controller.batch_context_owner.completion_summary()
+    assert state is not None
+    assert state.active is True
+    assert summary.failed_set_ids == ()
+    assert state.completed_set_ids == ()
+    assert controller._batch_parallel.active_request_metadata("bad")
+    mw.message_box_critical.assert_not_called()
+
+
+@pytest.mark.unit
 def test_poll_parallel_batch_outcome_rejects_owner_epoch_mismatch_after_pop(
     mw: _FakeMainWindow,
     controller: SimulationController,
@@ -7018,6 +7081,52 @@ def test_completion_publication_cache_truth_uses_callback_owned_publication_cont
         batch_set_id="ok",
         cache_key="ck",
         policy_context=controller.batch_context_owner.completion_policy_context(callback_context),
+        ctx=callback_context,
+        shutdown_requested=False,
+        is_preview=False,
+        slider_triggered=False,
+        explicit_batch_coalescing=False,
+    )
+
+    controller._completion_publication_owner.publish_cache_truth(state)
+
+    assert publish_truth_spy.call_args.kwargs["active_cache_valid_set_ids"] == ("ok",)
+    assert publish_truth_spy.call_args.kwargs["active_cache_invalidated_set_ids"] == ("bad",)
+
+
+@pytest.mark.unit
+def test_completion_publication_preserves_scoped_failure_cache_truth_from_stale_callback(
+    controller: SimulationController,
+):
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=True,
+        run_id=1,
+        request_id=2,
+        fast_mode=False,
+        cache_key="ck",
+        queue_ids=["bad", "ok"],
+        queue_names=["Bad Set", "OK Set"],
+        total=2,
+        explicit_cache_valid_set_ids=("bad", "ok"),
+    )
+    callback_context = controller.batch_context_owner.callback_context_snapshot()
+    captured_policy_context = controller.batch_context_owner.completion_policy_context(callback_context)
+    assert captured_policy_context is not None
+    controller.batch_context_owner.record_scoped_failure(
+        set_id="bad",
+        failure={"kind": "simulation_error", "message": "bad failed"},
+    )
+    publish_truth_spy = MagicMock(wraps=controller._cache_admin.publish_completion_cache_truth)
+    controller._cache_admin.publish_completion_cache_truth = publish_truth_spy
+    state = CompletionCallbackState(
+        run_id=1,
+        request_id=2,
+        batch_set="OK Set",
+        batch_set_id="ok",
+        cache_key="ck",
+        policy_context=captured_policy_context,
         ctx=callback_context,
         shutdown_requested=False,
         is_preview=False,
@@ -10576,7 +10685,7 @@ def test_readiness_warm_replaces_prepare_capable_owner_for_identity_change(contr
         def is_ready(self) -> bool:
             return bool(self.ready)
 
-        def prepare_runtime_payload(self, payload: dict[str, object], *, wait: bool = True) -> None:
+        def prepare_runtime_payload(self, payload: dict[str, object]) -> None:
             self.prepare_calls.append(dict(payload))
             self._payload = dict(payload)
             self.ready = True
@@ -13599,16 +13708,8 @@ def test_error_missing_callback_context_does_not_use_current_preview_owner_epoch
         queue_ids=["id2"],
         queue_names=["set2"],
     )
-    owner_epoch_calls: list[dict[str, object]] = []
-
-    def _missing_owner_epoch_spy(**kwargs):
-        owner_epoch_calls.append(dict(kwargs))
-        return False
-
-    object.__setattr__(
-        controller._error_handling_owner._deps,
-        "missing_preview_owner_epoch_for_current_fast_owner",
-        _missing_owner_epoch_spy,
+    controller._error_handling_owner._deps.freshness.assess_callback = MagicMock(
+        side_effect=AssertionError("freshness must not be consulted without callback context")
     )
 
     with pytest.raises(ValueError, match="callback_identity.callback_context"):
@@ -13625,7 +13726,7 @@ def test_error_missing_callback_context_does_not_use_current_preview_owner_epoch
             ),
         ),
 
-    assert owner_epoch_calls == []
+    controller._error_handling_owner._deps.freshness.assess_callback.assert_not_called()
     state = controller.batch_context_owner.completion_state()
     assert state is not None
     assert state.active is True
@@ -13654,16 +13755,8 @@ def test_error_missing_callback_context_does_not_use_current_queue_or_stale_cont
         queue_names=["current-set"],
         pos=0,
     )
-    stale_calls: list[dict[str, object]] = []
-
-    def _stale_runtime_spy(**kwargs):
-        stale_calls.append(dict(kwargs))
-        return False
-
-    object.__setattr__(
-        controller._error_handling_owner._deps,
-        "active_batch_context_runtime_input_stale_for_set",
-        _stale_runtime_spy,
+    controller._error_handling_owner._deps.freshness.assess_callback = MagicMock(
+        side_effect=AssertionError("freshness must not be consulted without callback context")
     )
 
     with pytest.raises(ValueError, match="callback_identity.callback_context"):
@@ -13680,7 +13773,7 @@ def test_error_missing_callback_context_does_not_use_current_queue_or_stale_cont
             ),
         ),
 
-    assert stale_calls == []
+    controller._error_handling_owner._deps.freshness.assess_callback.assert_not_called()
 
 
 @pytest.mark.unit

@@ -68,7 +68,8 @@ def _make_fitting_window():
             {"id": "ds2", "t": t.copy(), "y": np.vstack([y_b.copy()]), "species": ["B"]},
         ],
         dataset_weights={"ds1": 1.0, "ds2": 0.5},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _make_species_entries(species_data=None, ds_id="ds1"):
@@ -269,7 +270,8 @@ def test_blank_label_normalization(qt_app):
             {"id": "ds_whitespace", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
         ],
         dataset_weights={"ds_whitespace": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         # After normalization, label must not be whitespace.
         for entry in window._dataset_entries:
@@ -392,7 +394,8 @@ def test_validation_colors_survive_targets_applied(qt_app):
             {"id": "ds2", "t": t.copy(), "y": np.vstack([y_a.copy()]), "species": ["A"]},
         ],
         dataset_weights={"ds1": 1.0, "ds2": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
     try:
         window.show()
         qt_app.processEvents()

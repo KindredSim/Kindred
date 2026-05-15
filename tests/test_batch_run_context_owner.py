@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from kindred.gui.controllers.batch_run_context_owner import BatchRunContextOwner, BatchRunStartRequest
 from kindred.gui.controllers.simulation_callback_identity import SimulationCallbackIdentity
-from kindred.gui.controllers.simulation_completion_policy import CompletionPolicyContext
+from kindred.gui.controllers.simulation_completion_policy import (
+    CacheAuthorityState,
+    CompletionPolicyContext,
+    SimulationCompletionPolicy,
+    cache_truth_generation_value,
+    next_cache_truth_generation,
+)
 from tests.batch_context_test_helpers import seed_batch_context
 
 
@@ -64,7 +72,7 @@ def test_inactive_context_has_no_active_batch_state():
     assert owner.active_batch_state() is None
 
 
-def test_completion_publication_policy_context_keeps_matching_callback_context_authoritative():
+def test_completion_publication_policy_context_reconciles_stale_same_run_cache_truth():
     owner = BatchRunContextOwner()
     seed_batch_context(
         owner,
@@ -79,17 +87,9 @@ def test_completion_publication_policy_context_keeps_matching_callback_context_a
     callback_context = owner.callback_context_snapshot()
     captured_policy_context = owner.completion_policy_context(callback_context)
     assert captured_policy_context is not None
-    seed_batch_context(
-        owner,
-        active=True,
-        parallel=True,
-        run_id=1,
-        request_id=2,
-        cache_key="ck",
-        queue_ids=["bad", "ok"],
-        completed_set_ids=["bad"],
-        explicit_cache_valid_set_ids=("ok",),
-        explicit_cache_invalidated_set_ids=("bad",),
+    owner.record_scoped_failure(
+        set_id="bad",
+        failure={"kind": "simulation_error", "message": "bad failed"},
     )
 
     context = owner.completion_publication_policy_context(
@@ -97,9 +97,9 @@ def test_completion_publication_policy_context_keeps_matching_callback_context_a
         policy_context=captured_policy_context,
     )
 
-    assert context is captured_policy_context
-    assert context.explicit_cache_valid_set_ids == ("bad", "ok")
-    assert context.explicit_cache_invalidated_set_ids is None
+    assert context is not None
+    assert context.explicit_cache_valid_set_ids == ("ok",)
+    assert context.explicit_cache_invalidated_set_ids == ("bad",)
 
 
 def test_completion_publication_policy_context_preserves_callback_owned_cache_truth():
@@ -1219,3 +1219,52 @@ def test_completion_policy_context_serialization_does_not_overwrite_newer_same_i
     assert current_policy is not None
     assert current_policy.completed_set_ids == ("id1",)
     assert owner.callback_context_snapshot().runtime_input_global_epoch == 2
+
+
+def test_success_cache_truth_update_advances_generation_for_callback_reconciliation():
+    policy = SimulationCompletionPolicy()
+    context = CompletionPolicyContext(
+        active=True,
+        request_id=7,
+        run_id=9,
+        fast_mode=False,
+        parallel=True,
+        keep_lane_pool_alive=False,
+        queue_ids=("id1", "id2"),
+        explicit_cache_valid_set_ids=("id1",),
+        explicit_cache_invalidated_set_ids=("id2",),
+        explicit_cache_truth_generation=0,
+    )
+    cache_state = CacheAuthorityState(
+        active_cache_key="cache-key",
+        active_cache_preview_token="token-b",
+        active_cache_preview_scope_set_ids=("id1", "id2"),
+        active_cache_valid_set_ids=("id1", "id2"),
+        active_cache_invalidated_set_ids=(),
+    )
+
+    updated = policy.build_context_update_from_cache_truth(
+        context=context,
+        cache_state=cache_state,
+        cache_key="cache-key",
+    )
+
+    assert updated.explicit_cache_valid_set_ids == ("id1", "id2")
+    assert updated.explicit_cache_invalidated_set_ids == ()
+    assert updated.explicit_cache_truth_generation == 1
+
+
+def test_cache_truth_generation_uses_shared_policy_helper():
+    assert cache_truth_generation_value(None) == 0
+    assert cache_truth_generation_value("bad") == 0
+    assert next_cache_truth_generation(None) == 1
+    assert next_cache_truth_generation("4") == 5
+
+    owner_source = Path("kindred/gui/controllers/batch_run_context_owner.py").read_text(encoding="utf-8")
+    policy_source = Path("kindred/gui/controllers/simulation_completion_policy.py").read_text(encoding="utf-8")
+
+    assert "def _cache_truth_generation_value" not in owner_source
+    assert "cache_truth_generation_value(" in owner_source
+    assert "next_cache_truth_generation(" in owner_source
+    assert "def cache_truth_generation_value" in policy_source
+    assert "def next_cache_truth_generation" in policy_source

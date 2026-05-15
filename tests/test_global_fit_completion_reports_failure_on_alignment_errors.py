@@ -35,7 +35,8 @@ def _make_window():
         dataset_entries=dataset_entries,
         simulation_func=simulation_func,
         mechanism_species=["A"],
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def test_completion_dialog_spec_reports_failure_when_chi2_nonfinite_or_errors(qt_app):

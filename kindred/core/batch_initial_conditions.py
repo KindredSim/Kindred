@@ -18,7 +18,6 @@ __all__ = [
     "BatchInitialConditionsStore",
     "dataset_base_label",
     "migrate_reaction_dsl_initial_concentration_sets",
-    "migrate_reaction_dsl_initial_concentrations",
     "strip_named_reaction_dsl_initial_concentration_sets",
     "strip_reaction_dsl_initial_concentrations",
     "resolve_run_scope",
@@ -346,22 +345,6 @@ def migrate_reaction_dsl_initial_concentration_sets(
             legacy_seed=legacy_seed,
         )
     return seeds_by_name, rewritten
-
-
-def migrate_reaction_dsl_initial_concentrations(
-    reaction_text: str,
-    *,
-    set_name: str = "set1",
-) -> Tuple[Dict[str, float], str]:
-    """
-    Compatibility wrapper for callers/tests that still expect a single-set return shape.
-    """
-    seeds_by_name, rewritten = migrate_reaction_dsl_initial_concentration_sets(
-        reaction_text,
-        default_set_name=str(set_name),
-    )
-    normalized_name = validate_name(str(set_name))
-    return dict(seeds_by_name.get(normalized_name) or {}), rewritten
 
 
 def _strip_named_initial_concentration_sets(text: str) -> str:

@@ -76,7 +76,8 @@ def _make_window(*, selected_species: list[str]):
         },
         dataset_payloads=dataset_payloads,
         dataset_weights={"ds1": 1.0},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 def _toggle_fit_targets_pending(window) -> None:
@@ -128,7 +129,7 @@ def test_run_stamp_uses_applied_fit_targets_not_pending(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:
@@ -186,7 +187,7 @@ def test_run_stamp_uses_applied_target_weights_not_pending(qt_app, monkeypatch):
         def isRunning(self):
             return False
 
-    monkeypatch.setattr("kindred.gui.fitting.worker_launch.GlobalFitWorker", _FakeWorker)
+    monkeypatch.setattr("kindred.gui.fitting.window.GlobalFitWorker", _FakeWorker)
 
     window = _make_window(selected_species=["A"])
     try:

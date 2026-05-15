@@ -34,14 +34,12 @@ from .errors import DSLError
 if TYPE_CHECKING:
     from ..mechanism import Mechanism
     from ..units import UnitsModel
-    from .dsl_parameter_scan import ParameterDefinition
 
 
 __all__ = [
     "DSLError",
     "StepPreview",
     "DSLResult",
-    "ParameterDefinition",
     "parse_and_preview",
     "parse_dsl",
     "parse_dsl_to_mechanism",
@@ -50,7 +48,7 @@ __all__ = [
 ]
 
 
-def extract_parameters_from_dsl(text: str) -> list["ParameterDefinition"]:
+def extract_parameters_from_dsl(text: str) -> list[object]:
     from .dsl_parameter_scan import extract_parameters_from_dsl as _impl
 
     return _impl(text)
@@ -72,11 +70,3 @@ def parse_dsl_to_mechanism(
     from .dsl_build import build_mechanism_from_ir
 
     return build_mechanism_from_ir(ir, initials=initials)
-
-
-def __getattr__(name: str):
-    if name == "ParameterDefinition":
-        from .dsl_parameter_scan import ParameterDefinition
-
-        return ParameterDefinition
-    raise AttributeError(name)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Mapping, Optional
@@ -26,6 +25,8 @@ class SimulationAlgebraPolicy(str, Enum):
 
 
 def _copy_payload_value(value: Any, memo: Optional[Dict[int, Any]] = None) -> Any:
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return value
     if memo is None:
         memo = {}
     value_id = id(value)
@@ -49,10 +50,15 @@ def _copy_payload_value(value: Any, memo: Optional[Dict[int, Any]] = None) -> An
         copied_tuple = tuple(_copy_payload_value(item, memo) for item in value)
         memo[value_id] = copied_tuple
         return copied_tuple
-    try:
-        return copy.deepcopy(value, memo)
-    except Exception:
-        return value
+    if isinstance(value, set):
+        copied_set = {_copy_payload_value(item, memo) for item in value}
+        memo[value_id] = copied_set
+        return copied_set
+    if isinstance(value, frozenset):
+        copied_frozenset = frozenset(_copy_payload_value(item, memo) for item in value)
+        memo[value_id] = copied_frozenset
+        return copied_frozenset
+    return value
 
 
 def _copy_optional_mapping(value: Optional[Mapping[str, Any]], *, field_name: str) -> Optional[Dict[str, Any]]:

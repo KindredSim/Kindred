@@ -52,7 +52,6 @@ if TYPE_CHECKING:
     from ..mechanism import Mechanism
     from ..intervention_schedule import InterventionSchedule
     from ..temperature import TemperatureScheduleProtocol
-    from .dsl_parameter_scan import ParameterDefinition
     from .state_model import StateNetwork
 
 logger = logging.getLogger(__name__)
@@ -62,7 +61,6 @@ __all__ = [
     "DSLError",
     "StepPreview",
     "DSLResult",
-    "ParameterDefinition",
     "parse_and_preview",
     "parse_dsl",
     "parse_dsl_to_mechanism",
@@ -288,7 +286,7 @@ def _extract_numeric_value(expr: str) -> Optional[float]:
     return _float_or_none(candidate)
 
 
-def extract_parameters_from_dsl(text: str) -> List["ParameterDefinition"]:
+def extract_parameters_from_dsl(text: str) -> List[object]:
     from .dsl_parameter_scan import extract_parameters_from_dsl as _impl
 
     return _impl(text)
@@ -298,14 +296,6 @@ def extract_parameter_names_from_dsl(text: str) -> set[str]:
     from .dsl_parameter_scan import extract_parameter_names_from_dsl as _impl
 
     return _impl(text)
-
-
-def __getattr__(name: str):
-    if name == "ParameterDefinition":
-        from .dsl_parameter_scan import ParameterDefinition
-
-        return ParameterDefinition
-    raise AttributeError(name)
 
 
 def _parse_species_side(text: str) -> Dict[str, float]:

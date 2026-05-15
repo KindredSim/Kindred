@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentrations
+from kindred.core.batch_initial_conditions import migrate_reaction_dsl_initial_concentration_sets
 import kindred.core.simulator.dsl as dsl
 import kindred.core.simulator.dsl_build as dsl_build
 from kindred.core.simulation_runtime_readiness import RuntimeReadinessSnapshot
@@ -18,6 +18,14 @@ from tests.worker_stubs import make_contained_simulation_worker_stub
 from tests.batch_context_test_helpers import seed_batch_context
 
 pytestmark = [pytest.mark.gui, pytest.mark.slow]
+
+
+def _migrate_single_set_initial_concentrations(reaction_text: str, *, set_name: str = "set1"):
+    seeds, rewritten = migrate_reaction_dsl_initial_concentration_sets(
+        reaction_text,
+        default_set_name=set_name,
+    )
+    return dict(seeds.get(set_name) or {}), rewritten
 
 @pytest.fixture(autouse=True)
 def _ready_contained_runtime_owner_for_slider_tests(request, monkeypatch):
@@ -2887,7 +2895,7 @@ def test_commit_primary_dirty_preview_drops_stale_secondary_explicit_overlay(mai
         },
         prefer=primary_label,
     )
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray(preview_t, dtype=float),
         {"A": np.asarray(primary_preview_series, dtype=float)},
         label=primary_label,
@@ -2964,7 +2972,7 @@ def test_commit_dirty_workspace_does_not_preserve_stale_explicit_plot_without_tr
     main_window._sync_mechanism_controls_to_focused_batch_set(use_workspace=True)
     assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray(explicit_t, dtype=float),
         {"A": np.asarray(explicit_series, dtype=float)},
         label=str(main_window.batch_set_name_for_id(set_id) or set_id),
@@ -3084,7 +3092,7 @@ def test_single_set_stale_preview_cache_display_returns_false_and_defers_to_prev
     cache.active_batch_set = str(main_window.batch_set_name_for_id(set_id) or "")
     cache.last_display_selection = [set_id]
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray(explicit_t, dtype=float),
         {"A": np.asarray(explicit_series, dtype=float)},
         label=str(main_window.batch_set_name_for_id(set_id) or set_id),
@@ -4611,7 +4619,7 @@ def test_direct_mechanism_edit_invalidates_displayed_explicit_results(main_windo
     cache.active_batch_set_id = selected_ids[0]
     cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
     cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([7.0, 14.0], dtype=float)},
         label="baseline",
@@ -4666,7 +4674,7 @@ def test_programmatic_mechanism_load_invalidates_displayed_explicit_results(main
     cache.active_batch_set_id = selected_ids[0]
     cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
     cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([7.0, 14.0], dtype=float)},
         label="baseline",
@@ -4696,7 +4704,7 @@ def test_pending_init_migration_rewrite_does_not_invalidate_displayed_explicit_r
     )
     qt_app.processEvents()
 
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+    seed, rewrite = _migrate_single_set_initial_concentrations(
         main_window._mechanism_editor._reactions_text.toPlainText(),
         set_name="set1",
     )
@@ -4714,7 +4722,7 @@ def test_pending_init_migration_rewrite_does_not_invalidate_displayed_explicit_r
         "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
         "algebra_scalars": {},
     }
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([7.0, 14.0], dtype=float)},
         label="set1",
@@ -4736,7 +4744,7 @@ def test_pending_init_migration_rewrite_does_not_invalidate_displayed_explicit_r
 
     assert getattr(main_window._plot_tabs._main_plot, "_t", None) is not None
 
-    applied = main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite)
+    applied = main_window.apply_pending_init_migration(seed_sets={"set1": seed}, rewrite=rewrite)
     qt_app.processEvents()
     qt_app.processEvents()
 
@@ -4758,7 +4766,7 @@ def test_pending_init_materialization_suppresses_ordinary_batch_initial_transiti
     main_window._batch_model.set_species(["A", "B"])
     qt_app.processEvents()
 
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+    seed, rewrite = _migrate_single_set_initial_concentrations(
         main_window._mechanism_editor._reactions_text.toPlainText(),
         set_name="set1",
     )
@@ -4790,7 +4798,7 @@ def test_pending_init_materialization_suppresses_ordinary_batch_initial_transiti
         raising=True,
     )
 
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    assert main_window.apply_pending_init_migration(seed_sets={"set1": seed}, rewrite=rewrite) is True
     qt_app.processEvents()
 
     assert "batch_initials_table_edit" not in canonical_sources
@@ -4809,7 +4817,7 @@ def test_pending_init_failed_run_reinvalidates_preserved_result(main_window, qt_
     )
     qt_app.processEvents()
 
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+    seed, rewrite = _migrate_single_set_initial_concentrations(
         main_window._mechanism_editor._reactions_text.toPlainText(),
         set_name="set1",
     )
@@ -4824,7 +4832,7 @@ def test_pending_init_failed_run_reinvalidates_preserved_result(main_window, qt_
         "series": {"A": np.asarray([7.0, 14.0], dtype=float)},
         "algebra_scalars": {},
     }
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([7.0, 14.0], dtype=float)},
         label="set1",
@@ -4844,7 +4852,7 @@ def test_pending_init_failed_run_reinvalidates_preserved_result(main_window, qt_
         raising=True,
     )
 
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    assert main_window.apply_pending_init_migration(seed_sets={"set1": seed}, rewrite=rewrite) is True
     qt_app.processEvents()
     qt_app.processEvents()
     assert main_window._status_label.text() != "Result not cached (evicted). Press Run to compute."
@@ -4898,18 +4906,18 @@ def test_pending_init_guard_does_not_suppress_next_real_mechanism_edit(
     cache.active_batch_set_id = selected_ids[0]
     cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
     cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([7.0, 14.0], dtype=float)},
         label="baseline",
         overlays=[],
     )
 
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+    seed, rewrite = _migrate_single_set_initial_concentrations(
         main_window._mechanism_editor._reactions_text.toPlainText(),
         set_name="set1",
     )
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    assert main_window.apply_pending_init_migration(seed_sets={"set1": seed}, rewrite=rewrite) is True
     main_window.arm_pending_init_result_invalidation_guard()
     qt_app.processEvents()
 
@@ -4954,7 +4962,7 @@ def test_direct_mechanism_edit_clears_orphaned_visible_plot_without_cache_metada
         raising=True,
     )
 
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([1.0, 0.5], dtype=float)},
         label="orphaned",
@@ -5007,18 +5015,18 @@ def test_pending_init_guard_does_not_suppress_next_real_state_network_edit(
     cache.active_batch_set_id = selected_ids[0]
     cache.active_batch_set = str(main_window.batch_set_name_for_id(selected_ids[0]) or "")
     cache.last_display_selection = list(selected_ids)
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([7.0, 14.0], dtype=float)},
         label="baseline",
         overlays=[],
     )
 
-    seed, rewrite = migrate_reaction_dsl_initial_concentrations(
+    seed, rewrite = _migrate_single_set_initial_concentrations(
         main_window._mechanism_editor._reactions_text.toPlainText(),
         set_name="set1",
     )
-    assert main_window.apply_pending_init_migration(seed=seed, rewrite=rewrite) is True
+    assert main_window.apply_pending_init_migration(seed_sets={"set1": seed}, rewrite=rewrite) is True
     main_window.arm_pending_init_result_invalidation_guard()
     qt_app.processEvents()
 
@@ -5123,7 +5131,7 @@ def test_open_solver_settings_ok_without_changes_preserves_focused_slider_previe
 
     main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[focused_set_id])
     main_window._sync_mechanism_controls_to_focused_batch_set()
-    main_window.set_data(
+    main_window.results_controller.set_data(
         np.asarray([0.0, 1.0], dtype=float),
         {"A": np.asarray([3.0, 6.0], dtype=float)},
         label=focused_set_id,

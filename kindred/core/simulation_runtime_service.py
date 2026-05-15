@@ -40,6 +40,9 @@ class SimulationRuntimeOwner:
     def startup_payload(self) -> dict[str, Any]:
         return self._kernel_owner.startup_payload
 
+    def update_startup_payload(self, payload: Mapping[str, Any] | None) -> None:
+        self._kernel_owner.update_startup_payload(dict(payload or {}))
+
     @property
     def is_running(self) -> bool:
         return bool(self._kernel_owner.is_running)

@@ -54,7 +54,8 @@ def _make_fitting_window():
             {"id": "ds2", "t": t.copy(), "y": np.vstack([y_b.copy()]), "species": ["B"]},
         ],
         dataset_weights={"ds1": 1.0, "ds2": 0.5},
-    )
+        runtime_lane_budget=lambda dataset_count: max(1, int(dataset_count)),
+)
 
 
 # ------------------------------------------------------------------
