@@ -462,9 +462,9 @@ def test_runtime_session_close_shields_lane_close_failures() -> None:
 
 def test_global_fit_dataset_evaluation_uses_runtime_batch_boundary() -> None:
     from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
-    from kindred.core.analysis.global_fitting import (
-        _ObjectiveDatasetInput,
-        _evaluate_dataset_simulations,
+    from kindred.core.analysis.global_fit_execution import (
+        ObjectiveDatasetInput,
+        evaluate_dataset_simulations,
     )
 
     payloads = coerce_fit_dataset_specs(
@@ -474,7 +474,7 @@ def test_global_fit_dataset_evaluation_uses_runtime_batch_boundary() -> None:
         ]
     )
     items = [
-        _ObjectiveDatasetInput(
+        ObjectiveDatasetInput(
             index=index,
             payload=payload,
             full_params={"dataset": payload.dataset_id, "value": float(index + 1)},
@@ -495,7 +495,7 @@ def test_global_fit_dataset_evaluation_uses_runtime_batch_boundary() -> None:
                 out.append({"t": t, "species": {"A": np.full_like(t, float(request.params["value"]))}})
             return out
 
-    results = _evaluate_dataset_simulations(
+    results = evaluate_dataset_simulations(
         _BatchEvaluator(),
         items,
         cancellation_check=lambda: False,
@@ -508,17 +508,17 @@ def test_global_fit_dataset_evaluation_uses_runtime_batch_boundary() -> None:
 
 def test_global_fit_dataset_evaluation_preserves_runtime_protocol_failures_as_fatal() -> None:
     from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
-    from kindred.core.analysis.global_fitting import (
-        _ObjectiveDatasetInput,
-        _evaluate_dataset_simulations,
-        _dataset_evaluation_is_fatal,
+    from kindred.core.analysis.global_fit_execution import (
+        ObjectiveDatasetInput,
+        dataset_evaluation_is_fatal,
+        evaluate_dataset_simulations,
     )
     from kindred.core.fitting_containment import FittingLaneProtocolError
 
     payload = coerce_fit_dataset_specs(
         [{"id": "ds1", "t": np.asarray([0.0, 1.0]), "y": np.asarray([1.0, 2.0]), "species": "A"}]
     )[0]
-    item = _ObjectiveDatasetInput(
+    item = ObjectiveDatasetInput(
         index=0,
         payload=payload,
         full_params={"k": 1.0},
@@ -530,22 +530,22 @@ def test_global_fit_dataset_evaluation_preserves_runtime_protocol_failures_as_fa
         def evaluate_fitting_runtime_batch(self, requests, *, cancellation_check=None):
             return [FittingLaneProtocolError("bad runtime reply")]
 
-    result = _evaluate_dataset_simulations(
+    result = evaluate_dataset_simulations(
         _BrokenRuntimeEvaluator(),
         [item],
         cancellation_check=lambda: False,
     )[0]
 
-    assert _dataset_evaluation_is_fatal(result) is True
+    assert dataset_evaluation_is_fatal(result) is True
     assert result.error.details["failure"]["kind"] == "fitting_containment_protocol"
 
 
 def test_global_fit_dataset_evaluation_preserves_raised_runtime_warm_protocol_failure_as_fatal() -> None:
     from kindred.core.analysis.fit_dataset_payload import coerce_fit_dataset_specs
-    from kindred.core.analysis.global_fitting import (
-        _ObjectiveDatasetInput,
-        _dataset_evaluation_is_fatal,
-        _evaluate_dataset_simulations,
+    from kindred.core.analysis.global_fit_execution import (
+        ObjectiveDatasetInput,
+        dataset_evaluation_is_fatal,
+        evaluate_dataset_simulations,
     )
     from kindred.core.fitting_containment import FittingLaneProtocolError
     from kindred.core.fitting_runtime_session import FittingRuntimeSession
@@ -557,7 +557,7 @@ def test_global_fit_dataset_evaluation_preserves_raised_runtime_warm_protocol_fa
         ]
     )
     items = [
-        _ObjectiveDatasetInput(
+        ObjectiveDatasetInput(
             index=index,
             payload=payload,
             full_params={"k": 1.0},
@@ -580,12 +580,12 @@ def test_global_fit_dataset_evaluation_preserves_raised_runtime_warm_protocol_fa
         lane_factory=_BrokenWarmLane,
     )
 
-    results = _evaluate_dataset_simulations(
+    results = evaluate_dataset_simulations(
         session.evaluator(cancellation_check=lambda: False),
         items,
         cancellation_check=lambda: False,
     )
 
     assert [result.index for result in results] == [0, 1]
-    assert all(_dataset_evaluation_is_fatal(result) for result in results)
+    assert all(dataset_evaluation_is_fatal(result) for result in results)
     assert {result.error.details["failure"]["kind"] for result in results} == {"fitting_containment_protocol"}

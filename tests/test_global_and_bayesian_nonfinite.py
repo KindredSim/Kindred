@@ -5,11 +5,8 @@ import pytest
 
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.dataset_parameter_overrides import FitDatasetParameterOverrides
-from kindred.core.analysis.global_fitting import (
-    _FitParameterLayout,
-    _GlobalFitObjective,
-    fit_global,
-)
+from kindred.core.analysis.global_fit_execution import FitParameterLayout, GlobalFitObjective
+from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.exceptions import FitSimulationError
 from kindred.core.objective import ObjectiveContext
 from kindred.core.fitting_evaluation import (
@@ -55,7 +52,7 @@ def _build_serial_fit_components():
         x_obs=None,
         x_mode="auto",
     )
-    layout = _FitParameterLayout(
+    layout = FitParameterLayout(
         param_names=["k1"],
         shared_log10={},
         dataset_var_order=[],
@@ -168,7 +165,7 @@ def test_global_fit_objective_penalizes_nonfinite_param_without_stale_binding_re
         x_obs=None,
         x_mode="auto",
     )
-    layout = _FitParameterLayout(
+    layout = FitParameterLayout(
         param_names=["k1", "k2"],
         shared_log10={},
         dataset_var_order=[],
@@ -178,7 +175,7 @@ def test_global_fit_objective_penalizes_nonfinite_param_without_stale_binding_re
         lower=np.asarray([0.0, 0.0], dtype=float),
         upper=np.asarray([1.0, 1.0], dtype=float),
     )
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=CallableFittingEvaluator(simulation_func),
         payloads=[payload],
         shared_params={"k1": 0.25, "k2": 0.5},
@@ -202,7 +199,7 @@ def test_global_fit_objective_penalizes_nonfinite_param_without_stale_binding_re
 @pytest.mark.unit
 def test_global_fit_objective_penalizes_nonfinite_probe_on_shared_serial_evaluator():
     evaluator, payload, layout, _dataset = _build_serial_fit_components()
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=evaluator,
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -230,7 +227,7 @@ def test_global_fit_objective_penalizes_nonfinite_probe_through_callable_wrapper
     def _simulate(params):
         return evaluator.evaluate_series(params)
 
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=CallableFittingEvaluator(_simulate),
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -257,7 +254,7 @@ def test_global_fit_objective_penalizes_nonfinite_probe_through_evaluate_series_
         def evaluate_series(self, params):
             return evaluator.evaluate_series(params)
 
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=coerce_fitting_series_evaluator(_EvaluateOnly()),
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -280,7 +277,7 @@ def test_global_fit_objective_penalizes_nonfinite_probe_through_evaluate_series_
 def test_global_fit_objective_uses_origin_aware_method_on_wrapped_non_callable_optimizer_probe():
     evaluator, payload, layout, _dataset = _build_serial_fit_components()
     wrapped = _OriginAwareEvaluateOnly(evaluator)
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=coerce_fitting_series_evaluator(wrapped),
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -307,7 +304,7 @@ def test_global_fit_objective_uses_origin_aware_method_on_wrapped_non_callable_o
 def test_global_fit_objective_uses_origin_aware_method_on_wrapped_non_callable_configured_param():
     evaluator, payload, layout, _dataset = _build_serial_fit_components()
     wrapped = _OriginAwareEvaluateOnly(evaluator)
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=coerce_fitting_series_evaluator(wrapped),
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -333,7 +330,7 @@ def test_global_fit_objective_uses_origin_aware_method_on_wrapped_non_callable_c
 @pytest.mark.unit
 def test_global_fit_objective_fails_when_fixed_override_shadows_optimizer_name_with_nonfinite():
     evaluator, payload, layout, _dataset = _build_serial_fit_components()
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=evaluator,
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -517,7 +514,7 @@ def test_global_fit_raw_callable_fails_on_configured_nonfinite_forwarded_key():
         t_axis = np.asarray([0.0, 1.0], dtype=float)
         return {"t": t_axis, "B": np.zeros_like(t_axis)}
 
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=CallableFittingEvaluator(_simulate),
         payloads=[payload],
         shared_params={"k1": 0.5},
@@ -545,7 +542,7 @@ def test_global_fit_evaluate_series_adapter_fails_on_configured_nonfinite_forwar
             t_axis = np.asarray([0.0, 1.0], dtype=float)
             return {"t": t_axis, "B": np.zeros_like(t_axis)}
 
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=coerce_fitting_series_evaluator(_EvaluateOnly()),
         payloads=[payload],
         shared_params={"k1": 0.5},

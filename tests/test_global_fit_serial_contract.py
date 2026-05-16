@@ -5,6 +5,8 @@ import inspect
 import numpy as np
 import pytest
 
+import kindred.core.analysis.global_fit_execution as global_fit_execution
+
 from kindred.core.exceptions import ErrorContext, FitSimulationError
 from kindred.core.fitting_completion import FitDetailSection, FitDiagnostic, GlobalFitCompletion
 from kindred.core.fitting_optimization import FitResult
@@ -42,9 +44,9 @@ def _raw_dataset(dataset_id: str, y_values) -> dict[str, object]:
 
 
 def _dataset_input(index: int, dataset_id: str, init_a: float):
-    from kindred.core.analysis.global_fitting import _ObjectiveDatasetInput
+    from kindred.core.analysis.global_fit_execution import ObjectiveDatasetInput
 
-    return _ObjectiveDatasetInput(
+    return ObjectiveDatasetInput(
         index=int(index),
         payload=_payload(dataset_id, [0.0, 0.0]),
         full_params={"init:A": float(init_a)},
@@ -154,8 +156,6 @@ def test_fit_global_final_replay_executes_parameterized_intervention_schedule(mo
 
 
 def test_dataset_simulation_generic_wrap_prefers_inner_snapshot_when_sources_disagree_and_preserves_context() -> None:
-    import kindred.core.analysis.global_fitting as global_fitting
-
     class _ContextCarrierError(RuntimeError):
         def __init__(self):
             super().__init__("generic simulation failure")
@@ -168,12 +168,12 @@ def test_dataset_simulation_generic_wrap_prefers_inner_snapshot_when_sources_dis
     def _raise_generic(*_args, **_kwargs):
         raise _ContextCarrierError()
 
-    original = global_fitting.evaluate_fitting_series
-    global_fitting.evaluate_fitting_series = _raise_generic
+    original = global_fit_execution.evaluate_fitting_series
+    global_fit_execution.evaluate_fitting_series = _raise_generic
     try:
-        evaluation = global_fitting._evaluate_dataset_simulation(object(), item)
+        evaluation = global_fit_execution.evaluate_dataset_simulation(object(), item)
     finally:
-        global_fitting.evaluate_fitting_series = original
+        global_fit_execution.evaluate_fitting_series = original
 
     assert isinstance(evaluation.error, FitSimulationError)
     assert evaluation.error.context is not None
@@ -209,7 +209,7 @@ def test_fit_global_serial_generic_wrap_uses_outer_candidate_snapshot_when_inner
         raise RuntimeError("generic simulation failure without snapshot")
 
     monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
-    monkeypatch.setattr(global_fitting, "evaluate_fitting_series", _raise_runtime_error)
+    monkeypatch.setattr(global_fit_execution, "evaluate_fitting_series", _raise_runtime_error)
 
     result = global_fitting.fit_global(
         lambda _params: {"t": np.asarray([0.0, 1.0], dtype=float), "A": np.asarray([1.0, 1.0], dtype=float)},
@@ -230,7 +230,6 @@ def test_fit_global_serial_generic_wrap_uses_outer_candidate_snapshot_when_inner
 
 
 def test_objective_simulation_error_rewrap_preserves_context() -> None:
-    import kindred.core.analysis.global_fitting as global_fitting
     from kindred.core.objective import ObjectiveContext
 
     class _ObjectiveCarrierError(RuntimeError):
@@ -240,7 +239,7 @@ def test_objective_simulation_error_rewrap_preserves_context() -> None:
             self.details = {"origin": "objective-sim"}
 
     payloads = [_payload("ds1", [0.0, 0.0])]
-    layout = global_fitting._build_parameter_layout(
+    layout = global_fit_execution.build_parameter_layout(
         payloads=payloads,
         shared_params={"k1": 1.0},
         dataset_variable_params={},
@@ -248,7 +247,7 @@ def test_objective_simulation_error_rewrap_preserves_context() -> None:
         log10_params=None,
     )
     ctx = ObjectiveContext()
-    objective = global_fitting._GlobalFitObjective(
+    objective = global_fit_execution.GlobalFitObjective(
         fit_evaluator=object(),
         payloads=payloads,
         shared_params={"k1": 1.0},
@@ -260,7 +259,7 @@ def test_objective_simulation_error_rewrap_preserves_context() -> None:
         progress_callback=None,
         cancellation_check=None,
     )
-    evaluation = global_fitting._DatasetSimulationEvaluation(
+    evaluation = global_fit_execution.DatasetSimulationEvaluation(
         index=0,
         sim_time=None,
         sim_species={},
@@ -269,12 +268,12 @@ def test_objective_simulation_error_rewrap_preserves_context() -> None:
         final_error_message="evaluation error",
     )
 
-    original = global_fitting._evaluate_dataset_simulations
-    global_fitting._evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
+    original = global_fit_execution.evaluate_dataset_simulations
+    global_fit_execution.evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
     try:
         residuals = objective(layout.x0.copy())
     finally:
-        global_fitting._evaluate_dataset_simulations = original
+        global_fit_execution.evaluate_dataset_simulations = original
 
     assert residuals.size
     assert isinstance(ctx.last_error, FitSimulationError)
@@ -287,11 +286,10 @@ def test_objective_simulation_error_rewrap_preserves_context() -> None:
 
 
 def test_objective_alignment_rewrap_preserves_context() -> None:
-    import kindred.core.analysis.global_fitting as global_fitting
     from kindred.core.objective import ObjectiveContext
 
     payloads = [_payload("ds1", [0.0, 0.0])]
-    layout = global_fitting._build_parameter_layout(
+    layout = global_fit_execution.build_parameter_layout(
         payloads=payloads,
         shared_params={"k1": 1.0},
         dataset_variable_params={},
@@ -299,7 +297,7 @@ def test_objective_alignment_rewrap_preserves_context() -> None:
         log10_params=None,
     )
     ctx = ObjectiveContext()
-    objective = global_fitting._GlobalFitObjective(
+    objective = global_fit_execution.GlobalFitObjective(
         fit_evaluator=object(),
         payloads=payloads,
         shared_params={"k1": 1.0},
@@ -311,7 +309,7 @@ def test_objective_alignment_rewrap_preserves_context() -> None:
         progress_callback=None,
         cancellation_check=None,
     )
-    evaluation = global_fitting._DatasetSimulationEvaluation(
+    evaluation = global_fit_execution.DatasetSimulationEvaluation(
         index=0,
         sim_time=np.asarray([0.0, 1.0], dtype=float),
         sim_species={"A": np.asarray([0.0, 0.0], dtype=float)},
@@ -322,15 +320,15 @@ def test_objective_alignment_rewrap_preserves_context() -> None:
         details={"origin": "alignment"},
     )
 
-    original_evaluate = global_fitting._evaluate_dataset_simulations
-    original_align = global_fitting._align_series
-    global_fitting._evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
-    global_fitting._align_series = lambda *_args, **_kwargs: (_ for _ in ()).throw(exc)
+    original_evaluate = global_fit_execution.evaluate_dataset_simulations
+    original_align = global_fit_execution._align_series
+    global_fit_execution.evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
+    global_fit_execution._align_series = lambda *_args, **_kwargs: (_ for _ in ()).throw(exc)
     try:
         residuals = objective(layout.x0.copy())
     finally:
-        global_fitting._evaluate_dataset_simulations = original_evaluate
-        global_fitting._align_series = original_align
+        global_fit_execution.evaluate_dataset_simulations = original_evaluate
+        global_fit_execution._align_series = original_align
 
     assert residuals.size
     assert isinstance(ctx.last_error, FitSimulationError)
@@ -343,7 +341,6 @@ def test_objective_alignment_rewrap_preserves_context() -> None:
 
 
 def test_objective_alignment_generic_wrap_preserves_context() -> None:
-    import kindred.core.analysis.global_fitting as global_fitting
     from kindred.core.objective import ObjectiveContext
 
     class _AlignmentGenericError(RuntimeError):
@@ -353,7 +350,7 @@ def test_objective_alignment_generic_wrap_preserves_context() -> None:
             self.details = {"origin": "alignment-generic"}
 
     payloads = [_payload("ds1", [0.0, 0.0])]
-    layout = global_fitting._build_parameter_layout(
+    layout = global_fit_execution.build_parameter_layout(
         payloads=payloads,
         shared_params={"k1": 1.0},
         dataset_variable_params={},
@@ -361,7 +358,7 @@ def test_objective_alignment_generic_wrap_preserves_context() -> None:
         log10_params=None,
     )
     ctx = ObjectiveContext()
-    objective = global_fitting._GlobalFitObjective(
+    objective = global_fit_execution.GlobalFitObjective(
         fit_evaluator=object(),
         payloads=payloads,
         shared_params={"k1": 1.0},
@@ -373,21 +370,21 @@ def test_objective_alignment_generic_wrap_preserves_context() -> None:
         progress_callback=None,
         cancellation_check=None,
     )
-    evaluation = global_fitting._DatasetSimulationEvaluation(
+    evaluation = global_fit_execution.DatasetSimulationEvaluation(
         index=0,
         sim_time=np.asarray([0.0, 1.0], dtype=float),
         sim_species={"A": np.asarray([0.0, 0.0], dtype=float)},
     )
 
-    original_evaluate = global_fitting._evaluate_dataset_simulations
-    original_align = global_fitting._align_series
-    global_fitting._evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
-    global_fitting._align_series = lambda *_args, **_kwargs: (_ for _ in ()).throw(_AlignmentGenericError())
+    original_evaluate = global_fit_execution.evaluate_dataset_simulations
+    original_align = global_fit_execution._align_series
+    global_fit_execution.evaluate_dataset_simulations = lambda *_args, **_kwargs: [evaluation]
+    global_fit_execution._align_series = lambda *_args, **_kwargs: (_ for _ in ()).throw(_AlignmentGenericError())
     try:
         residuals = objective(layout.x0.copy())
     finally:
-        global_fitting._evaluate_dataset_simulations = original_evaluate
-        global_fitting._align_series = original_align
+        global_fit_execution.evaluate_dataset_simulations = original_evaluate
+        global_fit_execution._align_series = original_align
 
     assert residuals.size
     assert isinstance(ctx.last_error, FitSimulationError)

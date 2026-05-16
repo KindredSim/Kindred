@@ -4,14 +4,14 @@ import numpy as np
 import pytest
 
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
-from kindred.core.analysis.global_fitting import (
-    _build_parameter_layout,
-    _build_completion_detail_sections,
-    _completion_result_message,
-    _GlobalFitObjective,
-    _normalize_weights,
-    fit_global,
+from kindred.core.analysis.global_fit_execution import (
+    GlobalFitObjective,
+    build_completion_detail_sections,
+    build_parameter_layout,
+    completion_result_message,
+    normalize_weights,
 )
+from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.fitting_completion import FitDiagnostic, GlobalFitCompletion
 from kindred.core.fitting_evaluation import CallableFittingEvaluator
 from kindred.core.objective import ObjectiveContext
@@ -40,15 +40,15 @@ def _make_payload(dataset_id: str, *, point_count: int = 3) -> FitDatasetSpec:
     )
 
 
-def test_normalize_weights_rejects_unknown_dataset_ids() -> None:
+def testnormalize_weights_rejects_unknown_dataset_ids() -> None:
     payloads = [_make_payload("ds1"), _make_payload("ds2")]
 
     with pytest.raises(ValueError, match="ghost"):
-        _normalize_weights(payloads, {"ds1": 2.0, "ghost": 1.0})
+        normalize_weights(payloads, {"ds1": 2.0, "ghost": 1.0})
 
 
 def test_failed_param_snapshot_namespaces_dataset_specific_values() -> None:
-    snapshot = _GlobalFitObjective._build_failed_param_snapshot(
+    snapshot = GlobalFitObjective.build_failed_param_snapshot(
         ds_id="ds2",
         shared_params={"k": 0.5},
         full_params={"k": 0.5, "init:A": 2.25, "offset": 7.0},
@@ -283,8 +283,8 @@ def test_transient_optimizer_error_does_not_leak_into_real_warning_completion(mo
     assert "non-finite parameter value" not in result.message.lower()
 
 
-def test_build_completion_detail_sections_keeps_top_level_failure_without_stack_trace_when_dataset_failures_exist() -> None:
-    sections = _build_completion_detail_sections(
+def testbuild_completion_detail_sections_keeps_top_level_failure_without_stack_trace_when_dataset_failures_exist() -> None:
+    sections = build_completion_detail_sections(
         status="fail",
         optimizer_diagnostic=FitDiagnostic(
             phase="fatal",
@@ -323,7 +323,7 @@ def test_nonfinite_metrics_message_takes_precedence_over_stale_optimizer_diagnos
         detail_sections=[],
     )
 
-    message = _completion_result_message(
+    message = completion_result_message(
         base_message="Optimization terminated successfully.",
         completion=completion,
         optimizer_diagnostic=diagnostic,
@@ -345,7 +345,7 @@ def test_warn_message_preserves_non_success_optimizer_termination_reason() -> No
         detail_sections=[],
     )
 
-    message = _completion_result_message(
+    message = completion_result_message(
         base_message="Maximum number of function evaluations exceeded.",
         completion=completion,
         optimizer_diagnostic=None,
@@ -586,14 +586,14 @@ def test_global_fit_objective_normalizes_missing_target_penalty_within_dataset_w
         x_mode="auto",
         target_weights={"A": 1.0, "B": 3.0},
     )
-    layout = _build_parameter_layout(
+    layout = build_parameter_layout(
         payloads=[payload],
         shared_params={"k": 0.5},
         dataset_variable_params={},
         bounds=None,
         log10_params=None,
     )
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=CallableFittingEvaluator(lambda _params: {"t": t_obs.copy(), "species": {}}),
         payloads=[payload],
         shared_params={"k": 0.5},
@@ -631,7 +631,7 @@ def test_global_fit_objective_timeout_fit_simulation_error_uses_penalty_residual
         x_obs=None,
         x_mode="auto",
     )
-    layout = _build_parameter_layout(
+    layout = build_parameter_layout(
         payloads=[payload],
         shared_params={"k": 0.5},
         dataset_variable_params={},
@@ -652,7 +652,7 @@ def test_global_fit_objective_timeout_fit_simulation_error_uses_penalty_residual
             },
         )
 
-    objective = _GlobalFitObjective(
+    objective = GlobalFitObjective(
         fit_evaluator=CallableFittingEvaluator(_timeout),
         payloads=[payload],
         shared_params={"k": 0.5},
@@ -673,6 +673,7 @@ def test_global_fit_objective_timeout_fit_simulation_error_uses_penalty_residual
 
 
 def test_final_replay_timeout_failure_is_scoped_to_failed_dataset(monkeypatch) -> None:
+    import kindred.core.analysis.global_fit_execution as global_fit_execution
     from kindred.core.analysis import global_fitting
     from kindred.core.fitting_optimization import FitResult
 
@@ -710,7 +711,7 @@ def test_final_replay_timeout_failure_is_scoped_to_failed_dataset(monkeypatch) -
         return {"t": t_obs.copy(), "species": {"A": np.zeros_like(t_obs)}}
 
     monkeypatch.setattr(global_fitting, "fit_parameters", _fake_fit_parameters)
-    monkeypatch.setattr(global_fitting, "evaluate_fitting_series", _evaluate_final_replay)
+    monkeypatch.setattr(global_fit_execution, "evaluate_fitting_series", _evaluate_final_replay)
 
     result = global_fitting.fit_global(
         lambda _params: {"t": t_obs.copy(), "A": np.zeros_like(t_obs)},
@@ -773,14 +774,14 @@ def test_global_fit_objective_rebalances_targets_without_raw_cross_dataset_infla
     residual_vectors = []
     for target_weights in ({"A": 1.0, "B": 1.0}, {"A": 5.0, "B": 1.0}):
         payloads = [_make_ds1_payload(target_weights), ds2_payload]
-        layout = _build_parameter_layout(
+        layout = build_parameter_layout(
             payloads=payloads,
             shared_params={"k": 0.5},
             dataset_variable_params={},
             bounds=None,
             log10_params=None,
         )
-        objective = _GlobalFitObjective(
+        objective = GlobalFitObjective(
             fit_evaluator=CallableFittingEvaluator(simulation_func),
             payloads=payloads,
             shared_params={"k": 0.5},
@@ -837,14 +838,14 @@ def test_global_fit_objective_keeps_dx_penalty_dataset_weighted_only_when_target
     payload_5 = _make_payload(5.0)
     residuals = []
     for payload in (payload_1, payload_5):
-        layout = _build_parameter_layout(
+        layout = build_parameter_layout(
             payloads=[payload],
             shared_params={"k": 0.5},
             dataset_variable_params={},
             bounds=None,
             log10_params=None,
         )
-        objective = _GlobalFitObjective(
+        objective = GlobalFitObjective(
             fit_evaluator=CallableFittingEvaluator(simulation_func),
             payloads=[payload],
             shared_params={"k": 0.5},
