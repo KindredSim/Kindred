@@ -91,14 +91,14 @@ class SimulationErrorHandlingOwner:
             if isinstance(ctx, Mapping)
                 else None
             )
-        callback_owner_epoch = freshness.callback_owner_epoch
+        callback_preview_owner_epoch = freshness.callback_preview_owner_epoch
         is_superseded_fast_request = freshness.superseded_fast_request
         if is_superseded_fast_request:
             stale_fast_decision = self._completion_policy.resolve_superseded_fast_error(
                 preview_ownership=self._deps.completion_policy_preview_ownership(),
                 context=policy_context,
                 request_id=int(request_id),
-                preview_owner_epoch=callback_owner_epoch,
+                preview_owner_epoch=callback_preview_owner_epoch,
                 pending_replay=self._deps.completion_policy_pending_replay_state(),
             )
             logger.debug(

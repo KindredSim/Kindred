@@ -34,7 +34,7 @@ class BatchLaneOutcome:
     run_id: int
     request_id: int
     set_id: str
-    owner_epoch: int
+    lane_owner_epoch: int
     success: bool
     payload: Mapping[str, Any] | None = None
     failure: Mapping[str, Any] | None = None
@@ -45,7 +45,7 @@ class BatchLaneOutcome:
         object.__setattr__(self, "run_id", int(self.run_id))
         object.__setattr__(self, "request_id", int(self.request_id))
         object.__setattr__(self, "set_id", str(self.set_id))
-        object.__setattr__(self, "owner_epoch", int(self.owner_epoch))
+        object.__setattr__(self, "lane_owner_epoch", int(self.lane_owner_epoch))
         object.__setattr__(self, "success", bool(self.success))
         object.__setattr__(self, "payload", None if self.payload is None else dict(self.payload))
         object.__setattr__(self, "failure", None if self.failure is None else dict(self.failure))
@@ -60,7 +60,6 @@ class BatchRequestMetadata:
     request_id: int
     generation: int
     preview_owner_epoch: int | None = None
-    expected_owner_epoch: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "set_id", str(self.set_id or ""))
@@ -72,11 +71,6 @@ class BatchRequestMetadata:
             self,
             "preview_owner_epoch",
             None if self.preview_owner_epoch is None else int(self.preview_owner_epoch),
-        )
-        object.__setattr__(
-            self,
-            "expected_owner_epoch",
-            None if self.expected_owner_epoch is None else int(self.expected_owner_epoch),
         )
 
 
@@ -114,11 +108,6 @@ class BatchCompletionRecord:
     @property
     def preview_owner_epoch(self) -> int | None:
         return self.metadata.preview_owner_epoch
-
-    @property
-    def expected_owner_epoch(self) -> int | None:
-        return self.metadata.expected_owner_epoch
-
 
 @dataclass(frozen=True)
 class BatchPolledCompletion:
@@ -339,7 +328,7 @@ class WarmBatchSimulationLane:
         payload.setdefault("run_id", rid)
         payload.setdefault("request_id", req_id)
         payload.setdefault("set_id", sid)
-        owner_epoch = int(self._owner.owner_epoch)
+        lane_owner_epoch = int(self._owner.owner_epoch)
         events: list[ContainmentKernelEvent] = []
         try:
             result = self._owner.solve(
@@ -347,64 +336,64 @@ class WarmBatchSimulationLane:
                 active_timeout_s=float(active_timeout_s),
                 reply_fields={"run_id": rid, "batch_request_id": req_id, "set_id": sid},
             )
-            owner_epoch = int(self._owner.owner_epoch)
+            lane_owner_epoch = int(self._owner.owner_epoch)
             events = self._drain_owner_events()
             return BatchLaneOutcome(
                 lane_id=self._lane_id,
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 success=True,
                 payload=result,
                 events=tuple(events),
             )
         except ContainmentKernelStartupTimeout as exc:
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             return self._failed_outcome(
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=_failure(kind="startup_timeout", phase="startup", message=str(exc), exc=exc),
             )
         except ContainmentKernelAcceptTimeout as exc:
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             return self._failed_outcome(
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=_failure(kind="accept_timeout", phase="accept", message=str(exc), exc=exc),
             )
         except ContainmentKernelActiveTimeout as exc:
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             return self._failed_outcome(
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=_failure(kind="active_timeout", phase="active", message=str(exc), exc=exc),
             )
         except ContainmentKernelCancelled as exc:
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             return self._failed_outcome(
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=_failure(kind="cancelled", phase="internal", message=str(exc) or "Contained request cancelled.", exc=exc),
             )
         except ContainmentKernelChildFailure as exc:
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             raw_failure = dict(exc.failure or {})
             raw_failure.setdefault("kind", "child_failure")
@@ -414,31 +403,31 @@ class WarmBatchSimulationLane:
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=raw_failure,
             )
         except ContainmentKernelProtocolError as exc:
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             self._owner.close(kill=True)
             return self._failed_outcome(
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=_failure(kind="protocol_error", phase="protocol", message=str(exc), exc=exc),
             )
         except BaseException as exc:  # noqa: BLE001 - lane boundary must return structured failure
-            owner_epoch = max(owner_epoch, int(self._owner.owner_epoch))
+            lane_owner_epoch = max(lane_owner_epoch, int(self._owner.owner_epoch))
             events = self._drain_owner_events()
             self._owner.close(kill=True)
             return self._failed_outcome(
                 run_id=rid,
                 request_id=req_id,
                 set_id=sid,
-                owner_epoch=owner_epoch,
+                lane_owner_epoch=lane_owner_epoch,
                 events=events,
                 failure=_failure(kind="internal_error", phase="internal", message=str(exc), exc=exc),
             )
@@ -449,7 +438,7 @@ class WarmBatchSimulationLane:
         run_id: int,
         request_id: int,
         set_id: str,
-        owner_epoch: int,
+        lane_owner_epoch: int,
         events: list[ContainmentKernelEvent],
         failure: Mapping[str, Any],
     ) -> BatchLaneOutcome:
@@ -458,7 +447,7 @@ class WarmBatchSimulationLane:
             run_id=int(run_id),
             request_id=int(request_id),
             set_id=str(set_id),
-            owner_epoch=int(owner_epoch),
+            lane_owner_epoch=int(lane_owner_epoch),
             success=False,
             failure=dict(failure),
             events=tuple(events),
@@ -1043,7 +1032,7 @@ class BatchRuntimeLaneOwner:
                     run_id=handle.run_id,
                     request_id=handle.request_id,
                     set_id=handle.set_id,
-                    owner_epoch=0,
+                    lane_owner_epoch=0,
                     success=False,
                     failure={
                         "kind": "internal_error",
@@ -1068,7 +1057,6 @@ class BatchRuntimeLaneOwner:
         set_name: str,
         preview_owner_epoch: int | None,
         active_timeout_s: float,
-        expected_owner_epoch: int | None = None,
         request_metadata: Mapping[str, Any] | None = None,
     ) -> BatchRequestHandle:
         pool = self.lane_pool
@@ -1082,13 +1070,11 @@ class BatchRuntimeLaneOwner:
             request_id=int(request_id),
             generation=int(self._generation),
             preview_owner_epoch=preview_owner_epoch,
-            expected_owner_epoch=None if expected_owner_epoch is None else int(expected_owner_epoch),
         )
         handle = BatchRequestHandle(metadata)
         stored_metadata = {
             "set_name": metadata.set_name,
             "preview_owner_epoch": metadata.preview_owner_epoch,
-            "owner_epoch": metadata.expected_owner_epoch,
             "generation": metadata.generation,
         }
         if isinstance(request_metadata, Mapping):
@@ -1184,11 +1170,7 @@ class BatchRuntimeLaneOwner:
                 if (
                     handle_metadata is not None
                     and int(handle_metadata.generation) == int(record_or_outcome.generation)
-                    and (
-                        handle_metadata.expected_owner_epoch is None
-                        or record_or_outcome.expected_owner_epoch is None
-                        or int(handle_metadata.expected_owner_epoch) == int(record_or_outcome.expected_owner_epoch)
-                    )
+                    and handle_metadata.preview_owner_epoch == record_or_outcome.preview_owner_epoch
                 ):
                     self.active_request_map.pop(sid, None)
                     self.active_request_meta.pop(sid, None)

@@ -9,7 +9,7 @@ class SimulationCallbackIdentity:
     run_id: int
     fast_mode: bool
     request_id: int
-    owner_epoch: Optional[int]
+    preview_owner_epoch: Optional[int]
     batch_set: Optional[str]
     batch_set_id: Optional[str]
     cache_key: str
@@ -36,8 +36,8 @@ class SimulationCallbackIdentity:
         object.__setattr__(self, "request_id", int(self.request_id))
         object.__setattr__(
             self,
-            "owner_epoch",
-            int(self.owner_epoch) if self.owner_epoch is not None else None,
+            "preview_owner_epoch",
+            int(self.preview_owner_epoch) if self.preview_owner_epoch is not None else None,
         )
         object.__setattr__(self, "batch_set", str(self.batch_set) if self.batch_set is not None else None)
         object.__setattr__(self, "batch_set_id", str(self.batch_set_id) if self.batch_set_id is not None else None)
@@ -62,7 +62,7 @@ class SimulationCallbackIdentity:
         run_id: int,
         fast_mode: bool,
         request_id: int,
-        owner_epoch: Optional[int],
+        preview_owner_epoch: Optional[int],
         batch_set: Optional[str],
         batch_set_id: Optional[str],
         cache_key: str,
@@ -83,7 +83,7 @@ class SimulationCallbackIdentity:
             run_id=int(run_id),
             fast_mode=bool(fast_mode),
             request_id=int(request_id),
-            owner_epoch=int(owner_epoch) if owner_epoch is not None else None,
+            preview_owner_epoch=int(preview_owner_epoch) if preview_owner_epoch is not None else None,
             batch_set=str(batch_set) if batch_set is not None else None,
             batch_set_id=str(batch_set_id) if batch_set_id is not None else None,
             cache_key=str(cache_key),

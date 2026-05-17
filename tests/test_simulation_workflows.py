@@ -354,7 +354,7 @@ def test_stale_simulation_completion_does_not_publish_cache_or_display(main_wind
         run_id=3,
         fast_mode=False,
         request_id=5,
-        owner_epoch=None,
+        preview_owner_epoch=None,
         batch_set="set1",
         batch_set_id="id1",
         cache_key="workflow-stale-completion",

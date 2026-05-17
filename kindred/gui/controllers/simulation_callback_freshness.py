@@ -24,10 +24,10 @@ class SimulationCallbackFreshnessDecision:
     latest_request_id: int
     shutdown_requested: bool
     current_global_epoch: int
-    callback_owner_epoch: Optional[int]
+    callback_preview_owner_epoch: Optional[int]
     stale_run: bool
     runtime_input_stale: bool
-    missing_owner_epoch: bool
+    missing_preview_owner_epoch: bool
     preview_owner_matches: bool
     superseded_fast_request: bool
 
@@ -48,19 +48,21 @@ class SimulationCallbackFreshnessOwner:
         current_global_epoch = int(self._deps.current_global_epoch())
         current_epoch = int(self._deps.current_epoch())
         current_set_epoch = int(self._deps.current_set_epoch(batch_set_id))
-        callback_owner_epoch = (
-            None if callback_identity.owner_epoch is None else int(callback_identity.owner_epoch)
+        callback_preview_owner_epoch = (
+            None
+            if callback_identity.preview_owner_epoch is None
+            else int(callback_identity.preview_owner_epoch)
         )
         active_run_id = int(getattr(self._deps.run_state, "active_run_id", 0))
         latest_request_id = int(getattr(self._deps.run_state, "latest_sim_request_id", 0))
-        preview_owner_matches = self._preview_request_matches_current_owner_epoch(
+        preview_owner_matches = self._preview_request_matches_current_preview_owner_epoch(
             callback_identity.request_id,
-            callback_owner_epoch,
+            callback_preview_owner_epoch,
         )
-        missing_owner_epoch = self._missing_owner_epoch_is_stale_for_fast_callback(
+        missing_preview_owner_epoch = self._missing_preview_owner_epoch_is_stale_for_fast_callback(
             fast_mode=callback_identity.fast_mode,
             request_id=callback_identity.request_id,
-            owner_epoch=callback_owner_epoch,
+            preview_owner_epoch=callback_preview_owner_epoch,
             latest_request_id=latest_request_id,
         )
         runtime_input_stale = False
@@ -77,14 +79,14 @@ class SimulationCallbackFreshnessOwner:
             latest_request_id=latest_request_id,
             shutdown_requested=bool(self._deps.shutdown_requested()),
             current_global_epoch=current_global_epoch,
-            callback_owner_epoch=callback_owner_epoch,
+            callback_preview_owner_epoch=callback_preview_owner_epoch,
             stale_run=int(callback_identity.run_id) != active_run_id,
             runtime_input_stale=bool(runtime_input_stale),
-            missing_owner_epoch=bool(missing_owner_epoch),
+            missing_preview_owner_epoch=bool(missing_preview_owner_epoch),
             preview_owner_matches=bool(preview_owner_matches),
             superseded_fast_request=bool(
                 callback_identity.fast_mode
-                and (bool(missing_owner_epoch) or not bool(preview_owner_matches))
+                and (bool(missing_preview_owner_epoch) or not bool(preview_owner_matches))
             ),
         )
 
@@ -105,10 +107,10 @@ class SimulationCallbackFreshnessOwner:
         if transition.batch_done:
             self._deps.finalize_batch_queue_done_without_result(transition.context)
 
-    def _preview_request_matches_current_owner_epoch(
+    def _preview_request_matches_current_preview_owner_epoch(
         self,
         request_id: Optional[int],
-        owner_epoch: Optional[int],
+        preview_owner_epoch: Optional[int],
     ) -> bool:
         if request_id is None:
             return True
@@ -118,19 +120,19 @@ class SimulationCallbackFreshnessOwner:
             return False
         if int(owner_request_id) != int(request_id):
             return False
-        if owner_epoch is None:
+        if preview_owner_epoch is None:
             return True
-        return int(getattr(ownership, "epoch", 0)) == int(owner_epoch)
+        return int(getattr(ownership, "epoch", 0)) == int(preview_owner_epoch)
 
-    def _missing_owner_epoch_is_stale_for_fast_callback(
+    def _missing_preview_owner_epoch_is_stale_for_fast_callback(
         self,
         *,
         fast_mode: Optional[bool],
         request_id: Optional[int],
-        owner_epoch: Optional[int],
+        preview_owner_epoch: Optional[int],
         latest_request_id: int,
     ) -> bool:
-        if (not bool(fast_mode)) or request_id is None or owner_epoch is not None:
+        if (not bool(fast_mode)) or request_id is None or preview_owner_epoch is not None:
             return False
         ownership = self._deps.preview_ownership()
         owner_request_id = getattr(ownership, "request_id", None)

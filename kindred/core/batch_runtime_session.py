@@ -136,7 +136,6 @@ class BatchRuntimeLaneOwnerProtocol(Protocol):
         set_name: str,
         preview_owner_epoch: int | None,
         active_timeout_s: float,
-        expected_owner_epoch: int | None = None,
         request_metadata: Mapping[str, Any] | None = None,
     ) -> BatchRequestHandle: ...
 
@@ -268,7 +267,6 @@ class BatchRuntimeSession:
         *,
         set_id: str,
         set_name: str,
-        expected_owner_epoch: int | None = None,
         active_timeout_s: float | None = None,
         callback_identity: Any,
     ) -> BatchRequestHandle:
@@ -284,7 +282,6 @@ class BatchRuntimeSession:
             set_name=str(set_name or set_id or ""),
             preview_owner_epoch=request.preview_owner_epoch,
             active_timeout_s=float(request.active_timeout_s if active_timeout_s is None else active_timeout_s),
-            expected_owner_epoch=None if expected_owner_epoch is None else int(expected_owner_epoch),
             request_metadata=request_metadata,
         )
 
@@ -305,8 +302,8 @@ class BatchRuntimeSession:
                 and (
                     request.preview_owner_epoch is None
                     or (
-                        record.expected_owner_epoch is not None
-                        and int(record.expected_owner_epoch) == int(request.preview_owner_epoch)
+                        record.preview_owner_epoch is not None
+                        and int(record.preview_owner_epoch) == int(request.preview_owner_epoch)
                     )
                 )
             )
@@ -315,10 +312,10 @@ class BatchRuntimeSession:
                 stale_metadata["runtime_session_stale"] = {
                     "expected_run_id": int(request.run_id),
                     "expected_request_id": int(request.request_id),
-                    "expected_owner_epoch": request.preview_owner_epoch,
+                    "expected_preview_owner_epoch": request.preview_owner_epoch,
                     "actual_run_id": int(record.run_id),
                     "actual_request_id": int(record.request_id),
-                    "actual_owner_epoch": record.expected_owner_epoch,
+                    "actual_preview_owner_epoch": record.preview_owner_epoch,
                 }
                 record = BatchCompletionRecord(
                     metadata=record.metadata,

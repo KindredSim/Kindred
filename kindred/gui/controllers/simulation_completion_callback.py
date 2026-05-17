@@ -88,7 +88,7 @@ class SimulationCompletionCallbackOwner:
                 else None
             )
         latest_request_id = freshness.latest_request_id
-        callback_owner_epoch = freshness.callback_owner_epoch
+        callback_preview_owner_epoch = freshness.callback_preview_owner_epoch
         state = CompletionCallbackState(
             run_id=run_id,
             request_id=request_id,
@@ -134,7 +134,7 @@ class SimulationCompletionCallbackOwner:
             preview_ownership=self._deps.completion_policy_preview_ownership(),
             context=policy_context,
             request_id=int(request_id),
-            preview_owner_epoch=callback_owner_epoch,
+            preview_owner_epoch=callback_preview_owner_epoch,
             pending_replay=self._deps.completion_policy_pending_replay_state(),
             shutdown_requested=freshness.shutdown_requested,
         )

@@ -396,7 +396,7 @@ class BatchErrorDispatchContext:
     run_id: int
     request_id: int
     fast_mode: bool
-    owner_epoch: int | None
+    preview_owner_epoch: int | None
     cache_key: str
     callback_context: BatchCallbackContext
     simulation_identity: Dict[str, Any]
@@ -659,7 +659,7 @@ class BatchRunContextOwner:
             run_id=int(state.run_id or 0),
             request_id=int(state.request_id or 0),
             fast_mode=bool(state.fast_mode),
-            owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
+            preview_owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
             cache_key=str(ctx.get("cache_key") or ""),
             callback_context=self.callback_context_snapshot(ctx),
             simulation_identity=deepcopy(dict(ctx.get("scope_identity") or {})),

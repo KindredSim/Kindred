@@ -6,10 +6,11 @@ from typing import Any, Dict, List
 
 import numpy as np
 import pytest
-from PySide6 import QtCore
+from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
+from kindred.gui.controllers.parallel_batch_outcome import resolve_parallel_batch_outcome
 
 pytestmark = [pytest.mark.gui]
 
@@ -76,7 +77,7 @@ class _FakeLanePool:
             run_id=int(run_id),
             request_id=int(request_id),
             set_id=sid,
-            owner_epoch=1,
+            lane_owner_epoch=1,
             success=True,
             payload=payload,
         )
@@ -132,6 +133,25 @@ def _prime_three_batch_sets(main_window) -> list[str]:
     return names[:3]
 
 
+def _prime_three_m1_batch_sets(main_window) -> list[str]:
+    main_window._load_preset_mechanism("M1")
+    QtWidgets.QApplication.processEvents()
+    main_window._batch_model.set_species(["A", "B"])
+
+    add_btn = main_window.findChild(type(main_window._run_btn), "addBatchSetButton")
+    assert add_btn is not None
+    add_btn.click()
+    add_btn.click()
+
+    names = list(main_window._batch_store.set_names())
+    for idx, name in enumerate(names[:3]):
+        row = main_window._batch_store.row_for_set(name)
+        assert row is not None
+        main_window._batch_store.set_value(int(row), "A", f"{1.0 + idx:.6g}")
+        main_window._batch_store.set_value(int(row), "B", "0")
+    return names[:3]
+
+
 def _simulation_submissions(lane_pool: _FakeLanePool) -> list[_Submission]:
     return [sub for sub in lane_pool.submissions if sub.fn is run_batch_simulation_task]
 
@@ -142,6 +162,107 @@ def _wait_for_submission_count(lane_pool: _FakeLanePool, expected: int, timeout_
         if len(_simulation_submissions(lane_pool)) >= int(expected):
             return
         time.sleep(0.005)
+
+
+def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
+    option = QtWidgets.QStyleOptionSlider()
+    slider.initStyleOption(option)
+    handle = slider.style().subControlRect(
+        QtWidgets.QStyle.CC_Slider,
+        option,
+        QtWidgets.QStyle.SC_SliderHandle,
+        slider,
+    )
+    return handle.center()
+
+
+
+def test_fast_parallel_preview_accepts_lane_epoch_distinct_from_preview_epoch():
+    for set_id in ("id1", "id2"):
+        outcome = BatchLaneOutcome(
+            lane_id=f"lane-{set_id}",
+            run_id=7,
+            request_id=11,
+            set_id=set_id,
+            lane_owner_epoch=1,
+            success=True,
+            payload={"success": True, "set_id": set_id},
+        )
+
+        resolution = resolve_parallel_batch_outcome(
+            set_id=set_id,
+            outcome=outcome,
+            metadata={
+                "run_id": 7,
+                "request_id": 11,
+                "set_name": set_id,
+                "preview_owner_epoch": 2,
+            },
+        )
+
+        assert resolution.stale is False
+        assert resolution.preview_owner_epoch == 2
+        assert resolution.payload == {"success": True, "set_id": set_id}
+
+
+
+def test_multi_set_species_slider_parallel_preview_completes_with_distinct_lane_epoch(
+    main_window,
+    monkeypatch,
+    qtbot,
+):
+    _prime_three_m1_batch_sets(main_window)
+    set_ids = [str(main_window.batch_set_id_for_row(row) or "") for row in (0, 1)]
+    assert all(set_ids)
+    _select_rows(main_window, [0, 1])
+    main_window.set_slider_edit_target_set_ids(set_ids)
+    main_window._on_slider_edit_targets_changed()
+
+    fake = _FakeLanePool(done_immediately=True, value_marker=3.0)
+    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
+    monkeypatch.setattr(
+        main_window.simulation_controller.parallel_batch,
+        "lane_pool_factory",
+        lambda max_workers, limit_blas_threads: fake,
+        raising=True,
+    )
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=2)
+    main_window._set_runtime_backed_controls_ready(True)
+    main_window.simulation_controller._claim_preview_ownership(
+        request_id=1,
+        target_set_ids=set_ids,
+    )
+
+    qtbot.addWidget(main_window)
+    main_window.show()
+    QtWidgets.QApplication.processEvents()
+
+    slider_a = main_window.findChild(QtWidgets.QSlider, "speciesSlider_A")
+    assert slider_a is not None
+    press_pos = _slider_handle_center(slider_a)
+    qtbot.mousePress(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
+    slider_a.setValue(5000)
+    qtbot.mouseRelease(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
+    QtWidgets.QApplication.processEvents()
+
+    staged_row_0 = main_window._preview_session.preview_initials_for_row(0, main_window.batch_initials_for_row(0))
+    staged_row_1 = main_window._preview_session.preview_initials_for_row(1, main_window.batch_initials_for_row(1))
+    assert float(staged_row_0["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
+    assert float(staged_row_1["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
+
+    qtbot.waitUntil(lambda: len(_simulation_submissions(fake)) >= 2, timeout=3000)
+    qtbot.waitUntil(
+        lambda: (
+            not main_window.simulation_controller.simulation_running
+            and not bool(main_window.simulation_controller._slider_simulation_active)
+            and main_window.simulation_controller._batch_context_owner.active_batch_state() is None
+        ),
+        timeout=3000,
+    )
+
+    assert main_window.simulation_controller._preview_ownership.epoch == 2
+    assert str(main_window.simulation_controller._last_nonfatal_exception or "").find("stale batch lane outcome") == -1
+    assert len(_simulation_submissions(fake)) == 2
 
 
 

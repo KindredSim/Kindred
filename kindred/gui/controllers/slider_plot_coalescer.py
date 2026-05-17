@@ -13,8 +13,8 @@ class PendingSliderPlotUpdate:
     cache_kind: Optional[str] = None
     request_id: Optional[int] = None
     run_id: Optional[int] = None
-    accepted_owner_request_id: Optional[int] = None
-    accepted_owner_epoch: Optional[int] = None
+    accepted_preview_request_id: Optional[int] = None
+    accepted_preview_owner_epoch: Optional[int] = None
     valid_set_ids: Optional[tuple[str, ...]] = None
     allow_fallback: bool = True
 
@@ -52,8 +52,8 @@ class SliderPlotCoalescer(QtCore.QObject):
         request_id: Optional[int],
         request_accepted: bool,
         run_id: Optional[int],
-        accepted_owner_request_id: Optional[int],
-        accepted_owner_epoch: Optional[int],
+        accepted_preview_request_id: Optional[int],
+        accepted_preview_owner_epoch: Optional[int],
         slider_triggered: bool,
         valid_set_ids: Optional[Sequence[str]],
         allow_fallback: bool,
@@ -71,15 +71,15 @@ class SliderPlotCoalescer(QtCore.QObject):
         if self.pending.set_ids and incoming_cache_kind == "preview":
             pending_owner_key = (
                 self.pending.request_id,
-                self.pending.accepted_owner_request_id,
-                self.pending.accepted_owner_epoch,
+                self.pending.accepted_preview_request_id,
+                self.pending.accepted_preview_owner_epoch,
                 self.pending.cache_key,
                 self.pending.run_id,
             )
             incoming_owner_key = (
                 int(request_id) if request_id is not None else None,
-                int(accepted_owner_request_id) if accepted_owner_request_id is not None else None,
-                int(accepted_owner_epoch) if accepted_owner_epoch is not None else None,
+                int(accepted_preview_request_id) if accepted_preview_request_id is not None else None,
+                int(accepted_preview_owner_epoch) if accepted_preview_owner_epoch is not None else None,
                 cache_token,
                 int(run_id) if run_id is not None else None,
             )
@@ -92,10 +92,12 @@ class SliderPlotCoalescer(QtCore.QObject):
         self.pending.cache_kind = incoming_cache_kind
         self.pending.request_id = int(request_id) if request_id is not None else None
         self.pending.run_id = int(run_id) if run_id is not None else None
-        self.pending.accepted_owner_request_id = (
-            int(accepted_owner_request_id) if accepted_owner_request_id is not None else None
+        self.pending.accepted_preview_request_id = (
+            int(accepted_preview_request_id) if accepted_preview_request_id is not None else None
         )
-        self.pending.accepted_owner_epoch = int(accepted_owner_epoch) if accepted_owner_epoch is not None else None
+        self.pending.accepted_preview_owner_epoch = (
+            int(accepted_preview_owner_epoch) if accepted_preview_owner_epoch is not None else None
+        )
         self.pending.valid_set_ids = (
             tuple(str(set_id) for set_id in valid_set_ids)
             if valid_set_ids is not None
@@ -122,8 +124,8 @@ class SliderPlotCoalescer(QtCore.QObject):
             cache_kind=self.pending.cache_kind,
             request_id=self.pending.request_id,
             run_id=self.pending.run_id,
-            accepted_owner_request_id=self.pending.accepted_owner_request_id,
-            accepted_owner_epoch=self.pending.accepted_owner_epoch,
+            accepted_preview_request_id=self.pending.accepted_preview_request_id,
+            accepted_preview_owner_epoch=self.pending.accepted_preview_owner_epoch,
             valid_set_ids=self.pending.valid_set_ids,
             allow_fallback=self.pending.allow_fallback,
         )

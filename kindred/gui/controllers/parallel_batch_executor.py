@@ -212,10 +212,8 @@ class ParallelBatchExecutor:
         *,
         set_id: str,
         set_name: str,
-        expected_owner_epoch: object = None,
         callback_identity: object,
     ) -> BatchRequestHandle:
-        expected_lane_owner_epoch = None if expected_owner_epoch is None else int(expected_owner_epoch)
         sid = str(set_id or "")
         if callback_identity is None:
             raise ValueError("Parallel batch task submission requires callback_identity.")
@@ -223,7 +221,6 @@ class ParallelBatchExecutor:
             task,
             set_id=sid,
             set_name=str(set_name or set_id or ""),
-            expected_owner_epoch=expected_lane_owner_epoch,
             callback_identity=callback_identity,
         )
 

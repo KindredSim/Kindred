@@ -938,23 +938,23 @@ class SimulationController(QtCore.QObject):
             self._latest_sim_request_id = request_id_i
         return request_id_i
 
-    def _queued_preview_update_still_matches_current_owner(
+    def _queued_preview_update_still_matches_current_preview_owner(
         self,
         *,
         request_id: Optional[int],
-        accepted_owner_request_id: Optional[int],
-        accepted_owner_epoch: Optional[int],
+        accepted_preview_request_id: Optional[int],
+        accepted_preview_owner_epoch: Optional[int],
     ) -> bool:
         if request_id is None:
             return True
         current = self._preview_ownership
-        if accepted_owner_request_id is None or accepted_owner_epoch is None:
+        if accepted_preview_request_id is None or accepted_preview_owner_epoch is None:
             return False
         return (
             current.request_id is not None
             and int(current.request_id) == int(request_id)
-            and int(accepted_owner_request_id) == int(request_id)
-            and int(current.epoch) == int(accepted_owner_epoch)
+            and int(accepted_preview_request_id) == int(request_id)
+            and int(current.epoch) == int(accepted_preview_owner_epoch)
         )
 
     def queue_pending_slider_preview_replay(
@@ -1054,20 +1054,20 @@ class SimulationController(QtCore.QObject):
         self._plot_coalescer.pending.run_id = int(value) if value is not None else None
 
     @property
-    def _pending_slider_plot_owner_request_id(self) -> Optional[int]:
-        return self._plot_coalescer.pending.accepted_owner_request_id
+    def _pending_slider_plot_preview_request_id(self) -> Optional[int]:
+        return self._plot_coalescer.pending.accepted_preview_request_id
 
-    @_pending_slider_plot_owner_request_id.setter
-    def _pending_slider_plot_owner_request_id(self, value: Optional[int]) -> None:
-        self._plot_coalescer.pending.accepted_owner_request_id = int(value) if value is not None else None
+    @_pending_slider_plot_preview_request_id.setter
+    def _pending_slider_plot_preview_request_id(self, value: Optional[int]) -> None:
+        self._plot_coalescer.pending.accepted_preview_request_id = int(value) if value is not None else None
 
     @property
-    def _pending_slider_plot_owner_epoch(self) -> Optional[int]:
-        return self._plot_coalescer.pending.accepted_owner_epoch
+    def _pending_slider_plot_preview_owner_epoch(self) -> Optional[int]:
+        return self._plot_coalescer.pending.accepted_preview_owner_epoch
 
-    @_pending_slider_plot_owner_epoch.setter
-    def _pending_slider_plot_owner_epoch(self, value: Optional[int]) -> None:
-        self._plot_coalescer.pending.accepted_owner_epoch = int(value) if value is not None else None
+    @_pending_slider_plot_preview_owner_epoch.setter
+    def _pending_slider_plot_preview_owner_epoch(self, value: Optional[int]) -> None:
+        self._plot_coalescer.pending.accepted_preview_owner_epoch = int(value) if value is not None else None
 
     @property
     def _slider_plot_coalesce_interval_ms(self) -> int:
@@ -1461,7 +1461,7 @@ class SimulationController(QtCore.QObject):
         run_id: int,
         fast_mode: bool,
         request_id: int,
-        owner_epoch: Optional[int],
+        preview_owner_epoch: Optional[int],
         batch_set: Optional[str],
         batch_set_id: Optional[str],
         cache_key: str,
@@ -1483,7 +1483,7 @@ class SimulationController(QtCore.QObject):
             run_id=run_id,
             fast_mode=fast_mode,
             request_id=request_id,
-            owner_epoch=owner_epoch,
+            preview_owner_epoch=preview_owner_epoch,
             batch_set=resolved_batch_set,
             batch_set_id=set_id or batch_set_id,
             cache_key=cache_key,
@@ -2575,10 +2575,10 @@ class SimulationController(QtCore.QObject):
             request_id=request_id,
             request_accepted=bool(request_accepted),
             run_id=run_id,
-            accepted_owner_request_id=(
+            accepted_preview_request_id=(
                 preview_ownership.request_id if bool(slider_triggered) and bool(request_accepted) else None
             ),
-            accepted_owner_epoch=(
+            accepted_preview_owner_epoch=(
                 int(preview_ownership.epoch) if bool(slider_triggered) and bool(request_accepted) else None
             ),
             slider_triggered=slider_triggered,
@@ -2602,8 +2602,8 @@ class SimulationController(QtCore.QObject):
         pending_cache_kind = str(pending.cache_kind or "")
         pending_request_id = pending.request_id
         pending_run_id = pending.run_id
-        pending_owner_request_id = pending.accepted_owner_request_id
-        pending_owner_epoch = pending.accepted_owner_epoch
+        pending_preview_request_id = pending.accepted_preview_request_id
+        pending_preview_owner_epoch = pending.accepted_preview_owner_epoch
         pending_valid_set_ids = pending.valid_set_ids
         pending_allow_fallback = bool(pending.allow_fallback)
 
@@ -2613,10 +2613,10 @@ class SimulationController(QtCore.QObject):
         if not cache_key:
             return False
         request_accepted = (
-            self._queued_preview_update_still_matches_current_owner(
+            self._queued_preview_update_still_matches_current_preview_owner(
                 request_id=request_id,
-                accepted_owner_request_id=pending_owner_request_id,
-                accepted_owner_epoch=pending_owner_epoch,
+                accepted_preview_request_id=pending_preview_request_id,
+                accepted_preview_owner_epoch=pending_preview_owner_epoch,
             )
             if pending_cache_kind == "preview"
             else (request_id is None or int(request_id) == int(getattr(self, "_latest_sim_request_id", 0)))
@@ -2699,7 +2699,7 @@ class SimulationController(QtCore.QObject):
             run_id=int(dispatch_context.run_id),
             fast_mode=bool(dispatch_context.fast_mode),
             request_id=int(dispatch_context.request_id),
-            owner_epoch=dispatch_context.owner_epoch,
+            preview_owner_epoch=dispatch_context.preview_owner_epoch,
             batch_set="",
             batch_set_id="",
             cache_key=str(dispatch_context.cache_key),
@@ -3947,7 +3947,7 @@ class SimulationController(QtCore.QObject):
                     run_id=payload.run_id,
                     fast_mode=payload.fast_mode,
                     request_id=payload.request_id,
-                    owner_epoch=payload.preview_owner_epoch,
+                    preview_owner_epoch=payload.preview_owner_epoch,
                     batch_set=str(set_name),
                     batch_set_id=sid,
                     cache_key=payload.cache_key,
@@ -3988,7 +3988,6 @@ class SimulationController(QtCore.QObject):
                     task_plan.task,
                     set_id=sid,
                     set_name=str(set_name),
-                    expected_owner_epoch=callback_identity.owner_epoch,
                     callback_identity=callback_identity,
                 )
             except Exception as exc:
@@ -4072,7 +4071,7 @@ class SimulationController(QtCore.QObject):
         run_id: int,
         request_id: int,
         fast_mode: bool,
-        owner_epoch: int | None,
+        preview_owner_epoch: int | None,
         set_name: str,
         set_id: str,
         cache_key: str,
@@ -4095,7 +4094,7 @@ class SimulationController(QtCore.QObject):
             run_id=int(run_id),
             fast_mode=bool(fast_mode),
             request_id=int(request_id),
-            owner_epoch=owner_epoch,
+            preview_owner_epoch=preview_owner_epoch,
             batch_set=str(set_name),
             batch_set_id=str(set_id),
             cache_key=str(cache_key),
@@ -4255,7 +4254,7 @@ class SimulationController(QtCore.QObject):
             run_id=int(run_id),
             request_id=int(request_id),
             fast_mode=bool(fast_mode),
-            owner_epoch=payload.preview_owner_epoch,
+            preview_owner_epoch=payload.preview_owner_epoch,
             set_name=str(set_name),
             set_id=str(set_id),
             cache_key=str(dispatch_state.cache_key),

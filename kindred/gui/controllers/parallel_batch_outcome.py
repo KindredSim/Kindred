@@ -17,10 +17,8 @@ logger = logging.getLogger(__name__)
 class ParallelBatchOutcomeResolution:
     set_id: str
     set_name: str
-    owner_epoch: object | None
-    expected_owner_epoch: object | None
+    preview_owner_epoch: object | None
     stale: bool
-    owner_epoch_mismatch: bool
     failed: bool
     payload: Dict[str, Any] | None
     error_payload: Dict[str, Any] | None
@@ -57,22 +55,12 @@ def resolve_parallel_batch_outcome(
                 "run_id": completion_record.run_id,
                 "request_id": completion_record.request_id,
                 "preview_owner_epoch": completion_record.preview_owner_epoch,
-                "owner_epoch": completion_record.expected_owner_epoch,
                 "generation": completion_record.generation,
             }
         )
     meta["set_name"] = str(meta.get("set_name") or sid)
     set_name = str(meta["set_name"])
-    owner_epoch = meta.get("preview_owner_epoch")
-    if owner_epoch is None:
-        owner_epoch = meta.get("owner_epoch")
-    expected_owner_epoch = meta.get("owner_epoch")
-    owner_epoch_mismatch = False
-    if expected_owner_epoch is not None:
-        try:
-            owner_epoch_mismatch = int(outcome.owner_epoch) != int(expected_owner_epoch)
-        except Exception:
-            owner_epoch_mismatch = True
+    preview_owner_epoch = meta.get("preview_owner_epoch")
     missing_identity_metadata: list[str] = []
     if meta.get("run_id") is None:
         missing_identity_metadata.append("run_id")
@@ -93,18 +81,17 @@ def resolve_parallel_batch_outcome(
         or int(outcome.run_id) != int(expected_run_id)
         or int(outcome.request_id) != int(expected_request_id)
         or str(outcome.set_id or "") != sid
-        or owner_epoch_mismatch
     )
     if stale:
         details = {
             "expected_run_id": int(expected_run_id),
             "expected_request_id": int(expected_request_id),
             "expected_set_id": sid,
-            "expected_owner_epoch": expected_owner_epoch,
+            "expected_preview_owner_epoch": preview_owner_epoch,
             "actual_run_id": int(outcome.run_id),
             "actual_request_id": int(outcome.request_id),
             "actual_set_id": str(outcome.set_id or ""),
-            "actual_owner_epoch": int(outcome.owner_epoch),
+            "lane_owner_epoch": int(outcome.lane_owner_epoch),
         }
         if runtime_session_stale is not None:
             details["runtime_session_stale"] = dict(runtime_session_stale)
@@ -113,10 +100,8 @@ def resolve_parallel_batch_outcome(
         return ParallelBatchOutcomeResolution(
             set_id=sid,
             set_name=set_name,
-            owner_epoch=owner_epoch,
-            expected_owner_epoch=expected_owner_epoch,
+            preview_owner_epoch=preview_owner_epoch,
             stale=True,
-            owner_epoch_mismatch=bool(owner_epoch_mismatch),
             failed=True,
             payload=None,
             error_payload=build_simulation_failure(
@@ -142,10 +127,8 @@ def resolve_parallel_batch_outcome(
     return ParallelBatchOutcomeResolution(
         set_id=sid,
         set_name=set_name,
-        owner_epoch=owner_epoch,
-        expected_owner_epoch=expected_owner_epoch,
+        preview_owner_epoch=preview_owner_epoch,
         stale=False,
-        owner_epoch_mismatch=False,
         failed=bool(failed),
         payload=payload,
         error_payload=error_payload,
@@ -270,22 +253,13 @@ class ParallelBatchOutcomeOwner:
                     "Rejected stale batch lane outcome "
                     f"(expected run_id={expected_run_id if expected_run_id is not None else 'missing'} "
                     f"request_id={expected_request_id if expected_request_id is not None else 'missing'} "
-                    f"set_id={sid} owner_epoch={resolution.expected_owner_epoch}; "
+                    f"set_id={sid} preview_owner_epoch={resolution.preview_owner_epoch}; "
                     f"got run_id={int(outcome.run_id)} request_id={int(outcome.request_id)} "
-                    f"set_id={str(outcome.set_id or '')} owner_epoch={int(outcome.owner_epoch)})"
+                    f"set_id={str(outcome.set_id or '')} lane_owner_epoch={int(outcome.lane_owner_epoch)})"
                 ),
                 RuntimeError("stale batch lane outcome"),
             )
             if isinstance(runtime_session_stale, Mapping):
-                return True
-            run_request_set_match = bool(
-                expected_run_id is not None
-                and expected_request_id is not None
-                and int(outcome.run_id) == int(expected_run_id)
-                and int(outcome.request_id) == int(expected_request_id)
-                and str(outcome.set_id or "") == sid
-            )
-            if bool(getattr(callback_identity, "fast_mode", False)) and resolution.owner_epoch_mismatch and run_request_set_match:
                 return True
             self._deps.reset_parallel_batch_run_and_shutdown_lane_pool()
             self._deps.set_simulation_running(False)
