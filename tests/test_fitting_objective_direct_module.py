@@ -112,6 +112,78 @@ def test_direct_fitting_objective_resolves_protected_schedule_name_through_canon
 
 
 @pytest.mark.unit
+def test_build_fitting_objective_composes_prepared_context_factories() -> None:
+    prepared = PreparedFittingObjectiveContext(
+        bound=BoundMechanism(
+            mechanism=SimpleNamespace(),
+            rhs=lambda *_args, **_kwargs: np.array([], dtype=float),
+            bindings={},
+            species_names=["A"],
+            y0=np.array([1.0], dtype=float),
+            param_names=["k1"],
+            mechanism_text=MECHANISM,
+        ),
+        requested_param_names=["k1"],
+        request=SimpleNamespace(t_span=(0.0, 1.0)),
+        target_species="A",
+        target_is_species=True,
+        target_species_index=0,
+        compiled_algebra=None,
+        initials_for_algebra={"A": 1.0},
+        temperature_K=298.15,
+    )
+    events: list[tuple[str, object]] = []
+
+    def _prepare_context(**kwargs: object) -> PreparedFittingObjectiveContext:
+        events.append(("prepare", tuple(kwargs["param_names"])))  # type: ignore[index]
+        return prepared
+
+    def _solve_policy_factory(received: PreparedFittingObjectiveContext):
+        events.append(("solve_factory", received is prepared))
+
+        def _solve_request(request: object, param_values: np.ndarray) -> SimulationOutput:
+            events.append(("solve", (request is prepared.request, tuple(param_values))))
+            return SimulationOutput(
+                t=np.array([0.0, 1.0], dtype=float),
+                Y=np.array([[1.0, 0.5]], dtype=float),
+                provenance={"solver": "prepared-pipeline-test"},
+            )
+
+        return _solve_request
+
+    def _parameter_algebra_policy_factory(received: PreparedFittingObjectiveContext):
+        events.append(("algebra_factory", received is prepared))
+
+        def _apply(params: dict[str, float]) -> None:
+            events.append(("algebra", dict(params)))
+
+        return _apply
+
+    objective = build_fitting_objective(
+        mechanism_text=MECHANISM,
+        param_names=["k1"],
+        t_exp=np.array([0.0, 1.0], dtype=float),
+        y_exp=np.array([1.0, 0.5], dtype=float),
+        target_species="A",
+        solver="BDF",
+        prepare_context_func=_prepare_context,
+        solve_policy_factory=_solve_policy_factory,
+        parameter_algebra_policy_factory=_parameter_algebra_policy_factory,
+    )
+
+    residuals = objective(np.array([0.25], dtype=float))
+
+    assert np.allclose(residuals, 0.0)
+    assert events == [
+        ("prepare", ("k1",)),
+        ("solve_factory", True),
+        ("algebra_factory", True),
+        ("algebra", {"k1": 0.25}),
+        ("solve", (True, (0.25,))),
+    ]
+
+
+@pytest.mark.unit
 def test_direct_module_parameterized_schedule_preserves_structured_execution_request() -> None:
     from kindred.core.intervention_schedule import parse_intervention_schedule_from_dsl
     from kindred.core.simulation_preparation import SimulationExecutionRequest

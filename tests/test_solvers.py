@@ -447,7 +447,8 @@ def test_solve_ode_scheduled_terminal_event_stops_later_segments_and_preserves_e
     assert out.provenance["intervention_segments"] == 1
 
 
-def test_solve_ode_scheduled_event_terminal_flags_stop_inside_segment():
+@pytest.mark.parametrize("event_terminal", [[True], np.array([True, False])])
+def test_solve_ode_scheduled_event_terminal_flags_stop_inside_segment(event_terminal):
     def terminal_event(t: float, _y: np.ndarray) -> float:
         return float(t) - 0.5
 
@@ -458,34 +459,7 @@ def test_solve_ode_scheduled_event_terminal_flags_stop_inside_segment():
         solver="BDF",
         t_eval=np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
         events=[terminal_event],
-        event_terminal=[True],
-        species_names=("A",),
-        intervention_schedule={
-            "instant_events": [
-                {"op": "set", "species": "A", "time": 0.8, "value": 3.0}
-            ]
-        },
-    )
-
-    out = solvers.solve_ode(request)
-
-    np.testing.assert_allclose(out.t, np.array([0.0, 0.25, 0.5]))
-    assert out.provenance["events"] == [[0.5]]
-    assert out.provenance["intervention_segments"] == 1
-
-
-def test_solve_ode_scheduled_event_terminal_flags_accept_numpy_arrays():
-    def terminal_event(t: float, _y: np.ndarray) -> float:
-        return float(t) - 0.5
-
-    request = solvers.SimulationRequest(
-        rhs=lambda _t, y: np.asarray([0.0 * float(y[0])]),
-        t_span=(0.0, 1.0),
-        y0=np.array([1.0]),
-        solver="BDF",
-        t_eval=np.array([0.0, 0.25, 0.5, 0.75, 1.0]),
-        events=[terminal_event],
-        event_terminal=np.array([True, False]),
+        event_terminal=event_terminal,
         species_names=("A",),
         intervention_schedule={
             "instant_events": [
@@ -568,12 +542,20 @@ def test_solve_ode_state_trigger_resumes_from_event_state_between_requested_samp
     assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
 
 
-def test_solve_ode_state_trigger_rearms_after_min_interval_inside_same_segment():
+@pytest.mark.parametrize(
+    ("min_interval", "first_step"),
+    [
+        (0.25, None),
+        (0.0, 0.1),
+    ],
+)
+def test_solve_ode_state_trigger_rearms_inside_same_segment(min_interval, first_step):
     request = solvers.SimulationRequest(
         rhs=lambda _t, _y: np.array([1.0]),
         t_span=(0.0, 2.0),
         y0=np.array([0.0]),
         solver="BDF",
+        first_step=first_step,
         t_eval=np.array([0.0, 2.0]),
         species_names=("A",),
         intervention_schedule={
@@ -587,53 +569,7 @@ def test_solve_ode_state_trigger_rearms_after_min_interval_inside_same_segment()
                     "action": "set",
                     "value": 0.0,
                     "max_count": 2,
-                    "min_interval": 0.25,
-                }
-            ]
-        },
-    )
-
-    out = solvers.solve_ode(request)
-
-    assert out.provenance["intervention_trigger_events"] == [
-        {
-            "time": pytest.approx(0.5, abs=1e-6),
-            "trigger_species": "A",
-            "species": "A",
-            "action": "set",
-        },
-        {
-            "time": pytest.approx(1.0, abs=1e-6),
-            "trigger_species": "A",
-            "species": "A",
-            "action": "set",
-        },
-    ]
-    np.testing.assert_allclose(out.t, np.array([0.0, 2.0]))
-    assert float(out.Y[0, -1]) == pytest.approx(1.0, abs=1e-6)
-
-
-def test_solve_ode_state_trigger_rearm_slice_drops_out_of_bounds_first_step():
-    request = solvers.SimulationRequest(
-        rhs=lambda _t, _y: np.array([1.0]),
-        t_span=(0.0, 2.0),
-        y0=np.array([0.0]),
-        solver="BDF",
-        first_step=0.1,
-        t_eval=np.array([0.0, 2.0]),
-        species_names=("A",),
-        intervention_schedule={
-            "trigger_events": [
-                {
-                    "op": "trigger",
-                    "trigger_species": "A",
-                    "threshold": 0.5,
-                    "direction": "rising",
-                    "species": "A",
-                    "action": "set",
-                    "value": 0.0,
-                    "max_count": 2,
-                    "min_interval": 0.0,
+                    "min_interval": min_interval,
                 }
             ]
         },
@@ -724,7 +660,18 @@ def test_solve_ode_state_trigger_ignores_surplus_user_event_terminal_flags():
     assert float(out.Y[0, -1]) == pytest.approx(2.0, abs=1e-6)
 
 
-def test_solve_ode_state_trigger_respects_active_clamp_interval_at_event_sample():
+@pytest.mark.parametrize(
+    ("interval_end", "expected_at_trigger", "expected_final"),
+    [
+        (1.0, 0.0, 0.0),
+        (0.5, 1.0, 1.0),
+    ],
+)
+def test_solve_ode_state_trigger_applies_clamp_interval_state_at_event_sample(
+    interval_end,
+    expected_at_trigger,
+    expected_final,
+):
     request = solvers.SimulationRequest(
         rhs=lambda _t, _y: np.array([0.0, 1.0]),
         t_span=(0.0, 1.0),
@@ -734,7 +681,7 @@ def test_solve_ode_state_trigger_respects_active_clamp_interval_at_event_sample(
         species_names=("A", "B"),
         intervention_schedule={
             "intervals": [
-                {"kind": "clamp", "species": "A", "start": 0.0, "end": 1.0, "value": 0.0}
+                {"kind": "clamp", "species": "A", "start": 0.0, "end": interval_end, "value": 0.0}
             ],
             "trigger_events": [
                 {
@@ -755,43 +702,9 @@ def test_solve_ode_state_trigger_respects_active_clamp_interval_at_event_sample(
     out = solvers.solve_ode(request)
 
     np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
-    np.testing.assert_allclose(out.Y[0], np.array([0.0, 0.0, 0.0]), atol=1e-7)
+    assert float(out.Y[0, 1]) == pytest.approx(expected_at_trigger, abs=1e-7)
+    assert float(out.Y[0, -1]) == pytest.approx(expected_final, abs=1e-7)
     assert out.provenance["intervention_trigger_events"][0]["species"] == "A"
-
-
-def test_solve_ode_state_trigger_at_clamp_interval_end_is_not_reclamped():
-    request = solvers.SimulationRequest(
-        rhs=lambda _t, _y: np.array([0.0, 1.0]),
-        t_span=(0.0, 1.0),
-        y0=np.array([0.0, 0.0]),
-        solver="BDF",
-        t_eval=np.array([0.0, 0.5, 1.0]),
-        species_names=("A", "B"),
-        intervention_schedule={
-            "intervals": [
-                {"kind": "clamp", "species": "A", "start": 0.0, "end": 0.5, "value": 0.0}
-            ],
-            "trigger_events": [
-                {
-                    "op": "trigger",
-                    "trigger_species": "B",
-                    "threshold": 0.5,
-                    "direction": "rising",
-                    "species": "A",
-                    "action": "add",
-                    "amount": 1.0,
-                    "max_count": 1,
-                    "min_interval": 0.0,
-                }
-            ],
-        },
-    )
-
-    out = solvers.solve_ode(request)
-
-    np.testing.assert_allclose(out.t, np.array([0.0, 0.5, 1.0]))
-    assert float(out.Y[0, 1]) == pytest.approx(1.0, abs=1e-7)
-    assert float(out.Y[0, -1]) == pytest.approx(1.0, abs=1e-7)
 
 
 def test_solve_ode_state_trigger_requires_event_state_when_event_between_samples(monkeypatch):

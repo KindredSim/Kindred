@@ -125,3 +125,82 @@ def test_simulation_ui_ports_do_not_provide_generic_cross_port_fallback() -> Non
     source = target.read_text(encoding="utf-8")
 
     assert "def __getattr__(" not in source
+
+
+def _attribute_chain(node: ast.AST) -> tuple[str, ...] | None:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return tuple(reversed(parts))
+
+
+def _protocol_method_names(tree: ast.AST, protocol_names: set[str]) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name not in protocol_names:
+            continue
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef):
+                names.add(item.name)
+    return names
+
+
+def test_simulation_controller_surfaces_use_explicit_ui_subports() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    ports_target = repo_root / "kindred" / "gui" / "ports.py"
+    ports_tree = ast.parse(ports_target.read_text(encoding="utf-8"), filename=str(ports_target))
+
+    port_protocols = {
+        "SimulationDialogsPort",
+        "SimulationSettingsPort",
+        "SimulationCacheControlsPort",
+        "SimulationRunUiPort",
+        "SimulationSliderPort",
+        "SimulationBatchPort",
+        "SimulationMechanismPort",
+        "SimulationSolverPort",
+        "SimulationRuntimePort",
+        "SimulationResultsPort",
+        "SimulationProvenancePort",
+        "SimulationMechanismHelpersPort",
+    }
+    explicit_port_methods = _protocol_method_names(ports_tree, port_protocols)
+    assert explicit_port_methods
+
+    target_paths = [
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py",
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_run_preparation.py",
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_callback.py",
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_completion_publication.py",
+        repo_root / "kindred" / "gui" / "controllers" / "simulation_error_handling.py",
+    ]
+    flattened_hits: list[str] = []
+    for target in target_paths:
+        source = target.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(target))
+        lines = source.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            chain = _attribute_chain(node)
+            if (
+                chain is not None
+                and len(chain) == 3
+                and chain[:2] in {("self", "ui"), ("self", "_ui"), ("self", "_ports")}
+                and chain[2] in explicit_port_methods
+            ):
+                flattened_hits.append(
+                    f"{target.relative_to(repo_root)}:{node.lineno}: {lines[node.lineno - 1].strip()}"
+                )
+
+    assert flattened_hits == [], (
+        "Simulation controller surfaces must route UI responsibilities through explicit "
+        "`SimulationUiPorts` sub-ports, not flattened `self.ui.<method>`/`self._ui.<method>`/"
+        "`self._ports.<method>` access.\n"
+        + "\n".join(flattened_hits)
+    )

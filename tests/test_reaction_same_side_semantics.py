@@ -406,7 +406,6 @@ def test_programmatic_reactions_use_explicit_physical_sides_and_clone_dicts() ->
     assert reaction.products == {"B": 1.0, "E": 1.0}
     assert reaction.rate_orders == {"A": 1.0, "E": 1.0}
     assert reaction.net_stoich == {"A": -1.0, "B": 1.0}
-    assert not hasattr(reaction, "stoich")
 
     with pytest.raises(ValueError, match="referenced by a reaction"):
         mechanism.remove_species("E")

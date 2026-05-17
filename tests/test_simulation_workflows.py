@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
-from tests.test_gui_sliders import (
-    _current_preview_time_axis,
-    _parameter_table_numeric_value,
-    _select_batch_rows,
-    _set_shown_rows,
-)
-from tests.test_gui_species_mode_sliders import (
-    _set_batch_current_and_selected_rows,
-    _slider_handle_center,
+from tests.batch_context_test_helpers import seed_batch_context
+from tests.workflow_helpers import (
+    current_preview_time_axis,
+    parameter_table_numeric_value,
+    select_batch_rows,
+    set_batch_current_and_selected_rows,
+    set_shown_rows,
+    slider_handle_center,
 )
 from tests.worker_stubs import make_contained_simulation_worker_stub
 
@@ -68,13 +69,13 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
     cache = main_window.simulation_controller.batch_cache
     main_window._preview_session.sync_committed_slider_values({"k1": 1.0})
 
-    _select_batch_rows(main_window, [0, 1])
+    select_batch_rows(main_window, [0, 1])
     qtbot.waitUntil(lambda: len(_selected_set_ids(main_window)) == 2, timeout=1000)
     first_set_id, second_set_id = _selected_set_ids(main_window)
     main_window._preview_session.stage_slider_value("k1", 2.0, target_set_ids=[first_set_id])
     main_window._preview_session.stage_slider_value("k1", 3.0, target_set_ids=[second_set_id])
 
-    preview_t = _current_preview_time_axis(main_window)
+    preview_t = current_preview_time_axis(main_window)
     first_preview_series = np.asarray(np.linspace(9.0, 18.0, preview_t.size, dtype=float))
     second_preview_series = np.asarray(np.linspace(11.0, 22.0, preview_t.size, dtype=float))
     first_preview_key = "workflow-first-preview-key"
@@ -100,7 +101,7 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
     cache.active_preview_cache_key = first_preview_key
     cache.active_preview_scope_set_ids = (first_set_id,)
 
-    _select_batch_rows(main_window, [0])
+    select_batch_rows(main_window, [0])
     qtbot.waitUntil(lambda: main_window.active_batch_selection()[0] == first_set_id, timeout=1000)
 
     plot = main_window._plot_tabs._main_plot
@@ -109,7 +110,7 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
         first_preview_series,
     )
     assert main_window.variable_slider_values()["k1"] == pytest.approx(2.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
+    assert parameter_table_numeric_value(main_window, "k1") == pytest.approx(2.0)
 
     monkeypatch.setattr(
         "kindred.gui.simulation_worker.ContainedSimulationWorker",
@@ -132,18 +133,18 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
     sel.clearSelection()
     QtWidgets.QApplication.processEvents()
 
-    _select_batch_rows(main_window, [0])
+    select_batch_rows(main_window, [0])
     qtbot.waitUntil(lambda: main_window.active_batch_selection()[0] == first_set_id, timeout=1000)
     assert np.allclose(
         np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
         explicit_series,
     )
     assert main_window.variable_slider_values()["k1"] == pytest.approx(1.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
+    assert parameter_table_numeric_value(main_window, "k1") == pytest.approx(1.0)
 
     cache.active_preview_cache_key = second_preview_key
     cache.active_preview_scope_set_ids = (second_set_id,)
-    _select_batch_rows(main_window, [1])
+    select_batch_rows(main_window, [1])
     qtbot.waitUntil(lambda: main_window.active_batch_selection()[0] == second_set_id, timeout=1000)
 
     assert np.allclose(
@@ -151,7 +152,7 @@ def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_s
         second_preview_series,
     )
     assert main_window.variable_slider_values()["k1"] == pytest.approx(3.0)
-    assert _parameter_table_numeric_value(main_window, "k1") == pytest.approx(3.0)
+    assert parameter_table_numeric_value(main_window, "k1") == pytest.approx(3.0)
 
 
 def test_cached_explicit_selection_change_reuses_cached_overlay_without_recompute(
@@ -171,8 +172,8 @@ def test_cached_explicit_selection_change_reuses_cached_overlay_without_recomput
     assert main_window._batch_model.setData(main_window._batch_model.index(0, 1), "1.0")
     assert main_window._batch_model.setData(main_window._batch_model.index(1, 1), "0.5")
 
-    _select_batch_rows(main_window, [0, 1])
-    _set_shown_rows(main_window, [0, 1])
+    select_batch_rows(main_window, [0, 1])
+    set_shown_rows(main_window, [0, 1])
     qtbot.waitUntil(lambda: len(_selected_set_ids(main_window)) == 2, timeout=1000)
     primary_id, secondary_id = _selected_set_ids(main_window)
     cache = main_window.simulation_controller.batch_cache
@@ -221,7 +222,7 @@ def test_cached_explicit_selection_change_reuses_cached_overlay_without_recomput
     )
 
     completed_runs = len(worker_initials)
-    _set_batch_current_and_selected_rows(main_window, current_row=1, selected_rows=[0, 1])
+    set_batch_current_and_selected_rows(main_window, current_row=1, selected_rows=[0, 1])
     main_window._refresh_batch_display_from_focus_and_shown()
     qtbot.waitUntil(lambda: main_window.active_batch_selection()[0] == secondary_id, timeout=1000)
 
@@ -260,7 +261,7 @@ def test_species_mode_slider_overlay_commit_and_reset_follow_transaction_boundar
     assert model.setData(model.index(1, 1), "0.25")
     assert model.setData(model.index(1, 2), "0.75")
 
-    _set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
+    set_batch_current_and_selected_rows(main_window, current_row=0, selected_rows=[0, 1])
     main_window.set_slider_edit_target_set_ids(
         [
             str(main_window.batch_set_id_for_row(0) or ""),
@@ -280,7 +281,7 @@ def test_species_mode_slider_overlay_commit_and_reset_follow_transaction_boundar
     assert commit_btn is not None
     assert reset_btn is not None
 
-    press_pos = _slider_handle_center(slider_a)
+    press_pos = slider_handle_center(slider_a)
     qtbot.mousePress(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
     slider_a.setValue(5000)
     qtbot.mouseRelease(slider_a, QtCore.Qt.LeftButton, pos=press_pos)
@@ -322,3 +323,71 @@ def test_species_mode_slider_overlay_commit_and_reset_follow_transaction_boundar
     assert float(main_window._batch_store.get_value(1, "A")) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
     assert float(reset_row_0["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
     assert float(reset_row_1["A"]) == pytest.approx(2.5, rel=1e-6, abs=1e-9)
+
+
+def test_stale_simulation_completion_does_not_publish_cache_or_display(main_window):
+    controller = main_window.simulation_controller
+    controller._active_run_id = 3
+    controller._latest_sim_request_id = 5
+    controller._simulation_running = True
+    controller._authoritative_runtime_input_global_epoch = 0
+    controller._authoritative_runtime_input_epoch = 0
+    controller._authoritative_runtime_input_set_epoch_by_set_id = {"id1": 2}
+    seed_batch_context(
+        controller.batch_context_owner,
+        active=True,
+        parallel=False,
+        fast_mode=False,
+        run_id=3,
+        request_id=5,
+        runtime_input_global_epoch=0,
+        runtime_input_set_epoch_by_set_id={"id1": 1},
+        cache_key="workflow-stale-completion",
+        queue_ids=["id1"],
+        queue_names=["set1"],
+        rows=[0],
+        pos=0,
+        total=1,
+        primary_set_id="id1",
+    )
+    callback_identity = controller._capture_simulation_callback_identity(
+        run_id=3,
+        fast_mode=False,
+        request_id=5,
+        owner_epoch=None,
+        batch_set="set1",
+        batch_set_id="id1",
+        cache_key="workflow-stale-completion",
+        callback_context=controller.batch_context_owner.callback_context_snapshot(),
+        simulation_identity={},
+    )
+
+    controller._cache_admin.publish_completion_cache_truth = MagicMock()
+    controller._cache_admin.publish_completion_cache = MagicMock()
+    controller.ui.results.publish_simulation_completion_result = MagicMock()
+    controller.ui.results.publish_completion_intervention_annotations = MagicMock()
+    controller.ui.provenance.publish_simulation_completion_provenance = MagicMock()
+
+    controller.on_simulation_complete(
+        {
+            "t": np.asarray([0.0, 1.0], dtype=float),
+            "Y": np.asarray([[1.0, 0.5]], dtype=float),
+            "species_names": ["A"],
+            "algebra_scalars": {},
+            "mechanism": None,
+            "mechanism_text": "reaction: A -> B; k=1",
+            "solver_config": {"solver": "BDF"},
+            "fallback_occurred": False,
+            "fallback_message": None,
+        },
+        callback_identity=callback_identity,
+    )
+
+    controller._cache_admin.publish_completion_cache_truth.assert_not_called()
+    controller._cache_admin.publish_completion_cache.assert_not_called()
+    controller.ui.results.publish_simulation_completion_result.assert_not_called()
+    controller.ui.results.publish_completion_intervention_annotations.assert_not_called()
+    controller.ui.provenance.publish_simulation_completion_provenance.assert_not_called()
+    policy_context = controller.batch_context_owner.completion_policy_context()
+    assert policy_context is not None
+    assert policy_context.active is True

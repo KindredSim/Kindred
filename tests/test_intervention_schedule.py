@@ -598,66 +598,68 @@ def test_prepared_runtime_reuse_replaces_schedule_before_parameter_resolution() 
     ]
 
 
-def test_execution_request_payload_does_not_derive_schedule_authority_from_mechanism_text() -> None:
+@pytest.mark.parametrize(
+    ("mechanism_lines", "include_schedule_key", "intervention_schedule", "expected_payload_value"),
+    [
+        (
+            [
+                "reaction: A -> B; k=0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=set; species=A; time=0.0; value=2.0",
+            ],
+            False,
+            None,
+            None,
+        ),
+        (
+            [
+                "reaction: A -> B; k=0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+            ],
+            False,
+            None,
+            None,
+        ),
+        (
+            [
+                "reaction: A -> B; k=0",
+                "initial: A=1.0",
+                "initial: B=0.0",
+                "intervention: op=set; species=A; time=0.0; value=2.0",
+            ],
+            True,
+            None,
+            None,
+        ),
+    ],
+)
+def test_execution_request_payload_serializes_only_explicit_schedule_authority(
+    mechanism_lines,
+    include_schedule_key,
+    intervention_schedule,
+    expected_payload_value,
+) -> None:
     from kindred.core.simulation_preparation import SimulationExecutionRequest
 
-    scheduled_text = "\n".join(
-        [
-            "reaction: A -> B; k=0",
-            "initial: A=1.0",
-            "initial: B=0.0",
-            "intervention: op=set; species=A; time=0.0; value=2.0",
-        ]
-    )
-    unscheduled_text = "\n".join(
-        [
-            "reaction: A -> B; k=0",
-            "initial: A=1.0",
-            "initial: B=0.0",
-        ]
-    )
-
-    scheduled_payload = SimulationExecutionRequest(
-        prepared_payload=None,
-        initials={"A": 1.0, "B": 0.0},
-        t_span=(0.0, 2.0),
-        solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text=scheduled_text,
-    ).to_payload()
-    unscheduled_payload = SimulationExecutionRequest(
-        prepared_payload=None,
-        initials={"A": 1.0, "B": 0.0},
-        t_span=(0.0, 2.0),
-        solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text=unscheduled_text,
-    ).to_payload()
-
-    assert "intervention_schedule" not in scheduled_payload
-    assert "intervention_schedule" not in unscheduled_payload
-
-
-def test_execution_request_explicit_none_schedule_overrides_scheduled_mechanism_text() -> None:
-    from kindred.core.simulation_preparation import SimulationExecutionRequest
-
-    scheduled_text = "\n".join(
-        [
-            "reaction: A -> B; k=0",
-            "initial: A=1.0",
-            "initial: B=0.0",
-            "intervention: op=set; species=A; time=0.0; value=2.0",
-        ]
-    )
+    kwargs = {}
+    if include_schedule_key:
+        kwargs["intervention_schedule"] = intervention_schedule
 
     payload = SimulationExecutionRequest(
         prepared_payload=None,
         initials={"A": 1.0, "B": 0.0},
         t_span=(0.0, 2.0),
         solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text=scheduled_text,
-        intervention_schedule=None,
+        mechanism_text="\n".join(mechanism_lines),
+        **kwargs,
     ).to_payload()
 
-    assert payload["intervention_schedule"] is None
+    if include_schedule_key:
+        assert payload["intervention_schedule"] == expected_payload_value
+    else:
+        assert "intervention_schedule" not in payload
 
 
 def test_unscheduled_execution_request_does_not_inherit_prepared_payload_schedule() -> None:

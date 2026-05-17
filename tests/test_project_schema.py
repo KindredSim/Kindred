@@ -51,8 +51,9 @@ class TestProjectDefaults:
         assert second["batch_initial_conditions"] == {}
         assert second["mechanism"] == ""
 
-    def test_value_types(self):
-        from kindred.gui.project_schema import get_default_project_payload
+    def test_default_payload_types_and_authoritative_values(self):
+        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
+        from kindred.gui.project_schema import PROJECT_DEFAULTS, get_default_project_payload
 
         p = get_default_project_payload()
         assert isinstance(p["mechanism"], str)
@@ -70,21 +71,7 @@ class TestProjectDefaults:
         assert isinstance(p["temperature_K"], float)
         assert isinstance(p["simulation_time"], str)
         assert isinstance(p["num_points"], int)
-
-    def test_schema_version_matches(self):
-        from kindred.gui.project_schema import PROJECT_SCHEMA_VERSION
-
-        assert PROJECT_SCHEMA_VERSION == 4
-
-    def test_solver_default_matches_core(self):
-        from kindred.core.simulator.solvers import DEFAULT_SOLVER_NAME
-        from kindred.gui.project_schema import PROJECT_DEFAULTS
-
         assert PROJECT_DEFAULTS["solver"] == DEFAULT_SOLVER_NAME
-
-    def test_performance_defaults_match_expected_values(self):
-        from kindred.gui.project_schema import PROJECT_DEFAULTS
-
         assert PROJECT_DEFAULTS["use_sparse_jacobian"] is True
         assert PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"] is True
         assert PROJECT_DEFAULTS["max_parallel_batch_workers"] == min(
@@ -95,6 +82,11 @@ class TestProjectDefaults:
             PROJECT_DEFAULTS["batch_runtime_lane_budget"]
             == PROJECT_DEFAULTS["max_parallel_batch_workers"]
         )
+
+    def test_schema_version_matches(self):
+        from kindred.gui.project_schema import PROJECT_SCHEMA_VERSION
+
+        assert PROJECT_SCHEMA_VERSION == 4
 
     def test_runtime_default_batch_workers_caps_high_cpu_count(self):
         from kindred.core import runtime_defaults

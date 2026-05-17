@@ -3,13 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tests.test_global_fit_phase2_defaults_dataset_mgmt_ic_editor import (
-    _latest_fit_window,
-    _make_fit_result,
-    _patch_message_box_exec,
-    _seed_simple_mechanism,
-    _seed_two_datasets,
-    _show_only_batch_set,
+from tests.workflow_helpers import (
+    latest_fit_window,
+    make_fit_result,
+    patch_message_box_exec,
+    seed_simple_mechanism,
+    seed_two_datasets,
+    show_only_batch_set,
 )
 
 
@@ -38,7 +38,7 @@ def test_global_fit_launch_creates_and_seeds_batch_set_from_dataset_t0(main_wind
 
     main_window._mechanism_editor._reactions_text.setPlainText("reaction: A -> B; k=0.2")
     main_window._run_global_fit()
-    window = _latest_fit_window(main_window)
+    window = latest_fit_window(main_window)
     try:
         row = main_window._batch_store.row_for_set("dataset1")
         assert row is not None
@@ -55,8 +55,8 @@ def test_global_fit_launch_creates_and_seeds_batch_set_from_dataset_t0(main_wind
 def test_global_fit_apply_to_project_parameters_only_respects_dirty_slider_guard(main_window, monkeypatch):
     from PySide6 import QtWidgets
 
-    _seed_two_datasets(main_window)
-    _seed_simple_mechanism(main_window)
+    seed_two_datasets(main_window)
+    seed_simple_mechanism(main_window)
     main_window._extract_and_populate_variables()
     main_window._preview_session.stage_slider_value("k1", 2.0)
     assert main_window._preview_session.has_dirty_transaction() is True
@@ -66,7 +66,7 @@ def test_global_fit_apply_to_project_parameters_only_respects_dirty_slider_guard
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    _patch_message_box_exec(monkeypatch)
+    patch_message_box_exec(monkeypatch)
 
     prompt_actions: list[str] = []
     programmatic_calls: list[str] = []
@@ -79,11 +79,11 @@ def test_global_fit_apply_to_project_parameters_only_respects_dirty_slider_guard
     monkeypatch.setattr(main_window, "_on_programmatic_mechanism_load", lambda: programmatic_calls.append("called"))
 
     main_window._run_global_fit()
-    window = _latest_fit_window(main_window)
+    window = latest_fit_window(main_window)
     try:
         window._handle_global_fit_complete(
             {
-                "result": _make_fit_result(
+                "result": make_fit_result(
                     k_value=0.55,
                     dataset_initials={"ds1": {"init:A": 2.5}, "ds2": {"init:A": 1.7}},
                 )
@@ -112,17 +112,17 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
 ):
     from PySide6 import QtWidgets
 
-    _seed_two_datasets(main_window)
-    _seed_simple_mechanism(main_window)
+    seed_two_datasets(main_window)
+    seed_simple_mechanism(main_window)
     monkeypatch.setattr(
         main_window._dataset_manager,
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    _patch_message_box_exec(monkeypatch)
+    patch_message_box_exec(monkeypatch)
 
     main_window._run_global_fit()
-    window = _latest_fit_window(main_window)
+    window = latest_fit_window(main_window)
     try:
         ds1_settings = main_window._dataset_manager.get_fit_settings("ds1")
         ds2_settings = main_window._dataset_manager.get_fit_settings("ds2")
@@ -130,7 +130,7 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
         ds2_row = main_window._batch_store.row_for_set_id(str(ds2_settings.batch_set_id))
         assert ds1_row is not None
         assert ds2_row is not None
-        set_id, set_name = _show_only_batch_set(main_window, row=int(ds1_row), qt_app=qt_app)
+        set_id, set_name = show_only_batch_set(main_window, row=int(ds1_row), qt_app=qt_app)
         ds2_set_id = str(ds2_settings.batch_set_id)
         ds2_set_name = str(main_window._batch_store.set_name_for_row(int(ds2_row)))
 
@@ -161,7 +161,7 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
 
         window._handle_global_fit_complete(
             {
-                "result": _make_fit_result(
+                "result": make_fit_result(
                     k_value=0.44,
                     dataset_initials={"ds1": {"init:A": 2.5}},
                 )
@@ -201,17 +201,17 @@ def test_global_fit_apply_to_project_initial_conditions_discards_only_affected_d
 ):
     from PySide6 import QtWidgets
 
-    _seed_two_datasets(main_window)
-    _seed_simple_mechanism(main_window)
+    seed_two_datasets(main_window)
+    seed_simple_mechanism(main_window)
     monkeypatch.setattr(
         main_window._dataset_manager,
         "scan_mechanism_parameters",
         lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
     )
-    _patch_message_box_exec(monkeypatch)
+    patch_message_box_exec(monkeypatch)
 
     main_window._run_global_fit()
-    window = _latest_fit_window(main_window)
+    window = latest_fit_window(main_window)
     try:
         ds1_settings = main_window._dataset_manager.get_fit_settings("ds1")
         ds2_settings = main_window._dataset_manager.get_fit_settings("ds2")
@@ -237,7 +237,7 @@ def test_global_fit_apply_to_project_initial_conditions_discards_only_affected_d
 
         window._handle_global_fit_complete(
             {
-                "result": _make_fit_result(
+                "result": make_fit_result(
                     k_value=0.44,
                     dataset_initials={"ds1": {"init:A": 2.5}},
                 )
@@ -255,5 +255,51 @@ def test_global_fit_apply_to_project_initial_conditions_discards_only_affected_d
         assert float(main_window._batch_store.get_value(int(ds1_row), "A")) == pytest.approx(2.5)
         assert main_window._preview_session.has_dirty_state_for_set(ds1_set_id) is False
         assert main_window._preview_session.has_dirty_state_for_set(ds2_set_id) is True
+    finally:
+        window.close()
+
+
+def test_global_fit_rejects_stale_terminal_result_before_project_apply(main_window, monkeypatch):
+    seed_two_datasets(main_window)
+    seed_simple_mechanism(main_window)
+    monkeypatch.setattr(
+        main_window._dataset_manager,
+        "scan_mechanism_parameters",
+        lambda _dsl: [{"name": "k1", "value": 0.2, "min": 0.01, "max": 1.0}],
+    )
+    patch_message_box_exec(monkeypatch)
+
+    main_window._run_global_fit()
+    window = latest_fit_window(main_window)
+    try:
+        window._fit_run_state_owner.set_active_run_stamp_hash("current-fit-run")
+        before_result = getattr(window, "_last_result", None)
+
+        window._handle_global_fit_complete(
+            {
+                "result": make_fit_result(
+                    k_value=9.0,
+                    dataset_initials={"ds1": {"init:A": 9.0}, "ds2": {"init:A": 8.0}},
+                ),
+                "run_stamp_hash": "old-fit-run",
+            }
+        )
+
+        assert getattr(window, "_last_result", None) is before_result
+        assert window._apply_to_project_button.isEnabled() is False
+
+        current_result = make_fit_result(
+            k_value=0.66,
+            dataset_initials={"ds1": {"init:A": 2.5}, "ds2": {"init:A": 1.7}},
+        )
+        window._handle_global_fit_complete(
+            {
+                "result": current_result,
+                "run_stamp_hash": "current-fit-run",
+            }
+        )
+
+        assert window._last_result is current_result
+        assert window._apply_to_project_button.isEnabled() is True
     finally:
         window.close()

@@ -1669,16 +1669,24 @@ def test_apply_to_remaining_handles_unicode_decode_error(tmp_path, monkeypatch, 
 # Remaining-file detection uses full row for has_unit_row
 # ---------------------------------------------------------------------------
 
-def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot):
+@pytest.mark.parametrize("file_kind", ["csv", "excel"])
+def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot, file_kind):
     """has_unit_row is a physical property of the full row.  When unit text
     appears only in an unselected column (B has 'nM', selected columns time
     and A are blank), _build_remaining_file_config must still detect the
     unit row so that skip_unit_row=True in the resolved plan."""
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
-    # CSV where unit text appears ONLY in unselected column B
-    csv_path = tmp_path / "sparse_units.csv"
-    _write_csv(csv_path, ["time", "A", "B"], [["", "", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+    if file_kind == "csv":
+        filepath = tmp_path / "sparse_units.csv"
+        _write_csv(filepath, ["time", "A", "B"], [["", "", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+        kwargs = {}
+    else:
+        filepath = tmp_path / "sparse_units.xlsx"
+        _write_workbook(filepath, {
+            "Data": (["time", "A", "B"], [["", "", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]]),
+        })
+        kwargs = {"source_sheet_names": ("Data",)}
 
     source_intent = SheetImportIntent(
         time_column="time",
@@ -1690,36 +1698,7 @@ def test_remaining_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot
 
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
-    config = panel._build_remaining_file_config(str(csv_path), source_intent)
-
-    assert config.plans[0].skip_unit_row is True, (
-        "Unit row must be detected from full row (column B has 'nM') "
-        "even though selected column A has no unit text"
-    )
-
-def test_remaining_excel_file_detects_unit_row_from_unselected_columns(tmp_path, qtbot):
-    """Excel variant: unit text only in unselected column B must still
-    trigger has_unit_row=True for the remaining file."""
-    from kindred.gui.widgets.data_manager import DataManagerPanel
-
-    xlsx_path = tmp_path / "sparse_units.xlsx"
-    _write_workbook(xlsx_path, {
-        "Data": (["time", "A", "B"], [["", "", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]]),
-    })
-
-    source_intent = SheetImportIntent(
-        time_column="time",
-        species_columns=("A",),
-        time_unit="s",
-        concentration_units={"A": "M"},
-        override_no_unit_row=False,
-    )
-
-    panel = DataManagerPanel()
-    qtbot.addWidget(panel)
-    config = panel._build_remaining_file_config(
-        str(xlsx_path), source_intent, source_sheet_names=("Data",),
-    )
+    config = panel._build_remaining_file_config(str(filepath), source_intent, **kwargs)
 
     assert config.plans[0].skip_unit_row is True, (
         "Unit row must be detected from full row (column B has 'nM') "
@@ -1848,20 +1827,29 @@ def test_per_column_provenance_stored(tmp_path, monkeypatch, qtbot):
 # Fix B regression: remaining-file must use target's detected units
 # ---------------------------------------------------------------------------
 
-def test_remaining_file_uses_target_detected_units_not_source(tmp_path, monkeypatch, qtbot):
+@pytest.mark.parametrize("file_kind", ["csv", "excel"])
+def test_remaining_file_uses_target_detected_units_not_source(tmp_path, monkeypatch, qtbot, file_kind):
     """When apply_to_remaining copies source intent to a remaining file,
     concentration_units must be rebuilt from the TARGET file's own unit row
     detection, not carried verbatim from the source file.
 
-    File1: unit row s, uM, uM.  File2: unit row s, uM, nM.
+    Source file: unit row s, uM, uM.  Target file: unit row s, uM, nM.
     Source intent has concentration_units={'A': 'uM', 'B': 'uM'}.
-    After _build_remaining_file_config, file2's intent must have B='nM'."""
+    After _build_remaining_file_config, the target intent must have B='nM'."""
     from kindred.gui.widgets.data_manager import DataManagerPanel
 
-    file1 = tmp_path / "source_units.csv"
-    file2 = tmp_path / "target_units.csv"
-    _write_csv(file1, ["time", "A", "B"], [["s", "uM", "uM"], [0.0, 1.0, 2.0], [1.0, 3.0, 4.0]])
-    _write_csv(file2, ["time", "A", "B"], [["s", "uM", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+    if file_kind == "csv":
+        filepath = tmp_path / "target_units.csv"
+        _write_csv(filepath, ["time", "A", "B"], [["s", "uM", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]])
+        kwargs = {}
+        intent_key = None
+    else:
+        filepath = tmp_path / "target_units.xlsx"
+        _write_workbook(filepath, {
+            "Sheet1": (["time", "A", "B"], [["s", "uM", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]]),
+        })
+        kwargs = {"source_sheet_names": ("Sheet1",)}
+        intent_key = "Sheet1"
 
     panel = DataManagerPanel()
     qtbot.addWidget(panel)
@@ -1874,11 +1862,11 @@ def test_remaining_file_uses_target_detected_units_not_source(tmp_path, monkeypa
         override_no_unit_row=False,
     )
 
-    config = panel._build_remaining_file_config(str(file2), source_intent)
+    config = panel._build_remaining_file_config(str(filepath), source_intent, **kwargs)
 
-    target_intent = dict(config.per_sheet_intents)[None]
+    target_intent = dict(config.per_sheet_intents)[intent_key]
     assert target_intent.concentration_units["B"] == "nM", (
-        "File2 column B must use its own detected unit (nM), not source's (uM)"
+        "Target column B must use its own detected unit (nM), not source's (uM)"
     )
     assert target_intent.concentration_units["A"] == "uM"
 
@@ -1889,37 +1877,6 @@ def test_remaining_file_uses_target_detected_units_not_source(tmp_path, monkeypa
         "File2 column B factor must reflect nM, not uM"
     )
     assert plan.conc_factors["A"] == pytest.approx(parse_concentration_unit("uM"))
-
-def test_remaining_excel_file_uses_target_detected_units_not_source(tmp_path, monkeypatch, qtbot):
-    """Excel variant of Fix B: remaining Excel file sheets must use their own
-    detected units, not the source file's."""
-    from kindred.gui.widgets.data_manager import DataManagerPanel
-
-    xlsx_path = tmp_path / "target_units.xlsx"
-    _write_workbook(xlsx_path, {
-        "Sheet1": (["time", "A", "B"], [["s", "uM", "nM"], [0.0, 5.0, 6.0], [1.0, 7.0, 8.0]]),
-    })
-
-    panel = DataManagerPanel()
-    qtbot.addWidget(panel)
-
-    source_intent = SheetImportIntent(
-        time_column="time",
-        species_columns=("A", "B"),
-        time_unit="s",
-        concentration_units={"A": "uM", "B": "uM"},
-        override_no_unit_row=False,
-    )
-
-    config = panel._build_remaining_file_config(
-        str(xlsx_path), source_intent, source_sheet_names=("Sheet1",),
-    )
-
-    target_intent = dict(config.per_sheet_intents)["Sheet1"]
-    assert target_intent.concentration_units["B"] == "nM", (
-        "Sheet1 column B must use its own detected unit (nM), not source's (uM)"
-    )
-    assert target_intent.concentration_units["A"] == "uM"
 
 def test_remaining_file_fallback_to_source_when_target_has_no_detected_unit(tmp_path, qtbot):
     """When the target file has no detected unit for a column, the source

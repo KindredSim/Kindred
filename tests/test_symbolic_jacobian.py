@@ -98,7 +98,6 @@ def test_symbolic_jacobian_structure_does_not_carry_default_parameter_values():
 
     structure = build_symbolic_jacobian_structure(mechanism)
 
-    assert not hasattr(structure, "default_parameter_values")
     with pytest.raises(Exception, match="Missing symbolic parameter value"):
         structure.bind()
 

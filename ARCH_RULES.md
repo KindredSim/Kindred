@@ -143,22 +143,19 @@ Before merging any change that touches simulator plumbing or core models:
 - Run targeted tests relevant to the touched area (and ensure no `ImportError` at import time).
 
 Before merging any change that touches simulation GUI ownership, ports, or controller wiring:
-- Run the architecture guard tests that cover the touched seam:
-  - `tests/test_arch_simulation_controller_port_usage.py`
-  - `tests/test_arch_simulation_ports_contract.py`
-  - `tests/test_main_window_app_wiring_contract.py`
-  - `tests/test_main_window_preview_session_boundary.py`
-  - `tests/test_main_window_variable_runtime_boundary.py`
-  - `tests/test_main_window_mechanism_helpers_boundary.py`
+- Run public workflow or compact contract tests that cover the touched seam:
+  - `tests/test_arch_simulation_ports_contract.py` (including the compact explicit-subport guard against flattened `self.ui.<method>` access)
+  - `tests/test_simulation_workflows.py`
+  - `tests/test_runtime_readiness_gui_workflow.py`
 
 Before merging any change that touches import pipeline types or resolver:
-- Run tests: `tests/test_import_config.py`, `tests/test_import_config_dialog.py`, `tests/test_import_integration.py`, `tests/test_import_sweep_regressions.py`, `tests/test_excel_import.py`
+- Run tests: `tests/test_import_config.py`, `tests/test_data_manager_import_wiring.py`, `tests/test_excel_import.py`
 
 Before merging any change that touches fitting window, worker, or species table:
-- Run tests: `tests/test_fitting.py`, `tests/test_fitting_cancellation_contract.py`, `tests/test_fitting_failure_behavior.py`, `tests/test_fitting_launch_owner_contract.py`, `tests/test_fitting_window_gui_fixes.py`, `tests/test_fitting_mixin_dsl_update_errors.py`, `tests/test_fitting_objective_direct_module.py`, `tests/test_fitting_objective_pipeline_contract.py`
+- Run tests: `tests/test_core_workflows.py`, `tests/test_fitting_objective_direct_module.py`, `tests/test_fitting_completion_contract.py`, `tests/test_global_fit_project_workflows.py`
 
 Before merging any change that touches species table or fit-universe:
-- Run tests: `tests/test_species_sliders_logic.py`, `tests/test_species_statistics_result_selector.py`, `tests/test_species_statistics_table_layout.py`
+- Run tests: `tests/test_global_fit_project_workflows.py`, `tests/test_fitting_objective_direct_module.py`
 
 ## 6) GUI Architecture (Controllers and Layout)
 
