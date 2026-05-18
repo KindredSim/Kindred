@@ -129,6 +129,7 @@ class _TerminalFailureReplaySnapshot:
     active: bool
     request_id: Optional[int]
     target_set_ids: tuple[str, ...]
+    replay_generation: int = 0
     dirty_generation_by_set_id: tuple[tuple[str, int], ...] = ()
 
 
@@ -487,13 +488,6 @@ class SimulationController(QtCore.QObject):
     def _pending_slider_simulation(self) -> bool:
         return bool(self._pending_slider_preview_launch.active)
 
-    @_pending_slider_simulation.setter
-    def _pending_slider_simulation(self, value: object) -> None:
-        self._run_state.pending_slider_preview_launch = replace(
-            self._pending_slider_preview_launch,
-            active=value,
-        )
-
     @property
     def _run_sequence_id(self) -> int:
         return int(self._run_state.run_sequence_id)
@@ -533,13 +527,6 @@ class SimulationController(QtCore.QObject):
     def _pending_slider_sim_request_id(self) -> Optional[int]:
         return self._pending_slider_preview_launch.request_id
 
-    @_pending_slider_sim_request_id.setter
-    def _pending_slider_sim_request_id(self, value: Optional[int]) -> None:
-        self._run_state.pending_slider_preview_launch = replace(
-            self._pending_slider_preview_launch,
-            request_id=(int(value) if value is not None else None),
-        )
-
     @property
     def _pending_slider_target_set_ids(self) -> Tuple[str, ...]:
         return tuple(
@@ -548,32 +535,9 @@ class SimulationController(QtCore.QObject):
             if str(set_id)
         )
 
-    @_pending_slider_target_set_ids.setter
-    def _pending_slider_target_set_ids(self, value: Sequence[str]) -> None:
-        normalized: list[str] = []
-        seen: set[str] = set()
-        values = (value,) if isinstance(value, str) else value
-        for set_id in values or ():
-            set_id_s = str(set_id or "").strip()
-            if not set_id_s or set_id_s in seen:
-                continue
-            seen.add(set_id_s)
-            normalized.append(set_id_s)
-        self._run_state.pending_slider_preview_launch = replace(
-            self._pending_slider_preview_launch,
-            target_set_ids=tuple(normalized),
-        )
-
     @property
     def _pending_slider_handoff_queued(self) -> bool:
         return bool(self._pending_slider_preview_launch.handoff_queued)
-
-    @_pending_slider_handoff_queued.setter
-    def _pending_slider_handoff_queued(self, value: bool) -> None:
-        self._run_state.pending_slider_preview_launch = replace(
-            self._pending_slider_preview_launch,
-            handoff_queued=bool(value),
-        )
 
     @property
     def _pending_slider_preview_launch(self) -> PendingSliderPreviewLaunchState:
@@ -583,6 +547,15 @@ class SimulationController(QtCore.QObject):
         normalized = PendingSliderPreviewLaunchState()
         self._run_state.pending_slider_preview_launch = normalized
         return normalized
+
+    def _next_pending_slider_preview_replay_generation(self) -> int:
+        current = getattr(self._run_state, "pending_slider_preview_replay_generation", 0)
+        try:
+            next_generation = max(0, int(current)) + 1
+        except (TypeError, ValueError, OverflowError):
+            next_generation = 1
+        self._run_state.pending_slider_preview_replay_generation = int(next_generation)
+        return int(next_generation)
 
     @property
     def _pending_run_after_runtime_ready(self) -> PendingRunAfterRuntimeReadyState:
@@ -1000,6 +973,7 @@ class SimulationController(QtCore.QObject):
             request_id=next_request_id,
             target_set_ids=normalized_targets,
             handoff_queued=preserve_handoff_queued,
+            replay_generation=self._next_pending_slider_preview_replay_generation(),
         )
 
     def submit_slider_preview_replay_intent(
@@ -1265,6 +1239,7 @@ class SimulationController(QtCore.QObject):
                 active=False,
                 request_id=pending.request_id,
                 target_set_ids=target_set_ids,
+                replay_generation=pending.replay_generation,
             )
         dirty_state = self._capture_dirty_state_by_set_id(target_set_ids)
         generations: list[tuple[str, int]] = []
@@ -1275,12 +1250,14 @@ class SimulationController(QtCore.QObject):
                     active=False,
                     request_id=pending.request_id,
                     target_set_ids=target_set_ids,
+                    replay_generation=pending.replay_generation,
                 )
             generations.append((str(set_id), int(state.generation)))
         return _TerminalFailureReplaySnapshot(
             active=True,
             request_id=pending.request_id,
             target_set_ids=target_set_ids,
+            replay_generation=pending.replay_generation,
             dirty_generation_by_set_id=tuple(generations),
         )
 
@@ -1322,6 +1299,7 @@ class SimulationController(QtCore.QObject):
             tuple(str(set_id) for set_id in (current.target_set_ids or ()) if str(set_id))
             == tuple(snapshot.target_set_ids)
             and current.request_id == snapshot.request_id
+            and int(current.replay_generation) == int(snapshot.replay_generation)
         )
 
     def _apply_post_modal_explicit_failure_pending_replay_policy(
@@ -4402,7 +4380,6 @@ class SimulationController(QtCore.QObject):
         if bool(runtime_readiness_only):
             return True
         logger.debug("Fast slider run already in flight; recording latest-only pending request")
-        self._pending_slider_simulation = True
         deferred_target_set_ids: list[str] = []
         for row in list(batch_rows or []):
             try:
@@ -4412,10 +4389,11 @@ class SimulationController(QtCore.QObject):
             set_id_s = str(set_id or "").strip()
             if set_id_s and set_id_s not in deferred_target_set_ids:
                 deferred_target_set_ids.append(set_id_s)
-        if deferred_target_set_ids:
-            self._pending_slider_target_set_ids = deferred_target_set_ids
-        if request_id is not None:
-            self._pending_slider_sim_request_id = int(request_id)
+        self.queue_pending_slider_preview_replay(
+            target_set_ids=deferred_target_set_ids or self._pending_slider_target_set_ids,
+            request_id=int(request_id) if request_id is not None else None,
+            preserve_existing_request=request_id is None,
+        )
         return True
 
     def _run_request_id(self, *, request_id: Optional[int], runtime_readiness_only: bool) -> int:

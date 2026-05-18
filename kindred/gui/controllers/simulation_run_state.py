@@ -86,6 +86,7 @@ class PendingSliderPreviewLaunchState:
     request_id: Optional[int] = None
     target_set_ids: tuple[str, ...] = ()
     handoff_queued: bool = False
+    replay_generation: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "active", _normalize_preview_bool(self.active))
@@ -96,6 +97,7 @@ class PendingSliderPreviewLaunchState:
             _normalize_preview_target_set_ids(self.target_set_ids),
         )
         object.__setattr__(self, "handoff_queued", _normalize_preview_bool(self.handoff_queued))
+        object.__setattr__(self, "replay_generation", _normalize_preview_epoch(self.replay_generation))
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +134,7 @@ class SimulationRunState(QtCore.QObject):
         self.progress_flush_timer.timeout.connect(on_progress_timeout)
         self.slider_simulation_active = False
         self.pending_slider_preview_launch = PendingSliderPreviewLaunchState()
+        self.pending_slider_preview_replay_generation = 0
         self.pending_run_after_runtime_ready = PendingRunAfterRuntimeReadyState()
         self.run_sequence_id = 0
         self.active_run_id = 0

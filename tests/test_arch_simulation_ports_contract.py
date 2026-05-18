@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import fields
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,6 +79,85 @@ def test_slider_preview_lifecycle_port_is_explicit_and_bounded() -> None:
 
     assert actual_methods == expected_methods
     assert "__getattr__" not in lifecycle_block
+
+
+def test_pending_slider_replay_state_owns_explicit_freshness_identity() -> None:
+    from kindred.gui.controllers.simulation_run_state import PendingSliderPreviewLaunchState
+
+    field_names = {field.name for field in fields(PendingSliderPreviewLaunchState)}
+    assert "request_id" in field_names
+    assert "target_set_ids" in field_names
+    assert "replay_generation" in field_names
+
+    state = PendingSliderPreviewLaunchState(
+        active=True,
+        request_id="42",
+        target_set_ids=["set-1", "set-1"],
+        replay_generation="7",
+    )
+
+    assert state.request_id == 42
+    assert state.target_set_ids == ("set-1",)
+    assert state.replay_generation == 7
+
+
+def test_preserved_pending_slider_replay_keeps_launch_identity_but_refreshes_intent() -> None:
+    from kindred.gui.controllers.simulation_controller import SimulationController
+    from kindred.gui.controllers.simulation_run_state import PendingSliderPreviewLaunchState
+
+    controller = SimulationController.__new__(SimulationController)
+    controller._run_state = SimpleNamespace(
+        pending_slider_preview_launch=PendingSliderPreviewLaunchState(
+            active=True,
+            request_id=42,
+            target_set_ids=("set-1",),
+            handoff_queued=True,
+            replay_generation=3,
+        ),
+        pending_slider_preview_replay_generation=3,
+    )
+
+    controller.queue_pending_slider_preview_replay(
+        target_set_ids=["set-1"],
+        preserve_existing_request=True,
+    )
+
+    pending = controller._pending_slider_preview_launch
+    assert pending.active is True
+    assert pending.request_id == 42
+    assert pending.target_set_ids == ("set-1",)
+    assert pending.handoff_queued is True
+    assert pending.replay_generation == 4
+
+
+def test_simulation_controller_has_no_pending_replay_setters_that_bypass_generation() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    target = repo_root / "kindred" / "gui" / "controllers" / "simulation_controller.py"
+    assert target.is_file(), f"Expected file at {target}"
+
+    tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
+    controller_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SimulationController"
+    )
+    forbidden_setters = {
+        "_pending_slider_simulation",
+        "_pending_slider_sim_request_id",
+        "_pending_slider_target_set_ids",
+        "_pending_slider_handoff_queued",
+    }
+    setter_names: set[str] = set()
+    for node in controller_class.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Attribute) and decorator.attr == "setter":
+                value = decorator.value
+                if isinstance(value, ast.Name):
+                    setter_names.add(value.id)
+
+    assert forbidden_setters.isdisjoint(setter_names)
 
 
 def test_build_simulation_plumbing_wires_truthful_explicit_owners() -> None:
