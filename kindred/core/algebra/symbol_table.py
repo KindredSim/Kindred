@@ -7,7 +7,11 @@ import logging
 from typing import Dict, Mapping
 
 from kindred.core.algebra.symbols import SymbolTable
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+)
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
     is_protected_indexed_identifier,
@@ -36,6 +40,12 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
     step_map = metadata.get("step_index_map") if isinstance(metadata, dict) else None
     if not isinstance(step_map, list):
         raise ValueError("Mechanism step_index_map is missing; cannot build an authoritative algebra symbol table.")
+    temperature_K = 298.15
+    if isinstance(metadata, Mapping):
+        try:
+            temperature_K = float(metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+        except (TypeError, ValueError, OverflowError):
+            temperature_K = 298.15
     rxns = list(getattr(mechanism, "reactions", []) or [])
     eqs = list(getattr(mechanism, "equilibria", []) or [])
 
@@ -59,22 +69,12 @@ def build_algebra_symbol_table(mechanism) -> SymbolTable:
                 if not (0 <= eq_idx < len(eqs)):
                     raise ValueError(f"equilibrium index {eq_idx} is out of range")
                 eq = eqs[eq_idx]
-                if info.role in {"kf", "kr"}:
+                if info.role == "kf":
                     value_obj = getattr(eq, str(info.role), None)
+                elif info.role == "kr":
+                    value_obj = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
                 elif info.role == "Keq":
-                    eq_meta = getattr(eq, "metadata", {}) or {}
-                    value_obj = None
-                    if isinstance(eq_meta, Mapping):
-                        value_obj = eq_meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-                    if value_obj is None:
-                        kf_obj = getattr(eq, "kf", None)
-                        kr_obj = getattr(eq, "kr", None)
-                        kf_raw = kf_obj() if callable(kf_obj) else kf_obj
-                        kr_raw = kr_obj() if callable(kr_obj) else kr_obj
-                        kr_value = float(kr_raw)
-                        if kr_value == 0.0:
-                            raise ValueError("reverse rate is zero")
-                        value_obj = float(kf_raw) / kr_value
+                    value_obj = effective_equilibrium_keq(eq, temperature_K=temperature_K)
                 else:
                     raise ValueError(f"unsupported equilibrium role {info.role!r}")
             else:

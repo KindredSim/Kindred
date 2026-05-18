@@ -7,6 +7,8 @@ Authoritative fitting API.
   `kindred.core.analysis.global_fitting`.
 - `runtime_session`, `max_runtime_lanes`, and `runtime_ledger` are optional
   internal runtime-controller integration hooks used by the GUI fitting workflow.
+- `contained_runtime=True` is an explicit public/core opt-in for a temporary
+  contained runtime session. The default public path stays in-process.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ def fit_global(
     runtime_session: Optional[Any] = None,
     max_runtime_lanes: Optional[int] = None,
     runtime_ledger: Optional[Any] = None,
+    contained_runtime: bool = False,
 ) -> Any:
     """Run global fitting through the authoritative core implementation.
 
@@ -82,6 +85,7 @@ def fit_global(
         runtime_session=runtime_session,
         max_runtime_lanes=max_runtime_lanes,
         runtime_ledger=runtime_ledger,
+        contained_runtime=bool(contained_runtime),
     )
 
 

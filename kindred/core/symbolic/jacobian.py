@@ -10,6 +10,11 @@ import numpy as np
 
 from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateAuthorityKind,
+    effective_reverse_rate_from_keq,
+    normalize_existing_equilibrium_rate_authority,
+)
 from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
@@ -99,6 +104,22 @@ class SymbolicJacobianSupport:
         state = "supported" if self.supported else "unsupported"
         reason = self.reason if self.reason else "Symbolic Jacobian supported."
         return symbolic_status_payload(kind="jacobian", state=state, code=self.code, reason=reason)
+
+
+@dataclass(frozen=True, slots=True)
+class _EquilibriumRateSource:
+    kind: str
+    kf: object | None
+    kr: object | None
+    keq: object | None
+    kf_name: str
+    kr_name: str
+    keq_name: str
+    reverse_std_ratio: float = 1.0
+
+    @property
+    def consumes_keq(self) -> bool:
+        return self.kind == "kf_plus_keq"
 
 
 class _ParameterRegistry:
@@ -261,17 +282,25 @@ def _reaction_rate_expr(
 def _explicit_keq_source(eq: Equilibrium) -> object | None:
     meta = getattr(eq, "metadata", {}) or {}
     if isinstance(meta, Mapping):
+        keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+        if keq_input is not None:
+            return keq_input
+    return getattr(eq, "Keq", None)
+
+
+def _metadata_keq_input(eq: Equilibrium) -> object | None:
+    meta = getattr(eq, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
         return meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
     return None
 
 
-def _equilibrium_rates(
+def _equilibrium_rate_source(
     mechanism: Mechanism,
     eq: Equilibrium,
-    registry: _ParameterRegistry,
     *,
     equilibrium_index: int,
-) -> tuple[Any, Any]:
+) -> _EquilibriumRateSource:
     kf = getattr(eq, "kf", None)
     kr = getattr(eq, "kr", None)
     keq = _explicit_keq_source(eq)
@@ -299,25 +328,56 @@ def _equilibrium_rates(
         expected_name=f"Keq{int(equilibrium_index) + 1}",
         value=keq,
     )
-    if kf is None and kr is not None and keq is not None:
-        kr_symbol = registry.parameter(kr, label="equilibrium kr", default_name=kr_name)
-        keq_val = _finite_scalar(keq, label="equilibrium Keq")
+
+    kind = "unsupported"
+    try:
+        authority = normalize_existing_equilibrium_rate_authority(eq)
+    except ValueError:
+        authority = None
+    if authority is not None and authority.kind == EquilibriumRateAuthorityKind.KR:
+        kind = "explicit_pair"
+        keq = None
+    elif authority is not None and authority.kind == EquilibriumRateAuthorityKind.KEQ:
+        kind = "kf_plus_keq"
+        keq = authority.Keq
+    try:
+        reverse_std_ratio = float(authority.reverse_std_ratio) if authority is not None else 1.0
+    except Exception:
+        reverse_std_ratio = 1.0
+    if not math.isfinite(reverse_std_ratio) or reverse_std_ratio <= 0.0:
+        reverse_std_ratio = 1.0
+    return _EquilibriumRateSource(
+        kind=kind,
+        kf=kf,
+        kr=kr,
+        keq=keq,
+        kf_name=kf_name,
+        kr_name=kr_name,
+        keq_name=keq_name,
+        reverse_std_ratio=reverse_std_ratio,
+    )
+
+
+def _equilibrium_rates(
+    mechanism: Mechanism,
+    eq: Equilibrium,
+    registry: _ParameterRegistry,
+    *,
+    equilibrium_index: int,
+) -> tuple[Any, Any]:
+    source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
+    if source.kind == "kf_plus_keq":
+        kf_symbol = registry.parameter(source.kf, label="equilibrium kf", default_name=source.kf_name)
+        keq_val = _finite_scalar(source.keq, label="equilibrium Keq")
         if keq_val <= 0.0:
             raise UnsupportedSymbolicExpressionError("equilibrium Keq must be positive.")
-        keq_symbol = registry.parameter(keq, label="equilibrium Keq", default_name=keq_name)
-        return kr_symbol * keq_symbol, kr_symbol
-    if kr is None and kf is not None and keq is not None:
-        kf_symbol = registry.parameter(kf, label="equilibrium kf", default_name=kf_name)
-        keq_val = _finite_scalar(keq, label="equilibrium Keq")
-        if keq_val <= 0.0:
-            raise UnsupportedSymbolicExpressionError("equilibrium Keq must be positive.")
-        keq_symbol = registry.parameter(keq, label="equilibrium Keq", default_name=keq_name)
-        return kf_symbol, kf_symbol / keq_symbol
-    if kf is None or kr is None:
+        keq_symbol = registry.parameter(source.keq, label="equilibrium Keq", default_name=source.keq_name)
+        return kf_symbol, effective_reverse_rate_from_keq(kf_symbol, keq_symbol, source.reverse_std_ratio)
+    if source.kind != "explicit_pair":
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires explicit equilibrium kf/kr or one rate plus Keq.")
     return (
-        registry.parameter(kf, label="equilibrium kf", default_name=kf_name),
-        registry.parameter(kr, label="equilibrium kr", default_name=kr_name),
+        registry.parameter(source.kf, label="equilibrium kf", default_name=source.kf_name),
+        registry.parameter(source.kr, label="equilibrium kr", default_name=source.kr_name),
     )
 
 
@@ -399,10 +459,11 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
     equilibria_payload = []
     for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
         meta = dict(getattr(eq, "metadata", {}) or {})
-        kf = getattr(eq, "kf", None)
-        kr = getattr(eq, "kr", None)
-        keq = _explicit_keq_source(eq)
-        keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=idx - 1)
+        kf = source.kf
+        kr = source.kr
+        keq = source.keq
+        keq_input = _metadata_keq_input(eq)
         kf_kind = _symbolic_snapshot_value_kind(kf) if kf is not None else "missing"
         kr_kind = _symbolic_snapshot_value_kind(kr) if kr is not None else "missing"
         keq_kind = _symbolic_snapshot_value_kind(keq) if keq is not None else "missing"
@@ -428,28 +489,28 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
             unsupported_code = "temperature-dependent-equilibrium"
             unsupported_reason = "Temperature-dependent equilibrium models are outside symbolic Jacobian support."
             continue
-        if keq_input is not None and (
-            isinstance(keq_input, RateBinding)
-            or callable(keq_input)
-            or keq_input_kind != "snapshot_scalar"
+        if source.consumes_keq and (
+            keq is None
+            or isinstance(keq, RateBinding)
+            or callable(keq)
+            or keq_kind != "snapshot_scalar"
         ):
             unsupported_code = "unsupported-keq-input"
             unsupported_reason = f"Symbolic Jacobian does not support dynamic or non-finite Keq input for equilibrium {idx}."
             continue
-        supported_pair = False
-        if kf is not None and kr is not None:
+        if source.kind == "explicit_pair":
             supported_pair = kf_kind == "snapshot_scalar" and kr_kind == "snapshot_scalar"
-        elif kf is not None and keq is not None:
+        elif source.kind == "kf_plus_keq":
             supported_pair = kf_kind == "snapshot_scalar" and keq_kind == "snapshot_scalar"
-        elif kr is not None and keq is not None:
-            supported_pair = kr_kind == "snapshot_scalar" and keq_kind == "snapshot_scalar"
+        else:
+            supported_pair = False
         if not supported_pair:
             unsupported_code = "unsupported-equilibrium-parameters"
             unsupported_reason = (
                 f"Symbolic Jacobian is missing finite equilibrium parameters, including Keq, for equilibrium {idx}."
             )
             continue
-        if keq is not None and keq_kind == "snapshot_scalar":
+        if source.consumes_keq and keq is not None and keq_kind == "snapshot_scalar":
             keq_scalar = _symbolic_snapshot_scalar_value(keq)
             if keq_scalar is None or keq_scalar <= 0.0:
                 unsupported_code = "unsupported-equilibrium-keq"
@@ -496,35 +557,16 @@ def _structure_identity_payload(
         )
     equilibria_payload = []
     for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
+        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=idx - 1)
         equilibria_payload.append(
             {
                 "index": idx,
                 "stoich_forward": dict(getattr(eq, "stoich_forward", {}) or {}),
                 "stoich_back": dict(getattr(eq, "stoich_back", {}) or {}),
-                "kf_parameter": _canonical_step_parameter_name(
-                    mechanism,
-                    kind="equilibrium",
-                    item_index=idx - 1,
-                    role="kf",
-                    expected_name=f"kf{idx}",
-                    value=getattr(eq, "kf", None),
-                ) if getattr(eq, "kf", None) is not None else None,
-                "kr_parameter": _canonical_step_parameter_name(
-                    mechanism,
-                    kind="equilibrium",
-                    item_index=idx - 1,
-                    role="kr",
-                    expected_name=f"kr{idx}",
-                    value=getattr(eq, "kr", None),
-                ) if getattr(eq, "kr", None) is not None else None,
-                "keq_parameter": _canonical_step_parameter_name(
-                    mechanism,
-                    kind="equilibrium",
-                    item_index=idx - 1,
-                    role="Keq",
-                    expected_name=f"Keq{idx}",
-                    value=_explicit_keq_source(eq),
-                ) if _explicit_keq_source(eq) is not None else None,
+                "kf_parameter": source.kf_name if source.kind in {"explicit_pair", "kf_plus_keq"} else None,
+                "kr_parameter": source.kr_name if source.kind in {"explicit_pair", "kr_plus_keq"} else None,
+                "keq_parameter": source.keq_name if source.consumes_keq else None,
+                "reverse_std_ratio": source.reverse_std_ratio if source.consumes_keq else None,
             }
         )
     return {
@@ -551,41 +593,12 @@ def _structure_parameter_symbols(mechanism: Mechanism) -> tuple[str, ...]:
             )
         )
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
-        kf = getattr(eq, "kf", None)
-        kr = getattr(eq, "kr", None)
-        keq = _explicit_keq_source(eq)
-        kf_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="equilibrium",
-            item_index=int(equilibrium_index),
-            role="kf",
-            expected_name=f"kf{int(equilibrium_index) + 1}",
-            value=kf,
-        )
-        kr_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="equilibrium",
-            item_index=int(equilibrium_index),
-            role="kr",
-            expected_name=f"kr{int(equilibrium_index) + 1}",
-            value=kr,
-        )
-        keq_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="equilibrium",
-            item_index=int(equilibrium_index),
-            role="Keq",
-            expected_name=f"Keq{int(equilibrium_index) + 1}",
-            value=keq,
-        )
-        if kf is None and kr is not None and keq is not None:
-            parameter_names.update((kr_name, keq_name))
+        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
+        if source.kind == "kf_plus_keq":
+            parameter_names.update((source.kf_name, source.keq_name))
             continue
-        if kr is None and kf is not None and keq is not None:
-            parameter_names.update((kf_name, keq_name))
-            continue
-        if kf is not None and kr is not None:
-            parameter_names.update((kf_name, kr_name))
+        if source.kind == "explicit_pair":
+            parameter_names.update((source.kf_name, source.kr_name))
             continue
     return tuple(sorted(parameter_names))
 
@@ -607,44 +620,14 @@ def _parameter_values_for_mechanism(
         )
         values[name] = _finite_scalar(rate, label=f"symbolic parameter {name}")
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
-        kf = getattr(eq, "kf", None)
-        kr = getattr(eq, "kr", None)
-        keq = _explicit_keq_source(eq)
-        kf_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="equilibrium",
-            item_index=int(equilibrium_index),
-            role="kf",
-            expected_name=f"kf{int(equilibrium_index) + 1}",
-            value=kf,
-        )
-        kr_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="equilibrium",
-            item_index=int(equilibrium_index),
-            role="kr",
-            expected_name=f"kr{int(equilibrium_index) + 1}",
-            value=kr,
-        )
-        keq_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="equilibrium",
-            item_index=int(equilibrium_index),
-            role="Keq",
-            expected_name=f"Keq{int(equilibrium_index) + 1}",
-            value=keq,
-        )
-        if kf is None and kr is not None and keq is not None:
-            values[kr_name] = _finite_scalar(kr, label=f"symbolic parameter {kr_name}")
-            values[keq_name] = _finite_scalar(keq, label=f"symbolic parameter {keq_name}")
+        source = _equilibrium_rate_source(mechanism, eq, equilibrium_index=equilibrium_index)
+        if source.kind == "kf_plus_keq":
+            values[source.kf_name] = _finite_scalar(source.kf, label=f"symbolic parameter {source.kf_name}")
+            values[source.keq_name] = _finite_scalar(source.keq, label=f"symbolic parameter {source.keq_name}")
             continue
-        if kr is None and kf is not None and keq is not None:
-            values[kf_name] = _finite_scalar(kf, label=f"symbolic parameter {kf_name}")
-            values[keq_name] = _finite_scalar(keq, label=f"symbolic parameter {keq_name}")
-            continue
-        if kf is not None and kr is not None:
-            values[kf_name] = _finite_scalar(kf, label=f"symbolic parameter {kf_name}")
-            values[kr_name] = _finite_scalar(kr, label=f"symbolic parameter {kr_name}")
+        if source.kind == "explicit_pair":
+            values[source.kf_name] = _finite_scalar(source.kf, label=f"symbolic parameter {source.kf_name}")
+            values[source.kr_name] = _finite_scalar(source.kr, label=f"symbolic parameter {source.kr_name}")
             continue
 
     out: dict[str, float] = {}

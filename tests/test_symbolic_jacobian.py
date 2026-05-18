@@ -1133,7 +1133,6 @@ def test_symbolic_support_preflight_rejects_mutable_keq_input_before_structure_f
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
         kf=1.0,
-        kr=0.5,
         Keq=2.0,
         metadata={EquilibriumMetadataKeys.KEQ_INPUT: keq_input},
     )
@@ -1142,10 +1141,15 @@ def test_symbolic_support_preflight_rejects_mutable_keq_input_before_structure_f
         symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism)
 
 
-def test_symbolic_jacobian_rejects_nonpositive_direct_mechanism_keq_derivation():
+@pytest.mark.parametrize(
+    ("rate_kwargs", "expected_matrix"),
+    [
+        ({"kf": 2.0, "Keq": 4.0}, [[-2.0, 0.5], [2.0, -0.5]]),
+    ],
+)
+def test_symbolic_jacobian_supports_programmatic_kf_plus_keq(rate_kwargs, expected_matrix):
     from kindred.core.mechanism import Mechanism
-    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
-    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact, classify_symbolic_jacobian_support
 
     mechanism = Mechanism()
     mechanism.add_species("A", 1.0)
@@ -1153,9 +1157,119 @@ def test_symbolic_jacobian_rejects_nonpositive_direct_mechanism_keq_derivation()
     mechanism.add_equilibrium(
         stoich_forward={"A": 1.0},
         stoich_back={"B": 1.0},
-        kr=1.0,
+        **rate_kwargs,
+    )
+
+    support = classify_symbolic_jacobian_support(mechanism)
+    artifact = build_symbolic_jacobian_artifact(mechanism)
+
+    assert support.supported is True
+    np.testing.assert_allclose(
+        artifact.jacobian_func(0.0, np.asarray([1.0, 0.0], dtype=float)),
+        expected_matrix,
+    )
+
+
+@pytest.mark.parametrize(
+    "rate_kwargs",
+    [
+        {"Keq": 4.0},
+        {"kr": 0.5, "Keq": 4.0},
+        {"kf": 2.0, "kr": 0.5, "Keq": 4.0},
+    ],
+)
+def test_programmatic_equilibrium_rejects_non_normalized_rate_authority(rate_kwargs):
+    from kindred.core.mechanism import Mechanism
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+
+    with pytest.raises(ValueError, match="kf.*exactly one"):
+        mechanism.add_equilibrium(
+            stoich_forward={"A": 1.0},
+            stoich_back={"B": 1.0},
+            **rate_kwargs,
+        )
+
+
+def test_symbolic_jacobian_keeps_dsl_derived_reverse_rate_keq_sourced():
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                "equilibrium: A <-> B; kf=2.0; K=4.0",
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        initials={},
+    )
+
+    structure = build_symbolic_jacobian_structure(mechanism)
+
+    assert structure.parameter_symbols == ("Keq1", "kf1")
+
+
+@pytest.mark.parametrize(
+    ("line", "expected_symbols", "expected_matrix"),
+    [
+        ("equilibrium: A <-> B; kf=2.0; kr=0.5", ("kf1", "kr1"), [[-2.0, 0.5], [2.0, -0.5]]),
+        ("equilibrium: A <-> B; kf=2.0; K=4.0", ("Keq1", "kf1"), [[-2.0, 0.5], [2.0, -0.5]]),
+        (
+            "T=298.15\nenergy=kJ/mol\nequilibrium: A <-> B; kf=2.0; dG_eq=0.0",
+            (),
+            [[-2.0, 2.0], [2.0, -2.0]],
+        ),
+    ],
+)
+def test_symbolic_jacobian_and_rhs_share_effective_equilibrium_rates(line, expected_symbols, expected_matrix):
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact, classify_symbolic_jacobian_support
+
+    mechanism = parse_dsl_to_mechanism(
+        "\n".join(
+            [
+                line,
+                "init: A=1.0, B=0.0",
+            ]
+        ),
+        initials={},
+    )
+    rhs = build_ode_rhs_from_mechanism(mechanism)
+    support = classify_symbolic_jacobian_support(mechanism)
+    y = np.asarray([1.0, 0.0], dtype=float)
+
+    if expected_symbols:
+        artifact = build_symbolic_jacobian_artifact(mechanism)
+
+        assert support.supported is True
+        assert artifact.parameter_symbols == expected_symbols
+        np.testing.assert_allclose(artifact.jacobian_func(0.0, y), expected_matrix)
+    else:
+        assert support.supported is False
+        assert support.code == "temperature-dependent-equilibrium"
+
+    np.testing.assert_allclose(rhs(0.0, y), [-2.0, 2.0])
+
+
+def test_symbolic_jacobian_rejects_nonpositive_direct_mechanism_keq_derivation():
+    from kindred.core.mechanism import Mechanism
+    from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+    from kindred.core.symbolic.jacobian import build_symbolic_jacobian_artifact, classify_symbolic_jacobian_support
+
+    mechanism = Mechanism()
+    mechanism.add_species("A", 1.0)
+    mechanism.add_species("B", 0.0)
+    mechanism.add_equilibrium(
+        stoich_forward={"A": 1.0},
+        stoich_back={"B": 1.0},
+        kf=1.0,
         Keq=0.0,
     )
 
+    support = classify_symbolic_jacobian_support(mechanism)
+
+    assert support.supported is False
+    assert support.code == "unsupported-equilibrium-keq"
     with pytest.raises(UnsupportedSymbolicExpressionError, match="Keq"):
         build_symbolic_jacobian_artifact(mechanism)

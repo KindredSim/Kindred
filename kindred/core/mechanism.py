@@ -50,6 +50,18 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Tuple
 
 from .species import Species, coerce_float
 from .validation import validate_name
+from .equilibrium_rate_authority import (
+    EquilibriumRateAuthorityKind,
+    EquilibriumRateInputContext,
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    effective_reverse_rate_from_keq,
+    normalize_equilibrium_rate_authority,
+    plain_finite_float_or_none,
+    validate_equilibrium_rate_authority_values,
+)
+from .kinetics import K_from_deltaG_eq
+from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
 
 class StructuredRate(Protocol):
     pass
@@ -264,8 +276,9 @@ class Equilibrium:
     """
     Reversible equilibrium description.
 
-    Either Keq or kf/kr may be provided (or both). If only Keq is provided,
-    kf/kr may be derived later based on a fast-equilibrium policy.
+    A forward rate kf is required. Exactly one reverse-side authority is selected:
+    explicit kr, or thermodynamic Keq/dG_eq metadata. Backend consumers may carry
+    derived values for display, but provenance must not become a second authority.
     Equilibria stay reversible single steps; the ODE builder consumes them as
     one column with forward/reverse power-law terms rather than duplicating
     into two reactions.
@@ -478,9 +491,35 @@ class Mechanism:
         """
         Add an equilibrium pair.
 
-        At least one of {Keq, (kf and kr)} must be provided. Validation is structural;
-        numeric sanity (positivity, units) is the responsibility of the simulator layer.
+        kf is required, plus exactly one reverse-side authority: kr or thermodynamic
+        Keq/dG_eq metadata. Numeric sanity (positivity, units) is the responsibility
+        of the simulator layer.
         """
+        return self._add_equilibrium_with_authority_context(
+            stoich_forward,
+            stoich_back,
+            Keq=Keq,
+            kf=kf,
+            kr=kr,
+            fast=fast,
+            metadata=metadata,
+            record_step_index=record_step_index,
+            authority_context=EquilibriumRateInputContext.PUBLIC,
+        )
+
+    def _add_equilibrium_with_authority_context(
+        self,
+        stoich_forward: Mapping[str, float],
+        stoich_back: Mapping[str, float],
+        *,
+        Keq: Any | None = None,
+        kf: Any | None = None,
+        kr: Any | None = None,
+        fast: bool = False,
+        metadata: Optional[Mapping[str, Any]] = None,
+        record_step_index: bool = True,
+        authority_context: EquilibriumRateInputContext | str | None = None,
+    ) -> Equilibrium:
         sf = _validate_positive_side(stoich_forward, label="stoich_forward")
         sb = _validate_positive_side(stoich_back, label="stoich_back")
         if not sf:
@@ -490,10 +529,45 @@ class Mechanism:
         _ensure_species_exist(sf, self.species)
         _ensure_species_exist(sb, self.species)
 
-        if Keq is None and (kf is None or kr is None):
-            raise ValueError("equilibrium requires Keq or both kf and kr")
-
         meta = dict(metadata) if metadata else {}
+        meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KF, bool(kf is not None))
+        meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KR, bool(kr is not None))
+        validate_equilibrium_rate_authority_values(
+            kf=kf,
+            kr=kr,
+            Keq=Keq,
+            metadata=meta,
+            context=authority_context,
+        )
+        authority = normalize_equilibrium_rate_authority(
+            kf=kf,
+            kr=kr,
+            Keq=Keq,
+            metadata=meta,
+            context=authority_context,
+        )
+        if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+            effective_keq = Keq
+            if effective_keq is None and meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None:
+                effective_keq = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
+            if effective_keq is None and meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None:
+                temperature = plain_finite_float_or_none(self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+                dg_value = plain_finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL))
+                if temperature is not None and dg_value is not None:
+                    effective_keq = float(K_from_deltaG_eq(float(dg_value), float(temperature)))
+            scalar_keq = plain_finite_float_or_none(effective_keq)
+            if Keq is None and scalar_keq is not None:
+                Keq = scalar_keq
+            scalar_kf = plain_finite_float_or_none(kf)
+            scalar_std_ratio = plain_finite_float_or_none(authority.reverse_std_ratio)
+            if (
+                kr is None
+                and scalar_kf is not None
+                and scalar_keq is not None
+                and scalar_std_ratio is not None
+                and abs(float(scalar_keq)) > 1e-30
+            ):
+                kr = effective_reverse_rate_from_keq(scalar_kf, scalar_keq, scalar_std_ratio)
 
         eq = Equilibrium(
             stoich_forward=sf,
@@ -506,13 +580,12 @@ class Mechanism:
         )
         self.equilibria.append(eq)
         if bool(record_step_index):
-            self._append_step_index_map_entry(
-                {
-                    "kind": "equilibrium",
-                    "equilibrium_index": len(self.equilibria) - 1,
-                    "has_Keq_param": Keq is not None,
-                }
-            )
+            entry: Dict[str, object] = {
+                "kind": "equilibrium",
+                "equilibrium_index": len(self.equilibria) - 1,
+            }
+            entry.update(authority.step_map_fields())
+            self._append_step_index_map_entry(entry)
         return eq
 
     # ---------- vectorization helpers ----------
@@ -563,14 +636,26 @@ class Mechanism:
             }
             for r in self.reactions
         ]
-        equilibria_block = [
-            {
+        try:
+            temperature_K = float(self.metadata.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15))
+        except (TypeError, ValueError, OverflowError):
+            temperature_K = 298.15
+
+        equilibria_block = []
+        for e in self.equilibria:
+            effective_keq = effective_equilibrium_keq(e, temperature_K=temperature_K)
+            effective_kr = effective_equilibrium_reverse_rate(e, temperature_K=temperature_K)
+            equilibria_block.append(
+                {
                 "stoich_forward": OrderedDict(sorted(e.stoich_forward.items(), key=lambda kv: order_map[kv[0]])),
                 "stoich_back":   OrderedDict(sorted(e.stoich_back.items(),   key=lambda kv: order_map[kv[0]])),
-                "Keq": e.Keq, "kf": e.kf, "kr": e.kr, "fast": e.fast,
+                "Keq": effective_keq if effective_keq is not None else e.Keq,
+                "kf": e.kf,
+                "kr": effective_kr if effective_kr is not None else e.kr,
+                "fast": e.fast,
+                "metadata": OrderedDict(sorted(dict(e.metadata).items())),
             }
-            for e in self.equilibria
-        ]
+            )
         return {
             "species": species_block,
             "reactions": reactions_block,

@@ -106,7 +106,9 @@ def test_shared_step_policy_matches_builder_step_index_metadata(dsl, expected_ki
     assert policy.has_explicit_keq is expected_has_explicit_keq
     assert entry["kind"] == expected_kind
     if expected_kind == "equilibrium":
-        assert entry["has_Keq_param"] is expected_has_explicit_keq
+        assert entry["equilibrium_authority"]["has_explicit_keq_param"] is expected_has_explicit_keq
+        assert "has_Keq_param" not in entry
+        assert "derive_rate" not in entry
     else:
         assert "has_Keq_param" not in entry
 
@@ -174,3 +176,21 @@ def test_mechanism_namespace_builder_rejects_duplicate_step_indices():
 
     with pytest.raises(ValueError, match="unique step indices"):
         build_namespace_from_mechanism(_MechanismWithDuplicateStepIndex())
+
+
+def test_mechanism_namespace_rejects_equilibrium_step_map_without_normalized_authority():
+    class _MechanismWithTopLevelOnlyAuthority:
+        metadata = {
+            "step_index_map": [
+                {
+                    "step_index": 1,
+                    "kind": "equilibrium",
+                    "equilibrium_index": 0,
+                    "has_Keq_param": True,
+                    "derive_rate": "kr",
+                },
+            ],
+        }
+
+    with pytest.raises(ValueError, match="equilibrium_authority"):
+        build_namespace_from_mechanism(_MechanismWithTopLevelOnlyAuthority())

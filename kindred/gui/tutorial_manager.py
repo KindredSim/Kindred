@@ -155,8 +155,8 @@ class TutorialManager:
                     instruction=(
                         "Use the <code>equilibrium:</code> keyword for fast equilibria:<br>"
                         "<code>equilibrium: A &lt;-&gt; B ; K=2.5 ; kf=10.0</code><br><br>"
-                        "A reversible arrow is required. <code>K=</code> needs at least one "
-                        "of <code>kf=</code> or <code>kr=</code> as an anchor rate."
+                        "A reversible arrow is required. Provide <code>kf=</code> plus exactly one "
+                        "of <code>kr=</code>, <code>K=</code>, or <code>dG_eq=</code>."
                     ),
                     target_widget="mechanismEditor",
                     arrow_direction="left",

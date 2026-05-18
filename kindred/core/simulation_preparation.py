@@ -1409,7 +1409,14 @@ def _prepared_parameter_override_can_apply(mechanism: Any, name: str) -> bool:
     target = lookup_step_param_target(mechanism, target_name)
     if target is None:
         return _scalar_parameter_override_known(mechanism, name)
-    kind, idx, role, _entry = target
+    kind, idx, role, entry = target
+    if kind == "equilibrium":
+        from kindred.core.equilibrium_rate_authority import require_step_entry_role_editable
+
+        try:
+            require_step_entry_role_editable(entry, role, parameter_name=target_name)
+        except ValueError as exc:
+            raise SimulationPreparationError("parameter_overrides", str(exc)) from exc
     candidate = None
     try:
         if kind == "reaction" and role == "k":
@@ -2483,6 +2490,7 @@ def prepare_simulation_worker_run(
 
 
 def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]:
+    from kindred.core.equilibrium_rate_authority import require_step_entry_role_editable
     from kindred.core.rate_binding import RateBinding
     from kindred.core.simulator.step_indexing import lookup_step_param_target
     from kindred.core.validation import try_parse_callable_finite_float
@@ -2494,7 +2502,12 @@ def _bind_parameters_to_mechanism(mech: Any, names: List[str]) -> Dict[str, Any]
         target = lookup_step_param_target(mech, name)
         if target is None:
             continue
-        kind, idx, role, _entry = target
+        kind, idx, role, entry = target
+        if kind == "equilibrium":
+            try:
+                require_step_entry_role_editable(entry, role, parameter_name=name)
+            except ValueError as exc:
+                raise SimulationPreparationError("parameter_binding", str(exc)) from exc
 
         binding = bindings.get(name)
         if binding is None:
@@ -2547,6 +2560,7 @@ def _implicit_equilibrium_constant_override_names(
     *,
     exclude: Iterable[str] = (),
 ) -> set[str]:
+    from kindred.core.equilibrium_rate_authority import step_entry_role_editable
     from kindred.core.simulator.step_indexing import get_step_index_map
 
     requested = {str(name) for name in (names or ()) if str(name or "").strip()}
@@ -2565,7 +2579,7 @@ def _implicit_equilibrium_constant_override_names(
         else:
             continue
         keq_name = f"Keq{n}"
-        if bool(entry.get("has_Keq_param")):
+        if bool(step_entry_role_editable(entry, "Keq")):
             continue
         if keq_name in requested and keq_name not in excluded:
             implicit_keq.add(keq_name)
@@ -2600,6 +2614,7 @@ def _internal_parameter_algebra_binding_names(
     mechanism: Any,
     requested_names: Iterable[str] = (),
 ) -> set[str]:
+    from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry, step_entry_role_editable
     from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
     from kindred.core.simulator.step_indexing import get_step_index_map
 
@@ -2630,7 +2645,6 @@ def _internal_parameter_algebra_binding_names(
         for name in (requested_names or ())
         if str(name or "").strip()
     }
-    k_derived: set[str] = set()
     try:
         step_entries = list(get_step_index_map(mechanism))
     except Exception as exc:
@@ -2649,19 +2663,20 @@ def _internal_parameter_algebra_binding_names(
         else:
             continue
         keq_name = f"Keq{n}"
-        if bool(entry.get("has_Keq_param")) and (
+        authority = authority_fields_from_step_entry(entry)
+        has_keq_param = bool(step_entry_role_editable(entry, "Keq"))
+        if not authority:
+            raise SimulationPreparationError(
+                "parameter_algebra",
+                f"Equilibrium step {n} is missing normalized equilibrium_authority metadata.",
+            )
+        if has_keq_param and (
             keq_name in requested_canonical
             or f"kf{n}" in requested_canonical
             or f"kr{n}" in requested_canonical
         ):
             active_keq_names.add(keq_name)
-        if keq_name not in active_keq_names:
-            continue
-        derive_rate = str(entry.get("derive_rate") or "kr")
-        if derive_rate not in {"kf", "kr"}:
-            derive_rate = "kr"
-        k_derived.add(f"{derive_rate}{n}")
-    return (constrained - constrained_keq_targets) | k_derived
+    return constrained - constrained_keq_targets
 
 
 def _reject_requested_algebra_owned_mechanism_parameters_for_fitting(
@@ -3082,6 +3097,8 @@ def prepare_bound_mechanism(
             for name in requested_parameter_partition.bindable_mechanism_parameter_names
             if str(name or "").strip()
         }
+        from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry, step_entry_role_editable
+
         requested_implicit_keq: set[str] = set()
         k_derived = set()
         for entry in get_step_index_map(mechanism):
@@ -3095,16 +3112,25 @@ def prepare_bound_mechanism(
             else:
                 continue
             keq_name = f"Keq{n}"
-            if bool(entry.get("has_Keq_param")):
+            authority = authority_fields_from_step_entry(entry)
+            has_keq_param = bool(step_entry_role_editable(entry, "Keq"))
+            if not authority:
+                raise SimulationPreparationError(
+                    "parameter_algebra",
+                    f"Equilibrium step {n} is missing normalized equilibrium_authority metadata.",
+                )
+            has_thermo_param = bool(authority.get("has_thermo_param") or has_keq_param)
+            if has_keq_param:
                 active_keq_names.add(keq_name)
             elif keq_name in requested and keq_name not in constrained_keq_targets:
                 requested_implicit_keq.add(keq_name)
-            if keq_name not in active_keq_names:
+            if not has_thermo_param and keq_name not in active_keq_names:
                 continue
-            derive_rate = str(entry.get("derive_rate") or "kr")
+            derive_rate = str(authority.get("derived_role") or "")
             if derive_rate not in {"kf", "kr"}:
                 derive_rate = "kr"
-            k_derived.add(f"{derive_rate}{n}")
+            if derive_rate:
+                k_derived.add(f"{derive_rate}{n}")
 
         if requested_implicit_keq:
             raise SimulationPreparationError(
@@ -3142,7 +3168,6 @@ def prepare_bound_mechanism(
                 for n in (
                     (requested - constrained_keq_targets - k_derived)
                     | constrained_mutable_targets
-                    | k_derived
                 )
                 if str(n) in namespace_info
             }

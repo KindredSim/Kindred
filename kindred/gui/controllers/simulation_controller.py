@@ -124,6 +124,14 @@ class _SerialBatchDispatchState:
     context: Mapping[str, Any] | None
 
 
+@dataclass(frozen=True)
+class _TerminalFailureReplaySnapshot:
+    active: bool
+    request_id: Optional[int]
+    target_set_ids: tuple[str, ...]
+    dirty_generation_by_set_id: tuple[tuple[str, int], ...] = ()
+
+
 def _runtime_readiness_snapshot(
     *,
     mode: str,
@@ -774,12 +782,11 @@ class SimulationController(QtCore.QObject):
         *,
         failed_run_context: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        if effects.modal_error is not None:
-            self.ui.dialogs.message_box_critical(
-                effects.modal_error.title,
-                effects.modal_error.message,
-                details=effects.modal_error.details,
-            )
+        explicit_failure_replay_snapshot = (
+            self._capture_terminal_failure_replay_snapshot()
+            if bool(effects.apply_explicit_failure_pending_replay)
+            else None
+        )
         if bool(effects.release_worker):
             self._release_current_simulation_worker()
         if bool(effects.shutdown_lane_pool):
@@ -869,13 +876,20 @@ class SimulationController(QtCore.QObject):
             self._schedule_deferred_preview_replay_handoff_once(
                 stop_timers=bool(effects.deferred_replay_stop_timers),
             )
-        if bool(effects.apply_explicit_failure_pending_replay):
-            self._apply_explicit_failure_pending_replay_policy(
-                fast_mode=bool(effects.close_contained_fast_mode)
-            )
         if bool(effects.invalidate_failed_pending_init_results):
             self._invalidate_preserved_pending_init_results_after_failed_run(
                 ctx=failed_run_context if isinstance(failed_run_context, Mapping) else None,
+            )
+        if effects.modal_error is not None:
+            self.ui.dialogs.message_box_critical(
+                effects.modal_error.title,
+                effects.modal_error.message,
+                details=effects.modal_error.details,
+            )
+        if bool(effects.apply_explicit_failure_pending_replay):
+            self._apply_post_modal_explicit_failure_pending_replay_policy(
+                fast_mode=bool(effects.close_contained_fast_mode),
+                replay_snapshot=explicit_failure_replay_snapshot,
             )
 
     @property
@@ -1243,6 +1257,88 @@ class SimulationController(QtCore.QObject):
             state_by_set_id[set_id_s] = DirtySetState(is_dirty=is_dirty, generation=generation)
         return state_by_set_id
 
+    def _capture_terminal_failure_replay_snapshot(self) -> _TerminalFailureReplaySnapshot:
+        pending = self._pending_slider_preview_launch
+        target_set_ids = tuple(str(set_id) for set_id in (pending.target_set_ids or ()) if str(set_id))
+        if not self._has_deferred_preview_replay_intent(pending) or not target_set_ids:
+            return _TerminalFailureReplaySnapshot(
+                active=False,
+                request_id=pending.request_id,
+                target_set_ids=target_set_ids,
+            )
+        dirty_state = self._capture_dirty_state_by_set_id(target_set_ids)
+        generations: list[tuple[str, int]] = []
+        for set_id in target_set_ids:
+            state = dirty_state.get(str(set_id))
+            if state is None or not bool(state.is_dirty) or state.generation is None:
+                return _TerminalFailureReplaySnapshot(
+                    active=False,
+                    request_id=pending.request_id,
+                    target_set_ids=target_set_ids,
+                )
+            generations.append((str(set_id), int(state.generation)))
+        return _TerminalFailureReplaySnapshot(
+            active=True,
+            request_id=pending.request_id,
+            target_set_ids=target_set_ids,
+            dirty_generation_by_set_id=tuple(generations),
+        )
+
+    def _terminal_failure_replay_snapshot_still_current(
+        self,
+        snapshot: _TerminalFailureReplaySnapshot,
+    ) -> bool:
+        if not bool(snapshot.active) or not snapshot.target_set_ids:
+            return False
+        current = self._pending_slider_preview_launch
+        if tuple(current.target_set_ids or ()) != tuple(snapshot.target_set_ids):
+            return False
+        if current.request_id != snapshot.request_id:
+            return False
+        expected_generations = {
+            str(set_id): int(generation)
+            for set_id, generation in (snapshot.dirty_generation_by_set_id or ())
+            if str(set_id)
+        }
+        if set(expected_generations) != set(snapshot.target_set_ids):
+            return False
+        current_dirty_state = self._capture_dirty_state_by_set_id(snapshot.target_set_ids)
+        for set_id, expected_generation in expected_generations.items():
+            state = current_dirty_state.get(str(set_id))
+            if state is None or not bool(state.is_dirty) or state.generation is None:
+                return False
+            if int(state.generation) != int(expected_generation):
+                return False
+        return True
+
+    def _terminal_failure_replay_snapshot_matches_current(
+        self,
+        snapshot: _TerminalFailureReplaySnapshot,
+    ) -> bool:
+        if not bool(snapshot.active) or not snapshot.target_set_ids:
+            return False
+        current = self._pending_slider_preview_launch
+        return (
+            tuple(str(set_id) for set_id in (current.target_set_ids or ()) if str(set_id))
+            == tuple(snapshot.target_set_ids)
+            and current.request_id == snapshot.request_id
+        )
+
+    def _apply_post_modal_explicit_failure_pending_replay_policy(
+        self,
+        *,
+        fast_mode: bool,
+        replay_snapshot: Optional[_TerminalFailureReplaySnapshot],
+    ) -> None:
+        if (
+            replay_snapshot is not None
+            and self._terminal_failure_replay_snapshot_matches_current(replay_snapshot)
+            and not self._terminal_failure_replay_snapshot_still_current(replay_snapshot)
+        ):
+            self.clear_pending_slider_preview_replay(clear_plot_updates=False)
+            return
+        self._apply_explicit_failure_pending_replay_policy(fast_mode=bool(fast_mode))
+
     def queue_slider_plot_update(
         self,
         *,
@@ -1341,6 +1437,13 @@ class SimulationController(QtCore.QObject):
             affected_set_ids=affected_set_ids,
             close_preview_runtime_owner=bool(close_preview_runtime_owner),
         )
+
+    def prepare_runtime_work_for_project_apply(self, *, epoch: int) -> None:
+        self._supersede_active_work_for_authoritative_mechanism_transition(
+            epoch=int(epoch),
+            close_preview_runtime_owner=True,
+        )
+        self._reset_parallel_batch_run_and_shutdown_lane_pool()
 
     def run_simulation_internal(
         self,

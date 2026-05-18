@@ -3499,6 +3499,7 @@ class MainWindow(
         """Clear the visible simulation plot while leaving mechanism controls untouched."""
         plot = self.main_plot()
         setattr(plot, "_workspace_preview_display_provenance_by_set_id", {})
+        setattr(plot, "_kindred_stale_preserved_display", None)
         if hasattr(plot, "clear"):
             plot.clear()
         if hasattr(plot, "set_statistics_results"):
@@ -3522,6 +3523,33 @@ class MainWindow(
         self._clear_main_plot_display_state()
         self.show_simulation_tab()
         self.refresh_simulation_plot_views()
+
+    def _mark_stale_preserved_batch_plot_display(
+        self,
+        *,
+        reason: str,
+        cache_key: str,
+        selected_set_ids: Sequence[str],
+    ) -> None:
+        """Record that preserved plot data is stale display, not active selection truth."""
+        plot = self.main_plot()
+        if plot is None:
+            return
+        setattr(
+            plot,
+            "_kindred_stale_preserved_display",
+            {
+                "kind": "stale_preserved_plot",
+                "reason": str(reason or ""),
+                "cache_key": str(cache_key or ""),
+                "selected_set_ids": tuple(str(set_id) for set_id in (selected_set_ids or ()) if str(set_id)),
+            },
+        )
+
+    def _clear_stale_preserved_batch_plot_display(self) -> None:
+        plot = self.main_plot()
+        if plot is not None:
+            setattr(plot, "_kindred_stale_preserved_display", None)
 
     def _active_workspace_preview_display_snapshot(self) -> Optional[Dict[str, Any]]:
         batch_cache = getattr(self._sim_controller, "batch_cache", None)
@@ -3996,6 +4024,12 @@ class MainWindow(
         """Clear non-serialized session state before applying a project payload."""
         if not self._prepare_fit_window_shutdown_for_close():
             logger.warning("Project apply requested while one or more fit windows remained open after close request")
+        runtime_epoch = max(
+            int(getattr(self._mechanism_runtime_transition, "current_epoch", 0) or 0),
+            int(getattr(self._sim_controller, "_authoritative_runtime_input_epoch", 0) or 0),
+            int(getattr(self._sim_controller, "_authoritative_runtime_input_global_epoch", 0) or 0),
+        ) + 1
+        self._sim_controller.prepare_runtime_work_for_project_apply(epoch=int(runtime_epoch))
         self._preview_session.clear_working_transaction(clear_committed_slider_values=True)
         self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
         dataset_manager = getattr(self, "_dataset_manager", None)
@@ -6172,8 +6206,14 @@ class MainWindow(
 
         def _clear_non_displayed_selection_state(*, preserve_plot: bool = False) -> None:
             if preserve_plot:
+                self._mark_stale_preserved_batch_plot_display(
+                    reason=str(outcome_reason or ""),
+                    cache_key=str(active_cache_key or ""),
+                    selected_set_ids=shown_sets,
+                )
                 self.clear_display_selection_state()
                 return
+            self._clear_stale_preserved_batch_plot_display()
             self._clear_batch_selection_display_state()
 
         def _selection_contains_active_invalidated_set() -> bool:
@@ -6184,6 +6224,7 @@ class MainWindow(
             return any(str(set_id) in invalidated_set_ids for set_id in shown_sets)
 
         def _finalize_displayed_selection_change() -> None:
+            self._clear_stale_preserved_batch_plot_display()
             self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
             _reset_stale_cache_warning_status()
 
@@ -6665,6 +6706,10 @@ class MainWindow(
                 return
         tokens.append([str(key), str(value)])
 
+    @staticmethod
+    def _remove_semicolon_kv(tokens: list[list[str]], key: str) -> None:
+        tokens[:] = [pair for pair in tokens if str(pair[0]).strip() != key]
+
     def _apply_energy_overrides_to_inline_state_network(
         self,
         base_text: str,
@@ -6734,8 +6779,8 @@ class MainWindow(
         """
         Apply energy-mode ΔG° overrides to Computational Mode fast equilibria inside the generated block.
 
-        These fast equilibria are emitted as explicit `equilibrium:` lines (kf/kr) and are updated by
-        rewriting `dG_eq=` and `kr=` while keeping `kf=` fixed.
+        These generated fast equilibria keep `kf=` fixed and rewrite `dG_eq=`.
+        The effective reverse rate is derived from ΔG° plus the generated standard-state ratio.
         """
         energy_overrides = [
             o
@@ -6844,31 +6889,20 @@ class MainWindow(
                 continue
             if not (math.isfinite(K) and K > 0.0):
                 continue
-            try:
-                kr_new = float(kf_fixed / (K * std_ratio))
-            except Exception as exc:
-                self._record_best_effort_failure(
-                    "main_window.computational_mode_fast_eq.compute_kr",
-                    message=f"Failed to compute kr from Computational Mode fast-equilibrium override (cm_id='{cm_id}')",
-                    exc=exc,
-                )
-                continue
-            if not (math.isfinite(kr_new) and kr_new > 0.0):
-                continue
             step_index = equilibrium_step_by_line_index.get(int(absolute_line_index))
             if step_index is None:
                 continue
-            warning_reason = step_rewrite_block_reason(
+            if step_rewrite_block_reason(
                 step_index=int(step_index),
-                affected_parameter_names=(f"kr{int(step_index)}",),
+                affected_parameter_names=(f"kf{int(step_index)}", f"kr{int(step_index)}", f"Keq{int(step_index)}"),
                 step_analysis_context=step_analysis_context,
-            )
-            if warning_reason is not None:
+            ) is not None:
                 continue
 
             self._set_semicolon_kv(tokens, "dG_eq", f"{float(new_dG):.12g}")
             self._set_semicolon_kv(tokens, "kf", f"{float(kf_fixed):.17g}")
-            self._set_semicolon_kv(tokens, "kr", f"{float(kr_new):.17g}")
+            self._set_semicolon_kv(tokens, "cm_std_ratio", f"{float(std_ratio):.17g}")
+            self._remove_semicolon_kv(tokens, "kr")
 
             serialized = prefix
             if tokens:
@@ -7149,106 +7183,26 @@ class MainWindow(
         # Refresh snapshot after any derived updates.
         current = sliders.get_variables()
 
-        # Apply Keq-implied equilibrium constraints (canonical step indexing) so derived
-        # rates update immediately when Keq changes.
+        # Apply authority-implied readout updates (canonical step indexing) so
+        # derived rates update immediately when their authority inputs change.
         step_map = getattr(self, "_step_index_map", None) or []
         if isinstance(step_map, list) and step_map:
+            from kindred.core.equilibrium_rate_authority import authority_readout_updates_from_step_entry
+
             for entry in step_map:
                 if not isinstance(entry, dict):
                     continue
                 if str(entry.get("kind") or "") != "equilibrium":
                     continue
-                try:
-                    n = int(entry.get("step_index"))  # type: ignore[arg-type]
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "main_window.derived_Keq_constraints.step_index",
-                        message="Invalid step_index while applying Keq-implied constraints",
-                        exc=exc,
-                    )
-                    continue
-                K_key = f"Keq{n}"
-                kf_key = f"kf{n}"
-                kr_key = f"kr{n}"
-                if not bool(entry.get("has_Keq_param")):
-                    if kf_key not in current or kr_key not in current:
-                        continue
-                    try:
-                        kf_val = float(current[kf_key])
-                        kr_val = float(current[kr_key])
-                    except Exception as exc:
-                        self._record_best_effort_failure(
-                            "main_window.derived_Keq_readout.live_rate_values",
-                            message=f"Invalid kf/kr value while deriving {K_key}",
-                            exc=exc,
-                        )
-                        continue
-                    if not (math.isfinite(kf_val) and math.isfinite(kr_val) and abs(kr_val) > 1e-30):
-                        continue
-                    K_val = float(kf_val) / float(kr_val)
-                    current[K_key] = K_val
-                    sliders.update_variable_readout(K_key, float(K_val))
+                for update in authority_readout_updates_from_step_entry(entry, current):
+                    current[update.name] = float(update.value)
+                    sliders.update_variable_readout(update.name, float(update.value))
                     meta_map = self._mutable_variable_metadata()
-                    meta = dict(meta_map.get(K_key) or {})
-                    meta["editable"] = False
-                    meta["derived"] = True
-                    meta_map[K_key] = meta
-                    sliders.update_metadata(K_key, meta)
-                    continue
-                if K_key not in current:
-                    continue
-                try:
-                    K_val = float(current[K_key])
-                except Exception as exc:
-                    self._record_best_effort_failure(
-                        "main_window.derived_Keq_constraints.K_val",
-                        message=f"Invalid Keq value for {K_key} while applying Keq-implied constraints",
-                        exc=exc,
-                    )
-                    continue
-                if not math.isfinite(K_val) or abs(K_val) < 1e-30:
-                    continue
-                derive_rate = str(entry.get("derive_rate") or "kr")
-                if derive_rate == "kf":
-                    if kr_key not in current:
-                        continue
-                    try:
-                        kr_val = float(current[kr_key])
-                    except Exception as exc:
-                        self._record_best_effort_failure(
-                            "main_window.derived_Keq_constraints.kr_val",
-                            message=f"Invalid kr value for {kr_key} while deriving kf",
-                            exc=exc,
-                        )
-                        continue
-                    kf_val = kr_val * K_val
-                    sliders.update_variable_readout(kf_key, float(kf_val))
-                    meta_map = self._mutable_variable_metadata()
-                    meta = dict(meta_map.get(kf_key) or {})
-                    meta["editable"] = False
-                    meta["derived"] = True
-                    meta_map[kf_key] = meta
-                    sliders.update_metadata(kf_key, meta)
-                else:
-                    if kf_key not in current:
-                        continue
-                    try:
-                        kf_val = float(current[kf_key])
-                    except Exception as exc:
-                        self._record_best_effort_failure(
-                            "main_window.derived_Keq_constraints.kf_val",
-                            message=f"Invalid kf value for {kf_key} while deriving kr",
-                            exc=exc,
-                        )
-                        continue
-                    kr_val = kf_val / K_val
-                    sliders.update_variable_readout(kr_key, float(kr_val))
-                    meta_map = self._mutable_variable_metadata()
-                    meta = dict(meta_map.get(kr_key) or {})
-                    meta["editable"] = False
-                    meta["derived"] = True
-                    meta_map[kr_key] = meta
-                    sliders.update_metadata(kr_key, meta)
+                    meta = dict(meta_map.get(update.name) or {})
+                    meta["editable"] = bool(update.editable)
+                    meta["derived"] = bool(update.derived)
+                    meta_map[update.name] = meta
+                    sliders.update_metadata(update.name, meta)
 
     def _energy_mode_energy_unit_from_metadata(self) -> str:
         meta_map = self.variable_metadata() or {}
@@ -8051,7 +8005,7 @@ class MainWindow(
             return "kf"
         if isinstance(kr_meta, dict) and (kr_meta.get("derived") is True or kr_meta.get("editable") is False):
             return "kr"
-        # Default policy matches core: derive kr unless only kr was explicitly provided.
+        # Default policy matches core: thermodynamic authority derives kr.
         return "kr"
 
     @staticmethod
@@ -8200,7 +8154,11 @@ class MainWindow(
                 slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
         elif family == "kf":
             kf_val = float(resolved_values[f"kf{step_index}"])
-            kr_val = float(resolved_values[f"kr{step_index}"])
+            kr_val = (
+                float(resolved_values[f"kr{step_index}"])
+                if f"kr{step_index}" in resolved_values
+                else None
+            )
             label_text = self._label_for_step_from_metadata(metadata, step_index, line_label)
             kf_meta = dict(metadata.get(f"kf{step_index}") or {})
             kf_meta.update(
@@ -8213,17 +8171,18 @@ class MainWindow(
                 }
             )
             metadata[f"kf{step_index}"] = kf_meta
-            kr_meta = dict(metadata.get(f"kr{step_index}") or {})
-            kr_meta.update(
-                {
-                    "type": "equilibrium",
-                    "index": step_index,
-                    "label": kr_meta.get("label") or label_text,
-                    "line": line_index,
-                    "role": "kr",
-                }
-            )
-            metadata[f"kr{step_index}"] = kr_meta
+            if kr_val is not None:
+                kr_meta = dict(metadata.get(f"kr{step_index}") or {})
+                kr_meta.update(
+                    {
+                        "type": "equilibrium",
+                        "index": step_index,
+                        "label": kr_meta.get("label") or label_text,
+                        "line": line_index,
+                        "role": "kr",
+                    }
+                )
+                metadata[f"kr{step_index}"] = kr_meta
             if f"Keq{step_index}" in resolved_values:
                 K_val = float(resolved_values[f"Keq{step_index}"])
                 K_meta = dict(metadata.get(f"Keq{step_index}") or {})
@@ -8239,7 +8198,8 @@ class MainWindow(
                 metadata[f"Keq{step_index}"] = K_meta
             if commit:
                 slider_updates.append((f"kf{step_index}", float(f"{kf_val:.6g}"), metadata[f"kf{step_index}"]))
-                slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
+                if kr_val is not None:
+                    slider_updates.append((f"kr{step_index}", float(f"{kr_val:.6g}"), metadata[f"kr{step_index}"]))
                 if f"Keq{step_index}" in resolved_values:
                     slider_updates.append((f"Keq{step_index}", float(f"{resolved_values[f'Keq{step_index}']:.6g}"), metadata[f"Keq{step_index}"]))
         elif family == "kr":
@@ -8340,6 +8300,8 @@ class MainWindow(
                 # must never be rewritten back into the DSL.
                 if not (isinstance(meta, dict) and meta.get("editable") is False):
                     self._preview_session.stage_slider_value(slider_name, slider_value)
+
+        self._refresh_derived_parameters_display()
 
         timer = getattr(self._mechanism_editor, "_network_update_timer", None)
         if timer is not None:

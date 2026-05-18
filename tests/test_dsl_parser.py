@@ -165,13 +165,42 @@ class TestEquilibria:
         dsl = """
         T=310.0
         energy=kJ/mol
-        equilibrium: A <-> B; dG_eq=-8.5
+        equilibrium: A <-> B; kf=1.0; dG_eq=-8.5
         [A] = 1.0
         [B] = 0.0
         """
         mechanism = parse_dsl_to_mechanism(dsl, initials={})
 
         assert len(mechanism.equilibria) == 1
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "equilibrium: A <-> B; K=2.0",
+            "equilibrium: A <-> B; kr=0.5; K=2.0",
+            "equilibrium: A <-> B; kr=0.5; dG_eq=-1.7",
+            "equilibrium: A <-> B; kf=1.0; kr=0.5; K=2.0",
+            "equilibrium: A <-> B; kf=1.0; kr=0.5; dG_eq=-1.7",
+            "equilibrium: A <-> B; kf=1.0; K=2.0; dG_eq=-1.7",
+        ],
+    )
+    def test_equilibrium_requires_kf_and_exactly_one_reverse_authority(self, line):
+        with pytest.raises(DSLError, match="kf.*exactly one"):
+            parse_dsl_to_mechanism(f"{line}\n[A] = 1.0\n[B] = 0.0", initials={})
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "reaction: A <-> B; kr=0.5; K=2.0",
+            "reaction: A <-> B; kf=1.0; kr=0.5; K=2.0",
+            "reaction: A <-> B; kf=1.0; kr=0.5; dG_eq=-1.7",
+            "A <-> B; kr=0.5; K=2.0",
+            "A <-> B; kf=1.0; kr=0.5; K=2.0",
+        ],
+    )
+    def test_reversible_reaction_requires_kf_and_exactly_one_reverse_authority(self, line):
+        with pytest.raises(DSLError, match="kf.*exactly one"):
+            parse_dsl_to_mechanism(f"{line}\n[A] = 1.0\n[B] = 0.0", initials={})
 
 
 class TestThermodynamicParameters:
@@ -314,7 +343,7 @@ class TestErrorHandling:
 
     @pytest.mark.parametrize("parser", [parse_dsl, parse_dsl_to_mechanism])
     def test_reversible_eyring_without_equilibrium_data_reports_line(self, parser):
-        """Reversible Eyring without K/dG_eq should surface DSLError with context, not ValueError."""
+        """Reversible Eyring without reverse authority should surface DSLError with context, not ValueError."""
         dsl = "reaction: A <-> B; dG_act=10"
         with pytest.raises(DSLError) as exc_info:
             parser(dsl)
@@ -322,7 +351,7 @@ class TestErrorHandling:
         err = exc_info.value
         assert err.line_number == 1
         assert "reaction: A <-> B" in (err.line_content or "")
-        assert "requires K" in str(err)
+        assert "exactly one of kr or Keq/dG_eq" in str(err)
 
     def test_empty_reactants_allowed(self):
         """Test that empty reactants are allowed (e.g., photochemical reactions)."""
@@ -484,6 +513,23 @@ class TestPublicAliasAndStateMemberParsing:
         result = parse_dsl("state: AB, kind=GS, energy=0, members=2A+B\nreaction: A -> B; k=1")
 
         assert result.ir.state_network.get("AB").members == ("A", "A", "B")
+
+    def test_state_network_direct_equilibrium_builds_through_public_dsl(self):
+        mechanism = parse_dsl_to_mechanism(
+            "\n".join(
+                [
+                    "energy=kJ/mol",
+                    "state: A, kind=GS, energy=0",
+                    "state: B, kind=GS, energy=1",
+                    "edge: A,B",
+                    "init: A=1.0, B=0.0",
+                ]
+            ),
+            initials={},
+        )
+
+        assert len(mechanism.equilibria) == 1
+        assert mechanism.equilibria[0].metadata["source"] == "state_network_direct"
 
     @pytest.mark.parametrize(
         ("members", "message"),

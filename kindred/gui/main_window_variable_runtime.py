@@ -8,6 +8,10 @@ import re
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from kindred.core.api.simulation import prepare_bound_mechanism
+from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+)
 from kindred.core.simulator.dsl_text_update import (
     _dedupe_tokens_case_insensitive,
     _duplicate_canonical_step_token,
@@ -592,19 +596,13 @@ class MainWindowVariableRuntime:
         mw = self._mw
 
         def _equilibrium_value(eq_obj: object, role: str) -> float:
+            effective_temperature = float(temperature_k) if temperature_k is not None else 298.15
             if role == "Keq":
-                meta_value = (getattr(eq_obj, "metadata", {}) or {}).get("Keq_input")
-                try:
-                    return float(meta_value() if callable(meta_value) else meta_value)
-                except Exception:
-                    try:
-                        kf_value = getattr(eq_obj, "kf", None)
-                        kr_value = getattr(eq_obj, "kr", None)
-                        kf = float(kf_value() if callable(kf_value) else kf_value)
-                        kr = float(kr_value() if callable(kr_value) else kr_value)
-                        return float(kf) / float(kr) if kr != 0.0 else float("nan")
-                    except Exception:
-                        return float("nan")
+                value = effective_equilibrium_keq(eq_obj, temperature_K=effective_temperature)
+                return float(value) if value is not None else float("nan")
+            if role == "kr":
+                value = effective_equilibrium_reverse_rate(eq_obj, temperature_K=effective_temperature)
+                return float(value) if value is not None else float("nan")
             raw_value = getattr(eq_obj, role, None)
             try:
                 return float(raw_value() if callable(raw_value) else raw_value)
@@ -812,16 +810,21 @@ class MainWindowVariableRuntime:
 
                 try:
                     kf = float(tokens.get("kf") or "")
-                    kr = float(tokens.get("kr") or "")
                 except Exception as exc:
                     mw._record_best_effort_failure(
                         "main_window.energy_channels.fast_eq.read_k",
-                        message="Skipping fast-equilibrium entry with invalid kf/kr tokens",
+                        message="Skipping fast-equilibrium entry with invalid kf token",
                         exc=exc,
                     )
                     continue
-                if not (math.isfinite(kf) and kf > 0.0 and math.isfinite(kr) and kr > 0.0):
+                if not (math.isfinite(kf) and kf > 0.0):
                     continue
+                kr_token = None
+                try:
+                    if tokens.get("kr") is not None:
+                        kr_token = float(tokens.get("kr") or "")
+                except Exception:
+                    kr_token = None
 
                 try:
                     if "<=>" in eqn:
@@ -861,6 +864,11 @@ class MainWindowVariableRuntime:
                     dg_eq_val = None
 
                 std_ratio = 1.0
+                try:
+                    if tokens.get("cm_std_ratio") is not None:
+                        std_ratio = float(tokens.get("cm_std_ratio") or "1.0")
+                except Exception:
+                    std_ratio = 1.0
                 k_thermo = float("nan")
                 if dg_eq_val is not None and temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
                     try:
@@ -870,15 +878,29 @@ class MainWindowVariableRuntime:
                             else float(dg_eq_val) * 1000.0
                         )
                         k_thermo = float(math.exp(-float(dg_eq_j) / (float(r_j_per_mol_k) * float(temperature_k))))
-                        if math.isfinite(k_thermo) and k_thermo > 0.0:
-                            kc = float(kf / kr)
+                        if (
+                            tokens.get("cm_std_ratio") is None
+                            and kr_token is not None
+                            and math.isfinite(k_thermo)
+                            and k_thermo > 0.0
+                            and math.isfinite(kr_token)
+                            and kr_token > 0.0
+                        ):
+                            kc = float(kf / kr_token)
                             std_ratio = float(kc / k_thermo)
                     except Exception:
                         std_ratio = 1.0
                         k_thermo = float("nan")
-                elif temperature_k is not None and math.isfinite(float(temperature_k)) and float(temperature_k) > 0.0:
+                elif (
+                    kr_token is not None
+                    and math.isfinite(kr_token)
+                    and kr_token > 0.0
+                    and temperature_k is not None
+                    and math.isfinite(float(temperature_k))
+                    and float(temperature_k) > 0.0
+                ):
                     try:
-                        kc = float(kf / kr)
+                        kc = float(kf / kr_token)
                         dg_eq_j = -float(r_j_per_mol_k) * float(temperature_k) * math.log(kc)
                         dg_eq_val = (
                             float(unit_conv.from_jmol(float(dg_eq_j)))
@@ -899,6 +921,13 @@ class MainWindowVariableRuntime:
                     continue
                 if not (math.isfinite(float(std_ratio)) and float(std_ratio) > 0.0):
                     std_ratio = 1.0
+                kr = float("nan")
+                if math.isfinite(k_thermo) and k_thermo > 0.0:
+                    kr = float(kf / (k_thermo * max(1e-300, float(std_ratio))))
+                elif kr_token is not None and math.isfinite(kr_token) and kr_token > 0.0:
+                    kr = float(kr_token)
+                if not (math.isfinite(kr) and kr > 0.0):
+                    continue
 
                 fast_eq_channels.append(
                     {

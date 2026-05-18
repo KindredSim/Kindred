@@ -133,6 +133,11 @@ class GlobalFitResult:
         if not isinstance(self.completion, GlobalFitCompletion):
             raise TypeError("GlobalFitResult.completion must be a GlobalFitCompletion")
 
+    @property
+    def success(self) -> bool:
+        """Compatibility view of the authoritative completion contract."""
+        return self.completion.status == "ok"
+
 
 def _coerce_fit_failure_payload(value: object) -> SimulationFailure:
     payload = dict(coerce_simulation_failure(value))
@@ -1741,4 +1746,3 @@ def assemble_global_fit_result(
         plot_model_series=plot_model_series_map,
         alignment_report=dict(alignment_report),
     )
-

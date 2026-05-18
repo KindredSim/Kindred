@@ -16,6 +16,16 @@ import math
 import re
 from typing import Dict, Optional, Set
 
+from kindred.core.equilibrium_rate_authority import (
+    EquilibriumRateAuthorityKind,
+    authority_fields_from_step_entry,
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    normalize_existing_equilibrium_rate_authority,
+    require_step_entry_role_editable,
+    step_entry_role_editable,
+)
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
@@ -81,6 +91,10 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
 
     rxns = getattr(mechanism, "reactions", []) or []
     eqs = getattr(mechanism, "equilibria", []) or []
+    mechanism_meta = getattr(mechanism, "metadata", {}) or {}
+    temperature_K = _as_float(mechanism_meta.get(MechanismMetadataKeys.TEMPERATURE_K)) if isinstance(mechanism_meta, dict) else None
+    if temperature_K is None:
+        temperature_K = 298.15
     for name, entry, role in iter_canonical_parameters(mechanism):
         if name not in wanted:
             continue
@@ -98,22 +112,14 @@ def read_mechanism_parameter_values(mechanism: object, *, names: Optional[Set[st
             eq = eqs[idx]
             if role in {"kf", "kr"}:
                 v = _as_float(getattr(eq, role, None))
+                if role == "kr":
+                    authority = normalize_existing_equilibrium_rate_authority(eq)
+                    if authority.kind == EquilibriumRateAuthorityKind.KEQ:
+                        v = effective_equilibrium_reverse_rate(eq, temperature_K=float(temperature_K))
                 if v is not None:
                     out[name] = v
             elif role == "Keq":
-                meta = getattr(eq, "metadata", {}) or {}
-                v = _as_float(meta.get("Keq_input"))
-                if v is None:
-                    kf = _as_float(getattr(eq, "kf", None))
-                    kr = _as_float(getattr(eq, "kr", None))
-                    if (
-                        kf is not None
-                        and kr is not None
-                        and math.isfinite(kf)
-                        and math.isfinite(kr)
-                        and abs(kr) > 1e-30
-                    ):
-                        v = float(kf) / float(kr)
+                v = effective_equilibrium_keq(eq, temperature_K=float(temperature_K))
                 if v is not None:
                     out[name] = v
     return out
@@ -166,7 +172,7 @@ def _set_mechanism_param(
     target = lookup_step_param_target(mechanism, name)
     if target is None:
         raise DSLError(f"Unsupported parameter name {name!r} for parameter algebra")
-    kind, idx, role, _entry = target
+    kind, idx, role, entry = target
     if kind == "reaction" and role == "k":
         rxns = getattr(mechanism, "reactions", []) or []
         if not (0 <= idx < len(rxns)):
@@ -185,6 +191,7 @@ def _set_mechanism_param(
         eqs = getattr(mechanism, "equilibria", []) or []
         if not (0 <= idx < len(eqs)):
             raise DSLError(f"Unknown parameter {name!r} (equilibrium index out of range)")
+        require_step_entry_role_editable(entry, role, parameter_name=name)
         eq = eqs[idx]
         if role in {"kf", "kr"}:
             current = getattr(eq, role, None)
@@ -216,19 +223,38 @@ def _set_mechanism_param(
 
 def _active_equilibrium_keq_names(mechanism: object, spec: ParameterAlgebraSpec) -> Set[str]:
     active: Set[str] = set()
+    entry_by_keq_name: dict[str, dict] = {}
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
-        if not bool(entry.get("has_Keq_param")):
-            continue
         try:
-            active.add(f"Keq{int(entry.get('step_index'))}")
+            name = f"Keq{int(entry.get('step_index'))}"
         except (TypeError, ValueError):
             continue
+        entry_by_keq_name[name] = entry
+        if not bool(step_entry_role_editable(entry, "Keq")):
+            continue
+        active.add(name)
     for stmt in spec.param_statements or []:
-        if re.match(r"^Keq\d+$", str(stmt.name)):
-            active.add(str(stmt.name))
+        name = str(stmt.name)
+        if not re.match(r"^Keq\d+$", name):
+            continue
+        entry = entry_by_keq_name.get(name)
+        authority = authority_fields_from_step_entry(entry or {})
+        if authority and bool(authority.get("has_thermo_param")) and not bool(step_entry_role_editable(entry or {}, "Keq")):
+            raise ValueError(f"{name} cannot override dG_eq equilibrium authority.")
+        active.add(name)
     return active
+
+
+def _validate_parameter_algebra_editable_targets(mechanism: object, spec: ParameterAlgebraSpec) -> None:
+    for stmt in spec.param_statements or ():
+        target = lookup_step_param_target(mechanism, str(stmt.name))
+        if target is None:
+            continue
+        kind, _idx, role, entry = target
+        if kind == "equilibrium":
+            require_step_entry_role_editable(entry, role, parameter_name=str(stmt.name))
 
 
 def _apply_equilibrium_Keq_constraints_to_values(
@@ -252,7 +278,14 @@ def _apply_equilibrium_Keq_constraints_to_values(
             raise ValueError(
                 f"Invalid equilibrium Keq-constraint step_index={entry.get('step_index')!r}."
             ) from exc
-        derive_rate = str(entry.get("derive_rate") or "kr")
+        authority = authority_fields_from_step_entry(entry)
+        if not authority:
+            raise ValueError(
+                f"Equilibrium Keq-constraint step_index={entry.get('step_index')!r} is missing equilibrium_authority."
+            )
+        derive_rate = str(authority.get("derived_role") or "")
+        if derive_rate not in {"kf", "kr"}:
+            derive_rate = "kr"
         kf_key = f"kf{n}"
         kr_key = f"kr{n}"
         keq_key = f"Keq{n}"
@@ -282,35 +315,17 @@ def _apply_equilibrium_Keq_constraints_to_mechanism(
     active_keq_names: Set[str],
 ) -> Dict[str, float]:
     """
-    Apply equilibrium constraints implied by explicit Keq parameters to the mechanism in-place.
+    Validate equilibrium constraints implied by explicit Keq parameters.
 
-    Returns a map of derived rate updates (e.g., {'kr2': 1.23}).
+    Derived reverse/forward rates are effective values owned by the normalized
+    equilibrium authority boundary. They are populated into evaluation values by
+    `_apply_equilibrium_Keq_constraints_to_values`, but are not written back to
+    raw rate slots or reported as applied parameter-algebra mutations here.
     """
-    updates: Dict[str, float] = {}
     values = read_mechanism_parameter_values(mechanism)
     _apply_equilibrium_Keq_constraints_to_values(mechanism, values, active_keq_names=active_keq_names)
-    for entry in get_step_index_map(mechanism):
-        if str(entry.get("kind") or "") != "equilibrium":
-            continue
-        try:
-            n = int(entry.get("step_index"))  # type: ignore[arg-type]
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Invalid equilibrium Keq-constraint step_index={entry.get('step_index')!r}."
-            ) from exc
-        derive_rate = str(entry.get("derive_rate") or "kr")
-        if f"Keq{n}" not in active_keq_names:
-            continue
-        if derive_rate == "kf":
-            nm = f"kf{n}"
-        else:
-            nm = f"kr{n}"
-        if nm not in values:
-            raise ValueError(f"Active equilibrium constraint for step {n} cannot derive missing {nm!r}.")
-        v = float(values[nm])
-        _set_mechanism_param(mechanism, nm, v, require_mutable=require_mutable)
-        updates[nm] = v
-    return updates
+    _ = require_mutable
+    return {}
 
 
 def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec | None:
@@ -355,7 +370,7 @@ def _parameter_override_warnings_for_spec(
                 inline_name = "kf"
             elif role == "kr" and bool(entry.get("user_provided_kr")):
                 inline_name = "kr"
-            elif role == "Keq" and bool(entry.get("has_Keq_param")):
+            elif role == "Keq" and bool(step_entry_role_editable(entry, "Keq")):
                 inline_name = "Keq"
 
         if inline_name is None:
@@ -385,6 +400,7 @@ def apply_parameter_algebra_spec_to_mechanism(
     meta = getattr(mechanism, "metadata", None)
     if isinstance(meta, dict):
         meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
+    _validate_parameter_algebra_editable_targets(mechanism, spec)
     _ensure_scalar_param_storage(mechanism, require_mutable=require_mutable)
     active_keq_names = _active_equilibrium_keq_names(mechanism, spec)
     base_values: Dict[str, float] = {}

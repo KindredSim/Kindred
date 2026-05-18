@@ -72,6 +72,7 @@ def fit_global(
     runtime_session: Optional[FittingRuntimeSession] = None,
     max_runtime_lanes: Optional[int] = None,
     runtime_ledger: Optional[object] = None,
+    contained_runtime: bool = False,
 ) -> GlobalFitResult:
     """
     Fit single mechanism to multiple experimental datasets simultaneously.
@@ -132,6 +133,11 @@ def fit_global(
     runtime_ledger : object, optional
         Internal deterministic ledger object used by runtime-session tests and
         GUI controller diagnostics.
+    contained_runtime : bool, optional
+        Explicit opt-in for public/core callers that want this function to
+        create a temporary contained runtime session for an exact
+        SerialFittingEvaluator. GUI fitting should normally supply its accepted
+        prepared runtime session instead.
 
     Returns
     -------
@@ -298,7 +304,7 @@ def fit_global(
     try:
         if runtime_session is not None:
             fit_evaluator_for_run = runtime_session.evaluator(cancellation_check=cancellation_check)
-        elif type(fit_evaluator) is SerialFittingEvaluator:
+        elif bool(contained_runtime) and type(fit_evaluator) is SerialFittingEvaluator:
             lane_count = 1 if max_runtime_lanes is None else max(1, int(max_runtime_lanes))
             contained_fit_evaluator = FittingRuntimeSession.from_serial_evaluator(
                 fit_evaluator,

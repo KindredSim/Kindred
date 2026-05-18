@@ -7,9 +7,16 @@ This is intentionally Qt-free so it can be unit-tested without launching a GUI.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, Tuple
+from typing import Dict, Mapping, Tuple
 
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    normalize_existing_equilibrium_rate_authority,
+    step_entry_role_derived,
+    step_entry_role_editable,
+)
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.validation import try_parse_finite_float, try_parse_int
@@ -25,16 +32,19 @@ def _try_finite_float(x: object) -> tuple[float, bool]:
     return try_parse_finite_float(raw)
 
 
-def _equilibrium_keq_value(eq: object) -> tuple[float, bool]:
-    meta = getattr(eq, "metadata", {}) or {}
-    if isinstance(meta, dict):
-        value, ok = _try_finite_float(meta.get(EquilibriumMetadataKeys.KEQ_INPUT))
+def _mechanism_temperature(mechanism: object) -> float:
+    meta = getattr(mechanism, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
+        value, ok = _try_finite_float(meta.get(MechanismMetadataKeys.TEMPERATURE_K))
         if ok:
-            return value, True
-    kf, kf_ok = _try_finite_float(getattr(eq, "kf", None))
-    kr, kr_ok = _try_finite_float(getattr(eq, "kr", None))
-    if kf_ok and kr_ok and kr != 0.0:
-        return float(kf) / float(kr), True
+            return float(value)
+    return 298.15
+
+
+def _equilibrium_keq_value(eq: object, *, temperature_K: float) -> tuple[float, bool]:
+    value = effective_equilibrium_keq(eq, temperature_K=float(temperature_K))
+    if value is not None:
+        return float(value), True
     return 0.0, False
 
 
@@ -62,6 +72,7 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
             step_entry_by_index[int(n)] = entry
     rxns = list(getattr(mechanism, "reactions", []) or [])
     eqs = list(getattr(mechanism, "equilibria", []) or [])
+    temperature_K = _mechanism_temperature(mechanism)
     for item in namespace.ordered_items:
         info = item.info
         n = info.step_index
@@ -89,16 +100,16 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
             if not (0 <= idx < len(eqs)):
                 continue
             eq = eqs[idx]
-            has_K = bool(entry.get("has_Keq_param"))
-            derive_rate = str(entry.get("derive_rate") or "")
+            authority = normalize_existing_equilibrium_rate_authority(eq)
 
             name = item.canonical_name
             if role == "kf":
                 value, ok = _try_finite_float(getattr(eq, "kf", None))
             elif role == "kr":
-                value, ok = _try_finite_float(getattr(eq, "kr", None))
+                effective_kr = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
+                value, ok = (float(effective_kr), True) if effective_kr is not None else (0.0, False)
             elif role == "Keq":
-                value, ok = _equilibrium_keq_value(eq)
+                value, ok = _equilibrium_keq_value(eq, temperature_K=temperature_K)
             else:
                 continue
             variables[name] = float(value)
@@ -109,13 +120,15 @@ def enumerate_step_parameters_for_gui(mechanism: object) -> Tuple["OrderedDict[s
                 "label": label,
                 "value_valid": bool(ok),
             }
-            if has_K:
-                # Mark one rate as derived so Keq always has semantics.
-                if role == derive_rate:
-                    metadata[name]["editable"] = False
-                    metadata[name]["derived"] = True
-            elif role == "Keq":
+            editable = step_entry_role_editable(entry, role)
+            derived = step_entry_role_derived(entry, role)
+            if editable is None:
+                editable = authority.role_editability(role)
+            if derived is None:
+                derived = authority.role_derived(role)
+            if not editable:
                 metadata[name]["editable"] = False
+            if derived:
                 metadata[name]["derived"] = True
 
     return variables, metadata

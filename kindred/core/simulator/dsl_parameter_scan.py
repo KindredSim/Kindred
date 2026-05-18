@@ -8,10 +8,17 @@ This module keeps reaction/algebra parameter name extraction out of the public
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 from kindred.core.algebra.simulation_series import compile_algebra_observables
+from kindred.core.equilibrium_rate_authority import (
+    effective_equilibrium_keq,
+    effective_equilibrium_reverse_rate,
+    normalize_existing_equilibrium_rate_authority,
+    step_entry_role_editable,
+)
 from . import parameter_algebra
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.mechanism_metadata import MechanismMetadataKeys
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 
 from .dsl import _parse_dsl_ir
@@ -56,17 +63,13 @@ def _finite_value(value: object) -> float | None:
     return float(parsed) if ok else None
 
 
-def _equilibrium_keq_value(eq: object) -> float | None:
-    meta = getattr(eq, "metadata", {}) or {}
-    if isinstance(meta, dict):
-        explicit_value = _finite_value(meta.get(EquilibriumMetadataKeys.KEQ_INPUT))
-        if explicit_value is not None:
-            return explicit_value
-    kf = _finite_value(getattr(eq, "kf", None))
-    kr = _finite_value(getattr(eq, "kr", None))
-    if kf is None or kr in (None, 0.0):
-        return None
-    return float(kf) / float(kr)
+def _mechanism_temperature(mechanism: object) -> float:
+    meta = getattr(mechanism, "metadata", {}) or {}
+    if isinstance(meta, Mapping):
+        value = _finite_value(meta.get(MechanismMetadataKeys.TEMPERATURE_K))
+        if value is not None:
+            return float(value)
+    return 298.15
 
 
 def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
@@ -83,6 +86,7 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
     parameters: list[ParameterDefinition] = []
     rxns = list(getattr(mechanism, "reactions", []) or [])
     eqs = list(getattr(mechanism, "equilibria", []) or [])
+    temperature_K = _mechanism_temperature(mechanism)
     step_entry_by_index = {}
     for entry in get_step_index_map(mechanism):
         step_index, ok = try_parse_int(entry.get("step_index"))
@@ -121,12 +125,12 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
         if not ok or not (0 <= equilibrium_index < len(eqs)):
             continue
         eq = eqs[equilibrium_index]
-        has_explicit_keq = bool(entry.get("has_Keq_param"))
-        derive_rate = str(entry.get("derive_rate") or "kr")
+        authority = normalize_existing_equilibrium_rate_authority(eq)
+        kr_value = effective_equilibrium_reverse_rate(eq, temperature_K=temperature_K)
         source, value = {
             "kf": ("Forward rate", _finite_value(getattr(eq, "kf", None))),
-            "kr": ("Reverse rate", _finite_value(getattr(eq, "kr", None))),
-            "Keq": ("Equilibrium constant", _equilibrium_keq_value(eq)),
+            "kr": ("Reverse rate", kr_value),
+            "Keq": ("Equilibrium constant", effective_equilibrium_keq(eq, temperature_K=temperature_K)),
         }.get(role, ("", None))
         if value is None:
             continue
@@ -137,7 +141,11 @@ def extract_parameters_from_dsl(text: str) -> list[ParameterDefinition]:
                 context=context,
                 source=source,
                 step_index=int(step_index),
-                editable=bool((role != "Keq" or has_explicit_keq) and not (has_explicit_keq and role == derive_rate)),
+                editable=bool(
+                    step_entry_role_editable(entry, role)
+                    if step_entry_role_editable(entry, role) is not None
+                    else authority.role_editability(role)
+                ),
             )
         )
 

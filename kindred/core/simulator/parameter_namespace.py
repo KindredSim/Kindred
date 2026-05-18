@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 from typing import Iterable, Iterator, Mapping, Sequence
 
+from kindred.core.equilibrium_rate_authority import authority_fields_from_step_entry
 from kindred.core.validation import try_parse_int
 
 _CANONICAL_NAME_RE = re.compile(r"^(k|kf|kr|Keq)([1-9]\d*)$")
@@ -267,11 +268,19 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
         step_kind = str(raw_entry.get("kind") or "")
         if step_kind not in {"reaction", "equilibrium"}:
             raise ValueError(f"Mechanism step_index_map entry {source_index} has an invalid kind {step_kind!r}.")
+        has_explicit_keq = False
+        if step_kind == "equilibrium":
+            authority = authority_fields_from_step_entry(raw_entry)
+            if not authority:
+                raise ValueError(
+                    f"Mechanism equilibrium step_index_map entry {source_index} is missing equilibrium_authority."
+                )
+            has_explicit_keq = bool(authority.get("has_explicit_keq_param"))
         descriptors.append(
             _NamespaceStepDescriptor(
                 step_index=step_index,
                 step_kind=step_kind,
-                has_explicit_keq=bool(raw_entry.get("has_Keq_param")),
+                has_explicit_keq=has_explicit_keq,
                 source_index=source_index,
             )
         )

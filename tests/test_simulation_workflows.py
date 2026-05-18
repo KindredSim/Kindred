@@ -6,6 +6,9 @@ import numpy as np
 import pytest
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+from kindred.core.simulator.computational_mode import GENERATED_BLOCK_END, GENERATED_BLOCK_START
+
 from tests.batch_context_test_helpers import seed_batch_context
 from tests.workflow_helpers import (
     current_preview_time_axis,
@@ -49,6 +52,78 @@ def _stub_payload(worker) -> dict:
         "fallback_occurred": False,
         "fallback_message": None,
     }
+
+
+def test_main_window_override_materialization_preserves_dg_authority_without_kr(main_window):
+    source = "equilibrium: A <-> B; kf=6.0; dG_eq=-1.0"
+    main_window._mechanism_editor._reactions_text.setPlainText(source)
+    main_window._extract_and_populate_variables()
+
+    updated = main_window._apply_overrides_to_text(source, overrides={"kf1": 7.0})
+
+    assert "kf=7" in updated
+    assert "dG_eq=-1.0" in updated
+    assert "kr=" not in updated
+    parse_dsl_to_mechanism(updated, initials={})
+
+
+def test_main_window_kf_edit_refreshes_derived_kr_readout_for_dg_authority(main_window):
+    source = "T=298.15\nenergy=J/mol\nequilibrium: A <-> B; kf=6.0; dG_eq=0.0"
+    main_window._mechanism_editor._reactions_text.setPlainText(source)
+    main_window._extract_and_populate_variables()
+
+    main_window._update_variable_in_mechanism("kf1", 12.0, commit=True)
+
+    variables = main_window._mechanism_editor._variable_sliders.get_variables()
+    assert variables["kf1"] == pytest.approx(12.0)
+    assert variables["Keq1"] == pytest.approx(1.0)
+    assert variables["kr1"] == pytest.approx(12.0)
+
+
+def test_main_window_kf_edit_refreshes_derived_kr_readout_with_cm_std_ratio(main_window):
+    source = (
+        "T=298.15\n"
+        "energy=J/mol\n"
+        f"{GENERATED_BLOCK_START}\n"
+        "equilibrium: A <-> B; kf=10.0; dG_eq=0.0; cm_id=cm1; cm_std_ratio=0.5\n"
+        f"{GENERATED_BLOCK_END}"
+    )
+    main_window._mechanism_editor._reactions_text.setPlainText(source)
+    main_window._extract_and_populate_variables()
+
+    main_window._update_variable_in_mechanism("kf1", 20.0, commit=True)
+
+    variables = main_window._mechanism_editor._variable_sliders.get_variables()
+    assert variables["kf1"] == pytest.approx(20.0)
+    assert variables["Keq1"] == pytest.approx(1.0)
+    assert variables["kr1"] == pytest.approx(40.0)
+
+
+def test_computational_mode_fast_eq_override_respects_blocked_derived_kr_constraint(main_window, monkeypatch):
+    source = (
+        "T=298.15\n"
+        "energy=J/mol\n"
+        f"{GENERATED_BLOCK_START}\n"
+        "equilibrium: A <-> B; kf=10.0; dG_eq=0.0; cm_id=cm1; cm_std_ratio=1.0\n"
+        f"{GENERATED_BLOCK_END}\n"
+        "param kr1 = 99.0\n"
+    )
+
+    monkeypatch.setattr(
+        main_window,
+        "_collect_energy_overrides",
+        lambda **_kwargs: [
+            (
+                "dG_eq1",
+                1000.0,
+                {"role": "dG_eq_fast", "cm_id": "cm1", "unit": "J/mol", "kf_fixed": 10.0, "std_ratio": 1.0},
+            )
+        ],
+    )
+
+    updated = main_window._apply_energy_overrides_to_computational_mode_fast_equilibria(source)
+
+    assert updated == source
 
 
 def test_dirty_slider_preview_reselect_run_selected_clears_only_targeted_dirty_state(
@@ -391,3 +466,4 @@ def test_stale_simulation_completion_does_not_publish_cache_or_display(main_wind
     policy_context = controller.batch_context_owner.completion_policy_context()
     assert policy_context is not None
     assert policy_context.active is True
+

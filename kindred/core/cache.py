@@ -47,6 +47,7 @@ import numpy as np
 
 from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.lru_cache import LRUCache
+from kindred.core.equilibrium_rate_authority import normalize_existing_equilibrium_rate_authority
 from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
@@ -560,18 +561,18 @@ def generate_mechanism_hash(mechanism: Any) -> str:
             coeff = eq.stoich_back[name]
             hasher.update(f"back:{name}:{coeff}".encode('utf-8'))
 
-        # Equilibrium constant and rates
-        if eq.Keq is not None:
-            hasher.update(f"Keq:{_hash_rate_obj(eq.Keq)}".encode('utf-8'))
-        if eq.kf is not None:
-            hasher.update(f"kf:{_hash_rate_obj(eq.kf)}".encode('utf-8'))
-        if eq.kr is not None:
-            hasher.update(f"kr:{_hash_rate_obj(eq.kr)}".encode('utf-8'))
+        # Equilibrium authority and effective execution identity
+        authority = normalize_existing_equilibrium_rate_authority(eq)
+        for key, value in authority.identity_items():
+            hasher.update(f"eq_authority:{key}".encode("utf-8"))
+            hasher.update(_hash_rate_obj(value).encode("utf-8", errors="ignore"))
         hasher.update(f"fast:{eq.fast}".encode('utf-8'))
 
     # Hash select metadata (temperature, units, schedules) deterministically
     metadata_items = sorted(getattr(mechanism, "metadata", {}) .items())
     for key, val in metadata_items:
+        if key == "step_index_map":
+            continue
         if key in {"temperature_schedule"}:
             val_repr = _fingerprint_temperature_schedule_value(val)
             if val_repr is None:

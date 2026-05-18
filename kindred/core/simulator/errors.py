@@ -114,8 +114,8 @@ def missing_arrow_error(line: str) -> DSLError:
         examples=[
             "reaction: A -> B; k=1.0",
             "reaction: A + B -> C; dG_act=75.5",
-            "equilibrium: A <-> B; K=2.0",
-            "equilibrium: A <=> B; K=2.0",
+            "equilibrium: A <-> B; kf=1.0; K=2.0",
+            "equilibrium: A <=> B; kf=1.0; K=2.0",
         ],
         line_content=line
     )
@@ -155,13 +155,13 @@ def missing_rate_parameters_error(reaction_type: str) -> DSLError:
 def missing_equilibrium_parameters_error() -> DSLError:
     """Error for equilibrium missing required parameters."""
     return DSLError(
-        "Equilibrium requires K, dG_eq, or both kf and kr",
-        suggestion="Specify equilibrium constant or rate constants",
+        "Equilibrium requires kf and exactly one of kr or Keq/dG_eq",
+        suggestion="Provide kf with either kr, K/Keq, or dG_eq, but not more than one reverse authority",
         examples=[
-            "equilibrium: A <-> B; K=2.0",
-            "equilibrium: A <-> B; dG_eq=-8.5",
+            "equilibrium: A <-> B; kf=1.5; K=2.0",
+            "equilibrium: A <-> B; kf=1.5; dG_eq=-8.5",
             "equilibrium: A <-> B; kf=1.5; kr=0.75",
-            "equilibrium: A <=> B; K=2.0",
+            "equilibrium: A <=> B; kf=1.5; K=2.0",
         ]
     )
 
@@ -229,8 +229,8 @@ def non_integer_molecularity_error() -> DSLError:
 def reversible_arrhenius_missing_kr_error() -> DSLError:
     """Error for reversible Arrhenius without reverse rate."""
     return DSLError(
-        "Reversible Arrhenius reaction needs kr, K, or dG_eq",
-        suggestion="For reversible reactions, specify reverse rate constant or equilibrium",
+        "Reversible Arrhenius reaction needs exactly one of kr or Keq/dG_eq",
+        suggestion="For reversible Arrhenius reactions, specify one reverse authority",
         examples=[
             "reaction: A <-> B; A=1e10; Ea=50.0; kr=0.5",
             "reaction: A <-> B; A=1e10; Ea=50.0; K=2.0",

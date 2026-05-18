@@ -27,7 +27,9 @@ import math
 from typing import Dict, List, Optional, Set
 
 from .state_model import StateNetwork, State, StateType
+from ..equilibrium_rate_authority import EquilibriumRateInputContext
 from ..mechanism import Mechanism
+from ..mechanism_metadata import EquilibriumMetadataKeys
 from ..constants import R, k_B, h
 
 # Aliases for clarity
@@ -294,17 +296,20 @@ class StateNetworkConverter:
             "kf": float(k_forward),
             "kr": float(k_reverse),
             "Keq": float(K),
+            EquilibriumMetadataKeys.USER_PROVIDED_KF: True,
+            EquilibriumMetadataKeys.USER_PROVIDED_KR: True,
         }
 
         # Add as equilibrium to mechanism
-        mechanism.add_equilibrium(
+        mechanism._add_equilibrium_with_authority_context(
             stoich_forward=stoich_forward,
             stoich_back=stoich_back,
-            Keq=K,
+            Keq=None,
             kf=k_forward,
             kr=k_reverse,
             fast=False,  # Not instantaneous equilibrium
             metadata=meta,
+            authority_context=EquilibriumRateInputContext.GENERATED_STATE_NETWORK,
         )
 
     def _add_direct_equilibrium(
@@ -360,9 +365,12 @@ class StateNetworkConverter:
             "kf": float(k_forward),
             "kr": float(k_reverse),
             "Keq": float(K),
+            "std_ratio": float(std_prod / std_react),
+            EquilibriumMetadataKeys.USER_PROVIDED_KF: True,
+            EquilibriumMetadataKeys.USER_PROVIDED_KR: False,
         }
 
-        mechanism.add_equilibrium(
+        mechanism._add_equilibrium_with_authority_context(
             stoich_forward=stoich_forward,
             stoich_back=stoich_back,
             Keq=K,
@@ -370,6 +378,7 @@ class StateNetworkConverter:
             kr=k_reverse,
             fast=True,
             metadata=meta,
+            authority_context=EquilibriumRateInputContext.GENERATED_STATE_NETWORK,
         )
 
     def _eyring_rate(self, dG_barrier_J_per_mol: float, degeneracy_ratio: float, *, std_ratio: float = 1.0) -> float:
