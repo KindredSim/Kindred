@@ -22,6 +22,7 @@ class BatchCacheEntryV1(TypedDict):
     fallback_message: Any
     solver_provenance: Dict[str, Any]
     warnings: list[dict[str, Any]]
+    completion_provenance: NotRequired[Dict[str, Any]]
 
 
 class PlotOverlayEntryV1(TypedDict):
@@ -30,7 +31,8 @@ class PlotOverlayEntryV1(TypedDict):
     series: Dict[str, np.ndarray]
     set_id: NotRequired[str]
     popup_label: NotRequired[str]
-    curve_role: NotRequired[str]
+    layer_id: NotRequired[str]
+    layer_kind: NotRequired[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,7 @@ def build_batch_cache_entry(
     fallback_message: Any = None,
     solver_provenance: Optional[Mapping[str, Any]] = None,
     warnings: Optional[Sequence[Mapping[str, Any]]] = None,
+    completion_provenance: Optional[Mapping[str, Any]] = None,
 ) -> BatchCacheEntryV1:
     scalars: Dict[str, float] = {}
     if isinstance(algebra_scalars, Mapping):
@@ -85,7 +88,7 @@ def build_batch_cache_entry(
 
     identity = coerce_simulation_identity(simulation_identity)
 
-    return {
+    entry: BatchCacheEntryV1 = {
         "version": 1,
         "t": _coerce_1d_float_array(t),
         "series": _coerce_series_map(series),
@@ -100,9 +103,16 @@ def build_batch_cache_entry(
         "solver_provenance": dict(solver_provenance or {}),
         "warnings": [dict(item) for item in (warnings or []) if isinstance(item, Mapping)],
     }
+    if isinstance(completion_provenance, Mapping):
+        entry["completion_provenance"] = dict(completion_provenance)
+    return entry
 
 
-def read_batch_cache_entry(payload: object) -> BatchCacheEntryReadResult:
+def read_batch_cache_entry(
+    payload: object,
+    *,
+    require_completion_provenance: bool = False,
+) -> BatchCacheEntryReadResult:
     if payload is None:
         return BatchCacheEntryReadResult("missing")
     if not isinstance(payload, Mapping):
@@ -110,6 +120,9 @@ def read_batch_cache_entry(payload: object) -> BatchCacheEntryReadResult:
     t = payload.get("t")
     series = payload.get("series")
     if t is None or series is None:
+        return BatchCacheEntryReadResult("invalid")
+    completion_provenance = payload.get("completion_provenance")
+    if require_completion_provenance and not isinstance(completion_provenance, Mapping):
         return BatchCacheEntryReadResult("invalid")
     try:
         coerced = build_batch_cache_entry(
@@ -125,6 +138,7 @@ def read_batch_cache_entry(payload: object) -> BatchCacheEntryReadResult:
             fallback_message=payload.get("fallback_message"),
             solver_provenance=cast(Optional[Mapping[str, Any]], payload.get("solver_provenance")),
             warnings=cast(Optional[Sequence[Mapping[str, Any]]], payload.get("warnings")),
+            completion_provenance=cast(Optional[Mapping[str, Any]], completion_provenance),
         )
     except Exception:
         return BatchCacheEntryReadResult("invalid")
@@ -140,7 +154,8 @@ def build_overlay_entry(
     label: str,
     entry: BatchCacheEntryV1,
     set_id: str | None = None,
-    curve_role: str | None = None,
+    layer_id: str | None = None,
+    layer_kind: str | None = None,
 ) -> PlotOverlayEntryV1:
     overlay: PlotOverlayEntryV1 = {
         "label": str(label or ""),
@@ -149,6 +164,8 @@ def build_overlay_entry(
     }
     if set_id is not None and str(set_id):
         overlay["set_id"] = str(set_id)
-    if curve_role is not None and str(curve_role):
-        overlay["curve_role"] = str(curve_role)
+    if layer_id is not None and str(layer_id):
+        overlay["layer_id"] = str(layer_id)
+    if layer_kind is not None and str(layer_kind):
+        overlay["layer_kind"] = str(layer_kind)
     return overlay

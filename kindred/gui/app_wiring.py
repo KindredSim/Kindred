@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -347,12 +348,69 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
     plot_tabs = PlotTabsWidget(main_plot_embed_analysis_tabs=False)
     plot_tabs.setObjectName("plotTabs")
     theme_manager = ThemeManager(plot_tabs)
+
+    def main_plot() -> object:
+        return plot_tabs._main_plot
+
+    def main_plot_has_data() -> bool:
+        has_display_data = getattr(main_plot(), "has_display_data", None)
+        return bool(has_display_data()) if callable(has_display_data) else False
+
+    def main_plot_selected_series() -> list[str]:
+        selected = getattr(main_plot(), "selected_series", None)
+        return list(selected()) if callable(selected) else []
+
+    def set_main_plot_selected_series(series_names) -> None:
+        setter = getattr(main_plot(), "set_selected_series", None)
+        if callable(setter):
+            setter(list(series_names))
+
+    def set_main_plot_scalar_values(scalars) -> None:
+        setter = getattr(main_plot(), "set_scalar_values", None)
+        if callable(setter):
+            setter(dict(scalars or {}))
+
+    def update_main_plot_statistics(*, stats_results_map, prefer, t, series) -> None:
+        plot = main_plot()
+        setter = getattr(plot, "set_statistics_results", None)
+        if callable(setter):
+            setter(dict(stats_results_map or {}), prefer=str(prefer or ""))
+            return
+        raise RuntimeError("Main plot does not expose semantic statistics results")
+
+    def main_plot_stats_table() -> object:
+        return main_plot().stats_table()
+
+    def set_results_table(table) -> None:
+        main_window._results_table = table
+
+    def set_main_plot_data(t, series, **kwargs) -> None:
+        main_plot().set_data(t, series, **kwargs)
+
+    def show_simulation_tab() -> None:
+        plot_tabs._tabs.setCurrentIndex(0)
+
+    def refresh_simulation_plot_views() -> None:
+        main_plot().update()
+        plot_tabs.update()
+        main_window.update()
+
+    def schedule_main_plot_refresh(delays_ms) -> None:
+        plot = main_plot()
+
+        def _safe_plot_update(plot_widget=plot) -> None:
+            with suppress(RuntimeError):
+                plot_widget.update()
+
+        for delay_ms in delays_ms:
+            QtCore.QTimer.singleShot(int(delay_ms), _safe_plot_update)
+
     results_port = ResultsControllerPort(
         parent=main_window,
-        main_plot=main_window.main_plot,
-        main_plot_has_data=main_window.main_plot_has_data,
-        main_plot_selected_series=main_window.main_plot_selected_series,
-        set_main_plot_selected_series=main_window.set_main_plot_selected_series,
+        main_plot=main_plot,
+        main_plot_has_data=main_plot_has_data,
+        main_plot_selected_series=main_plot_selected_series,
+        set_main_plot_selected_series=set_main_plot_selected_series,
         batch_name_for_id=main_window.batch_set_name_for_id,
         batch_id_for_name=main_window.batch_set_id_for_name,
         shown_batch_set_ids=main_window.shown_batch_set_ids,
@@ -360,22 +418,62 @@ def build_window_shell(main_window: MainWindow) -> WindowShellComponents:
         selected_batch_set_ids=lambda: list(main_window.batch_set_ids_for_scope("selected")),
         current_batch_row=main_window.batch_current_row,
         batch_set_id_for_row=main_window.batch_set_id_for_row,
+        batch_row_for_set_id=main_window._batch_row_for_set_id,
         active_batch_cache_key=main_window.active_batch_cache_key,
-        active_batch_valid_set_ids=lambda: main_window.simulation_controller.batch_cache.active_cache_valid_set_ids,
-        active_batch_invalidated_set_ids=lambda: main_window.simulation_controller.batch_cache.active_cache_invalidated_set_ids,
-        active_batch_selection=main_window.active_batch_selection,
-        set_active_batch_selection=main_window.set_active_batch_selection,
+        active_batch_valid_set_ids=main_window._simulation_batch_owner.active_cache_valid_set_ids,
+        active_batch_invalidated_set_ids=main_window._simulation_batch_owner.active_cache_invalidated_set_ids,
+        active_batch_selection=main_window._simulation_batch_owner.active_batch_selection,
+        set_active_batch_selection=main_window._simulation_batch_owner.set_active_batch_selection,
+        clear_display_selection_state=main_window._simulation_batch_owner.clear_display_selection_state,
+        clear_active_preview_selection_state=main_window._simulation_batch_owner.clear_active_preview_selection_state,
+        last_display_selection=main_window._simulation_batch_owner.last_display_selection,
+        last_simulation_provenance=lambda: main_window._simulation_provenance_owner.last_simulation_provenance,
+        last_simulation_ctc=lambda: main_window._simulation_provenance_owner.last_simulation_ctc,
+        set_last_simulation_provenance=main_window._simulation_provenance_owner.set_last_simulation_provenance,
+        set_last_simulation_ctc=main_window._simulation_provenance_owner.set_last_simulation_ctc,
+        publish_simulation_completion_provenance=(
+            main_window._simulation_provenance_owner.publish_simulation_completion_provenance
+        ),
         result_cache_store=main_window._simulation_batch_owner.batch_result_cache_store,
-        set_main_plot_scalar_values=main_window.set_main_plot_scalar_values,
-        update_main_plot_statistics=main_window.update_main_plot_statistics,
-        main_plot_stats_table=main_window.main_plot_stats_table,
-        set_results_table=main_window.set_results_table,
-        set_main_plot_data=main_window.set_main_plot_data,
-        sync_main_plot_copy_labels=main_window.sync_main_plot_copy_labels,
-        show_simulation_tab=main_window.show_simulation_tab,
-        refresh_simulation_plot_views=main_window.refresh_simulation_plot_views,
-        schedule_main_plot_refresh=main_window.schedule_main_plot_refresh,
+        set_main_plot_scalar_values=set_main_plot_scalar_values,
+        update_main_plot_statistics=update_main_plot_statistics,
+        main_plot_stats_table=main_plot_stats_table,
+        set_results_table=set_results_table,
+        set_main_plot_data=set_main_plot_data,
+        show_simulation_tab=show_simulation_tab,
+        refresh_simulation_plot_views=refresh_simulation_plot_views,
+        schedule_main_plot_refresh=schedule_main_plot_refresh,
         set_status_text=main_window.set_status_text,
+        status_text_getter=main_window._status_text_value,
+        update_batch_row_controls_state=main_window._simulation_batch_owner.update_batch_row_controls_state,
+        focused_batch_selection_is_dirty=lambda selected_sets, prefer_set: (
+            main_window._simulation_batch_owner.focused_batch_selection_is_dirty(
+                selected_sets=selected_sets,
+                prefer_set=prefer_set,
+            )
+        ),
+        focused_batch_set_is_dirty=main_window._simulation_batch_owner.focused_batch_set_is_dirty,
+        selection_uses_fresh_explicit_cache_after_post_run_sync=(
+            lambda selected_sets: (
+                main_window._simulation_batch_owner.selection_uses_fresh_explicit_cache_after_post_run_sync(
+                    selected_sets=selected_sets
+                )
+            )
+        ),
+        workspace_selection_resolution=main_window._simulation_batch_owner.workspace_selection_resolution,
+        preview_launch_pending=lambda: bool(
+            getattr(
+                getattr(main_window.simulation_controller.run_state, "pending_slider_preview_launch", None),
+                "active",
+                False,
+            )
+        ),
+        current_workspace_preview_identity_payload=lambda set_id: (
+            main_window._simulation_batch_owner.current_workspace_preview_identity_payload(set_id=str(set_id))
+        ),
+        active_explicit_entry_matches_displayed_entry=lambda set_id, entry: (
+            main_window._simulation_batch_owner.active_explicit_cache_entry_matches_displayed_entry(str(set_id), entry)
+        ),
     )
     results_controller = ResultsController(results_port)
     return WindowShellComponents(

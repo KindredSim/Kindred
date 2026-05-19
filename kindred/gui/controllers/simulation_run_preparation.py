@@ -17,6 +17,7 @@ from kindred.core.simulation_identity import (
 from kindred.core.simulation_plan import SimulationAlgebraPolicy
 from kindred.gui.controllers.batch_run_context_owner import BatchRunStartRequest
 from kindred.gui.controllers.batch_dispatch_plan import BatchSetDispatchInput, build_batch_set_dispatch_plan
+from kindred.gui.ports import CompletedRunDisplayIntent
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,29 @@ def build_run_start_context(
         preview_scope_set_ids=run_start_cache_decision.preview_scope_set_ids,
         preview_owner_epoch=mechanism_context.preview_owner_epoch,
         preview_batch_cache_token_by_set_id=dispatch_context.preview_batch_cache_token_by_set_id,
+        completed_run_display_intent=CompletedRunDisplayIntent(
+            set_ids=tuple(str(set_id) for set_id in queue_ids if str(set_id)),
+            labels_by_set_id={
+                str(set_id): (
+                    str(mechanism_context.queue_names[index])
+                    if index < len(mechanism_context.queue_names)
+                    and str(mechanism_context.queue_names[index])
+                    else str(set_id)
+                )
+                for index, set_id in enumerate(queue_ids)
+                if str(set_id)
+            },
+            primary_set_id=(
+                str(mechanism_context.primary_set_id)
+                if mechanism_context.primary_set_id and str(mechanism_context.primary_set_id) in {
+                    str(set_id) for set_id in queue_ids if str(set_id)
+                }
+                else (str(queue_ids[0]) if queue_ids else "")
+            ),
+            cache_key=str(dispatch_context.cache_key or ""),
+            run_id=run_id,
+            request_id=int(request_id),
+        ),
     )
     return RunStartContext(
         request=request,

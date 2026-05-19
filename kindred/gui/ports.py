@@ -4,6 +4,110 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationCompletionDisplayOutcome:
+    displayed: bool
+    direct_completion_displayed: bool = False
+    reason: Optional[str] = None
+    primary_set_id: Optional[str] = None
+    displayed_set_ids: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        raise TypeError("Use SimulationCompletionDisplayOutcome.displayed explicitly")
+
+
+@dataclass(frozen=True, slots=True)
+class CachedBatchSelectionDisplayOutcome:
+    displayed: bool
+    reason: Optional[str] = None
+    primary_set_id: Optional[str] = None
+    displayed_set_ids: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        raise TypeError("Use CachedBatchSelectionDisplayOutcome.displayed explicitly")
+
+
+@dataclass(frozen=True, slots=True)
+class BatchDisplayRefreshOutcome:
+    focused_controls_use_workspace: Optional[bool] = None
+    displayed: bool = False
+    reason: Optional[str] = None
+    primary_set_id: Optional[str] = None
+    displayed_set_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedBatchSelectionEntry:
+    set_id: str
+    label: str
+    entry: Mapping[str, Any]
+    canonical_entry: Mapping[str, Any] | None = None
+    workspace_preview_provenance: Dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedRunDisplayIntent:
+    set_ids: tuple[str, ...]
+    labels_by_set_id: Mapping[str, str]
+    primary_set_id: str
+    cache_key: str
+    run_id: int | None = None
+    request_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionDisplayEntry:
+    set_id: str
+    label: str
+    t: Any
+    series: Mapping[str, Any]
+    algebra_scalars: Mapping[str, object]
+    solver_provenance: Mapping[str, Any] | None
+    mechanism_text: str
+    solver_config: Mapping[str, object]
+    warnings: tuple[Mapping[str, Any], ...]
+    completion_provenance: Mapping[str, Any] | None
+
+    def to_display_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "t": self.t,
+            "series": dict(self.series or {}),
+            "algebra_scalars": dict(self.algebra_scalars or {}),
+            "solver_provenance": dict(self.solver_provenance or {}),
+            "mechanism_text": str(self.mechanism_text or ""),
+            "solver_config": dict(self.solver_config or {}),
+            "warnings": [dict(warning) for warning in self.warnings if isinstance(warning, Mapping)],
+        }
+        if isinstance(self.completion_provenance, Mapping):
+            payload["completion_provenance"] = dict(self.completion_provenance)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedRunDisplayTransaction:
+    intent: CompletedRunDisplayIntent
+    completion_entries: tuple[CompletionDisplayEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedRunDisplayCoverage:
+    intent: CompletedRunDisplayIntent | None = None
+    transaction: CompletedRunDisplayTransaction | None = None
+    missing_set_ids: tuple[str, ...] = ()
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchDisplaySelectionResolution:
+    resolved_entries: tuple[ResolvedBatchSelectionEntry, ...] = ()
+    reason: Optional[str] = None
+    all_selected_sets_resolved: bool = False
+    has_workspace_selection: bool = False
+    has_resolved_workspace_preview: bool = False
+    focused_uses_workspace_controls: bool = False
+    focused_has_resolved_entry: bool = False
+
+
 def _normalize_slider_replay_target_set_ids(values: Sequence[str] | object) -> tuple[str, ...]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -184,6 +288,8 @@ class SimulationBatchPort(Protocol):
 
     def clear_display_selection_state(self) -> None: ...
 
+    def clear_active_preview_selection_state(self) -> None: ...
+
     def batch_cache_key(
         self,
         *,
@@ -202,24 +308,6 @@ class SimulationBatchPort(Protocol):
     def batch_model_validate_rows(self, rows: Sequence[int]) -> Set[Tuple[int, str]]: ...
 
     def batch_initials_for_row(self, row: int) -> Dict[str, float]: ...
-
-    def display_cached_batch_selection(
-        self,
-        *,
-        cache_key: str,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-        cache_store: Optional[object] = None,
-        valid_set_ids: Optional[Sequence[str]] = None,
-        allow_fallback: bool = True,
-    ) -> bool: ...
-
-    def display_workspace_aware_batch_selection(
-        self,
-        *,
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str] = None,
-    ) -> bool: ...
 
     def update_batch_row_controls_state(self) -> None: ...
 
@@ -326,23 +414,11 @@ class SimulationRuntimePort(Protocol):
 
 
 class SimulationResultsPort(Protocol):
-    def set_data(
-        self,
-        t: Any,
-        series: Dict[str, Any],
-        *,
-        label: Optional[str],
-        overlays: list[object],
-        owned_species: Optional[Sequence[str]] = None,
-    ) -> None: ...
-
     def main_plot(self) -> object: ...
 
     def update_main_plot_parameter_summary(self, parameters: Dict[str, Tuple[float, str]]) -> None: ...
 
     def set_results_table(self, table: object) -> None: ...
-
-    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None: ...
 
     def publish_simulation_completion_result(
         self,
@@ -352,15 +428,33 @@ class SimulationResultsPort(Protocol):
         cache_key: Optional[str],
         batch_set: Optional[str],
         batch_set_id: Optional[str],
-        selected_sets: Sequence[str],
-        prefer_set: Optional[str],
         redraw_valid_set_ids: Optional[Sequence[str]],
         has_redraw_subset: bool,
         slider_triggered: bool,
         explicit_batch_coalescing: bool,
         algebra_scalars: Optional[Mapping[str, object]],
+        solver_provenance: Optional[Mapping[str, Any]] = None,
+        direct_completion_provenance: Optional[Mapping[str, Any]] = None,
         owned_species: Optional[Sequence[str]] = None,
-    ) -> bool: ...
+    ) -> SimulationCompletionDisplayOutcome: ...
+
+    def publish_completed_run_display_transaction(
+        self,
+        transaction: CompletedRunDisplayTransaction,
+    ) -> SimulationCompletionDisplayOutcome: ...
+
+    def publish_cached_batch_selection(
+        self,
+        *,
+        cache_key: str,
+        selected_sets: Sequence[str],
+        prefer_set: Optional[str] = None,
+        cache_store: Optional[object] = None,
+        valid_set_ids: Optional[Sequence[str]] = None,
+        invalidated_set_ids: Optional[Sequence[str]] = None,
+    ) -> "CachedBatchSelectionDisplayOutcome": ...
+
+    def refresh_display_from_focus_and_shown(self) -> "BatchDisplayRefreshOutcome": ...
 
     def publish_completion_intervention_annotations(
         self,
@@ -405,6 +499,8 @@ class SimulationProvenancePort(Protocol):
         series: Mapping[str, Any],
         algebra_scalars: Optional[Mapping[str, Any]] = None,
         dataset_overlays: Any = None,
+        solver_provenance: Optional[Mapping[str, Any]] = None,
+        warnings: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]: ...
 
 

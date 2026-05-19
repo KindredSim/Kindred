@@ -16,6 +16,28 @@ from tests.workflow_helpers import (
 pytestmark = [pytest.mark.gui]
 
 
+def _completion_provenance_payload(*, t: np.ndarray, series: dict[str, np.ndarray]) -> dict:
+    return {
+        "mechanism_text": "reaction: A -> B; k=0.2",
+        "solver_method": "RK45",
+        "solver_label": "RK45",
+        "solver_warning": None,
+        "solver_config": {"rtol": 1e-6, "atol": 1e-12},
+        "temperature_K": 298.15,
+        "temperature_source": "test",
+        "energy_unit": None,
+        "energy_mode": False,
+        "simulation_time": float(np.asarray(t, dtype=float).reshape(-1)[-1]),
+        "num_points_requested": int(np.asarray(t).size),
+        "species_names": sorted(str(name) for name in series),
+        "t": t,
+        "series": series,
+        "algebra_scalars": {},
+        "solver_provenance": {},
+        "warnings": [],
+    }
+
+
 def test_global_fit_launch_creates_and_seeds_batch_set_from_dataset_t0(main_window, monkeypatch):
     data_panel = main_window._right_panel._data_manager
     data_panel._datasets.clear()
@@ -136,27 +158,42 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
 
         cache = main_window.simulation_controller.batch_cache
         cache_key = "fit-apply-ic-stale-cache"
+        t = np.asarray([0.0, 1.0], dtype=float)
+        set_series = {"A": np.asarray([1.0, 0.5], dtype=float)}
+        ds2_series = {"A": np.asarray([4.0, 3.5], dtype=float)}
         cache.result_cache[f"{cache_key}::{set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([1.0, 0.5], dtype=float)},
+            "t": t,
+            "series": set_series,
             "algebra_scalars": {},
+            "completion_provenance": _completion_provenance_payload(t=t, series=set_series),
         }
         cache.result_cache[f"{cache_key}::{ds2_set_id}"] = {
-            "t": np.asarray([0.0, 1.0], dtype=float),
-            "series": {"A": np.asarray([4.0, 3.5], dtype=float)},
+            "t": t,
+            "series": ds2_series,
             "algebra_scalars": {},
+            "completion_provenance": _completion_provenance_payload(t=t, series=ds2_series),
         }
         cache.active_cache_key = cache_key
         cache.active_cache_valid_set_ids = (set_id, ds2_set_id)
         cache.active_cache_invalidated_set_ids = None
-        main_window._batch_model.set_row_shown(int(ds1_row), True)
-        main_window._batch_model.set_row_shown(int(ds2_row), True)
-        main_window.set_active_batch_selection(set_id, set_name, [set_id, ds2_set_id])
+        for row in range(main_window._batch_model.rowCount()):
+            row_set_id = str(main_window._batch_store.set_id_for_row(int(row)))
+            main_window._batch_model.set_row_shown(int(row), row_set_id in {set_id, ds2_set_id})
+        main_window._simulation_batch_owner.set_active_batch_selection(set_id, set_name, [set_id, ds2_set_id])
+        assert set(main_window.shown_batch_set_ids()) == {set_id, ds2_set_id}
+        coverage = main_window.results_controller.cached_batch_selection_coverage(
+            cache_key=cache_key,
+            selected_sets=main_window.shown_batch_set_ids(),
+            valid_set_ids=cache.active_cache_valid_set_ids,
+            invalidated_set_ids=cache.active_cache_invalidated_set_ids,
+        )
+        assert coverage.full_coverage, coverage
 
-        main_window._refresh_batch_display_from_focus_and_shown()
+        outcome = main_window.results_controller.refresh_display_from_focus_and_shown()
         qt_app.processEvents()
 
-        assert main_window.active_batch_selection() == (set_id, set_name)
+        assert outcome.displayed, outcome.reason
+        assert main_window._simulation_batch_owner.active_batch_selection() == (set_id, set_name)
         assert main_window._plot_tabs._main_plot.export_payload() is not None
 
         window._handle_global_fit_complete(
@@ -177,15 +214,43 @@ def test_global_fit_apply_to_project_initial_conditions_invalidate_cached_select
         qt_app.processEvents()
 
         assert cache.active_cache_invalidated_set_ids == (set_id,)
+        assert cache.active_cache_key == cache_key
 
-        main_window._batch_model.set_row_shown(int(ds1_row), False)
-        main_window._batch_model.set_row_shown(int(ds2_row), True)
-        main_window.set_active_batch_selection(ds2_set_id, ds2_set_name, [ds2_set_id])
-        main_window._refresh_batch_display_from_focus_and_shown()
+        current_ds2_row = main_window._batch_store.row_for_set_id(ds2_set_id)
+        assert current_ds2_row is not None
+        shown_id, shown_name = show_only_batch_set(main_window, row=int(current_ds2_row), qt_app=qt_app)
+        assert shown_id == ds2_set_id
+        assert shown_name == ds2_set_name
+        current_ds1_row = main_window._batch_store.row_for_set_id(set_id)
+        if current_ds1_row is not None:
+            main_window._batch_store.set_shown(int(current_ds1_row), False)
+        main_window._batch_store.set_shown(int(current_ds2_row), True)
+        main_window._simulation_batch_owner.set_active_batch_selection(ds2_set_id, ds2_set_name, [ds2_set_id])
+        shown_after_apply = [str(set_id) for set_id in main_window.shown_batch_set_ids()]
+        for shown_set_id in shown_after_apply:
+            if shown_set_id == ds2_set_id:
+                continue
+            extra_series = {"A": np.asarray([2.0, 1.5], dtype=float)}
+            cache.result_cache[f"{cache_key}::{shown_set_id}"] = {
+                "t": t,
+                "series": extra_series,
+                "algebra_scalars": {},
+                "completion_provenance": _completion_provenance_payload(t=t, series=extra_series),
+            }
+        cache.active_cache_valid_set_ids = tuple(dict.fromkeys([set_id, ds2_set_id, *shown_after_apply]))
+        coverage = main_window.results_controller.cached_batch_selection_coverage(
+            cache_key=cache_key,
+            selected_sets=shown_after_apply,
+            valid_set_ids=cache.active_cache_valid_set_ids,
+            invalidated_set_ids=cache.active_cache_invalidated_set_ids,
+        )
+        assert coverage.full_coverage, coverage
+        outcome = main_window.results_controller.refresh_display_from_focus_and_shown()
         qt_app.processEvents()
 
         plot = main_window._plot_tabs._main_plot
-        assert main_window.active_batch_selection()[0] == ds2_set_id
+        assert outcome.displayed, outcome.reason
+        assert main_window._simulation_batch_owner.active_batch_selection()[0] == ds2_set_id
         assert np.allclose(
             np.asarray((getattr(plot, "_series", {}) or {})["A"], dtype=float),
             np.asarray([4.0, 3.5], dtype=float),

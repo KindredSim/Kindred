@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 from dataclasses import dataclass
 import json
 import hashlib
@@ -311,12 +310,18 @@ class MainWindow(
             batch_model=self._batch_model,
             batch_initials_for_row=self._batch_initials_for_row,
             preview_session=self._preview_session,
+            preview_launch_pending=lambda: bool(
+                getattr(
+                    getattr(self.simulation_controller.run_state, "pending_slider_preview_launch", None),
+                    "active",
+                    False,
+                )
+            ),
             mechanism_owner=self._simulation_mechanism_owner,
             solver_owner=self._simulation_solver_owner,
-            results_controller_getter=lambda: self.results_controller,
-            set_status_text=self.set_status_text,
             update_batch_row_controls_state=self._update_batch_row_controls_state,
             sync_batch_species_columns=self._sync_batch_species_columns,
+            sync_mechanism_controls_to_focused_batch_set=self._sync_mechanism_controls_to_focused_batch_set,
         )
         self._batch_table: Optional[BatchInitialConditionsTableView] = None
         self._focused_batch_set_id = ""
@@ -364,7 +369,7 @@ class MainWindow(
         main_plot = getattr(plot, "_main_plot", None)
         set_copy_all_provider = getattr(main_plot, "set_copy_all_export_plan_provider", None)
         if callable(set_copy_all_provider):
-            set_copy_all_provider(self._build_main_plot_copy_all_export_plan)
+            set_copy_all_provider(self.results_controller.build_main_plot_copy_all_export_plan)
 
     def _init_mechanism_dock_and_panel(self) -> None:
         mechanism_dock_components = build_mechanism_dock(self)
@@ -585,10 +590,10 @@ class MainWindow(
                     affected_set_ids=outcome.active_work_supersede_set_ids,
                     close_preview_runtime_owner=False,
                 )
-        if outcome.display_cache_invalidation_allowed and (
-            self._authoritative_mechanism_has_active_display()
-            or bool(outcome.cache_stale_scope_is_global)
-            or bool(outcome.cache_stale_set_ids)
+        if outcome.display_cache_invalidation_allowed and self.results_controller.authoritative_result_transition_required(
+            batch_has_active_display=self._simulation_batch_owner.authoritative_mechanism_has_active_display(),
+            cache_stale_scope_is_global=bool(outcome.cache_stale_scope_is_global),
+            cache_stale_set_ids=outcome.cache_stale_set_ids,
         ):
             self._apply_authoritative_result_truth_effects(
                 preserve_current_display=preserve_current_display,
@@ -635,6 +640,11 @@ class MainWindow(
         )
         if not affected_set_ids_t:
             return
+        pre_reset_display_snapshot = (
+            self.results_controller.active_workspace_preview_display_snapshot()
+            if bool(discard_dirty_preview)
+            else None
+        )
         outcome = self._apply_authoritative_mechanism_transition(
             transition_source=str(transition_source or "canonical_batch_initials_change"),
             canonical_batch_initials_by_set_id=self._canonical_batch_initials_identity_by_set_id(),
@@ -649,13 +659,6 @@ class MainWindow(
                 if bool(outcome.dirty_preview_reset_scope_is_global)
                 else outcome.dirty_preview_reset_set_ids
             )
-            displayed_dirty_preview_set_ids = []
-            for set_id in dirty_preview_reset_set_ids:
-                try:
-                    if self._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(set_id=str(set_id)):
-                        displayed_dirty_preview_set_ids.append(str(set_id))
-                except Exception:
-                    continue
             preview_state_changed = False
             try:
                 preview_state_changed = bool(
@@ -678,12 +681,10 @@ class MainWindow(
                     exc=exc,
                 )
             if preview_state_changed:
-                if displayed_dirty_preview_set_ids and self.main_plot_has_data():
-                    batch_cache = getattr(self._sim_controller, "batch_cache", None)
-                    clear_preview = getattr(batch_cache, "clear_active_preview_selection_state", None)
-                    if callable(clear_preview):
-                        clear_preview()
-                    self._clear_batch_selection_display_state()
+                self.results_controller.clear_display_if_workspace_previews_were_shown(
+                    dirty_preview_reset_set_ids,
+                    pre_reset_display_snapshot=pre_reset_display_snapshot,
+                )
                 self._refresh_species_sliders_after_canonical_initials_transition(dirty_preview_reset_set_ids)
 
     def _refresh_species_sliders_after_canonical_initials_transition(
@@ -2079,25 +2080,6 @@ class MainWindow(
             self._sim_controller.invalidate_interactive_simulation_runtimes(kill=False)
         except Exception:
             logger.debug("Failed to invalidate interactive simulation runtimes", exc_info=True)
-
-    def _authoritative_mechanism_has_active_display(self) -> bool:
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        has_active_cache = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_cache_key or "").strip()
-                or str(batch_cache.active_preview_cache_key or "").strip()
-            )
-        )
-        has_displayed_selection = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_batch_set_id or "").strip()
-                or str(batch_cache.active_batch_set or "").strip()
-                or batch_cache.last_display_selection
-            )
-        )
-        return bool(has_active_cache or has_displayed_selection or self.main_plot_has_data())
 
     def _on_authoritative_mechanism_input_changed(self) -> None:
         """Apply the ordered lifecycle for an authoritative mechanism transition."""
@@ -3495,475 +3477,6 @@ class MainWindow(
         """Drop cached mechanism so exports cannot use stale results."""
         self._mechanism_helpers.clear_last_mechanism()
 
-    def _clear_main_plot_display_state(self) -> None:
-        """Clear the visible simulation plot while leaving mechanism controls untouched."""
-        plot = self.main_plot()
-        setattr(plot, "_workspace_preview_display_provenance_by_set_id", {})
-        setattr(plot, "_kindred_stale_preserved_display", None)
-        if hasattr(plot, "clear"):
-            plot.clear()
-        if hasattr(plot, "set_statistics_results"):
-            plot.set_statistics_results({}, prefer="")
-
-    def _clear_main_plot_project_apply_state(self) -> None:
-        """Clear simulation-plot state that is not serialized into project files."""
-        self._clear_main_plot_display_state()
-
-    def _clear_batch_selection_display_state(self) -> None:
-        """Drop the active displayed batch selection without discarding cache ownership state."""
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is not None:
-            clear_display = getattr(batch_cache, "clear_display_selection_state", None)
-            if callable(clear_display):
-                clear_display()
-            else:
-                batch_cache.last_display_selection = []
-                batch_cache.active_batch_set = None
-                batch_cache.active_batch_set_id = None
-        self._clear_main_plot_display_state()
-        self.show_simulation_tab()
-        self.refresh_simulation_plot_views()
-
-    def _mark_stale_preserved_batch_plot_display(
-        self,
-        *,
-        reason: str,
-        cache_key: str,
-        selected_set_ids: Sequence[str],
-    ) -> None:
-        """Record that preserved plot data is stale display, not active selection truth."""
-        plot = self.main_plot()
-        if plot is None:
-            return
-        setattr(
-            plot,
-            "_kindred_stale_preserved_display",
-            {
-                "kind": "stale_preserved_plot",
-                "reason": str(reason or ""),
-                "cache_key": str(cache_key or ""),
-                "selected_set_ids": tuple(str(set_id) for set_id in (selected_set_ids or ()) if str(set_id)),
-            },
-        )
-
-    def _clear_stale_preserved_batch_plot_display(self) -> None:
-        plot = self.main_plot()
-        if plot is not None:
-            setattr(plot, "_kindred_stale_preserved_display", None)
-
-    def _active_workspace_preview_display_snapshot(self) -> Optional[Dict[str, Any]]:
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is None or not self.main_plot_has_data():
-            return None
-
-        active_set_id = str(batch_cache.active_batch_set_id or "").strip()
-        if not active_set_id:
-            return None
-
-        selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
-        if not selected_ids:
-            selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
-        if active_set_id not in selected_ids:
-            selected_ids = [active_set_id, *[set_id for set_id in selected_ids if set_id != active_set_id]]
-
-        selected_local_workspace_ids = {
-            set_id for set_id in selected_ids if self._preview_session.has_local_mechanism_workspace(set_id)
-        }
-        selected_overlay_dirty_ids: set[str] = set()
-        row_for_set_id = getattr(getattr(self, "_batch_store", None), "row_for_set_id", None)
-        if callable(row_for_set_id):
-            for set_id in selected_ids:
-                try:
-                    row = row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is None:
-                    continue
-                try:
-                    if bool(self._preview_session.preview_batch_cache_token([int(row)])):
-                        selected_overlay_dirty_ids.add(str(set_id))
-                except Exception:
-                    continue
-
-        active_has_local_mechanism_workspace = active_set_id in selected_local_workspace_ids
-        active_has_dirty_overlay = active_set_id in selected_overlay_dirty_ids
-        if not (active_has_local_mechanism_workspace or selected_overlay_dirty_ids):
-            return None
-
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return None
-
-        run_state = getattr(getattr(self, "_sim_controller", None), "run_state", None)
-        pending_launch = getattr(run_state, "pending_slider_preview_launch", None)
-        if bool(getattr(pending_launch, "active", False)):
-            return None
-
-        current_t_raw = getattr(plot, "_t", None)
-        current_t = np.asarray(current_t_raw if current_t_raw is not None else [], dtype=float).reshape(-1)
-        if current_t.size <= 0:
-            return None
-
-        current_series = dict(getattr(plot, "_series", {}) or {})
-        if not current_series:
-            return None
-
-        active_plot_is_truthful_dirty_preview = False
-        active_requires_truthful_dirty_preview = (
-            active_has_local_mechanism_workspace or active_has_dirty_overlay
-        )
-        if active_requires_truthful_dirty_preview:
-            active_preview_entry = self._simulation_batch_owner.matching_preview_entry_for_workspace_set(
-                set_id=active_set_id
-            )
-            active_plot_is_truthful_dirty_preview = self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
-                entry=active_preview_entry.entry,
-                t=current_t,
-                series=current_series,
-            )
-            if not active_plot_is_truthful_dirty_preview:
-                active_plot_is_truthful_dirty_preview = self._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(
-                    set_id=active_set_id,
-                )
-
-        selected_dirty_overlay_ids = {
-            str(set_id)
-            for set_id in selected_ids
-            if str(set_id)
-            and str(set_id) != active_set_id
-            and (
-                str(set_id) in selected_local_workspace_ids
-                or str(set_id) in selected_overlay_dirty_ids
-            )
-        }
-        preserved_overlays: list[Dict[str, object]] = []
-        if selected_ids and selected_dirty_overlay_ids:
-            overlay_label_to_set_id: Dict[str, str] = {}
-            truthful_preserved_preview_set_ids: set[str] = set()
-            for set_id in selected_ids:
-                set_id_s = str(set_id or "").strip()
-                if not set_id_s:
-                    continue
-                overlay_label_to_set_id[set_id_s] = set_id_s
-                set_name = str(self.batch_set_name_for_id(set_id_s) or "").strip()
-                if set_name:
-                    overlay_label_to_set_id[set_name] = set_id_s
-            for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-                if not isinstance(entry, dict):
-                    continue
-                overlay_label = str(entry.get("label") or "").strip()
-                overlay_set_id = str(entry.get("set_id") or "").strip() or overlay_label_to_set_id.get(overlay_label, "")
-                overlay_curve_role = str(entry.get("curve_role") or "").strip()
-                if not overlay_label or not overlay_set_id or overlay_set_id not in selected_dirty_overlay_ids:
-                    continue
-                overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-                overlay_series_raw = entry.get("series") or {}
-                if overlay_t.size <= 0 or not isinstance(overlay_series_raw, dict):
-                    continue
-                overlay_series: Dict[str, np.ndarray] = {}
-                for species_name, values in overlay_series_raw.items():
-                    overlay_arr = np.asarray(values, dtype=float).reshape(-1)
-                    if overlay_arr.size <= 0:
-                        continue
-                    overlay_series[str(species_name)] = overlay_arr
-                if not overlay_series:
-                    continue
-                explicit_overlay_entry = self._simulation_batch_owner.active_explicit_cache_entry_for_set(
-                    set_id=overlay_set_id
-                )
-                overlay_matches_explicit = self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
-                    entry=explicit_overlay_entry.entry,
-                    t=overlay_t,
-                    series=overlay_series,
-                )
-                if overlay_curve_role == "canonical_ghost":
-                    if (
-                        overlay_set_id == active_set_id
-                        or not overlay_matches_explicit
-                        or overlay_set_id not in truthful_preserved_preview_set_ids
-                    ):
-                        continue
-                else:
-                    overlay_preview_entry = self._simulation_batch_owner.matching_preview_entry_for_workspace_set(
-                        set_id=overlay_set_id
-                    )
-                    overlay_is_truthful_dirty_preview = self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
-                        entry=overlay_preview_entry.entry,
-                        t=overlay_t,
-                        series=overlay_series,
-                    )
-                    if not overlay_is_truthful_dirty_preview:
-                        overlay_is_truthful_dirty_preview = self._simulation_batch_owner.displayed_workspace_preview_provenance_matches_current_workspace(
-                            set_id=overlay_set_id,
-                        )
-                    if not overlay_is_truthful_dirty_preview or overlay_matches_explicit:
-                        continue
-                    truthful_preserved_preview_set_ids.add(overlay_set_id)
-                preserved_entry = {
-                    "label": overlay_label,
-                    "t": overlay_t,
-                    "series": overlay_series,
-                    "set_id": overlay_set_id,
-                }
-                if overlay_curve_role:
-                    preserved_entry["curve_role"] = overlay_curve_role
-                preserved_overlays.append(preserved_entry)
-
-        active_canonical_ghost: Dict[str, object] | None = None
-        if active_plot_is_truthful_dirty_preview:
-            explicit_active_entry = self._simulation_batch_owner.active_explicit_cache_entry_for_set(
-                set_id=active_set_id
-            )
-            for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("curve_role") or "").strip() != "canonical_ghost":
-                    continue
-                if str(entry.get("set_id") or "").strip() != active_set_id:
-                    continue
-                overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-                overlay_series_raw = entry.get("series") or {}
-                if overlay_t.size <= 0 or not isinstance(overlay_series_raw, dict):
-                    continue
-                overlay_series: Dict[str, np.ndarray] = {}
-                for species_name, values in overlay_series_raw.items():
-                    overlay_arr = np.asarray(values, dtype=float).reshape(-1)
-                    if overlay_arr.size <= 0:
-                        continue
-                    overlay_series[str(species_name)] = overlay_arr
-                if not overlay_series:
-                    continue
-                if not self._simulation_batch_owner.batch_cache_entry_matches_plot_payload(
-                    entry=explicit_active_entry.entry,
-                    t=overlay_t,
-                    series=overlay_series,
-                ):
-                    continue
-                active_canonical_ghost = {
-                    "label": str(entry.get("label") or "").strip(),
-                    "t": overlay_t,
-                    "series": overlay_series,
-                    "set_id": active_set_id,
-                    "curve_role": "canonical_ghost",
-                }
-                break
-
-        if active_canonical_ghost is not None:
-            preserved_overlays.append(active_canonical_ghost)
-
-        if active_requires_truthful_dirty_preview and (not active_plot_is_truthful_dirty_preview):
-            return None
-        if (not active_plot_is_truthful_dirty_preview) and (not preserved_overlays):
-            return None
-
-        return {
-            "set_id": active_set_id,
-            "set_name": str(batch_cache.active_batch_set or self.batch_set_name_for_id(active_set_id) or active_set_id),
-            "selected_ids": selected_ids,
-            "preserved_overlays": preserved_overlays,
-        }
-
-    def _visible_result_display_set_ids(self, batch_cache: Any) -> set[str]:
-        visible_scope = {str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)}
-        visible_scope.update(str(set_id) for set_id in (batch_cache.last_display_selection or ()) if str(set_id))
-        active_batch_set_id = str(batch_cache.active_batch_set_id or "").strip()
-        if active_batch_set_id:
-            visible_scope.add(active_batch_set_id)
-        return visible_scope
-
-    def _display_clear_scope_affects_visible_results(
-        self,
-        *,
-        batch_cache: Any,
-        display_clear_set_ids: Sequence[str],
-        display_clear_scope_is_global: bool,
-    ) -> bool:
-        if bool(display_clear_scope_is_global):
-            return True
-        clear_scope = set(
-            str(set_id) for set_id in (display_clear_set_ids or ()) if str(set_id)
-        )
-        return bool(clear_scope & self._visible_result_display_set_ids(batch_cache))
-
-    def _clear_visible_results_for_authoritative_transition(
-        self,
-        *,
-        batch_cache: Any,
-        display_clear_set_ids: Sequence[str],
-        display_clear_scope_is_global: bool,
-    ) -> bool:
-        if not self._display_clear_scope_affects_visible_results(
-            batch_cache=batch_cache,
-            display_clear_set_ids=display_clear_set_ids,
-            display_clear_scope_is_global=display_clear_scope_is_global,
-        ):
-            return False
-        clear_display = getattr(batch_cache, "clear_display_selection_state", None)
-        if callable(clear_display):
-            clear_display()
-        else:
-            batch_cache.last_display_selection = []
-            batch_cache.active_batch_set = None
-            batch_cache.active_batch_set_id = None
-        return True
-
-    def _clear_orphaned_visible_results_for_authoritative_transition(
-        self,
-        *,
-        batch_cache: Any,
-        preserve_current_display: Optional[Dict[str, Any]],
-        display_clear_set_ids: Sequence[str],
-        display_clear_scope_is_global: bool,
-    ) -> bool:
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
-        if active_cache_key or preserve_current_display or not self.main_plot_has_data():
-            return False
-        display_selection = tuple(
-            str(set_id) for set_id in (batch_cache.last_display_selection or ()) if str(set_id)
-        )
-        has_display_provenance = bool(
-            str(batch_cache.active_batch_set_id or "").strip()
-            or str(batch_cache.active_batch_set or "").strip()
-            or display_selection
-        )
-        if has_display_provenance:
-            return False
-        if not self._display_clear_scope_affects_visible_results(
-            batch_cache=batch_cache,
-            display_clear_set_ids=display_clear_set_ids,
-            display_clear_scope_is_global=display_clear_scope_is_global,
-        ):
-            return False
-        self._clear_batch_selection_display_state()
-        return True
-
-    def _restore_preserved_authoritative_display(
-        self,
-        *,
-        batch_cache: Any,
-        preserve_current_display: Optional[Dict[str, Any]],
-    ) -> bool:
-        if preserve_current_display and self.main_plot_has_data():
-            preserved_set_id = str(preserve_current_display.get("set_id") or "").strip()
-            preserved_set_name = str(preserve_current_display.get("set_name") or "").strip()
-            preserved_selected_ids = [
-                str(set_id) for set_id in (preserve_current_display.get("selected_ids") or ()) if str(set_id)
-            ]
-            preserved_overlays = [
-                dict(entry)
-                for entry in (preserve_current_display.get("preserved_overlays") or ())
-                if isinstance(entry, dict)
-            ]
-            plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-            plot_t = np.asarray(getattr(plot, "_t", None) if plot is not None else [], dtype=float).reshape(-1)
-            plot_series = dict(getattr(plot, "_series", {}) or {}) if plot is not None else {}
-            plot_owned_species = None
-            if plot is not None:
-                owned_species_for_replay = getattr(plot, "owned_species_for_replay", None)
-                if callable(owned_species_for_replay):
-                    plot_owned_species = owned_species_for_replay()
-            plot_has_overlays = bool(getattr(plot, "_simulation_overlays", []) or []) if plot is not None else False
-            preserve_multiselect_overlays = bool(preserved_overlays)
-            if preserved_set_id:
-                batch_cache.active_batch_set_id = preserved_set_id
-                batch_cache.active_batch_set = preserved_set_name or str(
-                    self.batch_set_name_for_id(preserved_set_id) or preserved_set_id
-                )
-                if preserve_multiselect_overlays and preserved_selected_ids:
-                    batch_cache.last_display_selection = preserved_selected_ids
-                else:
-                    batch_cache.last_display_selection = [preserved_set_id]
-            elif preserved_selected_ids:
-                batch_cache.last_display_selection = preserved_selected_ids
-            if plot is not None and plot_t.size > 0 and plot_series and (plot_has_overlays or preserve_multiselect_overlays):
-                plot_label = preserved_set_name or preserved_set_id or "Results"
-                plot.set_data(
-                    plot_t,
-                    plot_series,
-                    label=plot_label,
-                    overlays=preserved_overlays if preserve_multiselect_overlays else [],
-                    owned_species=plot_owned_species,
-                )
-                self.sync_main_plot_copy_labels(
-                    preserved_set_id,
-                    preserved_selected_ids or ([preserved_set_id] if preserved_set_id else []),
-                )
-                plot_results_map: Dict[str, Dict[str, object]] = {
-                    plot_label: {
-                        "t": plot_t,
-                        "series": plot_series,
-                    }
-                }
-                for overlay_entry in preserved_overlays if preserve_multiselect_overlays else ():
-                    overlay_label = str(overlay_entry.get("label") or "").strip()
-                    if str(overlay_entry.get("curve_role") or "") == "canonical_ghost":
-                        continue
-                    overlay_t = np.asarray(
-                        overlay_entry.get("t") if overlay_entry.get("t") is not None else [],
-                        dtype=float,
-                    ).reshape(-1)
-                    overlay_series = dict(overlay_entry.get("series") or {})
-                    if not overlay_label or overlay_t.size <= 0 or not overlay_series:
-                        continue
-                    plot_results_map[overlay_label] = {
-                        "t": overlay_t,
-                        "series": overlay_series,
-                    }
-                plot.set_statistics_results(
-                    plot_results_map,
-                    prefer=plot_label,
-                )
-                replay_selected_ids = preserved_selected_ids or ([preserved_set_id] if preserved_set_id else [])
-                self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(
-                    selected_set_ids=replay_selected_ids
-                )
-                self.show_simulation_tab()
-                self.refresh_simulation_plot_views()
-            label = getattr(self, "_status_label", None)
-            if label is not None:
-                try:
-                    if str(label.text()) in (
-                        "Result not cached (evicted). Press Run to compute.",
-                        "Cached result invalid. Press Run to compute.",
-                        "Preview pending for current selection.",
-                    ):
-                        label.setText("Ready")
-                except RuntimeError:
-                    self._status_label = None
-            return True
-        return False
-
-    def _set_authoritative_transition_cache_miss_status(self) -> None:
-        label = getattr(self, "_status_label", None)
-        if label is not None:
-            try:
-                label.setText("Result not cached (evicted). Press Run to compute.")
-            except RuntimeError:
-                self._status_label = None
-
-    def _finish_authoritative_result_display_update(
-        self,
-        *,
-        batch_cache: Any,
-        active_cache_key: str,
-        selected_ids: Sequence[str],
-        display_cleared: bool,
-    ) -> None:
-        if active_cache_key and batch_cache.active_cache_invalidated_set_ids and display_cleared:
-            self._clear_batch_selection_display_state()
-            self._set_authoritative_transition_cache_miss_status()
-            return
-        if selected_ids and (
-            active_cache_key
-            or bool(batch_cache.active_batch_set_id)
-            or bool(batch_cache.last_display_selection)
-        ):
-            self._refresh_batch_display_from_focus_and_shown()
-            return
-        if selected_ids:
-            return
-        self._clear_batch_selection_display_state()
-
     def _apply_authoritative_result_truth_effects(
         self,
         *,
@@ -3976,40 +3489,26 @@ class MainWindow(
     ) -> None:
         if bool(clear_cached_mechanism):
             self._clear_last_mechanism()
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is None:
-            return
-
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
-        selected_ids = [str(set_id) for set_id in (self._shown_batch_set_ids() or []) if str(set_id)]
-        display_cleared = False
+        active_cache_key = self._simulation_batch_owner.active_cache_key()
         if active_cache_key:
-            batch_cache.record_active_result_cache_staleness(
+            self._simulation_batch_owner.record_active_result_cache_staleness(
                 set_ids=cache_stale_set_ids,
                 is_global=bool(cache_stale_scope_is_global),
             )
-            display_cleared = self._clear_visible_results_for_authoritative_transition(
-                batch_cache=batch_cache,
-                display_clear_set_ids=display_clear_set_ids,
-                display_clear_scope_is_global=display_clear_scope_is_global,
-            )
-        display_cleared = self._clear_orphaned_visible_results_for_authoritative_transition(
-            batch_cache=batch_cache,
+        active_set_id, active_set_name = self._simulation_batch_owner.active_batch_selection()
+        transition = self.results_controller.apply_authoritative_result_display_transition(
             preserve_current_display=preserve_current_display,
+            active_cache_key=active_cache_key,
+            selected_ids=self._simulation_batch_owner.shown_batch_set_ids(),
+            last_display_selection=self._simulation_batch_owner.last_display_selection(),
+            active_batch_set_id=active_set_id,
+            active_batch_set_name=active_set_name,
+            active_cache_invalidated_set_ids=self._simulation_batch_owner.active_cache_invalidated_set_ids() or (),
             display_clear_set_ids=display_clear_set_ids,
             display_clear_scope_is_global=display_clear_scope_is_global,
-        ) or display_cleared
-        if self._restore_preserved_authoritative_display(
-            batch_cache=batch_cache,
-            preserve_current_display=preserve_current_display,
-        ):
-            return
-        self._finish_authoritative_result_display_update(
-            batch_cache=batch_cache,
-            active_cache_key=active_cache_key,
-            selected_ids=selected_ids,
-            display_cleared=display_cleared,
         )
+        if transition.refresh_requested:
+            self._refresh_batch_display_from_focus_and_shown()
 
     def _invalidate_active_results_for_global_authoritative_change(self) -> None:
         self._sim_controller.supersede_active_work_for_authoritative_mechanism_transition(
@@ -4043,16 +3542,12 @@ class MainWindow(
         self._pre_dsl_temperature = None
         self._temperature_dsl_override_active = False
 
-        self._clear_main_plot_project_apply_state()
+        self.results_controller.clear_batch_display_publication()
         self._sync_overlay_catalog()
 
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        if batch_cache is not None and hasattr(batch_cache, "reset_runtime_state"):
-            batch_cache.reset_runtime_state()
+        self._simulation_batch_owner.reset_runtime_state()
 
         self._refresh_slider_transaction_button_state()
-        self.show_simulation_tab()
-        self.refresh_simulation_plot_views()
 
     def _rebind_species_panel_after_batch_model_replacement(self) -> None:
         """Reattach Species mode to the replacement batch model/selection model."""
@@ -4404,92 +3899,18 @@ class MainWindow(
         """Public API used by controllers (avoid reaching into `_` widget fields)."""
         self._simulation_run_ui_owner.set_status_text(str(text))
 
-    def main_plot_has_data(self) -> bool:
-        plot = self.main_plot()
-        return bool(getattr(plot, "_series", {})) and getattr(plot, "_t", None) is not None
-
-    def main_plot_selected_series(self) -> List[str]:
-        return list(self.main_plot().selected_series())
-
-    def set_main_plot_selected_series(self, series_names: Sequence[str]) -> None:
-        self.main_plot().set_selected_series(list(series_names))
+    def _status_text_value(self) -> str:
+        label = getattr(self, "_status_label", None)
+        if label is None:
+            return ""
+        try:
+            return str(label.text())
+        except RuntimeError:
+            self._status_label = None
+            return ""
 
     def main_plot(self) -> object:
         return self._plot_tabs._main_plot
-
-    def set_main_plot_data(
-        self,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
-        *,
-        label: Optional[str] = None,
-        overlays: Optional[Sequence[Dict[str, object]]] = None,
-        owned_species: Optional[Sequence[str]] = None,
-    ) -> None:
-        self.main_plot().set_data(t, series, label=label, overlays=overlays, owned_species=owned_species)
-
-    def sync_main_plot_copy_labels(self, primary_set_id: str, selected_set_ids: Sequence[str]) -> None:
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return
-        primary_set_id_s = str(primary_set_id or "").strip()
-        selected_ids: list[str] = []
-        for raw_set_id in selected_set_ids or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id or set_id in selected_ids:
-                continue
-            selected_ids.append(set_id)
-        if primary_set_id_s and primary_set_id_s not in selected_ids:
-            selected_ids.append(primary_set_id_s)
-        popup_labels = self._copy_all_popup_labels_by_set_id(selected_ids)
-        primary_label = str(getattr(plot, "_simulation_set_label", "") or "").strip()
-        setattr(plot, "_simulation_set_popup_label", str(popup_labels.get(primary_set_id_s, primary_label)))
-        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-            if not isinstance(entry, dict):
-                continue
-            entry_set_id = str(entry.get("set_id") or "").strip()
-            popup_label = str(popup_labels.get(entry_set_id, "")).strip()
-            if popup_label:
-                entry["popup_label"] = popup_label
-            else:
-                entry.pop("popup_label", None)
-
-    def _sync_main_plot_copy_labels_for_cached_batch_selection(self) -> None:
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        if batch_cache is None:
-            return
-        active_set_id = str(self.active_batch_selection()[0] or "").strip()
-        selected_ids = [str(set_id) for set_id in (batch_cache.last_display_selection or []) if str(set_id)]
-        if active_set_id or selected_ids:
-            self.sync_main_plot_copy_labels(active_set_id, selected_ids)
-
-    def show_simulation_tab(self) -> None:
-        self._plot_tabs._tabs.setCurrentIndex(0)
-
-    def refresh_simulation_plot_views(self) -> None:
-        self.main_plot().update()
-        self._plot_tabs.update()
-        self.update()
-
-    def schedule_main_plot_refresh(self, delays_ms: Sequence[int]) -> None:
-        plot = self.main_plot()
-
-        def _safe_plot_update(plot_widget=plot) -> None:
-            with suppress(RuntimeError):
-                plot_widget.update()
-
-        for delay_ms in delays_ms:
-            QtCore.QTimer.singleShot(int(delay_ms), _safe_plot_update)
-
-    def set_main_plot_scalar_values(self, scalars: Dict[str, object]) -> None:
-        plot = self.main_plot()
-        if hasattr(plot, "set_scalar_values"):
-            plot.set_scalar_values(scalars)
-
-    def update_main_plot_parameter_summary(self, parameters: Dict[str, tuple[float, str]]) -> None:
-        plot = self.main_plot()
-        if hasattr(plot, "update_parameters"):
-            plot.update_parameters(dict(parameters))
 
     def integrate_ctc(
         self,
@@ -4507,26 +3928,6 @@ class MainWindow(
             uniformity_eps=float(uniformity_eps),
             tail_strategy=str(tail_strategy),
         )
-
-    def update_main_plot_statistics(
-        self,
-        *,
-        stats_results_map: Dict[str, Dict[str, object]],
-        prefer: str,
-        t: np.ndarray,
-        series: Dict[str, np.ndarray],
-    ) -> None:
-        plot = self.main_plot()
-        if hasattr(plot, "set_statistics_results"):
-            plot.set_statistics_results(stats_results_map, prefer=prefer)
-            return
-        plot.update_statistics(t, series)
-
-    def main_plot_stats_table(self) -> object:
-        return self.main_plot().stats_table()
-
-    def set_results_table(self, table: object) -> None:
-        self._results_table = table
 
     def mechanism_reactions_text_raw(self) -> str:
         return self._simulation_mechanism_owner.mechanism_reactions_text_raw()
@@ -4652,25 +4053,7 @@ class MainWindow(
         )
 
     def active_batch_cache_key(self) -> str:
-        return str(self._sim_controller.batch_cache.active_cache_key or "")
-
-    def active_batch_selection(self) -> tuple[str, str]:
-        batch_cache = self._sim_controller.batch_cache
-        return (
-            str(batch_cache.active_batch_set_id or ""),
-            str(batch_cache.active_batch_set or ""),
-        )
-
-    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: Sequence[str]) -> None:
-        batch_cache = self._sim_controller.batch_cache
-        batch_cache.active_batch_set_id = str(set_id)
-        batch_cache.active_batch_set = str(set_name)
-        batch_cache.last_display_selection = [str(item) for item in (selected_ids or []) if str(item)]
-
-    def clear_display_selection_state(self) -> None:
-        clear_display = getattr(self._sim_controller.batch_cache, "clear_display_selection_state", None)
-        if callable(clear_display):
-            clear_display()
+        return self._simulation_batch_owner.active_cache_key()
 
     def batch_store_row_count(self) -> int:
         return int(self._batch_store.row_count())
@@ -4935,23 +4318,11 @@ class MainWindow(
         if pending_snapshot is None:
             return
         self._invalidate_slider_runtime()
-        batch_cache = getattr(self._sim_controller, "batch_cache", None)
-        has_active_cache = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_cache_key or "").strip()
-                or str(batch_cache.active_preview_cache_key or "").strip()
-            )
-        )
-        has_displayed_selection = bool(
-            batch_cache is not None
-            and (
-                str(batch_cache.active_batch_set_id or "").strip()
-                or str(batch_cache.active_batch_set or "").strip()
-                or batch_cache.last_display_selection
-            )
-        )
-        if not (has_active_cache or has_displayed_selection or self.main_plot_has_data()):
+        if not self.results_controller.authoritative_result_transition_required(
+            batch_has_active_display=self._simulation_batch_owner.authoritative_mechanism_has_active_display(),
+            cache_stale_scope_is_global=False,
+            cache_stale_set_ids=(),
+        ):
             return
         self._invalidate_active_results_for_global_authoritative_change()
 
@@ -5168,256 +4539,6 @@ class MainWindow(
         except Exception:
             return None
 
-    def _copy_all_popup_labels_by_set_id(self, set_ids: Sequence[str]) -> Dict[str, str]:
-        labels_by_id: Dict[str, str] = {}
-        label_counts: Dict[str, int] = {}
-        for raw_set_id in set_ids or ():
-            set_id = str(raw_set_id or "").strip()
-            if not set_id:
-                continue
-            label = str(self.batch_set_name_for_id(set_id) or set_id)
-            labels_by_id[set_id] = label
-            label_counts[label] = int(label_counts.get(label, 0)) + 1
-
-        popup_labels: Dict[str, str] = {}
-        for set_id, label in labels_by_id.items():
-            popup_label = str(label)
-            if int(label_counts.get(label, 0)) > 1:
-                row = self._batch_row_for_set_id(set_id)
-                if row is not None:
-                    popup_label = f"{label} (row {int(row) + 1})"
-            popup_labels[set_id] = popup_label
-        return popup_labels
-
-    def _copy_all_shown_block_from_entry(
-        self,
-        *,
-        set_id: str,
-        label: str,
-        entry: Mapping[str, Any],
-    ):
-        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllShownBlock
-
-        return CopyAllShownBlock(
-            set_id=str(set_id),
-            label=str(label),
-            t=np.asarray(entry.get("t"), dtype=float).reshape(-1),
-            series={
-                str(name): np.asarray(values, dtype=float).reshape(-1)
-                for name, values in dict(entry.get("series") or {}).items()
-            },
-        )
-
-    def _copy_all_clean_shown_block(
-        self,
-        *,
-        set_id: str,
-        label: str,
-        cache_key: str,
-        valid_set_ids: Optional[Sequence[str]],
-        invalidated_set_ids: Optional[Sequence[str]],
-    ):
-        if not cache_key:
-            return None, "no_cached_results"
-        coverage = self.results_controller.cached_batch_selection_coverage(
-            cache_key=str(cache_key),
-            selected_sets=[str(set_id)],
-            valid_set_ids=valid_set_ids,
-            invalidated_set_ids=invalidated_set_ids,
-            allow_fallback=False,
-        )
-        if not coverage.available_ids:
-            return None, str(coverage.reason or "no_cached_results")
-        entry_result = self._simulation_batch_owner.active_explicit_cache_entry_for_set(
-            cache_key=str(cache_key),
-            set_id=str(set_id),
-        )
-        if entry_result.entry is None:
-            return None, "invalid_cache_entry" if entry_result.state == "invalid" else "no_cached_results"
-        return self._copy_all_shown_block_from_entry(set_id=str(set_id), label=label, entry=entry_result.entry), None
-
-    def _copy_all_live_primary_block(
-        self,
-        *,
-        set_id: str,
-        label: str,
-    ):
-        sid = str(set_id or "").strip()
-        if not self.main_plot_has_data():
-            return None
-        if sid:
-            active_set_id = str(self.active_batch_selection()[0] or "").strip()
-            if active_set_id != sid:
-                return None
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return None
-        plot_t = np.asarray(
-            getattr(plot, "_t", None) if getattr(plot, "_t", None) is not None else [],
-            dtype=float,
-        ).reshape(-1)
-        plot_series_raw = getattr(plot, "_series", {}) or {}
-        if plot_t.size <= 0 or not isinstance(plot_series_raw, Mapping):
-            return None
-        plot_series = {
-            str(name): np.asarray(values, dtype=float).reshape(-1)
-            for name, values in dict(plot_series_raw).items()
-            if np.asarray(values, dtype=float).reshape(-1).size > 0
-        }
-        if not plot_series:
-            return None
-        return self._copy_all_shown_block_from_entry(
-            set_id=sid,
-            label=label,
-            entry={"t": plot_t, "series": plot_series},
-        )
-
-    def _copy_all_live_plot_shown_block(
-        self,
-        *,
-        set_id: str,
-        label: str,
-        invalidated_set_ids: Optional[Sequence[str]],
-        allow_clean_missing_cache: bool = False,
-    ):
-        sid = str(set_id or "").strip()
-        if not sid:
-            return None
-        invalidated = {str(raw_id) for raw_id in (invalidated_set_ids or ()) if str(raw_id)}
-        if sid not in invalidated and not bool(allow_clean_missing_cache):
-            return None
-        plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-        if plot is None:
-            return None
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_set_id = str(batch_cache.active_batch_set_id or "").strip() if batch_cache is not None else ""
-
-        if active_set_id == sid:
-            block = self._copy_all_live_primary_block(set_id=sid, label=label)
-            if block is not None:
-                return block
-
-        for entry in list(getattr(plot, "_simulation_overlays", []) or []):
-            if not isinstance(entry, Mapping):
-                continue
-            if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
-                continue
-            if str(entry.get("set_id") or "").strip() != sid:
-                continue
-            overlay_t = np.asarray(entry.get("t") if entry.get("t") is not None else [], dtype=float).reshape(-1)
-            overlay_series_raw = entry.get("series") or {}
-            if overlay_t.size <= 0 or not isinstance(overlay_series_raw, Mapping):
-                continue
-            overlay_series = {
-                str(name): np.asarray(values, dtype=float).reshape(-1)
-                for name, values in dict(overlay_series_raw).items()
-                if np.asarray(values, dtype=float).reshape(-1).size > 0
-            }
-            if not overlay_series:
-                continue
-            return self._copy_all_shown_block_from_entry(
-                set_id=sid,
-                label=label,
-                entry={"t": overlay_t, "series": overlay_series},
-            )
-        return None
-
-    def _copy_all_dirty_shown_block(self, *, set_id: str, label: str):
-        resolved_entries, reason, _, _, _, _, _ = self._simulation_batch_owner.resolve_workspace_aware_batch_selection(
-            selected_sets=[str(set_id)]
-        )
-        resolved = next((entry for entry in resolved_entries if str(entry.set_id) == str(set_id)), None)
-        if resolved is None or resolved.entry is None:
-            return None, str(reason or "preview_pending")
-        return self._copy_all_shown_block_from_entry(
-            set_id=str(resolved.set_id),
-            label=str(label),
-            entry=resolved.entry,
-        ), None
-
-    def _build_main_plot_copy_all_export_plan(self):
-        from kindred.gui.widgets.pyqtgraph_plot_panel_impl import CopyAllExportPlan, CopyAllMissingItem
-
-        shown_set_ids = [str(set_id) for set_id in (self.shown_batch_set_ids() or []) if str(set_id)]
-        live_primary_fallback_set_id = ""
-        non_batch_live_primary_label = ""
-        if not shown_set_ids and self.main_plot_has_data():
-            active_set_id = str(self.active_batch_selection()[0] or "").strip()
-            if active_set_id:
-                shown_set_ids = [active_set_id]
-                live_primary_fallback_set_id = active_set_id
-            else:
-                plot = getattr(getattr(self, "_plot_tabs", None), "_main_plot", None)
-                non_batch_live_primary_label = str(
-                    getattr(plot, "_simulation_set_label", "") if plot is not None else ""
-                ).strip() or "Results"
-        popup_labels = self._copy_all_popup_labels_by_set_id(shown_set_ids)
-        batch_cache = self._sim_controller.batch_cache
-        cache_key = str(batch_cache.active_cache_key or "")
-        valid_set_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id))
-        invalidated_set_ids = tuple(
-            str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
-        )
-
-        shown_blocks = []
-        missing_items = []
-        for set_id in shown_set_ids:
-            label = str(self.batch_set_name_for_id(set_id) or set_id)
-            export_label = str(popup_labels.get(str(set_id), label))
-            if self._preview_session.has_dirty_state_for_set(str(set_id)):
-                block, reason = self._copy_all_dirty_shown_block(set_id=str(set_id), label=export_label)
-            else:
-                block, reason = self._copy_all_clean_shown_block(
-                    set_id=str(set_id),
-                    label=export_label,
-                    cache_key=cache_key,
-                    valid_set_ids=valid_set_ids or None,
-                    invalidated_set_ids=invalidated_set_ids or None,
-                )
-                if block is None:
-                    allow_clean_missing_cache = (
-                        str(reason or "") == "no_cached_results" and str(set_id) not in invalidated_set_ids
-                    )
-                    block = self._copy_all_live_plot_shown_block(
-                        set_id=str(set_id),
-                        label=export_label,
-                        invalidated_set_ids=invalidated_set_ids or None,
-                        allow_clean_missing_cache=allow_clean_missing_cache,
-                    )
-                if block is None and str(set_id) == live_primary_fallback_set_id:
-                    block = self._copy_all_live_primary_block(
-                        set_id=str(set_id),
-                        label=export_label,
-                    )
-            if block is not None:
-                shown_blocks.append(block)
-                continue
-            missing_items.append(
-                CopyAllMissingItem(
-                    set_id=str(set_id),
-                    label=label,
-                    popup_label=str(popup_labels.get(str(set_id), label)),
-                    reason=str(reason or "no_cached_results"),
-                )
-            )
-        if non_batch_live_primary_label:
-            block = self._copy_all_live_primary_block(
-                set_id="",
-                label=non_batch_live_primary_label,
-            )
-            if block is not None:
-                shown_blocks.append(block)
-            else:
-                missing_items.append(
-                    CopyAllMissingItem(
-                        set_id="",
-                        label=non_batch_live_primary_label,
-                        popup_label=non_batch_live_primary_label,
-                        reason="no_simulation_data",
-                    )
-                )
-        return CopyAllExportPlan(shown_blocks=shown_blocks, missing_items=missing_items)
-
     def _set_cached_focused_batch_set_id(self, set_id: str) -> str:
         focused_set_id = str(set_id or "").strip()
         if focused_set_id and self._batch_row_for_set_id(focused_set_id) is None:
@@ -5567,7 +4688,6 @@ class MainWindow(
                     signals_blocked = False
                     signals_blocked = False
         self._update_batch_row_controls_state()
-        self._sync_main_plot_copy_labels_for_cached_batch_selection()
 
     def _batch_delete_target_rows(self) -> List[int]:
         rows = self._batch_selected_rows()
@@ -5725,15 +4845,15 @@ class MainWindow(
         self._unmap_datasets_for_deleted_batch_sets(set_ids=delete_ids, set_names=delete_names)
         self._simulation_batch_owner.purge_batch_cache_for_deleted_sets(set_ids=delete_ids, set_names=delete_names)
 
-        if str(self._sim_controller.batch_cache.active_batch_set_id or "") in set(delete_ids):
-            self._sim_controller.batch_cache.active_batch_set_id = None
-        if str(self._sim_controller.batch_cache.active_batch_set or "") in set(delete_names):
-            self._sim_controller.batch_cache.active_batch_set = None
+        self._simulation_batch_owner.clear_active_batch_display_identity_for_deleted_sets(
+            set_ids=delete_ids,
+            set_names=delete_names,
+        )
 
         target_row = min(rows[0], max(0, int(self._batch_store.row_count()) - 1))
         self._select_single_batch_row(target_row)
         self._update_batch_row_controls_state()
-        self.results_controller.refresh_batch_plot_after_set_mutation()
+        self._refresh_batch_display_from_focus_and_shown()
 
     def _batch_set_names_for_scope(self, scope: str) -> List[str]:
         from kindred.core.batch_initial_conditions import resolve_run_scope
@@ -5873,127 +4993,28 @@ class MainWindow(
             if 0 <= int(current_row) < len(names):
                 current_set = str(names[int(current_row)])
 
-        preview = getattr(self, "_preview_session", None)
-        batch_cache = getattr(getattr(self, "_sim_controller", None), "batch_cache", None)
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
-        active_preview_scope_ids = tuple(
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
-        )
-        active_valid_set_ids = tuple(
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_valid_set_ids", None) or ())
-        )
-
-        def _active_scope_overlay_token() -> str:
-            if preview is None or (not active_preview_token):
-                return ""
-            if active_preview_scope_ids:
-                scope_rows: list[int] = []
-                for set_id in active_preview_scope_ids:
-                    try:
-                        row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                    except Exception:
-                        row = None
-                    if row is not None:
-                        scope_rows.append(int(row))
-                if scope_rows:
-                    return str(preview.preview_batch_cache_token(scope_rows) or "")
-                return ""
-            if not bool(preview.has_staged_concentration_overlays()):
-                return ""
-            try:
-                row_count = int(getattr(self, "_batch_store", None).row_count())
-            except Exception:
-                row_count = 0
-            if row_count > 0:
-                return str(preview.preview_batch_cache_token(list(range(int(row_count)))) or "")
-            return ""
-
-        def _overlay_tokens_for_set_ids(set_ids: Sequence[str]) -> dict[str, str]:
-            tokens: dict[str, str] = {}
-            if preview is None:
-                return tokens
-            for set_id in set_ids or ():
-                try:
-                    row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is None:
-                    tokens[str(set_id)] = ""
-                    continue
-                tokens[str(set_id)] = str(preview.preview_batch_cache_token([int(row)]) or "")
-            return tokens
-
-        def _overlay_token_for_set_ids(set_ids: Sequence[str]) -> Optional[str]:
-            if preview is None:
-                return None
-            scope_rows: list[int] = []
-            for set_id in set_ids or ():
-                try:
-                    row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is not None:
-                    scope_rows.append(int(row))
-            if not scope_rows:
-                return None
-            token = str(preview.preview_batch_cache_token(scope_rows) or "")
-            return token or None
-
-        scope_tokens_before = _overlay_tokens_for_set_ids(active_preview_scope_ids)
+        species_sync_snapshot = self._simulation_batch_owner.batch_species_column_sync_snapshot()
 
         self._batch_model.set_species(new_species)
         prune_changed = False
         try:
-            if preview is not None and hasattr(preview, "prune_staged_concentration_overlays_to_species"):
-                prune_changed = bool(preview.prune_staged_concentration_overlays_to_species(new_species))
+            if hasattr(self._preview_session, "prune_staged_concentration_overlays_to_species"):
+                prune_changed = bool(self._preview_session.prune_staged_concentration_overlays_to_species(new_species))
         except RuntimeError as exc:
             logger.debug("Failed to prune staged concentration overlays after batch species sync: %s", exc, exc_info=True)
         if prune_changed:
             try:
-                preview.stop_species_slider_update_timer()
+                self._preview_session.stop_species_slider_update_timer()
             except RuntimeError as exc:
                 logger.debug("Failed to stop species slider timer after pruning overlays: %s", exc, exc_info=True)
             try:
                 self._sim_controller.invalidate_slider_preview_work()
             except RuntimeError as exc:
                 logger.debug("Failed to invalidate stale slider preview work after pruning overlays: %s", exc, exc_info=True)
-        if batch_cache is not None and active_cache_key and (not bool(preserve_active_cache)):
-            batch_cache.clear_active_selection_state()
-        elif batch_cache is not None and active_cache_key and bool(preserve_active_cache) and active_preview_token:
-            if _active_scope_overlay_token() != active_preview_token:
-                scope_tokens_after = _overlay_tokens_for_set_ids(active_preview_scope_ids)
-                invalidated_set_ids = {
-                    str(set_id)
-                    for set_id, before_token in scope_tokens_before.items()
-                    if str(before_token) != str(scope_tokens_after.get(str(set_id), ""))
-                }
-                if invalidated_set_ids:
-                    valid_ids = active_valid_set_ids or active_preview_scope_ids
-                    narrowed_valid_ids = tuple(str(set_id) for set_id in valid_ids if str(set_id) not in invalidated_set_ids)
-                    if not narrowed_valid_ids:
-                        batch_cache.clear_active_selection_state()
-                    else:
-                        narrowed_valid_set = set(narrowed_valid_ids)
-                        batch_cache.active_cache_valid_set_ids = narrowed_valid_ids
-                        batch_cache.active_cache_invalidated_set_ids = tuple(
-                            str(set_id) for set_id in invalidated_set_ids if str(set_id)
-                        )
-                        narrowed_scope_ids = tuple(
-                            str(set_id) for set_id in active_preview_scope_ids if str(set_id) in narrowed_valid_set
-                        )
-                        batch_cache.active_cache_preview_scope_set_ids = narrowed_scope_ids or None
-                        batch_cache.active_cache_preview_token = _overlay_token_for_set_ids(narrowed_scope_ids)
-                        batch_cache.last_display_selection = [
-                            str(set_id)
-                            for set_id in (batch_cache.last_display_selection or [])
-                            if str(set_id) in narrowed_valid_set
-                        ]
-                        if str(batch_cache.active_batch_set_id or "") not in narrowed_valid_set:
-                            batch_cache.active_batch_set_id = None
-                            batch_cache.active_batch_set = None
-                else:
-                    batch_cache.clear_active_selection_state()
+        self._simulation_batch_owner.reconcile_active_cache_after_species_column_sync(
+            species_sync_snapshot,
+            preserve_active_cache=bool(preserve_active_cache),
+        )
 
         table = getattr(self, "_batch_table", None)
         if table is None:
@@ -6068,8 +5089,6 @@ class MainWindow(
         normalized_roles = {int(getattr(role, "value", role)) for role in (roles or ())}
         if normalized_roles and display_role not in normalized_roles:
             return
-        if int(top_left.column()) <= 0 <= int(bottom_right.column()):
-            self._sync_main_plot_copy_labels_for_cached_batch_selection()
         if bool(getattr(self, "_suppress_canonical_batch_initials_transition", False)):
             return
         first_species_col = 1
@@ -6156,244 +5175,11 @@ class MainWindow(
         editor.set_slider_edit_targets_summary(summary)
 
     def _refresh_batch_display_from_focus_and_shown(self) -> None:
-        self._update_batch_row_controls_state()
-        batch_cache = self._sim_controller.batch_cache
-        shown_sets = self._shown_batch_set_ids()
-        if not shown_sets:
-            self._clear_batch_selection_display_state()
+        outcome = self.results_controller.refresh_display_from_focus_and_shown()
+        if outcome.focused_controls_use_workspace is not None:
             self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(
-                    self._preview_session.has_dirty_state_for_set(self._focused_batch_set_id_value())
-                )
+                use_workspace=bool(outcome.focused_controls_use_workspace)
             )
-            return
-        prefer = None
-        focused_set_id = self._focused_batch_set_id_value()
-        if focused_set_id:
-            prefer = focused_set_id
-        focused_selection_is_dirty = self._simulation_batch_owner.focused_batch_selection_is_dirty(
-            selected_sets=shown_sets,
-            prefer_set=prefer,
-        )
-        active_cache_key = str(batch_cache.active_cache_key or "").strip()
-
-        outcome = None
-        outcome_reason = None
-        miss_msg = "Result not cached (evicted). Press Run to compute."
-        invalid_msg = "Cached result invalid. Press Run to compute."
-        preview_pending_msg = "Preview pending for current selection."
-
-        def _reset_stale_cache_warning_status() -> None:
-            label = getattr(self, "_status_label", None)
-            if label is None:
-                return
-            try:
-                if str(label.text()) in (miss_msg, invalid_msg, preview_pending_msg):
-                    label.setText("Ready")
-            except RuntimeError as exc:
-                logger.debug("Failed to update status label: %s", exc, exc_info=True)
-                self._status_label = None
-
-        def _set_selection_status(text: str) -> None:
-            label = getattr(self, "_status_label", None)
-            if label is None:
-                return
-            try:
-                label.setText(str(text))
-            except RuntimeError as exc:
-                logger.debug("Failed to update status label: %s", exc, exc_info=True)
-                self._status_label = None
-
-        def _clear_non_displayed_selection_state(*, preserve_plot: bool = False) -> None:
-            if preserve_plot:
-                self._mark_stale_preserved_batch_plot_display(
-                    reason=str(outcome_reason or ""),
-                    cache_key=str(active_cache_key or ""),
-                    selected_set_ids=shown_sets,
-                )
-                self.clear_display_selection_state()
-                return
-            self._clear_stale_preserved_batch_plot_display()
-            self._clear_batch_selection_display_state()
-
-        def _selection_contains_active_invalidated_set() -> bool:
-            invalidated = batch_cache.active_cache_invalidated_set_ids
-            if invalidated is None:
-                return False
-            invalidated_set_ids = {str(set_id) for set_id in invalidated if str(set_id)}
-            return any(str(set_id) in invalidated_set_ids for set_id in shown_sets)
-
-        def _finalize_displayed_selection_change() -> None:
-            self._clear_stale_preserved_batch_plot_display()
-            self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
-            _reset_stale_cache_warning_status()
-
-        if focused_selection_is_dirty and self._simulation_batch_owner.selection_uses_fresh_explicit_cache_after_post_run_sync(
-            selected_sets=shown_sets
-        ):
-            valid_set_ids = None
-            if batch_cache.active_cache_valid_set_ids is not None:
-                valid_set_ids = tuple(str(set_id) for set_id in batch_cache.active_cache_valid_set_ids if str(set_id))
-            invalidated_set_ids = None
-            if batch_cache.active_cache_invalidated_set_ids is not None:
-                invalidated_set_ids = tuple(
-                    str(set_id) for set_id in batch_cache.active_cache_invalidated_set_ids if str(set_id)
-                )
-            outcome = self.results_controller.display_cached_batch_selection_outcome(
-                cache_key=active_cache_key,
-                selected_sets=shown_sets,
-                prefer_set=prefer,
-                valid_set_ids=valid_set_ids,
-                invalidated_set_ids=invalidated_set_ids,
-                allow_fallback=False,
-            )
-            if outcome.displayed:
-                self._sync_mechanism_controls_to_focused_batch_set(use_workspace=True)
-                _reset_stale_cache_warning_status()
-                return
-            if outcome.reason == "invalid_cache_entry":
-                _set_selection_status(invalid_msg)
-                return
-            _set_selection_status(miss_msg)
-            return
-
-        (
-            resolved_entries,
-            outcome_reason,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
-        ) = (
-            self._simulation_batch_owner.resolve_workspace_aware_batch_selection(selected_sets=shown_sets)
-        )
-        if all_selected_sets_resolved and resolved_entries:
-            outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                resolved_entries=resolved_entries,
-                prefer_set=prefer,
-            )
-            outcome_reason = outcome.reason
-            if outcome.displayed:
-                self._sync_mechanism_controls_to_focused_batch_set(
-                    use_workspace=bool(focused_selection_uses_workspace_controls)
-                )
-                _finalize_displayed_selection_change()
-                return
-
-        if resolved_entries and has_workspace_selection:
-            if (
-                outcome_reason == "preview_pending"
-                and has_resolved_workspace_preview
-                and (
-                    bool(focused_selection_uses_workspace_controls)
-                    or ((not bool(focused_selection_is_dirty)) and bool(focused_selection_has_resolved_entry))
-                )
-            ):
-                outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                    resolved_entries=resolved_entries,
-                    prefer_set=prefer,
-                )
-                if outcome.displayed:
-                    self._simulation_batch_owner.record_current_main_plot_workspace_preview_provenance(selected_set_ids=shown_sets)
-                    self._sync_mechanism_controls_to_focused_batch_set(
-                        use_workspace=bool(focused_selection_uses_workspace_controls)
-                    )
-                    _set_selection_status(preview_pending_msg)
-                    return
-                _clear_non_displayed_selection_state()
-                self._sync_mechanism_controls_to_focused_batch_set(
-                    use_workspace=bool(focused_selection_is_dirty)
-                )
-                _set_selection_status(preview_pending_msg)
-                return
-            if (
-                outcome_reason == "no_cached_results"
-                and has_resolved_workspace_preview
-                and (
-                    bool(focused_selection_uses_workspace_controls)
-                    or ((not bool(focused_selection_is_dirty)) and bool(focused_selection_has_resolved_entry))
-                )
-            ):
-                outcome = self.results_controller.display_resolved_batch_selection_outcome(
-                    resolved_entries=resolved_entries,
-                    prefer_set=prefer,
-                )
-                if outcome.displayed:
-                    self._sync_mechanism_controls_to_focused_batch_set(
-                        use_workspace=bool(focused_selection_uses_workspace_controls)
-                    )
-                    _finalize_displayed_selection_change()
-                    if not bool(focused_selection_uses_workspace_controls):
-                        _set_selection_status(miss_msg)
-                    return
-            if outcome_reason == "no_cached_results":
-                _clear_non_displayed_selection_state()
-                self._sync_mechanism_controls_to_focused_batch_set(
-                    use_workspace=bool(focused_selection_is_dirty)
-                )
-                _set_selection_status(miss_msg)
-                return
-
-        if (not has_workspace_selection) and outcome_reason in {"preview_pending", "no_cached_results"} and active_cache_key:
-            valid_set_ids = None
-            if batch_cache.active_cache_valid_set_ids is not None:
-                valid_set_ids = tuple(str(set_id) for set_id in batch_cache.active_cache_valid_set_ids if str(set_id))
-            invalidated_set_ids = None
-            if batch_cache.active_cache_invalidated_set_ids is not None:
-                invalidated_set_ids = tuple(
-                    str(set_id) for set_id in batch_cache.active_cache_invalidated_set_ids if str(set_id)
-                )
-            outcome = self.results_controller.display_cached_batch_selection_outcome(
-                cache_key=active_cache_key,
-                selected_sets=shown_sets,
-                prefer_set=prefer,
-                valid_set_ids=valid_set_ids,
-                invalidated_set_ids=invalidated_set_ids,
-                allow_fallback=False,
-            )
-            if outcome.displayed:
-                self._sync_mechanism_controls_to_focused_batch_set(use_workspace=False)
-                _finalize_displayed_selection_change()
-                return
-            if outcome_reason != "invalid_cache_entry" and outcome.reason == "invalid_cache_entry":
-                outcome_reason = "invalid_cache_entry"
-
-        if (not has_workspace_selection) and (not active_cache_key):
-            _clear_non_displayed_selection_state()
-            self._sync_mechanism_controls_to_focused_batch_set(use_workspace=False)
-            _reset_stale_cache_warning_status()
-            return
-
-        if outcome_reason == "invalid_cache_entry":
-            _clear_non_displayed_selection_state()
-            self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(focused_selection_is_dirty)
-            )
-            _set_selection_status(invalid_msg)
-            return
-        if outcome_reason == "preview_pending":
-            _clear_non_displayed_selection_state()
-            self._sync_mechanism_controls_to_focused_batch_set(
-                use_workspace=bool(focused_selection_is_dirty)
-            )
-            _set_selection_status(preview_pending_msg)
-            return
-        if (
-            outcome_reason == "no_cached_results"
-            and (not has_workspace_selection)
-            and active_cache_key
-            and not _selection_contains_active_invalidated_set()
-        ):
-            _clear_non_displayed_selection_state(preserve_plot=True)
-            self._sync_mechanism_controls_to_focused_batch_set(use_workspace=False)
-            _set_selection_status(miss_msg)
-            return
-        _clear_non_displayed_selection_state()
-        self._sync_mechanism_controls_to_focused_batch_set(
-            use_workspace=bool(focused_selection_is_dirty)
-        )
-        _set_selection_status(miss_msg)
 
     def _normalized_slider_overrides(
         self,
@@ -7730,7 +6516,7 @@ class MainWindow(
         description: str,
         apply_species_overlays: bool,
     ) -> None:
-        preserve_current_display = self._active_workspace_preview_display_snapshot()
+        preserve_current_display = self.results_controller.active_workspace_preview_display_snapshot()
         self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._preview_session.stop_variable_update_timer()
@@ -7809,14 +6595,22 @@ class MainWindow(
 
     def _on_reset_slider_overrides_clicked(self) -> None:
         """Reset slider overrides back to the baseline DSL values and refresh slider widgets."""
+        target_set_ids = self._effective_slider_edit_target_set_ids()
+        pre_reset_display = self.results_controller.active_workspace_preview_display_snapshot()
         if bool(self._preview_session.has_staged_concentration_overlays()):
             replay_intent = self._preview_session.capture_reset_slider_replay_intent()
-            self._discard_slider_transaction_for_invalidation()
+            cleared_display = self._discard_slider_transaction_for_invalidation(
+                target_set_ids=target_set_ids,
+                pre_reset_display_snapshot=pre_reset_display,
+            )
         else:
             self._sim_controller.discard_slider_preview_work_preserving_runtime_owner()
             self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
-            target_set_ids = self._effective_slider_edit_target_set_ids()
             self._preview_session.reset_mechanism_workspaces(target_set_ids)
+            cleared_display = self.results_controller.clear_display_if_workspace_previews_were_shown(
+                target_set_ids,
+                pre_reset_display_snapshot=pre_reset_display,
+            )
             self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
             sliders = getattr(getattr(self, "_mechanism_editor", None), "_variable_sliders", None)
@@ -7843,43 +6637,32 @@ class MainWindow(
                 logger.exception("Failed to reset species row")
                 self._species_panel_available = False
             self._refresh_slider_transaction_button_state()
-            self._refresh_batch_display_from_focus_and_shown()
+            if not cleared_display:
+                self._refresh_batch_display_from_focus_and_shown()
             return
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         if replay_intent is not None:
             self._preview_session.submit_slider_replay_intent(replay_intent)
             self._sim_controller.launch_pending_slider_preview_replay()
-        else:
+        elif not cleared_display:
             self._refresh_batch_display_from_focus_and_shown()
 
-    def _discard_slider_transaction_for_invalidation(self) -> None:
+    def _discard_slider_transaction_for_invalidation(
+        self,
+        *,
+        target_set_ids: Sequence[str] | None = None,
+        pre_reset_display_snapshot: Mapping[str, Any] | None = None,
+    ) -> bool:
         """Clear the staged transaction without scheduling a preview rerun."""
-        batch_cache = self._sim_controller.batch_cache
-        active_overlay_token = str(batch_cache.active_cache_preview_token or "").strip()
-        active_overlay_scope_ids = tuple(str(set_id) for set_id in (batch_cache.active_cache_preview_scope_set_ids or ()))
-        current_overlay_token = None
-        if active_overlay_token and active_overlay_scope_ids:
-            scope_rows = []
-            for set_id in active_overlay_scope_ids:
-                try:
-                    row = getattr(self, "_batch_store", None).row_for_set_id(str(set_id))
-                except Exception:
-                    row = None
-                if row is not None:
-                    scope_rows.append(int(row))
-            if scope_rows:
-                current_overlay_token = self._preview_session.preview_batch_cache_token(scope_rows) or None
-        elif active_overlay_token and bool(self._preview_session.has_staged_concentration_overlays()):
-            try:
-                row_count = int(getattr(self, "_batch_store", None).row_count())
-            except Exception:
-                row_count = 0
-            if row_count > 0:
-                current_overlay_token = self._preview_session.preview_batch_cache_token(list(range(int(row_count)))) or None
+        clear_active_selection = self._simulation_batch_owner.active_preview_selection_matches_current_workspace()
         self._sim_controller.invalidate_slider_preview_work()
         self._preview_session.clear_working_transaction(invalidate_preview_work=False)
-        if current_overlay_token and active_overlay_token == str(current_overlay_token):
-            batch_cache.clear_active_selection_state()
+        cleared_display = self.results_controller.clear_display_if_workspace_previews_were_shown(
+            target_set_ids or self._effective_slider_edit_target_set_ids(),
+            pre_reset_display_snapshot=pre_reset_display_snapshot,
+        )
+        if clear_active_selection:
+            self._simulation_batch_owner.clear_active_selection_state()
         self._sim_controller.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._variable_runtime.clear_prepared_slider_runtime(dirty=True)
 
@@ -7907,6 +6690,7 @@ class MainWindow(
             logger.exception("Failed to reset species row")
             self._species_panel_available = False
         self._refresh_slider_transaction_button_state()
+        return bool(cleared_display)
 
     # ------------------------------------------------------------------
     # Species mode (Batch Initial Conditions sliders)
@@ -7968,9 +6752,11 @@ class MainWindow(
             panel = None
         if panel is None:
             return
+        target_set_ids = self._effective_slider_edit_target_set_ids()
+        pre_reset_display = self.results_controller.active_workspace_preview_display_snapshot()
         try:
             rows = []
-            for set_id in self._effective_slider_edit_target_set_ids():
+            for set_id in target_set_ids:
                 row = self._batch_row_for_set_id(set_id)
                 if row is not None:
                     rows.append(int(row))
@@ -7983,6 +6769,10 @@ class MainWindow(
         except Exception:
             changed = False
         if changed:
+            self.results_controller.clear_display_if_workspace_previews_were_shown(
+                target_set_ids,
+                pre_reset_display_snapshot=pre_reset_display,
+            )
             self._refresh_slider_transaction_button_state()
             self._queue_species_slider_simulation(label="init:reset", delay_ms=0)
 

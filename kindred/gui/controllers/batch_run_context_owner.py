@@ -10,6 +10,12 @@ from kindred.gui.controllers.simulation_completion_policy import (
     cache_truth_generation_value,
     next_cache_truth_generation,
 )
+from kindred.gui.ports import (
+    CompletedRunDisplayCoverage,
+    CompletedRunDisplayIntent,
+    CompletedRunDisplayTransaction,
+    CompletionDisplayEntry,
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,7 @@ class BatchContextSeed:
     preview_batch_cache_token_by_set_id: Mapping[str, str] | None = None
     runtime_waiting: bool | None = None
     active_timeout_s: float | None = None
+    completed_run_display_intent: CompletedRunDisplayIntent | None = None
 
     def to_context(self) -> Dict[str, Any]:
         context: Dict[str, Any] = {}
@@ -117,6 +124,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
     explicit_cache_truth_generation: int | None = None
     preview_scope_set_ids: tuple[str, ...] | None = None
     preview_owner_epoch: int | None = None
+    completed_run_display_intent: CompletedRunDisplayIntent | None = None
 
     def to_context(self) -> Dict[str, Any]:
         context: Dict[str, Any] = {
@@ -152,6 +160,8 @@ class BatchCallbackContext(MappingABC[str, Any]):
             "preview_scope_set_ids": self.preview_scope_set_ids,
             "preview_owner_epoch": self.preview_owner_epoch,
         }
+        if self.completed_run_display_intent is not None:
+            context["completed_run_display_intent"] = self.completed_run_display_intent
         if self.runtime_input_epoch is not None:
             context["runtime_input_epoch"] = self.runtime_input_epoch
         if self.runtime_input_global_epoch is not None:
@@ -211,6 +221,7 @@ class BatchRunStartRequest:
     preview_scope_set_ids: Sequence[str] | None
     preview_owner_epoch: int | None
     preview_batch_cache_token_by_set_id: Mapping[str, str]
+    completed_run_display_intent: CompletedRunDisplayIntent
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -324,6 +335,8 @@ class BatchRunStartRequest:
                 if str(set_id)
             },
         )
+        if not isinstance(self.completed_run_display_intent, CompletedRunDisplayIntent):
+            raise TypeError("BatchRunStartRequest requires a CompletedRunDisplayIntent.")
 
 
 @dataclass(frozen=True)
@@ -476,6 +489,9 @@ class BatchCompletionState:
 class BatchRunContextOwner:
     """Owns the mutable batch-run context for SimulationController."""
 
+    _COMPLETED_RUN_DISPLAY_INTENT_KEY = "completed_run_display_intent"
+    _COMPLETION_DISPLAY_ENTRIES_KEY = "completion_display_entries_by_set_id"
+
     def __init__(self) -> None:
         self._context: Dict[str, Any] = {}
 
@@ -487,6 +503,7 @@ class BatchRunContextOwner:
         context: Mapping[str, Any] | None = None,
     ) -> BatchCallbackContext:
         ctx = context if isinstance(context, Mapping) else self._context
+        display_intent = ctx.get(self._COMPLETED_RUN_DISPLAY_INTENT_KEY)
         return BatchCallbackContext(
             active=self._coerce_bool(ctx.get("active")),
             request_id=self._optional_int(ctx.get("request_id")),
@@ -550,6 +567,7 @@ class BatchRunContextOwner:
                 else None
             ),
             preview_owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
+            completed_run_display_intent=display_intent,
         )
 
     def _matches_current_identity(self, context: Mapping[str, Any]) -> bool:
@@ -607,7 +625,13 @@ class BatchRunContextOwner:
         return True
 
     def load_context(self, seed: BatchContextSeed) -> None:
-        self._context = seed.to_context()
+        context = seed.to_context()
+        display_intent = context.get(self._COMPLETED_RUN_DISPLAY_INTENT_KEY)
+        if not isinstance(display_intent, CompletedRunDisplayIntent):
+            display_intent = self._completed_run_display_intent_from_context(context)
+        if display_intent is not None:
+            context[self._COMPLETED_RUN_DISPLAY_INTENT_KEY] = display_intent
+        self._context = context
 
     def active_batch_state(
         self,
@@ -1109,6 +1133,7 @@ class BatchRunContextOwner:
                 if str(set_id)
             },
         }
+        context[self._COMPLETED_RUN_DISPLAY_INTENT_KEY] = request.completed_run_display_intent
         self._context = context
         return self._current_context()
 
@@ -1126,6 +1151,164 @@ class BatchRunContextOwner:
         if not self._context:
             return self._current_context()
         return self._update(active=False)
+
+    def record_completion_display_entry(
+        self,
+        context: Mapping[str, Any] | None,
+        *,
+        set_id: str | None,
+        label: str | None,
+        entry: CompletionDisplayEntry,
+    ) -> Dict[str, Any]:
+        sid = str(set_id or "").strip()
+        if not sid or not isinstance(entry, CompletionDisplayEntry):
+            return self._current_context() if context is None else deepcopy(dict(context))
+        base = context if isinstance(context, Mapping) else self._context
+        raw = (
+            dict(self._context)
+            if isinstance(base, Mapping) and self.context_matches_current_run_identity(base)
+            else dict(base or {})
+        )
+        entries_raw = raw.get(self._COMPLETION_DISPLAY_ENTRIES_KEY)
+        entries = deepcopy(dict(entries_raw)) if isinstance(entries_raw, Mapping) else {}
+        entries[sid] = CompletionDisplayEntry(
+            set_id=sid,
+            label=str(label or sid),
+            t=entry.t,
+            series=deepcopy(dict(entry.series or {})),
+            algebra_scalars=deepcopy(dict(entry.algebra_scalars or {})),
+            solver_provenance=deepcopy(dict(entry.solver_provenance or {})),
+            mechanism_text=str(entry.mechanism_text or ""),
+            solver_config=deepcopy(dict(entry.solver_config or {})),
+            warnings=tuple(deepcopy(dict(warning)) for warning in entry.warnings if isinstance(warning, Mapping)),
+            completion_provenance=deepcopy(dict(entry.completion_provenance or {})),
+        )
+        raw[self._COMPLETION_DISPLAY_ENTRIES_KEY] = entries
+        if self._matches_current_identity(raw):
+            self._context = raw
+            return self._current_context()
+        return deepcopy(raw)
+
+    def completed_run_display_coverage(
+        self,
+        context: Mapping[str, Any] | None = None,
+    ) -> CompletedRunDisplayCoverage:
+        ctx = context if isinstance(context, Mapping) else self._context
+        if not isinstance(ctx, Mapping):
+            return CompletedRunDisplayCoverage(reason="no_display_intent")
+        intent = ctx.get(self._COMPLETED_RUN_DISPLAY_INTENT_KEY)
+        if not isinstance(intent, CompletedRunDisplayIntent) or not intent.set_ids:
+            return CompletedRunDisplayCoverage(reason="no_display_intent")
+        failed_set_ids = {str(set_id) for set_id in (ctx.get("failed_set_ids") or ()) if str(set_id)}
+        display_set_ids = tuple(str(set_id) for set_id in intent.set_ids if str(set_id) not in failed_set_ids)
+        if not display_set_ids:
+            return CompletedRunDisplayCoverage(
+                intent=intent,
+                reason="no_displayable_completion_results",
+            )
+        display_primary_set_id = (
+            str(intent.primary_set_id)
+            if str(intent.primary_set_id or "") in set(display_set_ids)
+            else str(display_set_ids[0])
+        )
+        display_intent = (
+            intent
+            if display_set_ids == tuple(intent.set_ids) and display_primary_set_id == str(intent.primary_set_id)
+            else CompletedRunDisplayIntent(
+                set_ids=display_set_ids,
+                labels_by_set_id={
+                    str(set_id): str(intent.labels_by_set_id.get(str(set_id), str(set_id)))
+                    for set_id in display_set_ids
+                },
+                primary_set_id=display_primary_set_id,
+                cache_key=str(intent.cache_key or ""),
+                run_id=intent.run_id,
+                request_id=intent.request_id,
+            )
+        )
+        entries_raw = ctx.get(self._COMPLETION_DISPLAY_ENTRIES_KEY)
+        if not isinstance(entries_raw, Mapping):
+            return CompletedRunDisplayCoverage(
+                intent=display_intent,
+                missing_set_ids=display_set_ids,
+                reason="in_flight_completion_coverage_unavailable",
+            )
+        completion_entries: list[CompletionDisplayEntry] = []
+        missing_set_ids: list[str] = []
+        for set_id in display_set_ids:
+            raw_entry = entries_raw.get(str(set_id))
+            entry = self._coerce_completion_display_entry(
+                raw_entry,
+                set_id=str(set_id),
+                label=str(display_intent.labels_by_set_id.get(str(set_id), str(set_id))),
+            )
+            if entry is None:
+                missing_set_ids.append(str(set_id))
+                continue
+            completion_entries.append(entry)
+        if missing_set_ids:
+            return CompletedRunDisplayCoverage(
+                intent=display_intent,
+                missing_set_ids=tuple(missing_set_ids),
+                reason="in_flight_completion_coverage_unavailable",
+            )
+        return CompletedRunDisplayCoverage(
+            intent=display_intent,
+            transaction=CompletedRunDisplayTransaction(
+                intent=display_intent,
+                completion_entries=tuple(completion_entries),
+            ),
+        )
+
+    def _completed_run_display_intent_from_context(
+        self,
+        context: Mapping[str, Any],
+    ) -> CompletedRunDisplayIntent | None:
+        queue_ids = self._str_tuple(context.get("queue_ids"), dedupe=False)
+        if not queue_ids:
+            return None
+        queue_names = self._str_tuple(context.get("queue_names"), dedupe=False)
+        labels_by_set_id = {
+            str(set_id): (
+                str(queue_names[index])
+                if index < len(queue_names) and str(queue_names[index])
+                else str(set_id)
+            )
+            for index, set_id in enumerate(queue_ids)
+        }
+        primary_set_id = str(context.get("primary_set_id") or queue_ids[0] or "").strip()
+        if primary_set_id not in queue_ids:
+            primary_set_id = str(queue_ids[0])
+        return CompletedRunDisplayIntent(
+            set_ids=tuple(queue_ids),
+            labels_by_set_id=labels_by_set_id,
+            primary_set_id=primary_set_id,
+            cache_key=str(context.get("cache_key") or ""),
+            run_id=self._optional_int(context.get("run_id")),
+            request_id=self._optional_int(context.get("request_id")),
+        )
+
+    @staticmethod
+    def _coerce_completion_display_entry(
+        value: Any,
+        *,
+        set_id: str,
+        label: str,
+    ) -> CompletionDisplayEntry | None:
+        if isinstance(value, CompletionDisplayEntry):
+            return CompletionDisplayEntry(
+                set_id=str(value.set_id or set_id),
+                label=str(value.label or label),
+                t=value.t,
+                series=deepcopy(dict(value.series or {})),
+                algebra_scalars=deepcopy(dict(value.algebra_scalars or {})),
+                solver_provenance=deepcopy(dict(value.solver_provenance or {})),
+                mechanism_text=str(value.mechanism_text or ""),
+                solver_config=deepcopy(dict(value.solver_config or {})),
+                warnings=tuple(deepcopy(dict(warning)) for warning in value.warnings if isinstance(warning, Mapping)),
+                completion_provenance=deepcopy(dict(value.completion_provenance or {})),
+            )
+        return None
 
     def deactivate_if_active(
         self,

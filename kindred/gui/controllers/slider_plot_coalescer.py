@@ -16,7 +16,6 @@ class PendingSliderPlotUpdate:
     accepted_preview_request_id: Optional[int] = None
     accepted_preview_owner_epoch: Optional[int] = None
     valid_set_ids: Optional[tuple[str, ...]] = None
-    allow_fallback: bool = True
 
 
 class SliderPlotCoalescer(QtCore.QObject):
@@ -56,7 +55,6 @@ class SliderPlotCoalescer(QtCore.QObject):
         accepted_preview_owner_epoch: Optional[int],
         slider_triggered: bool,
         valid_set_ids: Optional[Sequence[str]],
-        allow_fallback: bool,
         active_run_id: int,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None:
@@ -103,7 +101,6 @@ class SliderPlotCoalescer(QtCore.QObject):
             if valid_set_ids is not None
             else None
         )
-        self.pending.allow_fallback = bool(allow_fallback)
         interval_ms = self.slider_interval_ms if bool(slider_triggered) else self.explicit_interval_ms
         try:
             self.timer.setInterval(max(1, int(interval_ms)))
@@ -127,7 +124,6 @@ class SliderPlotCoalescer(QtCore.QObject):
             accepted_preview_request_id=self.pending.accepted_preview_request_id,
             accepted_preview_owner_epoch=self.pending.accepted_preview_owner_epoch,
             valid_set_ids=self.pending.valid_set_ids,
-            allow_fallback=self.pending.allow_fallback,
         )
         self.pending = PendingSliderPlotUpdate()
         return pending

@@ -100,6 +100,19 @@ class BatchSimulationCache:
         self.active_cache_invalidated_set_ids = stale_scope or None
         return stale_scope
 
+    def apply_active_cache_preview_reconciliation(
+        self,
+        *,
+        valid_set_ids: Sequence[str],
+        invalidated_set_ids: Sequence[str],
+        preview_scope_set_ids: Sequence[str],
+        preview_token: str | None,
+    ) -> None:
+        self.active_cache_valid_set_ids = self.normalize_set_ids(valid_set_ids) or None
+        self.active_cache_invalidated_set_ids = self.normalize_set_ids(invalidated_set_ids) or None
+        self.active_cache_preview_scope_set_ids = self.normalize_set_ids(preview_scope_set_ids) or None
+        self.active_cache_preview_token = str(preview_token or "").strip() or None
+
     def apply_run_start_cache_decision(
         self,
         *,
@@ -313,6 +326,7 @@ class BatchSimulationCache:
         fallback_message: Any = None,
         solver_provenance: Optional[Mapping[str, Any]] = None,
         warnings: Optional[Sequence[Mapping[str, Any]]] = None,
+        completion_provenance: Optional[Mapping[str, Any]] = None,
     ) -> Optional[str]:
         entry = build_batch_cache_entry(
             t=t,
@@ -327,6 +341,7 @@ class BatchSimulationCache:
             fallback_message=fallback_message,
             solver_provenance=solver_provenance,
             warnings=warnings,
+            completion_provenance=completion_provenance,
         )
         return self.put_batch_cache_entry(
             cache_key=cache_key,
@@ -384,13 +399,16 @@ class BatchSimulationCache:
         self.active_batch_set = None
         self.active_batch_set_id = None
 
-    def clear_active_selection_state(self) -> None:
+    def clear_active_cache_identity_state(self) -> None:
         self.active_cache_key = None
         self.active_cache_preview_token = None
         self.active_cache_preview_scope_set_ids = None
         self.active_cache_valid_set_ids = None
         self.active_cache_invalidated_set_ids = None
         self.clear_active_preview_selection_state()
+
+    def clear_active_selection_state(self) -> None:
+        self.clear_active_cache_identity_state()
         self.clear_display_selection_state()
 
     def reset_runtime_state(self) -> None:

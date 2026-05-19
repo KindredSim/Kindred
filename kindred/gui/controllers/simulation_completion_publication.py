@@ -8,6 +8,12 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from PySide6 import QtCore
 
 from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
+from kindred.gui.ports import (
+    CompletedRunDisplayCoverage,
+    CompletedRunDisplayTransaction,
+    CompletionDisplayEntry,
+    SimulationCompletionDisplayOutcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +34,7 @@ class CompletionCallbackState:
     simulation_identity: Mapping[str, Any] | None = None
     preview_batch_cache_token: str | None = None
     stale_fast_handoff_after_display: bool = False
-    batch_queue_done: bool = True
+    batch_queue_done: bool = False
 
 
 @dataclass
@@ -113,9 +119,17 @@ class SimulationCompletionPublicationOwner:
             self.apply_algebra_status(completion)
             self.publish_cache_truth(state)
             self.publish_cache_entry(completion, state)
+            self.record_in_flight_completion_display_entry(completion, state)
             self.apply_pending_init(completion, state)
-            self.publish_display(completion, state)
-            self.publish_annotations_and_provenance(completion)
+            display_outcome = self.publish_display(completion, state)
+            if self._non_displayed_outcome_is_terminal(display_outcome, state):
+                self._deps.apply_lifecycle_effects(
+                    self._lifecycle_effect_owner.progress_update(status_text="Display failed")
+                )
+                if isinstance(state.ctx, Mapping):
+                    state.ctx = self._batch_context_owner.deactivate_if_active(state.ctx)
+                state.batch_queue_done = True
+                return
             self.apply_pending_init_guard(completion, state)
             self._result_materialization_owner.refresh_primary_result_controls(
                 mechanism=completion.mechanism,
@@ -334,6 +348,7 @@ class SimulationCompletionPublicationOwner:
                 for warning in completion.warnings
                 if isinstance(warning, Mapping)
             ],
+            completion_provenance=self.direct_completion_provenance_payload(completion),
         )
 
     def apply_pending_init(
@@ -372,26 +387,65 @@ class SimulationCompletionPublicationOwner:
             base_context=state.ctx if isinstance(state.ctx, Mapping) else None,
         )
 
-    def publish_display(
+    def record_in_flight_completion_display_entry(
         self,
         completion: CompletionResultState,
         state: CompletionCallbackState,
     ) -> None:
-        if state.cache_key and (state.slider_triggered or state.explicit_batch_coalescing):
+        if state.is_preview or not state.cache_key or not isinstance(state.ctx, Mapping):
+            return
+        entry = CompletionDisplayEntry(
+            set_id=str(state.batch_set_id or ""),
+            label=str(state.batch_set or state.batch_set_id or ""),
+            t=completion.t,
+            series=completion.series,
+            algebra_scalars=dict(completion.algebra_scalars),
+            solver_provenance=completion.solver_provenance,
+            mechanism_text=str(completion.mechanism_text or ""),
+            solver_config=dict(completion.solver_config),
+            warnings=tuple(
+                dict(warning)
+                for warning in completion.warnings
+                if isinstance(warning, Mapping)
+            ),
+            completion_provenance=self.direct_completion_provenance_payload(completion),
+        )
+        state.ctx = self._batch_context_owner.record_completion_display_entry(
+            state.ctx,
+            set_id=state.batch_set_id,
+            label=state.batch_set,
+            entry=entry,
+        )
+
+    def publish_display(
+        self,
+        completion: CompletionResultState,
+        state: CompletionCallbackState,
+    ) -> SimulationCompletionDisplayOutcome:
+        requires_completed_run_transaction = self._requires_completed_run_display_transaction(state)
+        completed_run_coverage = self._completed_run_display_coverage(state)
+        completed_run_transaction = completed_run_coverage.transaction if completed_run_coverage is not None else None
+        if state.cache_key and state.slider_triggered:
             self._deps.queue_slider_plot_update(
                 set_id=state.batch_set_id,
                 cache_key=str(state.cache_key),
                 request_id=state.request_id,
                 run_id=state.run_id,
                 slider_triggered=bool(state.slider_triggered),
-                valid_set_ids=(
-                    completion.redraw_valid_set_ids
-                    if (state.explicit_batch_coalescing and completion.has_redraw_subset)
-                    else None
-                ),
-                allow_fallback=(not bool(state.explicit_batch_coalescing)),
+                valid_set_ids=None,
             )
-            return
+            return SimulationCompletionDisplayOutcome(False, reason="queued_display")
+        if self._should_defer_in_progress_batch_display(state):
+            return SimulationCompletionDisplayOutcome(False, reason="queued_display")
+
+        if completed_run_transaction is not None:
+            return self._publish_completed_run_display_transaction(completed_run_transaction)
+        if requires_completed_run_transaction:
+            return SimulationCompletionDisplayOutcome(
+                False,
+                direct_completion_displayed=False,
+                reason="in_flight_completion_coverage_unavailable",
+            )
 
         owned_species = None
         if completion.mechanism is not None:
@@ -399,40 +453,104 @@ class SimulationCompletionPublicationOwner:
                 owned_species = list(completion.mechanism.species_names())
             except Exception:
                 owned_species = None
-        selected_sets = []
-        prefer = None
-        if isinstance(state.ctx, Mapping):
-            selected_sets = self._ui.batch.batch_set_ids_for_scope("selected")
-            current_row = self._ui.batch.batch_current_row()
-            if current_row is not None:
-                prefer = self._ui.batch.batch_set_id_for_row(int(current_row))
-        self._ui.results.publish_simulation_completion_result(
+        outcome = self._ui.results.publish_simulation_completion_result(
             t=completion.t,
             series=completion.series,
             cache_key=state.cache_key,
             batch_set=state.batch_set,
             batch_set_id=state.batch_set_id,
-            selected_sets=selected_sets,
-            prefer_set=prefer,
             redraw_valid_set_ids=completion.redraw_valid_set_ids,
             has_redraw_subset=completion.has_redraw_subset,
             slider_triggered=bool(state.slider_triggered),
             explicit_batch_coalescing=bool(state.explicit_batch_coalescing),
             algebra_scalars=completion.algebra_scalars,
+            solver_provenance=completion.solver_provenance,
+            direct_completion_provenance=self.direct_completion_provenance_payload(completion),
             owned_species=owned_species,
         )
+        if isinstance(outcome, SimulationCompletionDisplayOutcome):
+            return outcome
+        return SimulationCompletionDisplayOutcome(
+            False,
+            direct_completion_displayed=False,
+            reason="invalid_display_outcome",
+        )
 
-    def publish_annotations_and_provenance(
+    def _non_displayed_outcome_is_terminal(
+        self,
+        display_outcome: SimulationCompletionDisplayOutcome,
+        state: CompletionCallbackState,
+    ) -> bool:
+        if display_outcome.displayed:
+            return False
+        reason = str(display_outcome.reason or "")
+        if reason == "queued_display":
+            return False
+        if state.cache_key and reason in {"no_cached_results", "invalid_cache_entry"}:
+            return False
+        return True
+
+    def _should_defer_in_progress_batch_display(self, state: CompletionCallbackState) -> bool:
+        if (not state.cache_key) or state.is_preview or not isinstance(state.ctx, Mapping):
+            return False
+        completion_state = self._batch_context_owner.completion_state(state.ctx)
+        if completion_state is None or not completion_state.active:
+            return False
+        queue_ids = tuple(str(set_id) for set_id in (completion_state.queue_ids or ()) if str(set_id))
+        total = max(1, int(completion_state.total or len(queue_ids) or 1))
+        if total <= 1:
+            return False
+        current_set_id = str(state.batch_set_id or "").strip()
+        if completion_state.parallel:
+            completed = {str(set_id) for set_id in completion_state.completed_set_ids if str(set_id)}
+            if current_set_id:
+                completed.add(current_set_id)
+            return len(completed) < total
+        if state.shutdown_requested:
+            return False
+        pos = max(0, int(completion_state.pos or 0))
+        if queue_ids and 0 <= pos < len(queue_ids):
+            expected_set_id = str(queue_ids[pos])
+            if current_set_id and current_set_id != expected_set_id:
+                return False
+            return (pos + 1) < len(queue_ids)
+        return (pos + 1) < total
+
+    def _requires_completed_run_display_transaction(self, state: CompletionCallbackState) -> bool:
+        if (not state.cache_key) or state.is_preview or not isinstance(state.ctx, Mapping):
+            return False
+        completion_state = self._batch_context_owner.completion_state(state.ctx)
+        if completion_state is None or not completion_state.active:
+            return False
+        queue_ids = tuple(str(set_id) for set_id in (completion_state.queue_ids or ()) if str(set_id))
+        total = max(1, int(completion_state.total or len(queue_ids) or 1))
+        return bool(queue_ids) and total >= 1
+
+    def _completed_run_display_coverage(
+        self,
+        state: CompletionCallbackState,
+    ) -> CompletedRunDisplayCoverage | None:
+        if not self._requires_completed_run_display_transaction(state):
+            return None
+        return self._batch_context_owner.completed_run_display_coverage(state.ctx)
+
+    def _publish_completed_run_display_transaction(
+        self,
+        transaction: CompletedRunDisplayTransaction,
+    ) -> SimulationCompletionDisplayOutcome:
+        outcome = self._ui.results.publish_completed_run_display_transaction(transaction)
+        if not isinstance(outcome, SimulationCompletionDisplayOutcome):
+            return SimulationCompletionDisplayOutcome(
+                False,
+                direct_completion_displayed=False,
+                reason="invalid_display_outcome",
+            )
+        return outcome
+
+    def direct_completion_provenance_payload(
         self,
         completion: CompletionResultState,
-    ) -> None:
-        try:
-            self._ui.results.publish_completion_intervention_annotations(completion.solver_provenance)
-        except Exception as exc:
-            self._deps.record_nonfatal_exception("Failed to update intervention plot annotations", exc)
-
-        if not completion.is_primary:
-            return
+    ) -> Optional[Dict[str, Any]]:
         launch_provenance = (
             completion.solver_provenance.get("launch_provenance")
             if isinstance(completion.solver_provenance, Mapping)
@@ -476,39 +594,36 @@ class SimulationCompletionPublicationOwner:
         solver_method, solver_warning = normalize_solver_name(
             str(completion.solver_config.get("solver") or solver_label)
         )
-        overlay_snapshot = getattr(self._ui.results.main_plot(), "overlay_snapshot", None)
-        dataset_overlays = overlay_snapshot() if callable(overlay_snapshot) else None
-        self._ui.provenance.publish_simulation_completion_provenance(
-            mechanism_text=completion.mechanism_text,
-            solver_method=str(solver_method),
-            solver_label=str(solver_label),
-            solver_warning=(str(solver_warning) if solver_warning else None),
-            solver_config={
+        return {
+            "mechanism_text": completion.mechanism_text,
+            "solver_method": str(solver_method),
+            "solver_label": str(solver_label),
+            "solver_warning": (str(solver_warning) if solver_warning else None),
+            "solver_config": {
                 "rtol": completion.solver_config.get("rtol", 1e-6),
                 "atol": completion.solver_config.get("atol", 1e-12),
             },
-            temperature_K=float(temperature_used),
-            temperature_source=(
+            "temperature_K": float(temperature_used),
+            "temperature_source": (
                 str(launch_provenance.get("temperature_source"))
                 if launch_provenance.get("temperature_source") is not None
                 else "result"
             ),
-            energy_unit=energy_unit_used,
-            energy_mode=bool(completion.energy_mode),
-            simulation_time=sim_time_prov,
-            num_points_requested=(
+            "energy_unit": energy_unit_used,
+            "energy_mode": bool(completion.energy_mode),
+            "simulation_time": sim_time_prov,
+            "num_points_requested": (
                 int(launch_provenance["num_points_requested"])
                 if launch_provenance.get("num_points_requested") is not None
                 else int((completion.solver_config.get("grid") or {}).get("N") or len(completion.t))
             ),
-            species_names=list(completion.species_names),
-            t=completion.t,
-            series=completion.series,
-            algebra_scalars=completion.algebra_scalars,
-            dataset_overlays=dataset_overlays,
-            solver_provenance=completion.solver_provenance,
-            warnings=completion.warnings,
-        )
+            "species_names": list(completion.species_names),
+            "t": completion.t,
+            "series": completion.series,
+            "algebra_scalars": completion.algebra_scalars,
+            "solver_provenance": completion.solver_provenance,
+            "warnings": completion.warnings,
+        }
 
     def apply_pending_init_guard(
         self,

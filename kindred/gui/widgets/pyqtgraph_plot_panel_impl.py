@@ -38,6 +38,7 @@ class CopyAllShownBlock:
     label: str
     t: np.ndarray
     series: Dict[str, np.ndarray]
+    layer_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,7 +268,7 @@ if PYQTGRAPH_AVAILABLE:
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
             enable_axis_inversion_actions: bool = False,
-            enable_canonical_ghost_toggle_action: bool = False,
+            enable_reference_layer_toggle_action: bool = False,
             enable_copy_visible_data_action: bool = False,
         ):
             """
@@ -307,6 +308,8 @@ if PYQTGRAPH_AVAILABLE:
 
             # Batch simulation overlays (multiple initial-condition sets overlaid as lines)
             self._simulation_set_label: Optional[str] = None
+            self._simulation_set_id: Optional[str] = None
+            self._simulation_layer_id: Optional[str] = None
             self._simulation_set_popup_label: Optional[str] = None
             self._simulation_overlays: List[Dict[str, object]] = []
 
@@ -320,13 +323,14 @@ if PYQTGRAPH_AVAILABLE:
             self._invert_x_axis: bool = False
             self._invert_y_axis: bool = False
             self._enable_axis_inversion_actions = bool(enable_axis_inversion_actions)
-            self._show_canonical_ghost_lines: bool = True
-            self._enable_canonical_ghost_toggle_action = bool(enable_canonical_ghost_toggle_action)
+            self._show_reference_lines: bool = True
+            self._enable_reference_layer_toggle_action = bool(enable_reference_layer_toggle_action)
             self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
             self._copy_all_export_plan_provider: Optional[Callable[[], Optional[CopyAllExportPlan]]] = None
             self._annotations: List[pg.TextItem] = []
             self._intervention_annotations: List[Dict[str, object]] = []
             self._intervention_annotation_items: List[object] = []
+            self._intervention_annotation_signature: tuple[object, ...] | None = None
             self._show_intervention_annotations: bool = False
             self._sampling_mode: str = "dense"
             self._sampling_target: int = 1000
@@ -534,6 +538,8 @@ if PYQTGRAPH_AVAILABLE:
             series: Dict[str, np.ndarray],
             *,
             label: Optional[str] = None,
+            primary_set_id: Optional[str] = None,
+            layer_id: Optional[str] = None,
             overlays: Optional[Sequence[Dict[str, object]]] = None,
             owned_species: Optional[Sequence[str]] = None,
         ) -> None:
@@ -569,6 +575,10 @@ if PYQTGRAPH_AVAILABLE:
                     color_manager.seed_species(sorted(self._owned_species_keys))
 
             self._simulation_set_label = str(label) if label else None
+            self._simulation_set_id = str(primary_set_id or "").strip() or None
+            self._simulation_layer_id = str(layer_id or "").strip() or (
+                f"result:{self._simulation_set_id}" if self._simulation_set_id else "result:live"
+            )
             self._simulation_set_popup_label = None
             self._workspace_preview_display_provenance_by_set_id = {}
             self._intervention_annotations = []
@@ -597,9 +607,16 @@ if PYQTGRAPH_AVAILABLE:
                 popup_label = str(entry.get("popup_label") or "").strip()
                 if popup_label:
                     normalized_entry["popup_label"] = popup_label
-                curve_role = str(entry.get("curve_role") or "").strip()
-                if curve_role:
-                    normalized_entry["curve_role"] = curve_role
+                layer_kind = str(entry.get("layer_kind") or "").strip()
+                if not layer_kind:
+                    layer_kind = "overlay"
+                normalized_entry["layer_kind"] = layer_kind
+                layer_id = str(entry.get("layer_id") or "").strip()
+                if not layer_id:
+                    role_part = layer_kind or "overlay"
+                    identity_part = set_id or entry_label
+                    layer_id = f"{role_part}:{identity_part}"
+                normalized_entry["layer_id"] = layer_id
                 normalized_overlays.append(normalized_entry)
             self._simulation_overlays = normalized_overlays
             # Assign colors
@@ -614,7 +631,246 @@ if PYQTGRAPH_AVAILABLE:
 
             logger.debug(f"Data set: {len(self._t)} points, {len(self._series)} series")
 
-        def owned_species_for_replay(self) -> Optional[Tuple[str, ...]]:
+        @staticmethod
+        def _overlay_layer_kind(entry: Mapping[str, object]) -> str:
+            layer_kind = str(entry.get("layer_kind") or "").strip()
+            if layer_kind:
+                return layer_kind
+            return "overlay"
+
+        @classmethod
+        def _is_reference_layer(cls, entry: Mapping[str, object]) -> bool:
+            return cls._overlay_layer_kind(entry) == "reference"
+
+        def reference_layers_visible(self) -> bool:
+            return bool(self._show_reference_lines)
+
+        def set_reference_layers_visible(self, visible: bool) -> None:
+            self._set_reference_lines_visible(bool(visible))
+
+        @staticmethod
+        def _overlay_layer_id(entry: Mapping[str, object]) -> str:
+            layer_id = str(entry.get("layer_id") or "").strip()
+            if layer_id:
+                return layer_id
+            layer_kind = str(entry.get("layer_kind") or "").strip() or "overlay"
+            identity = str(entry.get("set_id") or entry.get("label") or "").strip()
+            return f"{layer_kind}:{identity}" if identity else layer_kind
+
+        @staticmethod
+        def _overlay_item_key(*, layer_id: str, species: str) -> str:
+            return f"{str(layer_id)}:{str(species)}"
+
+        def display_layer_snapshot(self) -> Dict[str, object]:
+            layers: List[Dict[str, object]] = []
+            if self._t is not None and self._series:
+                primary_label = str(self._simulation_set_popup_label or self._simulation_set_label or "Results")
+                primary_layer_id = str(self._simulation_layer_id or "").strip() or "result:live"
+                item_identities = {}
+                for species in self._series:
+                    item_key = self._overlay_item_key(layer_id=primary_layer_id, species=str(species))
+                    item = self._plot_items.get(item_key)
+                    if item is not None:
+                        item_identities[self._overlay_item_key(layer_id=primary_layer_id, species=str(species))] = id(item)
+                layers.append(
+                    {
+                        "layer_id": primary_layer_id,
+                        "kind": "result",
+                        "label": primary_label,
+                        "set_id": str(self._simulation_set_id or ""),
+                        "item_identities": item_identities,
+                    }
+                )
+            for entry in list(self._simulation_overlays or []):
+                if not isinstance(entry, Mapping):
+                    continue
+                layer_id = self._overlay_layer_id(entry)
+                layer_kind = self._overlay_layer_kind(entry)
+                series_map = entry.get("series") or {}
+                item_identities = {}
+                if isinstance(series_map, Mapping):
+                    for species in series_map:
+                        item_key = self._overlay_item_key(layer_id=layer_id, species=str(species))
+                        item = self._plot_items.get(item_key)
+                        if item is not None:
+                            item_identities[item_key] = id(item)
+                layers.append(
+                    {
+                        "layer_id": layer_id,
+                        "kind": layer_kind,
+                        "label": str(entry.get("popup_label") or entry.get("label") or ""),
+                        "set_id": str(entry.get("set_id") or ""),
+                        "visible": (not self._is_reference_layer(entry)) or bool(self._show_reference_lines),
+                        "item_identities": item_identities,
+                    }
+                )
+            if self._intervention_annotations:
+                layers.append(
+                    {
+                        "layer_id": "annotations:interventions",
+                        "kind": "annotation",
+                        "label": "Interventions",
+                        "set_id": "",
+                        "item_identities": {},
+                    }
+                )
+            return {"layers": layers}
+
+        def display_transaction_snapshot(self) -> Dict[str, object]:
+            return {
+                "_kindred_display_transaction_snapshot": True,
+                "t": np.asarray(self._t if self._t is not None else [], dtype=float).reshape(-1),
+                "series": dict(self._series or {}),
+                "label": self._simulation_set_label,
+                "primary_set_id": str(self._simulation_set_id or ""),
+                "primary_layer_id": str(self._simulation_layer_id or ""),
+                "popup_label": self._simulation_set_popup_label,
+                "layers": list(self.display_layer_snapshot().get("layers", [])),
+                "overlays": [
+                    dict(entry)
+                    for entry in list(self._simulation_overlays or [])
+                    if isinstance(entry, dict)
+                ],
+                "show_reference_layers": bool(self._show_reference_lines),
+                "owned_species": self.display_owned_species(),
+                "intervention_annotations": [
+                    dict(item)
+                    for item in list(self._intervention_annotations or [])
+                    if isinstance(item, dict)
+                ],
+                "show_intervention_annotations": bool(self._show_intervention_annotations),
+                "workspace_preview_display_provenance_by_set_id": dict(
+                    self._workspace_preview_display_provenance_by_set_id or {}
+                ),
+                "scalar_values": dict(self._scalar_values or {}),
+                "stats_results_map": dict(self._stats_results_map or {}),
+                "visible_stats_results_map": self._visible_stats_results_map(),
+                "stats_result_layer_id": str(self._stats_result_selector.currentData() or ""),
+                "stats_result_label": str(self._stats_result_selector.currentText() or ""),
+                "selected_series": list(self.selected_series()),
+            }
+
+        def restore_display_transaction_snapshot(self, snapshot: Mapping[str, object]) -> None:
+            if not isinstance(snapshot, Mapping):
+                return
+            self._show_reference_lines = bool(snapshot.get("show_reference_layers", True))
+            t = np.asarray(snapshot.get("t") if snapshot.get("t") is not None else [], dtype=float).reshape(-1)
+            series_raw = snapshot.get("series") or {}
+            series = (
+                {
+                    str(name): np.asarray(values, dtype=float)
+                    for name, values in series_raw.items()
+                }
+                if isinstance(series_raw, Mapping)
+                else {}
+            )
+            if t.size > 0 and series:
+                self.set_data(
+                    t,
+                    series,
+                    label=snapshot.get("label"),
+                    primary_set_id=snapshot.get("primary_set_id"),
+                    layer_id=snapshot.get("primary_layer_id"),
+                    overlays=[
+                        dict(entry)
+                        for entry in (snapshot.get("overlays") or ())
+                        if isinstance(entry, Mapping)
+                    ],
+                    owned_species=snapshot.get("owned_species"),
+                )
+            else:
+                self.clear()
+            self._simulation_set_popup_label = snapshot.get("popup_label")
+            self._intervention_annotations = [
+                dict(item)
+                for item in (snapshot.get("intervention_annotations") or ())
+                if isinstance(item, Mapping)
+            ]
+            self._show_intervention_annotations = bool(snapshot.get("show_intervention_annotations"))
+            self._workspace_preview_display_provenance_by_set_id = dict(
+                snapshot.get("workspace_preview_display_provenance_by_set_id") or {}
+            )
+            self._scalar_values = dict(snapshot.get("scalar_values") or {})
+            stats_results_map = snapshot.get("stats_results_map")
+            if isinstance(stats_results_map, Mapping):
+                self.set_statistics_results(
+                    dict(stats_results_map),
+                    prefer=str(snapshot.get("stats_result_layer_id") or snapshot.get("stats_result_label") or ""),
+                )
+            if "selected_series" in snapshot:
+                selected_series = [str(name) for name in (snapshot.get("selected_series") or ()) if str(name)]
+                self.set_selected_series(selected_series)
+            self._intervention_annotation_signature = None
+            self._refresh_intervention_annotations()
+
+        def clear_display_transaction_state(self) -> None:
+            self._workspace_preview_display_provenance_by_set_id = {}
+            self.clear()
+            self.set_statistics_results({}, prefer="")
+
+        def display_claim_snapshot(self) -> Dict[str, object]:
+            return {
+                "popup_label": self._simulation_set_popup_label,
+                "workspace_preview_display_provenance_by_set_id": dict(
+                    self._workspace_preview_display_provenance_by_set_id or {}
+                ),
+            }
+
+        def restore_display_claim_snapshot(self, snapshot: Mapping[str, object]) -> None:
+            if not isinstance(snapshot, Mapping):
+                return
+            self._simulation_set_popup_label = snapshot.get("popup_label")
+            self._workspace_preview_display_provenance_by_set_id = dict(
+                snapshot.get("workspace_preview_display_provenance_by_set_id") or {}
+            )
+
+        def set_workspace_preview_display_provenance(
+            self,
+            provenance_by_set_id: Mapping[str, Mapping[str, object]],
+        ) -> None:
+            cleaned: Dict[str, Dict[str, object]] = {}
+            for raw_set_id, raw_payload in dict(provenance_by_set_id or {}).items():
+                set_id = str(raw_set_id or "").strip()
+                if not set_id or not isinstance(raw_payload, Mapping):
+                    continue
+                cleaned[set_id] = dict(raw_payload)
+            self._workspace_preview_display_provenance_by_set_id = cleaned
+
+        def workspace_preview_display_provenance_snapshot(self) -> Dict[str, Dict[str, object]]:
+            return {
+                str(set_id): dict(payload)
+                for set_id, payload in dict(self._workspace_preview_display_provenance_by_set_id or {}).items()
+                if str(set_id) and isinstance(payload, Mapping)
+            }
+
+        def has_display_data(self) -> bool:
+            return bool(self._series) and self._t is not None
+
+        def set_simulation_popup_labels(
+            self,
+            *,
+            primary_set_id: str,
+            popup_labels_by_set_id: Mapping[str, str],
+        ) -> None:
+            primary_set_id_s = str(primary_set_id or "").strip()
+            labels = {
+                str(set_id): str(label)
+                for set_id, label in dict(popup_labels_by_set_id or {}).items()
+                if str(set_id)
+            }
+            primary_label = str(self._simulation_set_label or "").strip()
+            self._simulation_set_popup_label = str(labels.get(primary_set_id_s, primary_label))
+            for entry in list(self._simulation_overlays or []):
+                if not isinstance(entry, dict):
+                    continue
+                entry_set_id = str(entry.get("set_id") or "").strip()
+                popup_label = str(labels.get(entry_set_id, "")).strip()
+                if popup_label:
+                    entry["popup_label"] = popup_label
+                else:
+                    entry.pop("popup_label", None)
+
+        def display_owned_species(self) -> Optional[Tuple[str, ...]]:
             if not bool(getattr(self, "_owned_species_roster_explicit", False)):
                 return None
             owned_species = tuple(
@@ -762,9 +1018,25 @@ if PYQTGRAPH_AVAILABLE:
             """
             if self._t is None or not self._series:
                 return None
+            layers = [
+                dict(layer)
+                for layer in self.display_layer_snapshot().get("layers", [])
+                if not (
+                    isinstance(layer, Mapping)
+                    and str(layer.get("kind") or "") == "reference"
+                    and layer.get("visible") is False
+                )
+            ]
+            overlays = [
+                dict(entry)
+                for entry in self._simulation_overlays
+                if isinstance(entry, dict) and not (self._is_reference_layer(entry) and not self._show_reference_lines)
+            ]
             return {
                 "t": np.asarray(self._t, dtype=float).reshape(-1),
                 "series": dict(self._series),
+                "layers": layers,
+                "overlays": overlays,
                 "intervention_annotations": [dict(item) for item in self._intervention_annotations],
             }
 
@@ -901,7 +1173,10 @@ if PYQTGRAPH_AVAILABLE:
         def _overlay_copy_block_label(entry: object) -> str:
             if not isinstance(entry, dict):
                 return ""
-            return str(entry.get("popup_label") or entry.get("label") or "").strip()
+            label = str(entry.get("popup_label") or entry.get("label") or "").strip()
+            if PyQtGraphPlotPanel._is_reference_layer(entry) and label:
+                return f"{label} [ref]"
+            return label
 
         def _append_copy_column(
             self,
@@ -941,7 +1216,7 @@ if PYQTGRAPH_AVAILABLE:
             for entry in list(self._simulation_overlays or []):
                 if not isinstance(entry, dict):
                     continue
-                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                if self._is_reference_layer(entry) and not self._show_reference_lines:
                     continue
                 entry_set_id = str(entry.get("set_id") or "").strip()
                 if entry_set_id and entry_set_id in excluded:
@@ -1302,9 +1577,20 @@ if PYQTGRAPH_AVAILABLE:
         ) -> None:
             """Update the species statistics table with latest results."""
             label = str(getattr(self, "_simulation_set_label", "") or "").strip() or "Results"
+            layer_id = str(getattr(self, "_simulation_layer_id", "") or "").strip() or "result:live"
             self.set_statistics_results(
-                {label: {"t": t, "series": series, "chi_squared": chi_squared}},
-                prefer=label,
+                {
+                    layer_id: {
+                        "t": t,
+                        "series": series,
+                        "chi_squared": chi_squared,
+                        "label": label,
+                        "layer_id": layer_id,
+                        "layer_kind": "result",
+                        "set_id": str(getattr(self, "_simulation_set_id", "") or ""),
+                    }
+                },
+                prefer=layer_id,
             )
 
         def set_statistics_results(
@@ -1319,14 +1605,14 @@ if PYQTGRAPH_AVAILABLE:
             Parameters
             ----------
             results_map : dict
-                Mapping of result-set label -> {'t': array, 'series': {species: array}, 'chi_squared': optional}
+                Mapping of semantic layer ID -> {'t': array, 'series': {species: array}, 'label': display label}
             prefer : str, optional
-                Preferred selection label (used after refresh).
+                Preferred semantic layer ID or display label (used after refresh).
             """
             cleaned: Dict[str, Dict[str, object]] = {}
-            for raw_label, payload in (results_map or {}).items():
-                label = str(raw_label or "").strip()
-                if not label:
+            for raw_key, payload in (results_map or {}).items():
+                fallback_key = str(raw_key or "").strip()
+                if not fallback_key:
                     continue
                 if not isinstance(payload, dict):
                     continue
@@ -1334,25 +1620,37 @@ if PYQTGRAPH_AVAILABLE:
                 series_payload = payload.get("series")
                 if t_payload is None or not isinstance(series_payload, dict) or not series_payload:
                     continue
-                cleaned[label] = dict(payload)
+                cleaned_payload = dict(payload)
+                layer_key = str(cleaned_payload.get("layer_id") or fallback_key).strip()
+                if not layer_key:
+                    continue
+                cleaned_payload["layer_id"] = layer_key
+                cleaned_payload.setdefault("layer_kind", "result")
+                cleaned_payload.setdefault("label", fallback_key)
+                cleaned[layer_key] = cleaned_payload
 
             self._stats_results_map = cleaned
 
-            previous = str(self._stats_result_selector.currentText() or "").strip()
+            previous = str(self._stats_result_selector.currentData() or self._stats_result_selector.currentText() or "").strip()
             preferred = str(prefer or "").strip()
-            next_selection = (
-                preferred
-                if preferred and preferred in cleaned
-                else (previous if previous and previous in cleaned else next(iter(cleaned.keys()), ""))
+            visible_cleaned = self._visible_stats_results_map()
+            next_selection = self._stats_result_key_for_preference(preferred, visible_cleaned) or (
+                previous if previous and previous in visible_cleaned else next(iter(visible_cleaned.keys()), "")
             )
 
             self._stats_result_selector.blockSignals(True)
             try:
                 self._stats_result_selector.clear()
-                for label in cleaned.keys():
-                    self._stats_result_selector.addItem(label)
+                for layer_key, payload in visible_cleaned.items():
+                    self._stats_result_selector.addItem(
+                        self._stats_result_display_label(layer_key, payload),
+                        layer_key,
+                    )
                 if next_selection:
-                    self._stats_result_selector.setCurrentText(next_selection)
+                    for index in range(self._stats_result_selector.count()):
+                        if str(self._stats_result_selector.itemData(index) or "") == next_selection:
+                            self._stats_result_selector.setCurrentIndex(index)
+                            break
             finally:
                 self._stats_result_selector.blockSignals(False)
 
@@ -1362,15 +1660,54 @@ if PYQTGRAPH_AVAILABLE:
             else:
                 self._stats_table.setRowCount(0)
 
+        def _visible_stats_results_map(self) -> Dict[str, Dict[str, object]]:
+            if self._show_reference_lines:
+                return dict(self._stats_results_map or {})
+            return {
+                str(label): dict(payload)
+                for label, payload in (self._stats_results_map or {}).items()
+                if str(dict(payload).get("layer_kind") or "") != "reference"
+            }
+
+        @staticmethod
+        def _stats_result_display_label(layer_key: str, payload: Mapping[str, object]) -> str:
+            label = str(payload.get("label") or "").strip()
+            return label or str(layer_key)
+
+        @classmethod
+        def _stats_result_key_for_preference(
+            cls,
+            preferred: str,
+            visible_results: Mapping[str, Mapping[str, object]],
+        ) -> str:
+            preferred_s = str(preferred or "").strip()
+            if not preferred_s:
+                return ""
+            if preferred_s in visible_results:
+                return preferred_s
+            for layer_key, payload in visible_results.items():
+                if cls._stats_result_display_label(str(layer_key), payload) == preferred_s:
+                    return str(layer_key)
+            return ""
+
         def _on_stats_result_selector_changed(self, label: str) -> None:
-            label = str(label or "").strip()
-            if not label:
+            layer_key = str(self._stats_result_selector.currentData() or "").strip()
+            if not layer_key:
+                layer_key = str(label or "").strip()
+            if not layer_key:
                 self._stats_table.setRowCount(0)
                 return
-            self._render_statistics_for_label(label)
+            self._render_statistics_for_label(layer_key)
 
-        def _render_statistics_for_label(self, label: str) -> None:
-            payload = self._stats_results_map.get(str(label))
+        def _render_statistics_for_label(self, layer_key: str) -> None:
+            payload = self._stats_results_map.get(str(layer_key))
+            if (
+                not self._show_reference_lines
+                and isinstance(payload, dict)
+                and str(payload.get("layer_kind") or "") == "reference"
+            ):
+                self._stats_table.setRowCount(0)
+                return
             if not isinstance(payload, dict):
                 self._stats_table.setRowCount(0)
                 return
@@ -1715,14 +2052,57 @@ if PYQTGRAPH_AVAILABLE:
             y_data: np.ndarray,
             pen: object,
             name: Optional[str] = None,
+            visible: bool = True,
         ) -> None:
             item = self._plot_items.get(key)
             if item is None:
                 item = self._plot_item.plot(x_data, y_data, name=str(name or key), pen=pen)
                 self._plot_items[key] = item
+                item.setVisible(bool(visible))
                 return
-            item.setData(x_data, y_data)
+            self._update_curve_item_name(item, str(name or key))
+            if not self._curve_item_data_matches(item, x_data, y_data):
+                item.setData(x_data, y_data)
             item.setPen(pen)
+            item.setVisible(bool(visible))
+
+        def _update_curve_item_name(self, item: object, name: str) -> None:
+            new_name = str(name)
+            opts = getattr(item, "opts", None)
+            if isinstance(opts, dict):
+                current = str(opts.get("name") or "")
+                if current == new_name:
+                    return
+                opts["name"] = new_name
+            label_getter = getattr(self._legend, "getLabel", None)
+            if callable(label_getter):
+                try:
+                    label = label_getter(item)
+                    setter = getattr(label, "setText", None)
+                    if callable(setter):
+                        setter(new_name)
+                except Exception:
+                    pass
+
+        @staticmethod
+        def _curve_item_data_matches(item: object, x_data: np.ndarray, y_data: np.ndarray) -> bool:
+            data_getter = getattr(item, "getData", None)
+            if not callable(data_getter):
+                return False
+            try:
+                existing_x, existing_y = data_getter()
+            except Exception:
+                return False
+            try:
+                return bool(
+                    np.array_equal(np.asarray(existing_x, dtype=float).reshape(-1), np.asarray(x_data, dtype=float).reshape(-1))
+                    and np.array_equal(
+                        np.asarray(existing_y, dtype=float).reshape(-1),
+                        np.asarray(y_data, dtype=float).reshape(-1),
+                    )
+                )
+            except Exception:
+                return False
 
         def _prune_curve_items(self, active_keys: Set[str]) -> None:
             for key in list(self._plot_items.keys()):
@@ -1868,12 +2248,15 @@ if PYQTGRAPH_AVAILABLE:
 
                 y_plot = self._apply_sample_indices(y_data, sample_idx)
                 label = self._format_species_set_label(name, self._simulation_set_label)
-                active_curve_keys.add(label)
+                primary_layer_id = str(self._simulation_layer_id or "").strip() or "result:live"
+                item_key = self._overlay_item_key(layer_id=primary_layer_id, species=name)
+                active_curve_keys.add(item_key)
                 self._upsert_curve_item(
-                    key=label,
+                    key=item_key,
                     x_data=x_plot,
                     y_data=y_plot,
                     pen=pen,
+                    name=label,
                 )
 
             # Batch simulation overlays (additional initial-condition sets as lines)
@@ -1885,9 +2268,8 @@ if PYQTGRAPH_AVAILABLE:
                     if not isinstance(entry, dict):
                         continue
                     set_label = str(entry.get("label") or "")
-                    curve_role = str(entry.get("curve_role") or "")
-                    if curve_role == "canonical_ghost" and not self._show_canonical_ghost_lines:
-                        continue
+                    is_reference_layer = self._is_reference_layer(entry)
+                    layer_visible = (not is_reference_layer) or bool(self._show_reference_lines)
                     if not set_label:
                         continue
                     t_overlay = entry.get("t")
@@ -1932,10 +2314,10 @@ if PYQTGRAPH_AVAILABLE:
                             r, g, b = (100, 100, 100)
 
                         overlay_label = self._format_species_set_label(species, set_label)
-                        overlay_key = overlay_label
+                        layer_id = str(entry.get("layer_id") or "").strip() or set_label
+                        overlay_key = self._overlay_item_key(layer_id=layer_id, species=species)
                         overlay_name = overlay_label
-                        if curve_role == "canonical_ghost":
-                            overlay_key = f"{overlay_label} [canonical]"
+                        if is_reference_layer:
                             overlay_name = f"{overlay_label} [ref]"
                             pen = pg.mkPen(color=(r, g, b, 90), width=1.2, style=Qt.PenStyle.DashLine)
                         else:
@@ -1947,6 +2329,7 @@ if PYQTGRAPH_AVAILABLE:
                             y_data=y_plot_overlay,
                             pen=pen,
                             name=overlay_name,
+                            visible=layer_visible,
                         )
 
             self._prune_curve_items(active_curve_keys)
@@ -1958,12 +2341,16 @@ if PYQTGRAPH_AVAILABLE:
             self._refresh_view_after_plot_update()
 
         def _refresh_intervention_annotations(self) -> None:
+            signature = self._intervention_annotations_signature()
+            if signature == self._intervention_annotation_signature:
+                return
             for item in list(self._intervention_annotation_items):
                 try:
                     self._plot_item.removeItem(item)
                 except Exception:
                     pass
             self._intervention_annotation_items = []
+            self._intervention_annotation_signature = signature
             if (
                 not self._show_intervention_annotations
                 or self._t is None
@@ -2015,6 +2402,28 @@ if PYQTGRAPH_AVAILABLE:
                 line.setZValue(9)
                 self._plot_item.addItem(line, ignoreBounds=True)
                 self._intervention_annotation_items.append(line)
+
+        def _intervention_annotations_signature(self) -> tuple[object, ...]:
+            annotation_parts: list[tuple[tuple[str, str], ...]] = []
+            for annotation in list(self._intervention_annotations or []):
+                if not isinstance(annotation, dict):
+                    continue
+                annotation_parts.append(
+                    tuple(
+                        sorted(
+                            (str(key), repr(value))
+                            for key, value in annotation.items()
+                        )
+                    )
+                )
+            t_size = 0 if self._t is None else int(np.asarray(self._t).reshape(-1).size)
+            return (
+                bool(self._show_intervention_annotations),
+                bool(self._parametric_mode),
+                str(self._x_axis_name or ""),
+                t_size,
+                tuple(annotation_parts),
+            )
 
         def _refresh_view_after_plot_update(self) -> None:
             """Keep auto-range truthful across live result updates without overriding manual ranges."""
@@ -2243,7 +2652,7 @@ if PYQTGRAPH_AVAILABLE:
             for entry in list(self._simulation_overlays or []):
                 if not isinstance(entry, dict):
                     continue
-                if str(entry.get("curve_role") or "") == "canonical_ghost":
+                if self._is_reference_layer(entry) and not self._show_reference_lines:
                     continue
                 block_label = self._overlay_copy_block_label(entry)
                 overlay_series_map = entry.get("series") or {}
@@ -2549,6 +2958,8 @@ if PYQTGRAPH_AVAILABLE:
             self._guide_items = []
             self._scalar_values = {}
             self._simulation_set_label = None
+            self._simulation_set_id = None
+            self._simulation_layer_id = None
             self._simulation_set_popup_label = None
             self._simulation_overlays = []
 
@@ -2586,12 +2997,12 @@ if PYQTGRAPH_AVAILABLE:
 
             menu.addSeparator()
 
-            if self._enable_canonical_ghost_toggle_action:
+            if self._enable_reference_layer_toggle_action:
                 ghost_action = menu.addAction("Show Canonical Reference Lines")
                 ghost_action.setCheckable(True)
-                ghost_action.setChecked(self._show_canonical_ghost_lines)
-                ghost_action.setEnabled(self._has_canonical_ghost_overlays())
-                ghost_action.toggled.connect(self._set_canonical_ghost_lines_visible)
+                ghost_action.setChecked(self._show_reference_lines)
+                ghost_action.setEnabled(self._has_reference_layers())
+                ghost_action.toggled.connect(self._set_reference_lines_visible)
                 menu.addSeparator()
 
             # Axis range actions
@@ -2648,20 +3059,26 @@ if PYQTGRAPH_AVAILABLE:
             # Show menu at cursor position
             menu.exec_(self._plot_widget.mapToGlobal(position))
 
-        def _has_canonical_ghost_overlays(self) -> bool:
+        def _has_reference_layers(self) -> bool:
             for entry in (self._simulation_overlays or []):
                 if not isinstance(entry, dict):
                     continue
-                if str(entry.get("curve_role") or "").strip() == "canonical_ghost":
+                if self._is_reference_layer(entry):
                     return True
             return False
 
-        def _set_canonical_ghost_lines_visible(self, visible: bool) -> None:
+        def _set_reference_lines_visible(self, visible: bool) -> None:
             show = bool(visible)
-            if self._show_canonical_ghost_lines == show:
+            if self._show_reference_lines == show:
                 return
-            self._show_canonical_ghost_lines = show
+            self._show_reference_lines = show
             self._update_plot()
+            current = str(
+                self._stats_result_selector.currentData()
+                or self._stats_result_selector.currentText()
+                or ""
+            )
+            self.set_statistics_results(dict(self._stats_results_map or {}), prefer=current)
 
         def _apply_axis_inversion_state(self) -> None:
             viewbox = self._plot_item.getViewBox()
@@ -2853,13 +3270,13 @@ else:
             embed_analysis_tabs: bool = True,
             workspace_splitter_object_name: Optional[str] = None,
             enable_axis_inversion_actions: bool = False,
-            enable_canonical_ghost_toggle_action: bool = False,
+            enable_reference_layer_toggle_action: bool = False,
             enable_copy_visible_data_action: bool = False,
         ):
             super().__init__(parent)
             _ = workspace_splitter_object_name
             _ = enable_axis_inversion_actions
-            _ = enable_canonical_ghost_toggle_action
+            _ = enable_reference_layer_toggle_action
             _ = enable_copy_visible_data_action
             layout = QtWidgets.QVBoxLayout(self)
             layout.addWidget(make_pyqtgraph_fallback_widget(self))
@@ -2867,7 +3284,7 @@ else:
             self._details_tabs = None
             self._analysis_tabs_detached = not bool(embed_analysis_tabs)
 
-        def set_data(self, t, series):
+        def set_data(self, t, series, **_kwargs):
             """Stub method."""
             pass
 

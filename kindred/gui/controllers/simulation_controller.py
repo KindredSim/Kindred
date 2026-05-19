@@ -1326,7 +1326,6 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int],
         slider_triggered: bool = True,
         valid_set_ids: Optional[Sequence[str]] = None,
-        allow_fallback: bool = True,
     ) -> None:
         self._queue_slider_plot_update(
             set_id=set_id,
@@ -1335,7 +1334,6 @@ class SimulationController(QtCore.QObject):
             run_id=run_id,
             slider_triggered=slider_triggered,
             valid_set_ids=valid_set_ids,
-            allow_fallback=allow_fallback,
         )
 
     def next_sim_request_id(self) -> int:
@@ -2512,9 +2510,7 @@ class SimulationController(QtCore.QObject):
             self._close_contained_simulation_owner(fast_mode=True, kill=True)
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
-        clear_preview = getattr(self._batch_cache, "clear_active_preview_selection_state", None)
-        if callable(clear_preview):
-            clear_preview()
+        self.ui.batch.clear_active_preview_selection_state()
         state = self._batch_context_owner.active_batch_state()
         if state is not None and state.active and state.parallel and state.fast_mode:
             self._supersede_parallel_batch_run_soft()
@@ -2642,7 +2638,6 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int],
         slider_triggered: bool = True,
         valid_set_ids: Optional[Sequence[str]] = None,
-        allow_fallback: bool = True,
     ) -> None:
         preview_ownership = self._preview_ownership
         request_accepted = (
@@ -2664,7 +2659,6 @@ class SimulationController(QtCore.QObject):
             ),
             slider_triggered=slider_triggered,
             valid_set_ids=valid_set_ids,
-            allow_fallback=allow_fallback,
             active_run_id=int(self._active_run_id),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
@@ -2686,7 +2680,6 @@ class SimulationController(QtCore.QObject):
         pending_preview_request_id = pending.accepted_preview_request_id
         pending_preview_owner_epoch = pending.accepted_preview_owner_epoch
         pending_valid_set_ids = pending.valid_set_ids
-        pending_allow_fallback = bool(pending.allow_fallback)
 
         cache_key = str(cache_key or pending_cache_key or "")
         request_id = pending_request_id if request_id is None else request_id
@@ -2736,22 +2729,36 @@ class SimulationController(QtCore.QObject):
         if current_row is not None:
             prefer = self.ui.batch.batch_set_id_for_row(int(current_row))
 
-        displayed = self.ui.batch.display_cached_batch_selection(
-            cache_key=str(cache_key),
-            selected_sets=selected_sets,
-            prefer_set=prefer,
-            cache_store=cache_store,
-            valid_set_ids=pending_valid_set_ids,
-            allow_fallback=pending_allow_fallback,
-        )
+        if pending_cache_kind == "preview":
+            display_outcome = self.ui.results.refresh_display_from_focus_and_shown()
+            if display_outcome.focused_controls_use_workspace is not None:
+                try:
+                    self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
+                        use_workspace=bool(display_outcome.focused_controls_use_workspace)
+                    )
+                except Exception as exc:
+                    self._record_nonfatal_exception(
+                        "Failed to resync focused mechanism controls after preview display refresh",
+                        exc,
+                    )
+        else:
+            display_outcome = self.ui.results.publish_cached_batch_selection(
+                cache_key=str(cache_key),
+                selected_sets=selected_sets,
+                prefer_set=prefer,
+                cache_store=cache_store,
+                valid_set_ids=pending_valid_set_ids,
+            )
+        displayed = bool(display_outcome.displayed)
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
-                "BATCH_PAR plot flush run_id=%s request_id=%s changed_sets=%s forced=%s displayed=%s ts=%.6f",
+                "BATCH_PAR plot flush run_id=%s request_id=%s changed_sets=%s forced=%s displayed=%s reason=%s ts=%.6f",
                 int(run_id or 0),
                 int(request_id or 0),
                 int(len(pending_set_ids)),
                 bool(force),
                 bool(displayed),
+                str(display_outcome.reason or ""),
                 float(perf_counter()),
             )
         return bool(displayed)
@@ -3080,13 +3087,12 @@ class SimulationController(QtCore.QObject):
         self._continue_or_finish_serial_batch_after_stale_runtime_input(updated)
         return True
 
-    def _finalize_scoped_batch_success_subset(self, ctx: Mapping[str, Any]) -> tuple[str, ...]:
+    def _finalize_scoped_batch_success_subset(self, ctx: Mapping[str, Any]) -> bool:
         if not isinstance(ctx, Mapping):
-            return ()
+            return True
         policy_context = self._batch_context_owner.completion_policy_context(ctx)
         if policy_context is None:
-            return ()
-        eligible_reset_set_ids = tuple(policy_context.pending_workspace_reset_set_ids)
+            return True
         ctx = self._finalize_explicit_batch_dirty_reset(
             ctx,
             species_names=self._current_mechanism_species_for_batch_sync(),
@@ -3098,7 +3104,12 @@ class SimulationController(QtCore.QObject):
             request_id=flush_context.request_id,
             run_id=flush_context.run_id,
         )
-        return tuple(eligible_reset_set_ids)
+        coverage = self._batch_context_owner.completed_run_display_coverage(ctx)
+        if coverage.transaction is not None:
+            outcome = self.ui.results.publish_completed_run_display_transaction(coverage.transaction)
+            return bool(getattr(outcome, "displayed", False))
+        summary = self._batch_context_owner.completion_summary(ctx)
+        return not bool(summary.has_truthful_success)
 
     def _try_handle_scoped_batch_failure(
         self,
@@ -3239,11 +3250,11 @@ class SimulationController(QtCore.QObject):
     # ------------------------------------------------------------------
     def _slider_target_rows_for_dispatch(
         self,
-        fallback_rows: Sequence[int],
+        candidate_rows: Sequence[int],
         *,
         target_set_ids: Optional[Sequence[str]] = None,
     ) -> list[int]:
-        _ = fallback_rows
+        _ = candidate_rows
         snapshot_set_ids = [str(set_id) for set_id in (target_set_ids or ()) if str(set_id)]
         if not snapshot_set_ids:
             return []

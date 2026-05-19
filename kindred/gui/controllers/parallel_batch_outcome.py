@@ -194,7 +194,7 @@ class ParallelBatchOutcomeOwner:
             return True
 
         ctx = self._batch_context_owner.deactivate()
-        self._deps.finalize_scoped_batch_success_subset(ctx)
+        display_finalized = bool(self._deps.finalize_scoped_batch_success_subset(ctx))
         self._deps.cleanup_parallel_batch_lane_pool_after_run(
             keep_lane_pool_alive=False,
             clear_pending_plot_updates=False,
@@ -205,6 +205,10 @@ class ParallelBatchOutcomeOwner:
         self._ui.run_ui.set_sim_progress_value(100)
         self._ui.run_ui.set_run_button_enabled(True)
         self._ui.run_ui.set_stop_button_enabled(False)
+        if not display_finalized:
+            self._ui.run_ui.set_status_text("Display failed")
+            self._deps.apply_explicit_failure_pending_replay_policy(fast_mode=False)
+            return True
         failed_count = self._batch_context_owner.scoped_failure_cache_state().failed_count
         self._ui.run_ui.set_status_text(f"Batch completed with {failed_count} failed set(s)")
         summary = self._batch_context_owner.completion_summary(ctx)
