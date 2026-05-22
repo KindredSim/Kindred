@@ -28,13 +28,12 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 from kindred.core.fitting_evaluation import SerialFittingEvaluator, coerce_fitting_series_evaluator
 from kindred.core.simulation_series_payload import coerce_simulation_series_payload
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
-from kindred.core.api.fitting import fit_global
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.gui.fitting.constants import FITTING_DEFAULT_SOLVER
 
 if TYPE_CHECKING:
-    from kindred.core.api.fitting import GlobalFitResult
+    from kindred.core.analysis.global_fit_execution import GlobalFitResult
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "GlobalFitWorker",
-    "fit_global",
 ]
 
 
@@ -147,7 +145,11 @@ class GlobalFitWorker(QtCore.QThread):
         self._fit_runtime_max_lanes = None if fit_runtime_max_lanes is None else max(1, int(fit_runtime_max_lanes))
         self._fit_runtime_ledger = fit_runtime_ledger
         self._fit_runtime_best_evaluator = None
-        self._fit_func = fit_func or fit_global
+        if fit_func is None:
+            from kindred.core.analysis.global_fitting import fit_global as default_fit_global
+
+            fit_func = default_fit_global
+        self._fit_func = fit_func
         solver_label = str(solver or FITTING_DEFAULT_SOLVER).strip() or FITTING_DEFAULT_SOLVER
         solver_method, _solver_warning = normalize_solver_name(solver_label)
         self._solver = str(solver_method)

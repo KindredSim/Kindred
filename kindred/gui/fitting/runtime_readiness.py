@@ -181,6 +181,8 @@ class FittingRuntimePreparationWorker:
         stamp_hash: str,
         lane_count: int,
         finished_callback: Callable[[], None],
+        session_created_callback: Optional[Callable[[FittingRuntimeSession], None]] = None,
+        session_closed_callback: Optional[Callable[[FittingRuntimeSession], None]] = None,
     ) -> None:
         self._identity = identity
         self._session_factory = session_factory
@@ -193,7 +195,10 @@ class FittingRuntimePreparationWorker:
         self._status = ""
         self._error: Optional[BaseException] = None
         self._session_created = False
+        self._session_closed_by_cancel = False
         self._finished_callback = finished_callback
+        self._session_created_callback = session_created_callback
+        self._session_closed_callback = session_closed_callback
         self._thread = threading.Thread(
             target=self._run,
             name="kindred-fitting-runtime-prepare",
@@ -225,6 +230,10 @@ class FittingRuntimePreparationWorker:
     def session_created(self) -> bool:
         return bool(self._session_created)
 
+    @property
+    def session_closed_by_cancel(self) -> bool:
+        return bool(self._session_closed_by_cancel)
+
     def start(self) -> None:
         self._thread.start()
 
@@ -237,9 +246,20 @@ class FittingRuntimePreparationWorker:
             session = self._session
         if session is not None:
             try:
-                session.cancel_run()
+                session.close(kill=True)
             except Exception as exc:
                 logger.debug("Failed to cancel fitting runtime preparation: %s", exc, exc_info=True)
+            else:
+                callback = self._session_closed_callback
+                if callback is not None:
+                    try:
+                        callback(session)
+                    except Exception as exc:
+                        logger.debug("Failed to record fitting runtime preparation cleanup: %s", exc, exc_info=True)
+                with self._lock:
+                    if self._session is session:
+                        self._session = None
+                        self._session_closed_by_cancel = True
 
     def _cancel_requested(self) -> bool:
         return bool(self._cancelled.is_set())
@@ -271,6 +291,11 @@ class FittingRuntimePreparationWorker:
                 if bool(session_required)
                 else None
             )
+            if session is not None and self._session_created_callback is not None:
+                try:
+                    self._session_created_callback(session)
+                except Exception as exc:
+                    logger.debug("Failed to record fitting runtime preparation session: %s", exc, exc_info=True)
             with self._lock:
                 self._session = session
                 self._session_created = session is not None
@@ -319,6 +344,8 @@ class FittingRuntimeReadinessController:
         self._active_session: Optional[FittingRuntimeSession] = None
         self._ready_identity: Optional[FittingRuntimeIdentity] = None
         self._ready_session: Optional[FittingRuntimeSession] = None
+        self._owned_sessions: dict[int, FittingRuntimeSession] = {}
+        self._owned_sessions_lock = threading.RLock()
         self._worker: Optional[FittingRuntimePreparationWorker] = None
         self._error: Optional[BaseException] = None
 
@@ -444,6 +471,10 @@ class FittingRuntimeReadinessController:
     def cancel(self, *, kill: bool = True) -> bool:
         self._desired_identity = None
         if self._worker is None:
+            self._close_ready_session(kill=kill)
+            self._close_owned_sessions(kill=kill)
+            if self._state is not FittingRuntimeReadinessState.CLOSED:
+                self._state = FittingRuntimeReadinessState.EMPTY
             return True
         self._cancel_active_preparation()
         if self._worker is not None and kill:
@@ -463,9 +494,11 @@ class FittingRuntimeReadinessController:
             self._ledger.close_deferred += 1
             self._cancel_active_preparation()
             if self._worker is None and self._state is FittingRuntimeReadinessState.CLOSED:
+                self._close_owned_sessions(kill=kill)
                 return True
             return False
         self._close_ready_session(kill=kill)
+        self._close_owned_sessions(kill=kill)
         self._state = FittingRuntimeReadinessState.CLOSED
         self._ledger.close_completed += 1
         return True
@@ -485,6 +518,8 @@ class FittingRuntimeReadinessController:
         status = worker.status
         if worker.session_created:
             self._ledger.session_creations += 1
+        if worker.session_closed_by_cancel:
+            self._ledger.session_closes += 1
         if (
             status == "prepared"
             and active_identity is not None
@@ -512,6 +547,7 @@ class FittingRuntimeReadinessController:
             self._error = None
             self._desired_identity = None
             self._close_ready_session(kill=True)
+            self._close_owned_sessions(kill=True)
             self._state = FittingRuntimeReadinessState.CLOSED
             self._ledger.close_completed += 1
             return True
@@ -528,7 +564,7 @@ class FittingRuntimeReadinessController:
         if self._desired_identity is not None:
             self._start_preparation(self._desired_identity)
             return True
-        if status != "error":
+        if status != "error" and self._state is not FittingRuntimeReadinessState.BLOCKED:
             self._state = FittingRuntimeReadinessState.EMPTY
         return True
 
@@ -539,6 +575,8 @@ class FittingRuntimeReadinessController:
             stamp_hash=identity.stamp_hash,
             lane_count=int(identity.lane_count),
             finished_callback=self._finished_callback,
+            session_created_callback=self._register_owned_session,
+            session_closed_callback=self._unregister_owned_session,
         )
         self._active_identity = identity
         self._active_session = None
@@ -572,6 +610,25 @@ class FittingRuntimeReadinessController:
             logger.debug("Failed to close fitting runtime session: %s", exc, exc_info=True)
         else:
             self._ledger.session_closes += 1
+            self._unregister_owned_session(session)
+
+    def _register_owned_session(self, session: FittingRuntimeSession) -> None:
+        if session is None:
+            return
+        with self._owned_sessions_lock:
+            self._owned_sessions[id(session)] = session
+
+    def _unregister_owned_session(self, session: FittingRuntimeSession) -> None:
+        if session is None:
+            return
+        with self._owned_sessions_lock:
+            self._owned_sessions.pop(id(session), None)
+
+    def _close_owned_sessions(self, *, kill: bool) -> None:
+        with self._owned_sessions_lock:
+            sessions = list(self._owned_sessions.values())
+        for session in sessions:
+            self._close_session(session, kill=kill)
 
     @staticmethod
     def _worker_running(worker: FittingRuntimePreparationWorker) -> bool:
@@ -626,11 +683,6 @@ class FittingRuntimeReadinessController:
         stamp = finalize_global_fit_run_stamp_prepared_simulation(identity.stamp, prepared_simulation)
         stamp_hash = hash_global_fit_run_stamp(stamp)
         launch_request_hash = str(identity.launch_request_hash or identity.stamp_hash or "")
-        if (
-            prepared_simulation.symbolic_jacobian_identity
-            or prepared_simulation.symbolic_wegscheider_identity
-        ):
-            launch_request_hash = str(stamp_hash)
         return replace(
             identity,
             stamp=stamp,

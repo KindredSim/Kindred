@@ -336,7 +336,8 @@ class WarmFittingEvaluatorLane:
                 continue
             try:
                 owned_queue.close()
-            except (OSError, ValueError):
+                owned_queue.join_thread()
+            except (OSError, ValueError, AttributeError):
                 pass
 
     def _ensure_started(self, *, cancellation_check: Optional[Callable[[], bool]]) -> None:

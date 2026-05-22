@@ -17,9 +17,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 if TYPE_CHECKING:
-    from kindred.core.api.fitting import GlobalFitResult
+    from kindred.core.analysis.global_fit_execution import GlobalFitResult
 
-from kindred.core.api.fitting import fit_global
 from kindred.core.api.simulation import (
     SimulationBuilder,
     SimulationBuilderContractError,
@@ -105,7 +104,6 @@ __all__ = [
     "DEFAULT_PARALLEL_STARTS",
     "FittingWindow",
     "GlobalFitWorker",
-    "fit_global",
     "validate_de_bounds",
 ]
 
@@ -302,6 +300,10 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._mode = normalized_mode
         self._dataset_manager = dataset_manager
+        if fit_func is None:
+            from kindred.core.analysis.global_fitting import fit_global as default_fit_global
+
+            fit_func = default_fit_global
         self._fit_func = fit_func
         self._mechanism_species = [str(x) for x in (mechanism_species or []) if str(x).strip()]
         self._mechanism_text_getter = mechanism_text_getter
@@ -2728,7 +2730,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _discard_fit_runtime_session(self, *, kill: bool = False) -> None:
         self._fit_runtime_readiness.cancel(kill=bool(kill))
-        self._fit_runtime_readiness.close_ready_session(kill=bool(kill))
 
     def _set_fit_controls_locked(self, locked: bool) -> None:
         running = bool(locked)
