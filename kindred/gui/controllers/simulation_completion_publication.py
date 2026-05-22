@@ -1,17 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from time import perf_counter
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
+import numpy as np
 from PySide6 import QtCore
 
 from kindred.gui.controllers.simulation_completion_policy import CacheAuthorityState, CompletionPolicyContext
 from kindred.gui.ports import (
     CompletedRunDisplayCoverage,
+    CompletedRunDisplayIntent,
     CompletedRunDisplayTransaction,
     CompletionDisplayEntry,
+    DisplayStatus,
+    DisplayTransitionCause,
+    DisplayTransitionOutcome,
+    DisplayTransitionOutcomeKind,
+    FreshPreviewDisplayEntry,
     SimulationCompletionDisplayOutcome,
 )
 
@@ -69,6 +76,7 @@ class SimulationCompletionPublicationDependencies:
     show_scoped_batch_failure_summary: Callable[..., None]
     has_deferred_preview_replay_intent: Callable[[], bool]
     start_next_batch_simulation: Callable[[], None]
+    clear_pending_progress_status: Callable[[], None] = lambda: None
 
 
 class SimulationCompletionPublicationOwner:
@@ -123,9 +131,6 @@ class SimulationCompletionPublicationOwner:
             self.apply_pending_init(completion, state)
             display_outcome = self.publish_display(completion, state)
             if self._non_displayed_outcome_is_terminal(display_outcome, state):
-                self._deps.apply_lifecycle_effects(
-                    self._lifecycle_effect_owner.progress_update(status_text="Display failed")
-                )
                 if isinstance(state.ctx, Mapping):
                     state.ctx = self._batch_context_owner.deactivate_if_active(state.ctx)
                 state.batch_queue_done = True
@@ -139,16 +144,17 @@ class SimulationCompletionPublicationOwner:
             )
             state.batch_queue_done = self.advance_batch_success(completion, state)
             if state.batch_queue_done:
-                self.finalize_success(completion, state)
+                self.finalize_success(completion, state, display_outcome=display_outcome)
         except Exception as exc:
             logger.error("Error displaying results: %s", exc, exc_info=True)
             self._ui.dialogs.message_box_critical(
                 "Display Error",
                 f"Failed to display results:\n\n{exc}",
             )
-            self._deps.apply_lifecycle_effects(
-                self._lifecycle_effect_owner.progress_update(status_text="Display failed")
-            )
+            if self._display_exception_requires_terminal_cleanup(state):
+                if isinstance(state.ctx, Mapping):
+                    state.ctx = self._batch_context_owner.deactivate_if_active(state.ctx)
+                state.batch_queue_done = True
         finally:
             if state.batch_queue_done:
                 self.apply_final_effects(state)
@@ -202,7 +208,7 @@ class SimulationCompletionPublicationOwner:
         completion.mechanism = self._result_materialization_owner.resolve_completion_mechanism(
             mechanism=completion.mechanism,
             mechanism_text=completion.mechanism_text,
-            solver_config=completion.solver_config,
+            solver_config=self._mechanism_resolution_solver_config(completion),
             is_preview=bool(state.is_preview),
             is_primary=bool(completion.is_primary),
         )
@@ -259,7 +265,7 @@ class SimulationCompletionPublicationOwner:
         self._cache_admin.publish_completion_cache_truth(
             is_preview=False,
             cache_key=state.cache_key,
-            clear_active_selection_state=cache_reconciliation.clear_active_selection_state,
+            clear_active_cache_identity_state=cache_reconciliation.clear_active_cache_identity_state,
             active_cache_key=cache_reconciliation.active_cache_key,
             active_cache_preview_token=cache_reconciliation.active_cache_preview_token,
             active_cache_preview_scope_set_ids=cache_reconciliation.active_cache_preview_scope_set_ids,
@@ -327,6 +333,12 @@ class SimulationCompletionPublicationOwner:
         cache_preview_token = None
         if state.is_preview:
             cache_preview_token = state.preview_batch_cache_token
+        owned_species = ()
+        if isinstance(state.ctx, Mapping):
+            owned_species = self._batch_context_owner.launch_owned_species_for_computed_result(
+                state.ctx,
+                set_id=state.batch_set_id,
+            )
         self._cache_admin.publish_completion_cache(
             cache_key=cache_token,
             cache_token=cache_token,
@@ -349,6 +361,7 @@ class SimulationCompletionPublicationOwner:
                 if isinstance(warning, Mapping)
             ],
             completion_provenance=self.direct_completion_provenance_payload(completion),
+            owned_species=owned_species,
         )
 
     def apply_pending_init(
@@ -394,11 +407,33 @@ class SimulationCompletionPublicationOwner:
     ) -> None:
         if state.is_preview or not state.cache_key or not isinstance(state.ctx, Mapping):
             return
+        owned_species = self._batch_context_owner.launch_owned_species_for_computed_result(
+            state.ctx,
+            set_id=state.batch_set_id,
+        )
+        if not owned_species:
+            state.ctx = self._batch_context_owner.record_completion_display_unavailable(
+                state.ctx,
+                set_id=state.batch_set_id,
+                cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+            )
+            return
+        semantic_series = self._semantic_display_series_from_owned_rows(
+            completion,
+            owned_species=owned_species,
+        )
+        if semantic_series is None:
+            state.ctx = self._batch_context_owner.record_completion_display_unavailable(
+                state.ctx,
+                set_id=state.batch_set_id,
+                cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+            )
+            return
         entry = CompletionDisplayEntry(
             set_id=str(state.batch_set_id or ""),
             label=str(state.batch_set or state.batch_set_id or ""),
             t=completion.t,
-            series=completion.series,
+            series=semantic_series,
             algebra_scalars=dict(completion.algebra_scalars),
             solver_provenance=completion.solver_provenance,
             mechanism_text=str(completion.mechanism_text or ""),
@@ -409,12 +444,173 @@ class SimulationCompletionPublicationOwner:
                 if isinstance(warning, Mapping)
             ),
             completion_provenance=self.direct_completion_provenance_payload(completion),
+            owned_species=owned_species,
         )
         state.ctx = self._batch_context_owner.record_completion_display_entry(
             state.ctx,
             set_id=state.batch_set_id,
             label=state.batch_set,
             entry=entry,
+        )
+
+    @staticmethod
+    def _semantic_display_series_from_owned_rows(
+        completion: CompletionResultState,
+        *,
+        owned_species: Sequence[str],
+    ) -> Optional[Dict[str, Any]]:
+        owned = tuple(str(name) for name in owned_species if str(name))
+        if not owned:
+            return None
+        raw_series = completion.series if isinstance(completion.series, Mapping) else {}
+        if not raw_series:
+            return None
+        semantic_series: Dict[str, Any] = {}
+        for species_name in owned:
+            if species_name not in raw_series:
+                return None
+            try:
+                semantic_series[species_name] = np.asarray(raw_series[species_name], dtype=float).copy()
+            except Exception:
+                return None
+        return semantic_series or None
+
+    def _fresh_preview_display_entry(
+        self,
+        completion: CompletionResultState,
+        state: CompletionCallbackState,
+    ) -> Optional[FreshPreviewDisplayEntry]:
+        if not (state.cache_key and state.slider_triggered and state.is_preview):
+            return None
+        set_id = str(state.batch_set_id or "").strip()
+        if not set_id:
+            return None
+        workspace_provenance: Mapping[str, Any] | None = None
+        try:
+            candidate = self._ui.batch.current_workspace_preview_identity_payload(set_id=set_id)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, Mapping):
+            workspace_provenance = dict(candidate)
+        available_series = {str(name) for name in dict(completion.series or {}) if str(name)}
+        owned_species = tuple(
+            str(name)
+            for name in (completion.species_names or ())
+            if str(name) and (not available_series or str(name) in available_series)
+        )
+        return FreshPreviewDisplayEntry(
+            set_id=set_id,
+            label=str(state.batch_set or set_id),
+            t=completion.t,
+            series=dict(completion.series or {}),
+            algebra_scalars=dict(completion.algebra_scalars or {}),
+            solver_provenance=completion.solver_provenance,
+            completion_provenance=self.direct_completion_provenance_payload(completion),
+            owned_species=owned_species,
+            workspace_preview_provenance=workspace_provenance,
+        )
+
+    def _deferred_display_outcome(
+        self,
+        coverage: CompletedRunDisplayCoverage | None = None,
+    ) -> SimulationCompletionDisplayOutcome:
+        if coverage is None:
+            return self._ui.results.publish_deferred_display_request()
+        return self._ui.results.publish_deferred_display_request(
+            affected_set_ids=self._completed_run_coverage_affected_set_ids(coverage),
+            requested_show_set_ids=(
+                tuple(str(set_id) for set_id in coverage.intent.requested_show_set_ids if str(set_id))
+                if coverage.intent is not None
+                else ()
+            ),
+            requested_labels_by_set_id=(
+                {
+                    str(set_id): str(label)
+                    for set_id, label in dict(coverage.intent.labels_by_set_id or {}).items()
+                    if str(set_id)
+                }
+                if coverage.intent is not None
+                else {}
+            ),
+            unresolved_intent_set_ids=tuple(
+                str(set_id) for set_id in coverage.unresolved_intent_set_ids if str(set_id)
+            ),
+            missing_intent_set_ids=tuple(
+                str(set_id) for set_id in coverage.missing_set_ids if str(set_id)
+            ),
+            failed_intent_set_ids=tuple(
+                str(set_id) for set_id in coverage.failed_intent_set_ids if str(set_id)
+            ),
+            semantic_unavailable_set_ids=tuple(
+                str(set_id) for set_id in coverage.semantic_unavailable_set_ids if str(set_id)
+            ),
+        )
+
+    @staticmethod
+    def _completed_run_coverage_affected_set_ids(
+        coverage: CompletedRunDisplayCoverage | None,
+    ) -> tuple[str, ...]:
+        if coverage is None:
+            return ()
+        for values in (
+            coverage.unresolved_intent_set_ids,
+            coverage.unavailable_set_ids,
+            coverage.missing_set_ids,
+        ):
+            affected = tuple(str(set_id) for set_id in (values or ()) if str(set_id))
+            if affected:
+                return affected
+        intent = coverage.intent
+        if intent is not None:
+            return tuple(str(set_id) for set_id in (intent.requested_show_set_ids or ()) if str(set_id))
+        return ()
+
+    def _completed_run_unavailable_outcome(
+        self,
+        coverage: CompletedRunDisplayCoverage | None,
+    ) -> SimulationCompletionDisplayOutcome:
+        cause = (
+            coverage.cause
+            if coverage is not None and isinstance(coverage.cause, DisplayTransitionCause)
+            else DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
+        )
+        return self.publish_completed_run_display_unavailable(
+            cause=cause,
+            affected_set_ids=self._completed_run_coverage_affected_set_ids(coverage),
+            requested_show_set_ids=(
+                tuple(str(set_id) for set_id in coverage.intent.requested_show_set_ids if str(set_id))
+                if coverage is not None and coverage.intent is not None
+                else ()
+            ),
+            requested_labels_by_set_id=(
+                {
+                    str(set_id): str(label)
+                    for set_id, label in dict(coverage.intent.labels_by_set_id or {}).items()
+                    if str(set_id)
+                }
+                if coverage is not None and coverage.intent is not None
+                else {}
+            ),
+            unresolved_intent_set_ids=(
+                tuple(str(set_id) for set_id in coverage.unresolved_intent_set_ids if str(set_id))
+                if coverage is not None
+                else ()
+            ),
+            missing_intent_set_ids=(
+                tuple(str(set_id) for set_id in coverage.missing_set_ids if str(set_id))
+                if coverage is not None
+                else ()
+            ),
+            failed_intent_set_ids=(
+                tuple(str(set_id) for set_id in coverage.failed_intent_set_ids if str(set_id))
+                if coverage is not None
+                else ()
+            ),
+            semantic_unavailable_set_ids=(
+                tuple(str(set_id) for set_id in coverage.semantic_unavailable_set_ids if str(set_id))
+                if coverage is not None
+                else ()
+            ),
         )
 
     def publish_display(
@@ -425,7 +621,7 @@ class SimulationCompletionPublicationOwner:
         requires_completed_run_transaction = self._requires_completed_run_display_transaction(state)
         completed_run_coverage = self._completed_run_display_coverage(state)
         completed_run_transaction = completed_run_coverage.transaction if completed_run_coverage is not None else None
-        if state.cache_key and state.slider_triggered:
+        if state.cache_key and state.slider_triggered and not requires_completed_run_transaction:
             self._deps.queue_slider_plot_update(
                 set_id=state.batch_set_id,
                 cache_key=str(state.cache_key),
@@ -433,62 +629,66 @@ class SimulationCompletionPublicationOwner:
                 run_id=state.run_id,
                 slider_triggered=bool(state.slider_triggered),
                 valid_set_ids=None,
+                fresh_preview_entry=self._fresh_preview_display_entry(completion, state),
             )
-            return SimulationCompletionDisplayOutcome(False, reason="queued_display")
-        if self._should_defer_in_progress_batch_display(state):
-            return SimulationCompletionDisplayOutcome(False, reason="queued_display")
+            return self._deferred_display_outcome()
 
         if completed_run_transaction is not None:
-            return self._publish_completed_run_display_transaction(completed_run_transaction)
+            return self.publish_completed_run_display_transaction(completed_run_transaction)
+        defer_in_progress = self._should_defer_in_progress_batch_display(state)
+        if defer_in_progress:
+            return self._deferred_display_outcome(completed_run_coverage)
         if requires_completed_run_transaction:
-            return SimulationCompletionDisplayOutcome(
-                False,
-                direct_completion_displayed=False,
-                reason="in_flight_completion_coverage_unavailable",
-            )
+            return self._completed_run_unavailable_outcome(completed_run_coverage)
 
-        owned_species = None
-        if completion.mechanism is not None:
-            try:
-                owned_species = list(completion.mechanism.species_names())
-            except Exception:
-                owned_species = None
-        outcome = self._ui.results.publish_simulation_completion_result(
+        outcome = self._ui.results.publish_direct_completion_result(
             t=completion.t,
             series=completion.series,
-            cache_key=state.cache_key,
             batch_set=state.batch_set,
             batch_set_id=state.batch_set_id,
-            redraw_valid_set_ids=completion.redraw_valid_set_ids,
-            has_redraw_subset=completion.has_redraw_subset,
-            slider_triggered=bool(state.slider_triggered),
-            explicit_batch_coalescing=bool(state.explicit_batch_coalescing),
             algebra_scalars=completion.algebra_scalars,
             solver_provenance=completion.solver_provenance,
             direct_completion_provenance=self.direct_completion_provenance_payload(completion),
-            owned_species=owned_species,
         )
         if isinstance(outcome, SimulationCompletionDisplayOutcome):
             return outcome
-        return SimulationCompletionDisplayOutcome(
-            False,
-            direct_completion_displayed=False,
-            reason="invalid_display_outcome",
-        )
+        raise RuntimeError("ResultsController returned an invalid direct display outcome")
 
     def _non_displayed_outcome_is_terminal(
         self,
         display_outcome: SimulationCompletionDisplayOutcome,
         state: CompletionCallbackState,
     ) -> bool:
-        if display_outcome.displayed:
-            return False
-        reason = str(display_outcome.reason or "")
-        if reason == "queued_display":
-            return False
-        if state.cache_key and reason in {"no_cached_results", "invalid_cache_entry"}:
-            return False
+        transition_outcome = display_outcome.transition_outcome
+        if isinstance(transition_outcome, DisplayTransitionOutcome):
+            if transition_outcome.kind is DisplayTransitionOutcomeKind.PUBLISHED:
+                return False
+            if transition_outcome.kind is DisplayTransitionOutcomeKind.DEFERRED:
+                return False
+            if (
+                transition_outcome.cause
+                is DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE
+            ):
+                return False
+            if transition_outcome.display_status in {
+                DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
+            }:
+                return False
+            if state.cache_key and transition_outcome.cause in {
+                DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE,
+                DisplayTransitionCause.INVALID_CACHE_ENTRY,
+            }:
+                return False
+            return True
         return True
+
+    def _display_exception_requires_terminal_cleanup(self, state: CompletionCallbackState) -> bool:
+        if state.cache_key and state.slider_triggered:
+            return False
+        try:
+            return not self._should_defer_in_progress_batch_display(state)
+        except Exception:
+            return True
 
     def _should_defer_in_progress_batch_display(self, state: CompletionCallbackState) -> bool:
         if (not state.cache_key) or state.is_preview or not isinstance(state.ctx, Mapping):
@@ -534,17 +734,43 @@ class SimulationCompletionPublicationOwner:
             return None
         return self._batch_context_owner.completed_run_display_coverage(state.ctx)
 
-    def _publish_completed_run_display_transaction(
+    def publish_completed_run_display_transaction(
         self,
         transaction: CompletedRunDisplayTransaction,
     ) -> SimulationCompletionDisplayOutcome:
         outcome = self._ui.results.publish_completed_run_display_transaction(transaction)
         if not isinstance(outcome, SimulationCompletionDisplayOutcome):
-            return SimulationCompletionDisplayOutcome(
-                False,
-                direct_completion_displayed=False,
-                reason="invalid_display_outcome",
-            )
+            raise RuntimeError("ResultsController returned an invalid completed-run display outcome")
+        return outcome
+
+    def publish_completed_run_display_unavailable(
+        self,
+        *,
+        cause: DisplayTransitionCause,
+        affected_set_ids: Sequence[str],
+        requested_show_set_ids: Sequence[str] | None = None,
+        requested_labels_by_set_id: Mapping[str, str] | None = None,
+        attempted_display_set_ids: Sequence[str] = (),
+        unresolved_intent_set_ids: Sequence[str] = (),
+        missing_intent_set_ids: Sequence[str] = (),
+        failed_intent_set_ids: Sequence[str] = (),
+        semantic_unavailable_set_ids: Sequence[str] = (),
+    ) -> SimulationCompletionDisplayOutcome:
+        if not isinstance(cause, DisplayTransitionCause):
+            raise TypeError("Completed-run display unavailable requires DisplayTransitionCause")
+        outcome = self._ui.results.publish_completed_run_display_unavailable(
+            cause=cause,
+            affected_set_ids=affected_set_ids,
+            requested_show_set_ids=requested_show_set_ids,
+            requested_labels_by_set_id=requested_labels_by_set_id,
+            attempted_display_set_ids=attempted_display_set_ids,
+            unresolved_intent_set_ids=unresolved_intent_set_ids,
+            missing_intent_set_ids=missing_intent_set_ids,
+            failed_intent_set_ids=failed_intent_set_ids,
+            semantic_unavailable_set_ids=semantic_unavailable_set_ids,
+        )
+        if not isinstance(outcome, SimulationCompletionDisplayOutcome):
+            raise RuntimeError("ResultsController returned an invalid unavailable display outcome")
         return outcome
 
     def direct_completion_provenance_payload(
@@ -624,6 +850,25 @@ class SimulationCompletionPublicationOwner:
             "solver_provenance": completion.solver_provenance,
             "warnings": completion.warnings,
         }
+
+    @staticmethod
+    def _mechanism_resolution_solver_config(
+        completion: CompletionResultState,
+    ) -> Mapping[str, Any]:
+        solver_config = dict(completion.solver_config or {})
+        if solver_config.get("temperature_K") is not None:
+            return solver_config
+        launch_provenance = (
+            completion.solver_provenance.get("launch_provenance")
+            if isinstance(completion.solver_provenance, Mapping)
+            else None
+        )
+        if not isinstance(launch_provenance, Mapping):
+            return solver_config
+        if launch_provenance.get("temperature_K") is None:
+            return solver_config
+        solver_config["temperature_K"] = launch_provenance["temperature_K"]
+        return solver_config
 
     def apply_pending_init_guard(
         self,
@@ -724,6 +969,8 @@ class SimulationCompletionPublicationOwner:
         self,
         completion: CompletionResultState,
         state: CompletionCallbackState,
+        *,
+        display_outcome: SimulationCompletionDisplayOutcome | None = None,
     ) -> None:
         if (not state.is_preview) and isinstance(state.ctx, dict):
             state.ctx = self._deps.finalize_explicit_batch_dirty_reset(
@@ -731,23 +978,32 @@ class SimulationCompletionPublicationOwner:
                 mechanism=completion.mechanism,
                 species_names=completion.species_names,
             )
-        if state.slider_triggered or state.explicit_batch_coalescing:
+        has_completed_run_display_intent = (
+            isinstance(state.ctx, Mapping)
+            and isinstance(
+                state.ctx.get("completed_run_display_intent"),
+                CompletedRunDisplayIntent,
+            )
+        )
+        if state.slider_triggered and (state.is_preview or not has_completed_run_display_intent):
             self._deps.flush_slider_plot_updates(
-                force=bool(state.explicit_batch_coalescing),
+                force=False,
                 cache_key=state.cache_key,
                 request_id=state.request_id,
                 run_id=state.run_id,
-            )
+        )
         summary = self._batch_context_owner.completion_summary(state.ctx) if isinstance(state.ctx, Mapping) else None
         failed_set_ids = summary.failed_set_ids if summary is not None else ()
-        self._deps.apply_lifecycle_effects(
-            self._lifecycle_effect_owner.completion_status_effect(
-                species_count=len(completion.species_names),
-                point_count=len(completion.t),
-                failed_set_ids=failed_set_ids,
-                is_preview=bool(state.is_preview),
-            )
+        completion_effect = self._lifecycle_effect_owner.completion_status_effect(
+            species_count=len(completion.species_names),
+            point_count=len(completion.t),
+            failed_set_ids=failed_set_ids,
+            is_preview=bool(state.is_preview),
         )
+        if isinstance(display_outcome.transition_outcome, DisplayTransitionOutcome):
+            self._deps.clear_pending_progress_status()
+            completion_effect = replace(completion_effect, status_text=None)
+        self._deps.apply_lifecycle_effects(completion_effect)
         if summary is not None and summary.failed_set_ids and not bool(state.is_preview):
             self._deps.show_scoped_batch_failure_summary(
                 failed_set_ids=summary.failed_set_ids,

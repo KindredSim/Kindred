@@ -44,6 +44,26 @@ class SimulationProvenanceOwner:
     def set_last_simulation_ctc(self, ctc: Dict[str, float]) -> None:
         self._last_simulation_ctc = {str(key): float(value) for key, value in (ctc or {}).items()}
 
+    def update_display_transaction_provenance(
+        self,
+        *,
+        display_transaction: Mapping[str, Any] | None,
+        display_sets: Sequence[Mapping[str, Any]] | None,
+    ) -> Dict[str, Any]:
+        provenance = dict(self._last_simulation_provenance or {})
+        if isinstance(display_transaction, Mapping):
+            provenance["display_transaction"] = dict(display_transaction)
+        else:
+            provenance.pop("display_transaction", None)
+        if display_sets:
+            provenance["display_sets"] = [
+                dict(item) for item in display_sets if isinstance(item, Mapping)
+            ]
+        else:
+            provenance.pop("display_sets", None)
+        self._last_simulation_provenance = provenance
+        return dict(provenance)
+
     def publish_simulation_completion_provenance(
         self,
         *,
@@ -63,6 +83,8 @@ class SimulationProvenanceOwner:
         series: Mapping[str, Any],
         algebra_scalars: Mapping[str, Any] | None = None,
         dataset_overlays: Any = None,
+        display_transaction: Mapping[str, Any] | None = None,
+        display_sets: Sequence[Mapping[str, Any]] | None = None,
         solver_provenance: Mapping[str, Any] | None = None,
         warnings: Sequence[Mapping[str, Any]] | None = None,
     ) -> Dict[str, Any]:
@@ -93,6 +115,12 @@ class SimulationProvenanceOwner:
             provenance["algebra_scalars"] = dict(algebra_scalars)
         if dataset_overlays is not None:
             provenance["dataset_overlays"] = dataset_overlays
+        if isinstance(display_transaction, Mapping):
+            provenance["display_transaction"] = dict(display_transaction)
+        if display_sets:
+            provenance["display_sets"] = [
+                dict(item) for item in display_sets if isinstance(item, Mapping)
+            ]
         if isinstance(solver_provenance, Mapping) and solver_provenance:
             provenance["solver_provenance"] = dict(solver_provenance)
             symbolic_identity = solver_provenance.get("symbolic_jacobian_identity")

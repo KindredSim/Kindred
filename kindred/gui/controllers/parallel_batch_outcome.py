@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from kindred.core.batch_containment import BatchCompletionRecord, BatchLaneOutcome
 from kindred.core.simulation_failure import build_simulation_failure, coerce_simulation_failure
 from kindred.gui.controllers.simulation_callback_freshness import SimulationCallbackFreshnessOwner
+from kindred.gui.ports import DisplayTransitionOutcome
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ class ParallelBatchOutcomeDependencies:
     freshness: SimulationCallbackFreshnessOwner
     record_nonfatal_exception: Callable[..., None]
     invalidate_preserved_pending_init_results_after_failed_run: Callable[..., None]
-    finalize_scoped_batch_success_subset: Callable[..., None]
+    finalize_scoped_batch_success_subset: Callable[..., DisplayTransitionOutcome | None]
     cleanup_parallel_batch_lane_pool_after_run: Callable[..., None]
     show_scoped_batch_failure_summary: Callable[..., None]
     apply_explicit_failure_pending_replay_policy: Callable[..., None]
@@ -194,7 +195,9 @@ class ParallelBatchOutcomeOwner:
             return True
 
         ctx = self._batch_context_owner.deactivate()
-        display_finalized = bool(self._deps.finalize_scoped_batch_success_subset(ctx))
+        display_transition = self._deps.finalize_scoped_batch_success_subset(ctx)
+        if display_transition is not None and not isinstance(display_transition, DisplayTransitionOutcome):
+            raise TypeError("Scoped batch display finalization must return DisplayTransitionOutcome or None")
         self._deps.cleanup_parallel_batch_lane_pool_after_run(
             keep_lane_pool_alive=False,
             clear_pending_plot_updates=False,
@@ -205,12 +208,6 @@ class ParallelBatchOutcomeOwner:
         self._ui.run_ui.set_sim_progress_value(100)
         self._ui.run_ui.set_run_button_enabled(True)
         self._ui.run_ui.set_stop_button_enabled(False)
-        if not display_finalized:
-            self._ui.run_ui.set_status_text("Display failed")
-            self._deps.apply_explicit_failure_pending_replay_policy(fast_mode=False)
-            return True
-        failed_count = self._batch_context_owner.scoped_failure_cache_state().failed_count
-        self._ui.run_ui.set_status_text(f"Batch completed with {failed_count} failed set(s)")
         summary = self._batch_context_owner.completion_summary(ctx)
         self._deps.show_scoped_batch_failure_summary(
             failed_set_ids=summary.failed_set_ids,

@@ -24,7 +24,6 @@ def _select_batch_rows(main_window, rows: list[int]) -> None:
             main_window._batch_model.index(int(row), 0),
             QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows,
         )
-    main_window._refresh_batch_display_from_focus_and_shown()
 
 
 def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
@@ -523,18 +522,19 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
             def _finish() -> None:
                 point_count = 12 if self.fast_mode else 8
                 t = np.linspace(0.0, 1.0, point_count)
-                initial_a = max(0.0, float(self.initials.get("A", 1.0)))
-                initial_b = max(0.0, float(self.initials.get("B", 0.0)))
                 amplitude = 0.7
                 if self.fast_mode:
                     override_value = next(iter(self.parameter_overrides.values()), 1.0)
                     amplitude = max(0.05, min(0.95, 1.0 / (1.0 + float(override_value))))
-                final_a = initial_a * amplitude
-                final_b = initial_b + initial_a * (1.0 - amplitude)
+                species_names = list(self.initials) or ["A", "B"]
                 y = np.vstack(
                     [
-                        np.linspace(initial_a, final_a, point_count),
-                        np.linspace(initial_b, final_b, point_count),
+                        np.linspace(
+                            max(0.0, float(self.initials.get(name, 1.0))),
+                            max(0.0, float(self.initials.get(name, 1.0))) * amplitude,
+                            point_count,
+                        )
+                        for name in species_names
                     ]
                 )
                 self.running = False
@@ -543,7 +543,7 @@ def test_fresh_load_run_selected_and_slider_reuse_ready_exact_runtime_owners(
                     {
                         "t": t,
                         "Y": y,
-                        "species_names": ["A", "B"],
+                        "species_names": species_names,
                         "mechanism": None,
                         "mechanism_text": self.mechanism_text,
                         "solver_config": {"solver": "BDF"},

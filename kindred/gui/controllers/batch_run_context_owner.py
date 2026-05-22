@@ -15,6 +15,7 @@ from kindred.gui.ports import (
     CompletedRunDisplayIntent,
     CompletedRunDisplayTransaction,
     CompletionDisplayEntry,
+    DisplayTransitionCause,
 )
 
 
@@ -76,6 +77,7 @@ class BatchContextSeed:
     runtime_waiting: bool | None = None
     active_timeout_s: float | None = None
     completed_run_display_intent: CompletedRunDisplayIntent | None = None
+    computed_owned_species_by_set_id: Mapping[str, Sequence[str]] | None = None
 
     def to_context(self) -> Dict[str, Any]:
         context: Dict[str, Any] = {}
@@ -125,6 +127,7 @@ class BatchCallbackContext(MappingABC[str, Any]):
     preview_scope_set_ids: tuple[str, ...] | None = None
     preview_owner_epoch: int | None = None
     completed_run_display_intent: CompletedRunDisplayIntent | None = None
+    computed_owned_species_by_set_id: Mapping[str, Sequence[str]] | None = None
 
     def to_context(self) -> Dict[str, Any]:
         context: Dict[str, Any] = {
@@ -162,6 +165,12 @@ class BatchCallbackContext(MappingABC[str, Any]):
         }
         if self.completed_run_display_intent is not None:
             context["completed_run_display_intent"] = self.completed_run_display_intent
+        if self.computed_owned_species_by_set_id:
+            context["computed_owned_species_by_set_id"] = {
+                str(set_id): tuple(str(name) for name in (names or ()) if str(name))
+                for set_id, names in dict(self.computed_owned_species_by_set_id or {}).items()
+                if str(set_id)
+            }
         if self.runtime_input_epoch is not None:
             context["runtime_input_epoch"] = self.runtime_input_epoch
         if self.runtime_input_global_epoch is not None:
@@ -221,6 +230,7 @@ class BatchRunStartRequest:
     preview_scope_set_ids: Sequence[str] | None
     preview_owner_epoch: int | None
     preview_batch_cache_token_by_set_id: Mapping[str, str]
+    computed_owned_species_by_set_id: Mapping[str, Sequence[str]]
     completed_run_display_intent: CompletedRunDisplayIntent
 
     def __post_init__(self) -> None:
@@ -332,6 +342,15 @@ class BatchRunStartRequest:
             {
                 str(set_id): str(token)
                 for set_id, token in dict(self.preview_batch_cache_token_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+        object.__setattr__(
+            self,
+            "computed_owned_species_by_set_id",
+            {
+                str(set_id): tuple(str(name) for name in (names or ()) if str(name))
+                for set_id, names in dict(self.computed_owned_species_by_set_id or {}).items()
                 if str(set_id)
             },
         )
@@ -491,6 +510,8 @@ class BatchRunContextOwner:
 
     _COMPLETED_RUN_DISPLAY_INTENT_KEY = "completed_run_display_intent"
     _COMPLETION_DISPLAY_ENTRIES_KEY = "completion_display_entries_by_set_id"
+    _SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY = "semantic_display_unavailable_set_ids"
+    _COMPUTED_OWNED_SPECIES_BY_SET_ID_KEY = "computed_owned_species_by_set_id"
 
     def __init__(self) -> None:
         self._context: Dict[str, Any] = {}
@@ -568,6 +589,11 @@ class BatchRunContextOwner:
             ),
             preview_owner_epoch=self._optional_int(ctx.get("preview_owner_epoch")),
             completed_run_display_intent=display_intent,
+            computed_owned_species_by_set_id={
+                str(set_id): tuple(str(name) for name in (names or ()) if str(name))
+                for set_id, names in dict(ctx.get(self._COMPUTED_OWNED_SPECIES_BY_SET_ID_KEY) or {}).items()
+                if str(set_id)
+            },
         )
 
     def _matches_current_identity(self, context: Mapping[str, Any]) -> bool:
@@ -626,11 +652,6 @@ class BatchRunContextOwner:
 
     def load_context(self, seed: BatchContextSeed) -> None:
         context = seed.to_context()
-        display_intent = context.get(self._COMPLETED_RUN_DISPLAY_INTENT_KEY)
-        if not isinstance(display_intent, CompletedRunDisplayIntent):
-            display_intent = self._completed_run_display_intent_from_context(context)
-        if display_intent is not None:
-            context[self._COMPLETED_RUN_DISPLAY_INTENT_KEY] = display_intent
         self._context = context
 
     def active_batch_state(
@@ -1132,6 +1153,11 @@ class BatchRunContextOwner:
                 for set_id, token in dict(request.preview_batch_cache_token_by_set_id or {}).items()
                 if str(set_id)
             },
+            self._COMPUTED_OWNED_SPECIES_BY_SET_ID_KEY: {
+                str(set_id): tuple(str(name) for name in (names or ()) if str(name))
+                for set_id, names in dict(request.computed_owned_species_by_set_id or {}).items()
+                if str(set_id)
+            },
         }
         context[self._COMPLETED_RUN_DISPLAY_INTENT_KEY] = request.completed_run_display_intent
         self._context = context
@@ -1163,6 +1189,13 @@ class BatchRunContextOwner:
         sid = str(set_id or "").strip()
         if not sid or not isinstance(entry, CompletionDisplayEntry):
             return self._current_context() if context is None else deepcopy(dict(context))
+        owned_species = tuple(str(name) for name in entry.owned_species if str(name))
+        if not owned_species:
+            return self.record_completion_display_unavailable(
+                context,
+                set_id=sid,
+                cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+            )
         base = context if isinstance(context, Mapping) else self._context
         raw = (
             dict(self._context)
@@ -1182,8 +1215,79 @@ class BatchRunContextOwner:
             solver_config=deepcopy(dict(entry.solver_config or {})),
             warnings=tuple(deepcopy(dict(warning)) for warning in entry.warnings if isinstance(warning, Mapping)),
             completion_provenance=deepcopy(dict(entry.completion_provenance or {})),
+            owned_species=owned_species,
         )
         raw[self._COMPLETION_DISPLAY_ENTRIES_KEY] = entries
+        unavailable = [
+            set_id_s
+            for set_id_s in self._str_tuple(
+                raw.get(self._SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY),
+                dedupe=True,
+            )
+            if set_id_s != sid
+        ]
+        if unavailable:
+            raw[self._SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY] = tuple(unavailable)
+        else:
+            raw.pop(self._SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY, None)
+        if self._matches_current_identity(raw):
+            self._context = raw
+            return self._current_context()
+        return deepcopy(raw)
+
+    @staticmethod
+    def launch_owned_species_for_computed_result(
+        context: Mapping[str, Any] | None,
+        *,
+        set_id: str | None,
+    ) -> tuple[str, ...]:
+        if not isinstance(context, Mapping):
+            return ()
+        sid = str(set_id or "").strip()
+        if not sid:
+            return ()
+        owned_by_set = context.get(BatchRunContextOwner._COMPUTED_OWNED_SPECIES_BY_SET_ID_KEY)
+        if not isinstance(owned_by_set, Mapping):
+            return ()
+        return tuple(str(name) for name in (owned_by_set.get(sid) or ()) if str(name))
+
+    def record_completion_display_unavailable(
+        self,
+        context: Mapping[str, Any] | None,
+        *,
+        set_id: str | None,
+        cause: DisplayTransitionCause = DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+    ) -> Dict[str, Any]:
+        if not isinstance(cause, DisplayTransitionCause):
+            raise TypeError("Completion display unavailable requires DisplayTransitionCause")
+        sid = str(set_id or "").strip()
+        if not sid:
+            return self._current_context() if context is None else deepcopy(dict(context))
+        base = context if isinstance(context, Mapping) else self._context
+        raw = (
+            dict(self._context)
+            if isinstance(base, Mapping) and self.context_matches_current_run_identity(base)
+            else dict(base or {})
+        )
+        entries_raw = raw.get(self._COMPLETION_DISPLAY_ENTRIES_KEY)
+        entries = deepcopy(dict(entries_raw)) if isinstance(entries_raw, Mapping) else {}
+        entries.pop(sid, None)
+        if entries:
+            raw[self._COMPLETION_DISPLAY_ENTRIES_KEY] = entries
+        else:
+            raw.pop(self._COMPLETION_DISPLAY_ENTRIES_KEY, None)
+
+        unavailable = list(
+            self._str_tuple(
+                raw.get(self._SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY),
+                dedupe=True,
+            )
+        )
+        if sid not in unavailable:
+            unavailable.append(sid)
+        raw[self._SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY] = tuple(unavailable)
+        if isinstance(cause, DisplayTransitionCause):
+            raw["completion_display_unavailable_cause"] = cause.value
         if self._matches_current_identity(raw):
             self._context = raw
             return self._current_context()
@@ -1195,97 +1299,209 @@ class BatchRunContextOwner:
     ) -> CompletedRunDisplayCoverage:
         ctx = context if isinstance(context, Mapping) else self._context
         if not isinstance(ctx, Mapping):
-            return CompletedRunDisplayCoverage(reason="no_display_intent")
+            return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
         intent = ctx.get(self._COMPLETED_RUN_DISPLAY_INTENT_KEY)
-        if not isinstance(intent, CompletedRunDisplayIntent) or not intent.set_ids:
-            return CompletedRunDisplayCoverage(reason="no_display_intent")
+        if not isinstance(intent, CompletedRunDisplayIntent) or not intent.requested_show_set_ids:
+            return CompletedRunDisplayCoverage(cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS)
+        intent_set_ids = tuple(str(set_id) for set_id in intent.requested_show_set_ids if str(set_id))
+        run_target_ids_raw = tuple(str(set_id) for set_id in intent.run_target_set_ids if str(set_id))
+        run_target_members = set(run_target_ids_raw)
+        if run_target_members:
+            run_target_set_ids = tuple(set_id for set_id in intent_set_ids if set_id in run_target_members)
+        else:
+            run_target_set_ids = intent_set_ids
+        run_target_members = set(run_target_set_ids)
+        non_run_requested_ids = tuple(set_id for set_id in intent_set_ids if set_id not in run_target_members)
         failed_set_ids = {str(set_id) for set_id in (ctx.get("failed_set_ids") or ()) if str(set_id)}
-        display_set_ids = tuple(str(set_id) for set_id in intent.set_ids if str(set_id) not in failed_set_ids)
+        failed_intent_set_ids = tuple(set_id for set_id in intent_set_ids if set_id in failed_set_ids)
+        failed_run_target_set_ids = tuple(set_id for set_id in run_target_set_ids if set_id in failed_set_ids)
+        display_set_ids = tuple(set_id for set_id in run_target_set_ids if set_id not in failed_set_ids)
+
+        def _intent_ordered_union(*groups: Sequence[str]) -> tuple[str, ...]:
+            members = {str(set_id) for group in groups for set_id in (group or ()) if str(set_id)}
+            return tuple(set_id for set_id in intent_set_ids if set_id in members)
+
         if not display_set_ids:
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, non_run_requested_ids)
             return CompletedRunDisplayCoverage(
                 intent=intent,
-                reason="no_displayable_completion_results",
+                missing_set_ids=non_run_requested_ids,
+                unavailable_set_ids=unresolved,
+                unresolved_intent_set_ids=unresolved,
+                failed_intent_set_ids=failed_intent_set_ids,
+                cause=DisplayTransitionCause.NO_DISPLAYABLE_COMPLETION_RESULTS,
             )
         display_primary_set_id = (
             str(intent.primary_set_id)
             if str(intent.primary_set_id or "") in set(display_set_ids)
             else str(display_set_ids[0])
         )
-        display_intent = (
-            intent
-            if display_set_ids == tuple(intent.set_ids) and display_primary_set_id == str(intent.primary_set_id)
-            else CompletedRunDisplayIntent(
-                set_ids=display_set_ids,
-                labels_by_set_id={
-                    str(set_id): str(intent.labels_by_set_id.get(str(set_id), str(set_id)))
-                    for set_id in display_set_ids
-                },
-                primary_set_id=display_primary_set_id,
-                cache_key=str(intent.cache_key or ""),
-                run_id=intent.run_id,
-                request_id=intent.request_id,
+        unavailable_set_ids = set(
+            self._str_tuple(
+                ctx.get(self._SEMANTIC_DISPLAY_UNAVAILABLE_SET_IDS_KEY),
+                dedupe=True,
             )
         )
+        if unavailable_set_ids and all(set_id in unavailable_set_ids for set_id in display_set_ids):
+            semantic_ids = tuple(set_id for set_id in display_set_ids if set_id in unavailable_set_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, semantic_ids, non_run_requested_ids)
+            return CompletedRunDisplayCoverage(
+                intent=intent,
+                missing_set_ids=non_run_requested_ids,
+                unavailable_set_ids=unresolved,
+                unresolved_intent_set_ids=unresolved,
+                failed_intent_set_ids=failed_intent_set_ids,
+                semantic_unavailable_set_ids=semantic_ids,
+                cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+            )
+
         entries_raw = ctx.get(self._COMPLETION_DISPLAY_ENTRIES_KEY)
         if not isinstance(entries_raw, Mapping):
+            if unavailable_set_ids:
+                semantic_ids = tuple(
+                    set_id
+                    for set_id in intent_set_ids
+                    if set_id in unavailable_set_ids and set_id not in failed_set_ids
+                )
+                missing_ids = tuple(set_id for set_id in display_set_ids if set_id not in unavailable_set_ids)
+                unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids, non_run_requested_ids)
+                return CompletedRunDisplayCoverage(
+                    intent=intent,
+                    missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                    unavailable_set_ids=unresolved,
+                    unresolved_intent_set_ids=unresolved,
+                    failed_intent_set_ids=failed_intent_set_ids,
+                    semantic_unavailable_set_ids=semantic_ids,
+                    cause=(
+                        DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
+                        if missing_ids
+                        else DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE
+                    ),
+                )
+            if failed_run_target_set_ids:
+                unresolved = _intent_ordered_union(failed_run_target_set_ids, display_set_ids, non_run_requested_ids)
+                return CompletedRunDisplayCoverage(
+                    intent=intent,
+                    missing_set_ids=display_set_ids,
+                    unavailable_set_ids=unresolved,
+                    unresolved_intent_set_ids=unresolved,
+                    failed_intent_set_ids=failed_intent_set_ids,
+                    cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
+                )
             return CompletedRunDisplayCoverage(
-                intent=display_intent,
-                missing_set_ids=display_set_ids,
-                reason="in_flight_completion_coverage_unavailable",
+                intent=intent,
+                missing_set_ids=(*display_set_ids, *non_run_requested_ids),
+                unresolved_intent_set_ids=_intent_ordered_union(display_set_ids, non_run_requested_ids),
+                failed_intent_set_ids=failed_intent_set_ids,
+                cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
             )
         completion_entries: list[CompletionDisplayEntry] = []
         missing_set_ids: list[str] = []
+        semantic_unavailable_set_ids: list[str] = []
         for set_id in display_set_ids:
+            if str(set_id) in unavailable_set_ids:
+                semantic_unavailable_set_ids.append(str(set_id))
+                continue
             raw_entry = entries_raw.get(str(set_id))
             entry = self._coerce_completion_display_entry(
                 raw_entry,
                 set_id=str(set_id),
-                label=str(display_intent.labels_by_set_id.get(str(set_id), str(set_id))),
+                label=str(intent.labels_by_set_id.get(str(set_id), str(set_id))),
             )
             if entry is None:
                 missing_set_ids.append(str(set_id))
                 continue
+            if not tuple(str(name) for name in entry.owned_species if str(name)):
+                semantic_unavailable_set_ids.append(str(set_id))
+                continue
             completion_entries.append(entry)
-        if missing_set_ids:
+        if completion_entries:
+            completed_display_set_ids = tuple(str(entry.set_id) for entry in completion_entries if str(entry.set_id))
+            missing_ids = tuple(missing_set_ids)
+            semantic_ids = tuple(semantic_unavailable_set_ids)
+            unresolved = _intent_ordered_union(
+                failed_run_target_set_ids,
+                missing_ids,
+                semantic_ids,
+                non_run_requested_ids,
+            )
+            if missing_ids and bool(ctx.get("active", False)):
+                return CompletedRunDisplayCoverage(
+                    intent=intent,
+                    missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                    unavailable_set_ids=unresolved,
+                    unresolved_intent_set_ids=unresolved,
+                    failed_intent_set_ids=failed_intent_set_ids,
+                    semantic_unavailable_set_ids=semantic_ids,
+                    cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
+                )
+            completed_members = set(completed_display_set_ids)
+            display_primary_set_id = (
+                str(intent.primary_set_id)
+                if str(intent.primary_set_id or "") in completed_members
+                else str(completed_display_set_ids[0])
+            )
             return CompletedRunDisplayCoverage(
-                intent=display_intent,
-                missing_set_ids=tuple(missing_set_ids),
-                reason="in_flight_completion_coverage_unavailable",
+                intent=intent,
+                transaction=CompletedRunDisplayTransaction(
+                    intent=intent,
+                    completion_entries=tuple(completion_entries),
+                    display_set_ids=completed_display_set_ids,
+                    display_primary_set_id=display_primary_set_id,
+                    failed_set_ids=failed_run_target_set_ids,
+                    unresolved_intent_set_ids=unresolved,
+                    missing_intent_set_ids=(*missing_ids, *non_run_requested_ids),
+                    failed_intent_set_ids=failed_intent_set_ids,
+                    semantic_unavailable_set_ids=semantic_ids,
+                ),
+                missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                unavailable_set_ids=unresolved,
+                unresolved_intent_set_ids=unresolved,
+                failed_intent_set_ids=failed_intent_set_ids,
+                semantic_unavailable_set_ids=semantic_ids,
+            )
+        if semantic_unavailable_set_ids:
+            semantic_ids = tuple(semantic_unavailable_set_ids)
+            missing_ids = tuple(missing_set_ids)
+            unresolved = _intent_ordered_union(failed_run_target_set_ids, missing_ids, semantic_ids, non_run_requested_ids)
+            return CompletedRunDisplayCoverage(
+                intent=intent,
+                missing_set_ids=(*missing_ids, *non_run_requested_ids),
+                unavailable_set_ids=unresolved,
+                unresolved_intent_set_ids=unresolved,
+                failed_intent_set_ids=failed_intent_set_ids,
+                semantic_unavailable_set_ids=semantic_ids,
+                cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+            )
+        if missing_set_ids:
+            unresolved = _intent_ordered_union(
+                failed_run_target_set_ids,
+                tuple(missing_set_ids),
+                non_run_requested_ids,
+            )
+            return CompletedRunDisplayCoverage(
+                intent=intent,
+                missing_set_ids=(*tuple(missing_set_ids), *non_run_requested_ids),
+                unresolved_intent_set_ids=unresolved,
+                failed_intent_set_ids=failed_intent_set_ids,
+                cause=DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE,
             )
         return CompletedRunDisplayCoverage(
-            intent=display_intent,
+            intent=intent,
             transaction=CompletedRunDisplayTransaction(
-                intent=display_intent,
+                intent=intent,
                 completion_entries=tuple(completion_entries),
+                display_set_ids=display_set_ids,
+                display_primary_set_id=display_primary_set_id,
+                failed_set_ids=failed_run_target_set_ids,
+                unresolved_intent_set_ids=non_run_requested_ids,
+                missing_intent_set_ids=non_run_requested_ids,
+                failed_intent_set_ids=failed_intent_set_ids,
+                semantic_unavailable_set_ids=(),
             ),
-        )
-
-    def _completed_run_display_intent_from_context(
-        self,
-        context: Mapping[str, Any],
-    ) -> CompletedRunDisplayIntent | None:
-        queue_ids = self._str_tuple(context.get("queue_ids"), dedupe=False)
-        if not queue_ids:
-            return None
-        queue_names = self._str_tuple(context.get("queue_names"), dedupe=False)
-        labels_by_set_id = {
-            str(set_id): (
-                str(queue_names[index])
-                if index < len(queue_names) and str(queue_names[index])
-                else str(set_id)
-            )
-            for index, set_id in enumerate(queue_ids)
-        }
-        primary_set_id = str(context.get("primary_set_id") or queue_ids[0] or "").strip()
-        if primary_set_id not in queue_ids:
-            primary_set_id = str(queue_ids[0])
-        return CompletedRunDisplayIntent(
-            set_ids=tuple(queue_ids),
-            labels_by_set_id=labels_by_set_id,
-            primary_set_id=primary_set_id,
-            cache_key=str(context.get("cache_key") or ""),
-            run_id=self._optional_int(context.get("run_id")),
-            request_id=self._optional_int(context.get("request_id")),
+            missing_set_ids=non_run_requested_ids,
+            unresolved_intent_set_ids=non_run_requested_ids,
+            failed_intent_set_ids=failed_intent_set_ids,
         )
 
     @staticmethod
@@ -1307,6 +1523,7 @@ class BatchRunContextOwner:
                 solver_config=deepcopy(dict(value.solver_config or {})),
                 warnings=tuple(deepcopy(dict(warning)) for warning in value.warnings if isinstance(warning, Mapping)),
                 completion_provenance=deepcopy(dict(value.completion_provenance or {})),
+                owned_species=tuple(str(name) for name in value.owned_species if str(name)),
             )
         return None
 

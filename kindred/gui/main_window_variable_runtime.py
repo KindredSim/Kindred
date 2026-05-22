@@ -430,7 +430,10 @@ class MainWindowVariableRuntime:
                 )
                 continue
         try:
-            mw.results_controller.update_main_plot_parameter_summary(params)
+            plot = mw.main_plot()
+            updater = getattr(plot, "update_parameters", None)
+            if callable(updater):
+                updater(dict(params))
         except Exception:
             return
 
@@ -956,7 +959,10 @@ class MainWindowVariableRuntime:
             self.clear_variable_metadata()
             mw._energy_mode_channels = []
             try:
-                mw.results_controller.update_main_plot_parameter_summary({})
+                plot = mw.main_plot()
+                updater = getattr(plot, "update_parameters", None)
+                if callable(updater):
+                    updater({})
             except Exception as exc:
                 logger.debug("Failed to clear plot parameter summary: %s", exc, exc_info=True)
                 mw._plot_parameter_summary_stale = True
@@ -1082,7 +1088,10 @@ class MainWindowVariableRuntime:
             mw._preview_session.sync_committed_slider_values(dict(variables))
 
         try:
-            mw.results_controller.update_main_plot_parameter_summary(params)
+            plot = mw.main_plot()
+            updater = getattr(plot, "update_parameters", None)
+            if callable(updater):
+                updater(dict(params))
         except Exception as exc:
             logger.debug("Failed to update plot parameter summary: %s", exc, exc_info=True)
             mw._plot_parameter_summary_stale = True

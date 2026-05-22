@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from kindred.core.batch_parallel import batch_mechanism_signature
@@ -65,6 +66,7 @@ class RunDispatchContext:
     mechanism_text_by_set_id: Dict[str, str]
     mechanism_signature_by_set_id: Dict[str, str]
     simulation_identity_by_set_id: Dict[str, Dict[str, Any]]
+    owned_species_by_set_id: Dict[str, tuple[str, ...]]
     preview_batch_cache_token_by_set_id: Dict[str, str]
     scope_identity: SimulationScopeIdentity
     cache_key: str
@@ -170,8 +172,21 @@ def build_run_start_context(
     dispatch_context: RunDispatchContext,
     run_start_cache_decision: Any,
     dirty_reset_tracking: Any,
+    requested_show_set_ids: Sequence[str],
+    requested_show_labels_by_set_id: Mapping[str, str] | None = None,
 ) -> RunStartContext:
     queue_ids = list(mechanism_context.queue_ids)
+    requested_show_intent_set_ids = _deduped_nonempty_set_ids(requested_show_set_ids)
+    requested_show_intent_labels_by_set_id = _completed_run_display_labels_by_set_id(
+        requested_show_set_ids=requested_show_intent_set_ids,
+        requested_show_labels_by_set_id=requested_show_labels_by_set_id,
+        queue_ids=queue_ids,
+        queue_names=mechanism_context.queue_names,
+    )
+    display_primary_set_id = _completed_run_display_primary_set_id(
+        requested_show_set_ids=requested_show_intent_set_ids,
+        preferred_set_id=mechanism_context.primary_set_id,
+    )
     parallel_mode = bool(int(effective_workers) > 1 and len(queue_ids) > 1)
     run_sequence_id = int(current_run_sequence_id)
     run_id = None
@@ -243,28 +258,19 @@ def build_run_start_context(
         preview_scope_set_ids=run_start_cache_decision.preview_scope_set_ids,
         preview_owner_epoch=mechanism_context.preview_owner_epoch,
         preview_batch_cache_token_by_set_id=dispatch_context.preview_batch_cache_token_by_set_id,
+        computed_owned_species_by_set_id=dispatch_context.owned_species_by_set_id,
         completed_run_display_intent=CompletedRunDisplayIntent(
-            set_ids=tuple(str(set_id) for set_id in queue_ids if str(set_id)),
-            labels_by_set_id={
-                str(set_id): (
-                    str(mechanism_context.queue_names[index])
-                    if index < len(mechanism_context.queue_names)
-                    and str(mechanism_context.queue_names[index])
-                    else str(set_id)
-                )
-                for index, set_id in enumerate(queue_ids)
-                if str(set_id)
-            },
-            primary_set_id=(
-                str(mechanism_context.primary_set_id)
-                if mechanism_context.primary_set_id and str(mechanism_context.primary_set_id) in {
-                    str(set_id) for set_id in queue_ids if str(set_id)
-                }
-                else (str(queue_ids[0]) if queue_ids else "")
-            ),
+            requested_show_set_ids=requested_show_intent_set_ids,
+            labels_by_set_id=requested_show_intent_labels_by_set_id,
+            primary_set_id=display_primary_set_id,
             cache_key=str(dispatch_context.cache_key or ""),
             run_id=run_id,
             request_id=int(request_id),
+            owned_species_by_set_id=_completed_run_display_owned_species_by_set_id(
+                dispatch_context=dispatch_context,
+                set_ids=requested_show_intent_set_ids,
+            ),
+            run_target_set_ids=tuple(str(set_id) for set_id in queue_ids if str(set_id)),
         ),
     )
     return RunStartContext(
@@ -274,6 +280,132 @@ def build_run_start_context(
         run_id=run_id,
         run_sequence_id=int(run_sequence_id),
     )
+
+
+def _deduped_nonempty_set_ids(set_ids: Sequence[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for set_id in set_ids or ():
+        sid = str(set_id or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        result.append(sid)
+    return tuple(result)
+
+
+def _completed_run_display_labels_by_set_id(
+    *,
+    requested_show_set_ids: Sequence[str],
+    requested_show_labels_by_set_id: Mapping[str, str] | None,
+    queue_ids: Sequence[str],
+    queue_names: Sequence[str],
+) -> Dict[str, str]:
+    requested_labels = {
+        str(set_id): str(label)
+        for set_id, label in dict(requested_show_labels_by_set_id or {}).items()
+        if str(set_id)
+    }
+    queue_labels = {
+        str(set_id): (str(queue_names[index]) if index < len(queue_names) and str(queue_names[index]) else str(set_id))
+        for index, set_id in enumerate(queue_ids)
+        if str(set_id)
+    }
+    return {
+        str(set_id): str(requested_labels.get(str(set_id)) or queue_labels.get(str(set_id)) or str(set_id))
+        for set_id in requested_show_set_ids
+        if str(set_id)
+    }
+
+
+def _completed_run_display_primary_set_id(
+    *,
+    requested_show_set_ids: Sequence[str],
+    preferred_set_id: str | None,
+) -> str:
+    requested_show_ids = tuple(str(set_id) for set_id in requested_show_set_ids if str(set_id))
+    preferred = str(preferred_set_id or "").strip()
+    if preferred and preferred in set(requested_show_ids):
+        return preferred
+    return str(requested_show_ids[0]) if requested_show_ids else ""
+
+
+def _completed_run_display_owned_species_by_set_id(
+    *,
+    dispatch_context: RunDispatchContext,
+    set_ids: Sequence[str],
+) -> Dict[str, tuple[str, ...]]:
+    owned_by_set: Dict[str, tuple[str, ...]] = {}
+    for set_id in set_ids:
+        sid = str(set_id or "").strip()
+        if not sid:
+            continue
+        owned_species = tuple(
+            str(name)
+            for name in dispatch_context.owned_species_by_set_id.get(sid, ())
+            if str(name)
+        )
+        if owned_species:
+            owned_by_set[sid] = owned_species
+    return owned_by_set
+
+
+def _owned_species_from_launch_mechanism_text(
+    mechanism_text: str,
+    *,
+    temperature_K: float | None,
+) -> tuple[str, ...]:
+    if temperature_K is None:
+        return ()
+    try:
+        from kindred.core.simulator.dsl import parse_dsl_to_mechanism
+        from kindred.core.units import UnitsModel
+
+        mechanism = parse_dsl_to_mechanism(
+            str(mechanism_text or ""),
+            initials={},
+            units=UnitsModel(temperature_K=float(temperature_K), energy_unit="kJ/mol"),
+        )
+        return tuple(str(name) for name in mechanism.species_names() if str(name))
+    except Exception:
+        return ()
+
+
+def _semantic_temperature_from_solver_config(solver_config: Mapping[str, Any]) -> float | None:
+    raw_temperature = solver_config.get("temperature_K")
+    if raw_temperature is None:
+        return None
+    try:
+        temperature = float(raw_temperature)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        return None
+    return temperature
+
+
+def _owned_species_from_prepared_launch_payload(
+    *prepared_payloads: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    for prepared_payload in prepared_payloads:
+        if not isinstance(prepared_payload, Mapping):
+            continue
+        species_source = prepared_payload.get("species_names")
+        if species_source is None:
+            mechanism = prepared_payload.get("mechanism")
+            species_names = getattr(mechanism, "species_names", None)
+            if callable(species_names):
+                try:
+                    species_source = species_names()
+                except Exception:
+                    species_source = None
+        try:
+            owned_species = tuple(str(name) for name in (species_source or ()) if str(name))
+        except Exception:
+            owned_species = ()
+        if owned_species:
+            return owned_species
+    return ()
 
 
 class SimulationRunMechanismPreparationOwner:
@@ -583,6 +715,8 @@ class SimulationRunDispatchPreparationOwner:
         parameter_overrides_by_set_id: Dict[str, Dict[str, Any]] = {}
         intervention_schedule_by_set_id: Dict[str, Dict[str, Any]] = {}
         contained_owner_identity_by_set_id: Dict[str, Dict[str, Any]] = {}
+        owned_species_by_set_id: Dict[str, tuple[str, ...]] = {}
+        solver_temperature_K = _semantic_temperature_from_solver_config(solver_context.solver_config)
 
         def _abort_invalid_intervention_schedule(set_id_s: str, exc: BaseException) -> None:
             if bool(runtime_readiness_only):
@@ -650,6 +784,17 @@ class SimulationRunDispatchPreparationOwner:
                 if intervention_schedule is not None:
                     intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
                 simulation_identity_by_set_id[set_id_s] = identity_payload
+                prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
+                prepared_payload = solver_context.prepared_payload_by_set_id.get(set_id_s)
+                owned_species = _owned_species_from_prepared_launch_payload(
+                    prepared_execution_payload,
+                    prepared_payload,
+                ) or _owned_species_from_launch_mechanism_text(
+                    str(mechanism_context.owner_full_dsl or ""),
+                    temperature_K=solver_temperature_K,
+                )
+                if owned_species:
+                    owned_species_by_set_id[set_id_s] = owned_species
                 continue
             row = int(mechanism_context.batch_rows[index])
             set_name = (
@@ -662,6 +807,17 @@ class SimulationRunDispatchPreparationOwner:
                 has_slider_overrides=mechanism_context.has_slider_overrides,
             )
             mechanism_text_by_set_id[set_id_s] = str(request_mechanism_text)
+            prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
+            prepared_payload = solver_context.prepared_payload_by_set_id.get(set_id_s)
+            owned_species = _owned_species_from_prepared_launch_payload(
+                prepared_execution_payload,
+                prepared_payload,
+            ) or _owned_species_from_launch_mechanism_text(
+                str(request_mechanism_text),
+                temperature_K=solver_temperature_K,
+            )
+            if owned_species:
+                owned_species_by_set_id[set_id_s] = owned_species
             try:
                 intervention_schedule = _submitted_intervention_schedule_from_text(str(request_mechanism_text))
             except Exception as exc:
@@ -669,7 +825,6 @@ class SimulationRunDispatchPreparationOwner:
                 return None
             if intervention_schedule is not None:
                 intervention_schedule_by_set_id[set_id_s] = intervention_schedule.to_payload()
-            prepared_execution_payload = solver_context.execution_prepared_payload_by_set_id.get(set_id_s)
             try:
                 initials_dict = self._deps.resolved_initials_for_batch_row(
                     row=row,
@@ -727,10 +882,10 @@ class SimulationRunDispatchPreparationOwner:
                     mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
                         simulation_identity=identity,
                     )
-                else:
+                elif solver_temperature_K is not None:
                     mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
                         mechanism_text=str(request_mechanism_text),
-                        temperature_K=float(solver_context.solver_config.get("temperature_K") or 298.15),
+                        temperature_K=solver_temperature_K,
                         use_sparse_jacobian=bool(
                             solver_context.solver_config.get(
                                 "use_sparse_jacobian",
@@ -743,6 +898,10 @@ class SimulationRunDispatchPreparationOwner:
                                 PROJECT_DEFAULTS["wegscheider_cyclicity_enabled"],
                             )
                         ),
+                    )
+                else:
+                    mechanism_signature_by_set_id[set_id_s] = batch_mechanism_signature(
+                        simulation_identity=identity,
                     )
                 parameter_names = solver_context.owner_parameter_names_by_set_id.get(set_id_s)
                 if parameter_names is None:
@@ -826,6 +985,7 @@ class SimulationRunDispatchPreparationOwner:
             mechanism_text_by_set_id=mechanism_text_by_set_id,
             mechanism_signature_by_set_id=mechanism_signature_by_set_id,
             simulation_identity_by_set_id=simulation_identity_by_set_id,
+            owned_species_by_set_id=owned_species_by_set_id,
             preview_batch_cache_token_by_set_id=preview_batch_cache_token_by_set_id,
             scope_identity=scope_identity,
             cache_key=str(cache_key),

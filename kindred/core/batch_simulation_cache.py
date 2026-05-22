@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from kindred.core.batch_cache_contracts import (
+    BatchCacheResultReadSnapshot,
+    BatchCacheResultReadSnapshotEntry,
     BatchCacheEntryReadResult,
     BatchCacheEntryV1,
     build_batch_cache_entry,
@@ -16,7 +18,7 @@ from kindred.core.runtime_defaults import PREVIEW_CACHE_CAP_DEFAULT, RESULT_CACH
 @dataclass
 class BatchSimulationCache:
     """
-    Owns explicit/preview batch simulation caches and related selection state.
+    Owns explicit/preview batch simulation caches and active cache identity state.
 
     This object is intentionally Qt-free so it can be exercised in unit tests and
     shared by GUI-facing controllers without living in the GUI layer.
@@ -34,11 +36,6 @@ class BatchSimulationCache:
     active_cache_invalidated_set_ids: Optional[tuple[str, ...]] = None
     active_preview_cache_key: Optional[str] = None
     active_preview_scope_set_ids: Optional[tuple[str, ...]] = None
-    last_display_selection: List[str] = field(default_factory=list)
-
-    active_batch_set: Optional[str] = None
-    active_batch_set_id: Optional[str] = None
-
     def __post_init__(self) -> None:
         self.result_cache_cap = max(0, int(self.result_cache_cap))
         self.preview_cache_cap = max(0, int(self.preview_cache_cap))
@@ -176,15 +173,15 @@ class BatchSimulationCache:
     def apply_explicit_cache_reconciliation(
         self,
         *,
-        clear_active_selection_state: bool,
+        clear_active_cache_identity_state: bool,
         active_cache_key: str | None,
         active_cache_preview_token: str | None,
         active_cache_preview_scope_set_ids: Sequence[str] | None,
         active_cache_valid_set_ids: Sequence[str] | None,
         active_cache_invalidated_set_ids: Sequence[str] | None,
     ) -> None:
-        if bool(clear_active_selection_state):
-            self.clear_active_selection_state()
+        if bool(clear_active_cache_identity_state):
+            self.clear_active_cache_identity_state()
             return
         self.active_cache_key = str(active_cache_key or "").strip() or None
         self.active_cache_preview_token = str(active_cache_preview_token or "").strip() or None
@@ -226,6 +223,7 @@ class BatchSimulationCache:
         cache_key: str,
         set_id: str,
         is_preview: bool,
+        require_completion_provenance: bool = False,
     ) -> BatchCacheEntryReadResult:
         normalized_key = str(cache_key or "").strip()
         normalized_set_id = str(set_id or "").strip()
@@ -233,7 +231,71 @@ class BatchSimulationCache:
             return BatchCacheEntryReadResult("missing")
         store = self.store_for_preview(is_preview=bool(is_preview))
         payload = (store or {}).get(self.entry_key(normalized_key, normalized_set_id))
-        return read_batch_cache_entry(payload)
+        return read_batch_cache_entry(
+            payload,
+            require_completion_provenance=bool(require_completion_provenance),
+        )
+
+    def result_cache_read_snapshot(self, *, cache_key: str | None = None) -> BatchCacheResultReadSnapshot:
+        explicit_cache_key = cache_key is not None
+        normalized_key = str(
+            cache_key
+            if cache_key is not None
+            else self.active_cache_key
+            or ""
+        ).strip()
+        if not normalized_key:
+            return BatchCacheResultReadSnapshot(cache_key="")
+        use_active_sidecars = (
+            (not explicit_cache_key)
+            or normalized_key == str(self.active_cache_key or "").strip()
+        )
+        if use_active_sidecars:
+            valid_set_ids = self.normalize_set_ids(self.active_cache_valid_set_ids)
+            invalidated_set_ids = self.normalize_set_ids(self.active_cache_invalidated_set_ids)
+            entry_set_ids = self.normalize_set_ids(
+                (
+                    *valid_set_ids,
+                    *invalidated_set_ids,
+                    *self.active_result_cache_set_ids(),
+                )
+            )
+            if not entry_set_ids:
+                entry_set_ids = tuple(
+                    set_id
+                    for set_id, _entry in self.entries_for_cache_key(
+                        cache_key=normalized_key,
+                        is_preview=False,
+                    )
+                )
+        else:
+            entry_set_ids = tuple(
+                set_id
+                for set_id, _entry in self.entries_for_cache_key(
+                    cache_key=normalized_key,
+                    is_preview=False,
+                )
+            )
+            valid_set_ids = entry_set_ids
+            invalidated_set_ids = ()
+        entries = tuple(
+            BatchCacheResultReadSnapshotEntry(
+                set_id=str(set_id),
+                read_result=self.entry_for_set(
+                    cache_key=normalized_key,
+                    set_id=str(set_id),
+                    is_preview=False,
+                ),
+            )
+            for set_id in entry_set_ids
+            if str(set_id)
+        )
+        return BatchCacheResultReadSnapshot(
+            cache_key=normalized_key,
+            valid_set_ids=valid_set_ids,
+            invalidated_set_ids=invalidated_set_ids,
+            entries=entries,
+        )
 
     def entries_for_cache_key(
         self,
@@ -256,6 +318,31 @@ class BatchSimulationCache:
             if set_id and result.state == "valid" and result.entry is not None:
                 entries.append((set_id, result.entry))
         return tuple(sorted(entries, key=lambda item: item[0]))
+
+    def preview_entry_results_for_set_id(
+        self,
+        *,
+        set_id: str,
+        exclude_cache_key: str = "",
+    ) -> tuple[BatchCacheEntryReadResult, ...]:
+        normalized_set_id = str(set_id or "").strip()
+        if not normalized_set_id:
+            return ()
+        excluded_prefix = (
+            f"{str(exclude_cache_key or '').strip()}::"
+            if str(exclude_cache_key or "").strip()
+            else ""
+        )
+        suffix = f"::{normalized_set_id}"
+        results: list[BatchCacheEntryReadResult] = []
+        for raw_key in reversed(list(self.preview_cache.keys())):
+            key = str(raw_key or "")
+            if not key.endswith(suffix):
+                continue
+            if excluded_prefix and key.startswith(excluded_prefix):
+                continue
+            results.append(read_batch_cache_entry(self.preview_cache.get(raw_key)))
+        return tuple(results)
 
     @staticmethod
     def _entry_key_suffixes(*, set_id: str = "", set_name: str = "") -> tuple[str, ...]:
@@ -327,6 +414,7 @@ class BatchSimulationCache:
         solver_provenance: Optional[Mapping[str, Any]] = None,
         warnings: Optional[Sequence[Mapping[str, Any]]] = None,
         completion_provenance: Optional[Mapping[str, Any]] = None,
+        owned_species: Optional[Sequence[str]] = None,
     ) -> Optional[str]:
         entry = build_batch_cache_entry(
             t=t,
@@ -342,6 +430,7 @@ class BatchSimulationCache:
             solver_provenance=solver_provenance,
             warnings=warnings,
             completion_provenance=completion_provenance,
+            owned_species=owned_species,
         )
         return self.put_batch_cache_entry(
             cache_key=cache_key,
@@ -390,14 +479,9 @@ class BatchSimulationCache:
         self.purge_result_cache()
         self.purge_preview_cache()
 
-    def clear_active_preview_selection_state(self) -> None:
+    def clear_active_preview_cache_identity_state(self) -> None:
         self.active_preview_cache_key = None
         self.active_preview_scope_set_ids = None
-
-    def clear_display_selection_state(self) -> None:
-        self.last_display_selection.clear()
-        self.active_batch_set = None
-        self.active_batch_set_id = None
 
     def clear_active_cache_identity_state(self) -> None:
         self.active_cache_key = None
@@ -405,12 +489,8 @@ class BatchSimulationCache:
         self.active_cache_preview_scope_set_ids = None
         self.active_cache_valid_set_ids = None
         self.active_cache_invalidated_set_ids = None
-        self.clear_active_preview_selection_state()
-
-    def clear_active_selection_state(self) -> None:
-        self.clear_active_cache_identity_state()
-        self.clear_display_selection_state()
+        self.clear_active_preview_cache_identity_state()
 
     def reset_runtime_state(self) -> None:
         self.purge_all()
-        self.clear_active_selection_state()
+        self.clear_active_cache_identity_state()

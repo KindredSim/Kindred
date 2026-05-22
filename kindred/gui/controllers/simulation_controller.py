@@ -102,7 +102,18 @@ from kindred.gui.controllers.slider_plot_coalescer import SliderPlotCoalescer
 from kindred.gui.project_schema import PROJECT_DEFAULTS
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.batch_initial_conditions import strip_reaction_dsl_initial_concentrations
-from kindred.gui.ports import SimulationCacheOpResult, SimulationUiPorts, SliderReplayIntent
+from kindred.gui.ports import (
+    DisplayRefreshSource,
+    DisplayTransitionCause,
+    DisplayTransitionOutcome,
+    DisplayTransitionOutcomeKind,
+    FreshPreviewDisplayEntry,
+    FreshPreviewDisplayTransaction,
+    SimulationCacheOpResult,
+    SimulationCompletionDisplayOutcome,
+    SimulationUiPorts,
+    SliderReplayIntent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +204,7 @@ class SimulationController(QtCore.QObject):
         self._batch_run_queue: List[str] = []
         self._batch_run_results: Dict[str, Dict[str, Any]] = {}
 
-        # Cache + selection state (explicit full results vs slider previews)
+        # Cache identity state (explicit full results vs slider previews)
         self._batch_cache = BatchSimulationCache()
         self._cache_admin = SimulationCacheAdmin(
             cache=self._batch_cache,
@@ -301,6 +312,7 @@ class SimulationController(QtCore.QObject):
                 show_scoped_batch_failure_summary=self._show_scoped_batch_failure_summary,
                 has_deferred_preview_replay_intent=self._has_deferred_preview_replay_intent,
                 start_next_batch_simulation=self._start_next_batch_simulation,
+                clear_pending_progress_status=self._clear_pending_progress_status,
             ),
         )
         self._callback_freshness_owner = SimulationCallbackFreshnessOwner(
@@ -1326,6 +1338,7 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int],
         slider_triggered: bool = True,
         valid_set_ids: Optional[Sequence[str]] = None,
+        fresh_preview_entry: Optional[FreshPreviewDisplayEntry] = None,
     ) -> None:
         self._queue_slider_plot_update(
             set_id=set_id,
@@ -1334,6 +1347,7 @@ class SimulationController(QtCore.QObject):
             run_id=run_id,
             slider_triggered=slider_triggered,
             valid_set_ids=valid_set_ids,
+            fresh_preview_entry=fresh_preview_entry,
         )
 
     def next_sim_request_id(self) -> int:
@@ -1344,6 +1358,21 @@ class SimulationController(QtCore.QObject):
 
     def launch_pending_slider_preview_replay(self) -> None:
         self._run_simulation_from_slider()
+
+    def deauthorize_completed_run_display_for_slider_preview_scope(
+        self,
+        target_set_ids: Sequence[str],
+    ) -> bool:
+        scoped_ids = tuple(dict.fromkeys(str(set_id) for set_id in (target_set_ids or ()) if str(set_id)))
+        if not scoped_ids:
+            return False
+        return (
+            self.ui.results.deauthorize_completed_run_display_for_runtime_input_preview(
+                affected_set_ids=scoped_ids,
+                affected_scope_is_global=False,
+            )
+            is not None
+        )
 
     def run_simulation(self) -> None:
         self._run_simulation()
@@ -1394,6 +1423,9 @@ class SimulationController(QtCore.QObject):
 
     def invalidate_slider_preview_work(self) -> None:
         self._invalidate_slider_preview_work()
+
+    def slider_preview_work_intersects_target_scope(self, target_set_ids: Sequence[str]) -> bool:
+        return bool(self._preview_work_intersects_runtime_input_scope(target_set_ids))
 
     def discard_slider_preview_work_preserving_runtime_owner(self) -> None:
         self._invalidate_slider_preview_work(close_runtime_owner=False)
@@ -2510,7 +2542,7 @@ class SimulationController(QtCore.QObject):
             self._close_contained_simulation_owner(fast_mode=True, kill=True)
         self.clear_pending_slider_preview_replay(clear_plot_updates=False)
         self._clear_pending_preview_slider_plot_updates()
-        self.ui.batch.clear_active_preview_selection_state()
+        self.ui.batch.clear_active_preview_cache_identity_state()
         state = self._batch_context_owner.active_batch_state()
         if state is not None and state.active and state.parallel and state.fast_mode:
             self._supersede_parallel_batch_run_soft()
@@ -2638,12 +2670,16 @@ class SimulationController(QtCore.QObject):
         run_id: Optional[int],
         slider_triggered: bool = True,
         valid_set_ids: Optional[Sequence[str]] = None,
+        fresh_preview_entry: Optional[FreshPreviewDisplayEntry] = None,
     ) -> None:
         preview_ownership = self._preview_ownership
         request_accepted = (
             self._preview_request_can_display(request_id)
             if bool(slider_triggered)
             else (request_id is None or int(request_id) == int(getattr(self, "_latest_sim_request_id", 0)))
+        )
+        accepted_target_set_ids = (
+            preview_ownership.target_set_ids if bool(slider_triggered) and bool(request_accepted) else ()
         )
         self._plot_coalescer.queue(
             set_id=set_id,
@@ -2659,6 +2695,8 @@ class SimulationController(QtCore.QObject):
             ),
             slider_triggered=slider_triggered,
             valid_set_ids=valid_set_ids,
+            fresh_preview_entry=fresh_preview_entry,
+            target_set_ids=accepted_target_set_ids,
             active_run_id=int(self._active_run_id),
             record_nonfatal_exception=self._record_nonfatal_exception,
         )
@@ -2679,7 +2717,9 @@ class SimulationController(QtCore.QObject):
         pending_run_id = pending.run_id
         pending_preview_request_id = pending.accepted_preview_request_id
         pending_preview_owner_epoch = pending.accepted_preview_owner_epoch
+        pending_target_set_ids = tuple(str(set_id) for set_id in getattr(pending, "target_set_ids", ()) if str(set_id))
         pending_valid_set_ids = pending.valid_set_ids
+        pending_fresh_preview_entries = dict(getattr(pending, "fresh_preview_entries", {}) or {})
 
         cache_key = str(cache_key or pending_cache_key or "")
         request_id = pending_request_id if request_id is None else request_id
@@ -2700,28 +2740,14 @@ class SimulationController(QtCore.QObject):
         if run_id is not None and int(run_id) != int(getattr(self, "_active_run_id", 0)):
             return False
 
-        cache_store = self._batch_cache.store_for_kind(pending_cache_kind)
-
-        shown_sets = list(self.ui.batch.shown_batch_set_ids())
-        selected_sets = [str(set_id) for set_id in shown_sets if str(set_id)]
-        if not selected_sets:
-            selected_sets = list(self.ui.batch.batch_set_ids_for_scope("selected"))
-        if not selected_sets:
-            selected_sets = sorted(pending_set_ids)
-        else:
-            selected_sets = [str(set_id) for set_id in selected_sets if str(set_id)]
-        if force and not selected_sets:
-            cached_ids = {
-                set_id
-                for set_id, _entry in self._batch_cache.entries_for_cache_key(
-                    cache_key=str(cache_key),
-                    is_preview=(pending_cache_kind == "preview"),
-                )
-                if str(set_id)
-            }
-            if cached_ids:
-                selected_sets = sorted(cached_ids)
-        if not selected_sets:
+        live_requested_show_set_ids = list(self.ui.batch.requested_show_batch_set_ids())
+        live_requested_show_ids = [str(set_id) for set_id in live_requested_show_set_ids if str(set_id)]
+        requested_show_ids = (
+            [str(set_id) for set_id in pending_target_set_ids if str(set_id)]
+            if pending_cache_kind == "preview" and pending_target_set_ids
+            else live_requested_show_ids
+        )
+        if not requested_show_ids:
             return False
 
         prefer = None
@@ -2729,27 +2755,52 @@ class SimulationController(QtCore.QObject):
         if current_row is not None:
             prefer = self.ui.batch.batch_set_id_for_row(int(current_row))
 
+        display_outcome: object | None = None
         if pending_cache_kind == "preview":
-            display_outcome = self.ui.results.refresh_display_from_focus_and_shown()
-            if display_outcome.focused_controls_use_workspace is not None:
-                try:
-                    self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
-                        use_workspace=bool(display_outcome.focused_controls_use_workspace)
-                    )
-                except Exception as exc:
-                    self._record_nonfatal_exception(
-                        "Failed to resync focused mechanism controls after preview display refresh",
-                        exc,
-                    )
+            if set(live_requested_show_ids) == set(requested_show_ids):
+                display_outcome = self.ui.results.refresh_display_from_request_scope(
+                    display_source=DisplayRefreshSource.SLIDER_REPLAY,
+                )
+                if display_outcome.focused_controls_use_workspace is not None:
+                    try:
+                        self.ui.mechanism_helpers.sync_mechanism_controls_to_focused_batch_set(
+                            use_workspace=bool(display_outcome.focused_controls_use_workspace)
+                        )
+                    except Exception as exc:
+                        self._record_nonfatal_exception(
+                            "Failed to resync focused mechanism controls after preview display refresh",
+                            exc,
+                        )
         else:
-            display_outcome = self.ui.results.publish_cached_batch_selection(
+            if pending_valid_set_ids:
+                self._batch_cache.apply_explicit_cache_reconciliation(
+                    clear_active_cache_identity_state=False,
+                    active_cache_key=str(cache_key),
+                    active_cache_preview_token=None,
+                    active_cache_preview_scope_set_ids=None,
+                    active_cache_valid_set_ids=pending_valid_set_ids,
+                    active_cache_invalidated_set_ids=None,
+                )
+            display_outcome = self.ui.results.publish_cached_batch_display_scope(
                 cache_key=str(cache_key),
-                selected_sets=selected_sets,
+                requested_show_set_ids=requested_show_ids,
                 prefer_set=prefer,
-                cache_store=cache_store,
-                valid_set_ids=pending_valid_set_ids,
+                display_source=DisplayRefreshSource.SLIDER_REPLAY,
             )
-        displayed = bool(display_outcome.displayed)
+        displayed = self._display_transition_published(display_outcome)
+        if pending_cache_kind == "preview" and not displayed:
+            fresh_outcome = self._publish_fresh_preview_plot_update(
+                fresh_preview_entries=pending_fresh_preview_entries,
+                requested_show_set_ids=requested_show_ids,
+                target_set_ids=pending_target_set_ids,
+                prefer_set=prefer,
+                cache_key=str(cache_key),
+                request_id=request_id,
+                run_id=run_id,
+            )
+            if fresh_outcome is not None:
+                display_outcome = fresh_outcome
+                displayed = self._display_transition_published(display_outcome)
         if bool(getattr(self, "_debug_batch_parallel", False)):
             logger.info(
                 "BATCH_PAR plot flush run_id=%s request_id=%s changed_sets=%s forced=%s displayed=%s reason=%s ts=%.6f",
@@ -2758,10 +2809,85 @@ class SimulationController(QtCore.QObject):
                 int(len(pending_set_ids)),
                 bool(force),
                 bool(displayed),
-                str(display_outcome.reason or ""),
+                self._display_transition_log_reason(display_outcome),
                 float(perf_counter()),
             )
         return bool(displayed)
+
+    def _publish_fresh_preview_plot_update(
+        self,
+        *,
+        fresh_preview_entries: Mapping[str, FreshPreviewDisplayEntry],
+        requested_show_set_ids: Sequence[str],
+        target_set_ids: Sequence[str],
+        prefer_set: Optional[str],
+        cache_key: str,
+        request_id: Optional[int],
+        run_id: Optional[int],
+    ) -> Optional[SimulationCompletionDisplayOutcome]:
+        entries_by_id = {
+            str(set_id): entry
+            for set_id, entry in dict(fresh_preview_entries or {}).items()
+            if str(set_id) and isinstance(entry, FreshPreviewDisplayEntry)
+        }
+        if not entries_by_id:
+            return None
+        requested_show_ids = tuple(str(set_id) for set_id in (requested_show_set_ids or ()) if str(set_id))
+        target_ids = tuple(dict.fromkeys(str(set_id) for set_id in (target_set_ids or ()) if str(set_id)))
+        if not target_ids:
+            return None
+        display_ids = requested_show_ids or target_ids
+        if (
+            not display_ids
+            or set(display_ids) != set(target_ids)
+            or set(target_ids) != set(entries_by_id)
+        ):
+            return None
+        primary_id = str(prefer_set or "").strip()
+        if primary_id not in display_ids:
+            primary_id = str(display_ids[0])
+        transaction = FreshPreviewDisplayTransaction(
+            entries=tuple(entries_by_id[set_id] for set_id in display_ids),
+            display_set_ids=display_ids,
+            target_set_ids=target_ids,
+            display_primary_set_id=primary_id,
+            cache_key=str(cache_key or ""),
+            display_source=DisplayRefreshSource.SLIDER_REPLAY,
+            requested_show_set_ids=requested_show_ids or display_ids,
+            requested_labels_by_set_id={
+                str(set_id): str(self.ui.batch.batch_set_name_for_id(str(set_id)) or set_id)
+                for set_id in (requested_show_ids or display_ids)
+                if str(set_id)
+            },
+            request_id=(int(request_id) if request_id is not None else None),
+            run_id=(int(run_id) if run_id is not None else None),
+        )
+        outcome = self.ui.results.publish_fresh_preview_display(transaction)
+        if not isinstance(outcome, SimulationCompletionDisplayOutcome):
+            raise RuntimeError("ResultsController returned an invalid fresh-preview display outcome")
+        return outcome
+
+    @staticmethod
+    def _display_transition_published(
+        outcome: SimulationCompletionDisplayOutcome | None,
+    ) -> bool:
+        transition_outcome = outcome.transition_outcome if outcome is not None else None
+        return (
+            isinstance(transition_outcome, DisplayTransitionOutcome)
+            and transition_outcome.kind is DisplayTransitionOutcomeKind.PUBLISHED
+        )
+
+    @staticmethod
+    def _display_transition_log_reason(
+        outcome: SimulationCompletionDisplayOutcome | None,
+    ) -> str:
+        transition_outcome = outcome.transition_outcome if outcome is not None else None
+        if isinstance(transition_outcome, DisplayTransitionOutcome):
+            cause = transition_outcome.cause
+            if cause is not None:
+                return str(cause.value)
+            return str(transition_outcome.kind.value)
+        return ""
 
     # ------------------------------------------------------------------
     # Batch lane outcome polling/consumption
@@ -2936,7 +3062,7 @@ class SimulationController(QtCore.QObject):
                 if species_for_sync:
                     self.ui.batch.sync_batch_species_columns(
                         species_for_sync,
-                        preserve_active_cache=True,
+                        retain_active_cache_identity=True,
                     )
             except Exception as exc:
                 self._record_nonfatal_exception(
@@ -3087,29 +3213,76 @@ class SimulationController(QtCore.QObject):
         self._continue_or_finish_serial_batch_after_stale_runtime_input(updated)
         return True
 
-    def _finalize_scoped_batch_success_subset(self, ctx: Mapping[str, Any]) -> bool:
+    def _finalize_scoped_batch_success_subset(
+        self,
+        ctx: Mapping[str, Any],
+    ) -> DisplayTransitionOutcome | None:
         if not isinstance(ctx, Mapping):
-            return True
+            return None
         policy_context = self._batch_context_owner.completion_policy_context(ctx)
         if policy_context is None:
-            return True
+            return None
         ctx = self._finalize_explicit_batch_dirty_reset(
             ctx,
             species_names=self._current_mechanism_species_for_batch_sync(),
         )
-        flush_context = self._batch_context_owner.completion_flush_context(ctx)
-        self.flush_slider_plot_updates(
-            force=True,
-            cache_key=str(flush_context.cache_key),
-            request_id=flush_context.request_id,
-            run_id=flush_context.run_id,
-        )
         coverage = self._batch_context_owner.completed_run_display_coverage(ctx)
         if coverage.transaction is not None:
-            outcome = self.ui.results.publish_completed_run_display_transaction(coverage.transaction)
-            return bool(getattr(outcome, "displayed", False))
-        summary = self._batch_context_owner.completion_summary(ctx)
-        return not bool(summary.has_truthful_success)
+            outcome = self._completion_publication_owner.publish_completed_run_display_transaction(
+                coverage.transaction
+            )
+            if not isinstance(outcome, SimulationCompletionDisplayOutcome):
+                raise TypeError("Completed-run display publication must return SimulationCompletionDisplayOutcome")
+            return outcome.transition_outcome
+        cause = coverage.cause
+        if not isinstance(cause, DisplayTransitionCause):
+            raise TypeError("Completed-run display coverage requires DisplayTransitionCause")
+        affected_set_ids = tuple(
+            str(set_id)
+            for set_id in (
+                coverage.unresolved_intent_set_ids
+                or coverage.unavailable_set_ids
+                or coverage.missing_set_ids
+            )
+            if str(set_id)
+        )
+        if not affected_set_ids and coverage.intent is not None:
+            affected_set_ids = tuple(
+                str(set_id) for set_id in coverage.intent.requested_show_set_ids if str(set_id)
+            )
+        outcome = self._completion_publication_owner.publish_completed_run_display_unavailable(
+            cause=cause,
+            affected_set_ids=affected_set_ids,
+            requested_show_set_ids=(
+                tuple(str(set_id) for set_id in coverage.intent.requested_show_set_ids if str(set_id))
+                if coverage.intent is not None
+                else affected_set_ids
+            ),
+            requested_labels_by_set_id=(
+                {
+                    str(set_id): str(label)
+                    for set_id, label in dict(coverage.intent.labels_by_set_id or {}).items()
+                    if str(set_id)
+                }
+                if coverage.intent is not None
+                else {}
+            ),
+            unresolved_intent_set_ids=tuple(
+                str(set_id) for set_id in coverage.unresolved_intent_set_ids if str(set_id)
+            ),
+            missing_intent_set_ids=tuple(
+                str(set_id) for set_id in coverage.missing_set_ids if str(set_id)
+            ),
+            failed_intent_set_ids=tuple(
+                str(set_id) for set_id in coverage.failed_intent_set_ids if str(set_id)
+            ),
+            semantic_unavailable_set_ids=tuple(
+                str(set_id) for set_id in coverage.semantic_unavailable_set_ids if str(set_id)
+            ),
+        )
+        if not isinstance(outcome, SimulationCompletionDisplayOutcome):
+            raise TypeError("Completed-run display unavailable publication must return SimulationCompletionDisplayOutcome")
+        return outcome.transition_outcome
 
     def _try_handle_scoped_batch_failure(
         self,
@@ -4616,6 +4789,15 @@ class SimulationController(QtCore.QObject):
             queue_ids=tuple(mechanism_context.queue_ids),
             dirty_state_by_set_id=self._capture_dirty_state_by_set_id(mechanism_context.queue_ids),
         )
+        requested_show_set_ids = tuple(
+            str(set_id)
+            for set_id in self.ui.batch.requested_show_batch_set_ids()
+            if str(set_id)
+        )
+        requested_show_labels_by_set_id = {
+            str(set_id): str(self.ui.batch.batch_set_name_for_id(str(set_id)) or str(set_id))
+            for set_id in requested_show_set_ids
+        }
         run_start_context = build_run_start_context(
             request_id=int(request_id),
             current_run_sequence_id=int(getattr(self, "_run_sequence_id", 0)),
@@ -4630,6 +4812,8 @@ class SimulationController(QtCore.QObject):
             dispatch_context=dispatch_context,
             run_start_cache_decision=run_start_cache_decision,
             dirty_reset_tracking=dirty_reset_tracking,
+            requested_show_set_ids=requested_show_set_ids,
+            requested_show_labels_by_set_id=requested_show_labels_by_set_id,
         )
         self._run_sequence_id = int(run_start_context.run_sequence_id)
         if run_start_context.run_id is not None:
@@ -4723,6 +4907,11 @@ class SimulationController(QtCore.QObject):
     # ------------------------------------------------------------------
     # Worker callbacks
     # ------------------------------------------------------------------
+    def _clear_pending_progress_status(self) -> None:
+        self._pending_progress_payload = None
+        if self._progress_flush_timer.isActive():
+            self._progress_flush_timer.stop()
+
     def _flush_progress_ui(self) -> None:
         payload = self._pending_progress_payload
         if payload is None:

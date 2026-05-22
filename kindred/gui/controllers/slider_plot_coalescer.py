@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence, Set
+from typing import Callable, Dict, Optional, Sequence, Set
 
 from PySide6 import QtCore
+
+from kindred.gui.ports import FreshPreviewDisplayEntry
 
 
 @dataclass
 class PendingSliderPlotUpdate:
     set_ids: Set[str] = field(default_factory=set)
+    target_set_ids: tuple[str, ...] = ()
     cache_key: Optional[str] = None
     cache_kind: Optional[str] = None
     request_id: Optional[int] = None
@@ -16,6 +19,7 @@ class PendingSliderPlotUpdate:
     accepted_preview_request_id: Optional[int] = None
     accepted_preview_owner_epoch: Optional[int] = None
     valid_set_ids: Optional[tuple[str, ...]] = None
+    fresh_preview_entries: Dict[str, FreshPreviewDisplayEntry] = field(default_factory=dict)
 
 
 class SliderPlotCoalescer(QtCore.QObject):
@@ -55,6 +59,8 @@ class SliderPlotCoalescer(QtCore.QObject):
         accepted_preview_owner_epoch: Optional[int],
         slider_triggered: bool,
         valid_set_ids: Optional[Sequence[str]],
+        fresh_preview_entry: Optional[FreshPreviewDisplayEntry],
+        target_set_ids: Sequence[str],
         active_run_id: int,
         record_nonfatal_exception: Callable[[str, BaseException], None],
     ) -> None:
@@ -73,19 +79,31 @@ class SliderPlotCoalescer(QtCore.QObject):
                 self.pending.accepted_preview_owner_epoch,
                 self.pending.cache_key,
                 self.pending.run_id,
+                self.pending.target_set_ids,
             )
+            normalized_targets = tuple(str(set_id) for set_id in (target_set_ids or ()) if str(set_id))
             incoming_owner_key = (
                 int(request_id) if request_id is not None else None,
                 int(accepted_preview_request_id) if accepted_preview_request_id is not None else None,
                 int(accepted_preview_owner_epoch) if accepted_preview_owner_epoch is not None else None,
                 cache_token,
                 int(run_id) if run_id is not None else None,
+                normalized_targets,
             )
             if pending_owner_key != incoming_owner_key:
                 self.pending = PendingSliderPlotUpdate()
+        normalized_targets = tuple(str(set_id) for set_id in (target_set_ids or ()) if str(set_id))
         sid = str(set_id or "").strip()
         if sid:
             self.pending.set_ids.add(sid)
+        if fresh_preview_entry is not None:
+            fresh_set_id = str(fresh_preview_entry.set_id or sid).strip()
+            if fresh_set_id:
+                self.pending.fresh_preview_entries[fresh_set_id] = fresh_preview_entry
+        if incoming_cache_kind == "preview":
+            self.pending.target_set_ids = normalized_targets
+        else:
+            self.pending.target_set_ids = ()
         self.pending.cache_key = cache_token
         self.pending.cache_kind = incoming_cache_kind
         self.pending.request_id = int(request_id) if request_id is not None else None
@@ -117,6 +135,7 @@ class SliderPlotCoalescer(QtCore.QObject):
             self.timer.stop()
         pending = PendingSliderPlotUpdate(
             set_ids=set(self.pending.set_ids),
+            target_set_ids=self.pending.target_set_ids,
             cache_key=self.pending.cache_key,
             cache_kind=self.pending.cache_kind,
             request_id=self.pending.request_id,
@@ -124,6 +143,7 @@ class SliderPlotCoalescer(QtCore.QObject):
             accepted_preview_request_id=self.pending.accepted_preview_request_id,
             accepted_preview_owner_epoch=self.pending.accepted_preview_owner_epoch,
             valid_set_ids=self.pending.valid_set_ids,
+            fresh_preview_entries=dict(self.pending.fresh_preview_entries),
         )
         self.pending = PendingSliderPlotUpdate()
         return pending

@@ -264,8 +264,8 @@ class FittingMixin:
         if callable(getattr(self, "_sync_batch_species_columns", None)):
             mechanism_initials = self._extract_mechanism_initials(updated_text)
             self._sync_batch_species_columns(list(mechanism_initials.keys()))
-        if refresh_display and callable(getattr(self, "_refresh_batch_display_from_focus_and_shown", None)):
-            self._refresh_batch_display_from_focus_and_shown()
+        if refresh_display and callable(getattr(self, "_refresh_batch_display_from_request_scope", None)):
+            self._refresh_batch_display_from_request_scope()
         logger.info("Wrote %d fitted parameter(s) to mechanism editor", len(normalized_parameters))
         return _FIT_PARAMETER_APPLY_STATUS_REWRITTEN
 
@@ -986,9 +986,9 @@ class FittingMixin:
         if (
             plan.needs_display_refresh
             and applied_any
-            and callable(getattr(self, "_refresh_batch_display_from_focus_and_shown", None))
+            and callable(getattr(self, "_refresh_batch_display_from_request_scope", None))
         ):
-            self._refresh_batch_display_from_focus_and_shown()
+            self._refresh_batch_display_from_request_scope()
         if parameter_apply_failed and applied_any:
             parameter_warnings.append(
                 "Fitted parameter values were not written to the current mechanism text."

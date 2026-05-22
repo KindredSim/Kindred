@@ -105,7 +105,7 @@ class SimulationResultMaterializationOwner:
         try:
             self._ui.batch.sync_batch_species_columns(
                 mechanism.species_names(),
-                preserve_active_cache=True,
+                retain_active_cache_identity=True,
             )
         except Exception as exc:
             self._record_nonfatal_exception(

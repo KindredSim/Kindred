@@ -1,43 +1,381 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
+from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Set, Tuple
+
+
+class DisplayRefreshSource(Enum):
+    INCIDENTAL_REFRESH = "incidental_refresh"
+    EXPLICIT_SHOW_REQUEST = "explicit_show_request"
+    PROGRAMMATIC_SHOW_REQUEST = "programmatic_show_request"
+    SLIDER_REPLAY = "slider_replay"
+
+
+class ActiveDisplayKind(Enum):
+    COMPLETED_RUN = "completed_run"
+    CACHED_RESULT = "cached_result"
+    RESOLVED_RESULT = "resolved_result"
+    WORKSPACE_PREVIEW = "workspace_preview"
+    FRESH_PREVIEW = "fresh_preview"
+    DIRECT_SINGLE_RESULT = "direct_single_result"
+
+
+class DisplaySetRole(Enum):
+    PRIMARY_RESULT = "primary_result"
+    RESULT_OVERLAY = "result_overlay"
+    REFERENCE_OVERLAY = "reference_overlay"
+
+
+class DisplayEventKind(Enum):
+    CACHE_DISPLAY_SCOPE_READY = "cache_display_scope_ready"
+    RESOLVED_DISPLAY_REQUEST_READY = "resolved_display_request_ready"
+    WORKSPACE_PREVIEW_READY = "workspace_preview_ready"
+    COMPLETED_RUN_COVERAGE_READY = "completed_run_coverage_ready"
+    COMPLETED_RUN_COVERAGE_UNAVAILABLE = "completed_run_coverage_unavailable"
+    FRESH_PREVIEW_READY = "fresh_preview_ready"
+    DIRECT_RESULT_READY = "direct_result_ready"
+    SHOW_SCOPE_CHANGED = "show_scope_changed"
+    DISPLAY_FAILURE = "display_failure"
+    DISPLAY_CLEARED = "display_cleared"
+
+
+class DisplayTransitionOutcomeKind(Enum):
+    PUBLISHED = "published"
+    CLEARED = "cleared"
+    DENIED = "denied"
+    FAILED = "failed"
+    DEFERRED = "deferred"
+
+
+class DisplayTransitionCause(Enum):
+    CACHE_DISPLAY_SCOPE_READY = "cache_display_scope_ready"
+    RESOLVED_DISPLAY_REQUEST_READY = "resolved_display_request_ready"
+    WORKSPACE_PREVIEW_READY = "workspace_preview_ready"
+    COMPLETED_RUN_COVERAGE_READY = "completed_run_coverage_ready"
+    SEMANTIC_METADATA_UNAVAILABLE = "semantic_metadata_unavailable"
+    NO_DISPLAYABLE_COMPLETION_RESULTS = "no_displayable_completion_results"
+    NO_DISPLAYABLE_PREVIEW_RESULTS = "no_displayable_preview_results"
+    IN_FLIGHT_COVERAGE_UNAVAILABLE = "in_flight_coverage_unavailable"
+    FRESH_PREVIEW_READY = "fresh_preview_ready"
+    DIRECT_RESULT_READY = "direct_result_ready"
+    SHOW_REMOVED_ACTIVE_SET = "show_removed_active_set"
+    AFFECTED_SCOPE_INTERSECTS_ACTIVE_DISPLAY = "affected_scope_intersects_active_display"
+    DELETED_ACTIVE_SET = "deleted_active_set"
+    DISPLAY_MUTATION_DENIED = "display_mutation_denied"
+    DISPLAY_MUTATION_FAILED = "display_mutation_failed"
+    QUEUED_DISPLAY = "queued_display"
+    CACHE_RESULT_UNAVAILABLE = "cache_result_unavailable"
+    INVALID_CACHE_ENTRY = "invalid_cache_entry"
+    INVALID_DISPLAY_OUTCOME = "invalid_display_outcome"
+    MANUAL_CLEAR = "manual_clear"
+
+
+class DisplayStatus(Enum):
+    DISPLAYED_COMPLETED_RUN = "displayed_completed_run"
+    DISPLAYED_CACHED_RESULT = "displayed_cached_result"
+    DISPLAYED_RESOLVED_RESULT = "displayed_resolved_result"
+    DISPLAYED_WORKSPACE_PREVIEW = "displayed_workspace_preview"
+    DISPLAYED_FRESH_PREVIEW = "displayed_fresh_preview"
+    DISPLAYED_DIRECT_RESULT = "displayed_direct_result"
+    DISPLAY_CLEARED = "display_cleared"
+    DISPLAY_FAILED = "display_failed"
+    DISPLAY_DENIED = "display_denied"
+    DISPLAY_DEFERRED = "display_deferred"
+    NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE = "no_complete_displayable_request_scope"
+
+
+def _normalized_str_tuple(values: Sequence[str] | object) -> tuple[str, ...]:
+    if isinstance(values, str):
+        values = (values,)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values or ():
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return tuple(normalized)
+
+
+def _readonly_display_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _immutable_display_mapping(value)
+    if isinstance(value, list):
+        return tuple(_readonly_display_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_readonly_display_value(item) for item in value)
+    copier = getattr(value, "copy", None)
+    if callable(copier):
+        try:
+            copied = copier()
+        except Exception:
+            return value
+        setflags = getattr(copied, "setflags", None)
+        if callable(setflags):
+            try:
+                setflags(write=False)
+            except Exception:
+                pass
+        return copied
+    return value
+
+
+def _immutable_display_mapping(values: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    return MappingProxyType(
+        {
+            str(key): _readonly_display_value(value)
+            for key, value in dict(values or {}).items()
+            if str(key)
+        }
+    )
+
+
+def _immutable_display_mapping_tuple(values: Sequence[Mapping[str, Any]] | object) -> tuple[Mapping[str, Any], ...]:
+    if isinstance(values, Mapping):
+        values = (values,)
+    return tuple(
+        _immutable_display_mapping(item)
+        for item in (values or ())
+        if isinstance(item, Mapping)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayRequestScopeSnapshot:
+    requested_show_set_ids: tuple[str, ...] = ()
+    requested_labels_by_set_id: Mapping[str, str] = field(default_factory=dict)
+    focused_set_id: str = ""
+    current_row_set_id: str = ""
+    row_selection_set_ids: tuple[str, ...] = ()
+    explicit_slider_target_set_ids: tuple[str, ...] = ()
+    effective_slider_target_set_ids: tuple[str, ...] = ()
+    run_target_set_ids: tuple[str, ...] = ()
+    cache_key: str = ""
+    run_id: int | None = None
+    request_id: int | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "requested_show_set_ids",
+            "row_selection_set_ids",
+            "explicit_slider_target_set_ids",
+            "effective_slider_target_set_ids",
+            "run_target_set_ids",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _normalized_str_tuple(getattr(self, field_name)),
+            )
+        object.__setattr__(self, "focused_set_id", str(self.focused_set_id or "").strip())
+        object.__setattr__(self, "current_row_set_id", str(self.current_row_set_id or "").strip())
+        object.__setattr__(self, "cache_key", str(self.cache_key or "").strip())
+        object.__setattr__(
+            self,
+            "requested_labels_by_set_id",
+            MappingProxyType(
+                {
+                    str(set_id): str(label)
+                    for set_id, label in dict(self.requested_labels_by_set_id or {}).items()
+                    if str(set_id)
+                }
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DisplaySetMetadata:
+    set_id: str
+    label: str
+    role: DisplaySetRole
+    t: Any
+    series: Mapping[str, Any]
+    owned_species: tuple[str, ...]
+    display_species: tuple[str, ...]
+    layer_id: str
+    provenance: Mapping[str, Any] | None = None
+    completion_provenance: Mapping[str, Any] | None = None
+    workspace_preview_provenance: Mapping[str, Any] | None = None
+    visible: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "set_id", str(self.set_id or "").strip())
+        object.__setattr__(self, "label", str(self.label or "").strip())
+        object.__setattr__(self, "layer_id", str(self.layer_id or "").strip())
+        object.__setattr__(self, "t", _readonly_display_value(self.t))
+        object.__setattr__(self, "series", _immutable_display_mapping(self.series))
+        object.__setattr__(
+            self,
+            "provenance",
+            _immutable_display_mapping(self.provenance)
+            if isinstance(self.provenance, Mapping)
+            else None,
+        )
+        object.__setattr__(
+            self,
+            "completion_provenance",
+            (
+                _immutable_display_mapping(self.completion_provenance)
+                if isinstance(self.completion_provenance, Mapping)
+                else None
+            ),
+        )
+        object.__setattr__(
+            self,
+            "workspace_preview_provenance",
+            (
+                _immutable_display_mapping(self.workspace_preview_provenance)
+                if isinstance(self.workspace_preview_provenance, Mapping)
+                else None
+            ),
+        )
+        object.__setattr__(self, "owned_species", _normalized_str_tuple(self.owned_species))
+        object.__setattr__(self, "display_species", _normalized_str_tuple(self.display_species))
+        object.__setattr__(self, "visible", bool(self.visible))
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveDisplayTransaction:
+    transaction_id: str
+    kind: ActiveDisplayKind
+    display_set_ids: tuple[str, ...]
+    primary_display_set_id: str
+    sets: Mapping[str, DisplaySetMetadata]
+    status: DisplayStatus
+    intervention_annotations: tuple[Mapping[str, Any], ...] = ()
+    show_intervention_annotations: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "transaction_id", str(self.transaction_id or "").strip())
+        object.__setattr__(self, "display_set_ids", _normalized_str_tuple(self.display_set_ids))
+        object.__setattr__(
+            self,
+            "primary_display_set_id",
+            str(self.primary_display_set_id or "").strip(),
+        )
+        object.__setattr__(
+            self,
+            "sets",
+            MappingProxyType({
+                str(set_id): metadata
+                for set_id, metadata in dict(self.sets or {}).items()
+                if str(set_id) and isinstance(metadata, DisplaySetMetadata)
+            }),
+        )
+        object.__setattr__(
+            self,
+            "intervention_annotations",
+            _immutable_display_mapping_tuple(self.intervention_annotations),
+        )
+        object.__setattr__(
+            self,
+            "show_intervention_annotations",
+            bool(self.show_intervention_annotations),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayTransitionOutcome:
+    kind: DisplayTransitionOutcomeKind
+    active_transaction: ActiveDisplayTransaction | None
+    previous_transaction: ActiveDisplayTransaction | None
+    display_status: DisplayStatus
+    request_scope: DisplayRequestScopeSnapshot = field(default_factory=DisplayRequestScopeSnapshot)
+    requested_show_set_ids: tuple[str, ...] = ()
+    requested_labels_by_set_id: Mapping[str, str] = field(default_factory=dict)
+    display_set_ids: tuple[str, ...] = ()
+    attempted_display_set_ids: tuple[str, ...] = ()
+    affected_set_ids: tuple[str, ...] = ()
+    unresolved_intent_set_ids: tuple[str, ...] = ()
+    missing_intent_set_ids: tuple[str, ...] = ()
+    failed_intent_set_ids: tuple[str, ...] = ()
+    semantic_unavailable_set_ids: tuple[str, ...] = ()
+    event_kind: DisplayEventKind | None = None
+    cause: DisplayTransitionCause | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "request_scope",
+            self.request_scope
+            if isinstance(self.request_scope, DisplayRequestScopeSnapshot)
+            else DisplayRequestScopeSnapshot(),
+        )
+        object.__setattr__(
+            self,
+            "requested_show_set_ids",
+            _normalized_str_tuple(self.requested_show_set_ids),
+        )
+        object.__setattr__(
+            self,
+            "requested_labels_by_set_id",
+            MappingProxyType(
+                {
+                    str(key).strip(): str(value)
+                    for key, value in dict(self.requested_labels_by_set_id or {}).items()
+                    if str(key).strip()
+                }
+            ),
+        )
+        object.__setattr__(self, "display_set_ids", _normalized_str_tuple(self.display_set_ids))
+        object.__setattr__(
+            self,
+            "attempted_display_set_ids",
+            _normalized_str_tuple(self.attempted_display_set_ids),
+        )
+        object.__setattr__(self, "affected_set_ids", _normalized_str_tuple(self.affected_set_ids))
+        object.__setattr__(
+            self,
+            "unresolved_intent_set_ids",
+            _normalized_str_tuple(self.unresolved_intent_set_ids),
+        )
+        object.__setattr__(
+            self,
+            "missing_intent_set_ids",
+            _normalized_str_tuple(self.missing_intent_set_ids),
+        )
+        object.__setattr__(
+            self,
+            "failed_intent_set_ids",
+            _normalized_str_tuple(self.failed_intent_set_ids),
+        )
+        object.__setattr__(
+            self,
+            "semantic_unavailable_set_ids",
+            _normalized_str_tuple(self.semantic_unavailable_set_ids),
+        )
+
+    def __bool__(self) -> bool:
+        raise TypeError("Use DisplayTransitionOutcome.kind or display_status explicitly")
 
 
 @dataclass(frozen=True, slots=True)
 class SimulationCompletionDisplayOutcome:
-    displayed: bool
-    direct_completion_displayed: bool = False
-    reason: Optional[str] = None
-    primary_set_id: Optional[str] = None
-    displayed_set_ids: tuple[str, ...] = ()
+    transition_outcome: DisplayTransitionOutcome | None = None
 
     def __bool__(self) -> bool:
-        raise TypeError("Use SimulationCompletionDisplayOutcome.displayed explicitly")
+        raise TypeError("Use SimulationCompletionDisplayOutcome.transition_outcome explicitly")
 
 
 @dataclass(frozen=True, slots=True)
-class CachedBatchSelectionDisplayOutcome:
-    displayed: bool
-    reason: Optional[str] = None
-    primary_set_id: Optional[str] = None
-    displayed_set_ids: tuple[str, ...] = ()
+class CachedBatchDisplayScopeOutcome:
+    transition_outcome: DisplayTransitionOutcome | None = None
 
     def __bool__(self) -> bool:
-        raise TypeError("Use CachedBatchSelectionDisplayOutcome.displayed explicitly")
+        raise TypeError("Use CachedBatchDisplayScopeOutcome.transition_outcome explicitly")
 
 
 @dataclass(frozen=True, slots=True)
 class BatchDisplayRefreshOutcome:
     focused_controls_use_workspace: Optional[bool] = None
-    displayed: bool = False
-    reason: Optional[str] = None
-    primary_set_id: Optional[str] = None
-    displayed_set_ids: tuple[str, ...] = ()
+    transition_outcome: DisplayTransitionOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedBatchSelectionEntry:
+class ResolvedBatchDisplayRequestEntry:
     set_id: str
     label: str
     entry: Mapping[str, Any]
@@ -47,12 +385,43 @@ class ResolvedBatchSelectionEntry:
 
 @dataclass(frozen=True, slots=True)
 class CompletedRunDisplayIntent:
-    set_ids: tuple[str, ...]
+    requested_show_set_ids: tuple[str, ...]
     labels_by_set_id: Mapping[str, str]
     primary_set_id: str
     cache_key: str
     run_id: int | None = None
     request_id: int | None = None
+    owned_species_by_set_id: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    run_target_set_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        requested_show_set_ids = tuple(str(set_id) for set_id in self.requested_show_set_ids if str(set_id))
+        object.__setattr__(self, "requested_show_set_ids", requested_show_set_ids)
+        object.__setattr__(
+            self,
+            "labels_by_set_id",
+            {
+                str(set_id): str(label)
+                for set_id, label in dict(self.labels_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+        object.__setattr__(self, "primary_set_id", str(self.primary_set_id or ""))
+        object.__setattr__(self, "cache_key", str(self.cache_key or ""))
+        object.__setattr__(
+            self,
+            "owned_species_by_set_id",
+            {
+                str(set_id): tuple(str(name) for name in (names or ()) if str(name))
+                for set_id, names in dict(self.owned_species_by_set_id or {}).items()
+                if str(set_id)
+            },
+        )
+        object.__setattr__(
+            self,
+            "run_target_set_ids",
+            _normalized_str_tuple(self.run_target_set_ids),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +436,7 @@ class CompletionDisplayEntry:
     solver_config: Mapping[str, object]
     warnings: tuple[Mapping[str, Any], ...]
     completion_provenance: Mapping[str, Any] | None
+    owned_species: tuple[str, ...]
 
     def to_display_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -80,6 +450,8 @@ class CompletionDisplayEntry:
         }
         if isinstance(self.completion_provenance, Mapping):
             payload["completion_provenance"] = dict(self.completion_provenance)
+        if self.owned_species:
+            payload["owned_species"] = tuple(str(name) for name in self.owned_species if str(name))
         return payload
 
 
@@ -87,6 +459,13 @@ class CompletionDisplayEntry:
 class CompletedRunDisplayTransaction:
     intent: CompletedRunDisplayIntent
     completion_entries: tuple[CompletionDisplayEntry, ...]
+    display_set_ids: tuple[str, ...]
+    display_primary_set_id: str
+    failed_set_ids: tuple[str, ...]
+    unresolved_intent_set_ids: tuple[str, ...] = ()
+    missing_intent_set_ids: tuple[str, ...] = ()
+    failed_intent_set_ids: tuple[str, ...] = ()
+    semantic_unavailable_set_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,15 +473,64 @@ class CompletedRunDisplayCoverage:
     intent: CompletedRunDisplayIntent | None = None
     transaction: CompletedRunDisplayTransaction | None = None
     missing_set_ids: tuple[str, ...] = ()
-    reason: Optional[str] = None
+    unavailable_set_ids: tuple[str, ...] = ()
+    unresolved_intent_set_ids: tuple[str, ...] = ()
+    failed_intent_set_ids: tuple[str, ...] = ()
+    semantic_unavailable_set_ids: tuple[str, ...] = ()
+    cause: DisplayTransitionCause | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class BatchDisplaySelectionResolution:
-    resolved_entries: tuple[ResolvedBatchSelectionEntry, ...] = ()
-    reason: Optional[str] = None
-    all_selected_sets_resolved: bool = False
-    has_workspace_selection: bool = False
+class FreshPreviewDisplayEntry:
+    set_id: str
+    label: str
+    t: Any
+    series: Mapping[str, Any]
+    algebra_scalars: Mapping[str, object]
+    solver_provenance: Mapping[str, Any] | None
+    completion_provenance: Mapping[str, Any] | None
+    owned_species: tuple[str, ...] = ()
+    workspace_preview_provenance: Mapping[str, Any] | None = None
+
+    def to_display_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "t": self.t,
+            "series": dict(self.series or {}),
+            "algebra_scalars": dict(self.algebra_scalars or {}),
+            "solver_provenance": dict(self.solver_provenance or {}),
+        }
+        if isinstance(self.completion_provenance, Mapping):
+            payload["completion_provenance"] = dict(self.completion_provenance)
+        if self.owned_species:
+            payload["owned_species"] = tuple(str(name) for name in self.owned_species if str(name))
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class FreshPreviewDisplayTransaction:
+    entries: tuple[FreshPreviewDisplayEntry, ...]
+    display_set_ids: tuple[str, ...]
+    target_set_ids: tuple[str, ...]
+    display_primary_set_id: str
+    cache_key: str
+    display_source: DisplayRefreshSource
+    requested_show_set_ids: tuple[str, ...] = ()
+    requested_labels_by_set_id: Mapping[str, str] = field(default_factory=dict)
+    request_id: int | None = None
+    run_id: int | None = None
+
+
+class BatchDisplayRequestCoverage(Enum):
+    INCOMPLETE = "incomplete"
+    FULL = "full"
+
+
+@dataclass(frozen=True, slots=True)
+class BatchDisplayRequestResolution:
+    resolved_entries: tuple[ResolvedBatchDisplayRequestEntry, ...] = ()
+    unavailable_cause: DisplayTransitionCause | None = None
+    coverage: BatchDisplayRequestCoverage = BatchDisplayRequestCoverage.INCOMPLETE
+    has_workspace_display_request: bool = False
     has_resolved_workspace_preview: bool = False
     focused_uses_workspace_controls: bool = False
     focused_has_resolved_entry: bool = False
@@ -147,6 +575,11 @@ class SliderPreviewLifecyclePort(Protocol):
     def clear_pending_slider_preview_replay(self, *, clear_plot_updates: bool = True) -> None: ...
 
     def invalidate_slider_preview_work(self) -> None: ...
+
+    def deauthorize_completed_run_display_for_slider_preview_scope(
+        self,
+        target_set_ids: Sequence[str],
+    ) -> bool: ...
 
     def launch_pending_slider_preview_replay(self) -> None: ...
 
@@ -268,7 +701,7 @@ class SimulationBatchPort(Protocol):
 
     def batch_set_ids_for_scope(self, scope: str) -> List[str]: ...
 
-    def shown_batch_set_ids(self) -> List[str]: ...
+    def requested_show_batch_set_ids(self) -> List[str]: ...
 
     def slider_edit_target_set_ids(self) -> List[str]: ...
 
@@ -284,11 +717,9 @@ class SimulationBatchPort(Protocol):
 
     def batch_preferred_primary_set_id(self, rows: Sequence[int]) -> Optional[str]: ...
 
-    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: Sequence[str]) -> None: ...
+    def current_workspace_preview_identity_payload(self, *, set_id: str) -> Optional[Dict[str, Any]]: ...
 
-    def clear_display_selection_state(self) -> None: ...
-
-    def clear_active_preview_selection_state(self) -> None: ...
+    def clear_active_preview_cache_identity_state(self) -> None: ...
 
     def batch_cache_key(
         self,
@@ -315,7 +746,7 @@ class SimulationBatchPort(Protocol):
         self,
         species_names: Sequence[str],
         *,
-        preserve_active_cache: bool = False,
+        retain_active_cache_identity: bool = False,
     ) -> None: ...
 
 
@@ -414,28 +845,30 @@ class SimulationRuntimePort(Protocol):
 
 
 class SimulationResultsPort(Protocol):
-    def main_plot(self) -> object: ...
+    def active_display_transaction(self) -> ActiveDisplayTransaction | None: ...
 
-    def update_main_plot_parameter_summary(self, parameters: Dict[str, Tuple[float, str]]) -> None: ...
+    def publish_deferred_display_request(
+        self,
+        *,
+        affected_set_ids: Sequence[str] = (),
+        requested_show_set_ids: Sequence[str] | None = None,
+        requested_labels_by_set_id: Mapping[str, str] | None = None,
+        unresolved_intent_set_ids: Sequence[str] = (),
+        missing_intent_set_ids: Sequence[str] = (),
+        failed_intent_set_ids: Sequence[str] = (),
+        semantic_unavailable_set_ids: Sequence[str] = (),
+    ) -> SimulationCompletionDisplayOutcome: ...
 
-    def set_results_table(self, table: object) -> None: ...
-
-    def publish_simulation_completion_result(
+    def publish_direct_completion_result(
         self,
         *,
         t: Any,
         series: Dict[str, Any],
-        cache_key: Optional[str],
         batch_set: Optional[str],
         batch_set_id: Optional[str],
-        redraw_valid_set_ids: Optional[Sequence[str]],
-        has_redraw_subset: bool,
-        slider_triggered: bool,
-        explicit_batch_coalescing: bool,
         algebra_scalars: Optional[Mapping[str, object]],
+        direct_completion_provenance: Mapping[str, Any],
         solver_provenance: Optional[Mapping[str, Any]] = None,
-        direct_completion_provenance: Optional[Mapping[str, Any]] = None,
-        owned_species: Optional[Sequence[str]] = None,
     ) -> SimulationCompletionDisplayOutcome: ...
 
     def publish_completed_run_display_transaction(
@@ -443,23 +876,46 @@ class SimulationResultsPort(Protocol):
         transaction: CompletedRunDisplayTransaction,
     ) -> SimulationCompletionDisplayOutcome: ...
 
-    def publish_cached_batch_selection(
+    def publish_completed_run_display_unavailable(
+        self,
+        *,
+        cause: DisplayTransitionCause,
+        affected_set_ids: Sequence[str],
+        requested_show_set_ids: Sequence[str] | None = None,
+        requested_labels_by_set_id: Mapping[str, str] | None = None,
+        attempted_display_set_ids: Sequence[str] = (),
+        unresolved_intent_set_ids: Sequence[str] = (),
+        missing_intent_set_ids: Sequence[str] = (),
+        failed_intent_set_ids: Sequence[str] = (),
+        semantic_unavailable_set_ids: Sequence[str] = (),
+    ) -> SimulationCompletionDisplayOutcome: ...
+
+    def publish_fresh_preview_display(
+        self,
+        transaction: FreshPreviewDisplayTransaction,
+    ) -> SimulationCompletionDisplayOutcome: ...
+
+    def deauthorize_completed_run_display_for_runtime_input_preview(
+        self,
+        *,
+        affected_set_ids: Sequence[str],
+        affected_scope_is_global: bool,
+    ) -> DisplayTransitionOutcome | None: ...
+
+    def publish_cached_batch_display_scope(
         self,
         *,
         cache_key: str,
-        selected_sets: Sequence[str],
+        requested_show_set_ids: Sequence[str],
         prefer_set: Optional[str] = None,
-        cache_store: Optional[object] = None,
-        valid_set_ids: Optional[Sequence[str]] = None,
-        invalidated_set_ids: Optional[Sequence[str]] = None,
-    ) -> "CachedBatchSelectionDisplayOutcome": ...
+        display_source: Optional[DisplayRefreshSource] = None,
+    ) -> "CachedBatchDisplayScopeOutcome": ...
 
-    def refresh_display_from_focus_and_shown(self) -> "BatchDisplayRefreshOutcome": ...
-
-    def publish_completion_intervention_annotations(
+    def refresh_display_from_request_scope(
         self,
-        solver_provenance: Optional[Mapping[str, Any]],
-    ) -> None: ...
+        *,
+        display_source: Optional[DisplayRefreshSource] = None,
+    ) -> "BatchDisplayRefreshOutcome": ...
 
 
 class SimulationProvenancePort(Protocol):
@@ -499,6 +955,8 @@ class SimulationProvenancePort(Protocol):
         series: Mapping[str, Any],
         algebra_scalars: Optional[Mapping[str, Any]] = None,
         dataset_overlays: Any = None,
+        display_transaction: Optional[Mapping[str, Any]] = None,
+        display_sets: Optional[Sequence[Mapping[str, Any]]] = None,
         solver_provenance: Optional[Mapping[str, Any]] = None,
         warnings: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]: ...

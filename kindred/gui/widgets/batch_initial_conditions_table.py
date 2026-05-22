@@ -56,7 +56,8 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 continue
             normalized.append(set_id_s)
         before_ids = self.slider_edit_target_set_ids()
-        if normalized == before_ids:
+        slider_changed = normalized != before_ids
+        if not slider_changed:
             return False
         self._slider_edit_target_set_ids = list(normalized)
         changed_ids = set(before_ids) | set(normalized)
@@ -92,15 +93,16 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         self._emit_checkbox_column_change(self.edit_target_column(), changed_rows)
         return True
 
-    def shown_set_ids(self) -> list[str]:
-        return [str(set_id) for set_id in self._store.shown_set_ids()]
+    def requested_show_set_ids(self) -> list[str]:
+        return [str(set_id) for set_id in self._store.requested_show_set_ids()]
 
-    def set_row_shown(self, row: int, shown: bool) -> bool:
+    def set_row_requested_show(self, row: int, requested_show: bool) -> bool:
         row_i = int(row)
-        shown_b = bool(shown)
-        if self._store.is_shown(row_i) == shown_b:
+        requested_show_b = bool(requested_show)
+        show_changed = self._store.is_requested_show(row_i) != requested_show_b
+        if not show_changed:
             return False
-        self._store.set_shown(row_i, shown_b)
+        self._store.set_requested_show(row_i, requested_show_b)
         self._emit_checkbox_column_change(self.show_column(), [row_i])
         self.showMembershipChanged.emit()
         return True
@@ -176,7 +178,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 set_id = self._store.set_id_for_row(row)
                 return QtCore.Qt.Checked if str(set_id) in self.slider_edit_target_set_ids() else QtCore.Qt.Unchecked
             if col == self.show_column():
-                return QtCore.Qt.Checked if self._store.is_shown(row) else QtCore.Qt.Unchecked
+                return QtCore.Qt.Checked if self._store.is_requested_show(row) else QtCore.Qt.Unchecked
 
         if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
             if col == self.edit_target_column():
@@ -205,7 +207,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                     return "Focused row is temporarily included in slider edit scope."
                 return "Select which set the interactive sliders control"
             if col == self.show_column():
-                return "Show or hide this set's curves on the plot"
+                return "Request this set for the next display refresh"
             return None
 
         if role == QtCore.Qt.ForegroundRole and col == self.edit_target_column():
@@ -245,7 +247,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 next_ids.append(str(set_id))
             return self.set_slider_edit_target_set_ids(next_ids)
         if int(column) == self.show_column():
-            return self.set_row_shown(int(row), bool(checked))
+            return self.set_row_requested_show(int(row), bool(checked))
         return False
 
     def setData(self, index: QtCore.QModelIndex, value, role: int = QtCore.Qt.EditRole) -> bool:  # noqa: N802
@@ -326,6 +328,7 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._pressed_checkbox_index = QtCore.QModelIndex()
+        self._user_current_change_depth = 0
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(
@@ -348,6 +351,15 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             model.modelReset.connect(self._apply_column_presentation)
         self._apply_column_presentation()
 
+    def current_change_is_user_initiated(self) -> bool:
+        return self._user_current_change_depth > 0
+
+    def _begin_user_current_change(self) -> None:
+        self._user_current_change_depth += 1
+
+    def _end_user_current_change(self) -> None:
+        self._user_current_change_depth = max(0, self._user_current_change_depth - 1)
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
         control_index = self._control_index_at_event(event)
         if control_index is not None:
@@ -355,7 +367,11 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             event.accept()
             return
         self._pressed_checkbox_index = QtCore.QModelIndex()
-        super().mousePressEvent(event)
+        self._begin_user_current_change()
+        try:
+            super().mousePressEvent(event)
+        finally:
+            self._end_user_current_change()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802
         control_index = self._control_index_at_event(event)
@@ -377,13 +393,21 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             self._pressed_checkbox_index = QtCore.QModelIndex()
             event.accept()
             return
-        super().mouseDoubleClickEvent(event)
+        self._begin_user_current_change()
+        try:
+            super().mouseDoubleClickEvent(event)
+        finally:
+            self._end_user_current_change()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802
         if event.matches(QtGui.QKeySequence.Paste):
             self._handle_paste()
             return
-        super().keyPressEvent(event)
+        self._begin_user_current_change()
+        try:
+            super().keyPressEvent(event)
+        finally:
+            self._end_user_current_change()
 
     def _apply_column_presentation(self) -> None:
         model = self.model()

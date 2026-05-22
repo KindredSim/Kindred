@@ -337,7 +337,7 @@ class SupersededFastDecision:
 
 @dataclass(frozen=True, slots=True)
 class CacheReconciliationDecision:
-    clear_active_selection_state: bool
+    clear_active_cache_identity_state: bool
     active_cache_key: Optional[str]
     active_cache_preview_token: Optional[str]
     active_cache_preview_scope_set_ids: Optional[tuple[str, ...]]
@@ -661,7 +661,7 @@ class SimulationCompletionPolicy:
         else:
             valid_set_ids = context.queue_ids if context.queue_ids else None
 
-        clear_active_selection_state = bool(has_valid_subset and valid_set_ids == ())
+        clear_active_cache_identity_state = bool(has_valid_subset and valid_set_ids == ())
         redraw_valid_set_ids = None
         has_redraw_subset = False
         if has_valid_subset:
@@ -672,13 +672,13 @@ class SimulationCompletionPolicy:
             redraw_valid_set_ids = cache_state.active_cache_valid_set_ids
 
         return CacheReconciliationDecision(
-            clear_active_selection_state=clear_active_selection_state,
-            active_cache_key=None if clear_active_selection_state else cache_key_norm,
-            active_cache_preview_token=None if clear_active_selection_state else preview_token,
-            active_cache_preview_scope_set_ids=None if clear_active_selection_state else preview_scope_set_ids,
-            active_cache_valid_set_ids=None if clear_active_selection_state else valid_set_ids,
+            clear_active_cache_identity_state=clear_active_cache_identity_state,
+            active_cache_key=None if clear_active_cache_identity_state else cache_key_norm,
+            active_cache_preview_token=None if clear_active_cache_identity_state else preview_token,
+            active_cache_preview_scope_set_ids=None if clear_active_cache_identity_state else preview_scope_set_ids,
+            active_cache_valid_set_ids=None if clear_active_cache_identity_state else valid_set_ids,
             active_cache_invalidated_set_ids=(
-                None if clear_active_selection_state else (invalidated_set_ids if has_valid_subset else None)
+                None if clear_active_cache_identity_state else (invalidated_set_ids if has_valid_subset else None)
             ),
             redraw_valid_set_ids=redraw_valid_set_ids,
             has_redraw_subset=has_redraw_subset,

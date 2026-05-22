@@ -81,6 +81,22 @@ class MainWindowPreviewSession:
             raise RuntimeError("Slider preview lifecycle port is not bound.")
         return port
 
+    def _deauthorize_completed_run_display_for_slider_preview_scope(
+        self,
+        target_set_ids: Sequence[str],
+    ) -> bool:
+        port = self._slider_preview_lifecycle_port
+        if port is None:
+            return False
+        deauthorize = getattr(port, "deauthorize_completed_run_display_for_slider_preview_scope", None)
+        if not callable(deauthorize):
+            return False
+        try:
+            return bool(deauthorize(target_set_ids))
+        except Exception:
+            logger.debug("Failed to deauthorize completed-run display for slider preview scope", exc_info=True)
+            return False
+
     def _refresh_transaction_button_state(self) -> None:
         mw = self._mw
         try:
@@ -99,7 +115,7 @@ class MainWindowPreviewSession:
             controller = getattr(mw, "_sim_controller", None)
             batch_cache = getattr(controller, "batch_cache", None)
             if batch_cache is not None:
-                clear_preview = getattr(batch_cache, "clear_active_preview_selection_state", None)
+                clear_preview = getattr(batch_cache, "clear_active_preview_cache_identity_state", None)
                 if callable(clear_preview):
                     clear_preview()
                 else:
@@ -112,7 +128,7 @@ class MainWindowPreviewSession:
     def _show_invalid_preview_state(self) -> None:
         mw = self._mw
         self._clear_active_preview_cache_state()
-        mw._refresh_batch_display_from_focus_and_shown()
+        mw._refresh_batch_display_from_request_scope()
         reason = ""
         variable_runtime = getattr(mw, "_variable_runtime", None)
         reason_getter = getattr(variable_runtime, "slider_runtime_unavailable_reason", None)
@@ -129,7 +145,7 @@ class MainWindowPreviewSession:
     def show_preview_unavailable_for_dirty_state(self, message: str) -> None:
         mw = self._mw
         self._clear_active_preview_cache_state()
-        mw._refresh_batch_display_from_focus_and_shown()
+        mw._refresh_batch_display_from_request_scope()
         mw._status_label.setText(str(message or "Preview unavailable. Adjust sliders or run again."))
 
     def _focused_mechanism_workspace_set_id(self) -> str:
@@ -327,33 +343,8 @@ class MainWindowPreviewSession:
             source=intent.source,
         )
 
-    def _prune_targeted_preview_state_for_reset(self, cleared_set_ids: Sequence[str]) -> None:
-        cleared_set_id_set = {
-            str(set_id or "").strip()
-            for set_id in (cleared_set_ids or ())
-            if str(set_id or "").strip()
-        }
-        if not cleared_set_id_set:
-            return
-
-        self._current_slider_replay_intent = self._pruned_slider_replay_intent_for_reset(
-            self._current_slider_replay_intent,
-            cleared_set_ids=cleared_set_id_set,
-        )
-        self._last_submitted_slider_replay_intent = self._pruned_slider_replay_intent_for_reset(
-            self._last_submitted_slider_replay_intent,
-            cleared_set_ids=cleared_set_id_set,
-        )
-
-        surviving_gesture_target_ids = [
-            str(set_id)
-            for set_id in self._slider_gesture_target_set_ids_snapshot
-            if str(set_id) and str(set_id) not in cleared_set_id_set
-        ]
-        self._slider_gesture_target_set_ids_snapshot = surviving_gesture_target_ids
-
-        has_surviving_gesture_scope = bool(surviving_gesture_target_ids)
-        surviving_replay_intents = tuple(
+    def _surviving_slider_replay_intents(self) -> tuple[SliderReplayIntent, ...]:
+        return tuple(
             intent
             for intent in (
                 self._current_slider_replay_intent,
@@ -361,6 +352,19 @@ class MainWindowPreviewSession:
             )
             if isinstance(intent, SliderReplayIntent)
         )
+
+    def _apply_surviving_slider_preview_scope(
+        self,
+        *,
+        surviving_gesture_target_ids: Sequence[str],
+    ) -> None:
+        self._slider_gesture_target_set_ids_snapshot = [
+            str(set_id)
+            for set_id in surviving_gesture_target_ids
+            if str(set_id)
+        ]
+        has_surviving_gesture_scope = bool(self._slider_gesture_target_set_ids_snapshot)
+        surviving_replay_intents = self._surviving_slider_replay_intents()
         has_surviving_replay_scope = bool(surviving_replay_intents)
 
         if not has_surviving_gesture_scope:
@@ -385,6 +389,108 @@ class MainWindowPreviewSession:
             self._stop_preview_timer("_variable_update_timer")
         if "species_slider" not in replay_sources:
             self._stop_preview_timer("_species_slider_update_timer")
+
+    def _prune_targeted_preview_state_for_reset(self, cleared_set_ids: Sequence[str]) -> None:
+        cleared_set_id_set = {
+            str(set_id or "").strip()
+            for set_id in (cleared_set_ids or ())
+            if str(set_id or "").strip()
+        }
+        if not cleared_set_id_set:
+            return
+
+        self._current_slider_replay_intent = self._pruned_slider_replay_intent_for_reset(
+            self._current_slider_replay_intent,
+            cleared_set_ids=cleared_set_id_set,
+        )
+        self._last_submitted_slider_replay_intent = self._pruned_slider_replay_intent_for_reset(
+            self._last_submitted_slider_replay_intent,
+            cleared_set_ids=cleared_set_id_set,
+        )
+
+        surviving_gesture_target_ids = [
+            str(set_id)
+            for set_id in self._slider_gesture_target_set_ids_snapshot
+            if str(set_id) and str(set_id) not in cleared_set_id_set
+        ]
+        self._apply_surviving_slider_preview_scope(
+            surviving_gesture_target_ids=surviving_gesture_target_ids,
+        )
+
+    @staticmethod
+    def _normalized_target_set_id_tuple(set_ids: Sequence[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_set_id in set_ids or ():
+            set_id = str(raw_set_id or "").strip()
+            if not set_id or set_id in seen:
+                continue
+            seen.add(set_id)
+            normalized.append(set_id)
+        return tuple(normalized)
+
+    def _pruned_slider_replay_intent_for_allowed_targets(
+        self,
+        intent: Optional[SliderReplayIntent],
+        *,
+        allowed_set_ids: set[str],
+    ) -> tuple[Optional[SliderReplayIntent], tuple[str, ...]]:
+        if not isinstance(intent, SliderReplayIntent):
+            return None, ()
+        current_target_ids = self._normalized_target_set_id_tuple(intent.target_set_ids)
+        if not current_target_ids:
+            return None, ()
+        surviving_target_ids = tuple(set_id for set_id in current_target_ids if set_id in allowed_set_ids)
+        removed_target_ids = tuple(set_id for set_id in current_target_ids if set_id not in allowed_set_ids)
+        return (
+            self.build_slider_replay_intent(
+                set_ids=surviving_target_ids,
+                source=intent.source,
+            ),
+            removed_target_ids,
+        )
+
+    def reconcile_slider_target_membership(self, target_set_ids: Sequence[str]) -> tuple[str, ...]:
+        allowed_target_ids = set(self._normalized_target_set_id_tuple(target_set_ids))
+        removed_target_ids: list[str] = []
+
+        def record_removed(ids: Sequence[str]) -> None:
+            for raw_set_id in ids or ():
+                set_id = str(raw_set_id or "").strip()
+                if set_id and set_id not in removed_target_ids:
+                    removed_target_ids.append(set_id)
+
+        current_gesture_ids = self._normalized_target_set_id_tuple(
+            self._slider_gesture_target_set_ids_snapshot
+        )
+        surviving_gesture_ids = tuple(
+            set_id for set_id in current_gesture_ids if set_id in allowed_target_ids
+        )
+        if surviving_gesture_ids != current_gesture_ids:
+            record_removed(set_id for set_id in current_gesture_ids if set_id not in allowed_target_ids)
+            self._slider_gesture_target_set_ids_snapshot = list(surviving_gesture_ids)
+
+        next_current_intent, removed_current_ids = self._pruned_slider_replay_intent_for_allowed_targets(
+            self._current_slider_replay_intent,
+            allowed_set_ids=allowed_target_ids,
+        )
+        record_removed(removed_current_ids)
+        self._current_slider_replay_intent = next_current_intent
+
+        next_submitted_intent, removed_submitted_ids = self._pruned_slider_replay_intent_for_allowed_targets(
+            self._last_submitted_slider_replay_intent,
+            allowed_set_ids=allowed_target_ids,
+        )
+        record_removed(removed_submitted_ids)
+        self._last_submitted_slider_replay_intent = next_submitted_intent
+
+        if not removed_target_ids:
+            return ()
+
+        self._apply_surviving_slider_preview_scope(
+            surviving_gesture_target_ids=self._slider_gesture_target_set_ids_snapshot,
+        )
+        return tuple(removed_target_ids)
 
     def build_slider_replay_intent(
         self,
@@ -572,6 +678,7 @@ class MainWindowPreviewSession:
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
             self._clear_active_preview_cache_state()
+            self._deauthorize_completed_run_display_for_slider_preview_scope(changed_set_ids)
         self._refresh_transaction_button_state()
 
     def effective_slider_values(self, set_id: Optional[str] = None) -> dict[str, float]:
@@ -637,6 +744,7 @@ class MainWindowPreviewSession:
                 changed_set_ids.append(str(set_id))
         if changed:
             self._bump_dirty_state_generation(changed_set_ids)
+            self._deauthorize_completed_run_display_for_slider_preview_scope(changed_set_ids)
             self.stage_slider_replay_intent(
                 set_ids=changed_set_ids,
                 source="species_slider",

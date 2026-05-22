@@ -17,10 +17,15 @@ from kindred.core.simulation_identity import (
     coerce_simulation_identity,
 )
 from kindred.core.validation import try_parse_finite_float
-from kindred.core.batch_cache_contracts import BatchCacheEntryReadResult, read_batch_cache_entry
+from kindred.core.batch_cache_contracts import (
+    BatchCacheResultReadSnapshot,
+    BatchCacheEntryReadResult,
+)
 from kindred.gui.ports import (
-    BatchDisplaySelectionResolution,
-    ResolvedBatchSelectionEntry,
+    BatchDisplayRequestCoverage,
+    BatchDisplayRequestResolution,
+    DisplayTransitionCause,
+    ResolvedBatchDisplayRequestEntry,
 )
 from kindred.gui.controllers.simulation_completion_policy import pending_initial_seed_for_set
 
@@ -35,14 +40,14 @@ class BatchSpeciesColumnSyncSnapshot:
 
 
 class SimulationBatchOwner:
-    """Thin Qt adapter for batch table/store selection and batch display state."""
+    """Thin Qt adapter for batch table/store, cache identity, and display-request resolution."""
 
     def __init__(
         self,
         *,
         batch_rows_for_scope: Callable[[str], Sequence[int]],
         batch_set_ids_for_scope: Callable[[str], Sequence[str]],
-        shown_batch_set_ids: Callable[[], Sequence[str]],
+        requested_show_batch_set_ids: Callable[[], Sequence[str]],
         slider_edit_target_set_ids: Callable[[], Sequence[str]],
         focused_batch_set_id: Callable[[], Optional[str]],
         batch_current_row: Callable[[], Optional[int]],
@@ -51,7 +56,7 @@ class SimulationBatchOwner:
         batch_set_id_for_name: Callable[[str], Optional[str]],
         batch_preferred_primary_set_id: Callable[[Sequence[int]], Optional[str]],
         batch_cache_key: Callable[..., str],
-        batch_cache_getter: Callable[[], object],
+        batch_cache_getter: Callable[[], BatchSimulationCache],
         batch_store: object,
         batch_model: object,
         batch_initials_for_row: Callable[[int], Dict[str, float]],
@@ -65,7 +70,7 @@ class SimulationBatchOwner:
     ) -> None:
         self._batch_rows_for_scope = batch_rows_for_scope
         self._batch_set_ids_for_scope = batch_set_ids_for_scope
-        self._shown_batch_set_ids = shown_batch_set_ids
+        self._requested_show_batch_set_ids = requested_show_batch_set_ids
         self._slider_edit_target_set_ids = slider_edit_target_set_ids
         self._focused_batch_set_id = focused_batch_set_id
         self._batch_current_row = batch_current_row
@@ -93,8 +98,8 @@ class SimulationBatchOwner:
     def batch_set_ids_for_scope(self, scope: str) -> List[str]:
         return [str(set_id) for set_id in (self._batch_set_ids_for_scope(str(scope)) or [])]
 
-    def shown_batch_set_ids(self) -> List[str]:
-        return [str(set_id) for set_id in (self._shown_batch_set_ids() or [])]
+    def requested_show_batch_set_ids(self) -> List[str]:
+        return [str(set_id) for set_id in (self._requested_show_batch_set_ids() or [])]
 
     def slider_edit_target_set_ids(self) -> List[str]:
         return [str(set_id) for set_id in (self._slider_edit_target_set_ids() or [])]
@@ -123,81 +128,26 @@ class SimulationBatchOwner:
         value = self._batch_preferred_primary_set_id([int(row) for row in rows])
         return str(value) if value is not None else None
 
-    def set_active_batch_selection(self, set_id: str, set_name: str, selected_ids: Sequence[str]) -> None:
-        batch_cache = self._batch_cache()
-        batch_cache.active_batch_set_id = str(set_id)
-        batch_cache.active_batch_set = str(set_name)
-        batch_cache.last_display_selection = [str(item) for item in (selected_ids or []) if str(item)]
-
-    def active_batch_selection(self) -> tuple[str, str]:
-        batch_cache = self._batch_cache()
-        return (
-            str(getattr(batch_cache, "active_batch_set_id", "") or ""),
-            str(getattr(batch_cache, "active_batch_set", "") or ""),
-        )
-
-    def last_display_selection(self) -> list[str]:
-        return [str(set_id) for set_id in (getattr(self._batch_cache(), "last_display_selection", ()) or ()) if str(set_id)]
-
     def active_cache_key(self) -> str:
-        return str(getattr(self._batch_cache(), "active_cache_key", "") or "")
+        return str(self._batch_cache().active_cache_key or "")
 
     def active_cache_valid_set_ids(self) -> Optional[tuple[str, ...]]:
-        value = getattr(self._batch_cache(), "active_cache_valid_set_ids", None)
+        value = self._batch_cache().active_cache_valid_set_ids
         if value is None:
             return None
         return tuple(str(set_id) for set_id in value if str(set_id))
 
     def active_cache_invalidated_set_ids(self) -> Optional[tuple[str, ...]]:
-        value = getattr(self._batch_cache(), "active_cache_invalidated_set_ids", None)
+        value = self._batch_cache().active_cache_invalidated_set_ids
         if value is None:
             return None
         return tuple(str(set_id) for set_id in value if str(set_id))
 
-    def clear_display_selection_state(self) -> None:
-        clear_display = getattr(self._batch_cache(), "clear_display_selection_state", None)
-        if callable(clear_display):
-            clear_display()
+    def clear_active_cache_identity_state(self) -> None:
+        self._batch_cache().clear_active_cache_identity_state()
 
-    def narrow_display_selection_state(self, valid_set_ids: Sequence[str]) -> None:
-        valid = {str(set_id) for set_id in (valid_set_ids or ()) if str(set_id)}
-        batch_cache = self._batch_cache()
-        batch_cache.last_display_selection = [
-            str(set_id)
-            for set_id in (getattr(batch_cache, "last_display_selection", ()) or ())
-            if str(set_id) in valid
-        ]
-        if str(getattr(batch_cache, "active_batch_set_id", "") or "") not in valid:
-            batch_cache.active_batch_set_id = None
-            batch_cache.active_batch_set = None
-
-    def clear_active_batch_display_identity_for_deleted_sets(
-        self,
-        *,
-        set_ids: Sequence[str],
-        set_names: Sequence[str],
-    ) -> None:
-        batch_cache = self._batch_cache()
-        deleted_set_ids = {str(set_id) for set_id in set_ids}
-        batch_cache.last_display_selection = [
-            str(set_id)
-            for set_id in (getattr(batch_cache, "last_display_selection", ()) or ())
-            if str(set_id) not in deleted_set_ids
-        ]
-        if str(getattr(batch_cache, "active_batch_set_id", "") or "") in deleted_set_ids:
-            batch_cache.active_batch_set_id = None
-        if str(getattr(batch_cache, "active_batch_set", "") or "") in {str(name) for name in set_names}:
-            batch_cache.active_batch_set = None
-
-    def clear_active_selection_state(self) -> None:
-        clear_active = getattr(self._batch_cache(), "clear_active_selection_state", None)
-        if callable(clear_active):
-            clear_active()
-
-    def clear_active_preview_selection_state(self) -> None:
-        clear_preview = getattr(self._batch_cache(), "clear_active_preview_selection_state", None)
-        if callable(clear_preview):
-            clear_preview()
+    def clear_active_preview_cache_identity_state(self) -> None:
+        self._batch_cache().clear_active_preview_cache_identity_state()
 
     def apply_active_cache_preview_reconciliation(
         self,
@@ -207,14 +157,12 @@ class SimulationBatchOwner:
         preview_scope_set_ids: Sequence[str],
         preview_token: str | None,
     ) -> None:
-        apply_reconciliation = getattr(self._batch_cache(), "apply_active_cache_preview_reconciliation", None)
-        if callable(apply_reconciliation):
-            apply_reconciliation(
-                valid_set_ids=valid_set_ids,
-                invalidated_set_ids=invalidated_set_ids,
-                preview_scope_set_ids=preview_scope_set_ids,
-                preview_token=preview_token,
-            )
+        self._batch_cache().apply_active_cache_preview_reconciliation(
+            valid_set_ids=valid_set_ids,
+            invalidated_set_ids=invalidated_set_ids,
+            preview_scope_set_ids=preview_scope_set_ids,
+            preview_token=preview_token,
+        )
 
     def record_active_result_cache_staleness(
         self,
@@ -222,48 +170,33 @@ class SimulationBatchOwner:
         set_ids: Sequence[str] = (),
         is_global: bool = False,
     ) -> tuple[str, ...]:
-        recorder = getattr(self._batch_cache(), "record_active_result_cache_staleness", None)
-        if callable(recorder):
-            return tuple(
-                str(set_id)
-                for set_id in recorder(set_ids=set_ids, is_global=bool(is_global))
-                if str(set_id)
+        return tuple(
+            str(set_id)
+            for set_id in self._batch_cache().record_active_result_cache_staleness(
+                set_ids=set_ids,
+                is_global=bool(is_global),
             )
-        return ()
+            if str(set_id)
+        )
 
     def reset_runtime_state(self) -> None:
-        reset_runtime = getattr(self._batch_cache(), "reset_runtime_state", None)
-        if callable(reset_runtime):
-            reset_runtime()
-
-    def authoritative_mechanism_has_active_display(self) -> bool:
-        batch_cache = self._batch_cache()
-        has_active_cache = bool(
-            str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-            or str(getattr(batch_cache, "active_preview_cache_key", "") or "").strip()
-        )
-        has_displayed_selection = bool(
-            str(getattr(batch_cache, "active_batch_set_id", "") or "").strip()
-            or str(getattr(batch_cache, "active_batch_set", "") or "").strip()
-            or getattr(batch_cache, "last_display_selection", None)
-        )
-        return bool(has_active_cache or has_displayed_selection)
+        self._batch_cache().reset_runtime_state()
 
     def batch_species_column_sync_snapshot(self) -> BatchSpeciesColumnSyncSnapshot:
         batch_cache = self._batch_cache()
         active_preview_scope_ids = tuple(
             str(set_id)
-            for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
+            for set_id in (batch_cache.active_cache_preview_scope_set_ids or ())
             if str(set_id)
         )
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
+        active_preview_token = str(batch_cache.active_cache_preview_token or "").strip()
         return BatchSpeciesColumnSyncSnapshot(
-            active_cache_key=str(getattr(batch_cache, "active_cache_key", "") or "").strip(),
+            active_cache_key=str(batch_cache.active_cache_key or "").strip(),
             active_preview_token=active_preview_token,
             active_preview_scope_ids=active_preview_scope_ids,
             active_valid_set_ids=tuple(
                 str(set_id)
-                for set_id in (getattr(batch_cache, "active_cache_valid_set_ids", None) or ())
+                for set_id in (batch_cache.active_cache_valid_set_ids or ())
                 if str(set_id)
             ),
             scope_tokens_before=self._overlay_tokens_for_set_ids(active_preview_scope_ids),
@@ -273,12 +206,12 @@ class SimulationBatchOwner:
         self,
         snapshot: BatchSpeciesColumnSyncSnapshot,
         *,
-        preserve_active_cache: bool,
+        retain_active_cache_identity: bool,
     ) -> None:
         if not snapshot.active_cache_key:
             return
-        if not bool(preserve_active_cache):
-            self.clear_active_selection_state()
+        if not bool(retain_active_cache_identity):
+            self.clear_active_cache_identity_state()
             return
         if not snapshot.active_preview_token:
             return
@@ -291,12 +224,12 @@ class SimulationBatchOwner:
             if str(before_token) != str(scope_tokens_after.get(str(set_id), ""))
         }
         if not invalidated_set_ids:
-            self.clear_active_selection_state()
+            self.clear_active_cache_identity_state()
             return
         valid_ids = snapshot.active_valid_set_ids or snapshot.active_preview_scope_ids
         narrowed_valid_ids = tuple(str(set_id) for set_id in valid_ids if str(set_id) not in invalidated_set_ids)
         if not narrowed_valid_ids:
-            self.clear_active_selection_state()
+            self.clear_active_cache_identity_state()
             return
         narrowed_valid_set = set(narrowed_valid_ids)
         narrowed_scope_ids = tuple(
@@ -310,19 +243,18 @@ class SimulationBatchOwner:
             preview_scope_set_ids=narrowed_scope_ids,
             preview_token=self._overlay_token_for_set_ids(narrowed_scope_ids),
         )
-        self.narrow_display_selection_state(narrowed_valid_set)
 
-    def active_preview_selection_matches_current_workspace(self) -> bool:
+    def active_preview_cache_identity_matches_current_workspace(self) -> bool:
         batch_cache = self._batch_cache()
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
+        active_preview_token = str(batch_cache.active_cache_preview_token or "").strip()
         if not active_preview_token:
             return False
         snapshot = BatchSpeciesColumnSyncSnapshot(
-            active_cache_key=str(getattr(batch_cache, "active_cache_key", "") or "").strip(),
+            active_cache_key=str(batch_cache.active_cache_key or "").strip(),
             active_preview_token=active_preview_token,
             active_preview_scope_ids=tuple(
                 str(set_id)
-                for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
+                for set_id in (batch_cache.active_cache_preview_scope_set_ids or ())
                 if str(set_id)
             ),
             active_valid_set_ids=(),
@@ -394,35 +326,15 @@ class SimulationBatchOwner:
             )
         )
 
-    def batch_result_cache_store(self) -> MutableMapping[str, Dict[str, Any]]:
-        return self._batch_cache().result_cache
-
-    def active_explicit_cache_entry_for_set(
+    def active_result_cache_read_snapshot(
         self,
         *,
-        set_id: str,
         cache_key: str | None = None,
-    ) -> BatchCacheEntryReadResult:
-        batch_cache = self._batch_cache()
-        active_cache_key = str(
-            cache_key
-            if cache_key is not None
-            else getattr(batch_cache, "active_cache_key", "")
-            or ""
-        ).strip()
-        if not active_cache_key:
-            return BatchCacheEntryReadResult("missing")
-        return self._cache_entry_for_set_id_from_store(
-            store=getattr(batch_cache, "result_cache", {}),
-            cache_key=active_cache_key,
-            set_id=str(set_id),
-        )
+    ) -> BatchCacheResultReadSnapshot:
+        return self._batch_cache().result_cache_read_snapshot(cache_key=cache_key)
 
     def batch_cache_contains_set(self, *, set_id: str, set_name: str) -> bool:
-        contains = getattr(self._batch_cache(), "contains_set_identifier", None)
-        if callable(contains):
-            return bool(contains(set_id=str(set_id), set_name=str(set_name)))
-        return False
+        return bool(self._batch_cache().contains_set_identifier(set_id=str(set_id), set_name=str(set_name)))
 
     def purge_batch_cache_for_deleted_sets(
         self,
@@ -430,15 +342,12 @@ class SimulationBatchOwner:
         set_ids: Sequence[str],
         set_names: Sequence[str],
     ) -> int:
-        purge = getattr(self._batch_cache(), "purge_entries_for_set_identifiers", None)
-        if callable(purge):
-            return int(
-                purge(
-                    set_ids=tuple(str(set_id) for set_id in set_ids),
-                    set_names=tuple(str(name) for name in set_names),
-                )
+        return int(
+            self._batch_cache().purge_entries_for_set_identifiers(
+                set_ids=tuple(str(set_id) for set_id in set_ids),
+                set_names=tuple(str(name) for name in set_names),
             )
-        return 0
+        )
 
     def batch_store_row_count(self) -> int:
         return int(self._batch_store.row_count())
@@ -467,47 +376,55 @@ class SimulationBatchOwner:
         focused_set_id = str(self.focused_batch_set_id() or "").strip()
         return bool(focused_set_id and self._preview_has_dirty_state_for_set(focused_set_id))
 
-    def focused_batch_selection_is_dirty(
+    def focused_show_request_is_dirty(
         self,
         *,
-        selected_sets: Sequence[str],
+        requested_show_set_ids: Sequence[str],
         prefer_set: Optional[str] = None,
     ) -> bool:
-        focused_set_id = str(prefer_set or (selected_sets[0] if selected_sets else "") or "").strip()
+        focused_set_id = str(
+            prefer_set or (requested_show_set_ids[0] if requested_show_set_ids else "") or ""
+        ).strip()
         if not focused_set_id:
             return False
         return self._preview_has_dirty_state_for_set(focused_set_id)
 
-    def selection_uses_fresh_explicit_cache_after_post_run_sync(
+    def show_request_uses_fresh_explicit_cache_after_post_run_sync(
         self,
         *,
-        selected_sets: Sequence[str],
+        requested_show_set_ids: Sequence[str],
     ) -> bool:
-        normalized_selected_sets = [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
-        if not normalized_selected_sets:
+        normalized_requested_show_set_ids = [
+            str(set_id) for set_id in (requested_show_set_ids or ()) if str(set_id)
+        ]
+        if not normalized_requested_show_set_ids:
             return False
         batch_cache = self._batch_cache()
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
-        active_preview_token = str(getattr(batch_cache, "active_cache_preview_token", "") or "").strip()
+        active_cache_key = str(batch_cache.active_cache_key or "").strip()
+        active_preview_token = str(batch_cache.active_cache_preview_token or "").strip()
         if not active_cache_key or not active_preview_token:
             return False
         active_valid_set_ids = {
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_valid_set_ids", None) or ()) if str(set_id)
+            str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id)
         }
-        if active_valid_set_ids and any(set_id not in active_valid_set_ids for set_id in normalized_selected_sets):
+        if active_valid_set_ids and any(
+            set_id not in active_valid_set_ids for set_id in normalized_requested_show_set_ids
+        ):
             return False
         active_preview_scope_ids = {
             str(set_id)
-            for set_id in (getattr(batch_cache, "active_cache_preview_scope_set_ids", None) or ())
+            for set_id in (batch_cache.active_cache_preview_scope_set_ids or ())
             if str(set_id)
         }
-        if active_preview_scope_ids and any(set_id not in active_preview_scope_ids for set_id in normalized_selected_sets):
+        if active_preview_scope_ids and any(
+            set_id not in active_preview_scope_ids for set_id in normalized_requested_show_set_ids
+        ):
             return False
         scope_rows: list[int] = []
         row_for_set_id = getattr(self._batch_store, "row_for_set_id", None)
         if not callable(row_for_set_id):
             return False
-        for set_id in normalized_selected_sets:
+        for set_id in normalized_requested_show_set_ids:
             try:
                 row = row_for_set_id(str(set_id))
             except Exception:
@@ -521,37 +438,40 @@ class SimulationBatchOwner:
             return False
         return bool(current_preview_token) and current_preview_token == active_preview_token
 
-    def resolve_workspace_aware_batch_selection(
+    def _resolve_workspace_aware_display_request(
         self,
         *,
-        selected_sets: Sequence[str],
+        requested_show_set_ids: Sequence[str],
         preview_cache_key: Optional[str] = None,
-    ) -> Tuple[List[object], Optional[str], bool, bool, bool, bool, bool]:
+    ) -> BatchDisplayRequestResolution:
         batch_cache = self._batch_cache()
-        active_cache_key = str(getattr(batch_cache, "active_cache_key", "") or "").strip()
+        active_cache_key = str(batch_cache.active_cache_key or "").strip()
+        active_valid_set_ids = {
+            str(set_id) for set_id in (batch_cache.active_cache_valid_set_ids or ()) if str(set_id)
+        }
         invalidated_set_ids = {
-            str(set_id) for set_id in (getattr(batch_cache, "active_cache_invalidated_set_ids", None) or ()) if str(set_id)
+            str(set_id) for set_id in (batch_cache.active_cache_invalidated_set_ids or ()) if str(set_id)
         }
         focused_set_id = str(self._focused_batch_set_id() or "").strip()
-        if (not focused_set_id) and selected_sets:
-            focused_set_id = str(selected_sets[0] or "").strip()
+        if (not focused_set_id) and requested_show_set_ids:
+            focused_set_id = str(requested_show_set_ids[0] or "").strip()
 
-        resolved_entries: List[object] = []
-        has_workspace_selection = False
+        resolved_entries: list[ResolvedBatchDisplayRequestEntry] = []
+        has_workspace_display_request = False
         has_resolved_workspace_preview = False
-        focused_selection_uses_workspace_controls = False
-        focused_selection_has_resolved_entry = False
+        focused_request_uses_workspace_controls = False
+        focused_request_has_resolved_entry = False
         missing_workspace_entry = False
         missing_explicit_entry = False
         invalid_entry = False
 
-        for raw_set_id in selected_sets or ():
+        for raw_set_id in requested_show_set_ids or ():
             set_id = str(raw_set_id or "").strip()
             if not set_id:
                 continue
             label = self.batch_set_name_for_id(set_id) or set_id
             if self._preview_has_dirty_state_for_set(set_id):
-                has_workspace_selection = True
+                has_workspace_display_request = True
                 preview_entry = self.matching_preview_entry_for_workspace_set(
                     set_id=set_id,
                     preview_cache_key=preview_cache_key,
@@ -559,16 +479,20 @@ class SimulationBatchOwner:
                 if preview_entry.entry is not None:
                     has_resolved_workspace_preview = True
                     canonical_entry = None
-                    if active_cache_key and set_id not in invalidated_set_ids:
-                        explicit_entry = self._cache_entry_for_set_id_from_store(
-                            store=getattr(batch_cache, "result_cache", {}),
+                    if (
+                        active_cache_key
+                        and set_id not in invalidated_set_ids
+                        and (not active_valid_set_ids or set_id in active_valid_set_ids)
+                    ):
+                        explicit_entry = batch_cache.entry_for_set(
                             cache_key=active_cache_key,
                             set_id=set_id,
+                            is_preview=False,
                             require_completion_provenance=True,
                         )
                         canonical_entry = explicit_entry.entry
                     resolved_entries.append(
-                        ResolvedBatchSelectionEntry(
+                        ResolvedBatchDisplayRequestEntry(
                             set_id=str(set_id),
                             label=str(label),
                             entry=preview_entry.entry,
@@ -580,8 +504,8 @@ class SimulationBatchOwner:
                         )
                     )
                     if set_id == focused_set_id:
-                        focused_selection_uses_workspace_controls = True
-                        focused_selection_has_resolved_entry = True
+                        focused_request_uses_workspace_controls = True
+                        focused_request_has_resolved_entry = True
                 elif preview_entry.state == "invalid":
                     invalid_entry = True
                 else:
@@ -591,10 +515,13 @@ class SimulationBatchOwner:
             if not active_cache_key:
                 missing_explicit_entry = True
                 continue
-            explicit_entry = self._cache_entry_for_set_id_from_store(
-                store=getattr(batch_cache, "result_cache", {}),
+            if active_valid_set_ids and set_id not in active_valid_set_ids:
+                missing_explicit_entry = True
+                continue
+            explicit_entry = batch_cache.entry_for_set(
                 cache_key=active_cache_key,
                 set_id=set_id,
+                is_preview=False,
                 require_completion_provenance=True,
             )
             if set_id in invalidated_set_ids:
@@ -605,55 +532,46 @@ class SimulationBatchOwner:
                 continue
             if explicit_entry.entry is not None:
                 resolved_entries.append(
-                    ResolvedBatchSelectionEntry(set_id=str(set_id), label=str(label), entry=explicit_entry.entry)
+                    ResolvedBatchDisplayRequestEntry(set_id=str(set_id), label=str(label), entry=explicit_entry.entry)
                 )
                 if set_id == focused_set_id:
-                    focused_selection_uses_workspace_controls = False
-                    focused_selection_has_resolved_entry = True
+                    focused_request_uses_workspace_controls = False
+                    focused_request_has_resolved_entry = True
             elif explicit_entry.state == "invalid":
                 invalid_entry = True
             else:
                 missing_explicit_entry = True
 
-        all_selected_sets_resolved = len(resolved_entries) == len(
-            [str(set_id) for set_id in (selected_sets or ()) if str(set_id)]
+        coverage = (
+            BatchDisplayRequestCoverage.FULL
+            if len(resolved_entries)
+            == len(
+                [str(set_id) for set_id in (requested_show_set_ids or ()) if str(set_id)]
+            )
+            else BatchDisplayRequestCoverage.INCOMPLETE
         )
-        reason: Optional[str] = None
+        unavailable_cause: DisplayTransitionCause | None = None
         if invalid_entry:
-            reason = "invalid_cache_entry"
+            unavailable_cause = DisplayTransitionCause.INVALID_CACHE_ENTRY
         elif missing_workspace_entry:
-            reason = "preview_pending"
+            unavailable_cause = DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
         elif missing_explicit_entry:
-            reason = "no_cached_results"
-        return (
-            resolved_entries,
-            reason,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_selection_uses_workspace_controls,
-            focused_selection_has_resolved_entry,
+            unavailable_cause = DisplayTransitionCause.CACHE_RESULT_UNAVAILABLE
+        return BatchDisplayRequestResolution(
+            resolved_entries=tuple(resolved_entries),
+            unavailable_cause=unavailable_cause,
+            coverage=coverage,
+            has_workspace_display_request=bool(has_workspace_display_request),
+            has_resolved_workspace_preview=bool(has_resolved_workspace_preview),
+            focused_uses_workspace_controls=bool(focused_request_uses_workspace_controls),
+            focused_has_resolved_entry=bool(focused_request_has_resolved_entry),
         )
 
-    def workspace_selection_resolution(self, selected_sets: Sequence[str]) -> BatchDisplaySelectionResolution:
-        (
-            resolved_entries,
-            reason,
-            all_selected_sets_resolved,
-            has_workspace_selection,
-            has_resolved_workspace_preview,
-            focused_uses_workspace_controls,
-            focused_has_resolved_entry,
-        ) = self.resolve_workspace_aware_batch_selection(selected_sets=selected_sets)
-        return BatchDisplaySelectionResolution(
-            resolved_entries=tuple(resolved_entries),
-            reason=reason,
-            all_selected_sets_resolved=bool(all_selected_sets_resolved),
-            has_workspace_selection=bool(has_workspace_selection),
-            has_resolved_workspace_preview=bool(has_resolved_workspace_preview),
-            focused_uses_workspace_controls=bool(focused_uses_workspace_controls),
-            focused_has_resolved_entry=bool(focused_has_resolved_entry),
-        )
+    def workspace_display_request_resolution(
+        self,
+        requested_show_set_ids: Sequence[str],
+    ) -> BatchDisplayRequestResolution:
+        return self._resolve_workspace_aware_display_request(requested_show_set_ids=requested_show_set_ids)
 
     def matching_preview_entry_for_workspace_set(
         self,
@@ -661,12 +579,12 @@ class SimulationBatchOwner:
         set_id: str,
         preview_cache_key: Optional[str] = None,
     ) -> BatchCacheEntryReadResult:
-        preview_store = getattr(self._batch_cache(), "preview_cache", {})
         expected_mechanism_text = self._mechanism_text_for_workspace_selection(set_id=str(set_id))
+        batch_cache = self._batch_cache()
         resolved_preview_cache_key = str(
             preview_cache_key
             if preview_cache_key is not None
-            else (getattr(self._batch_cache(), "active_preview_cache_key", "") or "")
+            else (batch_cache.active_preview_cache_key or "")
         ).strip()
 
         try:
@@ -705,34 +623,20 @@ class SimulationBatchOwner:
             return math.isclose(float(entry_t[-1]), float(expected_t_end), rel_tol=1e-9, abs_tol=1e-12)
 
         invalid_found = False
-        direct = self._cache_entry_for_set_id_from_store(
-            store=preview_store,
+        direct = batch_cache.entry_for_set(
             cache_key=resolved_preview_cache_key,
             set_id=str(set_id),
+            is_preview=True,
         )
         if _entry_matches_expected(direct):
             return direct
         if direct.state == "invalid":
             invalid_found = True
 
-        candidate_suffixes = {f"::{str(set_id)}"}
-        set_name = self.batch_set_name_for_id(str(set_id))
-        if set_name:
-            candidate_suffixes.add(f"::{str(set_name)}")
-
-        preview_data = getattr(preview_store, "_data", None)
-        if hasattr(preview_data, "items"):
-            preview_items = list(preview_data.items())
-        else:
-            preview_items = list((preview_store or {}).items())
-
-        for key, payload in reversed(preview_items):
-            key_s = str(key)
-            if not any(key_s.endswith(suffix) for suffix in candidate_suffixes):
-                continue
-            if resolved_preview_cache_key and key_s.startswith(f"{resolved_preview_cache_key}::"):
-                continue
-            result = read_batch_cache_entry(payload)
+        for result in batch_cache.preview_entry_results_for_set_id(
+            set_id=str(set_id),
+            exclude_cache_key=resolved_preview_cache_key,
+        ):
             if _entry_matches_expected(result):
                 return result
             invalid_found = invalid_found or result.state == "invalid"
@@ -762,7 +666,7 @@ class SimulationBatchOwner:
             return None
         if self._preview_has_local_mechanism_workspace(sid):
             preview_entry = self.matching_preview_entry_for_workspace_set(set_id=sid)
-            if self._entry_matches_displayed_entry(preview_entry.entry, entry):
+            if self._entry_matches_reference_payload(preview_entry.entry, entry):
                 return self.current_workspace_preview_identity_payload(set_id=sid)
             return None
         row = self._batch_row_for_set_id(sid)
@@ -775,17 +679,9 @@ class SimulationBatchOwner:
         if not has_preview_token:
             return None
         preview_entry = self.matching_preview_entry_for_workspace_set(set_id=sid)
-        if self._entry_matches_displayed_entry(preview_entry.entry, entry):
+        if self._entry_matches_reference_payload(preview_entry.entry, entry):
             return self.current_workspace_preview_identity_payload(set_id=sid)
         return None
-
-    def active_explicit_cache_entry_matches_displayed_entry(
-        self,
-        set_id: str,
-        entry: Mapping[str, Any],
-    ) -> bool:
-        explicit_entry = self.active_explicit_cache_entry_for_set(set_id=str(set_id))
-        return self._entry_matches_displayed_entry(explicit_entry.entry, entry)
 
     def _symbolic_jacobian_identity_for_preview(
         self,
@@ -938,36 +834,24 @@ class SimulationBatchOwner:
             mechanism_text=str(mechanism_text),
         )
 
-    def mechanism_text_for_workspace_selection(self, *, set_id: str) -> str:
-        return self._mechanism_text_for_workspace_selection(set_id=str(set_id))
-
-    def batch_cache_entry_matches_plot_payload(
-        self,
-        *,
-        entry: Optional[MutableMapping[str, Any]],
-        t: np.ndarray,
-        series: MutableMapping[str, Any],
-    ) -> bool:
-        return self._batch_cache_entry_matches_plot_payload(entry=entry, t=t, series=series)
-
-    def _entry_matches_displayed_entry(
+    def _entry_matches_reference_payload(
         self,
         expected_entry: Optional[MutableMapping[str, Any]],
-        displayed_entry: Mapping[str, Any],
+        reference_entry: Mapping[str, Any],
     ) -> bool:
-        if not isinstance(displayed_entry, Mapping):
+        if not isinstance(reference_entry, Mapping):
             return False
-        displayed_t = np.asarray(
-            displayed_entry.get("t") if displayed_entry.get("t") is not None else [],
+        reference_t = np.asarray(
+            reference_entry.get("t") if reference_entry.get("t") is not None else [],
             dtype=float,
         ).reshape(-1)
-        displayed_series = displayed_entry.get("series") or {}
-        if not isinstance(displayed_series, MutableMapping):
-            displayed_series = dict(displayed_series) if isinstance(displayed_series, Mapping) else {}
+        reference_series = reference_entry.get("series") or {}
+        if not isinstance(reference_series, MutableMapping):
+            reference_series = dict(reference_series) if isinstance(reference_series, Mapping) else {}
         return self._batch_cache_entry_matches_plot_payload(
             entry=expected_entry,
-            t=displayed_t,
-            series=displayed_series,
+            t=reference_t,
+            series=reference_series,
         )
 
     def update_batch_row_controls_state(self) -> None:
@@ -977,14 +861,14 @@ class SimulationBatchOwner:
         self,
         species_names: Sequence[str],
         *,
-        preserve_active_cache: bool = False,
+        retain_active_cache_identity: bool = False,
     ) -> None:
         self._sync_batch_species_columns(
             [str(species) for species in species_names],
-            preserve_active_cache=bool(preserve_active_cache),
+            retain_active_cache_identity=bool(retain_active_cache_identity),
         )
 
-    def _batch_cache(self) -> object:
+    def _batch_cache(self) -> BatchSimulationCache:
         return self._batch_cache_getter()
 
     def _batch_cache_entry_matches_plot_payload(
@@ -1023,36 +907,6 @@ class SimulationBatchOwner:
             if not np.allclose(entry_values, plot_values, rtol=1e-9, atol=1e-12):
                 return False
         return True
-
-    def _cache_entry_for_set_id_from_store(
-        self,
-        *,
-        store: MutableMapping[str, Dict[str, Any]],
-        cache_key: str,
-        set_id: str,
-        require_completion_provenance: bool = False,
-    ) -> BatchCacheEntryReadResult:
-        sid = str(set_id or "").strip()
-        if not sid or not cache_key:
-            return BatchCacheEntryReadResult("missing")
-        direct = read_batch_cache_entry(
-            (store or {}).get(BatchSimulationCache.entry_key(cache_key, sid)),
-            require_completion_provenance=bool(require_completion_provenance),
-        )
-        if direct.entry is not None:
-            return direct
-        name = self.batch_set_name_for_id(sid)
-        by_name = BatchCacheEntryReadResult("missing")
-        if name:
-            by_name = read_batch_cache_entry(
-                (store or {}).get(BatchSimulationCache.entry_key(cache_key, str(name))),
-                require_completion_provenance=bool(require_completion_provenance),
-            )
-            if by_name.entry is not None:
-                return by_name
-        if direct.state == "invalid" or by_name.state == "invalid":
-            return BatchCacheEntryReadResult("invalid")
-        return BatchCacheEntryReadResult("missing")
 
     def _mechanism_text_for_workspace_selection(
         self,

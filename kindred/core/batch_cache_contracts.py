@@ -23,6 +23,7 @@ class BatchCacheEntryV1(TypedDict):
     solver_provenance: Dict[str, Any]
     warnings: list[dict[str, Any]]
     completion_provenance: NotRequired[Dict[str, Any]]
+    owned_species: NotRequired[tuple[str, ...]]
 
 
 class PlotOverlayEntryV1(TypedDict):
@@ -39,6 +40,41 @@ class PlotOverlayEntryV1(TypedDict):
 class BatchCacheEntryReadResult:
     state: Literal["valid", "missing", "invalid"]
     entry: Optional[BatchCacheEntryV1] = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchCacheResultReadSnapshotEntry:
+    set_id: str
+    read_result: BatchCacheEntryReadResult
+
+
+@dataclass(frozen=True, slots=True)
+class BatchCacheResultReadSnapshot:
+    cache_key: str
+    valid_set_ids: tuple[str, ...] = ()
+    invalidated_set_ids: tuple[str, ...] = ()
+    entries: tuple[BatchCacheResultReadSnapshotEntry, ...] = ()
+
+    def entry_result_for_set(
+        self,
+        set_id: str,
+        *,
+        require_completion_provenance: bool = False,
+    ) -> BatchCacheEntryReadResult:
+        sid = str(set_id or "").strip()
+        if not sid:
+            return BatchCacheEntryReadResult("missing")
+        for entry in self.entries:
+            if str(entry.set_id) != sid:
+                continue
+            result = entry.read_result
+            if bool(require_completion_provenance) and result.entry is not None:
+                return read_batch_cache_entry(
+                    result.entry,
+                    require_completion_provenance=True,
+                )
+            return result
+        return BatchCacheEntryReadResult("missing")
 
 
 def _coerce_1d_float_array(values: object) -> np.ndarray:
@@ -77,6 +113,7 @@ def build_batch_cache_entry(
     solver_provenance: Optional[Mapping[str, Any]] = None,
     warnings: Optional[Sequence[Mapping[str, Any]]] = None,
     completion_provenance: Optional[Mapping[str, Any]] = None,
+    owned_species: Optional[Sequence[str]] = None,
 ) -> BatchCacheEntryV1:
     scalars: Dict[str, float] = {}
     if isinstance(algebra_scalars, Mapping):
@@ -105,6 +142,13 @@ def build_batch_cache_entry(
     }
     if isinstance(completion_provenance, Mapping):
         entry["completion_provenance"] = dict(completion_provenance)
+    owned_species_t = tuple(
+        str(name).strip()
+        for name in (owned_species or ())
+        if str(name).strip()
+    )
+    if owned_species_t:
+        entry["owned_species"] = owned_species_t
     return entry
 
 
@@ -139,6 +183,7 @@ def read_batch_cache_entry(
             solver_provenance=cast(Optional[Mapping[str, Any]], payload.get("solver_provenance")),
             warnings=cast(Optional[Sequence[Mapping[str, Any]]], payload.get("warnings")),
             completion_provenance=cast(Optional[Mapping[str, Any]], completion_provenance),
+            owned_species=cast(Optional[Sequence[str]], payload.get("owned_species")),
         )
     except Exception:
         return BatchCacheEntryReadResult("invalid")

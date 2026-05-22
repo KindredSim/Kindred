@@ -43,6 +43,7 @@ class SimulationCacheAdmin:
         solver_provenance: Mapping[str, Any] | None = None,
         warnings: Sequence[Mapping[str, Any]] | None = None,
         completion_provenance: Mapping[str, Any] | None = None,
+        owned_species: Sequence[str] | None = None,
         preview_scope_set_ids: Sequence[str] | None = None,
     ) -> SimulationCachePublicationResult:
         normalized_key = str(cache_key or "").strip() or None
@@ -72,6 +73,7 @@ class SimulationCacheAdmin:
                 solver_provenance=solver_provenance,
                 warnings=warnings,
                 completion_provenance=completion_provenance,
+                owned_species=owned_species,
             )
         return SimulationCachePublicationResult(
             cache_key=normalized_key,
@@ -85,7 +87,7 @@ class SimulationCacheAdmin:
         is_preview: bool,
         cache_key: str | None,
         preview_scope_set_ids: Sequence[str] | None = None,
-        clear_active_selection_state: bool = False,
+        clear_active_cache_identity_state: bool = False,
         active_cache_key: str | None = None,
         active_cache_preview_token: str | None = None,
         active_cache_preview_scope_set_ids: Sequence[str] | None = None,
@@ -101,7 +103,7 @@ class SimulationCacheAdmin:
                 )
             return
         self.cache.apply_explicit_cache_reconciliation(
-            clear_active_selection_state=bool(clear_active_selection_state),
+            clear_active_cache_identity_state=bool(clear_active_cache_identity_state),
             active_cache_key=active_cache_key,
             active_cache_preview_token=active_cache_preview_token,
             active_cache_preview_scope_set_ids=active_cache_preview_scope_set_ids,

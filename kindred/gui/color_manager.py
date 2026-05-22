@@ -189,6 +189,8 @@ class ColorManager:
         override = self._species_color_overrides.get(canonical)
         if override is not None:
             return QtGui.QColor(override)
+        if self._clean_species_names(known_species or ()):
+            return self._species_color_for_key(canonical)
         current_slot = self._registered_roster_slot(canonical)
         if current_slot is not None:
             return self._species_color_for_slot(current_slot)
@@ -206,6 +208,8 @@ class ColorManager:
         override = self._species_color_overrides.get(canonical)
         if override is not None:
             return QtGui.QColor(override)
+        if self._clean_species_names(known_species or ()):
+            return self._species_color_for_key(canonical)
         current_slot = self._registered_roster_slot(canonical)
         if current_slot is not None:
             return self._species_color_for_slot(current_slot)
@@ -326,9 +330,10 @@ class ColorManager:
         return qcolor
 
     def _resolution_roster(self, known_species: Sequence[str] | None) -> tuple[str, ...]:
-        if self._registered_species_roster:
-            return tuple(self._registered_species_roster)
-        return tuple(self._clean_species_names(known_species or ()))
+        explicit = tuple(self._clean_species_names(known_species or ()))
+        if explicit:
+            return explicit
+        return tuple(self._registered_species_roster)
 
     @staticmethod
     def _fallback_palette_slot(species_name: str) -> int:

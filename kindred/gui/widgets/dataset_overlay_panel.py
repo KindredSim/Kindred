@@ -13,6 +13,8 @@ from kindred.gui.color_manager import ColorManager
 
 __all__ = ["DatasetOverlayPanel", "DatasetStyle"]
 
+_KEEP_ACTIVE_KNOWN_SPECIES = object()
+
 
 @dataclass
 class DatasetStyle:
@@ -49,6 +51,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         # Display-only species swatches.
         # Maps: (dataset_name, column_key) -> QColor
         self._species_colors: Dict[Tuple[str, str], QtGui.QColor] = {}
+        self._active_color_known_species: Tuple[str, ...] | None = None
 
         # Dataset metadata (for building species lists)
         # Maps: dataset_name -> dataset_payload (with 'species' dict)
@@ -328,16 +331,27 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self.refresh_color_swatches()
         return {key: QtGui.QColor(color) for key, color in self._species_colors.items()}
 
-    def refresh_color_swatches(self) -> None:
-        """Refresh per-dataset swatches from the global species color manager."""
+    def refresh_color_swatches(
+        self,
+        *,
+        known_species: Iterable[str] | None | object = _KEEP_ACTIVE_KNOWN_SPECIES,
+    ) -> None:
+        """Refresh per-dataset swatches from the active species color authority."""
         color_manager = ColorManager.instance()
+        if known_species is not _KEEP_ACTIVE_KNOWN_SPECIES:
+            roster_update = tuple(str(name) for name in (known_species or ()) if str(name))
+            self._active_color_known_species = roster_update or None
+        roster = self._active_color_known_species or ()
 
         refreshed: Dict[Tuple[str, str], QtGui.QColor] = {}
         for dataset_name, payload in self._datasets.items():
             species_dict = (payload or {}).get("species") or {}
             for species_key in species_dict.keys():
                 key = (str(dataset_name), str(species_key))
-                refreshed[key] = color_manager.get_display_series_color(str(species_key))
+                refreshed[key] = color_manager.get_display_series_color(
+                    str(species_key),
+                    known_species=roster or None,
+                )
         self._species_colors = refreshed
 
         for key, button in list(self._color_buttons.items()):
@@ -430,7 +444,11 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         if not color.isValid():
             return
         _dataset_name, species_key = key
-        ColorManager.instance().set_species_color_override(str(species_key), color)
+        ColorManager.instance().set_species_color_override(
+            str(species_key),
+            color,
+            known_species=self._active_color_known_species,
+        )
         self.refresh_color_swatches()
         self.selectionChanged.emit(self.selected_datasets())
 

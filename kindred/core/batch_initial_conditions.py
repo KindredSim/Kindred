@@ -431,7 +431,7 @@ class BatchSet:
     name: str
     values: Dict[str, str] = field(default_factory=dict)
     set_id: str = field(default_factory=_new_batch_set_id)
-    shown: bool = True
+    requested_show: bool = True
 
 
 class BatchInitialConditionsStore:
@@ -450,7 +450,7 @@ class BatchInitialConditionsStore:
                     str(s.name),
                     dict(s.values),
                     str(getattr(s, "set_id", "") or _new_batch_set_id()),
-                    bool(getattr(s, "shown", True)),
+                    bool(getattr(s, "requested_show", True)),
                 )
                 for s in sets
             ]
@@ -511,18 +511,18 @@ class BatchInitialConditionsStore:
             raise IndexError("row out of range")
         return str(self._sets[int(row)].set_id)
 
-    def is_shown(self, row: int) -> bool:
+    def is_requested_show(self, row: int) -> bool:
         if not (0 <= int(row) < len(self._sets)):
             raise IndexError("row out of range")
-        return bool(self._sets[int(row)].shown)
+        return bool(self._sets[int(row)].requested_show)
 
-    def set_shown(self, row: int, shown: bool) -> None:
+    def set_requested_show(self, row: int, requested_show: bool) -> None:
         if not (0 <= int(row) < len(self._sets)):
             raise IndexError("row out of range")
-        self._sets[int(row)].shown = bool(shown)
+        self._sets[int(row)].requested_show = bool(requested_show)
 
-    def shown_set_ids(self) -> List[str]:
-        return [str(batch.set_id) for batch in self._sets if bool(batch.shown)]
+    def requested_show_set_ids(self) -> List[str]:
+        return [str(batch.set_id) for batch in self._sets if bool(batch.requested_show)]
 
     def set_name_for_row(self, row: int) -> str:
         if not (0 <= int(row) < len(self._sets)):
@@ -703,7 +703,7 @@ class BatchInitialConditionsStore:
                     "set_id": str(s.set_id),
                     "name": s.name,
                     "values": dict(s.values),
-                    "shown": bool(s.shown),
+                    "requested_show": bool(s.requested_show),
                 }
                 for s in self._sets
             ],
@@ -728,7 +728,7 @@ class BatchInitialConditionsStore:
                         name=name,
                         values={str(k): str(v) for k, v in values.items()},
                         set_id=set_id,
-                        shown=bool(entry.get("shown", True)),
+                        requested_show=bool(entry.get("requested_show", True)),
                     )
                 )
         store = cls(sets=sets)

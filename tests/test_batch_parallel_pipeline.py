@@ -10,7 +10,31 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.batch_containment import BatchLaneOutcome
 from kindred.core.batch_parallel import run_batch_simulation_task
-from kindred.gui.controllers.parallel_batch_outcome import resolve_parallel_batch_outcome
+from kindred.core.batch_simulation_cache import BatchSimulationCache
+from kindred.gui.controllers.batch_run_context_owner import BatchContextSeed, BatchRunContextOwner
+from kindred.gui.controllers.parallel_batch_outcome import (
+    ParallelBatchOutcomeDependencies,
+    ParallelBatchOutcomeOwner,
+    resolve_parallel_batch_outcome,
+)
+from kindred.gui.controllers.simulation_completion_publication import (
+    CompletionCallbackState,
+    CompletionResultState,
+    SimulationCompletionPublicationDependencies,
+    SimulationCompletionPublicationOwner,
+)
+from kindred.gui.ports import (
+    CompletedRunDisplayIntent,
+    CompletionDisplayEntry,
+    DisplayEventKind,
+    DisplayRefreshSource,
+    DisplayStatus,
+    DisplayTransitionCause,
+    DisplayTransitionOutcome,
+    DisplayTransitionOutcomeKind,
+    SimulationCompletionDisplayOutcome,
+)
+from tests.workflow_helpers import completion_provenance_payload
 
 pytestmark = [pytest.mark.gui]
 
@@ -52,19 +76,33 @@ class _FakeLanePool:
         self.ready_lane_count = 999
 
     def run(self, task, *, run_id: int, request_id: int, set_id: str, active_timeout_s: float):
+        from kindred.core.simulation_plan import SimulationPlan
+
         _ = active_timeout_s
         args = (dict(task or {}),)
         sub = _Submission(fn=run_batch_simulation_task, args=args, kwargs={}, result_placeholder=None)
         self.submissions.append(sub)
         sid = str(task.get("set_id") or task.get("batch_set_id") or set_id or "")
+        initials = {}
+        plan_payload = task.get("simulation_plan")
+        if isinstance(plan_payload, dict):
+            request = SimulationPlan.from_payload(plan_payload).to_execution_request().to_payload()
+            initials = dict(request.get("initials") or {})
+        species_names = [str(name) for name in initials.keys() if str(name)] or ["A"]
+        y = np.vstack(
+            [
+                np.full(2, self.value_marker + float(index), dtype=float)
+                for index, _species_name in enumerate(species_names)
+            ]
+        )
         payload = {
             "run_id": int(task.get("run_id") or run_id or 0),
             "request_id": int(task.get("request_id") or request_id or 0),
             "set_id": sid,
             "set_name": str(task.get("set_name") or sid or "set"),
             "t": np.array([0.0, 1.0]),
-            "Y": np.array([[self.value_marker, self.value_marker]]),
-            "species_names": ["A"],
+            "Y": y,
+            "species_names": species_names,
             "algebra_scalars": {},
             "mechanism": None,
             "mechanism_text": str(task.get("mechanism_text") or "reaction: A -> B ; k=0.1"),
@@ -100,6 +138,160 @@ class _FakeLanePool:
                 "kill": bool(kill),
             }
         )
+
+
+class _PublicationResultsProbe:
+    def __init__(self) -> None:
+        self.deferred_calls = 0
+        self.deferred_calls_kwargs: list[dict[str, Any]] = []
+        self.unavailable_calls: list[dict[str, Any]] = []
+
+    def publish_deferred_display_request(self, **kwargs: Any) -> SimulationCompletionDisplayOutcome:
+        self.deferred_calls += 1
+        self.deferred_calls_kwargs.append(dict(kwargs))
+        return SimulationCompletionDisplayOutcome(
+            transition_outcome=DisplayTransitionOutcome(
+                kind=DisplayTransitionOutcomeKind.DEFERRED,
+                active_transaction=None,
+                previous_transaction=None,
+                display_status=DisplayStatus.DISPLAY_DEFERRED,
+                requested_show_set_ids=tuple(kwargs.get("requested_show_set_ids") or ()),
+                requested_labels_by_set_id=dict(kwargs.get("requested_labels_by_set_id") or {}),
+                affected_set_ids=tuple(kwargs.get("affected_set_ids") or ()),
+                unresolved_intent_set_ids=tuple(kwargs.get("unresolved_intent_set_ids") or ()),
+                missing_intent_set_ids=tuple(kwargs.get("missing_intent_set_ids") or ()),
+                failed_intent_set_ids=tuple(kwargs.get("failed_intent_set_ids") or ()),
+                semantic_unavailable_set_ids=tuple(kwargs.get("semantic_unavailable_set_ids") or ()),
+                event_kind=DisplayEventKind.SHOW_SCOPE_CHANGED,
+                cause=DisplayTransitionCause.QUEUED_DISPLAY,
+            )
+        )
+
+    def publish_completed_run_display_unavailable(self, **kwargs: Any) -> SimulationCompletionDisplayOutcome:
+        self.unavailable_calls.append(dict(kwargs))
+        return SimulationCompletionDisplayOutcome(
+            transition_outcome=DisplayTransitionOutcome(
+                kind=DisplayTransitionOutcomeKind.FAILED,
+                active_transaction=None,
+                previous_transaction=None,
+                display_status=DisplayStatus.NO_COMPLETE_DISPLAYABLE_REQUEST_SCOPE,
+                requested_show_set_ids=tuple(kwargs.get("requested_show_set_ids") or ()),
+                requested_labels_by_set_id=dict(kwargs.get("requested_labels_by_set_id") or {}),
+                affected_set_ids=tuple(kwargs.get("affected_set_ids") or ()),
+                unresolved_intent_set_ids=tuple(kwargs.get("unresolved_intent_set_ids") or ()),
+                missing_intent_set_ids=tuple(kwargs.get("missing_intent_set_ids") or ()),
+                failed_intent_set_ids=tuple(kwargs.get("failed_intent_set_ids") or ()),
+                semantic_unavailable_set_ids=tuple(kwargs.get("semantic_unavailable_set_ids") or ()),
+                event_kind=DisplayEventKind.COMPLETED_RUN_COVERAGE_UNAVAILABLE,
+                cause=kwargs.get("cause"),
+            )
+        )
+
+    def publish_completed_run_display_transaction(self, transaction: Any) -> SimulationCompletionDisplayOutcome:
+        raise AssertionError(f"unexpected completed-run transaction publication: {transaction!r}")
+
+    def publish_direct_completion_result(self, **kwargs: Any) -> SimulationCompletionDisplayOutcome:
+        raise AssertionError(f"unexpected direct completion publication: {kwargs!r}")
+
+
+class _PublicationUiProbe:
+    def __init__(self, results: _PublicationResultsProbe) -> None:
+        self.results = results
+
+
+class _RunUiProbe:
+    def __init__(self) -> None:
+        self.status_texts: list[str] = []
+        self.progress_values: list[int] = []
+        self.run_enabled: list[bool] = []
+        self.stop_enabled: list[bool] = []
+
+    def set_status_text(self, text: str) -> None:
+        self.status_texts.append(str(text))
+
+    def set_sim_progress_value(self, value: int) -> None:
+        self.progress_values.append(int(value))
+
+    def set_run_button_enabled(self, enabled: bool) -> None:
+        self.run_enabled.append(bool(enabled))
+
+    def set_stop_button_enabled(self, enabled: bool) -> None:
+        self.stop_enabled.append(bool(enabled))
+
+
+class _SliderProbe:
+    def __init__(self) -> None:
+        self.slider_triggered: list[bool] = []
+
+    def set_slider_triggered_simulation(self, value: bool) -> None:
+        self.slider_triggered.append(bool(value))
+
+
+class _ParallelOutcomeUiProbe:
+    def __init__(self) -> None:
+        self.run_ui = _RunUiProbe()
+        self.slider = _SliderProbe()
+
+
+class _BatchCacheProbe:
+    def __init__(self) -> None:
+        self.failure_cache_states: list[dict[str, Any]] = []
+
+    def record_explicit_scoped_failure_cache_state(self, **kwargs: Any) -> None:
+        self.failure_cache_states.append(dict(kwargs))
+
+
+def _publication_dependencies_probe() -> SimulationCompletionPublicationDependencies:
+    return SimulationCompletionPublicationDependencies(
+        apply_lifecycle_effects=lambda **kwargs: None,
+        record_nonfatal_exception=lambda source, exc: None,
+        queue_slider_plot_update=lambda **kwargs: None,
+        finalize_explicit_batch_dirty_reset=lambda **kwargs: {},
+        flush_slider_plot_updates=lambda **kwargs: None,
+        show_scoped_batch_failure_summary=lambda **kwargs: None,
+        has_deferred_preview_replay_intent=lambda: False,
+        start_next_batch_simulation=lambda: None,
+        clear_pending_progress_status=lambda: None,
+    )
+
+
+def _completion_state_for_publication(*, set_id: str, ctx: dict[str, Any]) -> CompletionCallbackState:
+    return CompletionCallbackState(
+        run_id=41,
+        request_id=42,
+        batch_set=f"Set {set_id[-1].upper()}",
+        batch_set_id=set_id,
+        cache_key="publication-in-flight",
+        policy_context=None,
+        ctx=ctx,
+        shutdown_requested=False,
+        is_preview=False,
+        slider_triggered=False,
+        explicit_batch_coalescing=False,
+    )
+
+
+def _completion_result_for_publication() -> CompletionResultState:
+    return CompletionResultState(
+        t=np.array([0.0, 1.0]),
+        Y=np.array([[1.0, 0.5]]),
+        species_names=("A",),
+        algebra_scalars={},
+        algebra_errors=(),
+        solver_provenance={},
+        mechanism=None,
+        base_species_count=1,
+        mechanism_text="reaction: A -> B ; k=0.1",
+        solver_config={},
+        warnings=(),
+        fallback_occurred=False,
+        fallback_message=None,
+        series={"A": np.array([1.0, 0.5])},
+        is_primary=True,
+        energy_mode=False,
+        redraw_valid_set_ids=None,
+        has_redraw_subset=False,
+    )
 
 
 
@@ -175,6 +367,379 @@ def _slider_handle_center(slider: QtWidgets.QSlider) -> QtCore.QPoint:
     )
     return handle.center()
 
+
+
+def _completion_entry(*, set_id: str, label: str, values: tuple[float, float]) -> CompletionDisplayEntry:
+    t = np.asarray([0.0, 1.0], dtype=float)
+    series = {"A": np.asarray(values, dtype=float)}
+    return CompletionDisplayEntry(
+        set_id=set_id,
+        label=label,
+        t=t,
+        series=series,
+        algebra_scalars={},
+        solver_provenance={},
+        mechanism_text="reaction: A -> B ; k=0.1",
+        solver_config={},
+        warnings=(),
+        completion_provenance=completion_provenance_payload(
+            t=t,
+            series=series,
+            mechanism_text="reaction: A -> B ; k=0.1",
+        ),
+        owned_species=("A",),
+    )
+
+
+def test_explicit_result_cache_snapshot_uses_requested_cache_identity():
+    cache = BatchSimulationCache()
+    t = np.asarray([0.0, 1.0], dtype=float)
+    series = {"A": np.asarray([1.0, 0.5], dtype=float)}
+    cache.put_completion_entry(
+        cache_key="requested-cache",
+        set_id="requested-set",
+        is_preview=False,
+        t=t,
+        series=series,
+        mechanism_text="reaction: A -> B ; k=0.1",
+        completion_provenance=completion_provenance_payload(
+            t=t,
+            series=series,
+            mechanism_text="reaction: A -> B ; k=0.1",
+        ),
+        owned_species=("A",),
+    )
+    cache.apply_explicit_cache_reconciliation(
+        clear_active_cache_identity_state=False,
+        active_cache_key="active-cache",
+        active_cache_preview_token=None,
+        active_cache_preview_scope_set_ids=None,
+        active_cache_valid_set_ids=("active-set",),
+        active_cache_invalidated_set_ids=("active-stale",),
+    )
+
+    snapshot = cache.result_cache_read_snapshot(cache_key="requested-cache")
+
+    assert snapshot.cache_key == "requested-cache"
+    assert snapshot.valid_set_ids == ("requested-set",)
+    assert snapshot.invalidated_set_ids == ()
+    assert tuple(entry.set_id for entry in snapshot.entries) == ("requested-set",)
+    assert snapshot.entry_result_for_set("requested-set").state == "valid"
+    assert snapshot.entry_result_for_set("active-set").state == "missing"
+
+
+def test_completed_run_coverage_displays_completed_siblings_when_another_run_target_failed():
+    owner = BatchRunContextOwner()
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=("set-a", "set-b", "set-c"),
+        labels_by_set_id={"set-a": "Set A", "set-b": "Set B", "set-c": "Set C"},
+        primary_set_id="set-a",
+        cache_key="mixed-completion",
+        run_id=7,
+        request_id=8,
+        owned_species_by_set_id={"set-a": ("A",), "set-b": ("A",), "set-c": ("A",)},
+        run_target_set_ids=("set-a", "set-b"),
+    )
+    owner.load_context(
+        BatchContextSeed(
+            active=True,
+            run_id=7,
+            request_id=8,
+            cache_key="mixed-completion",
+            queue_ids=("set-a", "set-b"),
+            queue_names=("Set A", "Set B"),
+            failed_set_ids=("set-b",),
+            completed_run_display_intent=intent,
+        )
+    )
+    owner.record_completion_display_entry(
+        None,
+        set_id="set-a",
+        label="Set A",
+        entry=_completion_entry(set_id="set-a", label="Set A", values=(1.0, 0.4)),
+    )
+
+    coverage = owner.completed_run_display_coverage()
+
+    assert coverage.transaction is not None
+    assert coverage.transaction.display_set_ids == ("set-a",)
+    assert coverage.transaction.failed_set_ids == ("set-b",)
+    assert coverage.transaction.unresolved_intent_set_ids == ("set-b", "set-c")
+    assert coverage.transaction.failed_intent_set_ids == ("set-b",)
+    assert coverage.cause is None
+
+
+def test_completed_run_coverage_waits_for_in_flight_run_target_before_display():
+    owner = BatchRunContextOwner()
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=("set-a", "set-b"),
+        labels_by_set_id={"set-a": "Set A", "set-b": "Set B"},
+        primary_set_id="set-a",
+        cache_key="in-flight-completion",
+        run_id=17,
+        request_id=18,
+        owned_species_by_set_id={"set-a": ("A",), "set-b": ("A",)},
+        run_target_set_ids=("set-a", "set-b"),
+    )
+    owner.load_context(
+        BatchContextSeed(
+            active=True,
+            run_id=17,
+            request_id=18,
+            cache_key="in-flight-completion",
+            queue_ids=("set-a", "set-b"),
+            queue_names=("Set A", "Set B"),
+            completed_run_display_intent=intent,
+        )
+    )
+    owner.record_completion_display_entry(
+        None,
+        set_id="set-a",
+        label="Set A",
+        entry=_completion_entry(set_id="set-a", label="Set A", values=(1.0, 0.4)),
+    )
+
+    coverage = owner.completed_run_display_coverage()
+
+    assert coverage.transaction is None
+    assert coverage.missing_set_ids == ("set-b",)
+    assert coverage.unresolved_intent_set_ids == ("set-b",)
+    assert coverage.cause is DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
+
+
+def test_completed_run_coverage_publishes_terminal_success_with_missing_run_target():
+    owner = BatchRunContextOwner()
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=("set-a", "set-b"),
+        labels_by_set_id={"set-a": "Set A", "set-b": "Set B"},
+        primary_set_id="set-a",
+        cache_key="terminal-missing-completion",
+        run_id=21,
+        request_id=22,
+        owned_species_by_set_id={"set-a": ("A",), "set-b": ("A",)},
+        run_target_set_ids=("set-a", "set-b"),
+    )
+    owner.load_context(
+        BatchContextSeed(
+            active=False,
+            run_id=21,
+            request_id=22,
+            cache_key="terminal-missing-completion",
+            queue_ids=("set-a", "set-b"),
+            queue_names=("Set A", "Set B"),
+            completed_run_display_intent=intent,
+        )
+    )
+    owner.record_completion_display_entry(
+        None,
+        set_id="set-a",
+        label="Set A",
+        entry=_completion_entry(set_id="set-a", label="Set A", values=(1.0, 0.4)),
+    )
+
+    coverage = owner.completed_run_display_coverage()
+
+    assert coverage.transaction is not None
+    assert coverage.transaction.display_set_ids == ("set-a",)
+    assert coverage.transaction.missing_intent_set_ids == ("set-b",)
+    assert coverage.transaction.unresolved_intent_set_ids == ("set-b",)
+    assert coverage.cause is None
+
+
+def test_parallel_scoped_failure_finalizes_completed_subset_after_terminal_failure():
+    owner = BatchRunContextOwner()
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=("set-a", "set-b"),
+        labels_by_set_id={"set-a": "Set A", "set-b": "Set B"},
+        primary_set_id="set-a",
+        cache_key="terminal-scoped-failure",
+        run_id=23,
+        request_id=24,
+        owned_species_by_set_id={"set-a": ("A",), "set-b": ("A",)},
+        run_target_set_ids=("set-a", "set-b"),
+    )
+    owner.load_context(
+        BatchContextSeed(
+            active=True,
+            parallel=True,
+            run_id=23,
+            request_id=24,
+            cache_key="terminal-scoped-failure",
+            queue_ids=("set-a", "set-b"),
+            queue_names=("Set A", "Set B"),
+            total=2,
+            completed_set_ids=("set-a",),
+            completed_run_display_intent=intent,
+        )
+    )
+    owner.record_completion_display_entry(
+        None,
+        set_id="set-a",
+        label="Set A",
+        entry=_completion_entry(set_id="set-a", label="Set A", values=(1.0, 0.4)),
+    )
+    finalized_transactions = []
+
+    def _finalize(ctx):
+        coverage = owner.completed_run_display_coverage(ctx)
+        assert coverage.transaction is not None
+        finalized_transactions.append(coverage.transaction)
+        return DisplayTransitionOutcome(
+            kind=DisplayTransitionOutcomeKind.PUBLISHED,
+            active_transaction=None,
+            previous_transaction=None,
+            display_status=DisplayStatus.DISPLAYED_COMPLETED_RUN,
+            requested_show_set_ids=coverage.transaction.intent.requested_show_set_ids,
+            display_set_ids=coverage.transaction.display_set_ids,
+            attempted_display_set_ids=coverage.transaction.display_set_ids,
+            failed_intent_set_ids=coverage.transaction.failed_intent_set_ids,
+            missing_intent_set_ids=coverage.transaction.missing_intent_set_ids,
+            unresolved_intent_set_ids=coverage.transaction.unresolved_intent_set_ids,
+        )
+
+    cache = _BatchCacheProbe()
+    ui = _ParallelOutcomeUiProbe()
+    owner_under_test = ParallelBatchOutcomeOwner(
+        ui=ui,
+        batch_parallel=object(),
+        batch_context_owner=owner,
+        batch_cache=cache,
+        completion_callback_owner=object(),
+        error_handling_owner=object(),
+        dependencies=ParallelBatchOutcomeDependencies(
+            freshness=object(),
+            record_nonfatal_exception=lambda *args, **kwargs: None,
+            invalidate_preserved_pending_init_results_after_failed_run=lambda **kwargs: None,
+            finalize_scoped_batch_success_subset=_finalize,
+            cleanup_parallel_batch_lane_pool_after_run=lambda **kwargs: None,
+            show_scoped_batch_failure_summary=lambda **kwargs: None,
+            apply_explicit_failure_pending_replay_policy=lambda **kwargs: None,
+            reset_parallel_batch_run_and_shutdown_lane_pool=lambda **kwargs: None,
+            set_simulation_running=lambda value: None,
+            set_slider_simulation_active=lambda value: None,
+        ),
+    )
+
+    handled = owner_under_test.handle_scoped_failure(
+        set_id="set-b",
+        set_name="Set B",
+        error_payload={"message": "boom"},
+    )
+
+    assert handled is True
+    assert len(finalized_transactions) == 1
+    transaction = finalized_transactions[0]
+    assert transaction.display_set_ids == ("set-a",)
+    assert transaction.failed_intent_set_ids == ("set-b",)
+    assert transaction.unresolved_intent_set_ids == ("set-b",)
+    assert owner.completion_policy_context().active is False
+    assert ui.run_ui.progress_values[-1] == 100
+
+
+def test_completed_run_coverage_waits_when_semantic_unavailable_sibling_still_in_flight():
+    owner = BatchRunContextOwner()
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=("set-a", "set-b"),
+        labels_by_set_id={"set-a": "Set A", "set-b": "Set B"},
+        primary_set_id="set-a",
+        cache_key="semantic-in-flight-completion",
+        run_id=19,
+        request_id=20,
+        owned_species_by_set_id={"set-a": ("A",), "set-b": ("A",)},
+        run_target_set_ids=("set-a", "set-b"),
+    )
+    owner.load_context(
+        BatchContextSeed(
+            active=True,
+            run_id=19,
+            request_id=20,
+            cache_key="semantic-in-flight-completion",
+            queue_ids=("set-a", "set-b"),
+            queue_names=("Set A", "Set B"),
+            completed_run_display_intent=intent,
+        )
+    )
+    owner.record_completion_display_unavailable(
+        None,
+        set_id="set-a",
+        cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+    )
+
+    coverage = owner.completed_run_display_coverage()
+
+    assert coverage.transaction is None
+    assert coverage.missing_set_ids == ("set-b",)
+    assert coverage.semantic_unavailable_set_ids == ("set-a",)
+    assert coverage.unresolved_intent_set_ids == ("set-a", "set-b")
+    assert coverage.cause is DisplayTransitionCause.IN_FLIGHT_COVERAGE_UNAVAILABLE
+
+
+def test_completed_run_publication_defers_in_flight_request_instead_of_unavailable():
+    owner = BatchRunContextOwner()
+    intent = CompletedRunDisplayIntent(
+        requested_show_set_ids=("set-a", "set-b"),
+        labels_by_set_id={"set-a": "Set A", "set-b": "Set B"},
+        primary_set_id="set-a",
+        cache_key="publication-in-flight",
+        run_id=41,
+        request_id=42,
+        owned_species_by_set_id={"set-a": ("A",), "set-b": ("A",)},
+        run_target_set_ids=("set-a", "set-b"),
+    )
+    owner.load_context(
+        BatchContextSeed(
+            active=True,
+            parallel=True,
+            run_id=41,
+            request_id=42,
+            cache_key="publication-in-flight",
+            queue_ids=("set-a", "set-b"),
+            queue_names=("Set A", "Set B"),
+            completed_run_display_intent=intent,
+        )
+    )
+    owner.record_completion_display_unavailable(
+        None,
+        set_id="set-a",
+        cause=DisplayTransitionCause.SEMANTIC_METADATA_UNAVAILABLE,
+    )
+    ctx = owner._current_context()
+    results = _PublicationResultsProbe()
+    publication = SimulationCompletionPublicationOwner(
+        ui=_PublicationUiProbe(results),
+        batch_context_owner=owner,
+        batch_cache=object(),
+        cache_admin=object(),
+        completion_policy=object(),
+        lifecycle_effect_owner=object(),
+        result_materialization_owner=object(),
+        dependencies=_publication_dependencies_probe(),
+    )
+
+    outcome = publication.publish_display(
+        _completion_result_for_publication(),
+        _completion_state_for_publication(set_id="set-a", ctx=ctx),
+    )
+
+    assert results.deferred_calls == 1
+    assert results.unavailable_calls == []
+    assert results.deferred_calls_kwargs == [
+        {
+            "affected_set_ids": ("set-a", "set-b"),
+            "requested_show_set_ids": ("set-a", "set-b"),
+            "requested_labels_by_set_id": {"set-a": "Set A", "set-b": "Set B"},
+            "unresolved_intent_set_ids": ("set-a", "set-b"),
+            "missing_intent_set_ids": ("set-b",),
+            "failed_intent_set_ids": (),
+            "semantic_unavailable_set_ids": ("set-a",),
+        }
+    ]
+    assert outcome.transition_outcome is not None
+    assert outcome.transition_outcome.kind is DisplayTransitionOutcomeKind.DEFERRED
+    assert outcome.transition_outcome.requested_show_set_ids == ("set-a", "set-b")
+    assert outcome.transition_outcome.unresolved_intent_set_ids == ("set-a", "set-b")
+    assert outcome.transition_outcome.missing_intent_set_ids == ("set-b",)
+    assert outcome.transition_outcome.semantic_unavailable_set_ids == ("set-a",)
 
 
 def test_fast_parallel_preview_accepts_lane_epoch_distinct_from_preview_epoch():
@@ -302,6 +867,116 @@ def test_parallel_pipeline_submits_all_sets_without_serial_wait(main_window, mon
     qtbot.wait(40)
 
     assert len(_simulation_submissions(fake)) == len(names)
+
+
+def test_run_selected_completed_display_ignores_unrun_requested_show_rows(main_window, monkeypatch, qtbot):
+    names = _prime_three_m1_batch_sets(main_window)
+    selected_set_ids = tuple(str(main_window.batch_set_id_for_row(row) or "") for row in (0, 1))
+    unrun_requested_show_id = str(main_window.batch_set_id_for_row(2) or "")
+    assert all(selected_set_ids)
+    assert unrun_requested_show_id
+    for row in (0, 1, 2):
+        main_window._batch_model.set_row_requested_show(row, True)
+    assert set(main_window.requested_show_batch_set_ids()) == {
+        *selected_set_ids,
+        unrun_requested_show_id,
+    }
+    _select_rows(main_window, [0, 1])
+    monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
+
+    fake = _FakeLanePool(done_immediately=True, value_marker=4.0)
+
+    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
+    monkeypatch.setattr(
+        main_window.simulation_controller.parallel_batch,
+        "lane_pool_factory",
+        lambda max_workers, limit_blas_threads: fake,
+        raising=True,
+    )
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
+
+    main_window.simulation_controller.run_simulation()
+    _wait_for_submission_count(fake, len(selected_set_ids))
+    qtbot.waitUntil(
+        lambda: not main_window.simulation_controller.simulation_running,
+        timeout=3000,
+    )
+
+    active = main_window.results_controller.active_display_transaction()
+    assert active is not None, main_window._status_text_value()
+    assert set(main_window.requested_show_batch_set_ids()) == {
+        *selected_set_ids,
+        unrun_requested_show_id,
+    }
+    transition = main_window.results_controller._last_display_transition_outcome
+    assert transition is not None
+    assert transition.requested_show_set_ids == (
+        *selected_set_ids,
+        unrun_requested_show_id,
+    )
+    assert active.display_set_ids == selected_set_ids
+    assert unrun_requested_show_id not in active.display_set_ids
+    assert active.status is DisplayStatus.DISPLAYED_COMPLETED_RUN
+
+
+def test_run_hidden_computed_set_later_shows_from_cache_with_owned_species(main_window, monkeypatch, qtbot):
+    names = _prime_three_m1_batch_sets(main_window)
+    displayed_set_id = str(main_window.batch_set_id_for_row(0) or "")
+    hidden_computed_set_id = str(main_window.batch_set_id_for_row(1) or "")
+    assert displayed_set_id
+    assert hidden_computed_set_id
+    main_window._batch_model.set_row_requested_show(0, True)
+    main_window._batch_model.set_row_requested_show(1, False)
+    main_window._batch_model.set_row_requested_show(2, False)
+    _select_rows(main_window, [0, 1])
+    monkeypatch.setattr("kindred.core.batch_parallel.os.cpu_count", lambda: 8)
+
+    fake = _FakeLanePool(done_immediately=True, value_marker=5.0)
+
+    monkeypatch.setattr(main_window.simulation_controller.parallel_batch, "max_parallel_workers", 12, raising=True)
+    monkeypatch.setattr(
+        main_window.simulation_controller.parallel_batch,
+        "lane_pool_factory",
+        lambda max_workers, limit_blas_threads: fake,
+        raising=True,
+    )
+    main_window.simulation_controller.parallel_batch.ensure_lane_pool(max_lanes=len(names))
+    main_window._simulation_run_ui_owner.set_runtime_backed_run_controls_ready(True)
+
+    main_window.simulation_controller.run_simulation()
+    _wait_for_submission_count(fake, 2)
+    qtbot.waitUntil(
+        lambda: not main_window.simulation_controller.simulation_running,
+        timeout=3000,
+    )
+
+    cache = main_window.simulation_controller.batch_cache
+    cache_key = str(cache.active_cache_key or "")
+    assert cache_key
+    cached_hidden = cache.entry_for_set(
+        cache_key=cache_key,
+        set_id=hidden_computed_set_id,
+        is_preview=False,
+        require_completion_provenance=True,
+    ).entry
+    assert isinstance(cached_hidden, dict)
+    assert tuple(cached_hidden.get("owned_species") or ()) == ("A", "B")
+
+    main_window._batch_model.set_row_requested_show(0, False)
+    main_window._batch_model.set_row_requested_show(1, True)
+    outcome = main_window.results_controller.refresh_display_from_request_scope(
+        display_source=DisplayRefreshSource.EXPLICIT_SHOW_REQUEST,
+    )
+
+    assert outcome.transition_outcome is not None
+    assert outcome.transition_outcome.kind is DisplayTransitionOutcomeKind.PUBLISHED
+    active = main_window.results_controller.active_display_transaction()
+    assert active is not None, main_window._status_text_value()
+    assert active.display_set_ids == (hidden_computed_set_id,)
+    metadata = active.sets[f"result:{hidden_computed_set_id}"]
+    assert metadata.owned_species == ("A", "B")
+    assert len(fake.submissions) == 2
 
 
 
