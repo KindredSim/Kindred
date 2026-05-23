@@ -1,26 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 from typing import Any, Mapping
 
 from .backend import SymbolicBackendMetadata
+from .errors import UnsupportedSymbolicExpressionError
+from .identity import normalize_symbolic_identity_mapping, symbolic_fingerprint
 
 
 SYMBOLIC_JACOBIAN_IDENTITY_ATTR = "_kindred_symbolic_jacobian_identity"
 
 
-def _fingerprint(payload: Mapping[str, object]) -> str:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
 def symbolic_jacobian_identity_payload(value: object) -> dict[str, Any] | None:
     payload = getattr(value, SYMBOLIC_JACOBIAN_IDENTITY_ATTR, None)
-    if not isinstance(payload, Mapping):
+    if payload is None:
         return None
-    return {str(key): item for key, item in payload.items()}
+    if not isinstance(payload, Mapping):
+        raise UnsupportedSymbolicExpressionError("Symbolic Jacobian identity payload must be a JSON-safe mapping.")
+    return normalize_symbolic_identity_mapping(payload, label="Symbolic Jacobian identity payload")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +56,7 @@ class SymbolicArtifactIdentity:
             structure_fingerprint="",
             evaluation_snapshot_fingerprint="",
             parameter_symbols=(),
-            fingerprint=_fingerprint(payload),
+            fingerprint=symbolic_fingerprint(payload),
         )
 
     @classmethod
@@ -95,7 +92,7 @@ class SymbolicArtifactIdentity:
             structure_fingerprint=str(structure_fingerprint or source_fingerprint or ""),
             evaluation_snapshot_fingerprint=str(evaluation_snapshot_fingerprint or ""),
             parameter_symbols=normalized_parameter_symbols,
-            fingerprint=_fingerprint(payload),
+            fingerprint=symbolic_fingerprint(payload),
         )
 
     def to_payload(self) -> dict[str, str]:

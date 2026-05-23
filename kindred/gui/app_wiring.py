@@ -132,12 +132,20 @@ ANALYSIS_DOCK_SPEC = DockShellSpec(
     object_name="analysisDock",
     default_area=QtCore.Qt.RightDockWidgetArea,
 )
+SYMBOLIC_CALCULATOR_DOCK_SPEC = DockShellSpec(
+    identity_key="symbolic_calculator",
+    attr_name="_symbolic_calculator_dock",
+    title="Symbolic Calculator",
+    object_name="symbolicCalculatorDock",
+    default_area=QtCore.Qt.RightDockWidgetArea,
+)
 _DOCK_SHELL_SPECS: tuple[DockShellSpec, ...] = (
     MECHANISM_DOCK_SPEC,
     SLIDERS_DOCK_SPEC,
     BATCH_DOCK_SPEC,
     RIGHT_DOCK_SPEC,
     ANALYSIS_DOCK_SPEC,
+    SYMBOLIC_CALCULATOR_DOCK_SPEC,
 )
 
 
@@ -465,6 +473,18 @@ def build_bottom_analysis_dock(
         parent=main_window,
     )
     return BottomDockComponents(dock=dock, container=container)
+
+
+def build_symbolic_calculator_dock(
+    main_window: MainWindow,
+    *,
+    panel: QWidget,
+) -> PanelDockComponents:
+    return build_module_dock(
+        main_window,
+        spec=SYMBOLIC_CALCULATOR_DOCK_SPEC,
+        panel=panel,
+    )
 
 
 def build_module_dock(

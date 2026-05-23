@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 from typing import Mapping
 
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, ParameterAssignment
 
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
+from .identity import symbolic_fingerprint
 from .namespaces import SymbolicProductIdentityProofContext, make_product_identity_proof_context
 from .parameter_expression import translate_parameter_expression
 
@@ -19,11 +18,6 @@ class SymbolicProofResult:
     reason: str
     fingerprint: str
     symbol_context: dict[str, object]
-
-
-def _fingerprint(payload: Mapping[str, object]) -> str:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
 def _assignment_sources(assignments: Mapping[str, ParameterAssignment]) -> dict[str, dict[str, object]]:
@@ -92,7 +86,7 @@ def prove_product_identity(
             }
         )
     except UnsupportedSymbolicExpressionError:
-        fingerprint = _fingerprint(
+        fingerprint = symbolic_fingerprint(
             {
                 "candidate": str(candidate.name),
                 "expr_src": str(candidate.expr_src),
@@ -115,7 +109,7 @@ def prove_product_identity(
             target_expr *= factor ** exponent
         simplified = sympy.simplify(target_expr - 1)
     except UnsupportedSymbolicExpressionError:
-        fingerprint = _fingerprint(
+        fingerprint = symbolic_fingerprint(
             {
                 "candidate": candidate_name,
                 "expr_fingerprint": translated.fingerprint,
@@ -129,7 +123,7 @@ def prove_product_identity(
         return SymbolicProofResult(proven=False, reason="unsupported", fingerprint=fingerprint, symbol_context=proof_context_payload)
     proven = bool(simplified == 0)
     reason = "identity" if proven else "not_identity"
-    fingerprint = _fingerprint(
+    fingerprint = symbolic_fingerprint(
         {
             "candidate": candidate_name,
             "expr_fingerprint": translated.fingerprint,

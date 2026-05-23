@@ -11,6 +11,7 @@ from kindred.core.runtime_defaults import (
     USE_SPARSE_JACOBIAN_DEFAULT,
     WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
 )
+from kindred.core.symbolic.identity import normalize_symbolic_identity_mapping
 
 __all__ = [
     "SimulationIdentity",
@@ -32,7 +33,7 @@ def _try_float(value: object, default: float) -> float:
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return serialized.encode("utf-8", "ignore")
 
 
@@ -337,6 +338,24 @@ class SimulationIdentity:
     symbolic_wegscheider_identity: Optional[dict[str, Any]] = None
     version: int = 2
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "symbolic_jacobian_identity",
+            normalize_symbolic_identity_mapping(
+                self.symbolic_jacobian_identity,
+                label="symbolic Jacobian identity",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "symbolic_wegscheider_identity",
+            normalize_symbolic_identity_mapping(
+                self.symbolic_wegscheider_identity,
+                label="symbolic Wegscheider identity",
+            ),
+        )
+
     @classmethod
     def build(
         cls,
@@ -355,15 +374,13 @@ class SimulationIdentity:
         flags = tuple(sorted({str(flag) for flag in (execution_flags or ()) if str(flag)}))
         solver_identity = SimulationSolverIdentity.from_solver_config(solver_config)
         intervention_fp = str(intervention_schedule_fingerprint or "")
-        symbolic_identity = (
-            dict(symbolic_jacobian_identity) or None
-            if isinstance(symbolic_jacobian_identity, Mapping)
-            else None
+        symbolic_identity = normalize_symbolic_identity_mapping(
+            symbolic_jacobian_identity,
+            label="symbolic Jacobian identity",
         )
-        wegscheider_identity = (
-            dict(symbolic_wegscheider_identity) or None
-            if isinstance(symbolic_wegscheider_identity, Mapping)
-            else None
+        wegscheider_identity = normalize_symbolic_identity_mapping(
+            symbolic_wegscheider_identity,
+            label="symbolic Wegscheider identity",
         )
         return cls(
             schema_id=str(schema_id or ""),
@@ -395,15 +412,13 @@ class SimulationIdentity:
             intervention_schedule_fingerprint=str(payload.get("intervention_schedule_fingerprint") or ""),
             preview_batch_cache_token=str(payload.get("preview_batch_cache_token") or ""),
             execution_flags=tuple(str(flag) for flag in (payload.get("execution_flags") or ()) if str(flag)),
-            symbolic_jacobian_identity=(
-                dict(payload.get("symbolic_jacobian_identity") or {})
-                if isinstance(payload.get("symbolic_jacobian_identity"), Mapping)
-                else None
+            symbolic_jacobian_identity=normalize_symbolic_identity_mapping(
+                payload.get("symbolic_jacobian_identity"),
+                label="symbolic Jacobian identity",
             ),
-            symbolic_wegscheider_identity=(
-                dict(payload.get("symbolic_wegscheider_identity") or {})
-                if isinstance(payload.get("symbolic_wegscheider_identity"), Mapping)
-                else None
+            symbolic_wegscheider_identity=normalize_symbolic_identity_mapping(
+                payload.get("symbolic_wegscheider_identity"),
+                label="symbolic Wegscheider identity",
             ),
         )
 

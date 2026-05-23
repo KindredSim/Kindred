@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from fractions import Fraction
-import hashlib
-import json
 from math import gcd
 from functools import reduce
 import re
@@ -19,6 +17,7 @@ from kindred.core.simulator.parameter_algebra_spec import (
 )
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.symbolic.backend import get_symbolic_backend_metadata
+from kindred.core.symbolic.identity import symbolic_fingerprint
 from kindred.core.symbolic.proof import prove_product_identity
 
 __all__ = [
@@ -93,40 +92,18 @@ class WegscheiderCyclicityReport:
             "kind": "wegscheider_cyclicity_source",
             "cycles": source_cycles_payload,
         }
-        payload["source_fingerprint"] = hashlib.sha256(
-            json.dumps(
-                source_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-        payload["artifact_fingerprint"] = hashlib.sha256(
-            json.dumps(
-                {
-                    "kind": "wegscheider_cyclicity_proof",
-                    "resolved": bool(self.is_resolved),
-                    "proof_fingerprints": [
-                        item.get("proof_fingerprint")
-                        for item in cycles_payload
-                    ],
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-        payload["fingerprint"] = hashlib.sha256(
-            json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
+        payload["source_fingerprint"] = symbolic_fingerprint(source_payload)
+        payload["artifact_fingerprint"] = symbolic_fingerprint(
+            {
+                "kind": "wegscheider_cyclicity_proof",
+                "resolved": bool(self.is_resolved),
+                "proof_fingerprints": [
+                    item.get("proof_fingerprint")
+                    for item in cycles_payload
+                ],
+            }
+        )
+        payload["fingerprint"] = symbolic_fingerprint(payload)
         return payload
 
 

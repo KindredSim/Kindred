@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 import math
 from typing import Any, Callable, Mapping
 
@@ -24,6 +22,7 @@ from kindred.core.simulator.parameter_namespace import (
 from .artifacts import SYMBOLIC_JACOBIAN_IDENTITY_ATTR, SymbolicArtifactIdentity
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
+from .identity import symbolic_fingerprint
 from .namespaces import make_evaluation_snapshot_context, make_state_symbol_context, symbolic_status_payload
 
 
@@ -87,6 +86,17 @@ class SymbolicJacobianStructure:
             state_symbol_context=dict(self.state_symbol_context),
             evaluation_snapshot_context=snapshot_context,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _SymbolicMechanismExpressionModel:
+    species_names: tuple[str, ...]
+    parameter_symbols: tuple[str, ...]
+    rhs_expressions: tuple[Any, ...]
+    jacobian_expressions: tuple[tuple[Any, ...], ...]
+    state_symbols: tuple[Any, ...]
+    state_symbol_context: Mapping[str, Any]
+    support_payload: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,34 +198,6 @@ def _canonical_step_parameter_name(
     return canonical_name
 
 
-def _canonical_json(payload: object) -> bytes:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-    return data.encode("utf-8")
-
-
-def _fingerprint(payload: object) -> str:
-    return hashlib.sha256(_canonical_json(payload)).hexdigest()
-
-
-def _source_identity_payload(mechanism: Mechanism, species_names: tuple[str, ...]) -> dict[str, Any]:
-    if not hasattr(mechanism, "to_serializable"):
-        raise UnsupportedSymbolicExpressionError(
-            "Symbolic Jacobian requires a serializable Kindred mechanism."
-        )
-    serializable = mechanism.to_serializable()
-    mechanism_payload = dict(serializable or {})
-    species_payload = mechanism_payload.get("species")
-    if isinstance(species_payload, Mapping):
-        mechanism_payload["species"] = {
-            str(name): {}
-            for name in species_payload.keys()
-        }
-    return {
-        "species_names": species_names,
-        "mechanism": mechanism_payload,
-    }
-
-
 def _finite_scalar(value: object, *, label: str) -> float:
     if isinstance(value, RateBinding):
         value = value()
@@ -242,6 +224,12 @@ def _coerce_snapshot_values(
             raise UnsupportedSymbolicExpressionError(f"Missing symbolic parameter value for {name!r}.")
         out.append((name, _finite_scalar(raw, label=f"symbolic parameter {name}")))
     return tuple(out)
+
+
+def _stoichiometric_coefficient_expr(sympy: Any, coeff: float, *, exact: bool) -> Any:
+    if bool(exact):
+        return sympy.Rational(str(float(coeff)))
+    return sympy.Float(float(coeff))
 
 
 def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, object]) -> Any:
@@ -574,7 +562,7 @@ def _structure_identity_payload(
         "parameter_symbols": list(parameter_symbols),
         "reactions": reactions_payload,
         "equilibria": equilibria_payload,
-        "symbolic_support": dict(support_payload),
+        "symbolic_support": support_payload,
     }
 
 
@@ -650,10 +638,14 @@ def symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism: Mechanism) 
     if not species_names:
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
     parameter_symbols = _structure_parameter_symbols(mechanism)
-    return _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols, support.payload))
+    return symbolic_fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols, support.payload))
 
 
-def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
+def _build_symbolic_mechanism_expression_model(
+    mechanism: Mechanism,
+    *,
+    exact_stoichiometric_coefficients: bool = False,
+) -> _SymbolicMechanismExpressionModel:
     support = classify_symbolic_jacobian_support(mechanism)
     support.raise_if_unsupported()
     sympy = require_sympy()
@@ -666,7 +658,7 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
     if not species_names:
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
     state_context = make_state_symbol_context(species_names)
-    state_symbols = tuple(sympy.Symbol(name) for name in state_context.symbol_names)
+    state_symbols = tuple(sympy.Dummy(name) for name in state_context.symbol_names)
     symbol_by_species = dict(zip(species_names, state_symbols))
     registry = _ParameterRegistry(sympy)
     rhs = [sympy.Integer(0) for _name in species_names]
@@ -682,7 +674,11 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
             reaction_index=reaction_index,
         )
         for species_name, coeff in getattr(rxn, "net_stoich", {}).items():
-            rhs[species_index[str(species_name)]] += sympy.Float(float(coeff)) * rate_expr
+            rhs[species_index[str(species_name)]] += _stoichiometric_coefficient_expr(
+                sympy,
+                float(coeff),
+                exact=bool(exact_stoichiometric_coefficients),
+            ) * rate_expr
 
     for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
         rate_expr = _equilibrium_rate_expr(
@@ -698,15 +694,59 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
                 getattr(eq, "stoich_forward", {}).get(species_name, 0.0)
             )
             if coeff:
-                rhs[species_index[species_name]] += sympy.Float(coeff) * rate_expr
+                rhs[species_index[species_name]] += _stoichiometric_coefficient_expr(
+                    sympy,
+                    coeff,
+                    exact=bool(exact_stoichiometric_coefficients),
+                ) * rate_expr
 
     rhs_matrix = sympy.Matrix(rhs)
     jacobian_matrix = rhs_matrix.jacobian(sympy.Matrix(state_symbols))
-    rhs_strings = tuple(str(sympy.simplify(expr)) for expr in rhs_matrix)
-    jacobian_strings = tuple(tuple(str(sympy.simplify(jacobian_matrix[i, j])) for j in range(len(species_names))) for i in range(len(species_names)))
     parameter_symbols = registry.parameter_names
-    structure_fingerprint = _fingerprint(_structure_identity_payload(mechanism, species_names, parameter_symbols, support.payload))
-    artifact_fingerprint = _fingerprint(
+    return _SymbolicMechanismExpressionModel(
+        species_names=species_names,
+        parameter_symbols=parameter_symbols,
+        rhs_expressions=tuple(sympy.simplify(expr) for expr in rhs_matrix),
+        jacobian_expressions=tuple(
+            tuple(sympy.simplify(jacobian_matrix[i, j]) for j in range(len(species_names)))
+            for i in range(len(species_names))
+        ),
+        state_symbols=state_symbols,
+        state_symbol_context=state_context.to_payload(),
+        support_payload=support.payload,
+    )
+
+
+def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianStructure:
+    sympy = require_sympy()
+    model = _build_symbolic_mechanism_expression_model(
+        mechanism,
+        exact_stoichiometric_coefficients=False,
+    )
+    species_names = model.species_names
+    state_symbols = model.state_symbols
+    rhs_matrix = sympy.Matrix(model.rhs_expressions)
+    jacobian_matrix = sympy.Matrix(model.jacobian_expressions)
+    public_state_symbols = tuple(
+        sympy.Symbol(str(name))
+        for name in model.state_symbol_context.get("symbol_names", ())
+    )
+    if len(public_state_symbols) != len(state_symbols):
+        raise UnsupportedSymbolicExpressionError("Symbolic Jacobian state symbol context is inconsistent.")
+    public_symbol_by_internal = dict(zip(state_symbols, public_state_symbols))
+    rhs_strings = tuple(str(sympy.simplify(expr).xreplace(public_symbol_by_internal)) for expr in rhs_matrix)
+    jacobian_strings = tuple(
+        tuple(
+            str(sympy.simplify(jacobian_matrix[i, j]).xreplace(public_symbol_by_internal))
+            for j in range(len(species_names))
+        )
+        for i in range(len(species_names))
+    )
+    parameter_symbols = model.parameter_symbols
+    structure_fingerprint = symbolic_fingerprint(
+        _structure_identity_payload(mechanism, species_names, parameter_symbols, model.support_payload)
+    )
+    artifact_fingerprint = symbolic_fingerprint(
         {
             "rhs": rhs_strings,
             "jacobian": jacobian_strings,
@@ -723,7 +763,7 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         structure_fingerprint=structure_fingerprint,
         artifact_fingerprint=artifact_fingerprint,
         _compiled=compiled,
-        state_symbol_context=state_context.to_payload(),
+        state_symbol_context=model.state_symbol_context,
     )
 
 

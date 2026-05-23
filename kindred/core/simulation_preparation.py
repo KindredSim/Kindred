@@ -46,6 +46,7 @@ from kindred.core.simulator.solvers import (
     solve_ode,
 )
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
+from kindred.core.symbolic.identity import normalize_symbolic_identity_mapping
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.symbolic.namespaces import symbolic_status_payload
 from kindred.core.symbolic.structure_cache import (
@@ -536,6 +537,24 @@ class PreparedSimulationMetadata:
     symbolic_jacobian_status: Optional[Dict[str, Any]] = None
     symbolic_wegscheider_identity: Optional[Dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "symbolic_jacobian_identity",
+            normalize_symbolic_identity_mapping(
+                self.symbolic_jacobian_identity,
+                label="symbolic Jacobian identity",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "symbolic_wegscheider_identity",
+            normalize_symbolic_identity_mapping(
+                self.symbolic_wegscheider_identity,
+                label="symbolic Wegscheider identity",
+            ),
+        )
+
     def to_serializable_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "version": int(self.version),
@@ -606,21 +625,13 @@ class PreparedSimulationMetadata:
             ),
             initial_prefix=str(meta.get("initial_prefix") or ""),
             intervention_schedule_fingerprint=str(meta.get("intervention_schedule_fingerprint") or ""),
-            symbolic_jacobian_identity=(
-                dict(meta.get("symbolic_jacobian_identity") or {})
-                if isinstance(meta.get("symbolic_jacobian_identity"), Mapping)
-                else None
-            ),
+            symbolic_jacobian_identity=meta.get("symbolic_jacobian_identity"),
             symbolic_jacobian_status=(
                 dict(meta.get("symbolic_jacobian_status") or {})
                 if isinstance(meta.get("symbolic_jacobian_status"), Mapping)
                 else None
             ),
-            symbolic_wegscheider_identity=(
-                dict(meta.get("symbolic_wegscheider_identity") or {})
-                if isinstance(meta.get("symbolic_wegscheider_identity"), Mapping)
-                else None
-            ),
+            symbolic_wegscheider_identity=meta.get("symbolic_wegscheider_identity"),
         )
 
 

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ast
-import hashlib
-import json
 from typing import Any
 
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, ParameterAssignment
 
 from .backend import get_symbolic_backend_metadata, require_sympy
 from .errors import UnsupportedSymbolicExpressionError
+from .identity import symbolic_fingerprint
 from .namespaces import (
     SymbolicParameterNamespaceContext,
     make_parameter_namespace_context,
@@ -89,11 +88,6 @@ def _identifier_order(node: ast.AST) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _fingerprint(payload: dict[str, object]) -> str:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
 def translate_parameter_expression(
     assignment: ParameterAssignment,
     *,
@@ -116,7 +110,7 @@ def translate_parameter_expression(
     except Exception as exc:
         raise _unsupported(f"Could not translate symbolic expression {assignment.expr_src!r}.") from exc
     metadata = get_symbolic_backend_metadata()
-    fingerprint = _fingerprint(
+    fingerprint = symbolic_fingerprint(
         {
             "name": str(assignment.name),
             "normalized_source": str(expression),

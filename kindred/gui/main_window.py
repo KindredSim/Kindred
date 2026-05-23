@@ -59,6 +59,7 @@ from kindred.gui.app_wiring import (
     build_settings_and_controllers,
     build_sliders_dock,
     build_simulation_plumbing,
+    build_symbolic_calculator_dock,
     build_window_shell,
     dock_default_area,
     dock_shell_specs,
@@ -171,6 +172,7 @@ class MainWindow(
         self._init_sliders_dock()
         self._init_batch_dock_and_panel()
         self._init_right_dock_and_datasets()
+        self._init_symbolic_calculator_dock()
         self._init_bottom_analysis_dock()
         self._init_status_bar_widgets()
         self._finish_window_composition()
@@ -452,6 +454,7 @@ class MainWindow(
 
         self._mechanism_editor.speciesResetRequested.connect(self._on_species_reset_requested)
         self._mechanism_editor.run_btn.clicked.connect(self._sim_controller.run_simulation)
+        self._mechanism_editor.symbolic_calculator_btn.clicked.connect(self._open_symbolic_calculator_panel)
         self._refresh_slider_transaction_button_state()
 
     def _set_slider_override_mode_buttons_enabled(self, enabled: bool) -> None:
@@ -622,6 +625,7 @@ class MainWindow(
             and not (outcome.runtime_input_invalidation_required and not outcome.runtime_invalidation_required)
         ):
             self._refresh_authoritative_mechanism_derived_ui()
+        self._refresh_symbolic_calculator_state()
         if outcome.readiness_schedule_required:
             self._schedule_simulation_runtime_availability_refresh(wait=False)
         if (
@@ -789,6 +793,7 @@ class MainWindow(
         self._sync_mechanism_session_owner_from_widget_signal()
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None or bool(owner.edit_session_active):
+            self._refresh_symbolic_calculator_state()
             return
         self._apply_authoritative_mechanism_transition()
 
@@ -796,6 +801,7 @@ class MainWindow(
         self._sync_mechanism_session_owner_from_widget_signal()
         owner = getattr(self, "_mechanism_session_owner", None)
         if owner is None or bool(owner.edit_session_active):
+            self._refresh_symbolic_calculator_state()
             return
         self._apply_authoritative_mechanism_transition()
 
@@ -869,6 +875,7 @@ class MainWindow(
         validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
         if callable(validate):
             validate()
+        self._refresh_symbolic_calculator_state()
         return True
 
     def _try_lock_mechanism_editor(self) -> bool:
@@ -881,6 +888,7 @@ class MainWindow(
                 validate = getattr(getattr(self, "_mechanism_editor", None), "_validate_dsl", None)
                 if callable(validate):
                     validate()
+                self._refresh_symbolic_calculator_state()
                 return False
         elif not self._simulation_mechanism_owner.is_mechanism_ready_for_run():
             return False
@@ -899,6 +907,7 @@ class MainWindow(
             if not owner.edit_session_active:
                 owner.begin_edit_session()
             self._refresh_mechanism_edit_lock_ui()
+            self._refresh_symbolic_calculator_state()
             return True
         if self.mechanism_editing_locked():
             self._refresh_mechanism_edit_lock_ui()
@@ -1222,6 +1231,71 @@ class MainWindow(
 
         # Reference species statistics table within plot tabs.
         self._results_table = self._plot_tabs._main_plot.stats_table()
+
+    def _init_symbolic_calculator_dock(self) -> None:
+        from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorOwner
+        from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
+
+        owner = SymbolicCalculatorOwner(
+            mechanism_session_owner=self._mechanism_session_owner,
+        )
+        panel = SymbolicCalculatorPanel(
+            on_evaluate=owner.evaluate,
+            on_copy_result=owner.copy_compact_text,
+            on_copy_context=owner.copy_context_text,
+            parent=self,
+        )
+        self._symbolic_calculator_owner = owner
+        components = build_symbolic_calculator_dock(self, panel=panel)
+        self._symbolic_calculator_dock = components.dock
+        self._symbolic_calculator_panel = components.panel
+        self._symbolic_calculator_dock.setWidget(components.container)
+        self.addDockWidget(self._default_dock_area(self._symbolic_calculator_dock), self._symbolic_calculator_dock)
+        self._refresh_symbolic_calculator_state()
+
+    def _refresh_symbolic_calculator_state(self) -> None:
+        panel = getattr(self, "_symbolic_calculator_panel", None)
+        action = getattr(self, "_symbolic_calculator_action", None)
+        editor = getattr(self, "_mechanism_editor", None)
+        button = getattr(editor, "symbolic_calculator_btn", None)
+        owner = getattr(self, "_symbolic_calculator_owner", None)
+        if owner is None:
+            available = False
+            reason = "Canonical mechanism unavailable."
+            state = None
+        else:
+            state = owner.refresh()
+            available = bool(state.available)
+            reason = str(state.reason or "")
+        if panel is not None:
+            if state is not None:
+                panel.render_state(state)
+            else:
+                panel.set_available(available, reason)
+        if action is not None:
+            action.setEnabled(bool(available))
+            action.setToolTip(
+                "Open Symbolic Calculator panel"
+                if bool(available)
+                else str(reason or "Symbolic calculator unavailable.")
+            )
+        if button is not None:
+            button.setEnabled(bool(available))
+            button.setToolTip(
+                "Open Symbolic Calculator panel"
+                if bool(available)
+                else str(reason or "Symbolic calculator unavailable.")
+            )
+
+    def _open_symbolic_calculator_panel(self) -> None:
+        self._refresh_symbolic_calculator_state()
+        dock = getattr(self, "_symbolic_calculator_dock", None)
+        if dock is None or not dock.isEnabled():
+            return
+        dock.show()
+        dock.raise_()
+        if dock.isFloating():
+            dock.activateWindow()
 
     def _init_bottom_analysis_dock(self) -> None:
         analysis_widget = self._plot_tabs.main_plot_analysis_widget()
@@ -1858,10 +1932,12 @@ class MainWindow(
             [
                 ("&Run", self._sim_controller.run_simulation, None, "runSimulationAction", "Run kinetic simulation with current mechanism (Ctrl+R or F5)", {"shortcuts": ["Ctrl+R", "F5"]}),
                 ("&Stop", self._sim_controller.stop_simulation, "Esc", "stopSimulationAction", "Stop running simulation (Esc)"),
+                ("Symbolic Calculator...", self._open_symbolic_calculator_panel, None, "openSymbolicCalculatorAction", "Open Symbolic Calculator panel", {"store_as": "_symbolic_calculator_action"}),
                 None,
                 ("Simulation &Settings...", self._open_solver_settings, None, "simulationSettingsAction", "Configure solver tolerances and advanced simulation settings"),
             ],
         )
+        self._refresh_symbolic_calculator_state()
 
         fit_menu = menubar.addMenu("&Fitting")
         add_items(
@@ -3243,7 +3319,7 @@ class MainWindow(
         QtWidgets.QMessageBox.information(
             self,
             "Panel Layout Tips",
-            "Use View > Panels to show or hide the Mechanism, Interactive Sliders, Initial Conditions, Data, and Analysis panels.\n\n"
+            "Use View > Panels to show or hide the Mechanism, Symbolic Calculator, Interactive Sliders, Initial Conditions, Data, and Analysis panels.\n\n"
             "To place panels together on the same side, drag a panel by its title bar and pause over an occupied "
             "dock area until Qt shows an inner drop guide. Dropping there lets that side share space with the "
             "existing panel.\n\n"
@@ -3291,7 +3367,8 @@ class MainWindow(
         batch_dock = getattr(self, "_batch_dock", None)
         data_dock = getattr(self, "_right_dock", None)
         analysis_dock = getattr(self, "_analysis_dock", None)
-        if not all(dock is not None for dock in (mechanism_dock, sliders_dock, batch_dock, data_dock, analysis_dock)):
+        symbolic_dock = getattr(self, "_symbolic_calculator_dock", None)
+        if not all(dock is not None for dock in (mechanism_dock, sliders_dock, batch_dock, data_dock, analysis_dock, symbolic_dock)):
             return
 
         # Left column: Mechanism (top), Interactive Sliders (bottom).
@@ -3300,6 +3377,7 @@ class MainWindow(
         # Right column: Initial Conditions (top), Data and Analysis tabified (bottom).
         self.splitDockWidget(batch_dock, data_dock, Qt.Vertical)
         self.tabifyDockWidget(data_dock, analysis_dock)
+        self.tabifyDockWidget(data_dock, symbolic_dock)
         data_dock.raise_()
 
     def schedule_restored_floating_dock_recovery(self) -> None:
@@ -3514,6 +3592,12 @@ class MainWindow(
 
     def _reset_project_apply_dirty_session_state(self) -> None:
         """Clear non-serialized session state before applying a project payload."""
+        symbolic_calculator_owner = getattr(self, "_symbolic_calculator_owner", None)
+        reset_symbolic_calculator = getattr(symbolic_calculator_owner, "reset_project_session_state", None)
+        if callable(reset_symbolic_calculator):
+            reset_symbolic_calculator()
+            self._refresh_symbolic_calculator_state()
+
         if not self._prepare_fit_window_shutdown_for_close():
             logger.warning("Project apply requested while one or more fit windows remained open after close request")
         runtime_epoch = max(

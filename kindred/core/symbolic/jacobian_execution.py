@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 from .artifacts import symbolic_jacobian_identity_payload
 from .errors import UnsupportedSymbolicExpressionError
+from .identity import normalize_symbolic_identity_mapping
 from .namespaces import symbolic_status_payload
 
 
@@ -16,7 +17,7 @@ class SymbolicJacobianExecution:
     status: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        identity = dict(self.identity or {}) if isinstance(self.identity, Mapping) else None
+        identity = _normalize_execution_identity(self.identity)
         status = dict(self.status or {}) if isinstance(self.status, Mapping) else None
         state = str((status or {}).get("state") or "")
         if self.jacobian_func is None:
@@ -50,7 +51,7 @@ class SymbolicJacobianExecution:
         return cls(
             jacobian_func=jacobian_func,
             jac_sparsity=jac_sparsity,
-            identity=dict(identity),
+            identity=identity,
             status=symbolic_status_payload(
                 kind="jacobian",
                 state="supported",
@@ -126,7 +127,7 @@ class SymbolicJacobianExecution:
             return cls(
                 jacobian_func=jacobian_func,
                 jac_sparsity=jac_sparsity,
-                identity=dict(identity),
+                identity=identity,
                 status=dict(status or {}) if isinstance(status, Mapping) else None,
             )
         status_payload = dict(status or {}) if isinstance(status, Mapping) else None
@@ -182,3 +183,7 @@ class SymbolicJacobianExecution:
         if self.status:
             payload["symbolic_jacobian_status"] = dict(self.status)
         return payload
+
+
+def _normalize_execution_identity(identity: object) -> dict[str, Any] | None:
+    return normalize_symbolic_identity_mapping(identity, label="Symbolic Jacobian execution identity")

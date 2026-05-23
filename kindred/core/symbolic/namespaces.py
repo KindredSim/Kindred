@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 import re
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -11,14 +9,10 @@ from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, 
 from kindred.core.simulator.parameter_namespace import is_protected_indexed_identifier
 
 from .errors import UnsupportedSymbolicExpressionError
+from .identity import symbolic_fingerprint
 
 
 _PROTECTED_RUNTIME_SYMBOLS = {"T", "T0"}
-
-
-def _fingerprint(payload: Mapping[str, object]) -> str:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,7 +191,7 @@ def make_evaluation_snapshot_context(
     parameter_values: Sequence[tuple[str, float]],
 ) -> SymbolicEvaluationSnapshotContext:
     snapshot = tuple((str(name), float(value)) for name, value in parameter_values)
-    fingerprint = _fingerprint(
+    fingerprint = symbolic_fingerprint(
         {
             "kind": "evaluation-snapshot",
             "parameter_values": [[name, f"{value:.17g}"] for name, value in snapshot],

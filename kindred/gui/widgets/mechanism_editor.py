@@ -90,6 +90,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._run_btn.setFont(run_font)
         self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
         self._run_btn.setEnabled(False)
+        self.symbolic_calculator_btn = QtWidgets.QPushButton("Σ", self)
+        self.symbolic_calculator_btn.setObjectName("symbolicCalculatorOpenButton")
+        self.symbolic_calculator_btn.setToolTip("Open the Symbolic Calculator panel")
+        self.symbolic_calculator_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
+        self.symbolic_calculator_btn.setEnabled(False)
+        reactions_header_row.addWidget(self.symbolic_calculator_btn)
         reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 

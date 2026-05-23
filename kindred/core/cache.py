@@ -49,6 +49,7 @@ from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.lru_cache import LRUCache
 from kindred.core.equilibrium_rate_authority import normalize_existing_equilibrium_rate_authority
 from kindred.core.symbolic.artifacts import symbolic_jacobian_identity_payload
+from kindred.core.symbolic.identity import normalize_symbolic_identity_mapping, symbolic_identity_json
 
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     from kindred.core.simulator.solvers import SimulationRequest
@@ -876,7 +877,10 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
             intervention_species_names = tuple(str(name) for name in (getattr(req, "species_names", None) or ()))
 
     symbolic_jacobian_identity = symbolic_jacobian_identity_payload(getattr(req, "jacobian_func", None))
-    symbolic_wegscheider_identity = getattr(req, "symbolic_wegscheider_identity", None)
+    symbolic_wegscheider_identity = normalize_symbolic_identity_mapping(
+        getattr(req, "symbolic_wegscheider_identity", None),
+        label="symbolic Wegscheider identity",
+    )
 
     payload = (
         tuple(map(float, req.t_span)),
@@ -886,8 +890,16 @@ def fingerprint_simulation_request(req: "SimulationRequest") -> Optional[str]:
         float(req.atol),
         grid_items,
         t_eval_tuple,
-        dict(symbolic_jacobian_identity or {}) if symbolic_jacobian_identity else bool(getattr(req, "jacobian_func", None)),
-        dict(symbolic_wegscheider_identity or {}) if isinstance(symbolic_wegscheider_identity, Mapping) else None,
+        (
+            symbolic_identity_json(symbolic_jacobian_identity).decode("ascii")
+            if symbolic_jacobian_identity
+            else bool(getattr(req, "jacobian_func", None))
+        ),
+        (
+            symbolic_identity_json(symbolic_wegscheider_identity).decode("ascii")
+            if symbolic_wegscheider_identity
+            else None
+        ),
         jac_tag,
         schedule_fp,
         intervention_schedule_fp,

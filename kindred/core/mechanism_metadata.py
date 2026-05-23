@@ -26,6 +26,7 @@ class MechanismMetadataKeys:
     TEMPERATURE_SCHEDULE = "temperature_schedule"
     INTERVENTION_SCHEDULE = "intervention_schedule"
     WEGSCHEIDER_CYCLICITY_ENABLED = "wegscheider_cyclicity_enabled"
+    STATE_NETWORK = "state_network"
 
 
 class EquilibriumMetadataKeys:
