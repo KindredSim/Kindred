@@ -1010,7 +1010,7 @@ def test_slider_release_timer_uses_persisted_preview_debounce_controls(main_wind
 
     main_window._open_solver_settings()
     main_window._mechanism_editor._reactions_text.setPlainText(
-        "equilibrium: A <-> B ; kf=0.0928966, K=0.00963829\n"
+        "equilibrium: A <-> B ; kf=0.0928966, Keq=0.00963829\n"
         "reaction: B -> C ; k=0.1\n"
         "init: A=1, B=0, C=0\n"
     )

@@ -92,7 +92,7 @@ def test_shared_step_policy_classifies_namespace_kind_and_explicit_keq(step, exp
         ("reaction: A -> B; k=1\n", "reaction", False),
         ("reaction: A <-> B; kf=6; kr=2\n", "equilibrium", False),
         ("equilibrium: A <-> B; kf=6; kr=2\n", "equilibrium", False),
-        ("equilibrium: A <-> B; kf=6; K=3\n", "equilibrium", True),
+        ("equilibrium: A <-> B; kf=6; Keq=3\n", "equilibrium", True),
         ("reaction: A <-> B; kf=6; Keq=3\n", "equilibrium", True),
     ],
 )

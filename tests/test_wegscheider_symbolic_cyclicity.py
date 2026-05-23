@@ -18,9 +18,9 @@ pytestmark = pytest.mark.unit
 
 PBM_STOICHIOMETRIC_CYCLE = "\n".join(
     [
-        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; K=2",
-        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; K=3",
-        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; K=7",
+        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; Keq=2",
+        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; Keq=3",
+        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; Keq=7",
         "init: PBMproduct=1, Methidequinone=0, Methidequinone_CIS=0, Amine=0",
     ]
 )
@@ -28,9 +28,9 @@ PBM_STOICHIOMETRIC_CYCLE = "\n".join(
 
 PBM_SYMBOLICALLY_RESOLVED = "\n".join(
     [
-        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; K=2",
-        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; K=3",
-        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; K=7",
+        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; Keq=2",
+        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; Keq=3",
+        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; Keq=7",
         "param Keq3 = 1 / (Keq1 * Keq2)",
         "init: PBMproduct=1, Methidequinone=0, Methidequinone_CIS=0, Amine=0",
     ]
@@ -39,9 +39,9 @@ PBM_SYMBOLICALLY_RESOLVED = "\n".join(
 
 PBM_NUMERICALLY_CONSISTENT_BUT_UNRESOLVED = "\n".join(
     [
-        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; K=2",
-        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; K=3",
-        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; K=0.16666666666666666",
+        "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; Keq=2",
+        "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; Keq=3",
+        "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; Keq=0.16666666666666666",
         "init: PBMproduct=1, Methidequinone=0, Methidequinone_CIS=0, Amine=0",
     ]
 )
@@ -49,9 +49,9 @@ PBM_NUMERICALLY_CONSISTENT_BUT_UNRESOLVED = "\n".join(
 
 TRIANGLE_SYMBOLICALLY_RESOLVED = "\n".join(
     [
-        "equilibrium: A <-> B ; kf=2 ; K=2",
-        "equilibrium: B <-> C ; kf=3 ; K=3",
-        "equilibrium: C <-> A ; kf=1 ; K=1",
+        "equilibrium: A <-> B ; kf=2 ; Keq=2",
+        "equilibrium: B <-> C ; kf=3 ; Keq=3",
+        "equilibrium: C <-> A ; kf=1 ; Keq=1",
         "param Keq3 = 1 / (Keq1 * Keq2)",
         "init: A=1, B=0, C=0",
     ]
@@ -60,9 +60,9 @@ TRIANGLE_SYMBOLICALLY_RESOLVED = "\n".join(
 
 NON_UNIT_CYCLE = "\n".join(
     [
-        "equilibrium: A <-> B ; kf=1 ; K=2",
-        "equilibrium: 2 B <-> C ; kf=1 ; K=3",
-        "equilibrium: C <-> 2 A ; kf=1 ; K=5",
+        "equilibrium: A <-> B ; kf=1 ; Keq=2",
+        "equilibrium: 2 B <-> C ; kf=1 ; Keq=3",
+        "equilibrium: C <-> 2 A ; kf=1 ; Keq=5",
         "init: A=1, B=0, C=0",
     ]
 )
@@ -70,8 +70,8 @@ NON_UNIT_CYCLE = "\n".join(
 
 FRACTIONAL_NON_CYCLE = "\n".join(
     [
-        "equilibrium: C <-> B ; kf=1 ; K=2",
-        "equilibrium: B <-> 0.5 A + 1.5 C ; kf=1 ; K=3",
+        "equilibrium: C <-> B ; kf=1 ; Keq=2",
+        "equilibrium: B <-> 0.5 A + 1.5 C ; kf=1 ; Keq=3",
         "init: A=0, B=0, C=1",
     ]
 )
@@ -113,9 +113,9 @@ def test_numeric_coincidence_does_not_resolve_stoichiometric_cycle():
 def test_probe_coincidence_expression_does_not_resolve_stoichiometric_cycle():
     crafted_probe_match = "\n".join(
         [
-            "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; K=2",
-            "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; K=3",
-            "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; K=7",
+            "equilibrium: PBMproduct <-> Methidequinone + Amine ; kf=1 ; Keq=2",
+            "equilibrium: Methidequinone <-> Methidequinone_CIS ; kf=1 ; Keq=3",
+            "equilibrium: Methidequinone_CIS + Amine <-> PBMproduct ; kf=1 ; Keq=7",
             "param Keq3 = 1 / (Keq1 * Keq2) + (Keq1 - 2) * (Keq1 - 1.5) * (Keq1 - 8) * 0.001",
             "init: PBMproduct=1, Methidequinone=0, Methidequinone_CIS=0, Amine=0",
         ]

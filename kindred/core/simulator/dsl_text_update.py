@@ -27,7 +27,7 @@ from .step_constraint_authority import (
 AUTHORITATIVE_PARAMETER_SIG_DIGITS = 15
 _STEP_PARAMETER_RE = re.compile(r"^(kf|kr|Keq|k)\d+$")
 _STEP_PARAMETER_FLOOR = 1e-12
-_EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq", "k_eq"})
+_EQUILIBRIUM_K_ALIAS_LOWER = frozenset({"keq"})
 _STEP_TOKEN_CANONICAL_ALIASES = {
     "a": "A",
     "ea": "Ea",
@@ -225,16 +225,24 @@ def _dedupe_tokens_case_insensitive(tokens: list[list[str]]) -> list[list[str]]:
 
 def _is_equilibrium_k_token(key: object) -> bool:
     key_str = str(key).strip()
-    return key_str == "K" or key_str.lower() in _EQUILIBRIUM_K_ALIAS_LOWER
+    return key_str.lower() in _EQUILIBRIUM_K_ALIAS_LOWER
+
+
+def _is_legacy_equilibrium_constant_token(key: object) -> bool:
+    key_str = str(key).strip()
+    return key_str == "K" or key_str.lower() == "k_eq"
 
 
 def _token_matches_alias(key: object, alias: str) -> bool:
+    key_str = str(key).strip()
     if str(alias) == "Keq":
         return _is_equilibrium_k_token(key)
     alias_str = str(alias)
     if _is_equilibrium_k_token(key):
         return False
-    return str(key).strip().lower() == alias_str.lower()
+    if key_str == "K" and alias_str.lower() == "k":
+        return False
+    return key_str.lower() == alias_str.lower()
 
 
 def _canonical_step_token_key_for_duplicate_check(key: object) -> str | None:

@@ -100,9 +100,7 @@ _KEY_ALIASES: Dict[str, str] = {
     "a": "A",
     "A": "A",
     "k": "k",
-    "K": "Keq",  # Equilibrium constant (surface alias; distinct from lowercase k)
     "keq": "Keq",
-    "k_eq": "Keq",
     "kf": "kf",
     "kr": "kr",
     "k_fast": "k_fast",
@@ -178,9 +176,11 @@ class DSLIR:
 
 def _norm_key(k: str) -> str:
     key = k.strip()
-    # Preserve uppercase K as the equilibrium alias distinct from lowercase k.
-    if key == "K":
+    if key.lower() == "keq":
         return "Keq"
+    # Bare uppercase K is not lowercase k and is not accepted as a Keq alias.
+    if key == "K":
+        return "K"
     # Otherwise normalize to lowercase and look up
     return _KEY_ALIASES.get(key.lower(), key)
 
@@ -995,6 +995,16 @@ def _reject_unknown_params(
     """Reject parameter keys not in known_keys."""
     unknown = set(params) - known_keys
     if unknown:
+        legacy_keq_aliases = [
+            key for key in sorted(unknown) if key == "K" or str(key).lower() == "k_eq"
+        ]
+        if legacy_keq_aliases:
+            raw_key = legacy_keq_aliases[0]
+            raise DSLError(
+                f"Unknown {step_label} parameter '{raw_key}'. Use 'Keq=' for equilibrium constants.",
+                line_number=line_number,
+                line_content=line_content,
+            )
         raise DSLError(
             f"Unknown {step_label} parameter(s): {', '.join(sorted(unknown))}",
             line_number=line_number, line_content=line_content,
@@ -1009,7 +1019,7 @@ def _resolve_Keq_from_params(
     line_number: Optional[int],
     line_content: Optional[str],
 ) -> Tuple[float, Optional[float]]:
-    """Resolve equilibrium constant Keq from explicit K/Keq input or dG_eq=.
+    """Resolve equilibrium constant Keq from explicit Keq input or dG_eq=.
 
     Precondition: at least one of "Keq" or "dG_eq" must be present in params.
     Returns (Keq, dG_eqJ_or_None). Raises DSLError on numeric/overflow/underflow issues.
@@ -1153,7 +1163,7 @@ def _parse_reaction_like_step(
             else:
                 raise DSLError(
                     "reversible Arrhenius step needs exactly one of kr or Keq/dG_eq",
-                    examples=["A <-> B ; A=1e10 ; Ea=50 ; K=2.0"],
+                    examples=["A <-> B ; A=1e10 ; Ea=50 ; Keq=2.0"],
                     line_number=line_number, line_content=line_content,
                 )
     else:
@@ -1500,7 +1510,7 @@ def parse_dsl_to_mechanism(
         DSL content supporting all features:
         - reaction: A -> B; dG_act=80, energy=kJ/mol
         - reaction: A + B -> C; Ea=50, A=1e13, energy=kJ/mol
-        - equilibrium: A <-> B; kf=1.0; K=4.0
+        - equilibrium: A <-> B; kf=1.0; Keq=4.0
         - equilibrium: A <-> B; kf=1.0; dG_eq=-5, energy=kJ/mol
         - Global settings: T=310, energy=kJ/mol, κ=0.8, C0=1.0
         - State networks: state: A, kind=GS, energy=0
@@ -1528,7 +1538,7 @@ def parse_dsl_to_mechanism(
     >>> dsl_text = '''
     ... T=310
     ... reaction: A -> B; dG_act=80, energy=kJ/mol
-    ... equilibrium: B <-> C; kf=1.0; K=4.0
+    ... equilibrium: B <-> C; kf=1.0; Keq=4.0
     ... '''
     >>> mech = parse_dsl_to_mechanism(dsl_text, initials={'A': 1.0, 'B': 0.0, 'C': 0.0})
     >>> print(mech.species_names())

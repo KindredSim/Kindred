@@ -133,10 +133,10 @@ class TestBasicReactions:
 class TestEquilibria:
     """Test equilibrium parsing."""
 
-    def test_equilibrium_with_K(self):
+    def test_equilibrium_with_keq(self):
         """Test equilibrium with equilibrium constant."""
         dsl = """
-        equilibrium: A <-> B; kf=1.0; K=2.0
+        equilibrium: A <-> B; kf=1.0; Keq=2.0
         [A] = 1.0
         [B] = 0.0
         """
@@ -176,12 +176,12 @@ class TestEquilibria:
     @pytest.mark.parametrize(
         "line",
         [
-            "equilibrium: A <-> B; K=2.0",
-            "equilibrium: A <-> B; kr=0.5; K=2.0",
+            "equilibrium: A <-> B; Keq=2.0",
+            "equilibrium: A <-> B; kr=0.5; Keq=2.0",
             "equilibrium: A <-> B; kr=0.5; dG_eq=-1.7",
-            "equilibrium: A <-> B; kf=1.0; kr=0.5; K=2.0",
+            "equilibrium: A <-> B; kf=1.0; kr=0.5; Keq=2.0",
             "equilibrium: A <-> B; kf=1.0; kr=0.5; dG_eq=-1.7",
-            "equilibrium: A <-> B; kf=1.0; K=2.0; dG_eq=-1.7",
+            "equilibrium: A <-> B; kf=1.0; Keq=2.0; dG_eq=-1.7",
         ],
     )
     def test_equilibrium_requires_kf_and_exactly_one_reverse_authority(self, line):
@@ -191,11 +191,11 @@ class TestEquilibria:
     @pytest.mark.parametrize(
         "line",
         [
-            "reaction: A <-> B; kr=0.5; K=2.0",
-            "reaction: A <-> B; kf=1.0; kr=0.5; K=2.0",
+            "reaction: A <-> B; kr=0.5; Keq=2.0",
+            "reaction: A <-> B; kf=1.0; kr=0.5; Keq=2.0",
             "reaction: A <-> B; kf=1.0; kr=0.5; dG_eq=-1.7",
-            "A <-> B; kr=0.5; K=2.0",
-            "A <-> B; kf=1.0; kr=0.5; K=2.0",
+            "A <-> B; kr=0.5; Keq=2.0",
+            "A <-> B; kf=1.0; kr=0.5; Keq=2.0",
         ],
     )
     def test_reversible_reaction_requires_kf_and_exactly_one_reverse_authority(self, line):
@@ -403,12 +403,12 @@ class TestParameterExtraction:
         assert [p.name for p in params] == ["kf1", "kr1", "Keq1"]
         assert [p.editable for p in params] == [True, True, False]
 
-    def test_extract_parameters_from_dsl_rejects_duplicate_equilibrium_aliases(self):
+    def test_extract_parameters_from_dsl_rejects_underscore_equilibrium_alias(self):
         dsl = """
         equilibrium: A <-> B; kf=1.0; Keq=2.0; K_eq=3.0
         """
 
-        with pytest.raises(DSLError, match="Duplicate parameter"):
+        with pytest.raises(DSLError, match="Keq="):
             extract_parameters_from_dsl(dsl)
 
 
@@ -448,7 +448,7 @@ class TestComplexMechanisms:
     def test_reversible_and_irreversible(self):
         """Test mix of reversible and irreversible reactions."""
         dsl = """
-        equilibrium: A <-> B; kf=1.0; K=2.0
+        equilibrium: A <-> B; kf=1.0; Keq=2.0
         reaction: B -> C; k=0.5
         [A] = 1.0
         [B] = 0.0
@@ -497,13 +497,26 @@ class TestPublicAliasAndStateMemberParsing:
         assert float(eq.kf) == pytest.approx(1.5)
         assert float(eq.kr) == pytest.approx(0.25)
 
-    def test_equilibrium_K_alias_remains_distinct_from_irreversible_k(self):
-        mechanism = parse_dsl_to_mechanism("reaction: A <-> B; k=1.0; K=2.0", initials={})
+    @pytest.mark.parametrize("prefix", ["equilibrium: ", "reaction: ", ""])
+    @pytest.mark.parametrize("key", ["K", "K_eq", "k_eq"])
+    def test_equilibrium_constant_legacy_aliases_are_rejected(self, prefix, key):
+        source = f"{prefix}A <-> B; kf=1.0; {key}=2.0"
+
+        with pytest.raises(DSLError, match="Keq="):
+            parse_dsl_to_mechanism(source, initials={})
+
+    @pytest.mark.parametrize("key", ["Keq", "keq", "KEQ"])
+    def test_equilibrium_constant_exact_keq_key_is_case_insensitive(self, key):
+        mechanism = parse_dsl_to_mechanism(
+            f"equilibrium: A <-> B; kf=1.0; {key}=2.0",
+            initials={},
+        )
 
         eq = mechanism.equilibria[0]
         assert float(eq.kf) == pytest.approx(1.0)
         assert float(eq.kr) == pytest.approx(0.5)
         assert float(eq.Keq) == pytest.approx(2.0)
+        assert eq.metadata["Keq_input"] == pytest.approx(2.0)
 
     def test_malformed_key_value_chunk_reports_public_dsl_error(self):
         with pytest.raises(DSLError, match=r"Expected key=value pair"):

@@ -17,6 +17,7 @@ from kindred.core.simulator.dsl_text_update import (
     _duplicate_canonical_step_token,
     _get_token_float,
     _is_equilibrium_k_token,
+    _is_legacy_equilibrium_constant_token,
     _parse_mechanism_semicolon_kv,
     _remove_token_aliases,
     _serialize_mechanism_semicolon_kv,
@@ -153,6 +154,8 @@ class MainWindowVariableRuntime:
             original_line = line
 
             if "<->" in lower or "<=>" in lower:
+                if any(_is_legacy_equilibrium_constant_token(key) for key, _ in tokens):
+                    continue
                 if sum(1 for key, _ in tokens if _is_equilibrium_k_token(key)) > 1:
                     continue
                 k_explicit = any(_is_equilibrium_k_token(key) for key, _ in tokens)

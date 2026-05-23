@@ -861,7 +861,7 @@ def test_fitting_objective_context_disables_jacobian_for_mutable_keq_input_bindi
     prepared = prepare_fitting_objective_context(
         mechanism_text="\n".join(
             [
-                "equilibrium: A <-> B; kf=1.0; K=2.0",
+                "equilibrium: A <-> B; kf=1.0; Keq=2.0",
                 "init: A=1.0, B=0.0",
             ]
         ),
@@ -1199,7 +1199,7 @@ def test_symbolic_jacobian_keeps_dsl_derived_reverse_rate_keq_sourced():
     mechanism = parse_dsl_to_mechanism(
         "\n".join(
             [
-                "equilibrium: A <-> B; kf=2.0; K=4.0",
+                "equilibrium: A <-> B; kf=2.0; Keq=4.0",
                 "init: A=1.0, B=0.0",
             ]
         ),
@@ -1215,7 +1215,7 @@ def test_symbolic_jacobian_keeps_dsl_derived_reverse_rate_keq_sourced():
     ("line", "expected_symbols", "expected_matrix"),
     [
         ("equilibrium: A <-> B; kf=2.0; kr=0.5", ("kf1", "kr1"), [[-2.0, 0.5], [2.0, -0.5]]),
-        ("equilibrium: A <-> B; kf=2.0; K=4.0", ("Keq1", "kf1"), [[-2.0, 0.5], [2.0, -0.5]]),
+        ("equilibrium: A <-> B; kf=2.0; Keq=4.0", ("Keq1", "kf1"), [[-2.0, 0.5], [2.0, -0.5]]),
         (
             "T=298.15\nenergy=kJ/mol\nequilibrium: A <-> B; kf=2.0; dG_eq=0.0",
             (),

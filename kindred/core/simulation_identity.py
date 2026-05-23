@@ -134,7 +134,6 @@ _DSL_SEMICOLON_KEY_ALIASES = {
     "kf": "kf",
     "kr": "kr",
     "keq": "Keq",
-    "k_eq": "Keq",
 }
 _STRUCTURAL_SEMICOLON_DIRECTIVES = {
     "A",
@@ -152,7 +151,7 @@ def _mutable_preview_parameter_names(parameter_names: Sequence[str] | object) ->
 def _canonical_semicolon_directive_key(name: str) -> str:
     name_s = str(name or "").strip()
     if name_s == "K":
-        return "Keq"
+        return "K"
     return _DSL_SEMICOLON_KEY_ALIASES.get(name_s.lower(), name_s)
 
 

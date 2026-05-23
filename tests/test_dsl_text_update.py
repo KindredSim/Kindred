@@ -1,16 +1,66 @@
+import pytest
+
 from kindred.core.simulator.dsl_text_update import analyze_step_parameter_update
 from kindred.core.simulator.dsl import extract_parameters_from_dsl, parse_dsl_to_mechanism
+from kindred.gui.main_window_variable_runtime import MainWindowVariableRuntime
 from kindred.gui.parameter_enumeration import enumerate_step_parameters_for_gui
 
 
 def test_updating_derived_kr_on_keq_authority_equilibrium_is_blocked():
-    source = "equilibrium: A <-> B; kf=6.0; K=3.0"
+    source = "equilibrium: A <-> B; kf=6.0; Keq=3.0"
 
     outcome = analyze_step_parameter_update(source, "kr1", 4.0)
 
     assert not outcome.writable
     assert outcome.warning_reason == "target_unwritable"
     assert outcome.updated_text == source
+
+
+def test_updating_keq_on_keq_authority_equilibrium_is_writable():
+    source = "equilibrium: A <-> B; kf=6.0; Keq=3.0"
+
+    outcome = analyze_step_parameter_update(source, "Keq1", 4.0)
+
+    assert outcome.writable
+    assert outcome.warning_reason is None
+    assert "Keq=4" in outcome.updated_text
+
+
+def test_exact_keq_token_is_case_insensitive_for_text_update():
+    source = "equilibrium: A <-> B; kf=6.0; keq=3.0"
+
+    outcome = analyze_step_parameter_update(source, "Keq1", 4.0)
+
+    assert outcome.writable
+    assert outcome.warning_reason is None
+    assert "Keq=4" in outcome.updated_text
+
+
+@pytest.mark.parametrize("key", ["K", "K_eq", "k_eq"])
+def test_text_update_does_not_treat_legacy_aliases_as_keq_tokens(key):
+    source = f"equilibrium: A <-> B; kf=6.0; {key}=3.0"
+
+    outcome = analyze_step_parameter_update(source, "Keq1", 4.0)
+
+    assert not outcome.writable
+    assert outcome.updated_text == source
+    assert outcome.warning_reason in {
+        "constraint_analysis_failed",
+        "missing_target",
+        "target_unwritable",
+    }
+
+
+@pytest.mark.parametrize("key", ["K", "K_eq", "k_eq"])
+def test_runtime_sanitizer_does_not_canonicalize_legacy_keq_aliases(key):
+    runtime = MainWindowVariableRuntime.__new__(MainWindowVariableRuntime)
+    source = f"equilibrium: A <-> B; kf=6.0; {key}=3.0"
+
+    updated, variables, metadata = runtime.sanitize_mechanism_parameter_conflicts(source)
+
+    assert updated == source
+    assert variables == {}
+    assert metadata == {}
 
 
 def test_updating_derived_kr_on_dg_authority_equilibrium_is_blocked():
