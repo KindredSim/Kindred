@@ -234,6 +234,8 @@ class SimulationPlan:
 
     def _expected_schedule_identity(self) -> tuple[str, str]:
         schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
+        if schedule is None:
+            return "", ""
         prepared_payload = self.execution_request.prepared_payload
         if isinstance(prepared_payload, Mapping):
             mechanism = prepared_payload.get("mechanism")

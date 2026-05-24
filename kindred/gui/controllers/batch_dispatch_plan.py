@@ -6,6 +6,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 from kindred.core.intervention_schedule import (
     coerce_intervention_schedule,
     intervention_schedule_identity_fingerprints,
+    normalized_intervention_schedule_payload,
 )
 from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
 from kindred.core.simulation_preparation import SimulationExecutionRequest
@@ -71,6 +72,10 @@ class ParallelBatchTaskInput:
 class ParallelBatchTaskPlan:
     task: Dict[str, Any]
     simulation_identity: Dict[str, Any]
+
+
+def _optional_mapping_payload(value: object) -> Dict[str, Any] | None:
+    return dict(value) if isinstance(value, Mapping) else None
 
 
 def _simulation_plan_payload(value: object) -> Optional[Dict[str, Any]]:
@@ -158,30 +163,69 @@ def _new_simulation_plan_payload(
     ).to_payload()
 
 
+def _schedule_payload_and_identity_for_dispatch(
+    schedule_value: object,
+    *,
+    prepared_payload: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str, str]:
+    schedule = coerce_intervention_schedule(schedule_value)
+    if schedule is None:
+        return None, "", ""
+
+    if isinstance(prepared_payload, Mapping):
+        mechanism = prepared_payload.get("mechanism")
+        if mechanism is not None:
+            from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+            normalized_payload = normalized_intervention_schedule_payload(
+                schedule,
+                mechanism_namespace=build_namespace_from_mechanism(mechanism),
+            )
+            normalized_schedule = coerce_intervention_schedule(normalized_payload)
+            if normalized_schedule is None:
+                return None, "", ""
+            declarative_fingerprint, executable_fingerprint = intervention_schedule_identity_fingerprints(
+                normalized_schedule
+            )
+            return (
+                normalized_schedule.to_payload(),
+                declarative_fingerprint,
+                executable_fingerprint,
+            )
+
+    declarative_fingerprint, executable_fingerprint = intervention_schedule_identity_fingerprints(schedule)
+    return schedule.to_payload(), declarative_fingerprint, executable_fingerprint
+
+
 def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> BatchSetDispatchPlan:
     plan_payload = _simulation_plan_payload(dispatch_input.plan_payload)
     execution_request = _execution_request_payload_from_plan(plan_payload)
+    request_prepared_payload = None
+    if isinstance(execution_request, Mapping) and isinstance(execution_request.get("prepared_payload"), Mapping):
+        request_prepared_payload = execution_request.get("prepared_payload")
 
     if isinstance(execution_request, dict) and not bool(dispatch_input.fast_mode):
         execution_request = dict(execution_request)
         execution_request["prepared_payload"] = None
-        if isinstance(plan_payload, dict):
-            plan_payload = _simulation_plan_payload_with_execution_request(
-                plan_payload,
-                execution_request,
-                algebra_policy=dispatch_input.algebra_policy,
-            )
 
     simulation_identity = dict(dispatch_input.simulation_identity or {})
     intervention_schedule_payload: dict[str, Any] | None = None
-    if isinstance(dispatch_input.intervention_schedule, Mapping):
-        schedule = coerce_intervention_schedule(dispatch_input.intervention_schedule)
-        if schedule is not None:
-            intervention_schedule_payload = schedule.to_payload()
-            (
-                intervention_schedule_declarative_fingerprint,
-                intervention_schedule_executable_fingerprint,
-            ) = intervention_schedule_identity_fingerprints(schedule)
+    has_intervention_schedule_input = isinstance(dispatch_input.intervention_schedule, Mapping)
+    effective_prepared_payload = (
+        request_prepared_payload if isinstance(request_prepared_payload, Mapping) else dispatch_input.prepared_payload
+    )
+    if has_intervention_schedule_input:
+        (
+            intervention_schedule_payload,
+            intervention_schedule_declarative_fingerprint,
+            intervention_schedule_executable_fingerprint,
+        ) = _schedule_payload_and_identity_for_dispatch(
+            dispatch_input.intervention_schedule,
+            prepared_payload=effective_prepared_payload,
+        )
+        simulation_identity.pop("intervention_schedule_declarative_fingerprint", None)
+        simulation_identity.pop("intervention_schedule_executable_fingerprint", None)
+        if intervention_schedule_declarative_fingerprint or intervention_schedule_executable_fingerprint:
             simulation_identity["intervention_schedule_declarative_fingerprint"] = (
                 intervention_schedule_declarative_fingerprint
             )
@@ -240,9 +284,30 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
         if isinstance(plan_execution_request, dict) and intervention_schedule_payload is not None:
             plan_execution_request = dict(plan_execution_request)
             plan_execution_request["intervention_schedule"] = dict(intervention_schedule_payload)
+        elif isinstance(plan_execution_request, dict) and has_intervention_schedule_input:
+            plan_execution_request = dict(plan_execution_request)
+            plan_execution_request.pop("intervention_schedule", None)
+        elif (
+            isinstance(plan_execution_request, dict)
+            and not bool(dispatch_input.fast_mode)
+            and isinstance(plan_execution_request.get("intervention_schedule"), Mapping)
+        ):
+            normalized_schedule_payload, _, _ = _schedule_payload_and_identity_for_dispatch(
+                plan_execution_request["intervention_schedule"],
+                prepared_payload=effective_prepared_payload,
+            )
+            if normalized_schedule_payload is not None:
+                plan_execution_request = dict(plan_execution_request)
+                plan_execution_request["intervention_schedule"] = dict(normalized_schedule_payload)
         if isinstance(plan_execution_request, dict):
-            plan = SimulationPlan.from_payload(plan_payload)
-            plan_identity = plan.simulation_identity_payload()
+            existing_cache_identity_payload = _optional_mapping_payload(plan_payload.get("cache_identity_payload"))
+            existing_cache_scope_payload = _optional_mapping_payload(plan_payload.get("cache_scope_payload"))
+            existing_metadata = _optional_mapping_payload(plan_payload.get("metadata"))
+            plan_identity = {}
+            if isinstance(existing_cache_identity_payload, Mapping):
+                identity_payload = existing_cache_identity_payload.get("simulation_identity")
+                if isinstance(identity_payload, Mapping):
+                    plan_identity = dict(identity_payload)
             if plan_identity:
                 schedule_declarative_fingerprint = str(
                     simulation_identity.get("intervention_schedule_declarative_fingerprint") or ""
@@ -251,6 +316,9 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
                     simulation_identity.get("intervention_schedule_executable_fingerprint") or ""
                 )
                 simulation_identity = dict(plan_identity)
+                if has_intervention_schedule_input:
+                    simulation_identity.pop("intervention_schedule_declarative_fingerprint", None)
+                    simulation_identity.pop("intervention_schedule_executable_fingerprint", None)
                 if schedule_declarative_fingerprint or schedule_executable_fingerprint:
                     simulation_identity["intervention_schedule_declarative_fingerprint"] = (
                         schedule_declarative_fingerprint
@@ -261,19 +329,19 @@ def build_batch_set_dispatch_plan(dispatch_input: BatchSetDispatchInput) -> Batc
             cache_identity_payload = _cache_identity_payload(
                 dispatch_input,
                 simulation_identity=simulation_identity,
-                existing_cache_identity_payload=plan.cache_identity_payload,
+                existing_cache_identity_payload=existing_cache_identity_payload,
             )
             plan_payload = SimulationPlan.from_execution_request(
                 plan_execution_request,
-                execution_mode=plan.execution_mode,
+                execution_mode=str(plan_payload.get("execution_mode") or ""),
                 algebra_policy=dispatch_input.algebra_policy,
                 cache_identity_payload=cache_identity_payload,
                 cache_scope_payload=_cache_scope_payload(
                     dispatch_input,
-                    existing_cache_scope_payload=plan.cache_scope_payload,
+                    existing_cache_scope_payload=existing_cache_scope_payload,
                 ),
-                metadata=_metadata_payload(dispatch_input, existing_metadata=plan.metadata),
-                version=plan.version,
+                metadata=_metadata_payload(dispatch_input, existing_metadata=existing_metadata),
+                version=int(plan_payload.get("version") or 1),
             ).to_payload()
         plan = SimulationPlan.from_payload(plan_payload)
         plan_identity = plan.simulation_identity_payload()
