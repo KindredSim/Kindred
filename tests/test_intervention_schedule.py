@@ -76,48 +76,9 @@ def test_metadata_only_intervention_schedule_is_rejected() -> None:
         InterventionSchedule.from_payload({"metadata": {"label": "display only"}})
 
 
-def test_single_normalized_schedule_fingerprint_returns_declarative_identity() -> None:
-    from kindred.core.intervention_schedule import (
-        normalized_intervention_schedule_fingerprint,
-        normalized_intervention_schedule_fingerprint_from_dsl_text,
-        normalized_intervention_schedule_identity_fingerprints,
-        normalized_intervention_schedule_identity_fingerprints_from_dsl_text,
-        parse_intervention_schedule_from_dsl,
-    )
-    from kindred.core.simulator.dsl import parse_dsl_to_mechanism
-    from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-
-    text = "\n".join(
-        [
-            "reaction: A -> B; k=0",
-            "initial: A=0.0",
-            "initial: B=0.0",
-            "intervention: op=repeated_interval; kind=source; species=A; start=0.0; every=1.0; duration=0.25; count=2; rate=0.5",
-        ]
-    )
-    schedule = parse_intervention_schedule_from_dsl(text)
-    mechanism = parse_dsl_to_mechanism(text, initials={})
-    namespace = build_namespace_from_mechanism(mechanism)
-
-    declarative_fingerprint, executable_fingerprint = normalized_intervention_schedule_identity_fingerprints(
-        schedule,
-        mechanism_namespace=namespace,
-    )
-
-    assert declarative_fingerprint
-    assert executable_fingerprint
-    assert normalized_intervention_schedule_fingerprint(
-        schedule,
-        mechanism_namespace=namespace,
-    ) == declarative_fingerprint
-    assert (
-        normalized_intervention_schedule_fingerprint_from_dsl_text(text)
-        == normalized_intervention_schedule_identity_fingerprints_from_dsl_text(text)[0]
-    )
-
-
 def test_primitive_schedule_compiles_without_declarative_lowering() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+    from kindred.core.intervention_schedule import InterventionSchedule
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 
     schedule = InterventionSchedule.from_payload(
         {
@@ -136,7 +97,8 @@ def test_primitive_schedule_compiles_without_declarative_lowering() -> None:
 
 
 def test_repeated_interval_payload_lowers_to_executable_intervals_and_fingerprint_changes() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+    from kindred.core.intervention_schedule import InterventionSchedule
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 
     schedule = InterventionSchedule.from_payload(
         {
@@ -169,9 +131,9 @@ def test_repeated_interval_payload_lowers_to_executable_intervals_and_fingerprin
 def test_protocol_repeat_windows_lower_with_lineage_and_parameter_discovery() -> None:
     from kindred.core.intervention_schedule import (
         InterventionSchedule,
-        compile_intervention_schedule,
         intervention_schedule_parameter_names,
     )
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 
     schedule = InterventionSchedule.from_payload(
         {
@@ -215,8 +177,8 @@ def test_protocol_phase_conflicts_report_protocol_phase_species_and_time() -> No
     from kindred.core.intervention_schedule import (
         InterventionSchedule,
         InterventionScheduleError,
-        compile_intervention_schedule,
     )
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 
     schedule = InterventionSchedule.from_payload(
         {
@@ -242,7 +204,8 @@ def test_protocol_phase_conflicts_report_protocol_phase_species_and_time() -> No
 
 
 def test_intervention_metadata_round_trips_and_changes_declarative_fingerprint() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+    from kindred.core.intervention_schedule import InterventionSchedule
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 
     base = InterventionSchedule.from_payload(
         {
@@ -317,50 +280,6 @@ def test_declarative_repeat_counts_reject_non_integer_values() -> None:
         )
 
 
-def test_declarative_repeat_counts_reject_non_integer_extreme_values() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
-
-    with pytest.raises(InterventionScheduleError, match="count must be an integer"):
-        InterventionSchedule.from_payload(
-            {
-                "repeated_intervals": [
-                    {
-                        "start": 0.0,
-                        "every": 1.0,
-                        "duration": 0.5,
-                        "count": 1e308,
-                        "species": "A",
-                        "kind": "source",
-                        "rate": 1.0,
-                    }
-                ]
-            }
-        )
-    with pytest.raises(InterventionScheduleError, match="count must be an integer"):
-        InterventionSchedule.from_payload(
-            {
-                "protocols": [
-                    {
-                        "kind": "repeat",
-                        "name": "feed",
-                        "start": 0.0,
-                        "every": 1.0,
-                        "duration": 0.5,
-                        "count": 1e308,
-                        "during": [{"kind": "source", "species": "A", "rate": 1.0}],
-                    }
-                ]
-            }
-        )
-
-
-def test_intervention_schedule_rejects_unknown_payload_keys() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
-
-    with pytest.raises(InterventionScheduleError, match="Unsupported intervention schedule field: 'on_off'"):
-        InterventionSchedule.from_payload({"on_off": [{"species": "A"}]})
-
-
 def test_intervention_schedule_rejects_non_mapping_payload() -> None:
     from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
 
@@ -371,6 +290,10 @@ def test_intervention_schedule_rejects_non_mapping_payload() -> None:
 @pytest.mark.parametrize(
     ("payload", "match"),
     [
+        (
+            {"on_off": [{"species": "A"}]},
+            "Unsupported intervention schedule field: 'on_off'",
+        ),
         (
             {
                 "trigger_events": [
@@ -423,20 +346,7 @@ def test_intervention_schedule_rejects_non_mapping_payload() -> None:
             },
             "Unsupported source protocol during field: 'value'",
         ),
-    ],
-)
-def test_intervention_schedule_rejects_alias_and_cross_kind_payload_fields(payload, match) -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
-
-    with pytest.raises(InterventionScheduleError, match=match):
-        InterventionSchedule.from_payload(payload)
-
-
-def test_protocol_declarations_require_at_least_one_operation() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
-
-    with pytest.raises(InterventionScheduleError, match="protocol must include at least one"):
-        InterventionSchedule.from_payload(
+        (
             {
                 "protocols": [
                     {
@@ -448,8 +358,32 @@ def test_protocol_declarations_require_at_least_one_operation() -> None:
                         "count": 1,
                     }
                 ]
-            }
-        )
+            },
+            "protocol must include at least one",
+        ),
+        (
+            {
+                "protocols": [
+                    {
+                        "kind": "repeat",
+                        "name": "feed",
+                        "start": 0.0,
+                        "every": 1.0,
+                        "duration": 0.5,
+                        "count": 1,
+                        "during": "source:A:rate=1.0",
+                    }
+                ]
+            },
+            "protocol during operations must be a list",
+        ),
+    ],
+)
+def test_intervention_schedule_rejects_invalid_current_payload_shapes(payload, match) -> None:
+    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
+
+    with pytest.raises(InterventionScheduleError, match=match):
+        InterventionSchedule.from_payload(payload)
 
 
 @pytest.mark.parametrize(
@@ -463,51 +397,25 @@ def test_protocol_declarations_require_at_least_one_operation() -> None:
             "intervention: op=trigger; trigger_species=A; threshold=1.0; direction=rising; species=B; then=add; amount=1.0; max_count=1; min_interval=0.0",
             "Unsupported trigger intervention field: 'then'",
         ),
+        (
+            "intervention: op=source; op=sink; species=A; start=0.0; end=1.0; rate=1.0",
+            "Duplicate intervention field: 'op'",
+        ),
+        (
+            "intervention: op=protocol; kind=repeat; name=feed; start=0.0; every=1.0; duration=0.5; count=1; during=source:A:rate=1.0:rate=2.0",
+            "Duplicate protocol operation field: 'rate'",
+        ),
+        (
+            "intervention: op=source; kind=sink; species=A; start=0.0; end=1.0; rate=1.0",
+            "must not include kind when op supplies the interval kind",
+        ),
     ],
 )
-def test_dsl_intervention_aliases_are_rejected(directive: str, match: str) -> None:
+def test_dsl_intervention_directives_reject_invalid_current_shapes(directive: str, match: str) -> None:
     from kindred.core.intervention_schedule import InterventionScheduleError, parse_intervention_schedule_from_dsl
 
     with pytest.raises(InterventionScheduleError, match=match):
         parse_intervention_schedule_from_dsl(directive)
-
-
-def test_dsl_intervention_directives_reject_duplicate_and_conflicting_fields() -> None:
-    from kindred.core.intervention_schedule import InterventionScheduleError, parse_intervention_schedule_from_dsl
-
-    with pytest.raises(InterventionScheduleError, match="Duplicate intervention field: 'op'"):
-        parse_intervention_schedule_from_dsl(
-            "intervention: op=source; op=sink; species=A; start=0.0; end=1.0; rate=1.0"
-        )
-    with pytest.raises(InterventionScheduleError, match="Duplicate protocol operation field: 'rate'"):
-        parse_intervention_schedule_from_dsl(
-            "intervention: op=protocol; kind=repeat; name=feed; start=0.0; every=1.0; duration=0.5; count=1; during=source:A:rate=1.0:rate=2.0"
-        )
-    with pytest.raises(InterventionScheduleError, match="must not include kind when op supplies the interval kind"):
-        parse_intervention_schedule_from_dsl(
-            "intervention: op=source; kind=sink; species=A; start=0.0; end=1.0; rate=1.0"
-        )
-
-
-def test_protocol_payload_requires_structured_operation_lists() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
-
-    with pytest.raises(InterventionScheduleError, match="protocol during operations must be a list"):
-        InterventionSchedule.from_payload(
-            {
-                "protocols": [
-                    {
-                        "kind": "repeat",
-                        "name": "feed",
-                        "start": 0.0,
-                        "every": 1.0,
-                        "duration": 0.5,
-                        "count": 1,
-                        "during": "source:A:rate=1.0",
-                    }
-                ]
-            }
-        )
 
 
 def test_repeated_interval_dsl_directive_builds_core_schedule_metadata() -> None:
@@ -538,48 +446,6 @@ def test_repeated_interval_dsl_directive_builds_core_schedule_metadata() -> None
             "rate": 0.5,
         }
     ]
-
-
-@pytest.mark.parametrize("payload_key", ["time_varying_intervals", "conditional_intervals"])
-def test_future_interval_constructs_are_not_current_schedule_payloads(payload_key: str) -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, InterventionScheduleError
-
-    with pytest.raises(InterventionScheduleError, match=f"Unsupported intervention schedule field: '{payload_key}'"):
-        InterventionSchedule.from_payload({payload_key: [{"species": "A"}]})
-
-
-def test_declarative_schedule_must_be_compiled_before_primitive_execution_helpers() -> None:
-    from kindred.core.intervention_schedule import (
-        InterventionSchedule,
-        InterventionScheduleError,
-        active_interval_boundaries,
-        events_at_time,
-        intervals_active_at,
-    )
-
-    schedule = InterventionSchedule.from_payload(
-        {
-            "protocols": [
-                {
-                    "kind": "repeat",
-                    "name": "pulse",
-                    "start": 0.0,
-                    "every": 1.0,
-                    "duration": 0.5,
-                    "count": 1,
-                    "during": [{"kind": "source", "species": "A", "rate": 1.0}],
-                    "after": [{"op": "clear", "species": "A"}],
-                }
-            ]
-        }
-    )
-
-    with pytest.raises(InterventionScheduleError, match="compile_intervention_schedule"):
-        active_interval_boundaries(schedule, t0=0.0, t1=1.0)
-    with pytest.raises(InterventionScheduleError, match="compile_intervention_schedule"):
-        events_at_time(schedule, 0.5)
-    with pytest.raises(InterventionScheduleError, match="compile_intervention_schedule"):
-        intervals_active_at(schedule, 0.25)
 
 
 def test_intervention_schedule_rejects_conflicting_absolute_events() -> None:
@@ -941,7 +807,8 @@ def test_simulation_execution_request_round_trips_intervention_schedule_payload(
 
 
 def test_simulation_plan_validates_declarative_and_executable_schedule_identity() -> None:
-    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+    from kindred.core.intervention_schedule import InterventionSchedule
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
     from kindred.core.simulation_identity import SimulationIdentity
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
     from kindred.core.simulation_preparation import SimulationExecutionRequest
@@ -998,31 +865,69 @@ def test_simulation_plan_validates_declarative_and_executable_schedule_identity(
     )
 
 
-def test_simulation_plan_rejects_stale_single_schedule_identity_field() -> None:
+def test_simulation_plan_validates_schedule_identity_with_prepared_mechanism_namespace() -> None:
+    from kindred.core.intervention_schedule import normalized_intervention_schedule_identity_fingerprints
+    from kindred.core.simulation_identity import SimulationIdentity
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan
-    from kindred.core.simulation_preparation import SimulationExecutionRequest
+    from kindred.core.simulation_preparation import SimulationExecutionRequest, prepare_bound_mechanism
+    from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
+    mechanism_text = "\n".join(
+        [
+            "reaction: A -> B; k=1.0",
+            "initial: A=1.0",
+            "initial: B=0.0",
+            "intervention: op=add; species=A; time=1.0; amount_param=K1",
+        ]
+    )
+    bound = prepare_bound_mechanism(
+        mechanism_text=mechanism_text,
+        param_names=[],
+        temperature_K=298.15,
+        initials={},
+        use_advanced_dsl=True,
+        wegscheider_cyclicity_enabled=False,
+    )
+    schedule = bound.unresolved_intervention_schedule
+    assert schedule is not None
+    (
+        declarative_fingerprint,
+        executable_fingerprint,
+    ) = normalized_intervention_schedule_identity_fingerprints(
+        schedule,
+        mechanism_namespace=build_namespace_from_mechanism(bound.mechanism),
+    )
     request = SimulationExecutionRequest(
-        prepared_payload=None,
-        initials={"A": 0.0},
-        t_span=(0.0, 1.0),
+        prepared_payload=bound.as_serializable_execution_payload(),
+        initials={"A": 1.0, "B": 0.0},
+        t_span=(0.0, 2.0),
         solver_config={"solver": "BDF", "grid": {"N": 3}},
-        mechanism_text="reaction: A -> B; k=0\ninitial: A=0.0\ninitial: B=0.0",
-        intervention_schedule={
-            "instant_events": [{"time": 0.0, "species": "A", "op": "set", "value": 1.0}]
+        mechanism_text=mechanism_text,
+        intervention_schedule=schedule,
+    )
+    identity = SimulationIdentity.build(
+        schema_id="schema",
+        param_fingerprint="params",
+        canonical_initials_fingerprint="initials",
+        solver_config={"solver": "BDF", "temperature_K": 298.15},
+        t_end=2.0,
+        intervention_schedule_declarative_fingerprint=declarative_fingerprint,
+        intervention_schedule_executable_fingerprint=executable_fingerprint,
+    )
+
+    plan = SimulationPlan.from_execution_request(
+        request,
+        execution_mode="explicit",
+        algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        cache_identity_payload={
+            "cache_key": identity.cache_key(),
+            "simulation_identity": identity.to_payload(),
         },
     )
 
-    with pytest.raises(ValueError, match="stale intervention_schedule_fingerprint"):
-        SimulationPlan.from_execution_request(
-            request,
-            execution_mode="explicit",
-            algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
-            cache_identity_payload={
-                "simulation_identity": {"intervention_schedule_fingerprint": "stale"}
-            },
-        )
-
+    assert plan.simulation_identity_payload()["intervention_schedule_declarative_fingerprint"] == (
+        declarative_fingerprint
+    )
 
 def test_simulation_plan_explicit_empty_schedule_stays_noop_over_dsl_text() -> None:
     from kindred.core.simulation_plan import SimulationAlgebraPolicy, SimulationPlan

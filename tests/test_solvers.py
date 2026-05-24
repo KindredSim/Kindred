@@ -401,7 +401,8 @@ def test_solve_ode_intervention_interval_symbolic_jacobian_uses_scheduled_rhs(mo
 
 
 def test_solver_provenance_includes_declarative_and_executable_schedule_fingerprints(monkeypatch):
-    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+    from kindred.core.intervention_schedule import InterventionSchedule
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 
     def fake_solve_ivp(*, fun, t_span, y0, **kwargs):
         t_eval = np.asarray(kwargs["t_eval"], float)

@@ -12,6 +12,8 @@ from kindred.core.intervention_schedule import (
     InterventionSchedule,
     InterventionScheduleError,
     coerce_intervention_schedule,
+    _instant_event_is_absolute,
+    _instant_events_conflict,
 )
 
 
@@ -184,27 +186,22 @@ def _validate_protocol_instant_operations(
                     by_time_species[key] = (window_index, phase, operation)
                     continue
                 existing_window_index, existing_phase, existing_operation = existing
-                if _instant_operations_conflict(existing_operation, operation):
+                if _instant_events_conflict(
+                    existing_operation.to_instant_event(time=float(time)),
+                    operation.to_instant_event(time=float(time)),
+                ):
                     raise InterventionScheduleError(
                         f"Protocol {protocol.name!r} window {existing_window_index} phase {existing_phase!r} "
                         f"conflicts with window {window_index} phase {phase!r} for species {operation.species} "
                         f"at t={time:g}."
                     )
 
-
-def _instant_operations_conflict(left: InterventionProtocolOperation, right: InterventionProtocolOperation) -> bool:
-    absolute = {"set", "clear"}
-    if left.op in absolute and right.op in absolute:
-        return _operation_execution_payload(left) != _operation_execution_payload(right)
-    return left.op in absolute or right.op in absolute
-
-
 def _validate_compiled_instant_conflicts(instants: Sequence[tuple[InterventionInstantEvent, str]]) -> None:
     absolute_by_key: dict[tuple[float, str], tuple[InterventionInstantEvent, str]] = {}
     delta_by_key: dict[tuple[float, str], tuple[InterventionInstantEvent, str]] = {}
     for event, source in instants:
         key = (float(event.time if event.time is not None else 0.0), str(event.species))
-        if event.op not in {"set", "clear"}:
+        if not _instant_event_is_absolute(event):
             existing = absolute_by_key.get(key)
             if existing is not None:
                 _raise_instant_conflict(existing, (event, source), species=event.species, time=key[0])
@@ -233,19 +230,6 @@ def _raise_instant_conflict(
     raise InterventionScheduleError(
         f"{left_source} conflicts with {right_source} for species {species} at t={time:g}."
     )
-
-
-def _instant_events_conflict(left: InterventionInstantEvent, right: InterventionInstantEvent) -> bool:
-    absolute = {"set", "clear"}
-    if left.op in absolute and right.op in absolute:
-        return _instant_event_execution_payload(left) != _instant_event_execution_payload(right)
-    return left.op in absolute or right.op in absolute
-
-
-def _instant_event_execution_payload(event: InterventionInstantEvent) -> dict[str, Any]:
-    payload = event.to_payload()
-    payload.pop("metadata", None)
-    return payload
 
 
 def _operation_execution_payload(operation: InterventionProtocolOperation) -> dict[str, Any]:

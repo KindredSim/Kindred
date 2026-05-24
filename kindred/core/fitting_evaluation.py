@@ -27,6 +27,7 @@ from kindred.core.runtime_defaults import (
 )
 from kindred.core.intervention_schedule import (
     coerce_intervention_schedule,
+    normalized_intervention_schedule_identity_fingerprints,
 )
 from kindred.core.simulation_preparation import (
     PreparedSimulationMetadata,
@@ -34,7 +35,6 @@ from kindred.core.simulation_preparation import (
     _bind_symbolic_jacobian_for_current_mechanism,
     _build_solver_config,
     _fit_simulation_error_from_preparation_error,
-    _normalized_intervention_schedule_identity_fingerprints,
     _prepare_preparation_failure,
     _raise_unowned_request_parameter_values,
     _mechanism_supports_dynamic_symbolic_snapshot,
@@ -563,7 +563,7 @@ def prepare_fitting_execution_context(
     (
         intervention_schedule_declarative_fingerprint,
         intervention_schedule_executable_fingerprint,
-    ) = _normalized_intervention_schedule_identity_fingerprints(
+    ) = normalized_intervention_schedule_identity_fingerprints(
         intervention_schedule,
         mechanism_namespace=build_namespace_from_mechanism(bound.mechanism),
     )

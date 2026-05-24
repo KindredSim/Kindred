@@ -44,7 +44,8 @@ def test_preview_identity_does_not_mask_legacy_keq_aliases(key):
 
 
 def test_simulation_identity_distinguishes_declarative_protocol_fingerprint():
-    from kindred.core.intervention_schedule import InterventionSchedule, compile_intervention_schedule
+    from kindred.core.intervention_schedule import InterventionSchedule
+    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
     from kindred.core.simulation_identity import SimulationIdentity
 
     base_schedule = InterventionSchedule.from_payload(

@@ -30,6 +30,7 @@ from kindred.core.intervention_schedule import (
     InterventionSchedule,
     InterventionScheduleError,
     coerce_intervention_schedule,
+    intervention_schedule_identity_fingerprints,
     intervention_schedule_parameter_names,
     normalized_intervention_schedule_identity_fingerprints,
     normalized_intervention_schedule_payload,
@@ -890,28 +891,6 @@ def _execution_request_schedule_identity_mechanism(
     )
 
 
-def _normalized_schedule_payload_for_mechanism(
-    schedule: object,
-    *,
-    mechanism: object,
-) -> dict[str, Any] | None:
-    return normalized_intervention_schedule_payload(
-        coerce_intervention_schedule(schedule),
-        mechanism_namespace=build_namespace_from_mechanism(mechanism),
-    )
-
-
-def _normalized_intervention_schedule_identity_fingerprints(
-    schedule: object,
-    *,
-    mechanism_namespace: object,
-) -> tuple[str, str]:
-    return normalized_intervention_schedule_identity_fingerprints(
-        coerce_intervention_schedule(schedule),
-        mechanism_namespace=mechanism_namespace,
-    )
-
-
 def assert_simulation_execution_request_schedule_identity(
     request: SimulationExecutionRequest,
     *,
@@ -921,17 +900,21 @@ def assert_simulation_execution_request_schedule_identity(
     mechanism = _execution_request_schedule_identity_mechanism(request)
     request_payload = request.to_payload()
     request_schedule = _execution_request_schedule_payload_for_identity(request_payload)
-    request_normalized_payload = _normalized_schedule_payload_for_mechanism(
-        request_schedule,
-        mechanism=mechanism,
+    mechanism_namespace = build_namespace_from_mechanism(mechanism)
+    request_normalized_payload = normalized_intervention_schedule_payload(
+        coerce_intervention_schedule(request_schedule),
+        mechanism_namespace=mechanism_namespace,
     )
-    (
-        request_declarative_fingerprint,
-        request_executable_fingerprint,
-    ) = _normalized_intervention_schedule_identity_fingerprints(
-        request_schedule,
-        mechanism_namespace=build_namespace_from_mechanism(mechanism),
-    )
+    if request_normalized_payload is None:
+        request_declarative_fingerprint = ""
+        request_executable_fingerprint = ""
+    else:
+        (
+            request_declarative_fingerprint,
+            request_executable_fingerprint,
+        ) = intervention_schedule_identity_fingerprints(
+            InterventionSchedule.from_payload(request_normalized_payload)
+        )
     expected_declarative = str(expected_declarative_fingerprint or "")
     if expected_declarative != request_declarative_fingerprint:
         raise SimulationPreparationError(
@@ -949,9 +932,9 @@ def assert_simulation_execution_request_schedule_identity(
     for field_name in ("intervention_schedule", "unresolved_intervention_schedule"):
         if field_name not in prepared_payload:
             continue
-        prepared_normalized_payload = _normalized_schedule_payload_for_mechanism(
-            prepared_payload.get(field_name),
-            mechanism=mechanism,
+        prepared_normalized_payload = normalized_intervention_schedule_payload(
+            coerce_intervention_schedule(prepared_payload.get(field_name)),
+            mechanism_namespace=mechanism_namespace,
         )
         if prepared_normalized_payload != request_normalized_payload:
             raise SimulationPreparationError(
@@ -3484,7 +3467,7 @@ def build_prepared_simulation_func(
         (
             intervention_schedule_declarative_fingerprint,
             intervention_schedule_executable_fingerprint,
-        ) = _normalized_intervention_schedule_identity_fingerprints(
+        ) = normalized_intervention_schedule_identity_fingerprints(
             initial_bound.unresolved_intervention_schedule,
             mechanism_namespace=build_namespace_from_mechanism(initial_bound.mechanism),
         )

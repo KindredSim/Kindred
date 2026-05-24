@@ -31,10 +31,8 @@ from kindred.core.scipy_integrate import load_scipy_integrate
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 
 from kindred.core.temperature import TemperatureScheduleDictProtocol, TemperatureScheduleProtocol
-from kindred.core.intervention_schedule import (
-    compile_intervention_schedule,
-    coerce_intervention_schedule,
-)
+from kindred.core.intervention_schedule import coerce_intervention_schedule
+from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
 from kindred.core.exceptions import (
     InitialConditionError,
     SimulationCancelled,

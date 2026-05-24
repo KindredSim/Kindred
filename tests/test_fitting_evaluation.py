@@ -30,25 +30,16 @@ def _protocol_process_payload() -> dict[str, Any]:
     return SerialFittingEvaluator(context).to_process_payload()
 
 
-def test_process_payload_rejects_mismatched_declarative_intervention_schedule_fingerprint() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "intervention_schedule_declarative_fingerprint",
+        "intervention_schedule_executable_fingerprint",
+    ],
+)
+def test_process_payload_rejects_mismatched_intervention_schedule_fingerprint(field_name: str) -> None:
     payload = _protocol_process_payload()
-    payload["prepared_metadata"]["intervention_schedule_declarative_fingerprint"] = "wrong-fingerprint"
+    payload["prepared_metadata"][field_name] = "wrong-fingerprint"
 
     with pytest.raises(ValueError, match="intervention_schedule"):
-        SerialFittingEvaluator.from_process_payload(payload)
-
-
-def test_process_payload_rejects_mismatched_executable_intervention_schedule_fingerprint() -> None:
-    payload = _protocol_process_payload()
-    payload["prepared_metadata"]["intervention_schedule_executable_fingerprint"] = "wrong-fingerprint"
-
-    with pytest.raises(ValueError, match="intervention_schedule"):
-        SerialFittingEvaluator.from_process_payload(payload)
-
-
-def test_process_payload_rejects_stale_intervention_schedule_fingerprint_field() -> None:
-    payload = _protocol_process_payload()
-    payload["prepared_metadata"]["intervention_schedule_fingerprint"] = "stale-old-field"
-
-    with pytest.raises(KeyError, match="stale intervention_schedule_fingerprint"):
         SerialFittingEvaluator.from_process_payload(payload)

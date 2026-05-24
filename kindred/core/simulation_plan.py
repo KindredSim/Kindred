@@ -9,6 +9,7 @@ import numpy as np
 from kindred.core.intervention_schedule import (
     coerce_intervention_schedule,
     intervention_schedule_identity_fingerprints,
+    normalized_intervention_schedule_identity_fingerprints,
 )
 from kindred.core.simulation_preparation import SimulationExecutionRequest, SimulationPreparationError
 
@@ -231,6 +232,20 @@ class SimulationPlan:
             return ()
         return tuple(str(item) for item in queue_ids if str(item))
 
+    def _expected_schedule_identity(self) -> tuple[str, str]:
+        schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
+        prepared_payload = self.execution_request.prepared_payload
+        if isinstance(prepared_payload, Mapping):
+            mechanism = prepared_payload.get("mechanism")
+            if mechanism is not None:
+                from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+
+                return normalized_intervention_schedule_identity_fingerprints(
+                    schedule,
+                    mechanism_namespace=build_namespace_from_mechanism(mechanism),
+                )
+        return intervention_schedule_identity_fingerprints(schedule)
+
     def _validate_cache_identity_schedule(self) -> None:
         identity = self.simulation_identity_payload()
         if not identity:
@@ -246,8 +261,7 @@ class SimulationPlan:
             )
         if not self.execution_request.has_intervention_schedule_authority:
             return
-        schedule = coerce_intervention_schedule(self.execution_request.intervention_schedule)
-        expected_declarative, expected_executable = intervention_schedule_identity_fingerprints(schedule)
+        expected_declarative, expected_executable = self._expected_schedule_identity()
         if actual_declarative != expected_declarative or actual_executable != expected_executable:
             raise ValueError(
                 "SimulationPlan cache_identity_payload simulation_identity "

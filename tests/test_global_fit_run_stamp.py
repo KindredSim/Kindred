@@ -55,7 +55,7 @@ def _stamp(prepared: PreparedSimulationMetadata) -> dict:
     )
 
 
-def test_global_fit_run_stamp_uses_declarative_and_executable_schedule_identity() -> None:
+def test_global_fit_run_stamp_uses_schedule_identity_and_hashes_identity_changes() -> None:
     prepared = _prepared_metadata()
     stamp = _stamp(prepared)
 
@@ -64,15 +64,18 @@ def test_global_fit_run_stamp_uses_declarative_and_executable_schedule_identity(
     assert block["intervention_schedule_declarative_fingerprint"] == "declarative-fp"
     assert block["intervention_schedule_executable_fingerprint"] == "executable-fp"
     assert "intervention_schedule_fingerprint" not in block
-
-
-def test_global_fit_run_stamp_hash_changes_with_executable_schedule_identity() -> None:
-    first = _stamp(_prepared_metadata())
-    second = _stamp(
+    declarative_changed = _stamp(
         replace(
-            _prepared_metadata(),
+            prepared,
+            intervention_schedule_declarative_fingerprint="different-declarative-fp",
+        )
+    )
+    executable_changed = _stamp(
+        replace(
+            prepared,
             intervention_schedule_executable_fingerprint="different-executable-fp",
         )
     )
 
-    assert hash_global_fit_run_stamp(first) != hash_global_fit_run_stamp(second)
+    assert hash_global_fit_run_stamp(stamp) != hash_global_fit_run_stamp(declarative_changed)
+    assert hash_global_fit_run_stamp(stamp) != hash_global_fit_run_stamp(executable_changed)

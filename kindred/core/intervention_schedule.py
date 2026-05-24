@@ -16,13 +16,10 @@ __all__ = [
     "InterventionScheduleError",
     "InterventionTriggerEvent",
     "coerce_intervention_schedule",
-    "compile_intervention_schedule",
     "intervention_schedule_identity_fingerprints",
     "intervention_schedule_parameter_names",
     "normalized_intervention_schedule_identity_fingerprints",
     "normalized_intervention_schedule_identity_fingerprints_from_dsl_text",
-    "normalized_intervention_schedule_fingerprint",
-    "normalized_intervention_schedule_fingerprint_from_dsl_text",
     "normalized_intervention_schedule_payload",
     "parse_intervention_schedule_from_dsl",
 ]
@@ -440,7 +437,7 @@ class InterventionInstantEvent:
             "op": str(self.op),
         }
         _write_scalar_payload(payload, field="time", value=self.time, parameter=self.time_param)
-        if self.op in _ABSOLUTE_INSTANT_OPS:
+        if _instant_event_is_absolute(self):
             if self.op != "clear":
                 _write_scalar_payload(payload, field="value", value=self.value, parameter=self.value_param)
         else:
@@ -1398,7 +1395,7 @@ class InterventionSchedule:
         delta_keys: set[tuple[object, str]] = set()
         for event in _validation_instant_events(self):
             key = (_scalar_identity(event.time, event.time_param), str(event.species))
-            if event.op not in _ABSOLUTE_INSTANT_OPS:
+            if not _instant_event_is_absolute(event):
                 delta_keys.add(key)
                 if key in absolute_by_key:
                     raise InterventionScheduleError(
@@ -1410,9 +1407,7 @@ class InterventionSchedule:
                     f"Cannot combine absolute and add/remove interventions for {event.species} at t={_format_scalar_identity(key[0])}."
                 )
             existing = absolute_by_key.get(key)
-            if existing is not None and _instant_event_execution_payload(existing) != _instant_event_execution_payload(
-                event
-            ):
+            if existing is not None and _instant_events_conflict(existing, event):
                 raise InterventionScheduleError(
                     f"Conflicting absolute interventions for {event.species} at t={_format_scalar_identity(key[0])}."
                 )
@@ -1440,6 +1435,16 @@ def _instant_event_execution_payload(event: InterventionInstantEvent) -> dict[st
     payload = event.to_payload()
     payload.pop("metadata", None)
     return payload
+
+
+def _instant_event_is_absolute(event: object) -> bool:
+    return str(getattr(event, "op", "")) in _ABSOLUTE_INSTANT_OPS
+
+
+def _instant_events_conflict(left: InterventionInstantEvent, right: InterventionInstantEvent) -> bool:
+    if _instant_event_is_absolute(left) and _instant_event_is_absolute(right):
+        return _instant_event_execution_payload(left) != _instant_event_execution_payload(right)
+    return _instant_event_is_absolute(left) or _instant_event_is_absolute(right)
 
 
 def _format_scalar_identity(value: object) -> str:
@@ -1519,12 +1524,6 @@ def coerce_intervention_schedule(value: object) -> InterventionSchedule | None:
     raise InterventionScheduleError("Intervention schedule must be a mapping or InterventionSchedule.")
 
 
-def compile_intervention_schedule(schedule: "InterventionSchedule | Mapping[str, Any] | None"):
-    from kindred.core.intervention_schedule_compiler import compile_intervention_schedule as _compile
-
-    return _compile(schedule)
-
-
 def intervention_schedule_identity_fingerprints(
     schedule: "InterventionSchedule | Mapping[str, Any] | None",
 ) -> tuple[str, str]:
@@ -1533,6 +1532,8 @@ def intervention_schedule_identity_fingerprints(
         return "", ""
     executable_fingerprint = ""
     if not schedule_obj.is_parameterized:
+        from kindred.core.intervention_schedule_compiler import compile_intervention_schedule
+
         executable_fingerprint = compile_intervention_schedule(schedule_obj).executable_fingerprint
     return str(schedule_obj.fingerprint or ""), str(executable_fingerprint or "")
 
@@ -1653,18 +1654,6 @@ def normalized_intervention_schedule_identity_fingerprints(
     return intervention_schedule_identity_fingerprints(InterventionSchedule.from_payload(payload))
 
 
-def normalized_intervention_schedule_fingerprint(
-    schedule: "InterventionSchedule | Mapping[str, Any] | None",
-    *,
-    mechanism_namespace: object,
-) -> str:
-    declarative_fingerprint, _executable_fingerprint = normalized_intervention_schedule_identity_fingerprints(
-        schedule,
-        mechanism_namespace=mechanism_namespace,
-    )
-    return declarative_fingerprint
-
-
 def normalized_intervention_schedule_identity_fingerprints_from_dsl_text(text: str) -> tuple[str, str]:
     from kindred.core.simulator.dsl import parse_dsl_to_mechanism
     from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
@@ -1678,13 +1667,6 @@ def normalized_intervention_schedule_identity_fingerprints_from_dsl_text(text: s
         schedule,
         mechanism_namespace=namespace,
     )
-
-
-def normalized_intervention_schedule_fingerprint_from_dsl_text(text: str) -> str:
-    declarative_fingerprint, _executable_fingerprint = normalized_intervention_schedule_identity_fingerprints_from_dsl_text(
-        text
-    )
-    return declarative_fingerprint
 
 
 def _parse_directive_fields(rest: str, *, line_no: int) -> dict[str, Any]:
